@@ -80,7 +80,9 @@ use crate::sema::DecodeError;
 pub use dma::{DMA_REGISTERS_NEEDED, dma_method};
 pub use inline::{INLINE_A140, INLINE_C7C0, INLINE_C797, InlineClass, InlineUpload};
 pub use surface::CopySide;
-pub use twod::{BILINEAR_FORMATS, BLIT_REGISTERS_NEEDED, blit_method, bytes_per_pixel};
+pub use twod::{
+    BILINEAR_FORMATS, BLIT_REGISTERS_NEEDED, BLIT_RESET_REGISTERS, blit_method, bytes_per_pixel,
+};
 
 /// The most bytes one DMA copy or 2D blit may move: a copy whose larger side (source or
 /// destination bytes) exceeds this is [`CopyError::TooLarge`], checked before anything is read.
@@ -88,8 +90,9 @@ pub use twod::{BILINEAR_FORMATS, BLIT_REGISTERS_NEEDED, blit_method, bytes_per_p
 /// A **guess** with no reference behind it: Eden-NX2 has no bound and sizes its buffers from the
 /// registers (`maxwell_dma.cpp`, `pitch_in * line_count`), so a hostile launch could ask it for
 /// any amount. 256 MiB holds a 4096 by 4096 surface of 16-byte pixels, the largest the 2D class
-/// names (`RF32_GF32_BF32_AF32`); it bounds the time one launch can take and the memory a 2D row
-/// can hold.
+/// names (`RF32_GF32_BF32_AF32`); it bounds the time one launch can take, the memory a 2D row
+/// can hold, and the source an overlapping copy or blit reads before writing (the [`dma`] and
+/// [`twod`] docs).
 pub const MAX_COPY_BYTES: u64 = 256 << 20;
 
 /// Whether a copy of `bytes` is within [`MAX_COPY_BYTES`].
@@ -101,6 +104,13 @@ pub(crate) fn check_size(bytes: u128) -> Result<(), CopyError> {
         });
     }
     Ok(())
+}
+
+/// Whether two GPU ranges share a byte: when a copy's source and destination covers do, the
+/// engines read the source before writing, as Eden-NX2 does (the [`dma`] and [`twod`] docs say
+/// how much at a time).
+pub(crate) fn overlaps(a: &Range<u64>, b: &Range<u64>) -> bool {
+    a.start < b.end && b.start < a.end
 }
 
 /// Why a copy, inline upload or blit failed. Every variant is reported before the first byte

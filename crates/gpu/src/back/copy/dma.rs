@@ -43,6 +43,28 @@
 //! increasing line order, each line in chunks of at most [`CHUNK_BYTES`] in increasing x, each
 //! chunk read whole before it is written.
 //!
+//! # Overlapping source and destination
+//!
+//! When the source's cover and the destination's cover (`Surface::cover`) share a byte, the
+//! source is read before it is written over, as Eden-NX2 reads it:
+//!
+//! - between two pitch sides, each line is read whole before any of it is written, lines in
+//!   increasing order, so a later line's source may already hold an earlier line's copy
+//!   (Eden-NX2's multi-line pitch path calls `MemoryManager::CopyBlock` once per line, which
+//!   reads the line through `GpuGuestMemoryScoped` before writing it; a one-line copy reads its
+//!   one line through `GpuGuestMemoryScoped` the same way);
+//! - on every path with a block-linear side, the whole source region is read before anything is
+//!   written (`CopyPitchToBlockLinear`, `CopyBlockLinearToPitch` and
+//!   `CopyBlockLinearToBlockLinear` read it into `tmp_read_buffer` first). A one-line copy with a
+//!   block-linear side does the same here; Eden-NX2 picks that path by page kind and moves 16
+//!   bytes at a time (the one-line divergence below).
+//!
+//! The held source is one line or the whole region, at most [`super::MAX_COPY_BYTES`]. Covers
+//! that do not overlap give the same bytes in either order, so those copies stream in chunks.
+//! Pinned by `an_overlapping_one_line_copy_longer_than_a_chunk_reads_the_whole_line_first`,
+//! `overlapping_multi_line_pitch_copies_read_each_line_before_writing_it` and
+//! `overlapping_copies_with_a_block_linear_side_read_the_whole_source_first`.
+//!
 //! # Divergences from Eden-NX2
 //!
 //! Each is pinned by the test named, in `copy/tests/dma.rs`.
@@ -56,7 +78,8 @@
 //!   picks each side's layout from its page kind (`IsPitchKind`) and swizzles a block-linear side
 //!   within each 512-byte GOB only (`convert_linear_2_blocklinear_addr`); here the layout bits
 //!   and the full surface parameters apply to one line, as for a multi-line copy (this module's
-//!   memory carries no page kinds). Pinned by `divergence_a_one_line_copy_follows_the_layout_bits`.
+//!   memory carries no page kinds), with the overlap rule above. Pinned by
+//!   `divergence_a_one_line_copy_follows_the_layout_bits`.
 //! - **Remap rearranges components on every path.** Eden-NX2 remaps only a one-line copy whose
 //!   `DST_X` is `CONST_A`, filling `LINE_LENGTH_IN * COMPONENT_SIZE` bytes with the repeated
 //!   32-bit constant (so a 1- or 2-byte component gets the constant's bytes in turn, not its low
@@ -141,7 +164,10 @@ pub const DMA_REGISTERS_NEEDED: usize = registers_needed(&[
 ]);
 
 /// The most bytes moved through one buffer at a time: each line is copied in chunks of at most
-/// this many bytes of its larger side, so a launch holds at most two such buffers.
+/// this many bytes of its larger side, so a launch whose source and destination covers do not
+/// overlap holds at most two such buffers. One whose covers overlap also holds the source it
+/// read first (module docs): one line, or the whole region, at most
+/// [`super::MAX_COPY_BYTES`] either way.
 pub(crate) const CHUNK_BYTES: u64 = 64 << 10;
 
 /// Handles one DMA copy method, called after the channel's `C7B5` register mirror
@@ -448,22 +474,47 @@ impl Plan {
             .probe(memory, 0..self.lines, 0..self.source_region.width)?;
         self.destination
             .probe(memory, 0..self.lines, 0..self.destination_region.width)?;
-        sink.make_current(source_cover);
+        sink.make_current(source_cover.clone());
         sink.make_current(destination_cover.clone());
         let (source_bytes, destination_bytes) = self.remap.map_or((1, 1), |r| {
             (r.source_bytes() as u64, r.destination_bytes() as u64)
         });
         let per_chunk = (CHUNK_BYTES / source_bytes.max(destination_bytes)).max(1);
+        let width = self.source_region.width;
+        // Overlapping sides: the source is read before it is written, as Eden-NX2 reads it (the
+        // module docs): line by line between two pitch sides, whole on every other path.
+        let overlap = super::overlaps(&source_cover, &destination_cover);
+        let line_by_line = self.source.is_pitch() && self.destination.is_pitch();
+        let mut held: Option<(u32, Vec<u8>)> = None;
+        if overlap && !line_by_line {
+            held = Some((0, self.source.read_lines(memory, 0..self.lines, width)?));
+        }
         let mut input = Vec::new();
         let mut output = Vec::new();
         for line in 0..self.lines {
+            if overlap && line_by_line {
+                held = Some((line, self.source.read_lines(memory, line..line + 1, width)?));
+            }
             let mut first = 0;
             while first < self.elements {
                 let last = (first + per_chunk).min(self.elements);
                 let from = first * source_bytes..last * source_bytes;
                 let to = first * destination_bytes..last * destination_bytes;
                 input.resize(buffer_len(&from)?, 0);
-                self.source.read(memory, line, from, &mut input)?;
+                match &held {
+                    Some((first_line, bytes)) => {
+                        // Inside the held lines: `line - first_line` is below their count and
+                        // `from` inside one line of `width` bytes.
+                        let base = u64::from(line - first_line) * width;
+                        let start = buffer_len(&(0..base + from.start))?;
+                        let end = buffer_len(&(0..base + from.end))?;
+                        let held_bytes = bytes.get(start..end).ok_or(CopyError::Extent {
+                            side: CopySide::Source,
+                        })?;
+                        input.copy_from_slice(held_bytes);
+                    }
+                    None => self.source.read(memory, line, from, &mut input)?,
+                }
                 match &self.remap {
                     None => self.destination.write(memory, line, to, &input, |_| ())?,
                     Some(remap) => {

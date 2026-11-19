@@ -53,10 +53,38 @@
 //! ([`CopyError::TooLarge`]), the source then destination surfaces and regions, and the probe of
 //! the source then the destination ([`CopyError::Fault`]).
 //!
+//! # Register reset values
+//!
+//! Eden-NX2's `Fermi2D` constructor sets `SET_SRC_DEPTH` and `SET_DST_DEPTH` to 1 before the guest
+//! writes anything ([`BLIT_RESET_REGISTERS`]); the channel's register mirror (G10, G19) must
+//! apply them when it binds the class. This module reads the depth as the mirror stores it: a
+//! depth of 0 on a block-linear side is [`CopyError::Layout`] with
+//! [`starquake_layout::LayoutError::RegionOutOfBounds`] on that side (its last line is in a
+//! slice at or past the depth), and a pitch side never reads its depth. Pinned by
+//! `a_block_linear_side_of_depth_zero_is_refused`.
+//!
+//! # Overlapping source and destination
+//!
+//! When the source's cover and the destination's cover (`Surface::cover`) share a byte, the whole
+//! source region is read before anything is written, as Eden-NX2's `SoftwareBlitEngine::Blit`
+//! reads it (into `src_buffer`, before `SwizzleSubrect` or `ProcessPitchLinear<true>` writes the
+//! destination), so every destination pixel comes from the source as it was before the blit.
+//! The held source is at most [`super::MAX_COPY_BYTES`]. Covers that do not overlap give the
+//! same bytes in either order, so those blits read the source row by row. Pinned by
+//! `an_overlapping_same_surface_blit_reads_the_whole_source_first` and
+//! `an_overlapping_scaled_blit_samples_the_source_as_it_was`.
+//!
 //! # Divergences from Eden-NX2
 //!
 //! Each is pinned by the test named, in `copy/tests/twod.rs`.
 //!
+//! - **Rows that continue into the next depth slice are contiguous in the blit.** A block-linear
+//!   region whose rows pass the surface's last row continues in the next slice
+//!   ([`super::surface`]). Eden-NX2 passes `extent_x * bpp` as `SwizzleSubrectImpl`'s and
+//!   `UnswizzleSubrectImpl`'s linear pitch (`blitter.cpp`), so its linear offset for row `line`
+//!   of slice `s` is `s * extent_x * bpp * height + line * extent_x * bpp`, skipping `origin_y`
+//!   rows per slice; here row `r` of the blit is always the `r`th row of the region. Pinned by
+//!   `divergence_slices_keep_the_rows_contiguous`.
 //! - **Point sampling reads the pixel under the sample.** Eden-NX2's `NearestNeighbor` reads
 //!   element `(src_y * src_width + src_x) >> 32` with both coordinates in 32.32, so a fractional
 //!   source row adds `frac(y) * src_width` pixels; here the row and column are each rounded down
@@ -91,6 +119,16 @@ use super::{CopyError, CopySink, PendingWrites, Registers, check_size, registers
 use crate::classes::Method;
 use crate::classes::cl902d as d;
 use crate::memory::GpuMemory;
+
+/// The registers the channel's `902D` register mirror must hold when the class is bound, before
+/// the guest writes any: `SET_SRC_DEPTH` and `SET_DST_DEPTH` are 1, as Eden-NX2's `Fermi2D`
+/// constructor sets them (`regs.src.depth = 1; regs.dst.depth = 1;` in
+/// `eden-nx2/src/video_core/engines/fermi_2d.cpp` @ 50fa86bb, "Nvidia's OpenGL driver seems to
+/// assume these values"); every other register starts at 0. Applying them is the mirror's job
+/// (slices G10 and G19): [`blit_method`] reads the depth as stored, so a mirror that starts at 0
+/// refuses every block-linear blit from a title that never writes the depth (module docs).
+/// Pinned by `tests::twod::blit_reset_registers_match_the_constructor_written_out`.
+pub const BLIT_RESET_REGISTERS: [(Method, u32); 2] = [(d::SET_SRC_DEPTH, 1), (d::SET_DST_DEPTH, 1)];
 
 /// The register file must reach every method a blit reads.
 pub const BLIT_REGISTERS_NEEDED: usize = registers_needed(&[
@@ -443,7 +481,17 @@ impl Blit {
                 max: super::MAX_COPY_BYTES,
             })
         };
-        let mut rows = SourceRows::new(row_len(source_row)?);
+        // Overlapping covers: the whole source region is read before anything is written, as
+        // Eden-NX2's `SoftwareBlitEngine::Blit` reads it (module docs).
+        let held = if super::overlaps(&self.source_cover, &self.destination_cover) {
+            Some(
+                self.source
+                    .read_lines(memory, 0..self.source_rect.height, source_row)?,
+            )
+        } else {
+            None
+        };
+        let mut rows = SourceRows::new(row_len(source_row)?, held);
         let mut out = vec![0u8; row_len(destination_row)?];
         for y in 0..self.destination_rect.height {
             match self.sampling {
@@ -526,16 +574,24 @@ fn position(index: u32, source: u32, destination: u32) -> (u32, u32, u64) {
     (low, high.min(source - 1), weight)
 }
 
-/// The last source rows read, so a row sampled by consecutive destination rows is read once.
+/// The source rows of a blit: the whole region read before the first write when the covers
+/// overlap, otherwise the last two rows read, so a row sampled by consecutive destination rows
+/// is read once (with covers that do not overlap, no write can change a row held here).
 struct SourceRows {
+    /// The whole source region, rows of `len` bytes, when it was read first.
+    held: Option<Vec<u8>>,
+    len: usize,
     rows: [(Option<u32>, Vec<u8>); 2],
     next: usize,
 }
 
 impl SourceRows {
-    fn new(len: usize) -> Self {
+    fn new(len: usize, held: Option<Vec<u8>>) -> Self {
+        let row = if held.is_some() { 0 } else { len };
         Self {
-            rows: [(None, vec![0; len]), (None, vec![0; len])],
+            held,
+            len,
+            rows: [(None, vec![0; row]), (None, vec![0; row])],
             next: 0,
         }
     }
@@ -547,6 +603,16 @@ impl SourceRows {
         memory: &M,
         y: u32,
     ) -> Result<&[u8], CopyError> {
+        if let Some(held) = &self.held {
+            let start = (y as usize).checked_mul(self.len);
+            let end = start.and_then(|start| start.checked_add(self.len));
+            return start
+                .zip(end)
+                .and_then(|(start, end)| held.get(start..end))
+                .ok_or(CopyError::Extent {
+                    side: CopySide::Source,
+                });
+        }
         if let Some(slot) = self.rows.iter().position(|(row, _)| *row == Some(y)) {
             return Ok(&self.rows[slot].1);
         }

@@ -332,6 +332,40 @@ impl Surface {
         })
     }
 
+    /// Whether this is a pitch-linear surface.
+    pub fn is_pitch(&self) -> bool {
+        matches!(self.shape, Shape::Pitch { .. })
+    }
+
+    /// Reads bytes `0..width` of each line in `lines`, in increasing line order, into one buffer
+    /// of `lines.len() * width` bytes, line after line. The caller bounds the size (every caller
+    /// has passed [`super::check_size`] for a region at least this large).
+    pub fn read_lines<M: GpuMemory + ?Sized>(
+        &self,
+        memory: &M,
+        lines: Range<u32>,
+        width: u64,
+    ) -> Result<Vec<u8>, CopyError> {
+        let count = u64::from(lines.end.saturating_sub(lines.start));
+        let too_large = |bytes: u128| CopyError::TooLarge {
+            bytes,
+            max: super::MAX_COPY_BYTES,
+        };
+        let total = count
+            .checked_mul(width)
+            .ok_or_else(|| too_large(u128::from(count) * u128::from(width)))?;
+        let len = usize::try_from(total).map_err(|_| too_large(u128::from(total)))?;
+        let row = usize::try_from(width).map_err(|_| too_large(u128::from(width)))?;
+        let mut buf = vec![0u8; len];
+        if row == 0 {
+            return Ok(buf);
+        }
+        for (line, target) in lines.zip(buf.chunks_exact_mut(row)) {
+            self.read(memory, line, 0..width, target)?;
+        }
+        Ok(buf)
+    }
+
     /// Writes `buf` to bytes `x` of line `line`, and calls `written` with each run written.
     pub fn write<M: GpuMemory + ?Sized>(
         &self,

@@ -1979,3 +1979,145 @@ fn snapshot_with_hole(mem: &Memory) -> Vec<u8> {
     ]
     .concat()
 }
+
+// --- Overlapping sides ---
+
+#[test]
+fn an_overlapping_one_line_copy_longer_than_a_chunk_reads_the_whole_line_first() {
+    // One and a half chunks, the destination one byte past the source: the second chunk's
+    // source starts inside the first chunk's destination, so streaming chunk by chunk would
+    // copy one byte the first chunk had already overwritten.
+    let length = super::super::dma::CHUNK_BYTES * 3 / 2;
+    let mem = memory();
+    let before = snapshot(&mem);
+    let old = read(&mem, SRC, length);
+    let copy = Copy {
+        source: Side::Pitch {
+            address: SRC,
+            pitch: 0,
+        },
+        destination: Side::Pitch {
+            address: SRC + 1,
+            pitch: 0,
+        },
+        length: u32::try_from(length).unwrap(),
+        lines: 1,
+        multi_line: false,
+    };
+    launch(&mem, &regs_for(&copy), &mut Recorder::default()).unwrap();
+    let mut expected = before;
+    let at = us(SRC + 1 - GPU_BASE);
+    expected[at..at + us(length)].copy_from_slice(&old);
+    assert!(snapshot(&mem) == expected);
+}
+
+#[test]
+fn overlapping_multi_line_pitch_copies_read_each_line_before_writing_it() {
+    // Each destination line is the next source line: as Eden-NX2's per-line `CopyBlock`, line
+    // 1's source already holds line 0's copy when it is read, so every line becomes old line 0
+    // (reading the whole source first would give old lines 0 to 3 instead).
+    let mem = memory();
+    let before = snapshot(&mem);
+    let old_line0 = read(&mem, SRC, 0x100);
+    let copy = Copy {
+        source: Side::Pitch {
+            address: SRC,
+            pitch: 0x100,
+        },
+        destination: Side::Pitch {
+            address: SRC + 0x100,
+            pitch: 0x100,
+        },
+        length: 0x100,
+        lines: 4,
+        multi_line: true,
+    };
+    launch(&mem, &regs_for(&copy), &mut Recorder::default()).unwrap();
+    let mut expected = before;
+    for line in 1..=4 {
+        let at = us(SRC - GPU_BASE) + line * 0x100;
+        expected[at..at + 0x100].copy_from_slice(&old_line0);
+    }
+    assert!(snapshot(&mem) == expected);
+}
+
+#[test]
+fn overlapping_copies_with_a_block_linear_side_read_the_whole_source_first() {
+    // `check_against_layout` reads the source before the launch and expects it written whole:
+    // Eden-NX2's model for both block-linear paths, with each side on the other's bytes.
+    let bl = Bl {
+        width: 64,
+        height: 32,
+        depth: 1,
+        bh: 1,
+        bd: 0,
+    };
+    check_against_layout(Copy {
+        source: Side::Pitch {
+            address: DST,
+            pitch: 64,
+        },
+        destination: Side::Bl {
+            address: DST,
+            bl,
+            origin: (0, 0),
+        },
+        length: 64,
+        lines: 32,
+        multi_line: true,
+    });
+    check_against_layout(Copy {
+        source: Side::Bl {
+            address: DST,
+            bl,
+            origin: (0, 0),
+        },
+        destination: Side::Pitch {
+            address: DST + 0x10,
+            pitch: 64,
+        },
+        length: 64,
+        lines: 32,
+        multi_line: true,
+    });
+    check_against_layout(Copy {
+        source: Side::Bl {
+            address: DST,
+            bl,
+            origin: (0, 0),
+        },
+        destination: Side::Bl {
+            address: DST,
+            bl,
+            origin: (16, 3),
+        },
+        length: 48,
+        lines: 29,
+        multi_line: true,
+    });
+}
+
+#[test]
+fn a_launch_with_a_short_register_file_still_flushes_the_pending_writes() {
+    let mem = memory();
+    let before = snapshot(&mem);
+    let mut pending = PendingWrites::new();
+    pending.add(0x10..0x20);
+    let mut sink = Recorder::default();
+    assert_eq!(
+        dma_method(
+            c::LAUNCH_DMA.method(),
+            &vec![0; DMA_REGISTERS_NEEDED - 1],
+            &mem,
+            &mut pending,
+            &mut sink
+        ),
+        Err(CopyError::Registers {
+            len: DMA_REGISTERS_NEEDED - 1,
+            needed: DMA_REGISTERS_NEEDED
+        })
+    );
+    assert_eq!(sink.events, vec![Event::Invalidate(0x10..0x20)]);
+    assert!(pending.is_empty());
+    assert!(snapshot(&mem) == before);
+}

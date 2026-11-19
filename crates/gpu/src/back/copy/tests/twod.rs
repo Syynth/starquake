@@ -3,8 +3,8 @@
 
 use super::super::surface::CopySide;
 use super::super::{
-    BILINEAR_FORMATS, BLIT_REGISTERS_NEEDED, CopyError, MAX_COPY_BYTES, PendingWrites, blit_method,
-    bytes_per_pixel,
+    BILINEAR_FORMATS, BLIT_REGISTERS_NEEDED, BLIT_RESET_REGISTERS, CopyError, MAX_COPY_BYTES,
+    PendingWrites, blit_method, bytes_per_pixel,
 };
 use super::*;
 use crate::classes::cl902d as d;
@@ -1300,4 +1300,474 @@ fn point_sampling_clamps_to_the_last_source_pixel() {
         read(&mem, low(DST), u64::from(width)),
         vec![pixel; width as usize]
     );
+}
+
+// --- Register reset values ---
+
+/// `BLIT_RESET_REGISTERS` against Eden-NX2's `Fermi2D` constructor (`regs.src.depth = 1;
+/// regs.dst.depth = 1;`), with the byte addresses written out from `cl902d.h`
+/// (`NV902D_SET_SRC_DEPTH` 0x023c, `NV902D_SET_DST_DEPTH` 0x020c).
+#[test]
+fn blit_reset_registers_match_the_constructor_written_out() {
+    let written: Vec<(&str, u32, u32)> = BLIT_RESET_REGISTERS
+        .iter()
+        .map(|(method, value)| (method.name, method.byte_address, *value))
+        .collect();
+    assert_eq!(
+        written,
+        vec![("SET_SRC_DEPTH", 0x023c, 1), ("SET_DST_DEPTH", 0x020c, 1)]
+    );
+}
+
+/// A block-linear to block-linear blit for the depth tests.
+fn depth_blit() -> Blit {
+    Blit {
+        format: RGBA,
+        source: Side::Bl {
+            address: SRC,
+            width_px: 32,
+            height: 16,
+            bh: 1,
+        },
+        destination: Side::Bl {
+            address: DST,
+            width_px: 32,
+            height: 16,
+            bh: 1,
+        },
+        from: R {
+            x: 1,
+            y: 2,
+            w: 4,
+            h: 3,
+        },
+        to: R {
+            x: 2,
+            y: 1,
+            w: 4,
+            h: 3,
+        },
+        bilinear: false,
+    }
+}
+
+#[test]
+fn a_block_linear_side_of_depth_zero_is_refused() {
+    let out = starquake_layout::LayoutError::RegionOutOfBounds;
+    let blit = depth_blit();
+    assert_eq!(
+        run_with(&blit, &|r| {
+            r.set(d::SET_SRC_DEPTH, 0);
+        }),
+        Err(CopyError::Layout {
+            side: CopySide::Source,
+            error: out
+        })
+    );
+    assert_eq!(
+        run_with(&blit, &|r| {
+            r.set(d::SET_DST_DEPTH, 0);
+        }),
+        Err(CopyError::Layout {
+            side: CopySide::Destination,
+            error: out
+        })
+    );
+    // Both at 0: the source is reported.
+    assert_eq!(
+        run_with(&blit, &|r| {
+            r.set(d::SET_SRC_DEPTH, 0).set(d::SET_DST_DEPTH, 0);
+        }),
+        Err(CopyError::Layout {
+            side: CopySide::Source,
+            error: out
+        })
+    );
+    // The reset values make the same blit work.
+    assert_eq!(
+        run_with(&blit, &|r| {
+            r.set(d::SET_SRC_DEPTH, 0).set(d::SET_DST_DEPTH, 0);
+            for (method, value) in BLIT_RESET_REGISTERS {
+                r.set(method, value);
+            }
+        }),
+        Ok(())
+    );
+    // A pitch side never reads its depth.
+    assert_eq!(
+        run_with(&blit_base(), &|r| {
+            r.set(d::SET_SRC_DEPTH, 0).set(d::SET_DST_DEPTH, 0);
+        }),
+        Ok(())
+    );
+}
+
+// --- Overlapping sides ---
+
+#[test]
+fn an_overlapping_same_surface_blit_reads_the_whole_source_first() {
+    // `check_copy` reads the source before the blit and expects it written whole, as
+    // Eden-NX2's `SoftwareBlitEngine::Blit`. Rows 0..4 to rows 1..5 of one pitch surface: read
+    // row by row, every destination row would become old row 0.
+    let surface = Side::Pitch {
+        address: SRC,
+        pitch: 0x100,
+    };
+    check_copy(Blit {
+        format: RGBA,
+        source: surface,
+        destination: surface,
+        from: R {
+            x: 0,
+            y: 0,
+            w: 8,
+            h: 4,
+        },
+        to: R {
+            x: 0,
+            y: 1,
+            w: 8,
+            h: 4,
+        },
+        bilinear: false,
+    });
+    // The same on one block-linear surface.
+    let surface = Side::Bl {
+        address: SRC,
+        width_px: 32,
+        height: 16,
+        bh: 1,
+    };
+    check_copy(Blit {
+        format: RGBA,
+        source: surface,
+        destination: surface,
+        from: R {
+            x: 0,
+            y: 0,
+            w: 9,
+            h: 7,
+        },
+        to: R {
+            x: 1,
+            y: 1,
+            w: 9,
+            h: 7,
+        },
+        bilinear: false,
+    });
+}
+
+#[test]
+fn an_overlapping_scaled_blit_samples_the_source_as_it_was() {
+    // Rows 0..4 doubled onto rows 1..9 of the same surface: each source row is sampled by two
+    // consecutive destination rows, some after the row was overwritten.
+    let mem = memory();
+    let surface = Side::Pitch {
+        address: SRC,
+        pitch: 0x100,
+    };
+    let from = R {
+        x: 0,
+        y: 0,
+        w: 8,
+        h: 4,
+    };
+    let to = R {
+        x: 0,
+        y: 1,
+        w: 8,
+        h: 8,
+    };
+    let blit = Blit {
+        format: RGBA,
+        source: surface,
+        destination: surface,
+        from,
+        to,
+        bilinear: false,
+    };
+    let src = pixels(&mem, surface, from, 4);
+    let expected = expect(
+        &read(&mem, LOW_BASE, PAGES * PAGE_SIZE),
+        surface,
+        to,
+        4,
+        &point_model(&src, from, to, 4),
+    );
+    run(&mem, &blit, &mut Recorder::default()).unwrap();
+    assert!(read(&mem, LOW_BASE, PAGES * PAGE_SIZE) == expected);
+}
+
+// --- Size bound on scaled blits ---
+
+#[test]
+fn the_size_bound_counts_the_larger_side_of_a_scaled_blit() {
+    let base = blit_base();
+    let format = d::SET_SRC_FORMAT_V_RF32_GF32_BF32_AF32;
+    let bpp = u128::from(bytes_per_pixel(format).unwrap());
+    let one = R {
+        x: 0,
+        y: 0,
+        w: 1,
+        h: 1,
+    };
+    let big = |h: u32| R {
+        x: 0,
+        y: 0,
+        w: 4096,
+        h,
+    };
+    let wide = Side::Pitch {
+        address: SRC,
+        pitch: 0x10_0000,
+    };
+    // One pixel stretched over 4096 by 4097: the destination's bytes are counted.
+    let up = Blit {
+        format,
+        destination: Side::Pitch {
+            address: DST,
+            pitch: 0x10_0000,
+        },
+        from: one,
+        to: big(4097),
+        ..base
+    };
+    assert_eq!(
+        run_with(&up, &|_| ()),
+        Err(CopyError::TooLarge {
+            bytes: 4096 * 4097 * bpp,
+            max: MAX_COPY_BYTES
+        })
+    );
+    // At the bound the destination gets past the size check, to the probe (line 2 is past
+    // the mapping).
+    assert_eq!(
+        run_with(
+            &Blit {
+                to: big(4096),
+                ..up
+            },
+            &|_| ()
+        ),
+        Err(CopyError::Fault {
+            side: CopySide::Destination,
+            fault: crate::memory::GpuFault::Unmapped {
+                va: low(DST) + 2 * 0x10_0000
+            },
+        })
+    );
+    // 4096 by 4097 shrunk to one pixel: the source's bytes are counted.
+    let down = Blit {
+        format,
+        source: wide,
+        from: big(4097),
+        to: one,
+        ..base
+    };
+    assert_eq!(
+        run_with(&down, &|_| ()),
+        Err(CopyError::TooLarge {
+            bytes: 4096 * 4097 * bpp,
+            max: MAX_COPY_BYTES
+        })
+    );
+    assert_eq!(
+        run_with(
+            &Blit {
+                from: big(4096),
+                ..down
+            },
+            &|_| ()
+        ),
+        Err(CopyError::Fault {
+            side: CopySide::Source,
+            fault: crate::memory::GpuFault::Unmapped {
+                va: low(SRC) + 2 * 0x10_0000
+            },
+        })
+    );
+}
+
+// --- Pending writes on failure ---
+
+#[test]
+fn a_blit_with_a_short_register_file_still_flushes_the_pending_writes() {
+    let mem = memory();
+    let before = snapshot(&mem);
+    let mut pending = PendingWrites::new();
+    pending.add(5..9);
+    let mut sink = Recorder::default();
+    assert_eq!(
+        blit_method(
+            d::PIXELS_FROM_MEMORY_SRC_Y0_INT.method(),
+            &vec![0; BLIT_REGISTERS_NEEDED - 1],
+            &mem,
+            &mut pending,
+            &mut sink
+        ),
+        Err(CopyError::Registers {
+            len: BLIT_REGISTERS_NEEDED - 1,
+            needed: BLIT_REGISTERS_NEEDED
+        })
+    );
+    assert_eq!(sink.events, vec![Event::Invalidate(5..9)]);
+    assert!(pending.is_empty());
+    assert!(snapshot(&mem) == before);
+}
+
+// --- Unsigned pitch ---
+
+/// A pitch with bit 31 set: Eden-NX2 types `SET_SRC_PITCH` and `SET_DST_PITCH` `u32`
+/// (`fermi_2d.h`, `u32 pitch`), so line 1 is `2^31` bytes above line 0, not below.
+const HIGH_PITCH: u32 = 1 << 31;
+
+#[test]
+fn a_source_pitch_with_bit_31_set_is_unsigned() {
+    let mem = memory();
+    // Line 1 of the source, through a second mapping of a page of the same guest memory.
+    mem.map(
+        PageRange::new(low(SRC) + u64::from(HIGH_PITCH), PAGE_SIZE).unwrap(),
+        CPU_BASE + 0x10_0000,
+    )
+    .unwrap();
+    let source = Side::Pitch {
+        address: SRC,
+        pitch: HIGH_PITCH,
+    };
+    let destination = Side::Pitch {
+        address: DST,
+        pitch: 0x100,
+    };
+    let rect = R {
+        x: 0,
+        y: 0,
+        w: 4,
+        h: 2,
+    };
+    let rows = pixels(&mem, source, rect, 4);
+    assert_eq!(
+        rows[16..],
+        read(&mem, low(SRC) + u64::from(HIGH_PITCH), 16)[..]
+    );
+    let blit = Blit {
+        format: RGBA,
+        source,
+        destination,
+        from: rect,
+        to: rect,
+        bilinear: false,
+    };
+    run(&mem, &blit, &mut Recorder::default()).unwrap();
+    assert_eq!(pixels(&mem, destination, rect, 4), rows);
+}
+
+#[test]
+fn a_destination_pitch_with_bit_31_set_is_unsigned() {
+    let mem = memory();
+    let line1 = low(DST) + u64::from(HIGH_PITCH);
+    mem.map(
+        PageRange::new(line1, PAGE_SIZE).unwrap(),
+        CPU_BASE + 0x10_0000,
+    )
+    .unwrap();
+    let source = Side::Pitch {
+        address: SRC,
+        pitch: 0x100,
+    };
+    let destination = Side::Pitch {
+        address: DST,
+        pitch: HIGH_PITCH,
+    };
+    let rect = R {
+        x: 0,
+        y: 0,
+        w: 4,
+        h: 2,
+    };
+    let rows = pixels(&mem, source, rect, 4);
+    let blit = Blit {
+        format: RGBA,
+        source,
+        destination,
+        from: rect,
+        to: rect,
+        bilinear: false,
+    };
+    run(&mem, &blit, &mut Recorder::default()).unwrap();
+    assert_eq!(read(&mem, low(DST), 16), rows[..16]);
+    assert_eq!(read(&mem, line1, 16), rows[16..]);
+}
+
+// --- Depth slices ---
+
+#[test]
+fn divergence_slices_keep_the_rows_contiguous() {
+    // Source origin row 6 of 8, three rows: rows 0 and 1 in slice 0, row 2 in slice 1 at row 6.
+    // Destination row 2 takes source slice 1 row 6, not Eden-NX2's linear offset
+    // 1 * 64 * 8 + 0 into its source buffer.
+    let bl = Bl {
+        width: 64,
+        height: 8,
+        depth: 2,
+        bh: 0,
+        bd: 0,
+    };
+    let mem = memory();
+    let destination = Side::Pitch {
+        address: DST,
+        pitch: 0x100,
+    };
+    let blit = Blit {
+        format: RGBA,
+        source: Side::Bl {
+            address: SRC,
+            width_px: 16,
+            height: 8,
+            bh: 0,
+        },
+        destination,
+        from: R {
+            x: 0,
+            y: 6,
+            w: 16,
+            h: 3,
+        },
+        to: R {
+            x: 0,
+            y: 0,
+            w: 16,
+            h: 3,
+        },
+        bilinear: false,
+    };
+    let mut regs = regs_for(&Blit {
+        source: side_low(blit.source),
+        destination: side_low(blit.destination),
+        ..blit
+    });
+    regs.set(d::SET_SRC_DEPTH, bl.depth);
+    let tiled = read(&mem, low(SRC), bl.size());
+    blit_method(
+        d::PIXELS_FROM_MEMORY_SRC_Y0_INT.method(),
+        &regs.0,
+        &mem,
+        &mut PendingWrites::new(),
+        &mut Recorder::default(),
+    )
+    .unwrap();
+    for row in 0..3u32 {
+        let (z, y) = (row / 2, 6 + row % 2);
+        let offset = us(starquake_layout::block_linear_offset(
+            &bl.tiling(),
+            bl.extent(),
+            Offset4D::new(0, y, z, 0),
+        )
+        .unwrap());
+        assert_eq!(
+            read(&mem, low(DST) + u64::from(row) * 0x100, 16),
+            tiled[offset..offset + 16],
+            "row {row}"
+        );
+    }
 }

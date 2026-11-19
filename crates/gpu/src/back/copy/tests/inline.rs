@@ -860,3 +860,124 @@ fn constants_match_the_headers_written_out() {
         crate::sema::RED_XOR
     );
 }
+
+#[test]
+fn a_launch_refused_for_a_short_register_file_abandons_the_transfer() {
+    for class in CLASSES {
+        let mem = memory();
+        let mut rig = Rig::new(&class);
+        rig.configure(
+            Dest::Pitch {
+                address: DST,
+                pitch: 0,
+            },
+            8,
+            1,
+        )
+        .regs
+        .field(class.launch, class.completion, class.completion_release);
+        rig.launch(&mem).unwrap();
+        rig.word(&mem, 0x0403_0201).unwrap();
+        assert_eq!(rig.engine.remaining(), 4);
+        let short = vec![0; class.registers_needed() - 1];
+        assert_eq!(
+            rig.engine.method(
+                &class,
+                class.launch.method(),
+                &short,
+                &mem,
+                &mut rig.pending,
+                &mut rig.sink
+            ),
+            Err(CopyError::Registers {
+                len: short.len(),
+                needed: class.registers_needed()
+            })
+        );
+        assert_eq!(rig.engine.remaining(), 0, "{}", class.launch_word);
+        // A later word is ignored: nothing written, nothing released.
+        let before = snapshot(&mem);
+        rig.word(&mem, 0x0807_0605).unwrap();
+        assert!(snapshot(&mem) == before, "{}", class.launch_word);
+        assert_eq!(rig.sink.releases(), vec![]);
+    }
+}
+
+/// A pitch with bit 31 set: Eden-NX2 types `PITCH_OUT` `u32` (`engine_upload.h`, `u32 pitch`),
+/// so line 1 is `2^31` bytes above line 0, not below.
+#[test]
+fn a_pitch_with_bit_31_set_is_unsigned() {
+    let pitch: u32 = 1 << 31;
+    for class in CLASSES {
+        let mem = memory();
+        let line1 = DST + u64::from(pitch);
+        // Line 1, through a second mapping of a page of the same guest memory.
+        mem.map(
+            PageRange::new(line1, PAGE_SIZE).unwrap(),
+            CPU_BASE + 0x10_0000,
+        )
+        .unwrap();
+        let mut rig = Rig::new(&class);
+        rig.configure(
+            Dest::Pitch {
+                address: DST,
+                pitch,
+            },
+            4,
+            2,
+        )
+        .launch(&mem)
+        .unwrap();
+        let bytes = data(8);
+        rig.send(&mem, &bytes);
+        assert_eq!(read(&mem, DST, 4), bytes[..4], "{}", class.launch_word);
+        assert_eq!(read(&mem, line1, 4), bytes[4..], "{}", class.launch_word);
+    }
+}
+
+#[test]
+fn divergence_slices_take_the_next_stream_bytes() {
+    // Origin row 6 of 8: two lines per slice. Line 2 (slice 1, row 6) takes stream bytes 32..48,
+    // not Eden-NX2's 1 * 16 * 8 + 0 = 128 onward, past the 48 bytes the transfer supplies.
+    let bl = Bl {
+        width: 64,
+        height: 8,
+        depth: 2,
+        bh: 0,
+        bd: 0,
+    };
+    for class in CLASSES {
+        let mem = memory();
+        let mut rig = Rig::new(&class);
+        rig.configure(
+            Dest::Bl {
+                address: DST,
+                bl,
+                origin: (0, 6),
+            },
+            16,
+            3,
+        )
+        .launch(&mem)
+        .unwrap();
+        let bytes = data(48);
+        rig.send(&mem, &bytes);
+        let tiled = read(&mem, DST, bl.size());
+        for line in 0..3u32 {
+            let (z, y) = (line / 2, 6 + line % 2);
+            let offset = us(starquake_layout::block_linear_offset(
+                &bl.tiling(),
+                bl.extent(),
+                Offset4D::new(0, y, z, 0),
+            )
+            .unwrap());
+            let stream = line as usize * 16;
+            assert_eq!(
+                tiled[offset..offset + 16],
+                bytes[stream..stream + 16],
+                "{} line {line}",
+                class.launch_word
+            );
+        }
+    }
+}

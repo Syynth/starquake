@@ -57,6 +57,14 @@
 //! - **A region outside its surface, a block width other than one GOB, or a block height or
 //!   depth past `THIRTYTWO_GOBS` is refused** (Eden-NX2 writes past the surface, and ignores the
 //!   block width). Pinned by `divergence_bad_destinations_are_refused`.
+//! - **Lines that continue into the next depth slice take the next stream bytes.** A
+//!   block-linear region whose lines pass the surface's last row continues in the next slice
+//!   ([`super::surface`]). Eden-NX2 passes `LINE_LENGTH_IN` as `SwizzleSubrectImpl`'s linear pitch
+//!   (`engine_upload.cpp`, `ProcessData`), so with `SET_DST_ORIGIN_SAMPLES_Y` above 0 its stream
+//!   offset for line `line` of slice `s` is `s * LINE_LENGTH_IN * height + line * LINE_LENGTH_IN`,
+//!   skipping `origin_y * LINE_LENGTH_IN` stream bytes per slice and reading past the bytes the
+//!   transfer supplied; here line `l` of the region always takes stream bytes
+//!   `l * LINE_LENGTH_IN` onward. Pinned by `divergence_slices_take_the_next_stream_bytes`.
 //! - **As in Eden-NX2,** words past the transfer's end, and words with no transfer launched, are
 //!   ignored, and `SET_DST_LAYER`, `INTERRUPT_TYPE` and `SYSMEMBAR_DISABLE` are not read. Pinned
 //!   by `extra_words_and_words_without_a_launch_are_ignored`.
