@@ -91,9 +91,11 @@ use crate::adapter::AdapterReport;
 use crate::caps::{ByteLimits, FormatSupport, caps, device_features};
 use crate::config::{WgpuConfig, queue_full};
 use crate::convert::{TextureSpec, buffer_usages, sampler_descriptor, view_descriptor};
+use crate::draw::check::{graphics_info, layout_info};
+use crate::draw::{DrawLimits, PipelineInfo, extra_buffer_usages};
 use crate::pipeline::{
     self as pipelines, Compile, ComputeBuild, Counters, DrawPipeline, GraphicsBuild,
-    NO_COMPILE_POOL, PipelineCell, PipelineCounts, Registry, ShaderRec,
+    NO_COMPILE_POOL, PipelineCell, PipelineCounts, PipelineEntry, Registry, ShaderRec,
 };
 use crate::plan::{self, Tables, TextureRec, ViewRec};
 use crate::rules;
@@ -373,6 +375,13 @@ pub(crate) struct Shared {
     pub(crate) host_errors: AtomicU64,
     /// Scratch textures the render thread has made for rectangle clears (`crate::thread`).
     pub(crate) scratch_textures: AtomicU64,
+    /// The wait-while-compiling setting draws are encoded under (`crate::pipeline`).
+    pub(crate) setting: WhileCompiling,
+    /// Draws skipped for their pipelines.
+    pub(crate) counters: Counters,
+    /// Draws and dispatches the render thread skipped for a binding found unusable only at
+    /// encode time (`crate::draw`, "Divergences").
+    pub(crate) encode_skips: AtomicU64,
 }
 
 impl Shared {
@@ -421,8 +430,8 @@ pub struct WgpuBackend {
     compile: Option<Compile>,
     /// Whether the device runs every subgroup 32 wide (`pipeline::subgroups_honoured`).
     subgroups: bool,
-    /// Draws skipped for their pipelines.
-    counters: Counters,
+    /// What the device allows a draw beyond `Caps` (`crate::draw`).
+    limits: DrawLimits,
 }
 
 impl WgpuBackend {
@@ -495,6 +504,7 @@ impl WgpuBackend {
         let subgroups =
             pipelines::subgroups_honoured(features, info.subgroup_min_size, info.subgroup_max_size);
         let host_device = device.clone();
+        let draw_limits = DrawLimits::new(&device.limits(), features, caps.limits.max_buffer_size);
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
             work: Condvar::new(),
@@ -502,8 +512,13 @@ impl WgpuBackend {
             wake,
             host_errors: AtomicU64::new(0),
             scratch_textures: AtomicU64::new(0),
+            setting: compile
+                .as_ref()
+                .map_or(WhileCompiling::default(), |c| c.setting),
+            counters: Counters::default(),
+            encode_skips: AtomicU64::new(0),
         });
-        let thread = thread::start(device, queue, Arc::clone(&shared))
+        let thread = thread::start(device, queue, Arc::clone(&shared), draw_limits)
             .map_err(|e| NewError::Thread(e.to_string()))?;
         Ok(Self {
             caps,
@@ -520,7 +535,7 @@ impl WgpuBackend {
             device: host_device,
             compile,
             subgroups,
-            counters: Counters::default(),
+            limits: draw_limits,
         })
     }
 
@@ -543,20 +558,28 @@ impl WgpuBackend {
     /// What a draw gets for pipeline `id`, under the wait-while-compiling setting the backend
     /// was built with (`crate::pipeline`, "Draws: wait or skip"). Under
     /// [`WhileCompiling::Wait`] it blocks while the pipeline compiles, until its build settles;
-    /// a skipped draw is counted in [`WgpuBackend::pipeline_counts`]. The render thread calls it
-    /// for each draw (slice R7). `Err` for an id that names no live pipeline.
+    /// a skipped draw is counted in [`WgpuBackend::pipeline_counts`]. The render thread makes
+    /// the same decision for each draw and dispatch it encodes (`crate::draw`), from the
+    /// pipeline the list check resolved. `Err` for an id that names no live pipeline.
     pub fn draw_pipeline(&self, id: PipelineId) -> Result<DrawPipeline, RenderError> {
         let cell = self.pipeline_cell(id)?;
-        let setting = self
-            .compile
-            .as_ref()
-            .map_or(WhileCompiling::default(), |c| c.setting);
-        Ok(pipelines::acquire(&cell, setting, &self.counters))
+        Ok(pipelines::acquire(
+            &cell,
+            self.shared.setting,
+            &self.shared.counters,
+        ))
     }
 
     /// The draws skipped for their pipelines so far.
     pub fn pipeline_counts(&self) -> PipelineCounts {
-        self.counters.get()
+        self.shared.counters.get()
+    }
+
+    /// How many draws and dispatches the render thread skipped because a binding turned out
+    /// unusable only once their pipeline was built: a filtering sampler where the build made the
+    /// binding non-filtering (`crate::draw`, "Divergences").
+    pub fn encode_skips(&self) -> u64 {
+        self.shared.encode_skips.load(Ordering::Relaxed)
     }
 
     /// Whether the device runs every subgroup 32 wide, so pipelines whose shaders use subgroups
@@ -571,7 +594,7 @@ impl WgpuBackend {
             .pipelines
             .pipelines
             .get(id.index(), id.generation())
-            .cloned()
+            .map(|entry| Arc::clone(&entry.cell))
             .ok_or(RenderError::Invalid(validate::NO_PIPELINE))
     }
 
@@ -716,7 +739,7 @@ impl Backend for WgpuBackend {
         let mut state = self.live_state()?;
         let (index, generation) = state.tables.buffers.insert(*desc)?;
         let id = BufferId::new(index, generation);
-        let usage = buffer_usages(desc.usage);
+        let usage = buffer_usages(desc.usage) | extra_buffer_usages(desc.usage);
         self.queue(state, Message::Create(Create::Buffer { id, size, usage }));
         Ok(id)
     }
@@ -827,8 +850,13 @@ impl Backend for WgpuBackend {
         pipelines::check_requirements(shaders(), self.subgroups)?;
         let layout = pipelines::plan_layout(shaders())?;
         let plan = pipelines::state::graphics(&desc)?;
+        let stages: Vec<&ShaderRec> = shaders().collect();
+        let info = graphics_info(&desc, &plan, layout_info(&layout, &stages));
         let cell = Arc::new(PipelineCell::new());
-        let (index, generation) = state.pipelines.pipelines.insert(Arc::clone(&cell))?;
+        let (index, generation) = state.pipelines.pipelines.insert(PipelineEntry {
+            cell: Arc::clone(&cell),
+            info: Arc::new(PipelineInfo::Graphics(Box::new(info))),
+        })?;
         drop(state);
         let build = GraphicsBuild {
             device: self.device.clone(),
@@ -867,8 +895,12 @@ impl Backend for WgpuBackend {
         let shader = shader.ok_or(RenderError::Invalid(validate::NO_SHADER))?;
         pipelines::check_requirements([&*shader], self.subgroups)?;
         let layout = pipelines::plan_layout([&*shader])?;
+        let info = PipelineInfo::Compute(layout_info(&layout, &[&*shader]));
         let cell = Arc::new(PipelineCell::new());
-        let (index, generation) = state.pipelines.pipelines.insert(Arc::clone(&cell))?;
+        let (index, generation) = state.pipelines.pipelines.insert(PipelineEntry {
+            cell: Arc::clone(&cell),
+            info: Arc::new(info),
+        })?;
         drop(state);
         let build = ComputeBuild {
             device: self.device.clone(),
@@ -914,10 +946,15 @@ impl Backend for WgpuBackend {
         let fence = state.submitted.next().ok_or(RenderError::Overflow {
             what: "fence value",
         })?;
+        let rules = plan::Rules {
+            caps: &self.caps,
+            depth_copies: self.depth_copies,
+            draws: &self.limits,
+        };
         let checked = plan::check(
             &state.tables,
-            &self.caps,
-            self.depth_copies,
+            &state.pipelines,
+            &rules,
             &state.reserved,
             list,
         )?;
@@ -936,6 +973,7 @@ impl Backend for WgpuBackend {
             Message::List(ListWork {
                 fence,
                 steps: checked.steps,
+                rewrites: checked.rewrites,
                 sink,
                 presents,
                 newer_queued: false,

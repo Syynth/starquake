@@ -3,7 +3,7 @@
 //! fails it instead of hanging the gate.
 
 use super::*;
-use crate::plan::{BLITS_NOT_YET, DRAWS_NOT_YET, NO_BUFFER};
+use crate::plan::{BLITS_NOT_YET, NO_BUFFER};
 use starquake_render::command::{
     BlitDesc, BufferSlice, ClearDesc, ClearValue, Command, CopyDesc, CopyRegion, DispatchDesc,
     DispatchParams, Marker, PresentDesc, PresentTransform, Rect, TextureRegion,
@@ -1099,7 +1099,7 @@ fn what_the_backend_refuses() {
         });
         assert_eq!(
             gpu.submit(one(dispatch)),
-            Err(RenderError::Unsupported(DRAWS_NOT_YET))
+            Err(RenderError::Invalid(validate::NO_PIPELINE))
         );
         assert_eq!(
             gpu.submit(one(upload(vec![0; 6], slice(buf, 2, 6)))),

@@ -61,8 +61,14 @@
 //! variable. With lists in flight it waits in wgpu for the oldest one, in slices of
 //! [`POLL_SLICE`], so new work waits at most that long to be taken.
 
+mod pass;
+
 use crate::backend::Shared;
 use crate::convert::TextureSpec;
+use crate::draw::DrawLimits;
+use crate::draw::RewriteScratch;
+use crate::draw::rewrite::IndexRewrite;
+use pass::Recorder;
 use crate::plan::{ClearOps, ClearStep, Layers, ReadFrom, Rows, Step, TexelBox};
 use crate::present::frame_outcome;
 use crate::window::{Presenter, Target};
@@ -127,6 +133,8 @@ pub struct ListWork {
     pub fence: FenceValue,
     /// Its steps.
     pub steps: Vec<Step>,
+    /// The scratch its index rewrites use (`crate::draw`, "The index rewrite").
+    pub rewrites: RewriteScratch,
     /// Where its dumped frames go, or `None` to keep them.
     pub sink: Option<Arc<dyn FrameSink>>,
     /// How many presents it holds, counted in the backend's `queued_presents` while it waits.
@@ -288,6 +296,10 @@ struct Render {
     origin: Instant,
     /// Where shown frames go, and the window blit's objects.
     presenter: Presenter,
+    /// What the device allows a draw (`crate::draw`).
+    limits: DrawLimits,
+    /// The index rewrite's pipeline, made on the first rewrite.
+    rewrite: Option<IndexRewrite>,
 }
 
 /// What the thread does next.
@@ -302,6 +314,7 @@ pub fn start(
     device: wgpu::Device,
     queue: wgpu::Queue,
     shared: Arc<Shared>,
+    limits: DrawLimits,
 ) -> std::io::Result<JoinHandle<()>> {
     let errors = Arc::clone(&shared);
     device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
@@ -324,6 +337,8 @@ pub fn start(
         finished: Arc::default(),
         origin: Instant::now(),
         presenter: Presenter::new(),
+        limits,
+        rewrite: None,
     };
     std::thread::Builder::new()
         .name("starquake-render".into())
@@ -582,18 +597,31 @@ impl Render {
             .steps
             .iter()
             .rposition(|s| matches!(s, Step::Present { .. }));
+        let mut rec = Recorder::new(&self.device, &work.rewrites);
         for (index, step) in work.steps.into_iter().enumerate() {
             let queued = frame_outcome(Some(index) == last_present, work.newer_queued);
             let upload = matches!(step, Step::WriteBuffer { .. } | Step::WriteTexture { .. });
+            // Every command but a draw closes the render pass (`crate::draw`, "Render passes").
+            if !matches!(step, Step::Draw(_)) {
+                rec.close();
+            }
             if upload && recorded {
                 let finished = std::mem::replace(&mut encoder, self.encoder());
                 self.queue.submit([finished.finish()]);
             }
             // An upload leaves the encoder empty of commands: none before it, or just submitted.
             recorded = !upload;
-            let out = (&mut reads, &mut presents);
-            self.step(&mut encoder, step, out, &mut scratch, queued);
+            match step {
+                Step::Targets(targets) => rec.set_targets(targets),
+                Step::Draw(draw) => self.draw(&mut encoder, &mut rec, *draw),
+                Step::Dispatch(dispatch) => self.dispatch(&mut encoder, &dispatch),
+                other => {
+                    let out = (&mut reads, &mut presents);
+                    self.step(&mut encoder, other, out, &mut scratch, queued);
+                }
+            }
         }
+        rec.close();
         let submission = self.queue.submit([encoder.finish()]);
         // The window's texture this list drew into, after the submission that draws it.
         self.presenter.finish(&self.queue);
@@ -718,6 +746,8 @@ impl Render {
                     read,
                 });
             }
+            // `encode` takes these before it calls here.
+            Step::Targets(_) | Step::Draw(_) | Step::Dispatch(_) => {}
         }
     }
 

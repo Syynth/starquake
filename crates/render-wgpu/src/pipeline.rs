@@ -91,6 +91,7 @@ mod scan;
 pub mod state;
 
 use crate::backend::{NewError, block_on};
+use crate::draw::PipelineInfo;
 use layout::{LayoutPlan, Stage};
 use scan::ModuleFacts;
 use starquake_render::shader::ShaderInterface;
@@ -187,13 +188,22 @@ pub const fn on_draw(status: PipelineStatus, setting: WhileCompiling) -> DrawAct
     }
 }
 
-/// A built wgpu pipeline.
+/// A built pipeline's bind group layouts, by group (`None` for a group no stage uses), and the
+/// samplers its build made non-filtering ([`layout`], "Filtering samplers"), which the render
+/// thread checks a draw's samplers against (`crate::draw`, "Divergences").
+#[derive(Debug, Default)]
+pub(crate) struct HostLayout {
+    pub(crate) groups: Vec<Option<wgpu::BindGroupLayout>>,
+    pub(crate) non_filtering: BTreeSet<(u32, u32)>,
+}
+
+/// A built wgpu pipeline and its layouts.
 #[derive(Clone, Debug)]
 pub(crate) enum HostPipeline {
     /// A render pipeline.
-    Render(wgpu::RenderPipeline),
+    Render(wgpu::RenderPipeline, Arc<HostLayout>),
     /// A compute pipeline.
-    Compute(wgpu::ComputePipeline),
+    Compute(wgpu::ComputePipeline, Arc<HostLayout>),
 }
 
 /// A pipeline a draw can use, from [`crate::WgpuBackend::draw_pipeline`], for the render
@@ -205,16 +215,29 @@ impl ReadyPipeline {
     /// The render pipeline, for a graphics pipeline.
     pub fn render(&self) -> Option<&wgpu::RenderPipeline> {
         match &self.0 {
-            HostPipeline::Render(p) => Some(p),
-            HostPipeline::Compute(_) => None,
+            HostPipeline::Render(p, _) => Some(p),
+            HostPipeline::Compute(..) => None,
         }
     }
 
     /// The compute pipeline, for a compute pipeline.
     pub fn compute(&self) -> Option<&wgpu::ComputePipeline> {
         match &self.0 {
-            HostPipeline::Compute(p) => Some(p),
-            HostPipeline::Render(_) => None,
+            HostPipeline::Compute(p, _) => Some(p),
+            HostPipeline::Render(..) => None,
+        }
+    }
+
+    /// The bind group layout of `group`, if the pipeline's layout uses it.
+    pub fn bind_group_layout(&self, group: u32) -> Option<&wgpu::BindGroupLayout> {
+        let index = usize::try_from(group).ok()?;
+        self.layout().groups.get(index)?.as_ref()
+    }
+
+    /// The pipeline's layouts.
+    pub(crate) fn layout(&self) -> &HostLayout {
+        match &self.0 {
+            HostPipeline::Render(_, l) | HostPipeline::Compute(_, l) => l,
         }
     }
 }
@@ -312,6 +335,12 @@ impl ShaderRec {
         self.facts.subgroups
     }
 
+    /// The size the module declares for the buffer bound at `group` and `binding`, if it binds
+    /// a buffer there ([`scan`], "Buffer sizes").
+    pub(crate) fn buffer_size(&self, group: u32, binding: u32) -> Option<u64> {
+        self.facts.bindings.get(&(group, binding))?.size
+    }
+
     /// This shader's part of a pipeline layout.
     fn stage(&self) -> Stage<'_> {
         Stage {
@@ -370,7 +399,7 @@ pub(crate) fn discard(desc: ShaderDesc) {
 
 /// Runs `f` inside wgpu error scopes for validation, out-of-memory and internal errors, and
 /// returns the first error any of them caught, innermost first.
-fn scoped<T>(device: &wgpu::Device, f: impl FnOnce() -> T) -> Result<T, String> {
+pub(crate) fn scoped<T>(device: &wgpu::Device, f: impl FnOnce() -> T) -> Result<T, String> {
     let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
     let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
@@ -535,11 +564,18 @@ pub(crate) fn acquire(
     }
 }
 
+/// A live pipeline: its status, and what the list check needs of it (`crate::draw`).
+#[derive(Clone, Debug)]
+pub(crate) struct PipelineEntry {
+    pub(crate) cell: Arc<PipelineCell>,
+    pub(crate) info: Arc<PipelineInfo>,
+}
+
 /// The live shaders and pipelines, under the backend's state lock.
 #[derive(Debug, Default)]
 pub(crate) struct Registry {
     pub(crate) shaders: Slots<Arc<ShaderRec>>,
-    pub(crate) pipelines: Slots<Arc<PipelineCell>>,
+    pub(crate) pipelines: Slots<PipelineEntry>,
 }
 
 /// The compile pool and the setting the backend was built with.
@@ -578,13 +614,14 @@ pub(crate) fn plan_layout<'a>(
 }
 
 /// Makes the bind group layouts and the pipeline layout for `plan`, turning the samplers in
-/// `non_filtering` non-filtering. The caller runs it inside [`scoped`].
+/// `non_filtering` non-filtering, and keeps the group layouts for the draws' bind groups. The
+/// caller runs it inside [`scoped`].
 fn pipeline_layout(
     device: &wgpu::Device,
     plan: LayoutPlan,
-    non_filtering: &BTreeSet<(u32, u32)>,
-) -> wgpu::PipelineLayout {
-    let plan = layout::with_non_filtering(plan, non_filtering);
+    non_filtering: BTreeSet<(u32, u32)>,
+) -> (wgpu::PipelineLayout, Arc<HostLayout>) {
+    let plan = layout::with_non_filtering(plan, &non_filtering);
     let groups: Vec<Option<wgpu::BindGroupLayout>> = plan
         .groups
         .iter()
@@ -598,11 +635,18 @@ fn pipeline_layout(
         })
         .collect();
     let refs: Vec<Option<&wgpu::BindGroupLayout>> = groups.iter().map(Option::as_ref).collect();
-    device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: None,
         bind_group_layouts: &refs,
         immediate_size: 0,
-    })
+    });
+    (
+        layout,
+        Arc::new(HostLayout {
+            groups,
+            non_filtering,
+        }),
+    )
 }
 
 /// Everything a graphics build needs, owned, for the pool worker.
@@ -630,7 +674,7 @@ impl GraphicsBuild {
         }
         let plan = &self.plan;
         scoped(device, || {
-            let layout = pipeline_layout(device, self.layout, &non_filtering);
+            let (layout, host_layout) = pipeline_layout(device, self.layout, non_filtering);
             let buffers: Vec<Option<wgpu::VertexBufferLayout<'_>>> = plan
                 .buffers
                 .iter()
@@ -642,7 +686,7 @@ impl GraphicsBuild {
                     })
                 })
                 .collect();
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: None,
                 layout: Some(&layout),
                 vertex: wgpu::VertexState {
@@ -662,9 +706,9 @@ impl GraphicsBuild {
                 }),
                 multiview_mask: None,
                 cache: None,
-            })
+            });
+            HostPipeline::Render(pipeline, host_layout)
         })
-        .map(HostPipeline::Render)
     }
 }
 
@@ -682,17 +726,18 @@ impl ComputeBuild {
         let device = &self.device;
         let host = self.shader.host(device)?;
         scoped(device, || {
-            let layout = pipeline_layout(device, self.layout, &host.non_filtering);
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            let (layout, host_layout) =
+                pipeline_layout(device, self.layout, host.non_filtering.clone());
+            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: None,
                 layout: Some(&layout),
                 module: &host.module,
                 entry_point: Some(&self.shader.entry),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
-            })
+            });
+            HostPipeline::Compute(pipeline, host_layout)
         })
-        .map(HostPipeline::Compute)
     }
 }
 

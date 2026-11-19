@@ -94,6 +94,7 @@ mod backend;
 pub mod caps;
 mod config;
 mod convert;
+pub mod draw;
 #[cfg(test)]
 mod fixtures;
 pub mod format;

@@ -26,7 +26,17 @@ fn facts(entries: &[((u32, u32), ArrayCount, bool)]) -> ModuleFacts {
         nesting: 0,
         bindings: entries
             .iter()
-            .map(|&(slot, count, write_only)| (slot, BindingFacts { count, write_only }))
+            .map(|&(slot, count, write_only)| {
+                let size = None;
+                (
+                    slot,
+                    BindingFacts {
+                        count,
+                        write_only,
+                        size,
+                    },
+                )
+            })
             .collect(),
     }
 }
