@@ -5,7 +5,7 @@ use super::super::{
     CaptureBuffer, CaptureError, CaptureSink, CaptureWriter, Create, Created, Destroy, Limit,
     Record, RecordKind, ShaderCode, SourceRecord,
 };
-use super::{read, start, writer};
+use super::{naga, read, start, writer};
 use crate::command::CommandList;
 use crate::id::{BufferId, FenceValue, ResourceId};
 use crate::resource::{BufferDesc, BufferUsage};
@@ -211,19 +211,6 @@ fn shader(origin: Option<ShaderOrigin>, source: ShaderSource) -> ShaderDesc {
     }
 }
 
-fn naga() -> ShaderSource {
-    let module = naga::Module::default();
-    let info = naga::valid::Validator::new(
-        naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::empty(),
-    )
-    .validate(&module)
-    .expect("an empty module validates");
-    ShaderSource::Naga {
-        module: Box::new(module),
-        info: Box::new(info),
-    }
-}
 
 #[test]
 fn shader_code_is_its_origin_once_by_content_or_its_own_code() {

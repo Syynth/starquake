@@ -7,7 +7,9 @@ use super::super::{
     Created, FrameResult, PipelineOutcome, PipelineResult, ReadbackResult, Record, RecordKind,
     ShaderCode, WaitSetting,
 };
-use super::{caps, read, start};
+use super::{
+    Knobs, Spy, caps, naga, read, sampler_desc, shader, start, texture_desc, view_desc,
+};
 use crate::backend::{
     Backend, MemoryBudget, PipelineStatus, PresentFeedback, PresentTarget, Readback, WaitOutcome,
 };
@@ -69,73 +71,6 @@ impl FrameSink for Tee {
 fn tee(inner: &RecordingBackend, capture: &Arc<CapturingBackend>) {
     let sink: Arc<dyn FrameSink> = Arc::new(Tee(Arc::downgrade(capture)));
     inner.set_frame_sink(Some(sink));
-}
-
-fn texture_desc() -> TextureDesc {
-    TextureDesc {
-        dimension: TextureDimension::D2,
-        format: PixelFormat::A8B8G8R8Unorm,
-        size: Extent3d {
-            width: 2,
-            height: 2,
-            depth_or_layers: 1,
-        },
-        mip_levels: 1,
-        sample_count: 1,
-        usage: TextureUsage::ALL,
-    }
-}
-
-fn view_desc() -> ViewDesc {
-    ViewDesc {
-        format: PixelFormat::A8B8G8R8Unorm,
-        dimension: ViewDimension::D2,
-        base_mip: 0,
-        mip_count: 1,
-        base_layer: 0,
-        layer_count: 1,
-        swizzle: Swizzle::IDENTITY,
-    }
-}
-
-fn sampler_desc() -> SamplerDesc {
-    SamplerDesc {
-        mag_filter: FilterMode::Linear,
-        min_filter: FilterMode::Linear,
-        mip_filter: FilterMode::Nearest,
-        address: [AddressMode::Repeat; 3],
-        border_color: BorderColor::TransparentBlack,
-        lod_bias: 0.0,
-        min_lod: 0.0,
-        max_lod: 4.0,
-        max_anisotropy: 1,
-        compare: None,
-        reduction: ReductionMode::Average,
-    }
-}
-
-fn shader(stage: ShaderStage, source: ShaderSource, origin: Option<ShaderOrigin>) -> ShaderDesc {
-    ShaderDesc {
-        stage,
-        entry: "main".to_owned(),
-        source,
-        interface: ShaderInterface::default(),
-        origin,
-    }
-}
-
-fn naga() -> ShaderSource {
-    let module = naga::Module::default();
-    let info = naga::valid::Validator::new(
-        naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::empty(),
-    )
-    .validate(&module)
-    .expect("an empty module validates");
-    ShaderSource::Naga {
-        module: Box::new(module),
-        info: Box::new(info),
-    }
 }
 
 fn kinds(records: &[Record]) -> Vec<RecordKind> {
@@ -589,76 +524,13 @@ fn a_list_past_its_bounds_stops_the_capture_and_is_submitted() {
     );
 }
 
-/// A backend that hands out the same buffer id every time.
-#[derive(Debug)]
-struct Repeats(RecordingBackend);
-
-impl Backend for Repeats {
-    fn caps(&self) -> &Caps {
-        self.0.caps()
-    }
-    fn budget(&self) -> MemoryBudget {
-        self.0.budget()
-    }
-    fn create_buffer(&self, _: &BufferDesc) -> Result<BufferId, RenderError> {
-        Ok(BufferId::new(1, 1))
-    }
-    fn create_texture(&self, desc: &TextureDesc) -> Result<TextureId, RenderError> {
-        self.0.create_texture(desc)
-    }
-    fn create_view(&self, texture: TextureId, desc: &ViewDesc) -> Result<ViewId, RenderError> {
-        self.0.create_view(texture, desc)
-    }
-    fn create_sampler(&self, desc: &SamplerDesc) -> Result<SamplerId, RenderError> {
-        self.0.create_sampler(desc)
-    }
-    fn create_shader(&self, desc: ShaderDesc) -> Result<ShaderId, RenderError> {
-        self.0.create_shader(desc)
-    }
-    fn destroy(&self, resource: ResourceId, after: FenceValue) {
-        self.0.destroy(resource, after);
-    }
-    fn create_graphics_pipeline(
-        &self,
-        desc: GraphicsPipelineDesc,
-    ) -> Result<PipelineId, RenderError> {
-        self.0.create_graphics_pipeline(desc)
-    }
-    fn create_compute_pipeline(
-        &self,
-        desc: ComputePipelineDesc,
-    ) -> Result<PipelineId, RenderError> {
-        self.0.create_compute_pipeline(desc)
-    }
-    fn pipeline_status(&self, id: PipelineId) -> PipelineStatus {
-        self.0.pipeline_status(id)
-    }
-    fn staging(&self, size: u64) -> Result<StagingSlice, RenderError> {
-        self.0.staging(size)
-    }
-    fn submit(&self, list: CommandList) -> Result<FenceValue, RenderError> {
-        self.0.submit(list)
-    }
-    fn completed(&self) -> FenceValue {
-        self.0.completed()
-    }
-    fn wait(&self, value: FenceValue, timeout: Duration) -> Result<WaitOutcome, RenderError> {
-        self.0.wait(value, timeout)
-    }
-    fn take_readback(&self, id: ReadbackId) -> Option<Readback> {
-        self.0.take_readback(id)
-    }
-    fn set_present_target(&self, target: PresentTarget) -> Result<(), RenderError> {
-        self.0.set_present_target(target)
-    }
-    fn take_present_feedback(&self) -> Vec<PresentFeedback> {
-        self.0.take_present_feedback()
-    }
-}
 
 #[test]
 fn a_backend_handing_out_a_live_id_stops_the_capture() {
-    let inner: Arc<dyn Backend> = Arc::new(Repeats(RecordingBackend::new(caps(), MEMORY)));
+    let inner: Arc<dyn Backend> = Arc::new(Spy::new(Knobs {
+        repeat_buffer: true,
+        ..Knobs::default()
+    }));
     let buffer = Arc::new(CaptureBuffer::new());
     let sink: Arc<dyn CaptureSink> = Arc::<CaptureBuffer>::clone(&buffer);
     let capture = CapturingBackend::new(

@@ -122,7 +122,7 @@ impl ReplayFrames {
     }
 
     /// Takes the frame numbered `frame`, dropping every frame that arrived before it.
-    fn take(&self, frame: u64) -> Option<FrameResult> {
+    pub(crate) fn take(&self, frame: u64) -> Option<FrameResult> {
         let mut frames = self.frames.lock().unwrap_or_else(PoisonError::into_inner);
         let at = frames.iter().position(|f| f.frame == frame)?;
         frames.drain(..at);

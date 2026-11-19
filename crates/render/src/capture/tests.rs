@@ -13,10 +13,28 @@ use super::{
     CaptureBuffer, CaptureError, CaptureLimits, CaptureReader, CaptureSink, CaptureWriter, Record,
     Start, WaitSetting,
 };
+use crate::backend::{
+    Backend, MemoryBudget, PipelineStatus, PresentFeedback, PresentTarget, Readback, WaitOutcome,
+};
 use crate::caps::{
     Caps, DynamicState, Features, FormatFeatures, FormatTable, Limits, SampleCounts, StageSupport,
 };
-use std::sync::Arc;
+use crate::command::{CommandList, StagingSlice};
+use crate::error::RenderError;
+use crate::id::{
+    BufferId, FenceValue, PipelineId, ReadbackId, ResourceId, SamplerId, ShaderId, TextureId,
+    ViewId,
+};
+use crate::pipeline::{ComputePipelineDesc, GraphicsPipelineDesc};
+use crate::recording::RecordingBackend;
+use crate::format::PixelFormat;
+use crate::resource::{
+    AddressMode, BorderColor, BufferDesc, Extent3d, FilterMode, ReductionMode, SamplerDesc,
+    Swizzle, TextureDesc, TextureDimension, TextureUsage, ViewDesc, ViewDimension,
+};
+use crate::shader::{ShaderDesc, ShaderInterface, ShaderOrigin, ShaderSource, ShaderStage};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// A device with room for what the tests make.
 pub(super) fn caps() -> Caps {
@@ -131,4 +149,197 @@ pub(super) fn file(records: &[&[u8]]) -> Vec<u8> {
     }
     out.extend_from_slice(&END);
     out
+}
+
+/// What a [`Spy`] does differently from the recording backend it wraps.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Knobs {
+    /// Every `create_buffer` returns the same id.
+    pub(super) repeat_buffer: bool,
+    /// Every pipeline reports `Compiling`.
+    pub(super) compiling: bool,
+    /// Every `create_buffer` reports a lost device.
+    pub(super) lost: bool,
+    /// Every `wait` times out.
+    pub(super) time_out: bool,
+}
+
+/// A recording backend with [`Knobs`], which keeps every `destroy` call it is given. Where a
+/// knob is off it behaves as the recording backend does, call for call.
+#[derive(Debug)]
+pub(super) struct Spy {
+    pub(super) inner: RecordingBackend,
+    knobs: Knobs,
+    destroys: Mutex<Vec<(ResourceId, FenceValue)>>,
+}
+
+impl Spy {
+    /// A spy over a recording backend for [`caps`] with 1 MiB of memory.
+    pub(super) fn new(knobs: Knobs) -> Self {
+        Self {
+            inner: RecordingBackend::new(caps(), 1 << 20),
+            knobs,
+            destroys: Mutex::default(),
+        }
+    }
+
+    /// The `destroy` calls so far.
+    pub(super) fn destroys(&self) -> Vec<(ResourceId, FenceValue)> {
+        self.destroys.lock().expect("unpoisoned").clone()
+    }
+}
+
+impl Backend for Spy {
+    fn caps(&self) -> &Caps {
+        self.inner.caps()
+    }
+    fn budget(&self) -> MemoryBudget {
+        self.inner.budget()
+    }
+    fn create_buffer(&self, desc: &BufferDesc) -> Result<BufferId, RenderError> {
+        if self.knobs.lost {
+            return Err(RenderError::DeviceLost);
+        }
+        if self.knobs.repeat_buffer {
+            return Ok(BufferId::new(1, 1));
+        }
+        self.inner.create_buffer(desc)
+    }
+    fn create_texture(&self, desc: &TextureDesc) -> Result<TextureId, RenderError> {
+        self.inner.create_texture(desc)
+    }
+    fn create_view(&self, texture: TextureId, desc: &ViewDesc) -> Result<ViewId, RenderError> {
+        self.inner.create_view(texture, desc)
+    }
+    fn create_sampler(&self, desc: &SamplerDesc) -> Result<SamplerId, RenderError> {
+        self.inner.create_sampler(desc)
+    }
+    fn create_shader(&self, desc: ShaderDesc) -> Result<ShaderId, RenderError> {
+        self.inner.create_shader(desc)
+    }
+    fn destroy(&self, resource: ResourceId, after: FenceValue) {
+        self.destroys
+            .lock()
+            .expect("unpoisoned")
+            .push((resource, after));
+        self.inner.destroy(resource, after);
+    }
+    fn create_graphics_pipeline(
+        &self,
+        desc: GraphicsPipelineDesc,
+    ) -> Result<PipelineId, RenderError> {
+        self.inner.create_graphics_pipeline(desc)
+    }
+    fn create_compute_pipeline(
+        &self,
+        desc: ComputePipelineDesc,
+    ) -> Result<PipelineId, RenderError> {
+        self.inner.create_compute_pipeline(desc)
+    }
+    fn pipeline_status(&self, id: PipelineId) -> PipelineStatus {
+        if self.knobs.compiling {
+            return PipelineStatus::Compiling;
+        }
+        self.inner.pipeline_status(id)
+    }
+    fn staging(&self, size: u64) -> Result<StagingSlice, RenderError> {
+        self.inner.staging(size)
+    }
+    fn submit(&self, list: CommandList) -> Result<FenceValue, RenderError> {
+        self.inner.submit(list)
+    }
+    fn completed(&self) -> FenceValue {
+        self.inner.completed()
+    }
+    fn wait(&self, value: FenceValue, timeout: Duration) -> Result<WaitOutcome, RenderError> {
+        if self.knobs.time_out {
+            return Ok(WaitOutcome::TimedOut);
+        }
+        self.inner.wait(value, timeout)
+    }
+    fn take_readback(&self, id: ReadbackId) -> Option<Readback> {
+        self.inner.take_readback(id)
+    }
+    fn set_present_target(&self, target: PresentTarget) -> Result<(), RenderError> {
+        self.inner.set_present_target(target)
+    }
+    fn take_present_feedback(&self) -> Vec<PresentFeedback> {
+        self.inner.take_present_feedback()
+    }
+}
+
+/// A 2 by 2 RGBA8 texture with every usage.
+pub(super) fn texture_desc() -> TextureDesc {
+    TextureDesc {
+        dimension: TextureDimension::D2,
+        format: PixelFormat::A8B8G8R8Unorm,
+        size: Extent3d {
+            width: 2,
+            height: 2,
+            depth_or_layers: 1,
+        },
+        mip_levels: 1,
+        sample_count: 1,
+        usage: TextureUsage::ALL,
+    }
+}
+
+/// A view of all of [`texture_desc`].
+pub(super) fn view_desc() -> ViewDesc {
+    ViewDesc {
+        format: PixelFormat::A8B8G8R8Unorm,
+        dimension: ViewDimension::D2,
+        base_mip: 0,
+        mip_count: 1,
+        base_layer: 0,
+        layer_count: 1,
+        swizzle: Swizzle::IDENTITY,
+    }
+}
+
+/// A plain sampler.
+pub(super) fn sampler_desc() -> SamplerDesc {
+    SamplerDesc {
+        mag_filter: FilterMode::Linear,
+        min_filter: FilterMode::Linear,
+        mip_filter: FilterMode::Nearest,
+        address: [AddressMode::Repeat; 3],
+        border_color: BorderColor::TransparentBlack,
+        lod_bias: 0.0,
+        min_lod: 0.0,
+        max_lod: 4.0,
+        max_anisotropy: 1,
+        compare: None,
+        reduction: ReductionMode::Average,
+    }
+}
+
+/// A shader with entry `main` and no interface.
+pub(super) fn shader(
+    stage: ShaderStage,
+    source: ShaderSource,
+    origin: Option<ShaderOrigin>,
+) -> ShaderDesc {
+    ShaderDesc {
+        stage,
+        entry: "main".to_owned(),
+        source,
+        interface: ShaderInterface::default(),
+        origin,
+    }
+}
+
+/// An empty, validated naga module.
+pub(super) fn naga() -> ShaderSource {
+    let module = naga::Module::default();
+    let info = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&module)
+    .expect("an empty module validates");
+    ShaderSource::Naga {
+        module: Box::new(module),
+        info: Box::new(info),
+    }
 }
