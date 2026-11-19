@@ -978,7 +978,9 @@ impl Fold<'_> {
                 return Ok(());
             };
             if inner.opcode == construct {
-                if let Some(component) = inner.arg(slot).filter(|_| slot < construct.args().len()) {
+                // A construct has one argument per component, so an index past the vector
+                // finds none (Eden reads past its arguments there).
+                if let Some(component) = inner.arg(slot) {
                     self.replace(value, component);
                 }
                 return Ok(());

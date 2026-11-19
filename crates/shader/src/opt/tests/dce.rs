@@ -116,6 +116,33 @@ block1:
 }
 
 #[test]
+fn the_walk_is_post_order_not_reverse_arena_order() {
+    // Post order is block1, block2, block0; reverse arena order would visit block2 before
+    // block1 and keep %0, whose only user is block1's dead %1.
+    assert_eq!(
+        after(
+            "block0:
+    jump block2
+block1:
+    %1: u32 = IAdd32 %0, u32 1
+    return
+block2:
+    %0: u32 = GetCbufU32 u32 0, u32 0
+    jump block1
+",
+            Pass::DeadCodeElimination
+        ),
+        "block0:
+    jump block2
+block1:
+    return
+block2:
+    jump block1
+"
+    );
+}
+
+#[test]
 fn dead_loop_values_stay_as_in_eden() {
     // The counter's phi and its increment use each other round the loop, and nothing else
     // uses them: one walk in post order (block2, block1, block0) does not remove them.

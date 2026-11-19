@@ -1048,24 +1048,41 @@ fn a_chain_of_identities_is_followed_when_one_folds_later() {
 
 #[test]
 fn blocks_are_folded_in_reverse_post_order() {
-    // block2 comes before block1 in reverse post order (block0 branches to block2 first), so
-    // block1's add of block2's folded value sees it folded only if block2 is visited first.
+    // block2 comes before block1 in reverse post order, after it in the arena: block1's add
+    // of block2's sum folds only if block2 is visited first.
     let text = "block0:
-    %0: u1 = GetPred p0
-    branch %0, block2, block1
+    jump block2
 block1:
-    jump block3
+    %2: u32 = IAdd32 %1, u32 4
+    %3 = SetRegister r0, %2
+    return
 block2:
     %1: u32 = IAdd32 u32 1, u32 2
-    jump block3
-block3:
+    jump block1
+";
+    let mut function = parse(text);
+    run(&mut function, Pass::ConstantPropagation).expect("runs");
+    let out = function.to_string();
+    assert!(out.contains("%2: opaque = Identity u32 0x7"), "{out}");
+}
+
+#[test]
+fn a_remembered_end_that_folds_later_is_followed() {
+    // Unreachable blocks are visited in arena order: block1's add resolves %4 to %3 before
+    // block2 folds %3 to 3; block2's add must then follow %4 through %3 to the 3.
+    let text = "block0:
+    return
+block1:
+    %5: u32 = IAdd32 %4, u32 0
+    return
+block2:
+    %3: u32 = IAdd32 u32 1, u32 2
+    %4: opaque = Identity %3
+    %6: u32 = IAdd32 %4, u32 4
     return
 ";
     let mut function = parse(text);
     run(&mut function, Pass::ConstantPropagation).expect("runs");
-    assert!(
-        function
-            .to_string()
-            .contains("%1: opaque = Identity u32 0x3")
-    );
+    let out = function.to_string();
+    assert!(out.contains("%6: opaque = Identity u32 0x7"), "{out}");
 }
