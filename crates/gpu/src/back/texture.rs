@@ -43,11 +43,14 @@
 //! stand-in identity, fixed by the address. Eden keys images by CPU address, so for an image
 //! with no CPU backing Eden-NX2 makes a stand-in CPU address from the GPU one
 //! (`ImageCpuAddress` in `eden-nx2/src/video_core/texture_cache/texture_cache.h` @ 50fa86bb);
-//! keying by GPU address needs none. A render target whose first upload finds its memory
-//! unmapped ([`GpuFault::Unmapped`]) is **host-only**: it is never uploaded, watched or written
-//! back, as the spec's "GPU-only memory" has render targets in sparse regions (slice G22 replaces
-//! the unmapped-fault test with the GPU-only store's answer). A sampled texture whose memory is
-//! unmapped when it must be read is an error ([`TextureError::Fault`]). Pinned by
+//! keying by GPU address needs none. A render target is **host-only**, never uploaded, watched
+//! or written back, when it is made over memory whose every page leads to GPU-only memory
+//! ([`GpuMemory::is_gpu_only`]: a sparse region's pages, the spec's "GPU-only memory", slice
+//! G22), or when its first upload finds its memory unmapped ([`GpuFault::Unmapped`]). A sampled
+//! texture in GPU-only memory is read from the GPU-only store like any memory (zero where the
+//! GPU never wrote), and one whose memory is unmapped when it must be read is an error
+//! ([`TextureError::Fault`]). Pinned by
+//! `tests::a_render_target_in_gpu_only_memory_is_host_only`,
 //! `tests::an_unmapped_render_target_is_found_again_by_its_address` and
 //! `tests::a_sampled_texture_at_an_unmapped_address_is_an_error`.
 //!
@@ -107,8 +110,8 @@
 //!
 //! As in the buffer cache, the watch speaks in CPU addresses and the cache in GPU addresses, and
 //! the cache uses one as the other (row 30: memory registered with the graphics session is at
-//! GPU address = CPU address). The buffer cache's module docs give the gap that leaves until
-//! slice G22.
+//! GPU address = CPU address). The buffer cache's module docs give the gap that leaves, which
+//! slice G22's production memory does not close by itself.
 //!
 //! # GPU writes, write-back and unmaps
 //!
@@ -1004,8 +1007,10 @@ impl TextureCache {
                 .destroy(ResourceId::Texture(texture), FenceValue::ZERO);
         };
         let mut commands = Vec::new();
-        let mut host_only = false;
-        if plan.unconvertible.is_none() {
+        // A render target wholly in GPU-only memory stays host-only (module docs, "Unmapped
+        // addresses"; slice G22).
+        let mut host_only = render && mem.is_gpu_only(plan.pages.start(), plan.pages.size());
+        if plan.unconvertible.is_none() && !host_only {
             match self.stage(mem, &plan.info, &plan.layout, texture, &mut commands) {
                 Ok(()) => {}
                 Err(TextureError::Fault(fault)) if render && is_unmapped(&fault) => {

@@ -1351,9 +1351,9 @@ const ELSEWHERE: u64 = 0x40_0000_0000;
 
 #[test]
 fn the_watch_is_requested_at_the_gpu_address_not_the_cpu_one() {
-    // The known gap (module docs, "Learning of CPU writes"): until slice G22 translates a GPU
-    // range to its CPU pages, the watch is asked for the GPU range. When the gap closes, this
-    // test flips to expect `pages(5, 1)`.
+    // The known gap (module docs, "Learning of CPU writes"): until the caches ask the memory
+    // for a GPU range's CPU pages (a follow-up beyond slice G22), the watch is asked for the GPU
+    // range. When the gap closes, this test flips to expect `pages(5, 1)`.
     let mut rig = Rig::new();
     let gpu = PageRange::new(ELSEWHERE, PAGE_SIZE).unwrap();
     rig.mem.map(gpu, page(5)).unwrap();

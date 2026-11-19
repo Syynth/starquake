@@ -67,10 +67,12 @@
 //! lead elsewhere (a `Target::Guest` at another CPU address) the watch protects the wrong CPU
 //! pages: guest stores to the real ones are missed, so the cache keeps stale bytes, and stores
 //! to the others cost spurious re-uploads. GPU-only memory has no CPU pages behind it, so only
-//! the second applies. This is a **known gap** until the production memory (slice G22) can
-//! translate a range to its CPU pages. Pinned by
+//! the second applies. This is a **known gap**: the production memory
+//! ([`crate::memory::VmMemory`], slice G22) resolves each page's target, but [`GpuMemory`] has no
+//! call that hands a range's CPU pages to a cache, and adding one and using it here and in the
+//! texture cache is a follow-up beyond G22. Pinned by
 //! `tests::the_watch_is_requested_at_the_gpu_address_not_the_cpu_one`, which maps a GPU page onto
-//! a different CPU page and expects the GPU range in the request; G22 flips it.
+//! a different CPU page and expects the GPU range in the request; that follow-up flips it.
 //!
 //! # Streamed ranges
 //!

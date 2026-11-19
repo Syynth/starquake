@@ -2,6 +2,7 @@
 //! so ([`LateBackend`]), a fake GPU memory over flat guest memory, and recording doubles for the
 //! completion queue and the front's wake-up. Every wait is bounded.
 
+mod production;
 mod waiters;
 
 use std::collections::VecDeque;
