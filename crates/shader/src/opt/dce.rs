@@ -36,6 +36,10 @@ use super::{PassError, Work, arena_len, block_order, invalidated, tree_condition
 /// Eden's `Inst::MayHaveSideEffects` (`frontend/ir/microinstruction.cpp` @ cf654052), opcode
 /// for opcode (the uniform register class's set operations, which Eden lacks, are not side
 /// effects, as `SetRegister` is not).
+#[expect(
+    clippy::too_many_lines,
+    reason = "Eden's list of 159 opcodes, one per line as rustfmt writes a long pattern"
+)]
 pub const fn may_have_side_effects(opcode: Opcode) -> bool {
     use Opcode as O;
     matches!(
@@ -273,18 +277,17 @@ fn sweep(
 ) -> Result<(), PassError> {
     let list = function
         .block_mut(block)
-        .map(|b| std::mem::take(&mut b.insts))
-        .unwrap_or_default();
+        .map_or_default(|b| std::mem::take(&mut b.insts));
     let mut kept = Vec::with_capacity(list.len());
     for &value in list.iter().rev() {
         work.step();
         let inst = function.inst(value).ok_or(PassError::Missing(value))?;
-        let used = usize::try_from(value.index())
+        let in_use = usize::try_from(value.index())
             .ok()
             .and_then(|index| uses.get(index))
             .is_some_and(|&n| n > 0);
         let effect = matches!(inst, Inst::Op(op) if may_have_side_effects(op.opcode));
-        if used || effect {
+        if in_use || effect {
             kept.push(value);
             continue;
         }

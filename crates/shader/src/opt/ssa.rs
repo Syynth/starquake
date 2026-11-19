@@ -262,8 +262,7 @@ pub(super) fn run(function: &mut Function) -> Result<Work, PassError> {
     for &id in &ids {
         let list = function
             .block_mut(id)
-            .map(|block| std::mem::take(&mut block.insts))
-            .unwrap_or_default();
+            .map_or_default(|block| std::mem::take(&mut block.insts));
         original.push(list);
     }
     let mut ssa = Ssa {
@@ -293,8 +292,7 @@ pub(super) fn run(function: &mut Function) -> Result<Work, PassError> {
         let successors: Vec<BlockId> = ssa
             .function
             .block(block)
-            .map(|b| b.terminator.successors().collect())
-            .unwrap_or_default();
+            .map_or_default(|b| b.terminator.successors().collect());
         let mut previous = None;
         for to in successors {
             if previous == Some(to) {
@@ -428,7 +426,9 @@ impl Ssa<'_> {
                 }
             }
         }
-        Ok(stack.first().map_or(Operand::Imm(Imm::U1(false)), |f| f.result))
+        Ok(stack
+            .first()
+            .map_or(Operand::Imm(Imm::U1(false)), |f| f.result))
     }
 
     /// Records the top frame's result for its block and returns it to the frame below.
@@ -483,8 +483,7 @@ impl Ssa<'_> {
         let pending = self
             .incomplete
             .get_mut(index)
-            .map(std::mem::take)
-            .unwrap_or_default();
+            .map_or_default(std::mem::take);
         for (var, phi) in pending {
             self.add_phi_operands(var, phi, block)?;
         }
@@ -536,19 +535,18 @@ impl Ssa<'_> {
             return Ok(Operand::Value(phi));
         }
         let index = slot(block).unwrap_or(usize::MAX);
-        let same = match same {
-            Some(same) => same,
-            None => {
-                // The phi is unreachable or in the entry block.
-                let undef = self.function.push(
-                    block,
-                    Inst::Op(crate::ir::Operation::new(var.undef(), Vec::new())),
-                )?;
-                if let Some(list) = self.undefs.get_mut(index) {
-                    list.push(undef);
-                }
-                Operand::Value(undef)
+        let same = if let Some(same) = same {
+            same
+        } else {
+            // The phi is unreachable or in the entry block.
+            let undef = self.function.push(
+                block,
+                Inst::Op(crate::ir::Operation::new(var.undef(), Vec::new())),
+            )?;
+            if let Some(list) = self.undefs.get_mut(index) {
+                list.push(undef);
             }
+            Operand::Value(undef)
         };
         if let Some(inst) = self.function.inst_mut(phi) {
             *inst = identity_of(same);
@@ -640,10 +638,7 @@ fn split_entry(function: &mut Function, work: &mut Work) -> Result<(), PassError
         }
     }
     let new = function.add_block()?;
-    let moved = function
-        .block_mut(entry)
-        .map(std::mem::take)
-        .unwrap_or_default();
+    let moved = function.block_mut(entry).map_or_default(std::mem::take);
     if let Some(block) = function.block_mut(new) {
         *block = moved;
     }

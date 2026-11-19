@@ -54,7 +54,9 @@ use std::fmt::{self, Display, Formatter};
 
 use thiserror::Error;
 
-use crate::ir::{BlockId, BuildError, Function, Inst, Node, Opcode, Operand, Operation, VerifyError};
+use crate::ir::{
+    BlockId, BuildError, Function, Inst, Node, Opcode, Operand, Operation, VerifyError,
+};
 
 pub use dce::may_have_side_effects;
 
@@ -233,13 +235,12 @@ pub(crate) fn block_order(function: &Function, work: &mut Work) -> Vec<BlockId> 
     let count = function.block_count();
     let mut placed = vec![false; count];
     let mut order = Vec::with_capacity(count);
-    match function.structure() {
-        Some(tree) => tree_order(tree, &mut placed, &mut order, work),
-        None => {
-            let mut post = post_order(function, &mut placed, work);
-            post.reverse();
-            order = post;
-        }
+    if let Some(tree) = function.structure() {
+        tree_order(tree, &mut placed, &mut order, work);
+    } else {
+        let mut post = post_order(function, &mut placed, work);
+        post.reverse();
+        order = post;
     }
     for (id, _) in function.blocks() {
         if let Some(seen) = slot(id).and_then(|index| placed.get_mut(index))

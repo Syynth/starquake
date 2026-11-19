@@ -12,9 +12,13 @@ use proptest::collection::vec;
 use proptest::prelude::*;
 use proptest::test_runner::Config;
 
-use crate::interp::{ConditionCodes, Machine, PRED_SLOTS, REG_SLOTS, UNIFORM_PRED_SLOTS, UNIFORM_REG_SLOTS};
-use crate::ir::{Attribute, Builder, Function, Imm, Opcode, Operand, Terminator, UniformPred, UniformReg};
 use crate::decode::{Gpr, Pred};
+use crate::interp::{
+    ConditionCodes, Machine, PRED_SLOTS, REG_SLOTS, UNIFORM_PRED_SLOTS, UNIFORM_REG_SLOTS,
+};
+use crate::ir::{
+    Attribute, Builder, Function, Imm, Opcode, Operand, Terminator, UniformPred, UniformReg,
+};
 use crate::opt::{Pass, run};
 
 /// The data registers a program computes in: r0 to r4.
@@ -55,7 +59,11 @@ enum Stmt {
     /// `Z = (a != 0)`, then `pD = Z`.
     Flag { src: Src, dst: u8 },
     /// `if pP { then } else { otherwise }`.
-    If { pred: u8, then: Vec<Stmt>, otherwise: Vec<Stmt> },
+    If {
+        pred: u8,
+        then: Vec<Stmt>,
+        otherwise: Vec<Stmt>,
+    },
     /// The body `count` times.
     Loop { count: u32, body: Vec<Stmt> },
 }
@@ -82,7 +90,15 @@ const COMPARE: [Opcode; 6] = [
 ];
 
 fn imm() -> BoxedStrategy<u32> {
-    prop_oneof![Just(0), Just(1), Just(16), Just(31), Just(u32::MAX), any::<u32>()].boxed()
+    prop_oneof![
+        Just(0),
+        Just(1),
+        Just(16),
+        Just(31),
+        Just(u32::MAX),
+        any::<u32>()
+    ]
+    .boxed()
 }
 
 fn src() -> BoxedStrategy<Src> {
@@ -142,11 +158,15 @@ fn pred(index: u8) -> Operand {
 }
 
 fn uniform_reg(index: u8) -> Operand {
-    Operand::Imm(Imm::UniformReg(UniformReg::new(index).expect("a uniform register")))
+    Operand::Imm(Imm::UniformReg(
+        UniformReg::new(index).expect("a uniform register"),
+    ))
 }
 
 fn uniform_pred(index: u8) -> Operand {
-    Operand::Imm(Imm::UniformPred(UniformPred::new(index).expect("a uniform predicate")))
+    Operand::Imm(Imm::UniformPred(
+        UniformPred::new(index).expect("a uniform predicate"),
+    ))
 }
 
 fn u32_imm(value: u32) -> Operand {
@@ -225,10 +245,19 @@ impl Emit {
                 let zero = self.op(Opcode::GetZFlag, &[]);
                 self.op(Opcode::SetPred, &[pred(dst), zero]);
             }
-            Stmt::If { pred: p, ref then, ref otherwise } => {
+            Stmt::If {
+                pred: p,
+                ref then,
+                ref otherwise,
+            } => {
                 let cond = self.op(Opcode::GetPred, &[pred(p)]);
-                let (then_block, else_block, join) = (self.new_block(), self.new_block(), self.new_block());
-                self.terminate(Terminator::Branch { cond, then: then_block, otherwise: else_block });
+                let (then_block, else_block, join) =
+                    (self.new_block(), self.new_block(), self.new_block());
+                self.terminate(Terminator::Branch {
+                    cond,
+                    then: then_block,
+                    otherwise: else_block,
+                });
                 self.block = then_block;
                 self.stmts(then, depth);
                 self.terminate(Terminator::Jump(join));
@@ -249,7 +278,11 @@ impl Emit {
                 self.op(Opcode::SetRegister, &[counter, next]);
                 let again = self.op(Opcode::INotEqual, &[next, u32_imm(0)]);
                 let exit = self.new_block();
-                self.terminate(Terminator::Branch { cond: again, then: header, otherwise: exit });
+                self.terminate(Terminator::Branch {
+                    cond: again,
+                    then: header,
+                    otherwise: exit,
+                });
                 self.block = exit;
             }
         }
@@ -260,7 +293,14 @@ impl Emit {
         let mut attribute = OUTPUT_BASE;
         let mut store = |emit: &mut Self, value: Operand| {
             let bits = emit.op(Opcode::BitCastF32U32, &[value]);
-            emit.op(Opcode::SetAttribute, &[Operand::Imm(Imm::Attribute(Attribute(attribute))), bits, u32_imm(0)]);
+            emit.op(
+                Opcode::SetAttribute,
+                &[
+                    Operand::Imm(Imm::Attribute(Attribute(attribute))),
+                    bits,
+                    u32_imm(0),
+                ],
+            );
             attribute += 1;
         };
         for index in 0..DATA_REGS {
@@ -320,7 +360,13 @@ fn check_equivalence(function: &Function, start: &Machine) -> Result<(), TestCas
             .run(&current)
             .map_err(|e| TestCaseError::fail(format!("{pass}: {e}\n{current}")))?;
         if pass == Pass::DeadCodeElimination {
-            prop_assert_eq!(observable(&machine), observable(&reference), "{}: {}", pass, current);
+            prop_assert_eq!(
+                observable(&machine),
+                observable(&reference),
+                "{}: {}",
+                pass,
+                current
+            );
         } else {
             prop_assert_eq!(&machine, &reference, "{}: {}", pass, current);
         }
@@ -355,21 +401,53 @@ fn the_generator_makes_loops_ifs_and_phis() {
     // A hand-picked program of every statement kind, nested, keeps its result, and its SSA
     // form has phis (so the generated programs exercise them).
     let program = vec![
-        Stmt::Assign { dst: 0, op: Opcode::IAdd32, a: Src::Cbuf(0), b: Src::Imm(1) },
+        Stmt::Assign {
+            dst: 0,
+            op: Opcode::IAdd32,
+            a: Src::Cbuf(0),
+            b: Src::Imm(1),
+        },
         Stmt::Loop {
             count: 3,
             body: vec![
-                Stmt::Assign { dst: 0, op: Opcode::IMul32, a: Src::Reg(0), b: Src::Imm(3) },
-                Stmt::Compare { dst: 1, op: Opcode::ULessThan, a: Src::Reg(0), b: Src::Cbuf(1) },
+                Stmt::Assign {
+                    dst: 0,
+                    op: Opcode::IMul32,
+                    a: Src::Reg(0),
+                    b: Src::Imm(3),
+                },
+                Stmt::Compare {
+                    dst: 1,
+                    op: Opcode::ULessThan,
+                    a: Src::Reg(0),
+                    b: Src::Cbuf(1),
+                },
                 Stmt::If {
                     pred: 1,
-                    then: vec![Stmt::Select { dst: 2, pred: 1, a: Src::Reg(0), b: Src::Imm(7) }],
+                    then: vec![Stmt::Select {
+                        dst: 2,
+                        pred: 1,
+                        a: Src::Reg(0),
+                        b: Src::Imm(7),
+                    }],
                     otherwise: vec![
-                        Stmt::Flag { src: Src::Reg(0), dst: 2 },
-                        Stmt::Uniform { dst: 1, src: Src::Reg(2), pred: 2 },
+                        Stmt::Flag {
+                            src: Src::Reg(0),
+                            dst: 2,
+                        },
+                        Stmt::Uniform {
+                            dst: 1,
+                            src: Src::Reg(2),
+                            pred: 2,
+                        },
                     ],
                 },
-                Stmt::Logic { dst: 0, op: Opcode::LogicalOr, a: 1, b: 2 },
+                Stmt::Logic {
+                    dst: 0,
+                    op: Opcode::LogicalOr,
+                    a: 1,
+                    b: 2,
+                },
             ],
         },
     ];
@@ -391,8 +469,16 @@ fn a_join_of_two_copies_of_one_value_verifies() {
         count: 1,
         body: vec![Stmt::If {
             pred: 0,
-            then: vec![Stmt::Uniform { dst: 0, src: Src::Reg(0), pred: 2 }],
-            otherwise: vec![Stmt::Uniform { dst: 0, src: Src::Reg(0), pred: 0 }],
+            then: vec![Stmt::Uniform {
+                dst: 0,
+                src: Src::Reg(0),
+                pred: 2,
+            }],
+            otherwise: vec![Stmt::Uniform {
+                dst: 0,
+                src: Src::Reg(0),
+                pred: 0,
+            }],
         }],
     }];
     check_equivalence(&build(&program), &start(&[0; CBUF_WORDS as usize])).expect("equivalent");

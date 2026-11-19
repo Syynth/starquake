@@ -232,7 +232,10 @@ block3:
 fn unreachable_blocks_are_rewritten() {
     let text = rewrite_keeps_state(UNREACHABLE, &Machine::new());
     // block1 merges block0's and the unreachable block2's values; block3's read is undefined.
-    assert!(text.contains("Phi [block0: u32 0x1], [block2: u32 0x2]"), "{text}");
+    assert!(
+        text.contains("Phi [block0: u32 0x1], [block2: u32 0x2]"),
+        "{text}"
+    );
     insta::assert_snapshot!("ssa_unreachable", text);
 }
 
@@ -253,7 +256,10 @@ fn an_entry_loop_moves_to_its_own_block() {
     let text = rewrite_keeps_state(ENTRY_LOOP, &start);
     assert_eq!(ran(&parse(&text), &start).regs[0], 6);
     // block0 keeps only the jump (and the undefined value block2's phi takes from it).
-    assert!(text.contains("    jump block2\nblock1:\n    return\nblock2:\n"), "{text}");
+    assert!(
+        text.contains("    jump block2\nblock1:\n    return\nblock2:\n"),
+        "{text}"
+    );
     assert!(text.contains("Phi [block0: %6], [block2: %1]"), "{text}");
     insta::assert_snapshot!("ssa_entry_loop", text);
 }
@@ -338,9 +344,8 @@ structure:
 #[test]
 fn goto_indices_must_be_immediates() {
     for op in ["GetGotoVariable %0", "SetGotoVariable %0, u1 true"] {
-        let text = format!(
-            "block0:\n    %0: u32 = GetCbufU32 u32 0, u32 0\n    %1 = {op}\n    return\n"
-        );
+        let text =
+            format!("block0:\n    %0: u32 = GetCbufU32 u32 0, u32 0\n    %1 = {op}\n    return\n");
         assert_eq!(
             error(&text, Pass::SsaRewrite),
             PassError::GotoIndex(value(1))

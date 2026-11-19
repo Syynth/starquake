@@ -81,12 +81,11 @@ fn removed_instructions_are_invalidated() {
     );
     run(&mut function, Pass::IdentityRemoval).expect("runs");
     for index in [0, 1] {
-        match function.inst(value(index)) {
-            Some(Inst::Op(op)) => {
-                assert_eq!((op.opcode, op.args.len()), (Opcode::Void, 0));
-            }
-            other => panic!("%{index} is {other:?}"),
-        }
+        let inst = function.inst(value(index));
+        assert!(
+            matches!(inst, Some(Inst::Op(op)) if op.opcode == Opcode::Void && op.args.is_empty()),
+            "%{index} is {inst:?}"
+        );
     }
     let listed: Vec<_> = function.listed().map(|(v, _)| v).collect();
     assert_eq!(listed, vec![value(2)]);

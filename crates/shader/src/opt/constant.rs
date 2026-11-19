@@ -167,8 +167,7 @@ pub(super) fn run(function: &mut Function) -> Result<Work, PassError> {
         let list = fold
             .function
             .block_mut(block)
-            .map(|b| std::mem::take(&mut b.insts))
-            .unwrap_or_default();
+            .map_or_default(|b| std::mem::take(&mut b.insts));
         let mut out = Vec::with_capacity(list.len());
         for value in list {
             fold.work.step();
@@ -255,7 +254,8 @@ impl Seen {
 impl Fold<'_> {
     /// `operand` resolved through `Identity` chains (Eden's `Resolve`).
     fn resolve(&mut self, operand: Operand) -> Result<Operand, PassError> {
-        self.resolver.resolve(self.function, operand, &mut self.work)
+        self.resolver
+            .resolve(self.function, operand, &mut self.work)
     }
 
     /// The operation at `value` with each argument that resolves to an immediate replaced by
@@ -345,26 +345,46 @@ impl Fold<'_> {
 
     /// Visits instruction `value` (Eden's `ConstantPropagation`).
     fn visit(&mut self, value: Value) -> Result<(), PassError> {
+        use Opcode as O;
         let seen = match self.look(value)? {
             Some(seen) => seen,
             None if self.function.inst(value).is_some() => return Ok(()),
             None => return Err(PassError::Missing(value)),
         };
-        use Opcode as O;
+        if let Some((construct, insert)) = composite_of(seen.opcode) {
+            return self.extract(value, &seen, construct, insert);
+        }
         match seen.opcode {
-            O::GetRegister => self.reserved(value, &seen),
-            O::GetPred => self.reserved(value, &seen),
-            O::GetUniformRegister => self.reserved(value, &seen),
-            O::GetUniformPred => self.reserved(value, &seen),
+            O::GetRegister | O::GetPred | O::GetUniformRegister | O::GetUniformPred => {
+                self.reserved(value, &seen);
+            }
             O::IAdd32 => self.add(value, &seen, true)?,
             O::ISub32 => self.isub(value, &seen)?,
-            O::IMul32 | O::FPNeg32 => {
+            O::IMul32
+            | O::FPNeg32
+            | O::SLessThan
+            | O::ULessThan
+            | O::SLessThanEqual
+            | O::ULessThanEqual
+            | O::SGreaterThan
+            | O::UGreaterThan
+            | O::SGreaterThanEqual
+            | O::UGreaterThanEqual
+            | O::IEqual
+            | O::INotEqual
+            | O::BitwiseAnd32
+            | O::BitwiseOr32
+            | O::BitwiseXor32 => {
                 self.all_immediates(value, &seen);
             }
             O::ShiftRightArithmetic32 => {
                 // C++'s `a >> b` on an `s32` is defined for shifts 0 to 31.
-                if matches!(seen.arg(1), Some(Operand::Imm(Imm::U32(shift))) if shift < WORD_BITS)
-                {
+                if matches!(seen.arg(1), Some(Operand::Imm(Imm::U32(shift))) if shift < WORD_BITS) {
+                    self.all_immediates(value, &seen);
+                }
+            }
+            O::BitFieldUExtract | O::BitFieldSExtract | O::BitFieldInsert => {
+                if bit_field_defined(&seen) {
                     self.all_immediates(value, &seen);
                 }
             }
@@ -388,35 +408,6 @@ impl Fold<'_> {
             O::LogicalAnd => self.logical(value, &seen, false)?,
             O::LogicalOr => self.logical(value, &seen, true)?,
             O::LogicalNot => self.logical_not(value, &seen)?,
-            O::SLessThan
-            | O::ULessThan
-            | O::SLessThanEqual
-            | O::ULessThanEqual
-            | O::SGreaterThan
-            | O::UGreaterThan
-            | O::SGreaterThanEqual
-            | O::UGreaterThanEqual
-            | O::IEqual
-            | O::INotEqual
-            | O::BitwiseAnd32
-            | O::BitwiseOr32
-            | O::BitwiseXor32 => {
-                self.all_immediates(value, &seen);
-            }
-            O::BitFieldUExtract | O::BitFieldSExtract | O::BitFieldInsert => {
-                if bit_field_defined(&seen) {
-                    self.all_immediates(value, &seen);
-                }
-            }
-            O::CompositeExtractU32x2 => self.extract(value, &seen, O::CompositeConstructU32x2, O::CompositeInsertU32x2)?,
-            O::CompositeExtractU32x3 => self.extract(value, &seen, O::CompositeConstructU32x3, O::CompositeInsertU32x3)?,
-            O::CompositeExtractU32x4 => self.extract(value, &seen, O::CompositeConstructU32x4, O::CompositeInsertU32x4)?,
-            O::CompositeExtractF32x2 => self.extract(value, &seen, O::CompositeConstructF32x2, O::CompositeInsertF32x2)?,
-            O::CompositeExtractF32x3 => self.extract(value, &seen, O::CompositeConstructF32x3, O::CompositeInsertF32x3)?,
-            O::CompositeExtractF32x4 => self.extract(value, &seen, O::CompositeConstructF32x4, O::CompositeInsertF32x4)?,
-            O::CompositeExtractF16x2 => self.extract(value, &seen, O::CompositeConstructF16x2, O::CompositeInsertF16x2)?,
-            O::CompositeExtractF16x3 => self.extract(value, &seen, O::CompositeConstructF16x3, O::CompositeInsertF16x3)?,
-            O::CompositeExtractF16x4 => self.extract(value, &seen, O::CompositeConstructF16x4, O::CompositeInsertF16x4)?,
             O::FSwizzleAdd => self.swizzle_add(value, &seen)?,
             _ => {}
         }
@@ -472,20 +463,17 @@ impl Fold<'_> {
             }
             (Operand::Imm(_), Operand::Value(_)) => {
                 let inner = self.producer_of(Some(rhs), seen.opcode)?;
-                match inner.and_then(|inner| {
+                if let Some((first, combined)) = inner.and_then(|inner| {
                     let first = inner.arg(0)?;
                     let imm = inner.arg(1).filter(|a| a.imm().is_some())?;
                     Some((first, combine(lhs, imm)?))
                 }) {
-                    Some((first, combined)) => {
-                        self.set_arg(value, 0, first);
-                        self.set_arg(value, 1, combined);
-                    }
-                    None => {
-                        // Normalise: the immediate goes on the right.
-                        self.set_arg(value, 0, rhs);
-                        self.set_arg(value, 1, lhs);
-                    }
+                    self.set_arg(value, 0, first);
+                    self.set_arg(value, 1, combined);
+                } else {
+                    // Normalise: the immediate goes on the right.
+                    self.set_arg(value, 0, rhs);
+                    self.set_arg(value, 1, lhs);
                 }
             }
             (Operand::Value(_), Operand::Imm(_)) => {
@@ -595,103 +583,131 @@ impl Fold<'_> {
         use Opcode as O;
         let sixteen = Some(Operand::Imm(Imm::U32(16)));
         let zero = Some(Operand::Imm(Imm::U32(0)));
-        let Some(op25) = self.producer_of(now.arg(0), O::ShiftLeftLogical32)? else {
+        let Some(top_shift) = self.producer_of(now.arg(0), O::ShiftLeftLogical32)? else {
             return Ok(false);
         };
-        let Some(op27) = self.producer_of(now.arg(1), O::IAdd32)? else {
+        let Some(rest_sum) = self.producer_of(now.arg(1), O::IAdd32)? else {
             return Ok(false);
         };
-        if op25.arg(1) != sixteen {
+        if top_shift.arg(1) != sixteen {
             return Ok(false);
         }
-        let Some(op24) = self.producer_of(op25.arg(0), O::IMul32)? else {
+        let Some(top_product) = self.producer_of(top_shift.arg(0), O::IMul32)? else {
             return Ok(false);
         };
-        let Some(op22) = self.producer_of(op24.arg(0), O::BitFieldUExtract)? else {
+        let Some(multiplier_high) = self.producer_of(top_product.arg(0), O::BitFieldUExtract)?
+        else {
             return Ok(false);
         };
-        let Some(op23) = self.producer_of(op24.arg(1), O::BitFieldUExtract)? else {
+        let Some(merged_high) = self.producer_of(top_product.arg(1), O::BitFieldUExtract)? else {
             return Ok(false);
         };
-        if op22.arg(1) != sixteen || op22.arg(2) != sixteen {
+        if multiplier_high.arg(1) != sixteen || multiplier_high.arg(2) != sixteen {
             return Ok(false);
         }
-        if op23.arg(1) != sixteen || op23.arg(2) != sixteen {
+        if merged_high.arg(1) != sixteen || merged_high.arg(2) != sixteen {
             return Ok(false);
         }
-        let Some(arg11) = op23.arg(0) else {
+        let Some(merged_arg) = merged_high.arg(0) else {
             return Ok(false);
         };
-        let Some((id11, op11)) = self.producer(arg11)? else {
+        let Some((merged_id, merged)) = self.producer(merged_arg)? else {
             return Ok(false);
         };
-        if op11.opcode != O::BitFieldInsert || op11.arg(2) != sixteen || op11.arg(3) != sixteen {
+        if merged.opcode != O::BitFieldInsert
+            || merged.arg(2) != sixteen
+            || merged.arg(3) != sixteen
+        {
             return Ok(false);
         }
-        let Some(op8) = self.producer_of(op11.arg(0), O::IMul32)? else {
+        let Some(cross_product) = self.producer_of(merged.arg(0), O::IMul32)? else {
             return Ok(false);
         };
-        let Some(op10) = self.producer_of(op11.arg(1), O::BitFieldUExtract)? else {
+        let Some(multiplicand_insert) = self.producer_of(merged.arg(1), O::BitFieldUExtract)?
+        else {
             return Ok(false);
         };
-        let Some(op6) = self.producer_of(op8.arg(0), O::BitFieldUExtract)? else {
+        let Some(multiplier_cross) = self.producer_of(cross_product.arg(0), O::BitFieldUExtract)?
+        else {
             return Ok(false);
         };
-        let Some(op7) = self.producer_of(op8.arg(1), O::BitFieldUExtract)? else {
+        let Some(multiplicand_high) =
+            self.producer_of(cross_product.arg(1), O::BitFieldUExtract)?
+        else {
             return Ok(false);
         };
-        if op6.arg(1) != zero || op6.arg(2) != sixteen {
+        if multiplier_cross.arg(1) != zero || multiplier_cross.arg(2) != sixteen {
             return Ok(false);
         }
-        if op7.arg(1) != sixteen || op7.arg(2) != sixteen {
+        if multiplicand_high.arg(1) != sixteen || multiplicand_high.arg(2) != sixteen {
             return Ok(false);
         }
-        let Some(op26) = self.producer_of(op27.arg(0), O::ShiftLeftLogical32)? else {
+        let Some(merged_shift) = self.producer_of(rest_sum.arg(0), O::ShiftLeftLogical32)? else {
             return Ok(false);
         };
-        if op26.arg(1) != sixteen {
+        if merged_shift.arg(1) != sixteen {
             return Ok(false);
         }
-        match op26.arg(0) {
-            Some(arg) if self.producer(arg)?.map(|(id, _)| id) == Some(id11) => {}
+        match merged_shift.arg(0) {
+            Some(arg) if self.producer(arg)?.map(|(id, _)| id) == Some(merged_id) => {}
             _ => return Ok(false),
         }
-        let Some(op18) = self.producer_of(op27.arg(1), O::IAdd32)? else {
+        let Some(plus_c) = self.producer_of(rest_sum.arg(1), O::IAdd32)? else {
             return Ok(false);
         };
-        let Some(op17) = self.producer_of(op18.arg(0), O::IMul32)? else {
+        let Some(low_product) = self.producer_of(plus_c.arg(0), O::IMul32)? else {
             return Ok(false);
         };
-        let Some(op15) = self.producer_of(op17.arg(0), O::BitFieldUExtract)? else {
+        let Some(multiplier_low) = self.producer_of(low_product.arg(0), O::BitFieldUExtract)?
+        else {
             return Ok(false);
         };
-        let Some(op16) = self.producer_of(op17.arg(1), O::BitFieldUExtract)? else {
+        let Some(multiplicand_low) = self.producer_of(low_product.arg(1), O::BitFieldUExtract)?
+        else {
             return Ok(false);
         };
-        if op15.arg(1) != zero || op16.arg(1) != zero || op10.arg(1) != zero {
+        if multiplier_low.arg(1) != zero
+            || multiplicand_low.arg(1) != zero
+            || multiplicand_insert.arg(1) != zero
+        {
             return Ok(false);
         }
-        if op15.arg(2) != sixteen || op16.arg(2) != sixteen || op10.arg(2) != sixteen {
+        if multiplier_low.arg(2) != sixteen
+            || multiplicand_low.arg(2) != sixteen
+            || multiplicand_insert.arg(2) != sixteen
+        {
             return Ok(false);
         }
-        let mut operands = [op7.arg(0), op16.arg(0), op10.arg(0), op22.arg(0), op6.arg(0), op15.arg(0)];
-        for slot in &mut operands {
+        let mut multiplicand = [
+            multiplicand_high.arg(0),
+            multiplicand_low.arg(0),
+            multiplicand_insert.arg(0),
+        ];
+        let mut multiplier = [
+            multiplier_high.arg(0),
+            multiplier_cross.arg(0),
+            multiplier_low.arg(0),
+        ];
+        for slot in multiplicand.iter_mut().chain(&mut multiplier) {
             *slot = match *slot {
                 Some(operand) => Some(self.resolve(operand)?),
                 None => return Ok(false),
             };
         }
-        let [Some(a7), Some(a16), Some(a10), Some(b22), Some(b6), Some(b15)] = operands else {
+        let ([Some(a0), Some(a1), Some(a2)], [Some(b0), Some(b1), Some(b2)]) =
+            (multiplicand, multiplier)
+        else {
             return Ok(false);
         };
-        let Some(op_c) = op18.arg(1) else {
+        let Some(addend) = plus_c.arg(1) else {
             return Ok(false);
         };
-        if !self.all_equal(&[a7, a16, a10]) || !self.all_equal(&[b22, b6, b15]) {
+        if !self.all_equal(&[a0, a1, a2]) || !self.all_equal(&[b0, b1, b2]) {
             return Ok(false);
         }
-        let product = self.make(O::IMul32, vec![a7, b6])?;
-        let sum = self.make(O::IAdd32, vec![Operand::Value(product), op_c])?;
+        // Eden's `ir.IMul(op_as[0], op_bs[1])`.
+        let product = self.make(O::IMul32, vec![a0, b1])?;
+        let sum = self.make(O::IAdd32, vec![Operand::Value(product), addend])?;
         self.replace(value, Operand::Value(sum));
         Ok(true)
     }
@@ -855,7 +871,11 @@ impl Fold<'_> {
         let now = self.args_now(value);
         if let (Some(lhs), Some(Operand::Imm(Imm::U1(rhs)))) = (now.arg(0), now.arg(1)) {
             // `x && true` and `x || false` are `x`; `x && false` and `x || true` are `rhs`.
-            let replacement = if rhs == or { Operand::Imm(Imm::U1(rhs)) } else { lhs };
+            let replacement = if rhs == or {
+                Operand::Imm(Imm::U1(rhs))
+            } else {
+                lhs
+            };
             self.replace(value, replacement);
         }
         Ok(())
@@ -1045,6 +1065,24 @@ impl Fold<'_> {
             None => Ok(operand),
         }
     }
+}
+
+/// The construct and insert opcodes a composite extract folds through, for the extracts
+/// Eden's dispatch lists (the `u32`, `f32` and `f16` vectors; not `f64`).
+const fn composite_of(extract: Opcode) -> Option<(Opcode, Opcode)> {
+    use Opcode as O;
+    Some(match extract {
+        O::CompositeExtractU32x2 => (O::CompositeConstructU32x2, O::CompositeInsertU32x2),
+        O::CompositeExtractU32x3 => (O::CompositeConstructU32x3, O::CompositeInsertU32x3),
+        O::CompositeExtractU32x4 => (O::CompositeConstructU32x4, O::CompositeInsertU32x4),
+        O::CompositeExtractF32x2 => (O::CompositeConstructF32x2, O::CompositeInsertF32x2),
+        O::CompositeExtractF32x3 => (O::CompositeConstructF32x3, O::CompositeInsertF32x3),
+        O::CompositeExtractF32x4 => (O::CompositeConstructF32x4, O::CompositeInsertF32x4),
+        O::CompositeExtractF16x2 => (O::CompositeConstructF16x2, O::CompositeInsertF16x2),
+        O::CompositeExtractF16x3 => (O::CompositeConstructF16x3, O::CompositeInsertF16x3),
+        O::CompositeExtractF16x4 => (O::CompositeConstructF16x4, O::CompositeInsertF16x4),
+        _ => return None,
+    })
 }
 
 /// Eden's `QuadButterflyMask`: the lane mask of a quad butterfly, or 0.

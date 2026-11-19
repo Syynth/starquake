@@ -145,15 +145,14 @@ pub(super) fn run(function: &mut Function) -> Result<Work, PassError> {
         work.step();
         let list = function
             .block_mut(id)
-            .map(|block| std::mem::take(&mut block.insts))
-            .unwrap_or_default();
+            .map_or_default(|block| std::mem::take(&mut block.insts));
         let mut kept = Vec::with_capacity(list.len());
         for value in list {
             work.step();
             let mut index = 0;
             while let Some(arg) = argument(function, value, index)? {
-                let resolved = resolver.resolve(function, arg, &mut work)?;
-                set_argument(function, value, index, resolved);
+                let end = resolver.resolve(function, arg, &mut work)?;
+                set_argument(function, value, index, end);
                 index += 1;
             }
             let remove = matches!(

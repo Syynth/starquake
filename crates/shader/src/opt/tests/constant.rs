@@ -192,7 +192,11 @@ fn the_xmad_multiply_folds_to_one_multiply() {
         out.contains("    %9: u32 = IMul32 %0, %1\n    %7: opaque = Identity %9\n"),
         "{out}"
     );
-    for (a, b) in [(0x1234_5678, 0x9abc_def0), (0xffff_ffff, 3), (7, 0x0001_0001)] {
+    for (a, b) in [
+        (0x1234_5678, 0x9abc_def0),
+        (0xffff_ffff, 3),
+        (7, 0x0001_0001),
+    ] {
         let (before, after) = before_and_after(&text, &machine(&[a, b]));
         assert_eq!(after, before);
         assert_eq!(before.regs[0], u32::wrapping_mul(a, b));
@@ -210,7 +214,13 @@ fn the_xmad_multiply_needs_every_immediate() {
     }
     // The factors must agree: a different b in the low half, or a different a.
     let text = fill(XMAD_MULTIPLY, &good);
-    for (from, to) in [("%6: u32 = IMul32 %5, %1", "%6: u32 = IMul32 %5, %0"), ("%5: u32 = BitFieldUExtract %0", "%5: u32 = BitFieldUExtract %1")] {
+    for (from, to) in [
+        ("%6: u32 = IMul32 %5, %1", "%6: u32 = IMul32 %5, %0"),
+        (
+            "%5: u32 = BitFieldUExtract %0",
+            "%5: u32 = BitFieldUExtract %1",
+        ),
+    ] {
         assert!(!fold(&text.replace(from, to)).contains("%9"), "{to}");
     }
 }
@@ -240,7 +250,9 @@ const XMAD_MULTIPLY_ADD: &str = "    %0: u32 = GetCbufU32 u32 0, u32 0
 ";
 
 /// The immediates of [`XMAD_MULTIPLY_ADD`] as Eden's pattern has them.
-const XMAD_ADD_IMMEDIATES: [u32; 18] = [0, 16, 16, 16, 0, 16, 16, 16, 0, 16, 0, 16, 16, 16, 16, 16, 16, 16];
+const XMAD_ADD_IMMEDIATES: [u32; 18] = [
+    0, 16, 16, 16, 0, 16, 16, 16, 0, 16, 0, 16, 16, 16, 16, 16, 16, 16,
+];
 
 #[test]
 fn the_xmad_multiply_add_folds_to_a_multiply_and_an_add() {
@@ -252,7 +264,11 @@ fn the_xmad_multiply_add_folds_to_a_multiply_and_an_add() {
         ),
         "{out}"
     );
-    for (a, b, c) in [(0x1234_5678, 0x9abc_def0, 0x0f0f_0f0f), (0xffff_ffff, 0xffff_ffff, 1), (0x8000, 0x8000, 0)] {
+    for (a, b, c) in [
+        (0x1234_5678, 0x9abc_def0, 0x0f0f_0f0f),
+        (0xffff_ffff, 0xffff_ffff, 1),
+        (0x8000, 0x8000, 0),
+    ] {
         let (before, after) = before_and_after(&text, &machine(&[a, b, c]));
         assert_eq!(after, before);
         assert_eq!(before.regs[0], a.wrapping_mul(b).wrapping_add(c));
@@ -265,7 +281,10 @@ fn the_xmad_multiply_add_needs_every_immediate() {
         let mut values = XMAD_ADD_IMMEDIATES;
         values[index] ^= 1;
         let text = fill(XMAD_MULTIPLY_ADD, &values);
-        assert!(!fold(&text).contains("%31"), "folded with immediate {index} changed");
+        assert!(
+            !fold(&text).contains("%31"),
+            "folded with immediate {index} changed"
+        );
     }
 }
 
@@ -274,25 +293,56 @@ fn the_xmad_multiply_add_needs_matching_operands() {
     let text = fill(XMAD_MULTIPLY_ADD, &XMAD_ADD_IMMEDIATES);
     // Each of the three reads of a, the three of b, and the link from %26 to %11, in turn.
     for (from, to) in [
-        ("%7: u32 = BitFieldUExtract %0", "%7: u32 = BitFieldUExtract %2"),
-        ("%10: u32 = BitFieldUExtract %0", "%10: u32 = BitFieldUExtract %2"),
-        ("%16: u32 = BitFieldUExtract %0", "%16: u32 = BitFieldUExtract %2"),
-        ("%6: u32 = BitFieldUExtract %1", "%6: u32 = BitFieldUExtract %2"),
-        ("%15: u32 = BitFieldUExtract %1", "%15: u32 = BitFieldUExtract %2"),
-        ("%22: u32 = BitFieldUExtract %1", "%22: u32 = BitFieldUExtract %2"),
-        ("%26: u32 = ShiftLeftLogical32 %11", "%26: u32 = ShiftLeftLogical32 %8"),
-        ("%11: u32 = BitFieldInsert %8", "%11: u32 = BitFieldInsert %7"),
+        (
+            "%7: u32 = BitFieldUExtract %0",
+            "%7: u32 = BitFieldUExtract %2",
+        ),
+        (
+            "%10: u32 = BitFieldUExtract %0",
+            "%10: u32 = BitFieldUExtract %2",
+        ),
+        (
+            "%16: u32 = BitFieldUExtract %0",
+            "%16: u32 = BitFieldUExtract %2",
+        ),
+        (
+            "%6: u32 = BitFieldUExtract %1",
+            "%6: u32 = BitFieldUExtract %2",
+        ),
+        (
+            "%15: u32 = BitFieldUExtract %1",
+            "%15: u32 = BitFieldUExtract %2",
+        ),
+        (
+            "%22: u32 = BitFieldUExtract %1",
+            "%22: u32 = BitFieldUExtract %2",
+        ),
+        (
+            "%26: u32 = ShiftLeftLogical32 %11",
+            "%26: u32 = ShiftLeftLogical32 %8",
+        ),
+        (
+            "%11: u32 = BitFieldInsert %8",
+            "%11: u32 = BitFieldInsert %7",
+        ),
     ] {
         assert!(!fold(&text.replace(from, to)).contains("%31"), "{to}");
     }
     // Reads of the same constant buffer word count as the same operand (Eden's `AreEqual`).
     let copy = text
-        .replace("%16: u32 = BitFieldUExtract %0", "%16: u32 = BitFieldUExtract %3")
+        .replace(
+            "%16: u32 = BitFieldUExtract %0",
+            "%16: u32 = BitFieldUExtract %3",
+        )
         .replace(
             "    %2: u32 = GetCbufU32 u32 0, u32 8\n",
             "    %2: u32 = GetCbufU32 u32 0, u32 8\n    %3: u32 = GetCbufU32 u32 0, u32 0\n",
         );
-    assert!(fold(&copy).contains("%30: u32 = IMul32 %0, %1"), "{}", fold(&copy));
+    assert!(
+        fold(&copy).contains("%30: u32 = IMul32 %0, %1"),
+        "{}",
+        fold(&copy)
+    );
 }
 
 #[test]
@@ -549,8 +599,14 @@ fn integer_operations_fold_when_every_argument_is_an_immediate() {
     // Each against the reference's definition, the expected value written out.
     let cases: [(&str, &str); 17] = [
         ("u32 = IMul32 u32 0x10000, u32 0x10001", "u32 0x10000"),
-        ("u32 = ShiftRightArithmetic32 u32 0x80000000, u32 31", "u32 0xffffffff"),
-        ("u32 = ShiftRightArithmetic32 u32 0x40000000, u32 30", "u32 0x1"),
+        (
+            "u32 = ShiftRightArithmetic32 u32 0x80000000, u32 31",
+            "u32 0xffffffff",
+        ),
+        (
+            "u32 = ShiftRightArithmetic32 u32 0x40000000, u32 30",
+            "u32 0x1",
+        ),
         ("u1 = SLessThan u32 0xffffffff, u32 0", "u1 true"),
         ("u1 = ULessThan u32 0xffffffff, u32 0", "u1 false"),
         ("u1 = SLessThanEqual u32 5, u32 5", "u1 true"),
@@ -564,7 +620,10 @@ fn integer_operations_fold_when_every_argument_is_an_immediate() {
         ("u32 = BitwiseAnd32 u32 0xff00, u32 0x0ff0", "u32 0xf00"),
         ("u32 = BitwiseOr32 u32 0xff00, u32 0x0ff0", "u32 0xfff0"),
         ("u32 = BitwiseXor32 u32 0xff00, u32 0x0ff0", "u32 0xf0f0"),
-        ("u32 = BitFieldSExtract u32 0x00f0, u32 4, u32 4", "u32 0xffffffff"),
+        (
+            "u32 = BitFieldSExtract u32 0x00f0, u32 4, u32 4",
+            "u32 0xffffffff",
+        ),
     ];
     for (op, result) in cases {
         assert_eq!(
@@ -659,7 +718,11 @@ fn the_integer_attributes_are_edens() {
         INTEGER_ATTRIBUTES,
         [24, 190, 191, 256, 257, 258].map(Attribute)
     );
-    for attribute in [23, 25, 189, 192, 255, 259].map(Attribute).into_iter().chain(INTEGER_ATTRIBUTES) {
+    for attribute in [23, 25, 189, 192, 255, 259]
+        .map(Attribute)
+        .into_iter()
+        .chain(INTEGER_ATTRIBUTES)
+    {
         let body = format!(
             "    %0: f32 = GetAttribute {attribute}, u32 0\n    %1: u32 = BitCastU32F32 %0\n"
         );
@@ -805,8 +868,14 @@ fn every_composite_extract_pairs_with_its_own_construct() {
 "
         );
         let out = fold(&body);
-        assert!(out.contains(&format!("%1: opaque = Identity {value}")), "{out}");
-        assert!(out.contains(&format!("%3: opaque = Identity {value}")), "{out}");
+        assert!(
+            out.contains(&format!("%1: opaque = Identity {value}")),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("%3: opaque = Identity {value}")),
+            "{out}"
+        );
     }
     // The half-precision extracts, whose components no immediate has, through a value.
     for count in 2..=4 {
@@ -818,7 +887,10 @@ fn every_composite_extract_pairs_with_its_own_construct() {
     %2: f16 = CompositeExtractF16x{count} %1, u32 1
 "
         );
-        assert!(fold(&body).contains("%2: opaque = Identity %0"), "f16x{count}");
+        assert!(
+            fold(&body).contains("%2: opaque = Identity %0"),
+            "f16x{count}"
+        );
     }
 }
 
@@ -836,7 +908,11 @@ block1:
 ";
     let mut function = parse(text);
     run(&mut function, Pass::ConstantPropagation).expect("runs");
-    assert!(function.to_string().contains("%2: u32 = CompositeExtractU32x2 %1, u32 0x0"));
+    assert!(
+        function
+            .to_string()
+            .contains("%2: u32 = CompositeExtractU32x2 %1, u32 0x0")
+    );
 }
 
 /// A derivative pattern: `FSwizzleAdd(bitcast(shuffle(bitcast(%0))), %0, swizzle)`.
@@ -854,10 +930,17 @@ fn swizzle(shuffle: &str, swizzle: u32) -> String {
 #[test]
 fn swizzled_adds_of_quad_butterflies_become_derivatives() {
     let dx = fold(&swizzle("QuadSwap %1, u32 0", SWIZZLE_DX));
-    assert!(dx.ends_with("    %5: f32 = DPdxFine %0\n    %4: opaque = Identity %5\n"), "{dx}");
+    assert!(
+        dx.ends_with("    %5: f32 = DPdxFine %0\n    %4: opaque = Identity %5\n"),
+        "{dx}"
+    );
     let dy = fold(&swizzle("QuadSwap %1, u32 1", SWIZZLE_DY));
-    assert!(dy.ends_with("    %5: f32 = DPdyFine %0\n    %4: opaque = Identity %5\n"), "{dy}");
-    let butterfly = format!("ShuffleButterfly %1, u32 1, u32 {QUAD_CLAMP}, u32 {QUAD_SEGMENTATION}");
+    assert!(
+        dy.ends_with("    %5: f32 = DPdyFine %0\n    %4: opaque = Identity %5\n"),
+        "{dy}"
+    );
+    let butterfly =
+        format!("ShuffleButterfly %1, u32 1, u32 {QUAD_CLAMP}, u32 {QUAD_SEGMENTATION}");
     assert!(fold(&swizzle(&butterfly, SWIZZLE_DX)).contains("DPdxFine %0"));
 }
 
@@ -870,8 +953,20 @@ fn swizzled_adds_need_the_matching_lane_and_swizzle() {
         // Another swizzle.
         ("QuadSwap %1, u32 0".to_owned(), SWIZZLE_DX + 1),
         // A butterfly that is not a quad's.
-        (format!("ShuffleButterfly %1, u32 1, u32 {}, u32 {QUAD_SEGMENTATION}", QUAD_CLAMP + 1), SWIZZLE_DX),
-        (format!("ShuffleButterfly %1, u32 1, u32 {QUAD_CLAMP}, u32 {}", QUAD_SEGMENTATION + 1), SWIZZLE_DX),
+        (
+            format!(
+                "ShuffleButterfly %1, u32 1, u32 {}, u32 {QUAD_SEGMENTATION}",
+                QUAD_CLAMP + 1
+            ),
+            SWIZZLE_DX,
+        ),
+        (
+            format!(
+                "ShuffleButterfly %1, u32 1, u32 {QUAD_CLAMP}, u32 {}",
+                QUAD_SEGMENTATION + 1
+            ),
+            SWIZZLE_DX,
+        ),
         // QuadSwap direction 0xffffffff wraps to lane mask 0.
         ("QuadSwap %1, u32 0xffffffff".to_owned(), SWIZZLE_DX),
     ] {
@@ -894,8 +989,15 @@ fn swizzled_adds_compare_immediates_by_bits() {
     %4: f32 = FSwizzleAdd %3, f32 0x3f800000, u32 {SWIZZLE_DX}
 "
     );
-    assert!(fold(&body).contains("DPdxFine f32 0x3f800000"), "{}", fold(&body));
-    let off = body.replace("FSwizzleAdd %3, f32 0x3f800000", "FSwizzleAdd %3, f32 0x3f800001");
+    assert!(
+        fold(&body).contains("DPdxFine f32 0x3f800000"),
+        "{}",
+        fold(&body)
+    );
+    let off = body.replace(
+        "FSwizzleAdd %3, f32 0x3f800000",
+        "FSwizzleAdd %3, f32 0x3f800001",
+    );
     assert!(!fold(&off).contains("DPd"));
 }
 
@@ -961,5 +1063,9 @@ block3:
 ";
     let mut function = parse(text);
     run(&mut function, Pass::ConstantPropagation).expect("runs");
-    assert!(function.to_string().contains("%1: opaque = Identity u32 0x3"));
+    assert!(
+        function
+            .to_string()
+            .contains("%1: opaque = Identity u32 0x3")
+    );
 }
