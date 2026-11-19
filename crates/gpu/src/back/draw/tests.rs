@@ -504,6 +504,13 @@ impl Rig {
             &[],
             fields(&[(clc797::SET_SURFACE_CLIP_VERTICAL_HEIGHT, SIZE)]),
         );
+        // Viewport 0's scale and offset apply only while SET_VIEWPORT_SCALE_OFFSET is on; its
+        // reset value is off (`without_scale_offset_viewports_and_scissors_are_the_surface_clip`).
+        self.set(
+            &clc797::SET_VIEWPORT_SCALE_OFFSET,
+            &[],
+            clc797::SET_VIEWPORT_SCALE_OFFSET_ENABLE_TRUE,
+        );
         self.set(&clc797::SET_VIEWPORT_SCALE_X, &[0], 4.0f32.to_bits());
         self.set(&clc797::SET_VIEWPORT_SCALE_Y, &[0], 4.0f32.to_bits());
         self.set(&clc797::SET_VIEWPORT_OFFSET_X, &[0], 4.0f32.to_bits());
@@ -2622,7 +2629,7 @@ fn root_table_words_are_bounded_by_bank_and_offset() {
     // The constants buffer holds them at the table's offset.
     let bytes = constants_bytes(
         &roots,
-        &starquake_shader::driver_constants::DriverConstants::default(),
+        &starquake_shader::driver_constants::DriverConstants::default().encode(),
     );
     let at = 7 * ROOT_TABLE_BYTES + ROOT_TABLE_BYTES - 4;
     assert_eq!(bytes[at..at + 4], 0x55u32.to_le_bytes());
@@ -3091,14 +3098,26 @@ fn the_shader_description_carries_the_module_slots_and_resources() {
 
 #[test]
 fn draws_destroy_the_constants_buffer_after_the_last_fence() {
-    let mut rig = Rig::new(ready(vec![], vec![driver_use(0, 0)]));
+    let mut rig = Rig::new(ready(
+        vec![],
+        vec![driver_use(0, 0), texture_use(0, 1), sampler_use(0, 2)],
+    ));
     rig.basic();
     rig.draw();
     rig.submit();
     let Rig { draws, backend, .. } = rig;
+    let before = backend.snapshot();
     drop(draws);
     let snapshot = backend.snapshot();
-    assert!(snapshot.contains("destroy"), "{snapshot}");
+    let destroys: Vec<&str> = snapshot
+        .strip_prefix(before.as_str())
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains("destroy"))
+        .collect();
+    // The constants buffer, the one sampler and the two shaders, each once.
+    assert_eq!(destroys.len(), 4, "{destroys:?}");
+    assert_eq!(backend.refused_destroys(), 0);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3106,7 +3125,18 @@ fn draws_destroy_the_constants_buffer_after_the_last_fence() {
 
 #[test]
 fn error_messages_are_plain_words() {
-    let cases: [(DrawError, &str); 6] = [
+    let cases: [(DrawError, &str); 8] = [
+        (
+            DrawError::RootBank {
+                stage: GuestStage::Pixel,
+                bank: 32,
+            },
+            "the pixel stage reads constant buffer 32, which no root table backs (banks 24 to 31)",
+        ),
+        (
+            DrawError::NotFinite { what: "viewport" },
+            "the draw's viewport is not finite",
+        ),
         (
             DrawError::Topology { value: 0x1001 },
             "primitive topology 0x1001 is not one the class header defines for a draw",
@@ -3228,10 +3258,12 @@ fn depth_bias_applies_only_with_the_topologys_offset_enable() {
     // Triangles: the fill enable is off, so no bias.
     rig.draw();
     assert_eq!(rig.last_draw().dynamic.depth_bias.constant, 0.0);
-    // Lines: the line enable is on.
+    // Lines: the line enable is on. The constant is SET_DEPTH_BIAS / 2, as Eden's
+    // UpdateDepthBias passes `regs.depth_bias / 2.0f`; the slope scale is unchanged.
     rig.draw_arrays(clc797::BEGIN_OP_LINES, 0, 2).unwrap();
     let bias = rig.last_draw().dynamic.depth_bias;
-    assert_eq!((bias.constant, bias.slope_scale), (2.0, 3.0));
+    assert_eq!((bias.constant, bias.slope_scale), (1.0, 3.0));
+    assert_eq!(fixed::DEPTH_BIAS_UNITS_PER_HOST_UNIT, 2.0);
     // Points: off again.
     rig.draw_arrays(clc797::BEGIN_OP_POINTS, 0, 1).unwrap();
     assert_eq!(rig.last_draw().dynamic.depth_bias.constant, 0.0);
@@ -3305,4 +3337,545 @@ fn bank_24_answers_from_the_first_root_table() {
         answers.cbuf_word(GuestStage::Pixel, FIRST_ROOT_BANK - 1, 0),
         Some(0xdead_beef)
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review fixes: inline draws, root banks, the surface-clip viewports, the rasterizer values,
+// finite values and the host's viewport count.
+
+#[test]
+fn an_inline_index_draw_draws_nothing_until_the_next_begin() {
+    for inline in call::INLINE_METHODS {
+        let mut rig = Rig::new(ready(vec![], vec![]));
+        rig.basic();
+        // Stale vertex-array registers an END in the general mode would draw.
+        rig.set(&clc797::SET_VERTEX_ARRAY_START, &[], 1);
+        rig.set(&clc797::DRAW_VERTEX_ARRAY, &[], 3);
+        let unhandled = Ok(Some(Outcome::Skipped(Skip::Unhandled(inline.name))));
+        assert_eq!(
+            rig.put(&clc797::BEGIN, &[], clc797::BEGIN_OP_TRIANGLES),
+            Ok(None)
+        );
+        assert_eq!(rig.put(inline, &[], 0x0001_0000), unhandled);
+        assert_eq!(rig.put(&clc797::END, &[], 0), unhandled, "{}", inline.name);
+        // A flush draws nothing in the inline mode (Eden's DrawDeferred returns), and a second
+        // END is still the inline draw.
+        assert_eq!(rig.flush(), Ok(None));
+        assert_eq!(rig.put(&clc797::END, &[], 0), unhandled);
+        assert_eq!(rig.draw_commands(), [], "{}", inline.name);
+        // BEGIN with INSTANCE_ID UNCHANGED keeps the mode.
+        let unchanged = fields(&[
+            (clc797::BEGIN_OP, clc797::BEGIN_OP_TRIANGLES),
+            (
+                clc797::BEGIN_INSTANCE_ID,
+                clc797::BEGIN_INSTANCE_ID_UNCHANGED,
+            ),
+        ]);
+        assert_eq!(rig.put(&clc797::BEGIN, &[], unchanged), Ok(None));
+        assert_eq!(rig.put(&clc797::END, &[], 0), unhandled);
+        // BEGIN with INSTANCE_ID FIRST leaves it: the next END draws the vertex array.
+        assert_eq!(rig.draw(), Outcome::Drawn);
+        assert_eq!(rig.draw_commands().len(), 1);
+        assert_eq!(rig.draws.counters().unhandled, 4);
+    }
+    // BEGIN with INSTANCE_ID SUBSEQUENT leaves it too, for the instance mode.
+    let mut rig = Rig::new(ready(vec![], vec![]));
+    rig.basic();
+    rig.put(&clc797::DRAW_INLINE_INDEX, &[], 0).unwrap();
+    let subsequent = fields(&[
+        (clc797::BEGIN_OP, clc797::BEGIN_OP_TRIANGLES),
+        (
+            clc797::BEGIN_INSTANCE_ID,
+            clc797::BEGIN_INSTANCE_ID_SUBSEQUENT,
+        ),
+    ]);
+    assert_eq!(rig.put(&clc797::BEGIN, &[], subsequent), Ok(None));
+    assert_eq!(rig.put(&clc797::END, &[], 0), Ok(None));
+    assert_eq!(rig.flush(), Ok(Some(Outcome::Drawn)));
+    // DRAW_ZERO_INDEX and DRAW_AUTO do not enter the inline mode.
+    for method in [&clc797::DRAW_ZERO_INDEX, &clc797::DRAW_AUTO] {
+        let mut rig = Rig::new(ready(vec![], vec![]));
+        rig.basic();
+        rig.set(&clc797::SET_VERTEX_ARRAY_START, &[], 0);
+        rig.set(&clc797::DRAW_VERTEX_ARRAY, &[], 3);
+        assert_eq!(
+            rig.put(&clc797::BEGIN, &[], clc797::BEGIN_OP_TRIANGLES),
+            Ok(None)
+        );
+        rig.put(method, &[], 0).unwrap();
+        assert_eq!(
+            rig.put(&clc797::END, &[], 0),
+            Ok(Some(Outcome::Drawn)),
+            "{}",
+            method.name
+        );
+    }
+}
+
+#[test]
+fn root_banks_past_the_last_table_are_refused() {
+    let last = super::root::LAST_ROOT_BANK;
+    // PR #4588's IsBank: banks 24 to 31, written out.
+    assert_eq!(last, 31);
+    let mut rig = Rig::new(ready(vec![], vec![uniform(0, 0, last, 0)]));
+    rig.basic();
+    assert_eq!(rig.draw(), Outcome::Drawn);
+    let BindingResource::Buffer(slice) = rig.last_draw().bindings[0].resource else {
+        unreachable!("a buffer");
+    };
+    let table = u64::from(last - FIRST_ROOT_BANK);
+    let bytes = u64::try_from(ROOT_TABLE_BYTES).unwrap();
+    assert_eq!((slice.offset, slice.size), (table * bytes, bytes));
+    assert!(slice.offset + slice.size <= DRIVER_CONSTANTS_OFFSET);
+    for bank in [last + 1, 40, u8::MAX] {
+        let mut rig = Rig::new(ready(vec![], vec![uniform(0, 0, bank, 0)]));
+        rig.basic();
+        assert_eq!(
+            rig.draw_arrays(clc797::BEGIN_OP_TRIANGLES, 0, 3),
+            Err(DrawError::RootBank {
+                stage: GuestStage::Pixel,
+                bank
+            })
+        );
+        assert_eq!(rig.draw_commands(), []);
+    }
+}
+
+#[test]
+fn a_bound_constant_buffer_of_size_zero_is_unbound() {
+    let mut rig = Rig::new(ready(vec![], vec![uniform(0, 0, 11, 0x10)]));
+    rig.basic();
+    // VALID set, size 0.
+    rig.bind(4, 11, UNIFORMS, 0);
+    assert_eq!(
+        rig.draw_arrays(clc797::BEGIN_OP_TRIANGLES, 0, 3),
+        Err(DrawError::UnboundConstantBuffer {
+            stage: GuestStage::Pixel,
+            bank: 11
+        })
+    );
+    // One byte is bound.
+    rig.bind(4, 11, UNIFORMS, 1);
+    assert_eq!(rig.draw(), Outcome::Drawn);
+}
+
+/// Writes the surface clip `(x, y, width, height)`.
+fn surface_clip(rig: &mut Rig, x: u32, y: u32, width: u32, height: u32) {
+    rig.set(
+        &clc797::SET_SURFACE_CLIP_HORIZONTAL,
+        &[],
+        fields(&[
+            (clc797::SET_SURFACE_CLIP_HORIZONTAL_X, x),
+            (clc797::SET_SURFACE_CLIP_HORIZONTAL_WIDTH, width),
+        ]),
+    );
+    rig.set(
+        &clc797::SET_SURFACE_CLIP_VERTICAL,
+        &[],
+        fields(&[
+            (clc797::SET_SURFACE_CLIP_VERTICAL_Y, y),
+            (clc797::SET_SURFACE_CLIP_VERTICAL_HEIGHT, height),
+        ]),
+    );
+}
+
+fn lower_left(rig: &mut Rig) {
+    rig.set(
+        &clc797::SET_WINDOW_ORIGIN,
+        &[],
+        fields(&[(
+            clc797::SET_WINDOW_ORIGIN_MODE,
+            clc797::SET_WINDOW_ORIGIN_MODE_LOWER_LEFT,
+        )]),
+    );
+}
+
+#[test]
+fn without_scale_offset_viewports_and_scissors_are_the_surface_clip() {
+    use starquake_render::command::{Rect, Viewport};
+    let mut rig = Rig::new(ready(vec![], vec![]));
+    rig.basic();
+    // The reset value is off (Eden's viewport_scale_offset_enabled is 0 at reset).
+    let fresh = Mirror::new(CHANNEL, ClassId(clc797::CLASS));
+    assert_eq!(
+        fresh
+            .reg(&clc797::SET_VIEWPORT_SCALE_OFFSET, &[])
+            .unwrap()
+            .field(clc797::SET_VIEWPORT_SCALE_OFFSET_ENABLE),
+        Ok(clc797::SET_VIEWPORT_SCALE_OFFSET_ENABLE_FALSE)
+    );
+    rig.set(
+        &clc797::SET_VIEWPORT_SCALE_OFFSET,
+        &[],
+        clc797::SET_VIEWPORT_SCALE_OFFSET_ENABLE_FALSE,
+    );
+    // A scissor that is on is ignored too.
+    rig.set(&clc797::SET_SCISSOR_ENABLE, &[0], 1);
+    surface_clip(&mut rig, 2, 3, 10, 6);
+    rig.draw();
+    let draw = rig.last_draw();
+    let viewport = Viewport {
+        x: 2.0,
+        y: 3.0,
+        width: 10.0,
+        height: 6.0,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    };
+    let rect = Rect {
+        x: 2,
+        y: 3,
+        width: 10,
+        height: 6,
+    };
+    let slots = usize::try_from(crate::back::state::VIEWPORTS).unwrap();
+    assert_eq!(draw.dynamic.viewports, vec![viewport; slots]);
+    assert_eq!(draw.dynamic.scissors, vec![rect; slots]);
+    // Lower left: the viewport flips by its height; the scissor's y is 6 - (3 + 6), clamped
+    // at 0 (Eden's u32 wraps: a listed divergence).
+    lower_left(&mut rig);
+    rig.draw();
+    let draw = rig.last_draw();
+    assert_eq!(
+        draw.dynamic.viewports[0],
+        Viewport {
+            y: 9.0,
+            height: -6.0,
+            ..viewport
+        }
+    );
+    assert_eq!(draw.dynamic.scissors[0], Rect { y: 0, ..rect });
+    // A zero clip is 1 by 1.
+    surface_clip(&mut rig, 0, 0, 0, 0);
+    rig.draw();
+    let draw = rig.last_draw();
+    assert_eq!(
+        draw.dynamic.viewports[0],
+        Viewport {
+            x: 0.0,
+            y: 1.0,
+            width: 1.0,
+            height: -1.0,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        }
+    );
+    assert_eq!(
+        draw.dynamic.scissors[0],
+        Rect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1
+        }
+    );
+    // Turning the scale and offset on again reads viewport 0's registers.
+    rig.set(
+        &clc797::SET_VIEWPORT_SCALE_OFFSET,
+        &[],
+        clc797::SET_VIEWPORT_SCALE_OFFSET_ENABLE_TRUE,
+    );
+    surface_clip(&mut rig, 0, 0, SIZE, SIZE);
+    rig.draw();
+    let viewport = rig.last_draw().dynamic.viewports[0];
+    assert_eq!((viewport.width, viewport.height), (8.0, -8.0));
+}
+
+#[test]
+fn the_lower_left_flip_of_a_negative_scale_turns_at_the_clip_height() {
+    // Eden's GetViewportState: `src.scale_y < 0.0f && y >= clip_height` takes y = clip - y.
+    let mut rig = Rig::new(ready(vec![], vec![]));
+    rig.basic();
+    lower_left(&mut rig);
+    let clip = f32::from(u16::try_from(SIZE).unwrap());
+    rig.set(&clc797::SET_VIEWPORT_SCALE_Y, &[0], (-2.0f32).to_bits());
+    // y = offset - scale = clip exactly: flipped to clip - y = 0, height -(-4) = 4.
+    rig.set(&clc797::SET_VIEWPORT_OFFSET_Y, &[0], (clip - 2.0).to_bits());
+    rig.draw();
+    let viewport = rig.last_draw().dynamic.viewports[0];
+    assert_eq!((viewport.y, viewport.height), (0.0, 4.0));
+    // Half a pixel below: y + clip.
+    rig.set(&clc797::SET_VIEWPORT_OFFSET_Y, &[0], (clip - 2.5).to_bits());
+    rig.draw();
+    let viewport = rig.last_draw().dynamic.viewports[0];
+    assert_eq!((viewport.y, viewport.height), (clip - 0.5 + clip, 4.0));
+    // A positive scale with y past the clip is not flipped.
+    rig.set(&clc797::SET_VIEWPORT_SCALE_Y, &[0], 2.0f32.to_bits());
+    rig.set(&clc797::SET_VIEWPORT_OFFSET_Y, &[0], (clip + 2.0).to_bits());
+    rig.draw();
+    let viewport = rig.last_draw().dynamic.viewports[0];
+    assert_eq!((viewport.y, viewport.height), (clip + clip, -4.0));
+}
+
+/// The rasterizer part derived from the rig's state.
+fn raster_part(rig: &Rig) -> fixed::RasterPart {
+    let mut parts = fixed::Parts::new();
+    *parts
+        .refresh(&rig.mirror, rig.mirror.dirty())
+        .unwrap()
+        .raster
+}
+
+#[test]
+fn the_front_face_flips_with_flip_y() {
+    use starquake_render::pipeline::FrontFace;
+    let mut rig = Rig::new(ready(vec![], vec![]));
+    rig.basic();
+    let origin = |flip| {
+        fields(&[
+            (
+                clc797::SET_WINDOW_ORIGIN_MODE,
+                clc797::SET_WINDOW_ORIGIN_MODE_UPPER_LEFT,
+            ),
+            (clc797::SET_WINDOW_ORIGIN_FLIP_Y, flip),
+        ])
+    };
+    for (face, flip, expected) in [
+        (
+            clc797::OGL_SET_FRONT_FACE_V_CCW,
+            clc797::SET_WINDOW_ORIGIN_FLIP_Y_FALSE,
+            FrontFace::Ccw,
+        ),
+        (
+            clc797::OGL_SET_FRONT_FACE_V_CCW,
+            clc797::SET_WINDOW_ORIGIN_FLIP_Y_TRUE,
+            FrontFace::Cw,
+        ),
+        (
+            clc797::OGL_SET_FRONT_FACE_V_CW,
+            clc797::SET_WINDOW_ORIGIN_FLIP_Y_FALSE,
+            FrontFace::Cw,
+        ),
+        (
+            clc797::OGL_SET_FRONT_FACE_V_CW,
+            clc797::SET_WINDOW_ORIGIN_FLIP_Y_TRUE,
+            FrontFace::Ccw,
+        ),
+    ] {
+        rig.set(&clc797::OGL_SET_FRONT_FACE, &[], face);
+        rig.set(&clc797::SET_WINDOW_ORIGIN, &[], origin(flip));
+        assert_eq!(raster_part(&rig).front_face, expected, "{face:#x} {flip}");
+        // Through a draw: SET_WINDOW_ORIGIN re-derives the rasterizer part.
+        assert_eq!(rig.draw(), Outcome::Drawn);
+    }
+}
+
+#[test]
+fn the_line_width_follows_the_anti_aliased_line_enable() {
+    let mut rig = Rig::new(ready(vec![], vec![]));
+    rig.basic();
+    rig.set(&clc797::SET_LINE_WIDTH_FLOAT, &[], 3.0f32.to_bits());
+    rig.set(&clc797::SET_ALIASED_LINE_WIDTH_FLOAT, &[], 5.0f32.to_bits());
+    // Off (the reset value): the aliased width.
+    rig.draw();
+    assert_eq!(rig.last_draw().dynamic.line_width, 5.0);
+    rig.set(
+        &clc797::SET_ANTI_ALIASED_LINE,
+        &[],
+        clc797::SET_ANTI_ALIASED_LINE_ENABLE_TRUE,
+    );
+    rig.draw();
+    assert_eq!(rig.last_draw().dynamic.line_width, 3.0);
+    assert_eq!(raster_part(&rig).line_width, 3.0);
+    rig.set(
+        &clc797::SET_ANTI_ALIASED_LINE,
+        &[],
+        clc797::SET_ANTI_ALIASED_LINE_ENABLE_FALSE,
+    );
+    rig.draw();
+    assert_eq!(rig.last_draw().dynamic.line_width, 5.0);
+}
+
+#[test]
+fn the_topology_override_none_keeps_the_begin_topology() {
+    // Eden's PrimitiveTopologyOverride::None, written out.
+    assert_eq!(fixed::TOPOLOGY_OVERRIDE_NONE, 0);
+    let mut rig = Rig::new(ready(vec![], vec![]));
+    rig.basic();
+    rig.set(
+        &clc797::SET_PRIMITIVE_TOPOLOGY_CONTROL,
+        &[],
+        clc797::SET_PRIMITIVE_TOPOLOGY_CONTROL_OVERRIDE_USE_SEPARATE_TOPOLOGY_STATE,
+    );
+    rig.set(&clc797::SET_PRIMITIVE_TOPOLOGY, &[], 0);
+    for (begin, topology) in [
+        (clc797::BEGIN_OP_QUADS, Topology::Quads),
+        (clc797::BEGIN_OP_LINE_LOOP, Topology::LineLoop),
+    ] {
+        assert_eq!(fixed::effective_topology(&rig.mirror, begin), Ok(topology));
+    }
+    assert_eq!(
+        rig.draw_arrays(clc797::BEGIN_OP_TRIANGLES, 0, 3),
+        Ok(Some(Outcome::Drawn))
+    );
+    // One past it is points.
+    rig.set(&clc797::SET_PRIMITIVE_TOPOLOGY, &[], 1);
+    assert_eq!(
+        fixed::effective_topology(&rig.mirror, clc797::BEGIN_OP_QUADS),
+        Ok(Topology::Points)
+    );
+}
+
+#[test]
+fn a_draw_with_a_value_that_is_not_finite_is_refused_and_the_list_still_submits() {
+    let cases: [(&Method, &[u32], u32, &str); 6] = [
+        (
+            &clc797::SET_VIEWPORT_SCALE_X,
+            &[0],
+            f32::NAN.to_bits(),
+            "viewport",
+        ),
+        // f32::MAX * 2 is an infinite height.
+        (
+            &clc797::SET_VIEWPORT_SCALE_Y,
+            &[0],
+            f32::MAX.to_bits(),
+            "viewport",
+        ),
+        (
+            &clc797::SET_BLEND_CONST_RED,
+            &[],
+            f32::INFINITY.to_bits(),
+            "blend constant",
+        ),
+        (
+            &clc797::SET_DEPTH_BIAS,
+            &[],
+            f32::NAN.to_bits(),
+            "depth bias",
+        ),
+        (
+            &clc797::SET_ALIASED_LINE_WIDTH_FLOAT,
+            &[],
+            f32::NEG_INFINITY.to_bits(),
+            "line width",
+        ),
+        (
+            &clc797::SET_SLOPE_SCALE_DEPTH_BIAS,
+            &[],
+            f32::NAN.to_bits(),
+            "depth bias",
+        ),
+    ];
+    for (method, indices, value, what) in cases {
+        let mut rig = Rig::new(ready(vec![], vec![]));
+        rig.basic();
+        // The fill offset makes the bias reach a triangle draw.
+        rig.set(&clc797::SET_POLY_OFFSET_FILL, &[], 1);
+        assert_eq!(rig.draw(), Outcome::Drawn);
+        let before = rig.list.commands.len();
+        rig.set(method, indices, value);
+        assert_eq!(
+            rig.draw_arrays(clc797::BEGIN_OP_TRIANGLES, 0, 3),
+            Err(DrawError::NotFinite { what }),
+            "{}",
+            method.name
+        );
+        // Refused before anything was appended.
+        assert_eq!(rig.list.commands.len(), before, "{}", method.name);
+        assert_eq!(rig.draws.counters().failed, 1);
+        // The draw before it still reaches the backend.
+        let list = core::mem::take(&mut rig.list);
+        assert!(rig.backend.submit(list).is_ok(), "{}", method.name);
+    }
+    // A bias that a topology does not apply is not looked at.
+    let mut rig = Rig::new(ready(vec![], vec![]));
+    rig.basic();
+    rig.set(&clc797::SET_DEPTH_BIAS, &[], f32::NAN.to_bits());
+    assert_eq!(rig.draw(), Outcome::Drawn);
+}
+
+#[test]
+fn a_host_with_one_viewport_gets_one_viewport_and_scissor() {
+    let mut one = caps(true, Features::ALL, 16);
+    one.limits.max_viewports = 1;
+    let mut rig = Rig::with(one, WaitWhileCompiling::Wait, ready(vec![], vec![]));
+    rig.basic();
+    assert_eq!(rig.draw(), Outcome::Drawn);
+    let draw = rig.last_draw();
+    assert_eq!(
+        (draw.dynamic.viewports.len(), draw.dynamic.scissors.len()),
+        (1, 1)
+    );
+    let list = core::mem::take(&mut rig.list);
+    assert!(rig.backend.submit(list).is_ok());
+    // A host with more than the guest's 16 still gets 16.
+    let mut many = caps(true, Features::ALL, 16);
+    many.limits.max_viewports = 32;
+    let mut rig = Rig::with(many, WaitWhileCompiling::Wait, ready(vec![], vec![]));
+    rig.basic();
+    rig.draw();
+    let slots = usize::try_from(crate::back::state::VIEWPORTS).unwrap();
+    assert_eq!(rig.last_draw().dynamic.viewports.len(), slots);
+}
+
+#[test]
+fn loading_a_root_table_uploads_the_constants_buffer_again() {
+    let mut rig = Rig::new(ready(vec![], vec![uniform(0, 0, FIRST_ROOT_BANK, 0)]));
+    rig.basic();
+    let uploads = |rig: &Rig| {
+        rig.list
+            .commands
+            .iter()
+            .filter(|c| matches!(c, Command::Upload { from, .. } if u64::try_from(from.len()) == Ok(CONSTANTS_BUFFER_SIZE)))
+            .count()
+    };
+    rig.draw();
+    assert_eq!(uploads(&rig), 1);
+    rig.draw();
+    assert_eq!(uploads(&rig), 1);
+    rig.set(
+        &clc797::SET_ROOT_TABLE_SELECTOR,
+        &[],
+        fields(&[(clc797::SET_ROOT_TABLE_SELECTOR_OFFSET, 4)]),
+    );
+    rig.mirror
+        .run(clc797::LOAD_ROOT_TABLE.method(), &[0xabcd])
+        .unwrap();
+    rig.draws.load_root_table(&rig.mirror, &[0xabcd]).unwrap();
+    rig.draw();
+    assert_eq!(uploads(&rig), 2);
+    let Some(Command::Upload { from, .. }) = rig
+        .list
+        .commands
+        .iter()
+        .rev()
+        .find(|c| matches!(c, Command::Upload { .. }))
+    else {
+        unreachable!("an upload");
+    };
+    assert_eq!(from.bytes()[4..8], 0xabcdu32.to_le_bytes());
+}
+
+#[test]
+fn a_target_at_address_zero_is_made_like_any_other() {
+    // Eden's FindColorBuffer and FindDepthBuffer return no view for GPU address 0; here the
+    // texture cache makes the target (a listed divergence).
+    let mut rig = Rig::new(ready(vec![], vec![]));
+    rig.basic();
+    rig.address(
+        &clc797::SET_COLOR_TARGET_A,
+        &clc797::SET_COLOR_TARGET_B,
+        &[0],
+        0,
+    );
+    rig.set(&clc797::SET_ZT_FORMAT, &[], clc797::SET_ZT_FORMAT_V_Z16);
+    rig.set(&clc797::SET_ZT_SELECT, &[], 1);
+    rig.set(&clc797::SET_ZT_SIZE_A, &[], SIZE);
+    rig.set(&clc797::SET_ZT_SIZE_B, &[], SIZE);
+    let targets = targets::targets(&rig.mirror).unwrap();
+    assert_eq!(targets.colors[0].map(|info| info.address), Some(0));
+    assert_eq!(targets.depth.map(|info| info.address), Some(0));
+    assert_eq!(rig.draw(), Outcome::Drawn);
+    let set = rig
+        .list
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            Command::SetRenderTargets(targets) => Some(*targets),
+            _ => None,
+        })
+        .unwrap();
+    assert!(set.colors[0].is_some());
+    assert!(set.depth_stencil.is_some());
 }

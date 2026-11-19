@@ -31,6 +31,12 @@ pub const FIRST_ROOT_BANK: u8 = 24;
 /// How many root tables there are (`Count`).
 pub const ROOT_TABLES: usize = 8;
 
+/// The last bank a root table backs: [`FIRST_ROOT_BANK`] + [`ROOT_TABLES`] - 1 (PR #4588's
+/// `IsBank`, `bank - FirstBank < Count`; the assertion below ties the three).
+pub const LAST_ROOT_BANK: u8 = 31;
+
+const _: () = assert!(LAST_ROOT_BANK as usize + 1 == FIRST_ROOT_BANK as usize + ROOT_TABLES);
+
 /// Bytes in one root table (`Size`).
 pub const ROOT_TABLE_BYTES: usize = 256;
 
@@ -79,13 +85,17 @@ impl RootTables {
         self.table(bank)?.get(index).copied()
     }
 
-    /// The tables' bytes, table after table, little-endian.
-    pub fn bytes(&self) -> Vec<u8> {
-        self.tables
-            .iter()
-            .flatten()
-            .flat_map(|word| word.to_le_bytes())
-            .collect()
+    /// Writes the tables' bytes, table after table, little-endian, to the start of `out`; a
+    /// shorter `out` takes the words that fit whole.
+    pub fn write_le(&self, out: &mut [u8]) {
+        for (chunk, word) in out
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(self.tables.iter().flatten())
+        {
+            chunk.copy_from_slice(&word.to_le_bytes());
+        }
     }
 
     /// Bumped by every stored word.

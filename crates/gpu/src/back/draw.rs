@@ -30,9 +30,19 @@
 //!    first of the graphics decisions of 2026-11-12): wait for the ticket, or skip
 //!    ([`Skip::ShaderPending`]); `Rejected` skips the draw ([`Skip::ShaderRejected`]), logged and
 //!    counted once per distinct set of requests (rows 90, 112; the rejection does not say which
-//!    program of the set failed, so the set is the unit).
+//!    program of the set failed, so the set is the unit). **This departs from the approved
+//!    spec**, which says (gpu-protocol, "3D: from state to a draw"): "A draw whose shader was
+//!    rejected is skipped and counted, once per program in the log (negative cache, rows 90,
+//!    112)." Eden likewise keys `IsRejected` by program address. Here a program rejected in two
+//!    sets (one vertex program with two pixel programs) is logged and counted twice, and a set
+//!    is remembered whole. Keying by program needs the shader cache's rejection to name the
+//!    program, which the seam's [`starquake_shader::lookup::Rejection`] does not; an **owner
+//!    question**, pinned by `tests::a_rejected_set_skips_its_draws_and_logs_once`.
 //! 6. **Resources**: each shader's constant buffers (banks 24 to 31 from the root tables,
-//!    [`root`]), textures and samplers (by handle, through the texture cache and [`sampler`]),
+//!    [`root`]; a bank past 31 is refused, [`DrawError::RootBank`], as PR #4588's `IsBank`
+//!    requires `bank - 24 < 8`, `tests::root_banks_past_the_last_table_are_refused`; a bank
+//!    below 24 needs `VALID` and a size above 0, `tests::a_bound_constant_buffer_of_size_zero_is_unbound`),
+//!    textures and samplers (by handle, through the texture cache and [`sampler`]),
 //!    the vertex streams and the index buffer through the buffer cache, the render targets
 //!    through the texture cache ([`targets`]), and the pipeline through the pipeline-key cache.
 //!    A pipeline that failed is skipped ([`Skip::PipelineFailed`]); one still compiling is drawn,
@@ -44,7 +54,17 @@
 //!    area (the surface clip, or colour target 0's size when the clip is not set, as Eden-NX2's
 //!    `vk_graphics_pipeline.cpp`), and the draw's base vertex and instance.
 //! 8. **The draw**: a [`Command::SetRenderTargets`] when the targets' views changed since the
-//!    last one, then the [`Command::Draw`].
+//!    last one, then the [`Command::Draw`], with the first `min(Caps::limits.max_viewports, 16)`
+//!    viewports and scissors, as Eden sends `min(device.GetMaxViewports(), NumViewports)`
+//!    (`UpdateViewportsState`, `eden/src/video_core/renderer_vulkan/vk_rasterizer.cpp`;
+//!    `tests::a_host_with_one_viewport_gets_one_viewport_and_scissor`).
+//!
+//! Between steps 2 and 3 the dynamic values the draw hands the backend (every viewport, the blend
+//! constant, the depth bias the topology applies and the line width) must be finite, or the draw
+//! is refused ([`DrawError::NotFinite`]) before any cache or the list is touched: the backend
+//! would refuse the value at submit and lose every draw in the list. Eden hands such a value to
+//! the host API as it is; a listed divergence,
+//! `tests::a_draw_with_a_value_that_is_not_finite_is_refused_and_the_list_still_submits`.
 //!
 //! # Errors and what they leave
 //!
@@ -61,9 +81,31 @@
 //! the draw path owns: the eight tables at offsets `256 * i`, then the driver constants at
 //! [`DRIVER_CONSTANTS_OFFSET`]. That offsets are multiples of [`CONSTANTS_ALIGN`] (256, WebGPU's
 //! default uniform-buffer offset alignment) is a **guess** at what every host accepts; `Caps`
-//! names no such limit. The buffer is uploaded before a draw that binds it whenever its bytes
-//! changed since the last upload; the command model orders each upload before the draws after
-//! it ("Every command says which resources it reads and writes").
+//! names no such limit. The buffer is uploaded before a draw that binds it whenever the root
+//! tables were written ([`RootTables::generation`] moved) or the encoded driver constants changed
+//! since the last upload; the command model orders each upload before the draws after it ("Every
+//! command says which resources it reads and writes"). The comparison allocates nothing; the
+//! bytes are built in a stack array only for an upload
+//! (`tests::the_constants_buffer_is_uploaded_when_its_bytes_change`,
+//! `tests::loading_a_root_table_uploads_the_constants_buffer_again`).
+//!
+//! # Divergences from Eden
+//!
+//! Each fails a draw (or makes an object) where Eden still draws (or binds nothing); each is
+//! pinned by the test named.
+//!
+//! - **An active attribute on a disabled stream fails the draw** ([`DrawError::AttributeStream`]).
+//!   Eden binds all 32 streams and leaves out the attributes the vertex program does not load
+//!   (`stage_infos[0].loads.Generic`, `vk_graphics_pipeline.cpp`); the seam's sets carry no
+//!   such list (`fixed`'s vertex docs). `tests::every_active_attribute_is_in_the_layout`.
+//! - **A texture or sampler index past its pool's maximum fails the draw**
+//!   ([`DrawError::PoolIndex`]). Eden binds `NULL_IMAGE_VIEW_ID` or `NULL_SAMPLER_ID`
+//!   (`VisitImageView` and `GetSamplerId`, `eden/src/video_core/texture_cache/texture_cache.h`).
+//!   `tests::a_handle_past_a_pool_maximum_is_an_error`.
+//! - **A colour or depth target at GPU address 0 is made like any other.** Eden's
+//!   `FindColorBuffer` and `FindDepthBuffer` (same file) return no view for address 0; here the
+//!   texture cache makes the target. `tests::a_target_at_address_zero_is_made_like_any_other`.
+//! - **A non-finite dynamic value fails the draw** (above).
 //!
 //! # Not handled here
 //!
@@ -95,6 +137,7 @@ use starquake_render::command::{
     IndexBufferBinding, IndexFormat, RenderTargets,
 };
 use starquake_render::pipeline::{GraphicsPipelineDesc, RasterState, Stages};
+use starquake_render::validate::viewport_limit;
 use starquake_render::{
     Backend, BufferDesc, BufferId, BufferUsage, Command, CommandList, DepthRange, EmulationState,
     FenceValue, RenderError, ResourceId, emulation,
@@ -171,7 +214,8 @@ pub struct DrawCounters {
     pub drawn: u64,
     /// Draws skipped by conditional rendering.
     pub render_disabled: u64,
-    /// Words to draw methods this slice does not handle.
+    /// Words to draw methods this slice does not handle, and `END`s in the inline index mode
+    /// ([`call`]'s module docs).
     pub unhandled: u64,
     /// Draws skipped while their shaders were translated.
     pub shader_pending: u64,
@@ -198,19 +242,29 @@ pub const MAX_REJECTED_SETS: usize = 4096;
 /// kind of guess).
 pub const MAX_SWIZZLE_SETS: usize = 4096;
 
+/// [`CONSTANTS_ALIGN`] as a length.
+const ALIGN_BYTES: usize = 256;
+
+/// [`DRIVER_CONSTANTS_OFFSET`] as an index.
+const DRIVER_CONSTANTS_AT: usize = ROOT_TABLES * ROOT_TABLE_BYTES;
+
+/// [`CONSTANTS_BUFFER_SIZE`] as a length: the stack array the buffer's bytes are built in.
+const CONSTANTS_BUFFER_LEN: usize = DRIVER_CONSTANTS_AT + ALIGN_BYTES;
+
 /// The alignment of each block in the constants buffer (module docs; a guess).
-pub const CONSTANTS_ALIGN: u64 = 256;
+pub const CONSTANTS_ALIGN: u64 = ALIGN_BYTES as u64;
 
 /// Where the driver constants start in the constants buffer: after the root tables.
-pub const DRIVER_CONSTANTS_OFFSET: u64 = (ROOT_TABLES * ROOT_TABLE_BYTES) as u64;
+pub const DRIVER_CONSTANTS_OFFSET: u64 = DRIVER_CONSTANTS_AT as u64;
 
 /// The constants buffer's size: the root tables, then the driver constants padded to
 /// [`CONSTANTS_ALIGN`].
-pub const CONSTANTS_BUFFER_SIZE: u64 = DRIVER_CONSTANTS_OFFSET + CONSTANTS_ALIGN;
+pub const CONSTANTS_BUFFER_SIZE: u64 = CONSTANTS_BUFFER_LEN as u64;
 
 const _: () = assert!(DRIVER_CONSTANTS_OFFSET.is_multiple_of(CONSTANTS_ALIGN));
 const _: () = assert!((ROOT_TABLE_BYTES as u64).is_multiple_of(CONSTANTS_ALIGN));
 const _: () = assert!(DRIVER_CONSTANTS_SIZE as u64 <= CONSTANTS_ALIGN);
+const _: () = assert!(CONSTANTS_BUFFER_SIZE == DRIVER_CONSTANTS_OFFSET + CONSTANTS_ALIGN);
 
 /// Why a draw could not be derived. The draw is not drawn; the executor logs and counts it.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -279,6 +333,23 @@ pub enum DrawError {
         stage: GuestStage,
         /// The bank.
         bank: u8,
+    },
+    /// A shader binds a constant buffer bank at or past [`root::FIRST_ROOT_BANK`] that no root
+    /// table backs (PR #4588's `IsBank`: `bank - 24 < 8`).
+    #[error("the {} stage reads constant buffer {bank}, which no root table backs (banks {} to {})", .stage.name(), root::FIRST_ROOT_BANK, root::LAST_ROOT_BANK)]
+    RootBank {
+        /// The stage.
+        stage: GuestStage,
+        /// The bank.
+        bank: u8,
+    },
+    /// A value the draw hands the render backend is not finite (a NaN or an infinity the guest
+    /// wrote, or one its arithmetic made); the backend refuses such a value at submit, which
+    /// would throw away the whole list.
+    #[error("the draw's {what} is not finite")]
+    NotFinite {
+        /// Which value: `viewport`, `blend constant`, `depth bias` or `line width`.
+        what: &'static str,
     },
     /// A texture or sampler handle could not be read from its constant buffer.
     #[error("the {} stage's handle at constant buffer {bank} offset {offset:#x} cannot be read", .stage.name())]
@@ -364,7 +435,8 @@ pub struct Draws {
     rejected_limit: usize,
     swizzle_handles: HashMap<Vec<ProgramRequest>, Vec<(GuestStage, HandleSource)>>,
     constants: Option<BufferId>,
-    uploaded: Option<Vec<u8>>,
+    /// What the last upload held: the root tables' generation and the encoded driver constants.
+    uploaded: Option<(u64, [u8; DRIVER_CONSTANTS_SIZE])>,
     last_targets: Option<RenderTargets>,
     last_fence: FenceValue,
     /// Whether draws render (Eden's `execute_on`, true until `SET_RENDER_ENABLE_C` says
@@ -626,7 +698,7 @@ impl Draws {
         }
         // Step 2.
         let dirty = mirror.dirty();
-        let (blend, raster, depth_stencil, vertex, viewports, scissors) = {
+        let (blend, raster, depth_stencil, vertex, mut viewports, mut scissors) = {
             let parts = self.parts.refresh(mirror, dirty)?;
             (
                 parts.blend.clone(),
@@ -640,6 +712,13 @@ impl Draws {
         mirror.clear(dirty);
         let targets = targets::targets(mirror)?;
         let topology = fixed::effective_topology(mirror, call.topology)?;
+        let depth_bias = raster.bias_for(topology);
+        check_finite(&viewports, &blend.constant, depth_bias, raster.line_width)?;
+        // Eden sends `min(device.GetMaxViewports(), NumViewports)` viewports and scissors
+        // (`UpdateViewportsState` and `UpdateScissorsState` in `vk_rasterizer.cpp`).
+        let used = usize::try_from(viewport_limit(self.backend.caps())).unwrap_or(usize::MAX);
+        viewports.truncate(used);
+        scissors.truncate(used);
         let alpha_on = mirror
             .reg(&clc797::SET_ALPHA_TEST, &[])?
             .field(clc797::SET_ALPHA_TEST_ENABLE)?
@@ -774,6 +853,12 @@ impl Draws {
                 let bound = match resource.source {
                     ResourceSource::ConstantBuffer { bank, size } => {
                         if bank >= root::FIRST_ROOT_BANK {
+                            if self.roots.table(bank).is_none() {
+                                return Err(DrawError::RootBank {
+                                    stage: s.stage,
+                                    bank,
+                                });
+                            }
                             binds_constants = true;
                             let table = u64::from(bank - root::FIRST_ROOT_BANK);
                             BindingResource::Buffer(BufferSlice {
@@ -866,7 +951,7 @@ impl Draws {
                 front_face: raster.front_face,
                 polygon_mode: raster.polygon_mode,
                 depth_clamp: false,
-                depth_bias: raster.bias_for(topology),
+                depth_bias,
                 line_width: raster.line_width,
             },
             depth_stencil: depth_stencil.state,
@@ -922,7 +1007,7 @@ impl Draws {
                 stencil_reference: depth_stencil.reference,
                 stencil_read_mask: depth_stencil.read_mask,
                 stencil_write_mask: depth_stencil.write_mask,
-                depth_bias: raster.bias_for(topology),
+                depth_bias,
                 line_width: raster.line_width,
             },
             params,
@@ -982,11 +1067,51 @@ impl Draws {
 }
 
 impl Drop for Draws {
+    /// Destroys every host object the draw path made (the constants buffer, the host samplers
+    /// and the host shaders) after the last submitted fence, so opening and closing channels does
+    /// not grow the backend.
     fn drop(&mut self) {
-        if let Some(buffer) = self.constants {
+        if let Some(buffer) = self.constants.take() {
             self.backend
                 .destroy(ResourceId::Buffer(buffer), self.last_fence);
         }
+        self.samplers.destroy_all(self.last_fence);
+        self.host_shaders.destroy_all(self.last_fence);
+    }
+}
+
+/// Refuses a draw whose dynamic values are not all finite ([`DrawError::NotFinite`]), before
+/// any cache or the list is touched: the render backend refuses such a value at submit
+/// (`validate_draw`, "draw state values must be finite"), which would lose every draw in the
+/// list.
+fn check_finite(
+    viewports: &[starquake_render::command::Viewport],
+    blend_constant: &[f32; 4],
+    depth_bias: starquake_render::pipeline::DepthBias,
+    line_width: f32,
+) -> Result<(), DrawError> {
+    let viewports_finite = viewports.iter().all(|v| {
+        [v.x, v.y, v.width, v.height, v.min_depth, v.max_depth]
+            .iter()
+            .all(|x| x.is_finite())
+    });
+    let bias = [
+        depth_bias.constant,
+        depth_bias.slope_scale,
+        depth_bias.clamp,
+    ];
+    let checks = [
+        ("viewport", viewports_finite),
+        (
+            "blend constant",
+            blend_constant.iter().all(|x| x.is_finite()),
+        ),
+        ("depth bias", bias.iter().all(|x| x.is_finite())),
+        ("line width", line_width.is_finite()),
+    ];
+    match checks.into_iter().find(|&(_, finite)| !finite) {
+        Some((what, _)) => Err(DrawError::NotFinite { what }),
+        None => Ok(()),
     }
 }
 
@@ -1031,32 +1156,42 @@ fn constants_buffer(
     Ok(id)
 }
 
-/// The constants buffer's bytes: the root tables, then `constants` at
-/// [`DRIVER_CONSTANTS_OFFSET`], the rest zero.
-fn constants_bytes(roots: &RootTables, constants: &DriverConstants) -> Vec<u8> {
-    let mut bytes = roots.bytes();
-    bytes.resize(usize::try_from(CONSTANTS_BUFFER_SIZE).unwrap_or(0), 0);
-    let at = usize::try_from(DRIVER_CONSTANTS_OFFSET).unwrap_or(0);
-    if let Some(slot) = bytes.get_mut(at..at + DRIVER_CONSTANTS_SIZE) {
-        slot.copy_from_slice(&constants.encode());
+/// The constants buffer's bytes: the root tables, then `encoded` (the driver constants) at
+/// [`DRIVER_CONSTANTS_OFFSET`], the rest zero. Built on the stack, only when uploading.
+fn constants_bytes(
+    roots: &RootTables,
+    encoded: &[u8; DRIVER_CONSTANTS_SIZE],
+) -> [u8; CONSTANTS_BUFFER_LEN] {
+    let mut bytes = [0; CONSTANTS_BUFFER_LEN];
+    if let Some(tables) = bytes.get_mut(..DRIVER_CONSTANTS_AT) {
+        roots.write_le(tables);
+    }
+    if let Some(slot) =
+        bytes.get_mut(DRIVER_CONSTANTS_AT..DRIVER_CONSTANTS_AT + DRIVER_CONSTANTS_SIZE)
+    {
+        slot.copy_from_slice(encoded);
     }
     bytes
 }
 
-/// Uploads the constants buffer when its bytes changed since the last upload (module docs, "The
-/// constants buffer").
+/// Uploads the constants buffer when the root tables were written or the driver constants
+/// changed since the last upload (module docs, "The constants buffer"): it compares the tables'
+/// generation and the encoded driver constants, so a draw that uploads nothing allocates and
+/// copies nothing.
 fn upload_constants<M: GpuMemory + ?Sized>(
     ctx: &mut DrawContext<'_, M>,
     roots: &RootTables,
-    uploaded: &mut Option<Vec<u8>>,
+    uploaded: &mut Option<(u64, [u8; DRIVER_CONSTANTS_SIZE])>,
     buffer: &mut Option<BufferId>,
     backend: &dyn Backend,
     constants: &DriverConstants,
 ) -> Result<(), DrawError> {
-    let bytes = constants_bytes(roots, constants);
-    if uploaded.as_deref() == Some(&bytes) {
+    let encoded = constants.encode();
+    let state = (roots.generation(), encoded);
+    if *uploaded == Some(state) {
         return Ok(());
     }
+    let bytes = constants_bytes(roots, &encoded);
     let id = constants_buffer(buffer, backend)?;
     let mut staging = backend
         .staging(CONSTANTS_BUFFER_SIZE)
@@ -1075,7 +1210,7 @@ fn upload_constants<M: GpuMemory + ?Sized>(
             size: CONSTANTS_BUFFER_SIZE,
         }),
     });
-    *uploaded = Some(bytes);
+    *uploaded = Some(state);
     Ok(())
 }
 

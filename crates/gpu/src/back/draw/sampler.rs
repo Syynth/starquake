@@ -45,7 +45,7 @@ use std::sync::Arc;
 use starquake_render::resource::{
     AddressMode, BorderColor, CompareFunction, FilterMode, ReductionMode, SamplerDesc,
 };
-use starquake_render::{Backend, SamplerId};
+use starquake_render::{Backend, FenceValue, ResourceId, SamplerId};
 
 use super::DrawError;
 use crate::classes::clc797tex as tex;
@@ -281,5 +281,15 @@ impl Samplers {
             .map_err(DrawError::Render)?;
         self.by_words.insert(*words, id);
         Ok(id)
+    }
+
+    /// Destroys every host sampler the table made, after `fence`, in id order, and empties
+    /// it (the draw path's teardown; `Draws`' `Drop`).
+    pub fn destroy_all(&mut self, fence: FenceValue) {
+        let mut ids: Vec<_> = self.by_words.drain().map(|(_, id)| id).collect();
+        ids.sort_unstable();
+        for id in ids {
+            self.backend.destroy(ResourceId::Sampler(id), fence);
+        }
     }
 }

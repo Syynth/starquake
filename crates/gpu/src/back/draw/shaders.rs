@@ -88,7 +88,7 @@ use starquake_render::shader::{
     InterfaceVariable, Interpolation, ResourceBinding, ResourceKind, ScalarKind, ShaderDesc,
     ShaderInterface, ShaderSource, ShaderStage,
 };
-use starquake_render::{Backend, PixelFormat, ShaderId};
+use starquake_render::{Backend, FenceValue, PixelFormat, ResourceId, ShaderId};
 use starquake_shader::exchange::{SampledType, TextureFormat, TextureKind};
 use starquake_shader::host::{HostCode, HostShader, HostStage, SlotBinding, SlotType};
 use starquake_shader::lookup::{
@@ -569,5 +569,15 @@ impl HostShaders {
             .map_err(DrawError::Render)?;
         self.by_stamp.insert(info.stamp, id);
         Ok(id)
+    }
+
+    /// Destroys every host shader the table made, after `fence`, in id order, and empties
+    /// it (the draw path's teardown; `Draws`' `Drop`).
+    pub fn destroy_all(&mut self, fence: FenceValue) {
+        let mut ids: Vec<_> = self.by_stamp.drain().map(|(_, id)| id).collect();
+        ids.sort_unstable();
+        for id in ids {
+            self.backend.destroy(ResourceId::Shader(id), fence);
+        }
     }
 }

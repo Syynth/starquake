@@ -9,7 +9,8 @@
 //!
 //! # The methods
 //!
-//! Exactly these methods change the state here; every other method is ignored
+//! Exactly these methods, and the inline index forms (below), change the state here; every
+//! other method is ignored
 //! ([`DRAW_METHODS`] lists them, and `tests::only_the_listed_methods_are_seen` pins the set):
 //!
 //! - `BEGIN` (Eden's `draw.begin`, `DrawBegin`): `INSTANCE_ID` `FIRST` draws the deferred
@@ -33,6 +34,16 @@
 //! (`DRAW_INLINE_INDEX`, `DRAW_INLINE_INDEX2X16`, `DRAW_INLINE_INDEX4X8`), `DRAW_ZERO_INDEX` and
 //! `DRAW_AUTO`. Indirect draws reach the 3D class through macros, not here.
 //!
+//! An inline index word also puts the begin/end machine in its inline mode, as Eden's
+//! `SetInlineIndexBuffer` sets `DrawMode::InlineIndex`: until the next `BEGIN` with
+//! `INSTANCE_ID` `FIRST` or `SUBSEQUENT` (Eden's `DrawBegin`, the only writes of `draw_mode`
+//! besides the inline and instanced forms), every `END` is reported as [`Started::Unhandled`]
+//! with that inline method's name, where Eden's `DrawEnd` draws the inline indices, and
+//! [`DrawCalls::flush`] draws nothing, as Eden's `DrawDeferred` returns outside its instance
+//! mode. So `BEGIN`, an inline word, `END` never draws the vertex array from stale
+//! `SET_VERTEX_ARRAY_START` and `DRAW_VERTEX_ARRAY` values
+//! (`tests::an_inline_index_draw_draws_nothing_until_the_next_begin`).
+//!
 //! # Divergences from Eden-NX2
 //!
 //! Each is pinned by the test named, in `draw/tests.rs`.
@@ -43,8 +54,12 @@
 //!   field's meaning. `the_small_index_forms_take_their_size_from_the_method`.
 //! - **The small index forms count instances.** Eden's `index_buffer*_subsequent` case counts an
 //!   instance and then draws with the global base instance, so every instance draws as instance
-//!   0. Here they count instances as the vertex array forms do (first instance the counter), as
-//!   the header's `INSTANCE_SUBSEQUENT` says. `the_small_index_forms_count_instances`.
+//!   `SET_GLOBAL_BASE_INSTANCE_INDEX`. Here, as the header's `INSTANCE_SUBSEQUENT` says, they
+//!   keep a counter shared with the vertex array forms (0 at a `FIRST`, one more at each
+//!   `SUBSEQUENT`, saturating), and the first instance is `SET_GLOBAL_BASE_INSTANCE_INDEX` plus
+//!   that counter (saturating). The vertex array forms' first instance is the counter alone, as
+//!   Eden's `DrawArrayInstanced` has it (it does not read the global base instance).
+//!   `the_small_index_forms_count_instances`, `the_vertex_array_instanced_forms_count_from_zero`.
 //! - **The instanced forms leave the begin/end state alone.** Eden's `DrawArrayInstanced` also
 //!   sets the general draw mode to instanced, so a later `DrawDeferred` draws the begin/end
 //!   registers again with the instanced form's count. Here the instanced forms use their own
@@ -81,6 +96,14 @@ pub const UNHANDLED_METHODS: [&Method; 5] = [
     &clc797::DRAW_INLINE_INDEX4X8,
     &clc797::DRAW_ZERO_INDEX,
     &clc797::DRAW_AUTO,
+];
+
+/// The inline index forms of [`UNHANDLED_METHODS`], which put the machine in its inline mode
+/// (module docs).
+pub const INLINE_METHODS: [&Method; 3] = [
+    &clc797::DRAW_INLINE_INDEX,
+    &clc797::DRAW_INLINE_INDEX2X16,
+    &clc797::DRAW_INLINE_INDEX4X8,
 ];
 
 /// What one word to a 3D method started.
@@ -153,12 +176,14 @@ pub struct DrawCall {
     pub base_vertex: u32,
 }
 
-/// The begin/end mode (Eden's `DrawMode`, without its inline-index mode).
+/// The begin/end mode (Eden's `DrawMode`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Mode {
     #[default]
     General,
     Instance,
+    /// Eden's `InlineIndex`, by the name of the inline method that set it (module docs).
+    Inline(&'static str),
 }
 
 /// The draw state machine of one 3D mirror (module docs).
@@ -196,11 +221,22 @@ impl DrawCalls {
         value: u32,
     ) -> Result<Started, StateError> {
         if let Some(unhandled) = UNHANDLED_METHODS.iter().find(|m| m.method() == method) {
+            if INLINE_METHODS
+                .iter()
+                .any(|m| m.method() == unhandled.method())
+            {
+                self.mode = Mode::Inline(unhandled.name);
+            }
             return Ok(Started::Unhandled(unhandled.name));
         }
         let call = match method {
             m if m == clc797::BEGIN.method() => self.begin(mirror, value)?,
-            m if m == clc797::END.method() => self.end(mirror, 1, false)?,
+            m if m == clc797::END.method() => {
+                if let Mode::Inline(name) = self.mode {
+                    return Ok(Started::Unhandled(name));
+                }
+                self.end(mirror, 1, false)?
+            }
             m if m == clc797::DRAW_INDEX_BUFFER.method() => {
                 self.draw_indexed = true;
                 None

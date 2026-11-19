@@ -27,16 +27,29 @@
 //!   viewport height (the path Eden takes without `NV_viewport_swizzle`, which no wgpu host has),
 //!   a zero width or height made 1, depth from the offset and scale with `reduce_z` from the clip
 //!   range, clamped to 0..1 (the path Eden takes without `EXT_depth_range_unrestricted`, which
-//!   wgpu does not expose). A disabled scissor is the whole target.
+//!   wgpu does not expose). A disabled scissor is the whole target. While
+//!   `SET_VIEWPORT_SCALE_OFFSET` is off (its reset value), every viewport and scissor is the
+//!   surface clip instead, as Eden's `UpdateViewportsState` and `UpdateScissorsState` (same
+//!   file) have it: the clip's x, y, width and height (each extent at least 1), the lower-left
+//!   origin flipping the viewport by its height and the scissor's y to `clip height - (y +
+//!   height)`, depth 0 to 1 (`tests::without_scale_offset_viewports_and_scissors_are_the_surface_clip`).
 //! - Blending: Eden's `BlendingAttachment::Refresh` (`fixed_pipeline_state.cpp`): the write mask
 //!   from `SET_CT_WRITE(0)` for every target when `SET_SINGLE_CT_WRITE_CONTROL` is on, factors
 //!   only for a target whose `SET_BLEND(j)` is on, from the per-target fields when
 //!   `SET_BLEND_STATE_PER_TARGET` is on, else from the shared ones. Dual-source blending is on
 //!   when a factor of target 0's equation reads the second source (Eden's
 //!   `uses_dual_source`, same file).
-//! - Rasterizer: culling, front face, polygon mode (the front mode, as Eden packs
-//!   `polygon_mode_front`), primitive restart, and depth bias applied only when the polygon offset
-//!   enable of the topology's class is on (Eden's `POLYGON_OFFSET_ENABLE_LUT`).
+//! - Rasterizer: culling, front face (flipped while `SET_WINDOW_ORIGIN`'s `FLIP_Y` is set, as
+//!   Eden's `DynamicState::Refresh` in `fixed_pipeline_state.cpp` and `UpdateFrontFace` in
+//!   `vk_rasterizer.cpp`), polygon mode (the front mode, as Eden packs `polygon_mode_front`),
+//!   primitive restart, the line width (`SET_LINE_WIDTH_FLOAT` while `SET_ANTI_ALIASED_LINE` is
+//!   on, else `SET_ALIASED_LINE_WIDTH_FLOAT`, as Eden's `UpdateLineWidth`), and depth bias,
+//!   its constant `SET_DEPTH_BIAS / 2` as Eden's `UpdateDepthBias` passes it
+//!   ([`DEPTH_BIAS_UNITS_PER_HOST_UNIT`]; this module owns the conversion), applied only when
+//!   the polygon offset enable of the topology's class is on (Eden's
+//!   `POLYGON_OFFSET_ENABLE_LUT`). `tests::the_front_face_flips_with_flip_y`,
+//!   `tests::the_line_width_follows_the_anti_aliased_line_enable`,
+//!   `tests::depth_bias_applies_only_with_the_topologys_offset_enable`.
 //! - Depth and stencil: Eden's `FixedPipelineState::DynamicState` fields, with the back face
 //!   taking the front face's state when `SET_TWO_SIDED_STENCIL_TEST` is off.
 //! - Vertex input: one attribute per active attribute, its location the attribute's index, and
@@ -55,11 +68,20 @@
 //!   target's equations only while its blend is on. Dual-source blending therefore looks at
 //!   target 0 only while its blend is on, where Eden's `uses_dual_source` looks at its factors
 //!   whatever its enable (`tests::dual_source_blending_reaches_the_key`).
+//! - **The surface-clip scissor's flipped y is clamped at 0.** Without
+//!   `SET_VIEWPORT_SCALE_OFFSET` and with a lower-left origin, Eden computes the scissor's y as
+//!   `height - (y + height)` in `u32`, which wraps (and becomes a negative offset) when the clip's
+//!   y is not 0 or its height is 0; here it is 0
+//!   (`tests::without_scale_offset_viewports_and_scissors_are_the_surface_clip`).
+//! - **Eden's D24 depth-bias rescale is not applied.** Eden rescales the constant for a D24
+//!   target on a device without D24 support, for a list of titles only; the host formats here
+//!   come from the render backend, which has no such list.
 //!
 //! # Not read
 //!
 //! `SET_VIEWPORT_CLIP_CONTROL` (depth clamp is off), the viewport x, z and w swizzles, the back
-//! polygon mode, the line stipple, conservative raster, anti-aliased lines, `SET_ITERATED_BLEND`
+//! polygon mode, the line stipple, conservative raster, anti-aliased line rasterisation
+//! (`SET_ANTI_ALIASED_LINE` picks the line width only), `SET_ITERATED_BLEND`
 //! (Eden's squashed-blend workaround is a setting), alpha to coverage and to one, and the
 //! global colour key.
 
@@ -159,11 +181,13 @@ pub struct RasterPart {
     pub polygon_mode: PolygonMode,
     /// Primitive restart.
     pub primitive_restart: bool,
-    /// The bias registers, before the topology's polygon offset enable is applied.
+    /// The bias registers, before the topology's polygon offset enable is applied; the
+    /// constant is `SET_DEPTH_BIAS` divided by [`DEPTH_BIAS_UNITS_PER_HOST_UNIT`].
     pub depth_bias: DepthBias,
     /// Polygon offset enables: points, lines, fill.
     pub offset_enables: [bool; 3],
-    /// Line width.
+    /// Line width: `SET_LINE_WIDTH_FLOAT` while `SET_ANTI_ALIASED_LINE` is on, else
+    /// `SET_ALIASED_LINE_WIDTH_FLOAT`.
     pub line_width: f32,
     /// `SET_RASTER_ENABLE`.
     pub raster_enable: bool,
@@ -257,7 +281,7 @@ impl Parts {
         }
         if stale(Part::Scissors, self.scissors.is_some()) {
             self.scissors = None;
-            self.scissors = Some(scissors(three_d)?);
+            self.scissors = Some(scissors(mirror, three_d)?);
             self.count(Part::Scissors);
         }
         if stale(Part::Blend, self.blend.is_some()) {
@@ -358,10 +382,16 @@ pub fn topology(value: u32) -> Result<Topology, DrawError> {
     })
 }
 
+/// `SET_PRIMITIVE_TOPOLOGY`'s value that keeps the begin method's topology: Eden's
+/// `PrimitiveTopologyOverride::None = 0x0` (`eden-nx2/src/video_core/engines/maxwell_3d.h`
+/// @ 50fa86bb); `clc797.h` does not name 0.
+pub const TOPOLOGY_OVERRIDE_NONE: u32 = 0;
+
 /// The draw's topology after `SET_PRIMITIVE_TOPOLOGY_CONTROL` (Eden's `UpdateTopology`,
 /// `eden-nx2/src/video_core/engines/draw_manager.cpp`): with the separate state chosen,
-/// `SET_PRIMITIVE_TOPOLOGY`'s point, line and line strip values map to their topologies and its
-/// other non-legacy values are `BEGIN_OP`'s; a legacy value is refused (module docs of `call`).
+/// `SET_PRIMITIVE_TOPOLOGY`'s [`TOPOLOGY_OVERRIDE_NONE`] keeps `begin` (Eden's `None` case),
+/// its point, line and line strip values map to their topologies and its other non-legacy
+/// values are `BEGIN_OP`'s; a legacy value is refused (module docs of `call`).
 pub fn effective_topology(mirror: &Mirror, begin: u32) -> Result<Topology, DrawError> {
     let control = mirror.reg(&clc797::SET_PRIMITIVE_TOPOLOGY_CONTROL, &[])?;
     if control.field(clc797::SET_PRIMITIVE_TOPOLOGY_CONTROL_OVERRIDE)?
@@ -373,6 +403,7 @@ pub fn effective_topology(mirror: &Mirror, begin: u32) -> Result<Topology, DrawE
         .reg(&clc797::SET_PRIMITIVE_TOPOLOGY, &[])?
         .field(clc797::SET_PRIMITIVE_TOPOLOGY_V)?;
     match value {
+        TOPOLOGY_OVERRIDE_NONE => topology(begin),
         clc797::SET_PRIMITIVE_TOPOLOGY_V_POINTLIST => Ok(Topology::Points),
         clc797::SET_PRIMITIVE_TOPOLOGY_V_LINELIST => Ok(Topology::Lines),
         clc797::SET_PRIMITIVE_TOPOLOGY_V_LINESTRIP => Ok(Topology::LineStrip),
@@ -498,9 +529,57 @@ fn lower_left(three_d: ThreeD<'_>) -> Result<bool, StateError> {
         != clc797::SET_WINDOW_ORIGIN_MODE_UPPER_LEFT)
 }
 
+/// Whether `SET_VIEWPORT_SCALE_OFFSET` is on (Eden's `viewport_scale_offset_enabled`; its reset
+/// value is 0, off).
+fn scale_offset(mirror: &Mirror) -> Result<bool, StateError> {
+    Ok(mirror
+        .reg(&clc797::SET_VIEWPORT_SCALE_OFFSET, &[])?
+        .field(clc797::SET_VIEWPORT_SCALE_OFFSET_ENABLE)?
+        != clc797::SET_VIEWPORT_SCALE_OFFSET_ENABLE_FALSE)
+}
+
+/// The surface clip as `(x, y, width, height)`.
+fn surface_clip(three_d: ThreeD<'_>) -> Result<(u32, u32, u32, u32), StateError> {
+    let select = three_d.ct_select();
+    Ok((
+        select.surface_clip_x()?,
+        select.surface_clip_y()?,
+        select.surface_clip_width()?,
+        select.surface_clip_height()?,
+    ))
+}
+
 /// Every viewport (module docs, "Sources").
 fn viewports(mirror: &Mirror, three_d: ThreeD<'_>) -> Result<Vec<Viewport>, DrawError> {
     let lower_left = lower_left(three_d)?;
+    if !scale_offset(mirror)? {
+        // Eden's `UpdateViewportsState` without `viewport_scale_offset_enabled`: the surface
+        // clip, at least 1 by 1, flipped for a lower-left origin, depth 0 to 1, in every slot.
+        let (x, y, width, height) = surface_clip(three_d)?;
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "Eden converts the 16-bit surface clip to floats the same way"
+        )]
+        let (x, mut y, width, mut height) = (
+            x as f32,
+            y as f32,
+            (width as f32).max(1.0),
+            (height as f32).max(1.0),
+        );
+        if lower_left {
+            y += height;
+            height = -height;
+        }
+        let viewport = Viewport {
+            x,
+            y,
+            width,
+            height,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        return Ok(vec![viewport; VIEWPORTS as usize]);
+    }
     #[expect(
         clippy::cast_precision_loss,
         reason = "Eden converts the 16-bit surface clip height to a float the same way"
@@ -549,9 +628,31 @@ fn viewports(mirror: &Mirror, three_d: ThreeD<'_>) -> Result<Vec<Viewport>, Draw
 
 /// Every scissor (module docs, "Sources"): a disabled one is the whole target, the largest
 /// `i32` in each extent as Eden has it.
-fn scissors(three_d: ThreeD<'_>) -> Result<Vec<Rect>, DrawError> {
+fn scissors(mirror: &Mirror, three_d: ThreeD<'_>) -> Result<Vec<Rect>, DrawError> {
     const WHOLE: u32 = i32::MAX.unsigned_abs();
     let lower_left = lower_left(three_d)?;
+    if !scale_offset(mirror)? {
+        // Eden's `UpdateScissorsState` without `viewport_scale_offset_enabled`: the surface clip,
+        // at least 1 by 1, in every slot; a lower-left origin flips y to
+        // `height - (y + height)`, which Eden computes in `u32` and here is clamped at 0 (module
+        // docs, "Divergences from Eden").
+        let (x, y, width, clip) = surface_clip(three_d)?;
+        let (width, height) = (width.max(1), clip.max(1));
+        let y = if lower_left {
+            let (clip, y, h) = (i64::from(clip), i64::from(y), i64::from(height));
+            // Never above 0 (`clip <= h`): a negative value is 0.
+            u32::try_from(clip - (y + h)).unwrap_or(0)
+        } else {
+            y
+        };
+        let rect = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        return Ok(vec![rect; SCISSORS as usize]);
+    }
     let clip = i64::from(clip_height(three_d)?);
     (0..SCISSORS)
         .map(|index| {
@@ -687,6 +788,14 @@ fn blend(three_d: ThreeD<'_>) -> Result<BlendPart, DrawError> {
     })
 }
 
+/// `SET_DEPTH_BIAS` units per unit of the host's constant depth bias: Eden passes
+/// `regs.depth_bias / 2.0f` to Vulkan (`UpdateDepthBias` in
+/// `eden/src/video_core/renderer_vulkan/vk_rasterizer.cpp` @ cf654052) and to OpenGL
+/// (`SyncPolygonOffset` in `renderer_opengl/gl_rasterizer.cpp`). This module owns the
+/// conversion: [`RasterPart::depth_bias`]'s constant is in the render crate's
+/// [`DepthBias`] units, already halved.
+pub const DEPTH_BIAS_UNITS_PER_HOST_UNIT: f32 = 2.0;
+
 /// The rasterizer part (module docs, "Sources").
 fn raster(three_d: ThreeD<'_>) -> Result<RasterPart, DrawError> {
     let r = three_d.rasterizer();
@@ -707,6 +816,21 @@ fn raster(three_d: ThreeD<'_>) -> Result<RasterPart, DrawError> {
         "CCW" => FrontFace::Ccw,
         _ => return Err(unmapped(front, "front face")),
     };
+    // Eden flips the front face when `window_origin.flip_y != 0`.
+    let front_face = if on(r.window_origin_flip_y()?) {
+        match front_face {
+            FrontFace::Cw => FrontFace::Ccw,
+            FrontFace::Ccw => FrontFace::Cw,
+        }
+    } else {
+        front_face
+    };
+    // Eden's `line_anti_alias_enable ? line_width_smooth : line_width_aliased`.
+    let line_width = if on(r.anti_aliased_line()?) {
+        r.line_width()?
+    } else {
+        r.aliased_line_width()?
+    };
     let mode = r.front_polygon_mode()?;
     let polygon_mode = match mode.name {
         "POINT" => PolygonMode::Point,
@@ -720,7 +844,7 @@ fn raster(three_d: ThreeD<'_>) -> Result<RasterPart, DrawError> {
         polygon_mode,
         primitive_restart: on(r.primitive_restart()?),
         depth_bias: DepthBias {
-            constant: r.depth_bias()?,
+            constant: r.depth_bias()? / DEPTH_BIAS_UNITS_PER_HOST_UNIT,
             slope_scale: r.slope_scale_depth_bias()?,
             clamp: r.depth_bias_clamp()?,
         },
@@ -729,7 +853,7 @@ fn raster(three_d: ThreeD<'_>) -> Result<RasterPart, DrawError> {
             on(r.poly_offset_line()?),
             on(r.poly_offset_fill()?),
         ],
-        line_width: r.line_width()?,
+        line_width,
         raster_enable: on(r.raster_enable()?),
     })
 }
