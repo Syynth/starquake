@@ -11,11 +11,17 @@
 //!   [`Terminator::Branch`]. A test of `PT` is the immediate `true` and of `!PT` the immediate
 //!   `false` (the IR refuses to read `PT`: `ir`'s `ReservedName`).
 //! - **An indirect branch** reads its register (`GetRegister`, or `GetUniformRegister` for
-//!   `BRXU`; `RZ` reads as the immediate 0, as PR #4588's `Visitor::X` reads it), then compares
-//!   it with each target's address in turn (`IEqual`), each comparison in its own block, as
-//!   Eden's structurizer chains `IndirectBranchCond` gotos (`structured_control_flow.cpp` @
-//!   cf654052); when none matches, control never gets there ([`Terminator::Unreachable`], Eden's
-//!   `Unreachable` after the gotos).
+//!   `BRXU`; `RZ` reads as the immediate 0, as PR #4588's `Visitor::X` reads it) into the
+//!   indirect branch variable (`SetIndirectBranchVariable`, Eden's `SetIndirectBranchVariable`
+//!   statement), then compares the variable with each target's address in turn
+//!   (`GetIndirectBranchVariable`, then `IEqual`, Eden's `IndirectBranchCond`), each comparison in
+//!   its own block, as Eden's structurizer chains its `IndirectBranchCond` gotos
+//!   (`structured_control_flow.cpp` @ cf654052, `EndClass::IndirectBranch` and `VisitExpr`); when
+//!   none matches, control never gets there ([`Terminator::Unreachable`], Eden's `Unreachable`
+//!   after the gotos). Each comparison reads the variable again in its own block, so no value
+//!   crosses from one block to another and the structurizer (slice 11, `crate::structure`) can
+//!   place the comparisons anywhere its goto elimination moves them; the uniform register a
+//!   `BRXU` reads is read once, in the first block.
 //! - **An exit** is [`Terminator::Return`].
 //! - **A kill** is `DemoteToHelperInvocation` and then a jump to the next block, in a block of
 //!   its own after the block's instructions as for a test (PR #4588's structurizer emits the
@@ -99,9 +105,13 @@ impl FlowGraph {
                 BlockEnd::Indirect { src, targets } => {
                     to_test_block(&mut builder, flow.code.is_empty())?;
                     let value = read_reg(&mut builder, *src)?;
+                    builder.op(Opcode::SetIndirectBranchVariable, &[value])?;
                     for &IndirectTarget { address, block } in targets {
-                        let matches = builder
-                            .op(Opcode::IEqual, &[value, Operand::Imm(Imm::U32(address))])?;
+                        let variable = builder.op(Opcode::GetIndirectBranchVariable, &[])?;
+                        let matches = builder.op(
+                            Opcode::IEqual,
+                            &[Operand::Value(variable), Operand::Imm(Imm::U32(address))],
+                        )?;
                         let otherwise = builder.add_block()?;
                         builder.terminate(Terminator::Branch {
                             cond: Operand::Value(matches),

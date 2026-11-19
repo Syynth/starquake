@@ -67,6 +67,7 @@ pub mod lookup;
 pub mod lower;
 pub mod program;
 pub mod sph;
+pub mod structure;
 #[cfg(test)]
 mod testing;
 pub mod translate;

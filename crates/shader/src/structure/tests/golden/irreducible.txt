@@ -1,0 +1,91 @@
+block0:
+    %0: u1 = GetPred p0
+block1:
+    %1: u32 = GetRegister r1
+    %2: u32 = IAdd32 %1, u32 0x1
+    %3 = SetRegister r1, %2
+    %4: u1 = ULessThan %2, u32 0x3
+block2:
+    %5: u32 = GetRegister r2
+    %6: u32 = IAdd32 %5, u32 0x1
+    %7 = SetRegister r2, %6
+    %8: u1 = ULessThan %6, u32 0x3
+block3:
+block4:
+    %9 = Prologue
+    %10 = SetGotoVariable u32 0x3, u1 false
+    %11 = SetGotoVariable u32 0x6, u1 false
+    %12 = SetGotoVariable u32 0x2, u1 false
+    %13 = SetGotoVariable u32 0x5, u1 false
+    %14 = SetGotoVariable u32 0x1, u1 false
+    %15 = SetGotoVariable u32 0x4, u1 false
+    %16 = SetGotoVariable u32 0x0, u1 false
+    %17 = SetGotoVariable u32 0x0, u1 false
+block5:
+    %18 = SetGotoVariable u32 0x4, %0
+    %19: u1 = GetGotoVariable u32 0x4
+    %20 = SetGotoVariable u32 0x1, %19
+    %21: u1 = GetGotoVariable u32 0x1
+    %22: u1 = LogicalNot %21
+    %23: u1 = ConditionRef %22
+block6:
+    %24 = SetGotoVariable u32 0x2, u1 true
+block7:
+    %25: u1 = GetGotoVariable u32 0x1
+    %26 = SetGotoVariable u32 0x1, %25
+    %27: u1 = GetGotoVariable u32 0x1
+    %28: u1 = GetGotoVariable u32 0x2
+    %29: u1 = LogicalNot %28
+    %30: u1 = LogicalOr %27, %29
+    %31: u1 = ConditionRef %30
+block8:
+    %32 = SetGotoVariable u32 0x1, u1 false
+block9:
+    %33 = SetGotoVariable u32 0x5, %4
+    %34: u1 = GetGotoVariable u32 0x5
+    %35: u1 = LogicalNot %34
+    %36: u1 = ConditionRef %35
+block10:
+    %37 = SetGotoVariable u32 0x3, u1 true
+    %38: u1 = GetGotoVariable u32 0x3
+    %39: u1 = ConditionRef %38
+block11:
+    %40 = SetGotoVariable u32 0x2, u1 false
+block12:
+    %41 = SetGotoVariable u32 0x6, %8
+    %42: u1 = GetGotoVariable u32 0x6
+    %43 = SetGotoVariable u32 0x1, %42
+block13:
+    %44: u1 = GetGotoVariable u32 0x1
+    %45: u1 = ConditionRef %44
+block14:
+    %46 = SetGotoVariable u32 0x3, u1 false
+block15:
+    %47 = Epilogue
+structure:
+    block4
+    block0
+    block5
+    if %23 {
+        block6
+    }
+    loop {
+        block7
+        if %31 {
+            block8
+            block1
+            block9
+            if %36 {
+                block10
+                break %39
+            }
+        }
+        block11
+        block2
+        block12
+        block13
+    } repeat %45
+    block14
+    block3
+    block15
+    return
