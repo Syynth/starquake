@@ -106,8 +106,8 @@
 //! A poll counted past the first look's started after it, since no turn was in progress while
 //! the first look read the front quiet. A poll that finds the wait ended
 //! resumes the channel, and its turn ends busy, so the second look says "busy"
-//! (`a_released_acquire_is_busy_until_a_poll_has_looked`,
-//! `a_cpu_release_of_a_parked_acquire_is_busy_through_the_threads`); one that finds nothing
+//! (`a_cpu_release_of_a_parked_acquire_is_busy_through_the_threads`; with no poll at all the
+//! answer is "busy" too, `a_released_acquire_is_busy_until_a_poll_has_looked`); one that finds nothing
 //! leaves the GPU idle (`a_channel_parked_on_an_unreleased_acquire_is_idle`). A channel that
 //! still waits after that poll waits on something only the guest can end.
 //!
