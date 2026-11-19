@@ -20,6 +20,14 @@
 //!   writes the window's drawable size, in physical pixels, into a [`WindowSize`] on each resize,
 //!   and the backend reads it before each present ([`WindowSize::get`] never blocks).
 //!
+//! **The size departs from the approved spec and awaits the owner.** The spec
+//! (docs/specs/render-backend.md, "Present targets") defines the variant as
+//! `Window(WindowHandles)` with the doc sentence "A window the frontend created;
+//! `raw-window-handle` 0.6.2 display and window handles", which names the handles only.
+//! [`WindowHandles`] also carries the [`WindowSize`], for the reason above. Whether that
+//! addition stands is an open owner question (raised in the pull request that added this
+//! module); until it is answered, the size is a departure, not the spec's design.
+//!
 //! Re-exported: the `raw_window_handle` crate itself, so a frontend (through `core`) names the
 //! same version of the traits this crate does.
 
