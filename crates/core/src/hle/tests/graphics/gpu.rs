@@ -166,8 +166,12 @@ fn a_run_with_the_gpu_completes_what_waits_on_it() {
 fn a_graphics_server_with_a_busy_gpu_is_not_idle() {
     let graphics = with_gpu();
     let gpu = graphics.gpu().unwrap();
+    // While its threads run, an idle GPU still takes a turn at each safety-net wake
+    // (`IDLE_PARK`) and reads busy during it, so "idle" is waited for, never asserted once.
     wait_until("a new GPU is idle", || gpu.is_idle());
-    assert!(graphics.is_idle());
+    wait_until("the graphics server over an idle GPU is idle", || {
+        graphics.is_idle()
+    });
     // With its threads stopped, a barrier stays queued for the front: the GPU is busy, though
     // gsv's queue is empty.
     gpu.stop().unwrap();
