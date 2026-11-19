@@ -319,7 +319,8 @@ impl RegFile {
             self.run.push(value);
         }
         match self.run.as_slice() {
-            [] => return,
+            // Never reached: `write_run` makes no chunk of an empty run.
+            [] => {}
             &[value] => out.send(RingEntry::Write {
                 channel: self.channel,
                 class: self.class,
