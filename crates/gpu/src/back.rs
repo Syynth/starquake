@@ -10,11 +10,14 @@
 //! - [`state`]: the engine mirrors, their dirty state groups and typed views (slice G10).
 //! - [`buffer`]: the buffer cache (slice G16): guest ranges to host buffers, kept coherent with
 //!   CPU writes through the write watch, dropped by ordered unmaps, evicted by the budget.
+//! - [`fence`]: fences and completion (slice G15): the open command list, fenced releases,
+//!   increments and markers performed after host completion, the acquire waiter table they
+//!   latch, and the back thread's wait on its ring and on completion.
 //!
-//! Later slices add fences and completion (G15), draws (G18) and the executor that feeds them
-//! all from the ring (G19).
+//! Later slices add draws (G18) and the executor that feeds them all from the ring (G19).
 
 pub mod buffer;
 pub mod copy;
+pub mod fence;
 pub mod qmd;
 pub mod state;

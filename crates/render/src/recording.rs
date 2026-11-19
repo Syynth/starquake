@@ -65,6 +65,12 @@
 //! `SetRenderTargets` last until the end of the list (render-backend, "Commands": the list's end
 //! closes the host pass), so each list starts with none.
 //!
+//! **The completion wake.** A backend built with [`RecordingBackend::with_completion_wake`]
+//! calls its [`CompletionWake`] once from every `submit` that completes a list: after the new
+//! completed value is stored and the state lock released, before any frame is handed to a sink
+//! (render-backend, "The completion wake"). A refused list completes nothing and wakes nothing.
+//! [`RecordingBackend::new`] gives it [`CompletionWake::none`].
+//!
 //! **Other behaviour.** Pipelines are ready at once unless a test scripts their status
 //! ([`RecordingBackend::script_pipeline`]). `destroy` frees a resource at once when its fence
 //! value has passed and otherwise after the submit that reaches it; until then the id stays
@@ -96,6 +102,7 @@ use crate::pipeline::{ComputePipelineDesc, GraphicsPipelineDesc};
 use crate::resource::{BufferDesc, SamplerDesc, TextureDesc, ViewDesc};
 use crate::shader::{ShaderDesc, ShaderStage};
 use crate::validate;
+use crate::wake::CompletionWake;
 use plan::{Op, Place};
 use slots::Slots;
 use std::collections::{BTreeMap, VecDeque};
@@ -148,6 +155,8 @@ pub struct RecordingBackend {
     memory_allowed: u64,
     state: Mutex<State>,
     completed_moved: Condvar,
+    /// Called after each submit that completes a list (module docs, "The completion wake").
+    wake: CompletionWake,
 }
 
 #[derive(Debug)]
@@ -471,13 +480,20 @@ fn texture_bytes(desc: &TextureDesc) -> Result<(u64, Vec<Store>), RenderError> {
 
 impl RecordingBackend {
     /// A recording backend for a device with `caps`, reporting `memory_allowed` bytes as its
-    /// budget.
+    /// budget, whose completion wake does nothing ([`CompletionWake::none`]).
     pub fn new(caps: Caps, memory_allowed: u64) -> Self {
+        Self::with_completion_wake(caps, memory_allowed, CompletionWake::none())
+    }
+
+    /// A recording backend as [`RecordingBackend::new`] makes, which calls `wake` once from
+    /// every `submit` that completes a list (module docs, "The completion wake").
+    pub fn with_completion_wake(caps: Caps, memory_allowed: u64, wake: CompletionWake) -> Self {
         Self {
             caps,
             memory_allowed,
             state: Mutex::new(State::default()),
             completed_moved: Condvar::new(),
+            wake,
         }
     }
 
@@ -828,6 +844,8 @@ impl Backend for RecordingBackend {
         let waiting = !state.outbox.is_empty();
         drop(guard);
         self.completed_moved.notify_all();
+        // After the store above and with no lock held (render-backend, "The completion wake").
+        self.wake.wake();
         if waiting {
             self.deliver();
         }
