@@ -246,6 +246,12 @@ impl<I: Interrupter> Cores<I> {
         self.gpu_busy_reads.store(count, Ordering::SeqCst);
     }
 
+    /// How many of the reads [`Cores::read_gpu_busy`] asked for are left.
+    #[cfg(test)]
+    pub(super) fn gpu_busy_reads(&self) -> u32 {
+        self.gpu_busy_reads.load(Ordering::SeqCst)
+    }
+
     /// Stops every core: each is interrupted and woken, and parks no more.
     pub(super) fn stop(&self) {
         self.parks.stopped.store(true, Ordering::SeqCst);

@@ -311,7 +311,7 @@ fn presenting_run_until(
 
 /// A stand-in for the guest memory a real run shares with the GPU: the scripted runs' flat
 /// memory is not shared, and the GPU here reads nothing the guest wrote.
-fn stand_in_memory() -> Arc<dyn GuestMemory> {
+pub(super) fn stand_in_memory() -> Arc<dyn GuestMemory> {
     Arc::new(FlatMemory::new(0x8000_0000, usize::try_from(PAGE).unwrap()))
 }
 
