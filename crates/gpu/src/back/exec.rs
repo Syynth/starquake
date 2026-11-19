@@ -126,6 +126,16 @@
 //! entry's own work succeeded, and logged and counted otherwise
 //! (`tests::a_failed_deferred_draw_does_not_stop_the_entry_after_it`).
 //!
+//! # Report semaphores
+//!
+//! A `SET_REPORT_SEMAPHORE_D` word of the 3D class, once the mirror stored it and the draw path
+//! saw it, is decided by [`report::decide`]: a report of no counter becomes a fenced release of
+//! the payload ([`FencedAction::Release`]) through the channel's memory and address space,
+//! attached after the channel's deferred instances are drawn, exactly as a `Release` entry is;
+//! a counter report writes nothing and is logged at warning level, the first of the run only;
+//! an `ACQUIRE` or a `TRAP` does nothing. `back::report` has the fields, the reference and the
+//! divergences. Pinned in `tests/report.rs`.
+//!
 //! # Conditional rendering
 //!
 //! Before the draw path reads a conditional-render report (`SET_RENDER_ENABLE_C` written with a
@@ -230,6 +240,7 @@ use crate::back::fence::{CloseReason, FenceError, FencedAction, Fences, Settled}
 use crate::back::pipeline::PipelineCache;
 use crate::back::qmd::{LAST_INLINE_QMD_METHOD, QMD_BYTES, QmdError, QmdTable, inline_qmd_address};
 use crate::back::readback::ReadbackIds;
+use crate::back::report::{self, ReportAction};
 use crate::back::state::{Mirror, StateError};
 use crate::back::texture::{TextureCache, TextureError};
 use crate::channel::initial_binding;
@@ -518,6 +529,8 @@ pub struct Executor {
     drained: Vec<PageRange>,
     /// The constant-buffer upload (slice G25) and its scratch bytes.
     cb_load: ConstantBufferLoad,
+    /// Whether a counter report has been logged (module docs, "Report semaphores").
+    counter_report_logged: bool,
 }
 
 impl Executor {
@@ -549,6 +562,7 @@ impl Executor {
             scratch: CommandList::new(),
             drained: Vec::new(),
             cb_load: ConstantBufferLoad::new(),
+            counter_report_logged: false,
         }
     }
 
@@ -1170,7 +1184,11 @@ impl Executor {
                     self.before_work(space, true)?;
                 }
                 self.inline_word(channel, class, space, method)?;
-                self.draw_step(channel, DrawStep::Method { method, value })
+                self.draw_step(channel, DrawStep::Method { method, value })?;
+                if method == clc797::SET_REPORT_SEMAPHORE_D.method() {
+                    self.report_semaphore(channel, space)?;
+                }
+                Ok(())
             }
             clc7c0::CLASS => {
                 self.inline_word(channel, class, space, method)?;
@@ -1196,6 +1214,37 @@ impl Executor {
             }
             cla140::CLASS => self.inline_word(channel, class, space, method),
             _ => Ok(()),
+        }
+    }
+
+    /// A write of `SET_REPORT_SEMAPHORE_D` on `channel`'s 3D engine, once the mirror stored it
+    /// (module docs, "Report semaphores").
+    fn report_semaphore(&mut self, channel: ChannelId, space: AsId) -> Result<(), ExecError> {
+        let class = ClassId(clc797::CLASS);
+        match report::decide(&self.engine_mut(channel, class)?.mirror)? {
+            ReportAction::Release(release) => {
+                let deferred = self.flush_deferred(Some(channel));
+                let own = self.memory(space).and_then(|memory| {
+                    self.attach(FencedAction::Release {
+                        memory,
+                        space,
+                        release,
+                    })
+                });
+                self.then_deferred(own, deferred)
+            }
+            ReportAction::Counter { report } => {
+                if !self.counter_report_logged {
+                    self.counter_report_logged = true;
+                    tracing::warn!(
+                        channel = channel.0,
+                        report,
+                        "a counter report was asked for and is not written; later ones are not logged"
+                    );
+                }
+                Ok(())
+            }
+            ReportAction::Nothing => Ok(()),
         }
     }
 

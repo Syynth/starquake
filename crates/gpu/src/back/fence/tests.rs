@@ -60,7 +60,7 @@ const UNMAPPED: u64 = 0x7_0000_0000;
 /// The byte the guest memory is filled with, so bytes a release must not touch are visible.
 const FILL: u8 = 0xee;
 /// What the fake clock's timestamps read.
-const TIMESTAMP: u64 = 0x1122_3344_5566_7788;
+pub(crate) const TIMESTAMP: u64 = 0x1122_3344_5566_7788;
 /// Long enough for any of these tests' threads to make progress; only reached when broken.
 const PATIENCE: Duration = Duration::from_secs(10);
 /// A wait that only a wake or an entry can end before [`PATIENCE`].
