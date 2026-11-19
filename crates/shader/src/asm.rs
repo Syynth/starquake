@@ -86,6 +86,16 @@ pub enum EncodeError {
     /// `ALD` and `AST` move one to four words.
     #[error("an attribute access moves 1 to 4 words, not {0}")]
     Comps(u8),
+    /// The operand form or opcode the operation's other fields pick has no bits for this
+    /// operand or modifier (`decode::op::float`: `FMNMX`'s `.nan` and `FSET`'s combine
+    /// operation with a uniform-register source, among others).
+    #[error("{mnemonic} has no bits for {what}")]
+    NoBits {
+        /// The operation's mnemonic.
+        mnemonic: &'static str,
+        /// What cannot be encoded.
+        what: &'static str,
+    },
 }
 
 /// Builds one instruction word field by field.

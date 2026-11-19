@@ -2,6 +2,7 @@
 //! tests (form table, operand types at their edges, shells, check order) are in `framework`.
 
 mod control;
+mod float32;
 mod framework;
 
 use proptest::prelude::*;
