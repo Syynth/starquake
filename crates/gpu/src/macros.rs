@@ -90,9 +90,9 @@
 //! **A run's writes are committed only when it finishes.** Its register writes change the file
 //! at once, so its own `state` reads see them, but their ring entries are held, and the file
 //! words they changed are journaled. Its uploads and binds are held too, and its data RAM
-//! writes, `MME_DMA_READ`'s among them, are journaled by the memo. When the run finishes, its entries go to the sink in
-//! order and its uploads and binds are applied in order; when it fails or is abandoned for a
-//! catch-up, the file and the data RAM are put back and nothing is sent or applied
+//! writes, `MME_DMA_READ`'s among them, are journaled by the memo. When the run finishes, its
+//! entries go to the sink in order and its uploads and binds are applied in order; when it fails
+//! or is abandoned for a catch-up, the file and the data RAM are put back and nothing is sent or applied
 //! ([`CallResult`]). Neither the running macro's code nor its start table entry changes while it
 //! runs, even if it uploads code.
 //!
@@ -153,6 +153,11 @@
 //! words come from guest memory, which the memo's key and guard do not cover, and arrive without
 //! a barrier, so the barrier rule would not catch them. Eden-NX2 likewise stores no call that
 //! wrote 0x157 (`read_memory` in `MacroEngine::Execute`).
+//!
+//! `clc7c0.h` gives the compute class the same `MME_DMA_READ` and `_FIFOED` methods; a compute
+//! macro's write to them is a register write only, as Eden-NX2's compute front makes no MME
+//! memory reads (`kepler_compute.cpp`), and such a call may be remembered
+//! (`dma_reads_are_3d_only`, `data_ram_reads_are_3d_only_and_land_in_the_data_ram_compute_shares`).
 //!
 //! # Divergences
 //!

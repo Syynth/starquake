@@ -2957,3 +2957,28 @@ fn a_data_ram_read_stored_over_by_a_later_dwrite_keeps_the_dwrite() {
     assert!(matches!(report.result, CallResult::Committed(_)));
     assert_eq!(ram_words(&chan, 0x20, 3), [WORDS[0], WORDS[1], 0x77]);
 }
+
+#[test]
+fn two_data_ram_reads_in_one_run_each_land_where_they_were_sent() {
+    // Each read hands the interpreter its own words only.
+    let mut rig = make_rig();
+    let mut chan = Chan::new(A);
+    let program = finish(vec![
+        emit_param(m16(MEM_ADDRESS_A)),
+        emit_param(m16(MEM_ADDRESS_B)),
+        emit_imm(m16(DATA_RAM_ADDRESS), 0x20),
+        emit_imm(m16(DMA_READ), 2),
+        emit_param(m16(MEM_ADDRESS_B)),
+        emit_imm(m16(DATA_RAM_ADDRESS), 0x40),
+        emit_imm(m16(DMA_READ), 1),
+    ]);
+    rig.upload(&mut chan, Engine::ThreeD, 0, &program, 0);
+    rig.take();
+    rig.write_memory(SOURCE, &WORDS);
+    let [upper, lower, _] = source_parameters(SOURCE, 0);
+    let report = rig.call(&mut chan, Engine::ThreeD, 0, &[upper, lower, lower + 8]);
+    assert!(matches!(report.result, CallResult::Committed(_)));
+    assert_eq!(ram_words(&chan, 0x20, 3), [WORDS[0], WORDS[1], 0]);
+    assert_eq!(ram_words(&chan, 0x40, 3), [WORDS[2], 0, 0]);
+    assert_eq!(rig.back.queries.get(), 2);
+}
