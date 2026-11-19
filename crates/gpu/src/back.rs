@@ -17,12 +17,16 @@
 //!   textures uploaded through the layout crate, render targets, write-back on demand, kept
 //!   coherent with CPU writes, dropped by ordered unmaps, evicted by the budget.
 //! - [`readback`]: the readback ids the caches' write-backs share.
+//! - [`pipeline`]: the pipeline-key cache (slice G23): pipeline state to host pipelines, keyed
+//!   only on what the device does not set per draw, and the list of keys seen for precompiling
+//!   on the next boot.
 //!
 //! Later slices add draws (G18) and the executor that feeds them all from the ring (G19).
 
 pub mod buffer;
 pub mod copy;
 pub mod fence;
+pub mod pipeline;
 pub mod qmd;
 pub mod readback;
 pub mod state;

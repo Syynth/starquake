@@ -2,9 +2,10 @@
 //! (spec, "What the render backend (#14) gets, through the GPU crate": `HostShader`).
 //!
 //! Slice 1 fills the parts a vertex/pixel pair of the six slice-1 instructions needs: stage,
-//! code, entry point, inputs, outputs and requirements. The resource table, the driver-constants
-//! layout and the workgroup size join with the slices that produce them (13, 9 and 16), and
-//! the SPIR-V and MSL forms of `HostCode` with slice 22.
+//! code, entry point, inputs, outputs and requirements. The resource table and the workgroup
+//! size join with the slices that produce them (13 and 16); the driver-constants layout, which
+//! slice 9 defines ([`crate::driver_constants::DriverConstantsLayout`]), joins with slice 17,
+//! which lowers reads of it; and the SPIR-V and MSL forms of `HostCode` with slice 22.
 
 /// The host pipeline stage of a shader.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

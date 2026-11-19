@@ -499,6 +499,57 @@ Landed, the first milestone 3 wave: G8 (the channel pusher, #319, PR #335), G9 (
 | decided (decision log, 2026-11-18, "gpu-protocol errata from wave 36") | **What a QMD request that fails at run time leaves behind.** #336 keeps the request's own change, as Eden-NX2 does, and documents the exact sets; the spec does not say | #323 | gpu-protocol |
 | decided (decision log, 2026-11-18, "gpu-protocol errata from wave 36") | **Replay of data-upload runs:** runs to data-upload methods send shadow values, where Eden-NX2's fast paths upload the raw words. A possible compatibility difference | #320 | gpu-protocol |
 
+### From wave 37 (ledger: #22)
+
+Landed: G13 (the front macro host, #324, PR #340) and G11 (DMA copy, inline-to-memory and 2D on the CPU path, #322, PR #341). G10 (#321) was built and pushed but stopped before its checks; wave 38 resumes it from its branch. Wiring notes for G14 and G19 are comments on #325 and #330.
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| proposed | **Engine register reset values:** seed Eden's `InitializeRegisterDefaults` (and Fermi2D's depth of 1, already exported as `twod::BLIT_RESET_REGISTERS`) through G10's `ClassRules::initial_values`, which seeds the front file, the shadow file and the back mirror from one place. Wave 36's row; G14 and G19 need it before real streams | #321, #322 | area:gpu |
+| proposed | **`MME_DMA_READ` (0x157) into data RAM** at `SET_MME_DATA_RAM_ADDRESS`: Eden-NX2 performs it, G13 does not (row 58 names only the FIFO form). The memo must not store such calls, since they change data RAM without a barrier | #324 | area:gpu |
+| proposed | **The 2D format converter:** port `eden-nx2/src/video_core/engines/sw_blitter/converter.cpp` (about 1,200 lines). Blits between formats (`BlitConversion`) and bilinear filtering of formats other than the two 8888 ones (`BlitFilter`) are refused today | #322 | area:gpu |
+| proposed | **GPU counters for MME DMA reads, catch-ups and reruns**, folded into wave 36's front counters row; verification item 3 cannot be read from a run today | #324 | area:gpu |
+| proposed | **Macro store tests:** the cross-channel rewrite counter and `forget_channel` for the compute store and start entries; the memo stores a call whose write left the register file (arena space only) | #324 | area:gpu |
+| proposed | **Root tables for constant-buffer banks 24 to 31** have no owner yet (G18, with verification item 6) | #321 | area:gpu |
+| decided (decision log, 2026-11-18, "gpu-protocol errata from waves 37 and 38") | **`SET_PROGRAM_REGION` does not exist in `clc797.h`.** The spec's "3D: from state to a draw" names it; Ampere pipelines take a 64-bit address each through `SET_PIPELINE_PROGRAM_ADDRESS_A` and `_B` | #321 | gpu-protocol |
+| decided (decision log, 2026-11-18, "gpu-protocol errata from waves 37 and 38") | **`clc7c0.h` does list the compute macro calls** (`CALL_MME_MACRO` at byte 0x3800); the spec's facts table says it does not | #324 | gpu-protocol |
+| decided (decision log, 2026-11-18, "gpu-protocol errata from waves 37 and 38") | **Two code stores per process:** both references hold a 3D store and a compute store, and a channel's compute class uses the 3D store until it writes 0x45 or 0x47. The spec (and decision 11's wording) says one code store; G13 follows the references | #324 | gpu-protocol |
+| decided (decision log, 2026-11-18, "gpu-protocol errata from waves 37 and 38") | **The macro start table's size:** `clc797.h` lists 256 `CALL_MME_MACRO` elements; Eden-NX2 wraps at 0x80, and G13 follows it | #324 | gpu-protocol |
+| decided (decision log, 2026-11-18, "gpu-protocol errata from waves 37 and 38") | **A catch-up rerun after another channel rewrites the code:** G13 records the start the abandoned run used and reruns from it, reading the code as it is at the resume; listed as a divergence | #324 | gpu-protocol |
+| decided (decision log, 2026-11-18, "gpu-protocol errata from waves 37 and 38") | **Overlapping copies:** G11 reads each line whole before writing it for a pitch-to-pitch DMA copy, as Eden-NX2 does, and reads the whole source region first (at most `MAX_COPY_BYTES`) for a copy with a block-linear side and for every 2D blit. The spec does not say | #322 | gpu-protocol |
+| decided (decision log, 2026-11-18, "gpu-protocol errata from waves 37 and 38") | **Guessed bounds with no reference behind them:** at most 2^18 method writes and 0x1000 DMA words per macro run; `MAX_COPY_BYTES` (256 MiB) and `MAX_PENDING_RANGES` (1,024) for copies; vertex stream sizes (16 `SET_VERTEX_STREAM_SIZE` elements for 32 streams). Record them in the spec as guesses to confirm by trace | #321, #322, #324 | gpu-protocol |
+
+### From wave 38 (ledger: #22)
+
+Landed: G10 (back-thread engine mirrors, dirty groups and typed accessors, #321, PR #344, resumed from wave 37's branch), #342 (the 2026-11-18 rulings in `gpu::regs` and `gpu::back::qmd`, PR #345), G15 (fenced releases, completion and the completion wake, #326, PR #347) and G16 (the buffer cache, #327, PR #346). Shader-pipeline slice 9, which G18 waits on, is filed as #348 under the approved spec. Wiring notes are comments on #325, #328 and #329.
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| proposed | **GPU-written buffers and textures (milestone 4):** on-demand write-back (decision 4), keeping them out of routine eviction (row 139), a `ReadbackId` allocator shared by the buffer and texture caches, and a G15 hook so the guest write happens after the readback's list completes. Waits for the first host-GPU writer | #327 | area:gpu |
+| proposed | **`gpu::regs` and `gpu::back::state` follow-ups:** the front's `STATE_3D` still gives `SET_VERTEX_STREAM_SIZE` 16 elements where G10 gives 32; a contract and test for ungrouped registers; pin the legacy index registers 0x17d0, 0x17d4 and 0x17e0 | #321 | area:gpu |
+| proposed | **Test chores:** one shared `pub(crate)` tracing-capture test helper (the fence and macro tests each have a copy); whether the buffer cache's `Spans` should be the memory crate's `PageSet` | #326, #327 | area:gpu |
+| proposed | **The release timestamp's source:** `FenceClock::gpu_timestamp` is injected and not recorded; G21 picks the source (the spec's deferred queries say "from guest time"), and replay must supply the same clock | #326 | area:gpu |
+| decided (decision log, 2026-11-18, "gpu-protocol errata from waves 37 and 38") | **Ruling 6's wording:** the spec says "only state methods take the shadow value". #345 lets every method that is not a data load take it, triggers included, as Eden-NX2's `CallMethod` applies `ProcessShadowRam` to every method. Amend the sentence to "every method except data loads", or narrow the code | #342 | gpu-protocol |
+| decided (decision log, 2026-11-18, "gpu-protocol errata from waves 37 and 38") | **The 3D group table and typed accessors are hand-written,** keyed on the generated constants; the spec says they are generated (decision 6). Mesa's headers carry no group information. Accept hand-written tables, or extend `cargo xtask gen-classes` | #321 | gpu-protocol |
+| decided (decision log, 2026-11-18, "gpu-protocol errata from waves 37 and 38") | **Releases name no address space:** the ring's `Release` and the copy and QMD releases carry no channel, so the back cannot tell which `GpuMemory` a release writes. Add a channel to the ring's `Release` (with G19), or track the issuing channel | #326 | gpu-protocol |
+| decided (decision log, 2026-11-18, "gpu-protocol errata from waves 37 and 38") | **The buffer cache re-reads a range on its first use after arming its watch** (from the review notes on #197); the spec-literal alternative is a one-line change in `Entry::upload_spans` | #327 | gpu-protocol |
+| decided (decision log, 2026-11-18, "gpu-protocol errata from waves 37 and 38") | **Buffer cache guesses:** `STREAMED_AFTER_FAULTS = 4` and the budget halves in `eviction_limits`; record them in the spec as guesses to confirm by trace | #327 | gpu-protocol |
+
+### From filing the shader and render slices (2026-11-18)
+
+The remaining shader-pipeline slices (#349 to #381, #348 before them) and render-backend slices (#382 to #389) are filed under the approved specs, in milestone 3 except slice 21 (milestone 4) and slice 22 (unscheduled, for a direct backend). Drafting them turned up these spec gaps.
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| decided (decision log, 2026-11-18, "Render capture v2 no longer gates R5") | **Render capture v2 is to be designed "before R5"** (decision log, 2026-11-16), and no design exists. R11b (#388) needs it; R5 (#382) is otherwise ready to start. Let R5 go ahead while the lead drafts the capture v2 design as a design PR, or hold R5 until it merges | #382, #388 | render-backend |
+| decided (decision log, 2026-11-18, "Shader and render slice plan errata") | **Shader slice dependencies:** the spec's critical-path sentence disagrees with its own table (13 needs 12e, 12f, 8 and 9; 10 needs 3 and 9; 15 needs 2; every 12x needs 7) and leaves out the cache (19); slices 8, 11 and 18 test through the interpreter (7) without listing it; 6d builds on structs 6a, 6b and 6e make; 12h's branches become flow-analysis edges (10) | #348 to #381 | shader-pipeline |
+| decided (decision log, 2026-11-18, "Shader and render slice plan errata") | **Work no shader slice owns,** placed by the drafts: the local and shared memory pass (pass 6) in slice 16; the IR build step between flow analysis and the translators in slices 10 and 11; `cargo xtask shader-nvdisasm`; the speed test in slice 17 | #362, #363, #375, #376 | shader-pipeline |
+| decided (decision log, 2026-11-18, "Shader and render slice plan errata") | **One shader capture format:** the spec does not say whether `shader-replay` reads slice 20's format or the shader records inside the GPU capture (`SQGC`, G20 #331). The drafts make slice 20's format the one G20 embeds | #379, #331 | shader-pipeline |
+| decided (decision log, 2026-11-18, "Shader and render slice plan errata") | **R9b and R12 are circular:** R9b needs a backend in core, and R12, which chooses it, depends on R9. R9b can take G21's recording-backend wiring instead; also, no spec says how core sets the GPU crate's dump flag | #386, #389 | render-backend |
+| decided (decision log, 2026-11-18, "Shader and render slice plan errata") | **Small spec fixes:** PR #4588's test file is `src/tests/video_core/native_shader.cpp`; render-backend's "Open with #12: how the back thread wakes" line is stale since decision 14 | #348 to #389 | shader-pipeline, render-backend |
+| proposed | **Instructions with no reference source:** no encoding source for `JMX`, `UP2UR` and `BPT`; no translator in either Switch 2 reference for `IDP4`, `UP2UR`, `DSETP`, `AL2P` and `PIXLD` (Eden's Maxwell translators cover the last three). The decoder and translator issues mark them as guesses | #351 to #371 | area:shader |
+| proposed | **Render verification 3 (wgpu on lavapipe in Linux CI)** has no owner or issue; until it runs, every GPU test stays local-only | #382 | infra |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
@@ -735,3 +786,24 @@ passed to build agents as a provisional rule for the next wave.
 - Structurally invalid input (an unaligned address where alignment is documented) is refused at the API boundary with a named error, tested one step off the valid value.
 - Where a failure can come after a state change began, the docs list which failing paths leave state untouched and which keep their own change, and a test pins one of each.
 - Docs that claim reference or spec behaviour list every divergence (error reporting, check order, masked bits, read-back values), each with a named test; one that contradicts an approved spec sentence quotes it as an owner question in the module docs.
+
+### From wave 37 (ledger: #22)
+
+- A change that adds a way a function stops, returns or clears state updates every doc passage that lists those outcomes.
+- State shared across channels or engines is bound when the work starts, not at resume (or a generation is recorded and checked), with a test where a sibling rewrites it in between.
+- A chunked copy checks whether source and destination can overlap, and tests an overlap longer than one chunk.
+- A divergence that applies to sibling modules sharing one helper is listed, with a named test, in each module.
+- Reset and default register values come from the reference constructor, cited, and are tested with those registers left unwritten.
+- A function that promises a flush or cleanup on error has a failure-path test asserting the exact ordered events.
+- Register and field widths and signedness come from the reference types, tested with a value at or above 2^31.
+
+### From wave 38 (ledger: #22)
+
+- Table-driven mappings are pinned with hand-written literal cases from the reference, not expectations derived from the same table, covering each half of a paired entry.
+- Every typed getter has a test that each register it reads marks its view's group.
+- Set and bitmask operations are tested with operands that are not subsets and with clearing something already clean.
+- A worker that takes work in priority order has a bounded starvation test where the high-priority source never empties.
+- Ordering and carry-over logic is tested with two or more items in flight; removing the sole element of a collection is tested.
+- Every documented ordering between a signal and another side effect is pinned by a test double that observes the effect at the moment of the signal.
+- Every pool holding live bytes counts toward a documented memory cap, tested with a hostile growing sequence.
+- A doc that cites a reference name is checked against the reference tree; a doc that says code is generated or mirrors a spec sentence is checked literally.

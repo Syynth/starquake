@@ -584,8 +584,9 @@ Status: accepted as recommended in bulk (ruling 7), except gpu-protocol 1 and sh
   the bootstrap order first), 10 (no video decoding at first, then FFmpeg off by default), 11 (only
   the nvdrv ioctl subset).
 - **gpu-protocol** 1 (the front owns the register file; the largest internal choice), 6 (generate
-  class tables from Mesa headers), 7 (Ampere classes only), 11 (one macro store per process), 12
-  (drop same-value writes), 13 (stop on structural stream errors).
+  class tables from Mesa headers), 7 (Ampere classes only), 11 (one macro store per process;
+  refined by the owner on 2026-11-18 to one 3D and one compute store), 12 (drop same-value
+  writes), 13 (stop on structural stream errors).
 - **shader-pipeline** 1 (own arena IR with Eden's semantics; shapes the whole crate), 4 (strict
   decoding), 10 (ignore rounding modes except on conversions), 12 (shader overrides after milestone
   3), 15 (build the IR interpreter).
