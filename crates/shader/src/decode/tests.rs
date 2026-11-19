@@ -3,6 +3,7 @@
 
 mod control;
 mod framework;
+mod integer;
 
 use proptest::prelude::*;
 
@@ -541,7 +542,10 @@ fn mov_rejects_source_modifier_bits() {
         .iter()
         .map(|(form, _)| form.opcode(MOV_OPCODE))
         .collect();
-    for row in integer::REFERENCE_ROWS {
+    let mov_rows = super::integer::REFERENCE_ROWS
+        .iter()
+        .filter(|row| row.opcode & 0x1ff == MOV_OPCODE);
+    for row in mov_rows {
         let expected = if forms.contains(&row.opcode) {
             SLOT_ABS.mask() | SLOT_NEG.mask()
         } else {

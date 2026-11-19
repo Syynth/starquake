@@ -57,7 +57,7 @@ pub use control::{
     BMovDir, BarMode, BarRed, Barrier, BraCond, BranchOffset, BrxSrc, MatchOp, ReduxOp, ShflOp,
     ShflSrc, VoteDst, VoteOp,
 };
-pub use integer::MovSrc;
+pub use integer::{IMadMode, IntCmpOp, MovSrc, PLop3Src, PredSetOp, PrmtMode, ShfType};
 
 /// An operation's mnemonic, as `nvdisasm` writes it lower-cased (for a shell, a guess).
 pub(crate) trait Named {

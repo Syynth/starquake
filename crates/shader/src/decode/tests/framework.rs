@@ -38,17 +38,26 @@ fn decoded() -> Vec<&'static str> {
 
 /// The mnemonics the forms of `forms` decode to, sorted, without repeats: each form's word with
 /// only its opcode and fixed bits set (which every form accepts:
-/// `every_bit_outside_a_form_is_rejected`).
+/// `every_bit_outside_a_form_is_rejected`), and that word with any one more bit of the form set
+/// where it decodes (`IADD3.X` and `LEA.X` share their forms with `IADD3` and `LEA`, told apart
+/// by bit 74: `op::integer`).
 fn mnemonics_of(forms: &[Form]) -> Vec<&'static str> {
     let mut mnemonics: Vec<&str> = forms
         .iter()
-        .map(|form| {
+        .flat_map(|form| {
             let word =
                 Instruction::from_bits(form.fixed).with_field(OPCODE, u64::from(form.opcode));
-            decode(word)
+            let bare = decode(word)
                 .expect("a form's bare word decodes")
                 .op
-                .mnemonic()
+                .mnemonic();
+            let one_more = (0..128)
+                .filter(move |bit| form.known & !form.fixed & !OPCODE.mask() & (1 << bit) != 0)
+                .filter_map(move |bit| {
+                    decode(Instruction::from_bits(word.bits() | (1 << bit))).ok()
+                })
+                .map(|instr| instr.op.mnemonic());
+            std::iter::once(bare).chain(one_more)
         })
         .collect();
     mnemonics.sort_unstable();
@@ -147,6 +156,20 @@ fn fixed_bits_are_required() {
     ];
     for opcode in required {
         assert_eq!(lookup(opcode).expect("a form").fixed, SLOT_UNIFORM.mask());
+    }
+    // Slice 6a's uniform-register forms, written out (`op::integer`'s rows); some have fixed
+    // fields of their own besides bit 91.
+    let integer_uniform: [u16; 25] = [
+        0xc10, 0xe10, 0xc11, 0xe11, 0xc12, 0xe12, 0xc13, 0xc16, 0xe16, 0xc17, 0xc19, 0xe19, 0xc1a,
+        0xc1b, 0xc24, 0xe24, 0xc25, 0xe25, 0xc26, 0xe26, 0xc0c, 0xc07, 0xd00, 0xd01, 0xd09,
+    ];
+    for opcode in integer_uniform {
+        let fixed = lookup(opcode).expect("a form").fixed;
+        assert_eq!(
+            fixed & SLOT_UNIFORM.mask(),
+            SLOT_UNIFORM.mask(),
+            "{opcode:#x}"
+        );
     }
     for (opcode, _, fixed) in forms() {
         let word = Instruction::default().with_field(OPCODE, u64::from(opcode));
