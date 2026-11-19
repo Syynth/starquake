@@ -15,8 +15,11 @@
 //! 2. **The walk** ([`analyze`]): from instruction 0, every reachable instruction, the block
 //!    leaders, the reconvergence point of each `BSYNC`, the functions `CALL` names and the
 //!    targets of each `BRX`. Two barrier models: the strict `BSSY`/`BSYNC` stack and the
-//!    barrier-register model ([`BarrierModel`]); [`flow_graph`] uses the register model (spec),
-//!    and the tests check that the two agree wherever the stack model accepts a program.
+//!    barrier-register model ([`BarrierModel`]); [`flow_graph`] uses the register model (spec;
+//!    see the divergence table for how PR #4588 picks between them). The tests check that the
+//!    two agree on generated structured programs
+//!    (`tests::models::the_models_agree_on_structured_programs`) and on the synthetic programs
+//!    the walk's tests run under both (`tests::analysis`'s `accepted` and `refusal` helpers).
 //! 3. **Blocks**: each reachable leader starts a block that runs to the next leader or to a
 //!    control instruction; a guarded instruction that cannot be kept as a select, a `KILL`, a
 //!    guarded `CALL` and a conditional `EXIT` get their own block behind a test of their guard
@@ -55,6 +58,15 @@
 //! guarded instruction in a block is a pure one, whose guard the translator keeps as a select
 //! (`classify.h`, `pure`).
 //!
+//! A `KILL` gets a conditional block of its own that holds it and ends in [`BlockEnd::Kill`]:
+//! the discard is that end, not the instruction, as in PR #4588, where the block's end class
+//! is `EndClass::Kill` (`flow.cpp`, `BuildFrom`), the structurizer turns it into
+//! `DemoteToHelperInvocation` (`structured_control_flow.cpp`, `StatementType::Kill`) and the
+//! `KILL` instruction itself translates to nothing (`visitor.cpp`, `case 0x95b`). So the
+//! translator turns the `KILL` in such a block into nothing, and [`FlowGraph::build_ir`]
+//! emits the demote (pinned by `tests::graph::a_kill_gets_its_own_block` and
+//! `tests::ir::a_kill_demotes_after_its_block_then_continues`).
+//!
 //! # Divergences from PR #4588
 //!
 //! | What | Here | Reference | Pinned by |
@@ -68,15 +80,27 @@
 //! | The `MOV`s `CALL` and `RET` linkage reads | Must decode as a `MOV` | Read from their bits alone | `tests::analysis::link_mov_must_decode` |
 //! | Refused targets | [`FlowError::MisalignedTarget`] or [`FlowError::TargetOutside`] | One message for both | `tests::analysis::target_errors_name_their_reason` |
 //! | A `BRX` the decoder refuses | Not tracked by [`find_jump_tables`] (flow analysis refuses it anyway) | Tracked by its bits | `tests::jump_tables::undecodable_brx_is_not_tracked` |
-//! | Paths waiting to be walked from one instruction | Merged into one as they are queued, as the join would merge them | Each queued with its own barrier state | `tests::linear::paths_waiting_at_one_instruction_are_merged` |
+//! | Paths waiting to be walked from one instruction | Merged into one as they are queued, as the join would merge them | Each queued with its own barrier state | `tests::linear::paths_waiting_at_one_instruction_are_merged` (memory), `tests::analysis::stack_paths_waiting_at_one_instruction_keep_the_shorter_stack`, `tests::analysis::paths_waiting_at_one_instruction_merge_their_barriers` (register model), `tests::analysis::two_functions_waiting_at_one_instruction_are_refused`, `tests::analysis::stack_paths_waiting_with_unrelated_stacks_are_refused` |
+//! | Which barrier model [`flow_graph`] walks with | The register model only | `CfgBuilder::Build` calls `AnalyzeFlow`, which runs the stack model first and retries with the register model only when the stack model's error text contains "reconvergence" | `tests::models::the_models_agree_on_structured_programs`, and the `accepted` and `refusal` helpers of `tests::analysis` |
 //!
 //! Merging waiting paths gives the same result for every program both accept: the join at the
 //! instruction would merge them the same way, and the walk's result is the fixed point of
 //! those merges. For a program with several faults, which one is reported first can differ,
 //! since the reference's first fault depends on the order its stack of paths is walked in. A
 //! merge of two waiting paths reports what the join would: [`FlowError::SharedCode`] for two
-//! functions, and, in the stack model, [`FlowError::StacksDiffer`] for stacks neither of which
-//! is a prefix of the other.
+//! functions (`tests::analysis::two_functions_waiting_at_one_instruction_are_refused`), and,
+//! in the stack model, [`FlowError::StacksDiffer`] for stacks neither of which is a prefix of
+//! the other (`tests::analysis::stack_paths_waiting_with_unrelated_stacks_are_refused`).
+//!
+//! Walking with the register model alone gives the reference's result in these cases: where
+//! the stack model accepts a program, the two models give the same analysis (the tests named in
+//! the table check this on the programs they generate or build, not on every program); where it
+//! refuses with a "reconvergence" error ([`FlowError::NestedBarrier`],
+//! [`FlowError::MissingBarrier`], [`FlowError::TargetsDiffer`], [`FlowError::StacksDiffer`]),
+//! the reference retries with the register model, which is what runs here. Where the stack model
+//! refuses with any other error, the reference reports that error; the register model here
+//! reports its own first fault, which can be another one when a program has several, for the
+//! same reason as above.
 //!
 //! `JMX` and `BPT` have no encoding in any reference (slice 6h keeps them as shells), so they
 //! are not recognised: their words are straight-line instructions to the walk. When `JMX` gets
@@ -393,8 +417,10 @@ pub enum FlowError {
         /// The `CALL`.
         index: u32,
     },
-    /// A block leads to an instruction the walk did not reach: only a hand-made [`Analysis`]
-    /// could cause it, as [`flow_graph`] builds from the walk's own result.
+    /// A block leads to an instruction that has no block. No public function reaches it:
+    /// blocks are built only from the walk's own result, which walks every instruction a
+    /// branch, call, reconvergence point or table names. It is an error, not a panic, in case
+    /// that ever stops holding.
     #[error("instruction {index} leads to instruction {target}, which the walk did not reach")]
     Unwalked {
         /// The instruction that leads there.
@@ -413,6 +439,25 @@ pub enum FlowError {
     /// The IR could not take another block or instruction.
     #[error("the IR cannot hold the flow graph: {0}")]
     Ir(#[from] BuildError),
+    /// Flow analysis broke one of its own invariants: a fault in this module, not in the
+    /// program. No public function reaches it; it is an error, not a panic, in case that ever
+    /// stops holding.
+    #[error("flow analysis broke an invariant of its own: {0}")]
+    Internal(Invariant),
+}
+
+/// Which of flow analysis's own invariants broke ([`FlowError::Internal`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum Invariant {
+    /// More blocks were made than a `u32` block id can name.
+    #[error("more blocks than a block id can name")]
+    BlockCount,
+    /// A block was made but never filled.
+    #[error("block {0} was never filled")]
+    Unfilled(u32),
+    /// A block id names no block.
+    #[error("block {0} does not exist")]
+    NoBlock(u32),
 }
 
 /// A block of the inlined [`FlowGraph`], by its index.
@@ -461,6 +506,10 @@ pub enum BlockEnd {
     },
     /// The thread exits.
     Exit,
+    /// The block's `KILL` discards: the thread becomes a helper invocation (the IR's
+    /// `DemoteToHelperInvocation`), then control continues at the block (see the module docs,
+    /// "What a block holds").
+    Kill(BlockIndex),
 }
 
 /// A block of the flow graph: a run of instructions and how control leaves it.

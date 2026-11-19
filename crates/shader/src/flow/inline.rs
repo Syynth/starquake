@@ -12,8 +12,8 @@
 
 use super::blocks::{RawEnd, RawGraph};
 use super::{
-    BlockEnd, BlockIndex, FlowBlock, FlowError, FlowGraph, IndirectTarget, MAX_FLOW_BLOCKS,
-    MAX_INLINE_DEPTH,
+    BlockEnd, BlockIndex, FlowBlock, FlowError, FlowGraph, IndirectTarget, Invariant,
+    MAX_FLOW_BLOCKS, MAX_INLINE_DEPTH,
 };
 
 /// One copy of a function.
@@ -68,6 +68,7 @@ pub(super) fn inline(raw: &RawGraph) -> Result<FlowGraph, FlowError> {
                         .collect::<Result<_, FlowError>>()?,
                 },
                 RawEnd::Exit => BlockEnd::Exit,
+                RawEnd::Kill(next) => BlockEnd::Kill(map(raw, copy, *next)?),
                 RawEnd::Call { call, callee, next } => {
                     let depth = copy.depth.saturating_add(1);
                     if calls_itself(&copies, copy, *callee) {
@@ -153,10 +154,7 @@ fn raw_block(raw: &RawGraph, id: u32) -> Result<&super::blocks::RawBlock, FlowEr
     usize::try_from(id)
         .ok()
         .and_then(|slot| raw.blocks.get(slot))
-        .ok_or(FlowError::Unwalked {
-            index: id,
-            target: id,
-        })
+        .ok_or(FlowError::Internal(Invariant::NoBlock(id)))
 }
 
 /// The id, in `copy`, of raw block `id` of its function.
@@ -165,15 +163,9 @@ fn map(raw: &RawGraph, copy: Instance, id: u32) -> Result<BlockIndex, FlowError>
         .ok()
         .and_then(|slot| raw.position.get(slot))
         .copied()
-        .ok_or(FlowError::Unwalked {
-            index: id,
-            target: id,
-        })?;
+        .ok_or(FlowError::Internal(Invariant::NoBlock(id)))?;
     copy.start
         .checked_add(position)
         .map(BlockIndex)
-        .ok_or(FlowError::Unwalked {
-            index: id,
-            target: id,
-        })
+        .ok_or(FlowError::Internal(Invariant::BlockCount))
 }

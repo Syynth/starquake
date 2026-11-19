@@ -3,8 +3,8 @@
 
 use super::super::{BranchTables, FlowGraph, flow_graph};
 use super::{
-    Item, NEVER, Program, block, branch, bsync, exit, exit_if, graph, indirect, jump, kill, not_p,
-    offset, p, pure, r, side_effect, size, tested,
+    Item, NEVER, Program, block, branch, bsync, exit, exit_if, graph, indirect, jump, kill,
+    kill_then, not_p, offset, p, pure, r, side_effect, size, tested,
 };
 use crate::asm::assemble;
 use crate::decode::{BrxSrc, Instr, Op, OpCall, PredSrc};
@@ -98,7 +98,7 @@ fn a_kill_gets_its_own_block() {
         &[
             block(0..0, branch(p(0), 2, 1)),
             block(1..2, Exit),
-            tested(0..1, jump(1)),
+            tested(0..1, kill_then(1)),
         ]
     );
     let code = Program::new().op(kill(PredSrc::TRUE)).op(exit()).build();
@@ -107,7 +107,7 @@ fn a_kill_gets_its_own_block() {
         &[
             block(0..0, jump(2)),
             block(1..2, Exit),
-            tested(0..1, jump(1))
+            tested(0..1, kill_then(1))
         ]
     );
 }

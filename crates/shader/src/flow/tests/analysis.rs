@@ -2,7 +2,7 @@
 //! the accepted program one step away where there is one.
 
 use super::super::analysis::{LINK_LOOKBACK, RETURN_COPY_LOOKBACK, RETURN_COPY_REGISTER_LIMIT};
-use super::super::classify::WARP_WIDE_OPCODES;
+use super::super::classify::{UMOV_IMM_OPCODE, WARP_WIDE_OPCODES, classify};
 use super::super::{Analysis, BarrierModel, BranchTables, FlowError, MAX_PROGRAM, analyze};
 use super::{
     Item, NEVER, Program, bsync, exit, exit_if, kill, offset, p, pure, r, refusal, side_effect,
@@ -10,7 +10,7 @@ use super::{
 };
 use crate::asm::assemble;
 use crate::decode::{
-    BraCond, BranchOffset, BrxSrc, DecodeError, Field, GUARD, GUARD_NOT, Instr, Instruction,
+    BraCond, BranchOffset, BrxSrc, DST, DecodeError, Field, GUARD, GUARD_NOT, Instr, Instruction,
     MovSrc, OPCODE, Op, OpBSSy, OpBSync, OpBra, OpBrx, OpCall, OpExit, OpKill, OpMov, OpRet,
     PredSrc, UniformPred, UniformPredSrc, decode,
 };
@@ -1079,4 +1079,119 @@ fn a_loop_with_a_break_reaches_its_exit() {
         analysis.sync_target(program.at("out")),
         Some(program.at("after"))
     );
+}
+
+#[test]
+fn a_skip_call_needs_an_instruction_after_its_label() {
+    // 0: BRA 1; 1: @P0 CALL 3; 2: BRA 1. The skip call's label, 3, is one past the last
+    // instruction (`index + 2 >= code.size()` in `IsSkipCall`), so it is a call, whose target
+    // lies outside the program and which has no return address.
+    let code = [
+        bra_by(PredSrc::TRUE, PredSrc::TRUE, offset(0, 1)),
+        call_word(1, 3, true, PredSrc::TRUE, p(0)),
+        bra_by(PredSrc::TRUE, PredSrc::TRUE, offset(2, 1)),
+    ];
+    assert_eq!(refusal(&code), FlowError::CallLinkage { index: 1 });
+}
+
+#[test]
+fn a_uniform_write_to_the_link_index_is_no_overwrite() {
+    // 0: MOV R10, 32; 1: CALL 3; 2: EXIT; 3: UMOV UR10, imm; 4: RET R10. The UMOV writes the
+    // uniform register 10, not R10 (`pure && !uniform` in the reference's check).
+    let umov = raw(UMOV_IMM_OPCODE, PredSrc::TRUE).with_field(DST, 10);
+    let info = classify(UMOV_IMM_OPCODE);
+    assert!(info.pure && info.uniform);
+    let code = Program::new()
+        .call(10, "f")
+        .op(exit())
+        .label("f")
+        .word(umov)
+        .ret(10)
+        .build();
+    let analysis = accepted(&code);
+    assert_eq!(analysis.function_entries(), &[0, 3]);
+}
+
+#[test]
+fn two_functions_waiting_at_one_instruction_are_refused() {
+    // 0: MOV R10, 32; 1: CALL 3, which queues function 1 at 3; 2: BRA 3, which queues
+    // function 0 at 3 before 3 is walked. The queue refuses the second path, as the join would.
+    let code = Program::new()
+        .call(10, "f")
+        .bra(PredSrc::TRUE, "f")
+        .label("f")
+        .ret(10)
+        .build();
+    assert_eq!(refusal(&code), FlowError::SharedCode { index: 3 });
+}
+
+#[test]
+fn stack_paths_waiting_at_one_instruction_keep_the_shorter_stack() {
+    // 0 BSSY B0 -> 7; 1 BSSY B1 -> 5; 2 @P0 BRA 6 (waits at 6 with B0 B1); 3 BSYNC B1 (to 5
+    // with B0); 4 EXIT; 5 BRA 6 (waits at 6 with B0, before 6 is walked); 6 BSYNC B0; 7 EXIT.
+    // The waiting paths merge to the shorter stack, and both models agree.
+    let code = Program::new()
+        .bssy(0, "seven")
+        .bssy(1, "five")
+        .bra(p(0), "six")
+        .op(bsync(1))
+        .op(exit())
+        .label("five")
+        .bra(PredSrc::TRUE, "six")
+        .label("six")
+        .op(bsync(0))
+        .label("seven")
+        .op(exit())
+        .build();
+    let analysis = accepted(&code);
+    assert_eq!(analysis.sync_target(3), Some(5));
+    assert_eq!(analysis.sync_target(6), Some(7));
+    // The same, with 6 setting up B1 again before syncing it (6 BSSY B1 -> 8; 7 BSYNC B1;
+    // 8 BSYNC B0; 9 EXIT): a path walked from 6 with the longer stack would be refused there.
+    let code = Program::new()
+        .bssy(0, "nine")
+        .bssy(1, "five")
+        .bra(p(0), "six")
+        .op(bsync(1))
+        .op(exit())
+        .label("five")
+        .bra(PredSrc::TRUE, "six")
+        .label("six")
+        .bssy(1, "eight")
+        .op(bsync(1))
+        .label("eight")
+        .op(bsync(0))
+        .label("nine")
+        .op(exit())
+        .build();
+    let analysis = accepted(&code);
+    assert_eq!(analysis.sync_target(7), Some(8));
+    assert_eq!(analysis.sync_target(8), Some(9));
+}
+
+#[test]
+fn stack_paths_waiting_with_unrelated_stacks_are_refused() {
+    // 0 BSSY B0 -> 3; 1 @P0 BRA 7 (waits at 7 with B0); 2 BSYNC B0 (to 3, empty stack);
+    // 3 BSSY B1 -> 9; 4 BRA 7 (waits at 7 with B1, before 7 is walked); 5..9 EXIT. Neither
+    // stack is a prefix of the other: the queue refuses, as the join would.
+    let code = Program::new()
+        .bssy(0, "three")
+        .bra(p(0), "seven")
+        .op(bsync(0))
+        .label("three")
+        .bssy(1, "nine")
+        .bra(PredSrc::TRUE, "seven")
+        .op(exit())
+        .op(exit())
+        .label("seven")
+        .op(exit())
+        .op(exit())
+        .label("nine")
+        .op(exit())
+        .build();
+    assert_eq!(
+        analyze(&code, &tables(), BarrierModel::Stack),
+        Err(FlowError::StacksDiffer { index: 7 })
+    );
+    assert!(analyze(&code, &tables(), BarrierModel::Registers).is_ok());
 }

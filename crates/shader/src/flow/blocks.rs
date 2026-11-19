@@ -4,14 +4,15 @@
 //! Every reachable leader gets a block, made before any is filled so that ends can name them;
 //! filling a block walks from its leader to the next leader or to the control instruction that
 //! ends it. A conditional instruction (a guarded side effect, a `KILL`, a guarded `CALL`, a
-//! conditional `EXIT`) gets a test block at its leader and a block of its own behind it. The
+//! conditional `EXIT`) gets a test block at its leader and a block of its own behind it; a
+//! `KILL`'s block ends in [`RawEnd::Kill`] (PR #4588's `EndClass::Kill`). The
 //! blocks of each function are listed with its entry first, ready for inlining.
 
 use std::ops::Range;
 
 use super::analysis::{Analysis, guard_of, is_never, opcode_of, second_of};
 use super::classify::{OpKind, classify};
-use super::{BranchTables, FlowError};
+use super::{BranchTables, FlowError, Invariant};
 use crate::decode::{BrxSrc, Instruction, Op, PredSrc, UniformReg, decode};
 
 /// How control leaves a block before inlining: [`super::BlockEnd`] with calls and returns.
@@ -32,6 +33,8 @@ pub(super) enum RawEnd {
     },
     /// The thread exits.
     Exit,
+    /// The block's `KILL` discards, then control continues at a block.
+    Kill(u32),
     /// Run function `callee`, then continue at `next`. `call` is the `CALL`'s index.
     Call { call: u32, callee: u32, next: u32 },
     /// Return to the caller where `cond` holds (always when `None`), else continue at
@@ -91,7 +94,7 @@ pub(super) fn build(
     for (index, slot) in (0_u32..).zip(builder.entry_block.iter_mut()) {
         if analysis.is_leader(index) && analysis.is_reachable(index) {
             let block = u32::try_from(builder.blocks.len())
-                .map_err(|_| FlowError::RunsPastEnd { last: index })?;
+                .map_err(|_| FlowError::Internal(Invariant::BlockCount))?;
             *slot = Some(block);
             builder.blocks.push(None);
             builder
@@ -123,9 +126,8 @@ impl Builder<'_> {
 
     /// Adds a block of `function`.
     fn add(&mut self, function: u32, block: RawBlock) -> Result<u32, FlowError> {
-        let id = u32::try_from(self.blocks.len()).map_err(|_| FlowError::RunsPastEnd {
-            last: self.count().saturating_sub(1),
-        })?;
+        let id = u32::try_from(self.blocks.len())
+            .map_err(|_| FlowError::Internal(Invariant::BlockCount))?;
         self.blocks.push(Some(block));
         self.function.push(function);
         Ok(id)
@@ -348,6 +350,7 @@ impl Builder<'_> {
                     },
                 )
             }
+            OpKind::Kill => (index..next_index, RawEnd::Kill(next)),
             _ => (index..next_index, RawEnd::Jump(next)),
         };
         let conditional = self.add(
@@ -385,11 +388,9 @@ impl Builder<'_> {
     /// The graph, every block filled, with each function's blocks listed entry first.
     fn finish(self) -> Result<RawGraph, FlowError> {
         let mut blocks = Vec::with_capacity(self.blocks.len());
-        for block in self.blocks {
+        for (id, block) in (0_u32..).zip(self.blocks) {
             // Every leader block is filled by `build_from`, which returns an error otherwise.
-            blocks.push(block.ok_or(FlowError::RunsPastEnd {
-                last: self.analysis.len().saturating_sub(1),
-            })?);
+            blocks.push(block.ok_or(FlowError::Internal(Invariant::Unfilled(id)))?);
         }
         let entries = self.analysis.function_entries();
         let mut functions: Vec<Vec<u32>> = vec![Vec::new(); entries.len()];

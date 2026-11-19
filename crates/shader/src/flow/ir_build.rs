@@ -17,8 +17,13 @@
 //!   cf654052); when none matches, control never gets there ([`Terminator::Unreachable`], Eden's
 //!   `Unreachable` after the gotos).
 //! - **An exit** is [`Terminator::Return`].
+//! - **A kill** is `DemoteToHelperInvocation` and then a jump to the next block, in a block of
+//!   its own after the block's instructions as for a test (PR #4588's structurizer emits the
+//!   demote for `EndClass::Kill`, `structured_control_flow.cpp`, `StatementType::Kill`). The
+//!   `KILL` instruction in the block translates to nothing, as in the reference's
+//!   `visitor.cpp` (`case 0x95b`).
 
-use super::{BlockEnd, BlockIndex, FlowError, FlowGraph, IndirectTarget};
+use super::{BlockEnd, BlockIndex, FlowError, FlowGraph, IndirectTarget, Invariant};
 use crate::decode::{BrxSrc, PredSrc};
 use crate::ir::{BlockId, Builder, Function, Imm, Opcode, Operand, Terminator};
 
@@ -34,7 +39,8 @@ pub struct BlockSource {
 /// The IR's blocks for a flow graph: a control-flow graph whose blocks the translators fill.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IrBlocks {
-    /// The function: every block terminated, the test blocks holding their tests.
+    /// The function: every block terminated, the test blocks holding their tests and each
+    /// kill's `DemoteToHelperInvocation` (see the module docs).
     pub function: Function,
     /// For each flow block in order, the IR block that holds its instructions: block `n` for
     /// flow block `n`. Test blocks hold no instructions of the program and are not listed.
@@ -63,10 +69,7 @@ impl FlowGraph {
                 .ok()
                 .and_then(|slot| sources.get(slot))
                 .map(|source| source.block)
-                .ok_or(FlowError::Unwalked {
-                    index: target.0,
-                    target: target.0,
-                })
+                .ok_or(FlowError::Internal(Invariant::NoBlock(target.0)))
         };
         for (source, flow) in sources.iter().zip(&self.blocks) {
             let mut builder = Builder::new(&mut function, source.block);
@@ -75,6 +78,11 @@ impl FlowGraph {
                     builder.terminate(Terminator::Jump(ir_block(*target)?))?;
                 }
                 BlockEnd::Exit => builder.terminate(Terminator::Return)?,
+                BlockEnd::Kill(next) => {
+                    to_test_block(&mut builder, flow.code.is_empty())?;
+                    builder.op(Opcode::DemoteToHelperInvocation, &[])?;
+                    builder.terminate(Terminator::Jump(ir_block(*next)?))?;
+                }
                 BlockEnd::Branch {
                     cond,
                     then,

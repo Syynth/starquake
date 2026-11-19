@@ -2,7 +2,7 @@
 //! their own after any instructions.
 
 use super::super::{BranchTables, FlowError, IrBlocks, flow_graph};
-use super::{Item, NEVER, Program, bsync, exit, graph, not_p, p, pure, r, size};
+use super::{Item, NEVER, Program, bsync, exit, graph, kill, not_p, p, pure, r, size};
 use crate::decode::{BrxSrc, Instruction, PredSrc, UniformReg};
 use crate::ir::{Block, BlockId, Imm, Inst, Opcode, Operand, Terminator, Value};
 
@@ -274,4 +274,33 @@ fn exits_return_and_jumps_jump() {
     let ir = graph(&code).expect("accepted").build_ir().expect("IR");
     assert_eq!(ir.function.block_count(), 1);
     assert_eq!(nth(&ir, 0).1.terminator, Terminator::Return);
+}
+
+#[test]
+fn a_kill_demotes_after_its_block_then_continues() {
+    // Flow blocks: 0 the test of P0 (no code), 1 the EXIT, 2 the KILL (code 0..1), whose end
+    // carries the discard. Block 2 holds code, so the demote goes in a block of its own after
+    // it (block 3), which then jumps to block 1. With `PT` the test is a plain jump.
+    for guard in [p(0), PredSrc::TRUE] {
+        let code = Program::new().op(kill(guard)).op(exit()).build();
+        let ir = ir_of(&code, &BranchTables::new(0));
+        assert_eq!(ir.sources.len(), 3);
+        assert_eq!(ir.function.block_count(), 4);
+        let (block1, _) = nth(&ir, 1);
+        let (block2, kill_block) = nth(&ir, 2);
+        let (demote, demote_block) = nth(&ir, 3);
+        assert_eq!(
+            nth(&ir, 0).1.insts.len(),
+            usize::from(guard != PredSrc::TRUE)
+        );
+        assert_eq!(kill_block.insts, Vec::<Value>::new());
+        assert_eq!(kill_block.terminator, Terminator::Jump(demote));
+        assert_eq!(demote_block.insts.len(), 1);
+        assert_eq!(
+            op(&ir, demote_block.insts[0]),
+            (Opcode::DemoteToHelperInvocation, vec![])
+        );
+        assert_eq!(demote_block.terminator, Terminator::Jump(block1));
+        assert_ne!(demote, block2);
+    }
 }

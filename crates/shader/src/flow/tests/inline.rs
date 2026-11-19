@@ -1,9 +1,14 @@
-//! Inlining: recursion through other functions, and the depth and size limits at their edges.
+//! Inlining: recursion through other functions, the depth and size limits at their edges, a
+//! kill in a function copied per call, and the internal-invariant errors.
 
+use super::super::blocks::{RawBlock, RawEnd, RawGraph};
 use super::super::{
-    BarrierModel, BranchTables, FlowError, MAX_FLOW_BLOCKS, MAX_INLINE_DEPTH, analyze,
+    BarrierModel, BlockEnd, BlockIndex, BranchTables, FlowBlock, FlowError, FlowGraph, Invariant,
+    MAX_FLOW_BLOCKS, MAX_INLINE_DEPTH, analyze, inline,
 };
-use super::{Program, exit, graph, name, p, pure, side_effect};
+use super::{
+    Program, block, branch, exit, graph, jump, kill, kill_then, name, p, pure, side_effect, tested,
+};
 use crate::decode::{Instruction, PredSrc};
 
 #[test]
@@ -100,4 +105,103 @@ fn size_at_its_edge() {
         super::graph(&code),
         Err(FlowError::InlineSize { index: last_call })
     );
+}
+
+#[test]
+fn a_kill_in_a_function_continues_in_its_own_copy() {
+    // 0 MOV R10; 1 CALL f; 2 MOV R10; 3 CALL f; 4 EXIT; f = 5: @P0 KILL; 6: RET R10. Each copy
+    // of f has its test, its return and the KILL's block, whose end names the copy's return.
+    let code = Program::new()
+        .call(10, "f")
+        .call(10, "f")
+        .op(exit())
+        .label("f")
+        .op(kill(p(0)))
+        .ret(10)
+        .build();
+    assert_eq!(
+        graph(&code).expect("accepted").blocks(),
+        &[
+            block(0..1, jump(3)),
+            block(2..3, jump(6)),
+            block(4..5, BlockEnd::Exit),
+            block(5..5, branch(p(0), 5, 4)),
+            block(6..6, jump(1)),
+            tested(5..6, kill_then(4)),
+            block(5..5, branch(p(0), 8, 7)),
+            block(6..6, jump(2)),
+            tested(5..6, kill_then(7)),
+        ]
+    );
+}
+
+#[test]
+fn a_block_id_that_names_no_block_is_an_internal_error() {
+    // Inlining: a raw block jumping to raw block 5, which does not exist.
+    let raw = RawGraph {
+        blocks: vec![RawBlock {
+            code: 0..0,
+            guard_tested: false,
+            end: RawEnd::Jump(5),
+        }],
+        functions: vec![vec![0]],
+        position: vec![0],
+    };
+    assert_eq!(
+        inline::inline(&raw),
+        Err(FlowError::Internal(Invariant::NoBlock(5)))
+    );
+    // A kill's next block too.
+    let raw = RawGraph {
+        blocks: vec![RawBlock {
+            code: 0..1,
+            guard_tested: true,
+            end: RawEnd::Kill(6),
+        }],
+        ..raw
+    };
+    assert_eq!(
+        inline::inline(&raw),
+        Err(FlowError::Internal(Invariant::NoBlock(6)))
+    );
+    // The IR's blocks: a flow block jumping to flow block 3 of a graph of one.
+    let graph = FlowGraph {
+        blocks: vec![FlowBlock {
+            code: 0..0,
+            guard_tested: false,
+            end: BlockEnd::Jump(BlockIndex(3)),
+        }],
+    };
+    assert_eq!(
+        graph.build_ir(),
+        Err(FlowError::Internal(Invariant::NoBlock(3)))
+    );
+}
+
+#[test]
+fn internal_and_unwalked_errors_read_as_plain_words() {
+    let cases = [
+        (
+            FlowError::Internal(Invariant::BlockCount),
+            "flow analysis broke an invariant of its own: more blocks than a block id can name",
+        ),
+        (
+            FlowError::Internal(Invariant::Unfilled(4)),
+            "flow analysis broke an invariant of its own: block 4 was never filled",
+        ),
+        (
+            FlowError::Internal(Invariant::NoBlock(0)),
+            "flow analysis broke an invariant of its own: block 0 does not exist",
+        ),
+        (
+            FlowError::Unwalked {
+                index: 2,
+                target: 7,
+            },
+            "instruction 2 leads to instruction 7, which the walk did not reach",
+        ),
+    ];
+    for (error, text) in cases {
+        assert_eq!(error.to_string(), text);
+    }
 }

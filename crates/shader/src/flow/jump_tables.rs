@@ -83,20 +83,43 @@ const LDC_OFFSET_LOW: Field = Field::new(CBUF_OFFSET.start, 2);
 /// The register count, for the per-register memory of the forward pass.
 const REGISTERS: usize = 256;
 
-/// A tracked `BRX` and where its table lies (`CaptureIndirectBranch`).
+/// A tracked `BRX` and where its table lies (`CaptureIndirectBranch`). Its fields are private
+/// to the flow module, where only [`find_jump_tables`] (and the module's tests) builds one, so
+/// a table has 2 to [`MAX_TABLE_ENTRIES`] entries, which bounds [`JumpTable::questions`] and
+/// [`JumpTable::words`] (`tests::jump_tables::a_table_has_at_most_max_entries`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct JumpTable {
     /// The `BRX`'s instruction index.
-    pub branch: u32,
+    pub(super) branch: u32,
     /// The constant-buffer bank of the table.
-    pub bank: u8,
+    pub(super) bank: u8,
     /// The byte offset of the table's first entry in the bank.
-    pub offset: u32,
+    pub(super) offset: u32,
     /// How many entries it has: 2 to [`MAX_TABLE_ENTRIES`].
-    pub entries: u32,
+    pub(super) entries: u32,
 }
 
 impl JumpTable {
+    /// The `BRX`'s instruction index.
+    pub const fn branch(&self) -> u32 {
+        self.branch
+    }
+
+    /// The constant-buffer bank of the table.
+    pub const fn bank(&self) -> u8 {
+        self.bank
+    }
+
+    /// The byte offset of the table's first entry in the bank.
+    pub const fn offset(&self) -> u32 {
+        self.offset
+    }
+
+    /// How many entries it has: 2 to [`MAX_TABLE_ENTRIES`].
+    pub const fn entries(&self) -> u32 {
+        self.entries
+    }
+
     /// The byte offset of entry `entry`.
     fn entry_offset(&self, entry: u32) -> Option<u32> {
         entry.checked_mul(ENTRY_BYTES)?.checked_add(self.offset)

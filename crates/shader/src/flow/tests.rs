@@ -312,6 +312,11 @@ pub(super) fn jump(n: u32) -> BlockEnd {
     BlockEnd::Jump(BlockIndex(n))
 }
 
+/// A kill (the discard of a `KILL`), then a jump to block `n`.
+pub(super) fn kill_then(n: u32) -> BlockEnd {
+    BlockEnd::Kill(BlockIndex(n))
+}
+
 /// A branch to `then` where `cond` holds, else `otherwise`.
 pub(super) fn branch(cond: PredSrc, then: u32, otherwise: u32) -> BlockEnd {
     BlockEnd::Branch {

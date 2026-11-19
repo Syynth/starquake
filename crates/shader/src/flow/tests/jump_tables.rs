@@ -141,7 +141,7 @@ fn clamps_at_their_edges() {
     for (clamp, entries) in [(1, Some(2)), (15, Some(16)), (0, None), (16, None)] {
         let code = selector([imnmx(4, 3, clamp), shf(5, 4), ldc(6, 5, 2, 0x40)], brx(6));
         assert_eq!(
-            find_jump_tables(&code).first().map(|table| table.entries),
+            find_jump_tables(&code).first().map(JumpTable::entries),
             entries,
             "clamp {clamp}"
         );
@@ -241,14 +241,14 @@ fn the_nearest_match_of_each_step_is_used() {
         program.word(word);
     }
     let code = program.item(brx(6)).op(exit()).build();
-    assert_eq!(find_jump_tables(&code)[0].bank, 9);
+    assert_eq!(find_jump_tables(&code)[0].bank(), 9);
     // Another write of R6 between the load and the branch does not stop the search.
     let mut program = Program::new();
     for word in standard() {
         program.word(word);
     }
     let code = program.op(pure(6)).item(brx(6)).op(exit()).build();
-    assert_eq!(find_jump_tables(&code)[0].offset, 0x40);
+    assert_eq!(find_jump_tables(&code)[0].offset(), 0x40);
     // The nearest load's chain fails: the branch is not tracked, though an earlier load's
     // would succeed.
     let mut program = Program::new();
@@ -445,7 +445,7 @@ fn nested_tables_take_two_rounds() {
     let targets: Vec<(u32, Vec<u32>)> = resolved
         .tables
         .iter()
-        .map(|table| (table.table.branch, table.targets.clone()))
+        .map(|table| (table.table.branch(), table.targets.clone()))
         .collect();
     // Instruction 11 lies past the extended capture: ignored.
     assert_eq!(targets, vec![(3, vec![5, 6]), (9, vec![10])]);
@@ -572,4 +572,86 @@ fn a_graphics_table_counts_from_the_header_unless_a_value_is_below_it() {
         resolve([4 * size(), 5 * size(), 0, 0, 0, 0]),
         (0, vec![4, 5])
     );
+}
+
+#[test]
+fn a_table_has_at_most_max_entries() {
+    // The selector's clamp is the only way to make a table: the largest it accepts gives
+    // MAX_TABLE_ENTRIES entries and as many questions; one more is not tracked.
+    let largest = MAX_TABLE_ENTRIES - 1;
+    let code = selector(
+        [imnmx(4, 3, largest), shf(5, 4), ldc(6, 5, 2, 0x40)],
+        brx(6),
+    );
+    let tables = find_jump_tables(&code);
+    assert_eq!(tables.len(), 1);
+    assert_eq!(tables[0].entries(), MAX_TABLE_ENTRIES);
+    assert_eq!(
+        tables[0].questions().count(),
+        usize::try_from(MAX_TABLE_ENTRIES).expect("small")
+    );
+    let code = selector(
+        [
+            imnmx(4, 3, MAX_TABLE_ENTRIES),
+            shf(5, 4),
+            ldc(6, 5, 2, 0x40),
+        ],
+        brx(6),
+    );
+    assert_eq!(find_jump_tables(&code), vec![]);
+}
+
+#[test]
+fn the_getters_read_the_tracked_fields() {
+    let code = selector(standard(), brx(6));
+    let table = find_jump_tables(&code)[0];
+    assert_eq!(
+        (
+            table.branch(),
+            table.bank(),
+            table.offset(),
+            table.entries()
+        ),
+        (3, 2, 0x40, 6)
+    );
+}
+
+#[test]
+fn a_graphics_extension_keeps_the_first_tables_base() {
+    // The nested program behind a header. The first table's values count from the header, so
+    // the base is the header's size. The second table, found only in the extended code, holds
+    // a non-zero value below the header's size: read with the first base, as the reference
+    // does, it names nothing and the other value names 10; a base recomputed from it would be
+    // 0, and the values would name 4 and an instruction past the capture instead.
+    let header = u32::try_from(crate::sph::HEADER_BYTES).expect("small");
+    let mut bytes = vec![0; crate::sph::HEADER_BYTES];
+    bytes.extend(nested());
+    let mut capture = capture(&bytes[..], GuestStage::Pixel).expect("captured");
+    assert_eq!(capture.instruction_count(), 5);
+    let low = 4 * size();
+    assert!(low != 0 && low < header);
+    let engine = Words::new(&[
+        ((2, 0x10), header + 5 * size()),
+        ((2, 0x14), header + 6 * size()),
+        ((3, 0x20), header + 10 * size()),
+        ((3, 0x24), low),
+    ]);
+    let exchanged = exchange(
+        GuestStage::Pixel,
+        &JumpTableQuestions::new(&capture, &bytes[..]),
+        &engine,
+    )
+    .expect("exchanged");
+    assert_eq!(exchanged.rounds, 2);
+    let resolved =
+        resolve_jump_tables(&mut capture, &bytes[..], &exchanged.answers).expect("resolved");
+    assert_eq!(resolved.extension, Extension::Extended { from: 5 });
+    assert_eq!(resolved.base, header);
+    assert_eq!(capture.instruction_count(), 11);
+    let targets: Vec<(u32, Vec<u32>)> = resolved
+        .tables
+        .iter()
+        .map(|table| (table.table.branch(), table.targets.clone()))
+        .collect();
+    assert_eq!(targets, vec![(3, vec![5, 6]), (9, vec![10])]);
 }
