@@ -438,6 +438,73 @@ fn i2f_select_edges() {
     }
 }
 
+/// A listed divergence (module docs): with an immediate operand (form 4), `I2F` and `I2FP`
+/// have no select here, where PR #4588 reads bits 28 and 29 of the immediate as one
+/// (`Take(60, 2)`). `I2F.F32.S32 R0, 0x30000000` is translated (the PR refuses it: "native
+/// integer-to-float source select"), and `I2F.F32.S8` of `0x10000005` converts byte 0, giving
+/// 5.0 (the PR converts byte 1, giving 0.0).
+#[test]
+fn i2f_of_an_immediate_has_no_select() {
+    let wide = i2f(
+        r(0),
+        AluSrc::Imm(0x3000_0000),
+        IntType::S32,
+        RoundMode::NearestEven,
+    );
+    assert_eq!(wide.select, 0);
+    assert_eq!(
+        run_op(Op::I2F(wide), &[]).regs[0],
+        805_306_368.0_f32.to_bits()
+    );
+    let byte = i2f(
+        r(0),
+        AluSrc::Imm(0x1000_0005),
+        int(0, true),
+        RoundMode::NearestEven,
+    );
+    assert_eq!(byte.select, 0);
+    assert_eq!(run_op(Op::I2F(byte), &[]).regs[0], 5.0_f32.to_bits());
+    let packed = i2fp(
+        r(0),
+        AluSrc::Imm(0x3000_0000),
+        IntType::S32,
+        RoundMode::NearestEven,
+    );
+    assert_eq!(
+        run_op(Op::I2FP(packed), &[]).regs[0],
+        805_306_368.0_f32.to_bits()
+    );
+}
+
+/// `F2I` from a half into a 16-bit destination clamps with the bounds narrowed to half, as
+/// PR #4588 does (`FPConvert(16, Imm32(max_bound))`): 65535 narrows to infinity and 32767 to
+/// 32768, so half `+inf` gives `0xffffffff` for `.U16` and `0x8000` (+32768) for `.S16`, both
+/// outside the destination's range (module docs, "Known reference behaviour, mirrored"). The
+/// largest finite half, 65504, is inside `.U16`'s range and converts exactly; `.S16`'s lower
+/// bound, -32768, is exact in half, so half `-inf` gives `0xffff8000`.
+#[test]
+fn f2i_from_a_half_into_16_bits_mirrors_the_narrowed_bounds() {
+    let unsigned = OpF2I {
+        src_type: FloatType::F16,
+        ..f2i(r(0), reg(1), int(1, false), RoundMode::Zero)
+    };
+    let signed = OpF2I {
+        dst_type: int(1, true),
+        ..unsigned
+    };
+    let cases = [
+        (unsigned, 0x7c00, 0xffff_ffff),
+        (unsigned, 0x7bff, 65504),
+        (unsigned, 0xfc00, 0),
+        (signed, 0x7c00, 0x8000),
+        (signed, 0xfc00, 0xffff_8000),
+        (signed, 0x7e00, 0),
+    ];
+    for (op, half, expected) in cases {
+        assert_eq!(f2i_of(op, half), expected, "{} {half:#x}", op.dst_type);
+    }
+}
+
 /// PR #4588's "Native unsigned conversion toward zero is exact at float precision boundaries"
 /// and "Native unsigned 32-bit conversion preserves nearest and toward-zero rounding":
 /// `I2FP.F32.U32` to nearest and toward zero. The rounding is carried on the conversion, not

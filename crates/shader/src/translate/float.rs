@@ -103,8 +103,10 @@
 //! (`tests::refusals_append_nothing`). The order is pinned with two faults at once by
 //! `tests::refusals_report_in_the_prs_order`,
 //! `tests::conversion_refusals_report_in_the_prs_order`,
-//! `tests::more_conversion_refusals_report_in_the_prs_order` and
-//! `tests::the_bank_is_checked_last`. Two of the PR's checks cannot fail on a decoded
+//! `tests::more_conversion_refusals_report_in_the_prs_order`,
+//! `tests::i2f_source_size_comes_before_the_select` and `tests::the_bank_is_checked_last`;
+//! each instruction's bank check refusing on its own, with the bank one below accepted, by
+//! `tests::each_bank_check_refuses_on_its_own`. Two of the PR's checks cannot fail on a decoded
 //! instruction and are not repeated: `Require(set_op <= 2)` of `FSET` and `FSETP`
 //! ([`PredSetOp`] has three variants), and `F2I`'s `Ignore(77, 1)` is not a check.
 //!
@@ -117,6 +119,23 @@
 //! | `MUFU.SIN`, `MUFU.COS` | `FPSin`, `FPCos` of the argument as it is | of the argument times `2 pi` (row 95) | `tests::arith::mufu_sine_and_cosine_take_turns` |
 //! | `F2I.FTZ` with a 32-bit operand, `F2F` rounding and `.FTZ` | carried as flags only | emulated as well (decision 10) | `tests::convert::f2i_flushes_denormals_before_rounding`, `tests::convert::f2f_emulation_matches_the_modelled_conversion` |
 //! | `FSETP` with a `PT` destination | computes the combination, then `SetPred` discards it | computes nothing for it | `tests::arith::fsetp_writes_both_predicates` |
+//! | The byte or half select of `I2F` and `I2FP` with an immediate operand (form 4) | `Visitor::I2F` reads `Take(60, 2)` in every form, which for an immediate is bits 28 and 29 of the immediate: a 32-bit source is refused when they are not zero, and an 8- or 16-bit source extracts the byte or half they name | the select is 0 (the decoder's `i2f_has_select`; `I2FP` has no select field): `I2F.F32.S32 R0, 0x30000000` is translated, and `I2F.F32.S8` of `0x10000005` gives 5.0 where the PR gives 0.0 | `tests::convert::i2f_of_an_immediate_has_no_select` |
+//!
+//! **Owner question** (the immediate select above): what the hardware reads is not settled.
+//! NAK's encoder for `OpI2F` (`mesa-nouveau/src/nouveau/compiler/nak/sm70_encode.rs` @
+//! 52238762) writes `set_field(60..62, 0)` ("TODO: subop") after `encode_alu`, which suggests
+//! bits 60 and 61 are the select even in form 4, where they are bits 28 and 29 of the
+//! immediate, as the PR reads them; the decoder here keeps the whole immediate. A hardware
+//! trace of an `I2F` immediate with those bits set would settle it.
+//!
+//! **Known reference behaviour, mirrored** (owner's call whether to keep it): `F2I` from a half
+//! into a 16-bit destination clamps with the bounds narrowed to half, as the PR does
+//! (`ops_convert.cpp`, `F2I`: `FPConvert(16, Imm32(static_cast<f32>(max_bound)))`), and 65535
+//! narrows to infinity and 32767 to 32768. So `.U16` of half `+inf` gives `0xffffffff` and
+//! `.S16` of half `+inf` gives `0x8000` (+32768), both outside the destination's range. Not a
+//! divergence: the same values as the PR, pinned by
+//! `tests::convert::f2i_from_a_half_into_16_bits_mirrors_the_narrowed_bounds`; clamping within
+//! range instead would be a listed divergence.
 //!
 //! Where the decoder reads more than the PR translates, this module refuses what the PR
 //! refuses, as a listed choice: `FMUL`'s scale 0 ([`FloatUnsupported::FmulScale`]), the 8-bit
@@ -898,11 +917,19 @@ impl Emit<'_, '_> {
     }
 
     /// Half `high` (or the low half) of a register, with modifiers (`Maxwell::Extract` with
-    /// `Swizzle::H1_H0`: component 0 is the low half).
-    fn half_of(&mut self, src: AluSrc, high: bool) -> Result<Operand, FloatError> {
+    /// `Swizzle::H1_H0`: component 0 is the low half). Any other operand is refused with
+    /// `refusal`, the calling instruction's own ([`FloatUnsupported::HalfMufuSource`] or
+    /// [`FloatUnsupported::HalfF2iSource`]), before anything is appended. [`check`] refuses such
+    /// an operand first, so [`translate_instr`] never reaches this refusal; it is pinned by
+    /// `tests::a_half_operand_is_refused_with_the_callers_name`.
+    fn half_of(
+        &mut self,
+        src: AluSrc,
+        high: bool,
+        refusal: FloatUnsupported,
+    ) -> Result<Operand, FloatError> {
         let AluSrc::Reg { reg, abs, neg } = src else {
-            // `check` refuses every other operand for the 16-bit forms.
-            return Err(FloatUnsupported::HalfF2iSource.into());
+            return Err(refusal.into());
         };
         let bits = self.get(reg)?;
         let pair = self.emit(Opcode::UnpackFloat2x16, &[bits])?;
@@ -1120,7 +1147,7 @@ impl Emit<'_, '_> {
     fn mufu(&mut self, op: OpMuFu) -> Result<(), FloatError> {
         let function = mufu_function(op.op)?;
         let input = if op.f16 {
-            let half = self.half_of(op.src, op.high)?;
+            let half = self.half_of(op.src, op.high, FloatUnsupported::HalfMufuSource)?;
             self.emit_fp(Opcode::ConvertF32F16, &[half], NEAREST)?
         } else {
             self.float_value(op.src)?
@@ -1169,7 +1196,7 @@ impl Emit<'_, '_> {
     fn f2i(&mut self, op: OpF2I) -> Result<(), FloatError> {
         let half = op.src_type == FloatType::F16;
         let operand = if half {
-            self.half_of(op.src, op.high)?
+            self.half_of(op.src, op.high, FloatUnsupported::HalfF2iSource)?
         } else {
             self.float_value(op.src)?
         };

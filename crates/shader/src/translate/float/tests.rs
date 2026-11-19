@@ -1535,6 +1535,117 @@ fn the_bank_is_checked_last() {
     }
 }
 
+/// An instruction built around one source.
+type OpWith = fn(AluSrc) -> Op;
+
+/// Each instruction's bank check refuses on its own: a source in the first bank past the last
+/// ([`CBUF_BANKS`]) is the only fault, and the refusal names that bank; the same instruction
+/// with the last bank translates (hand-made: no word names bank 32). `FSEL`'s and `MUFU`'s are
+/// in [`the_bank_is_checked_last`].
+#[test]
+fn each_bank_check_refuses_on_its_own() {
+    let last = CBUF_BANKS - 1;
+    let cases: [(&str, OpWith); 11] = [
+        ("fadd", |src| Op::FAdd(fadd(r(0), reg(1), src))),
+        ("fmul", |src| Op::FMul(fmul(r(0), reg(1), src))),
+        ("ffma b", |src| Op::FFma(ffma(r(0), reg(1), src, reg(2)))),
+        ("ffma c", |src| Op::FFma(ffma(r(0), reg(1), reg(2), src))),
+        ("frnd", |src| Op::FRnd(frnd(r(0), src, RoundMode::Zero))),
+        ("f2f", |src| Op::F2F(f2f(r(0), src, RoundMode::Zero))),
+        ("f2i.f32", |src| {
+            Op::F2I(f2i(r(0), src, IntType::S32, RoundMode::Zero))
+        }),
+        ("i2f", |src| {
+            Op::I2F(i2f(r(0), src, IntType::S32, RoundMode::Zero))
+        }),
+        ("i2f.u8", |src| {
+            Op::I2F(crate::decode::OpI2F {
+                select: 3,
+                ..i2f(r(0), src, int(0, false), RoundMode::Zero)
+            })
+        }),
+        ("i2fp", |src| {
+            Op::I2FP(i2fp(r(0), src, IntType::S32, RoundMode::Zero))
+        }),
+        ("f2fp", |src| Op::F2FP(f2fp(r(0), reg(1), src))),
+    ];
+    for (name, case) in cases {
+        let past = Instr::new(case(cbuf(CBUF_BANKS, 0)));
+        assert_eq!(
+            translate_raw(&[past]),
+            refusal(past, FloatUnsupported::ConstantBufferBank(CBUF_BANKS)),
+            "{name}"
+        );
+        let accepted = translate_raw(&[Instr::new(case(cbuf(last, 0)))]);
+        assert_eq!(
+            accepted.as_ref().map(Function::verify),
+            Ok(Ok(())),
+            "{name}"
+        );
+    }
+}
+
+/// `I2F` checks its source size before its select (`ops_convert.cpp`, `I2F`: "native
+/// integer-to-float source size", then "source select"): a 64-bit source with select 1 has both
+/// faults and is refused for its size; the select alone, on a 32-bit source, is refused for the
+/// select (hand-made: the decoder gives a 64-bit or 32-bit source no select).
+#[test]
+fn i2f_source_size_comes_before_the_select() {
+    let both = crate::decode::OpI2F {
+        select: 1,
+        ..i2f(r(0), reg(1), int(3, false), RoundMode::Zero)
+    };
+    assert_refused_raw(
+        Op::I2F(both),
+        FloatUnsupported::I2fSourceSize(int(3, false)),
+    );
+    let select_only = crate::decode::OpI2F {
+        src_type: IntType::U32,
+        ..both
+    };
+    assert_refused_raw(
+        Op::I2F(select_only),
+        FloatUnsupported::I2fSelect {
+            select: 1,
+            width: u32::BITS,
+        },
+    );
+}
+
+/// The 16-bit forms' operand read refuses anything but a register with the calling
+/// instruction's own refusal, and appends nothing; [`check`] refuses those operands before
+/// emission, so this is driven on the emitter directly.
+#[test]
+fn a_half_operand_is_refused_with_the_callers_name() {
+    let cases = [
+        (
+            Op::MuFu(OpMuFu {
+                f16: true,
+                ..mufu(r(0), MuFuOp::Rcp, imm(1.0))
+            }),
+            FloatUnsupported::HalfMufuSource,
+        ),
+        (
+            Op::F2I(OpF2I {
+                src_type: FloatType::F16,
+                ..f2i(r(0), cbuf(1, 0), IntType::S32, RoundMode::Zero)
+            }),
+            FloatUnsupported::HalfF2iSource,
+        ),
+    ];
+    for (op, what) in cases {
+        let mut function = Function::new();
+        let entry = function.entry();
+        let mut builder = Builder::new(&mut function, entry);
+        assert_eq!(
+            Emit { b: &mut builder }.op(&op),
+            Err(FloatError::Unsupported(what)),
+            "{op}"
+        );
+        assert_eq!(function.listed().count(), 0, "{op}");
+    }
+}
+
 /// The float group's generators (`decode`'s per-group hooks), found by the group whose forms
 /// hold `FADD`'s opcode.
 fn float_ops() -> Vec<BoxedStrategy<Op>> {
