@@ -1187,7 +1187,7 @@ fn a_new_cache_holds_nothing() {
     assert!(rig.cache.entry(page(0)).is_none());
     assert_eq!(rig.cache.end_frame(), 0);
     assert_eq!(rig.sync(), []);
-    assert!(rig.log().is_empty());
+    assert_eq!(rig.backend.snapshot(), "");
 }
 
 #[test]
