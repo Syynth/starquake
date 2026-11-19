@@ -1086,8 +1086,10 @@ version = "0.0.0"
 dependencies = [
  "serde_json",
  "starquake-core",
+ "starquake-gpu",
  "starquake-ipc",
  "starquake-loader",
+ "starquake-memory",
  "starquake-services",
  "starquake-testkit",
  "starquake-trace",
@@ -1142,6 +1144,7 @@ dependencies = [
  "starquake-shader",
  "thiserror",
  "tracing",
+ "twox-hash",
 ]
 
 [[package]]
