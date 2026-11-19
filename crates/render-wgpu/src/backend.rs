@@ -772,7 +772,10 @@ impl Backend for WgpuBackend {
     /// Checks the shader and keeps its module (`crate::pipeline`, "Shaders"); wgpu first sees
     /// it when a pipeline that uses it is built.
     fn create_shader(&self, desc: ShaderDesc) -> Result<ShaderId, RenderError> {
-        validate::validate_shader(&self.caps, &desc)?;
+        if let Err(error) = validate::validate_shader(&self.caps, &desc) {
+            pipelines::discard(desc);
+            return Err(error);
+        }
         let rec = ShaderRec::new(desc)?;
         let mut state = self.live_state()?;
         let (index, generation) = state.pipelines.shaders.insert(Arc::new(rec))?;

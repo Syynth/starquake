@@ -23,6 +23,7 @@ fn interface(resources: Vec<ResourceBinding>) -> ShaderInterface {
 fn facts(entries: &[((u32, u32), ArrayCount, bool)]) -> ModuleFacts {
     ModuleFacts {
         subgroups: false,
+        nesting: 0,
         bindings: entries
             .iter()
             .map(|&(slot, count, write_only)| (slot, BindingFacts { count, write_only }))

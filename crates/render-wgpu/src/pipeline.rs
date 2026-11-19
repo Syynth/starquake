@@ -3,18 +3,21 @@
 //!
 //! # Shaders
 //!
-//! `create_shader` takes a [`ShaderSource::Naga`](starquake_render::ShaderSource::Naga) module
-//! only (SPIR-V and MSL serve a later direct backend, [`NAGA_ONLY`]); it checks the description
-//! against `Caps` (`validate::validate_shader`, which refuses a geometry or tessellation shader
-//! with `RenderError::StageUnsupported`), checks that the module has an entry point of the
-//! shader's name for its stage ([`NO_ENTRY_POINT`]), reads what the layouts and the requirements
-//! need from the module ([`scan`]), and keeps the module. It does not touch wgpu: the GPU back
-//! thread calls it, and the back thread never touches the host API (render-backend, "Where the
-//! backend sits"). The first pipeline build that needs the shader hands the module to wgpu
-//! (`wgpu::ShaderSource::Naga`, feature `naga-ir`), which validates it and writes the final code
-//! itself; this crate runs no naga writer ("Shader emission"). The wgpu module is then shared by
-//! every pipeline that uses the shader, and a module wgpu refused fails each of them with the
-//! same reason.
+//! `create_shader` takes a [`ShaderSource::Naga`](starquake_render::ShaderSource::Naga) module only
+//! (SPIR-V and MSL serve a later direct backend, [`NAGA_ONLY`]); it checks the description against
+//! `Caps` (`validate::validate_shader`, which refuses a geometry or tessellation shader with
+//! `RenderError::StageUnsupported`), checks that the module has an entry point of the shader's name
+//! for its stage ([`NO_ENTRY_POINT`]), reads what the layouts and the requirements need from the
+//! module ([`scan`]), refuses a module whose blocks nest deeper than [`MAX_SHADER_NESTING`]
+//! ([`NESTING`]), and keeps the module. The three module checks (a naga module, the entry point,
+//! the nesting) run in that order, pinned by `tests::shader_checks_run_in_order`. A module refused here or by the shared checks is taken
+//! apart without recursion (`scan::dismantle`), since naga's own `Drop` recurses once per nesting
+//! level. It does not touch wgpu: the GPU back thread calls it, and the back thread never touches
+//! the host API (render-backend, "Where the backend sits"). The first pipeline build that needs the
+//! shader hands the module to wgpu (`wgpu::ShaderSource::Naga`, feature `naga-ir`), which validates
+//! it and writes the final code itself; this crate runs no naga writer ("Shader emission"). The
+//! wgpu module is then shared by every pipeline that uses the shader, and a module wgpu refused
+//! fails each of them with the same reason.
 //!
 //! # Pipelines
 //!
@@ -122,6 +125,23 @@ pub const PANICKED: &str = "the pipeline's build panicked";
 /// popped scope at once (each pop's future is ready when it is made), so no host reaches this
 /// today; the branch is driven by `tests::a_scope_that_does_not_report_fails_the_build`.
 pub const SCOPE_TIMEOUT: &str = "wgpu did not report the pipeline build's errors in time";
+
+/// A module whose blocks nest deeper than [`MAX_SHADER_NESTING`].
+pub const NESTING: &str = "the shader's module nests its blocks too deeply for the wgpu backend";
+
+/// The deepest level a shader module's blocks may sit at (`scan`, "Nesting": a function's body is
+/// level 0). naga's validator and writers and wgpu recurse once per level on the compile pool's
+/// worker, and a module nested a few thousand deep overflows that thread's stack, which aborts
+/// the process (no `catch_unwind` can stop it). Measured on an Apple GPU under wgpu 30.0.1, in a
+/// debug build, on a thread with Rust's default 2 MiB stack: a compute module nested 1024 deep
+/// settles, one nested 1536 deep overflows. Metal's compiler itself refuses brackets nested past
+/// 256 ("bracket nesting level exceeded maximum of 256"; measured: a module nested 256 deep
+/// builds and 257 fails its pipeline), so the bound costs a Mac nothing; a Vulkan host could
+/// build deeper. Assumptions, to confirm when `core` makes the compile pool: its workers have at
+/// least the default 2 MiB of stack; and the shader crate's emitter keeps modules within this
+/// bound (its IR is bounded at 256 structured levels, `starquake_shader::ir::MAX_NESTING`, but
+/// whether emission adds naga levels per IR level is a guess, an owner question).
+pub const MAX_SHADER_NESTING: usize = 256;
 
 /// The guest's warp width, which a shader using subgroups relies on (shader-pipeline, "What
 /// naga 30.0.1 can express": subgroup operations need "a subgroup size of 32").
@@ -265,14 +285,22 @@ impl ShaderRec {
         let ShaderSource::Naga { module, .. } = desc.source else {
             return Err(RenderError::Unsupported(NAGA_ONLY));
         };
-        let entry_index = scan::naga_stage(desc.stage)
+        let Some(entry_index) = scan::naga_stage(desc.stage)
             .and_then(|stage| scan::entry_point(&module, &desc.entry, stage))
-            .ok_or(RenderError::Invalid(NO_ENTRY_POINT))?;
+        else {
+            scan::dismantle(*module);
+            return Err(RenderError::Invalid(NO_ENTRY_POINT));
+        };
+        let facts = scan::scan(&module);
+        if facts.nesting > MAX_SHADER_NESTING {
+            scan::dismantle(*module);
+            return Err(RenderError::Unsupported(NESTING));
+        }
         Ok(Self {
             stage: desc.stage,
             entry: desc.entry,
             entry_index,
-            facts: scan::scan(&module),
+            facts,
             interface: desc.interface,
             source: Mutex::new(Some(module)),
             host: OnceLock::new(),
@@ -329,6 +357,14 @@ impl ShaderRec {
             })
             .as_ref()
             .map_err(Clone::clone)
+    }
+}
+
+/// Drops a refused shader description without recursing through its module's nested blocks
+/// (`scan::dismantle`).
+pub(crate) fn discard(desc: ShaderDesc) {
+    if let ShaderSource::Naga { module, .. } = desc.source {
+        scan::dismantle(*module);
     }
 }
 

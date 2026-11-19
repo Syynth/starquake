@@ -256,6 +256,95 @@ fn shaders_must_be_naga_modules_with_their_entry_point() {
     }
 }
 
+/// A compute module named `main` whose body holds empty blocks nested `depth` deep (its
+/// deepest block at level `depth`), built by hand since the WGSL front end limits its own
+/// nesting. It is validated when `validate` is set; otherwise it carries a trivial module's
+/// info, which the backend does not read (naga's validator recurses once per level, so a very
+/// deep module cannot be validated on a test thread).
+fn nested_compute(depth: usize, validate: bool) -> ShaderSource {
+    let parse = || {
+        naga::front::wgsl::parse_str("@compute @workgroup_size(1) fn main() { }")
+            .expect("the test module parses")
+    };
+    let validator = || {
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+    };
+    let mut module = parse();
+    let mut inner = naga::Block::new();
+    for _ in 0..depth {
+        let mut outer = naga::Block::new();
+        outer.push(naga::Statement::Block(inner), naga::Span::UNDEFINED);
+        inner = outer;
+    }
+    module.entry_points[0].function.body = inner;
+    let info = if validate {
+        validator().validate(&module)
+    } else {
+        validator().validate(&parse())
+    }
+    .expect("the test module validates");
+    ShaderSource::Naga {
+        module: Box::new(module),
+        info: Box::new(info),
+    }
+}
+
+fn compute_desc(source: ShaderSource, entry: &str) -> ShaderDesc {
+    shader_desc(
+        ShaderStage::Compute,
+        entry,
+        source,
+        ShaderInterface::default(),
+    )
+}
+
+/// Nesting at the bound is kept and one level past it refused with [`NESTING`]; a module far
+/// past it (deep enough that naga's recursive `Drop` would overflow the test thread) is refused
+/// and freed without overflowing (`scan::dismantle`).
+#[test]
+fn shaders_nested_past_the_bound_are_refused() {
+    bounded(|| {
+        assert!(
+            ShaderRec::new(compute_desc(
+                nested_compute(MAX_SHADER_NESTING, true),
+                "main"
+            ))
+            .is_ok()
+        );
+        for depth in [MAX_SHADER_NESTING + 1, 100_000] {
+            assert_eq!(
+                ShaderRec::new(compute_desc(nested_compute(depth, depth < 1000), "main"))
+                    .map(|_| ()),
+                Err(RenderError::Unsupported(NESTING)),
+                "{depth}"
+            );
+        }
+    });
+}
+
+/// The documented order (module docs, "Shaders"): with the entry point missing and the module
+/// too deep, the entry point is reported; a module that is not naga is reported before either.
+#[test]
+fn shader_checks_run_in_order() {
+    bounded(|| {
+        assert_eq!(
+            ShaderRec::new(compute_desc(nested_compute(100_000, false), "other")).map(|_| ()),
+            Err(RenderError::Invalid(NO_ENTRY_POINT))
+        );
+        assert_eq!(
+            ShaderRec::new(compute_desc(
+                ShaderSource::SpirV(vec![0x0723_0203]),
+                "other"
+            ))
+            .map(|_| ()),
+            Err(RenderError::Unsupported(NAGA_ONLY))
+        );
+    });
+}
+
 const BALLOT: &str = "
     @group(0) @binding(0) var<storage, read_write> out: array<u32>;
     @compute @workgroup_size(32)
@@ -653,6 +742,43 @@ fn the_first_outcome_stands_with_a_real_pipeline() {
         failed_first.settle(Err("first".into()));
         failed_first.settle(Ok(host));
         assert_eq!(failed_first.status(), PipelineStatus::Failed);
+    });
+}
+
+/// A module nested exactly at the bound builds (the deepest Metal compiles, `MAX_SHADER_NESTING`'s
+/// docs); one level deeper is refused by `create_shader` with [`NESTING`], before any build can
+/// overflow the pool worker's stack; and a deep module refused by the shared checks first (a
+/// geometry shader) is freed without overflowing.
+#[test]
+fn a_module_at_the_nesting_bound_builds_and_one_past_it_is_refused() {
+    bounded(|| {
+        let Some(gpu) = gpu("nesting", Arc::new(ThreadPool), WhileCompiling::Wait) else {
+            return;
+        };
+        let at = gpu
+            .create_shader(compute_desc(
+                nested_compute(MAX_SHADER_NESTING, true),
+                "main",
+            ))
+            .expect("accepted at the bound");
+        let id = gpu
+            .create_compute_pipeline(ComputePipelineDesc { shader: at })
+            .expect("accepted");
+        assert_eq!(settled(&gpu, id), PipelineStatus::Ready);
+        assert_eq!(
+            gpu.create_shader(compute_desc(
+                nested_compute(MAX_SHADER_NESTING + 1, true),
+                "main"
+            )),
+            Err(RenderError::Unsupported(NESTING))
+        );
+        let mut geometry = compute_desc(nested_compute(100_000, false), "main");
+        geometry.stage = ShaderStage::Geometry;
+        assert_eq!(
+            gpu.create_shader(geometry),
+            Err(RenderError::StageUnsupported(ShaderStage::Geometry))
+        );
+        assert_eq!(gpu.host_errors(), 0);
     });
 }
 

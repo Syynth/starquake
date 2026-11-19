@@ -20,16 +20,28 @@
 //!   (`crate::pipeline::layout`).
 //!
 //! **Subgroups.** A module uses subgroups when a function or entry point holds a
-//! `SubgroupBallot`, `SubgroupGather` or `SubgroupCollectiveOperation` statement, at any depth
-//! of nested blocks, or when an entry point argument, an entry point result or a struct member
-//! is bound to one of the built-ins `SubgroupSize`, `SubgroupInvocationId`, `NumSubgroups` or
-//! `SubgroupId`. Those are the operations and built-ins whose results depend on how many
-//! invocations a subgroup has, which the guest's 32-lane warps fix at 32 (shader-pipeline, "What
-//! naga 30.0.1 can express": subgroup operations need "a subgroup size of 32"). A subgroup
-//! barrier (`Barrier::SUB_GROUP`) does not count: its meaning does not depend on the size.
-//! Helper functions are scanned whether an entry point calls them or not, which can only
-//! over-count. The walk keeps its own stack of blocks, so a deeply nested module costs heap, not
-//! call stack, and visits each block once.
+//! `SubgroupBallot` or `SubgroupCollectiveOperation` statement, or a `SubgroupGather` statement
+//! of any mode but the two quad modes (`GatherMode::QuadBroadcast` and `GatherMode::QuadSwap`),
+//! at any depth of nested blocks, or when an entry point argument, an entry point result or a
+//! struct member is bound to one of the built-ins `SubgroupSize`, `SubgroupInvocationId`,
+//! `NumSubgroups` or `SubgroupId`. Those are the operations and built-ins whose results depend on
+//! how many invocations a subgroup has, which the guest's 32-lane warps fix at 32
+//! (shader-pipeline, "What naga 30.0.1 can express": subgroup operations need "a subgroup size
+//! of 32"). A quad operation reads only the four invocations of its quad, whatever the subgroup
+//! size, and a subgroup barrier (`Barrier::SUB_GROUP`) does not depend on the size either, so
+//! neither counts. Helper functions are scanned whether an entry point calls them or not, which
+//! can only over-count.
+//!
+//! **Nesting.** The walk also measures how deep the module's blocks nest: a function's body is
+//! level 0, and each block a statement holds (a `Block`, either branch of an `If`, a `Switch`
+//! case, a `Loop`'s body or continuing block) is one level below the block holding the
+//! statement. `ShaderRec::new` refuses a module nested deeper than
+//! [`crate::pipeline::MAX_SHADER_NESTING`], since naga's validator and writers and wgpu recurse
+//! once per level on the build's thread.
+//!
+//! The walk keeps its own stack of blocks, so a deeply nested module costs heap, not call stack,
+//! and visits each block once. naga's own `Drop` of a module recurses once per level too, so a
+//! refused module is taken apart by [`dismantle`] instead.
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
@@ -60,6 +72,8 @@ pub(crate) struct BindingFacts {
 pub(crate) struct ModuleFacts {
     /// Whether the module uses subgroup operations or built-ins.
     pub(crate) subgroups: bool,
+    /// The deepest level any of its blocks sits at (module docs, "Nesting").
+    pub(crate) nesting: usize,
     /// The bound globals, by group and binding.
     pub(crate) bindings: BTreeMap<(u32, u32), BindingFacts>,
 }
@@ -103,38 +117,92 @@ fn binds_subgroup(binding: Option<&naga::Binding>) -> bool {
     matches!(binding, Some(naga::Binding::BuiltIn(b)) if is_subgroup_builtin(*b))
 }
 
-/// Whether any of `blocks`, or a block nested in one, holds a subgroup operation.
-fn blocks_use_subgroups<'a>(blocks: impl IntoIterator<Item = &'a naga::Block>) -> bool {
-    let mut stack: Vec<&naga::Block> = blocks.into_iter().collect();
-    while let Some(block) = stack.pop() {
+/// Whether a gather of `mode` depends on the subgroup size: every mode but the two quad ones
+/// (module docs).
+const fn gather_depends_on_size(mode: naga::GatherMode) -> bool {
+    !matches!(
+        mode,
+        naga::GatherMode::QuadBroadcast(_) | naga::GatherMode::QuadSwap(_)
+    )
+}
+
+/// Walks `blocks`, each at level 0, and the blocks nested in them: whether any holds a subgroup
+/// operation, and the deepest level reached (module docs).
+fn walk_blocks<'a>(blocks: impl IntoIterator<Item = &'a naga::Block>) -> (bool, usize) {
+    let mut stack: Vec<(&naga::Block, usize)> = blocks.into_iter().map(|b| (b, 0)).collect();
+    let mut subgroups = false;
+    let mut deepest = 0;
+    while let Some((block, level)) = stack.pop() {
+        deepest = deepest.max(level);
+        let below = level.saturating_add(1);
         for statement in block {
             match statement {
                 naga::Statement::SubgroupBallot { .. }
-                | naga::Statement::SubgroupGather { .. }
-                | naga::Statement::SubgroupCollectiveOperation { .. } => return true,
-                naga::Statement::Block(inner) => stack.push(inner),
+                | naga::Statement::SubgroupCollectiveOperation { .. } => subgroups = true,
+                naga::Statement::SubgroupGather { mode, .. } => {
+                    subgroups |= gather_depends_on_size(*mode);
+                }
+                naga::Statement::Block(inner) => stack.push((inner, below)),
                 naga::Statement::If { accept, reject, .. } => {
-                    stack.push(accept);
-                    stack.push(reject);
+                    stack.push((accept, below));
+                    stack.push((reject, below));
                 }
                 naga::Statement::Switch { cases, .. } => {
-                    stack.extend(cases.iter().map(|case| &case.body));
+                    stack.extend(cases.iter().map(|case| (&case.body, below)));
                 }
                 naga::Statement::Loop {
                     body, continuing, ..
                 } => {
-                    stack.push(body);
-                    stack.push(continuing);
+                    stack.push((body, below));
+                    stack.push((continuing, below));
                 }
                 _ => {}
             }
         }
     }
-    false
+    (subgroups, deepest)
 }
 
-/// Whether the module uses subgroups (module docs).
-fn uses_subgroups(module: &naga::Module) -> bool {
+/// Takes `module` apart and drops it without recursing through its nested blocks, which naga's
+/// own `Drop` does once per level (module docs).
+pub(crate) fn dismantle(mut module: naga::Module) {
+    let mut stack: Vec<naga::Block> = module
+        .functions
+        .iter_mut()
+        .map(|(_, f)| std::mem::take(&mut f.body))
+        .chain(
+            module
+                .entry_points
+                .iter_mut()
+                .map(|ep| std::mem::take(&mut ep.function.body)),
+        )
+        .collect();
+    while let Some(mut block) = stack.pop() {
+        for statement in block.iter_mut() {
+            match statement {
+                naga::Statement::Block(inner) => stack.push(std::mem::take(inner)),
+                naga::Statement::If { accept, reject, .. } => {
+                    stack.push(std::mem::take(accept));
+                    stack.push(std::mem::take(reject));
+                }
+                naga::Statement::Switch { cases, .. } => {
+                    stack.extend(cases.iter_mut().map(|case| std::mem::take(&mut case.body)));
+                }
+                naga::Statement::Loop {
+                    body, continuing, ..
+                } => {
+                    stack.push(std::mem::take(body));
+                    stack.push(std::mem::take(continuing));
+                }
+                _ => {}
+            }
+        }
+        // `block` holds no nested blocks now, so it drops without recursing.
+    }
+}
+
+/// Whether the module binds a subgroup built-in (module docs).
+fn binds_subgroups(module: &naga::Module) -> bool {
     let entry_bindings = module.entry_points.iter().any(|ep| {
         ep.function
             .arguments
@@ -152,12 +220,16 @@ fn uses_subgroups(module: &naga::Module) -> bool {
         }
         _ => false,
     });
-    let bodies = module
+    entry_bindings || member_bindings
+}
+
+/// The bodies of the module's functions and entry points.
+fn bodies(module: &naga::Module) -> impl Iterator<Item = &naga::Block> {
+    module
         .functions
         .iter()
         .map(|(_, f)| &f.body)
-        .chain(module.entry_points.iter().map(|ep| &ep.function.body));
-    entry_bindings || member_bindings || blocks_use_subgroups(bodies)
+        .chain(module.entry_points.iter().map(|ep| &ep.function.body))
 }
 
 /// The facts for one global's type.
@@ -196,8 +268,10 @@ pub(crate) fn scan(module: &naga::Module) -> ModuleFacts {
             ))
         })
         .collect();
+    let (operations, nesting) = walk_blocks(bodies(module));
     ModuleFacts {
-        subgroups: uses_subgroups(module),
+        subgroups: operations || binds_subgroups(module),
+        nesting,
         bindings,
     }
 }
@@ -227,6 +301,9 @@ mod tests {
             scan(&m),
             ModuleFacts {
                 subgroups: false,
+                // The `if` inside `main`'s loop: the loop's body is level 1, the `if`'s branches
+                // level 2.
+                nesting: 2,
                 bindings: BTreeMap::from([(
                     (0, 0),
                     BindingFacts {
@@ -301,6 +378,59 @@ mod tests {
         }
     }
 
+    /// The quad operations read their own quad only, so a module using nothing else does not
+    /// depend on the subgroup size (module docs).
+    #[test]
+    fn quad_operations_alone_are_not_a_size_dependence() {
+        let m = parse(
+            "
+             @compute @workgroup_size(32) fn main(@builtin(local_invocation_index) l: u32) {
+                 let b = quadBroadcast(l, 1u);
+                 let x = quadSwapX(l);
+                 let y = quadSwapY(l);
+                 let d = quadSwapDiagonal(l);
+             }",
+        );
+        assert!(!scan(&m).subgroups);
+    }
+
+    /// Every gather mode, each alone in a hand-built module: all but the two quad modes count.
+    #[test]
+    fn every_gather_mode_but_the_quad_ones_counts() {
+        type Mode = fn(naga::Handle<naga::Expression>) -> naga::GatherMode;
+        let modes: [(Mode, bool); 10] = [
+            (|_| naga::GatherMode::BroadcastFirst, true),
+            (naga::GatherMode::Broadcast, true),
+            (naga::GatherMode::Shuffle, true),
+            (naga::GatherMode::ShuffleDown, true),
+            (naga::GatherMode::ShuffleUp, true),
+            (naga::GatherMode::ShuffleXor, true),
+            (naga::GatherMode::QuadBroadcast, false),
+            (|_| naga::GatherMode::QuadSwap(naga::Direction::X), false),
+            (|_| naga::GatherMode::QuadSwap(naga::Direction::Y), false),
+            (
+                |_| naga::GatherMode::QuadSwap(naga::Direction::Diagonal),
+                false,
+            ),
+        ];
+        for (index, (mode, counts)) in modes.into_iter().enumerate() {
+            let m = nested(0, |f| {
+                let argument = f
+                    .expressions
+                    .append(naga::Expression::FunctionArgument(0), naga::Span::UNDEFINED);
+                let result = f
+                    .expressions
+                    .append(naga::Expression::FunctionArgument(0), naga::Span::UNDEFINED);
+                naga::Statement::SubgroupGather {
+                    mode: mode(argument),
+                    argument,
+                    result,
+                }
+            });
+            assert_eq!(scan(&m).subgroups, counts, "mode {index}");
+        }
+    }
+
     #[test]
     fn a_subgroup_barrier_alone_is_not_a_size_dependence() {
         let m = parse(
@@ -344,10 +474,143 @@ mod tests {
             naga::Statement::ControlBarrier(naga::Barrier::SUB_GROUP)
         });
         assert!(!scan(&barrier).subgroups, "a barrier at depth {depth}");
-        // naga's own `Drop` of the nested blocks recurses; leak them rather than overflow the
-        // test thread's stack while freeing them.
-        std::mem::forget(ballot);
-        std::mem::forget(barrier);
+        assert_eq!(scan(&barrier).nesting, depth);
+        // naga's own `Drop` of the nested blocks recurses once per level, which would overflow
+        // the test thread's stack here; `dismantle` does not.
+        dismantle(ballot);
+        dismantle(barrier);
+    }
+
+    /// A chain 100 000 deep that cycles through every way a statement holds a block: each link
+    /// counts one level, and `dismantle` takes every kind apart (one it skipped would leave a
+    /// deep chain to naga's recursive `Drop`, overflowing the test thread).
+    #[test]
+    fn every_held_block_kind_nests_and_is_dismantled() {
+        let depth = 100_000;
+        let mut m = parse("@compute @workgroup_size(1) fn main() { }");
+        let function = &mut m.entry_points[0].function;
+        let h = function
+            .expressions
+            .append(naga::Expression::FunctionArgument(0), naga::Span::UNDEFINED);
+        let mut inner = naga::Block::new();
+        for link in 0..depth {
+            let held = std::mem::take(&mut inner);
+            let empty = naga::Block::new;
+            let statement = match link % 6 {
+                0 => naga::Statement::Block(held),
+                1 => naga::Statement::If {
+                    condition: h,
+                    accept: held,
+                    reject: empty(),
+                },
+                2 => naga::Statement::If {
+                    condition: h,
+                    accept: empty(),
+                    reject: held,
+                },
+                3 => naga::Statement::Switch {
+                    selector: h,
+                    cases: vec![naga::SwitchCase {
+                        value: naga::SwitchValue::Default,
+                        body: held,
+                        fall_through: false,
+                    }],
+                },
+                4 => naga::Statement::Loop {
+                    body: held,
+                    continuing: empty(),
+                    break_if: None,
+                },
+                _ => naga::Statement::Loop {
+                    body: empty(),
+                    continuing: held,
+                    break_if: None,
+                },
+            };
+            inner.push(statement, naga::Span::UNDEFINED);
+        }
+        function.body = inner;
+        assert_eq!(scan(&m).nesting, depth);
+        dismantle(m);
+    }
+
+    /// Each kind of block a statement holds is one level below it, alone and in a chain of all
+    /// of them; the deepest of several bodies (an entry point and a helper) is the one reported.
+    #[test]
+    fn nesting_counts_one_level_per_held_block() {
+        type Holds = fn(naga::Block, naga::Handle<naga::Expression>) -> naga::Statement;
+        let m = parse(
+            "
+             fn helper(x: u32) -> u32 {
+                 { { { { { return x; } } } } }
+             }
+             @compute @workgroup_size(1) fn main(@builtin(local_invocation_index) l: u32) {
+                 if l == 0u { } else { }
+             }",
+        );
+        assert_eq!(scan(&m).nesting, 5, "the helper's five blocks");
+        let one = |statement: Holds, what: &str| {
+            let mut m = parse("@compute @workgroup_size(1) fn main() { }");
+            let function = &mut m.entry_points[0].function;
+            let handle = function
+                .expressions
+                .append(naga::Expression::FunctionArgument(0), naga::Span::UNDEFINED);
+            // The held block holds one more, so only the held block's own level decides the
+            // depth: the empty blocks beside it (the other branch, say) stop at level 1.
+            let mut inner = naga::Block::new();
+            inner.push(
+                naga::Statement::Block(naga::Block::new()),
+                naga::Span::UNDEFINED,
+            );
+            let mut body = naga::Block::new();
+            body.push(statement(inner, handle), naga::Span::UNDEFINED);
+            function.body = body;
+            assert_eq!(scan(&m).nesting, 2, "{what}");
+        };
+        one(|b, _| naga::Statement::Block(b), "a block");
+        one(
+            |b, h| naga::Statement::If {
+                condition: h,
+                accept: b,
+                reject: naga::Block::new(),
+            },
+            "an if's accept branch",
+        );
+        one(
+            |b, h| naga::Statement::If {
+                condition: h,
+                accept: naga::Block::new(),
+                reject: b,
+            },
+            "an if's reject branch",
+        );
+        one(
+            |b, h| naga::Statement::Switch {
+                selector: h,
+                cases: vec![naga::SwitchCase {
+                    value: naga::SwitchValue::Default,
+                    body: b,
+                    fall_through: false,
+                }],
+            },
+            "a switch case",
+        );
+        one(
+            |b, _| naga::Statement::Loop {
+                body: b,
+                continuing: naga::Block::new(),
+                break_if: None,
+            },
+            "a loop's body",
+        );
+        one(
+            |b, _| naga::Statement::Loop {
+                body: naga::Block::new(),
+                continuing: b,
+                break_if: None,
+            },
+            "a loop's continuing block",
+        );
     }
 
     #[test]
