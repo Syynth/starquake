@@ -720,3 +720,115 @@ fn the_wake_comes_before_any_frame_is_handed_to_a_sink() {
     // The back thread is woken before a sink, however slow, gets the list's frame.
     assert_eq!(log, vec!["wake", "frame"]);
 }
+
+/// A backend without a call log (module docs, "The call log") keeps no call and no present
+/// feedback however many lists it is given, and models everything else as the logging backend
+/// does: the same bytes read back, the same frames dumped to its sink, the same fences. The
+/// logging backend given the same calls keeps one event per call and one feedback per present.
+#[test]
+fn a_backend_without_a_call_log_keeps_no_call_and_no_feedback() {
+    use crate::backend::Readback;
+    use crate::command::StagingSlice;
+    use crate::frame::{Frame, FrameSink};
+    use crate::wake::CompletionWake;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, Default)]
+    struct Sink(Mutex<Vec<Frame>>);
+    impl FrameSink for Sink {
+        fn frame(&self, frame: Frame) {
+            self.0.lock().unwrap().push(frame);
+        }
+    }
+
+    /// Runs `lists` presents of an uploaded texture on `b`, each list an upload, a present with
+    /// a dump and a readback; what the readbacks and the sink got.
+    fn drive(b: &RecordingBackend, lists: u8) -> (Vec<Option<Readback>>, Vec<Frame>) {
+        let sink = Arc::new(Sink::default());
+        b.set_frame_sink(Some(Arc::<Sink>::clone(&sink)));
+        let t = b.create_texture(&texture_desc(1)).expect("valid");
+        let view = b
+            .create_view(
+                t,
+                &ViewDesc {
+                    format: PixelFormat::R8Unorm,
+                    dimension: ViewDimension::D2,
+                    base_mip: 0,
+                    mip_count: 1,
+                    base_layer: 0,
+                    layer_count: 1,
+                    swizzle: Swizzle::IDENTITY,
+                },
+            )
+            .expect("valid");
+        let region = TextureRegion {
+            texture: t,
+            mip: 0,
+            origin: Origin3d::default(),
+            extent: Extent3d {
+                width: 4,
+                height: 4,
+                depth_or_layers: 1,
+            },
+        };
+        let mut read = Vec::new();
+        for n in 0..lists {
+            let id = ReadbackId::new(u32::from(n), 1);
+            let list = CommandList {
+                commands: vec![
+                    Command::Upload {
+                        from: StagingSlice::from_bytes(vec![n.wrapping_add(1); 16]),
+                        to: CopyRegion::Texture(region),
+                    },
+                    Command::Present(PresentDesc {
+                        view,
+                        src_rect: Rect {
+                            x: 0,
+                            y: 0,
+                            width: 4,
+                            height: 4,
+                        },
+                        transform: PresentTransform::Identity,
+                        frame: u64::from(n),
+                        dump: true,
+                    }),
+                    Command::Readback {
+                        from: CopyRegion::Texture(region),
+                        id,
+                    },
+                ],
+            };
+            let fence = b.submit(list).expect("valid");
+            assert_eq!(fence, FenceValue::new(u64::from(n) + 1));
+            read.push(b.take_readback(id));
+        }
+        b.destroy(ResourceId::View(view), b.completed());
+        b.destroy(ResourceId::Texture(t), b.completed());
+        b.set_frame_sink(None);
+        let frames = std::mem::take(&mut *sink.0.lock().unwrap());
+        (read, frames)
+    }
+
+    const LISTS: u8 = 50;
+    let unlogged = RecordingBackend::without_call_log(caps(), 0, CompletionWake::none());
+    let logged = RecordingBackend::new(caps(), 0);
+    let unlogged_run = drive(&unlogged, LISTS);
+    let logged_run = drive(&logged, LISTS);
+    assert_eq!(unlogged_run, logged_run);
+    assert_eq!(unlogged_run.1.len(), usize::from(LISTS));
+    assert_eq!(
+        unlogged_run.0.last(),
+        Some(&Some(Readback::Bytes(vec![LISTS; 16])))
+    );
+    // Nothing kept of the calls without the log.
+    assert_eq!(unlogged.state().log.len(), 0);
+    assert_eq!(unlogged.snapshot(), "");
+    assert_eq!(unlogged.lists().len(), 0);
+    assert_eq!(unlogged.take_present_feedback().len(), 0);
+    assert_eq!(unlogged.state().feedback.len(), 0);
+    assert_eq!(unlogged.budget().used, 0);
+    // With it: two creates, the lists, two destroys and two frees; and every present's feedback.
+    assert_eq!(logged.lists().len(), usize::from(LISTS));
+    assert_eq!(logged.state().log.len(), usize::from(LISTS) + 6);
+    assert_eq!(logged.take_present_feedback().len(), usize::from(LISTS));
+}
