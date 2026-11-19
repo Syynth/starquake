@@ -506,3 +506,11 @@ Entry format:
 - **SCOPE:** moderate
 - **WHAT:** #33 closes as delivered by PR #127. Its leftovers (dynamic NRO loads through `ldr:ro`, trampoline reach past 128 MiB for large module sets, the NPDM system-call mask check, what `RemoteMemorySize` sizes) go to `docs/proposals.md`. #205's open part (unpatched `cntfrq_el0` and `cntvct_el0` reads disagree with the guest's rate) moves to milestone 4 unchanged, to be decided there. #21 closes, and so does milestone 2.
 - **WHY:** The title already loads and runs, so #33's leftovers wait until a title needs them. #205 is deferred because milestone 4 is where a title's frame timing first shows, so the cost of trapping every counter read can be weighed against a real symptom.
+
+## The completion wake: backends get a wake at construction, and the back thread sleeps on one wake-up
+- **WHEN:** 2026-11-18
+- **PROJECT:** starquake
+- **SYSTEM:** graphics (render-backend, gpu-protocol)
+- **SCOPE:** architectural (spec amendment)
+- **WHAT:** Core builds each render backend with a completion wake, as it passes the compile pool. The render thread stores each new `completed()` value and then calls the wake. The wake goes through the GPU ring's consumer wake-up, so the back thread sleeps on one thing and wakes for ring entries or for completion. Release writes stay on the back thread. A timer wake-up that finds `completed()` moved is logged and counted as a lost wake, and a contract test every backend must pass checks that a wake follows every advance. G15 builds against it; R5 implements it for wgpu.
+- **WHY:** It keeps every write the guest sees on one thread, in ring order, and reacts at once when the GPU finishes. A lost wake is bounded by the ring's 100 ms recheck, then detected and caught by a test. Eden's fencing thread carries the same obligation inside `wait()` and splits release writes across two threads. Polling would add delay to every semaphore the guest waits on.
