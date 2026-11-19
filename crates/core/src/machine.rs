@@ -158,6 +158,17 @@
 //!   `a_replay_without_the_date_stops_the_run_before_the_services_are_installed`).
 //!   `a_replay_without_the_date_is_this_emulator_error` pins the message [`date_at_boot`] gives.
 //!
+//! # The GPU and the frames
+//!
+//! A live run whose guest memory the GPU's threads can share ([`GuestProgram::gpu_memory`])
+//! gives its graphics server the GPU over the recording backend; any other run, the null front
+//! (`machine/gpu.rs`, which also says what the GPU is built with). The timer thread ends the run
+//! when a GPU thread ends ([`gpu::GPU_STOPPED`]), and once the run has stopped, the GPU is
+//! drained and stopped and its counters, flight recorder and frame dumps go into the report
+//! ([`RunReport::graphics`]). With [`RunOptions::until_frames`], the timer thread ends the run
+//! as [`ExitReason::FramesReached`] at the turn that hands the GPU front the last frame it
+//! allows (`crate::hle::graphics`, "Frames"; `machine/timer.rs`).
+//!
 //! # When the environment fails a service
 //!
 //! An `Env` call that fails (a replay that ran out or disagreed) stops the run as an emulator
@@ -212,10 +223,12 @@ use starquake_trace::{
 
 use crate::clock::Timebase;
 use crate::crash::{Backtrace, CrashReport, Exception};
-use crate::hle::{FrontMode, FspHost, Graphics, HostFolder, Reads};
+use crate::frames::FrameKeeper;
+use crate::hle::{FspHost, Graphics, HostFolder, Reads};
 use crate::image::{PAGE, Placement};
 use crate::report::{
-    ExitReason, GUEST_LOG_BYTES, Mapping, RunDate, RunOptions, RunReport, ThreadPc, empty_dump,
+    ExitReason, GUEST_LOG_BYTES, GraphicsReport, Mapping, RunDate, RunOptions, RunReport, ThreadPc,
+    empty_dump,
 };
 use crate::services_report::{LastStubbed, ServicesReport};
 use crate::space::{MapSink, Touch};
@@ -223,6 +236,7 @@ use crate::space::{MapSink, Touch};
 mod core_loop;
 mod cores;
 mod environment;
+pub(crate) mod gpu;
 mod timer;
 
 use cores::Cores;
@@ -498,6 +512,9 @@ struct Session<'a, C> {
     options: &'a RunOptions,
     clock: RunClock<C>,
     recorder: Arc<Recorder>,
+    /// The same guest memory as `memory`, shared, for the GPU's threads ([`GuestProgram`]'s
+    /// field of the same name; `machine/gpu.rs`). `None`: the run has no GPU.
+    gpu_memory: Option<Arc<dyn GuestMemory>>,
 }
 
 impl<C: HostClock + Clone> Session<'_, C> {
@@ -695,8 +712,10 @@ impl Tally {
 const UNDEFINED: Exception = Exception::UndefinedInstruction;
 
 /// How the loop ended.
-enum Ending {
+pub(crate) enum Ending {
     Exited,
+    /// The run presented the frames it was to stop at ([`RunOptions::until_frames`]).
+    FramesReached,
     /// The guest crashed with the exception, the syndrome the CPU backend reported for it (none
     /// for a `Break` system call), and its registers.
     Crashed(Exception, Option<Syndrome>, Box<GuestRegs>),
@@ -718,6 +737,9 @@ struct Aftermath {
     /// The date the run's clocks started from ([`RunReport::date`]); `None` when the run ended
     /// before it was read.
     date: Option<RunDate>,
+    /// What the graphics path left behind ([`RunReport::graphics`]; `machine/gpu.rs`, "At the
+    /// end").
+    graphics: GraphicsReport,
 }
 
 /// One guest thread when the run stopped (see [`ThreadPc`], which this becomes).
@@ -758,6 +780,8 @@ struct Machine<'a, V: Vcpu, C> {
     reads: Vec<Arc<LiveEnv>>,
     /// The graphics server, whose turns the timer thread runs (`machine/timer.rs`).
     graphics: Arc<Graphics>,
+    /// Where the GPU's frame dumps go, when the run has a GPU (`machine/gpu.rs`).
+    dumps: Option<Arc<FrameKeeper>>,
     /// The program counter of each thread a core's vCPU held when the core stopped, with the
     /// core, by the thread's id as the guest knows it (`core_loop`'s `Core::leave`).
     held: Mutex<BTreeMap<u64, (u8, u64)>>,
@@ -809,6 +833,10 @@ pub(crate) struct GuestProgram<'a, V> {
     pub(crate) placed: &'a Placement,
     /// The process's memory, for the kernel's tables.
     pub(crate) address_space: AddressSpace,
+    /// The guest's address space as the GPU's threads read it: the same memory as `space`,
+    /// shared. `None`: the run has no GPU, and its graphics server has the null front
+    /// (`machine/gpu.rs`, "Which front").
+    pub(crate) gpu_memory: Option<Arc<dyn GuestMemory>>,
 }
 
 /// Runs the loaded program `guest` on `vcpus` until it exits, crashes or times out, and
@@ -846,6 +874,11 @@ pub(crate) fn run_within<V: Vcpu, C: HostClock + Clone + 'static>(
 
 /// [`run_within`], with the services `install` puts in front of the kernel instead of a real
 /// run's.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the run from boot to report in order; the GPU's memory and report are one field \
+              each among the others"
+)]
 pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
     vcpus: Vcpus<'_, V>,
     guest: GuestProgram<'_, V>,
@@ -858,6 +891,7 @@ pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
         space,
         placed,
         address_space,
+        gpu_memory,
     } = guest;
     let console = time.console;
     let session = Session {
@@ -865,6 +899,7 @@ pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
         options,
         clock: RunClock::new(time.clone()),
         recorder: Arc::new(Recorder::new()),
+        gpu_memory,
     };
     let text = Arc::new(TextSink::with_limit(limits.trace_events));
     let flight = Arc::new(FlightRecorder::new(
@@ -898,9 +933,11 @@ pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
         threads,
         services,
         date,
+        graphics,
     } = aftermath;
     let exit = match ending {
         Ending::Exited => ExitReason::ProcessExited,
+        Ending::FramesReached => ExitReason::FramesReached,
         Ending::TimedOut => ExitReason::Timeout,
         Ending::Failed(message) => {
             tracing::error!(%message, "the run failed inside the emulator");
@@ -954,6 +991,7 @@ pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
         date,
         environment,
         environment_dropped,
+        graphics,
     }
 }
 
@@ -971,8 +1009,8 @@ fn thread_pcs(threads: Vec<StoppedThread>, modules: &[crate::crash::Module]) -> 
 ///
 /// A lost dump is never silent. It is logged, the report says why (`events_error` in
 /// `summary.json`), and `events.bin` holds a dump with no cores. A run that otherwise exited
-/// cleanly becomes an emulator error; a crash, a timeout and an emulator error keep their own
-/// reason, which matters more.
+/// cleanly (it exited, or presented the frames it was to stop at) becomes an emulator error; a
+/// crash, a timeout and an emulator error keep their own reason, which matters more.
 fn settle_dump(
     dump: Result<Vec<u8>, DumpError>,
     exit: ExitReason,
@@ -982,7 +1020,7 @@ fn settle_dump(
         Err(error) => {
             let message = format!("the flight recorder could not be written out: {error}");
             tracing::error!(%error, "the flight recorder could not be written out");
-            let exit = if exit == ExitReason::ProcessExited {
+            let exit = if matches!(exit, ExitReason::ProcessExited | ExitReason::FramesReached) {
                 ExitReason::EmulatorError(message.clone())
             } else {
                 exit
@@ -1137,6 +1175,25 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
             scheduler.core_count()
         });
         let bell = Arc::new(timer::Bell::default());
+        let wake: Arc<dyn starquake_gsv::completion::Wake> = Arc::<timer::Bell>::clone(&bell);
+        let built = gpu::graphics(
+            &session.options.environment,
+            session.gpu_memory.as_ref(),
+            session.options.until_frames,
+            wake,
+        );
+        let (graphics, dumps) = match built {
+            Ok(built) => built,
+            Err(message) => {
+                let log = GuestLog::new(limits.guest_log_bytes);
+                return Err(Box::new((
+                    Ending::Failed(message),
+                    log,
+                    Tally::default(),
+                    None,
+                )));
+            }
+        };
         let mut machine = Self {
             session,
             space,
@@ -1152,10 +1209,8 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
                 bell: Arc::clone(&bell),
             },
             halted: Arc::new(Halted::new(Arc::clone(&bell))),
-            graphics: Arc::new(Graphics::new(
-                FrontMode::Live,
-                Some(Arc::<timer::Bell>::clone(&bell)),
-            )),
+            graphics: Arc::new(graphics),
+            dumps,
             bell,
             reads: session.reads_environments(),
             held: Mutex::new(BTreeMap::new()),
@@ -1199,9 +1254,10 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
         for reads in &self.reads {
             drop(reads.take_recording());
         }
-        let ending = lock(&self.ending)
+        let mut ending = lock(&self.ending)
             .take()
             .unwrap_or_else(|| Ending::Failed("the run stopped without saying why".to_owned()));
+        let graphics = gpu::finish(&self.graphics, self.dumps.as_deref(), &mut ending);
         let services = ServicesReport::read(&self.dispatcher);
         let aftermath = match &ending {
             Ending::Crashed(_, _, regs) => Aftermath {
@@ -1209,16 +1265,19 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
                 threads: Vec::new(),
                 services,
                 date: self.date,
+                graphics,
             },
             Ending::TimedOut => Aftermath {
                 stack: None,
                 threads: self.stopped_threads(),
                 services,
                 date: self.date,
+                graphics,
             },
-            Ending::Exited | Ending::Failed(_) => Aftermath {
+            Ending::Exited | Ending::FramesReached | Ending::Failed(_) => Aftermath {
                 services,
                 date: self.date,
+                graphics,
                 ..Aftermath::default()
             },
         };

@@ -224,10 +224,15 @@ pub(crate) mod host {
         // it is dropped first, as the VM requires; the other cores' vCPUs are dropped on their
         // own threads before `machine::run` returns.
         let mut vcpu = new_vcpu()?;
+        // The GPU's threads read the same address space (`crate::machine`, "The GPU and the
+        // frames").
+        let gpu_memory: Arc<dyn starquake_memory::GuestMemory> =
+            Arc::<AddressSpace<PhysicalMemory>>::clone(&space);
         let guest = GuestProgram {
             space: &*space,
             placed: &placed,
             address_space,
+            gpu_memory: Some(gpu_memory),
         };
         let vcpus = Vcpus {
             first: &mut vcpu,

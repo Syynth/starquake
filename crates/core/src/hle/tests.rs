@@ -36,7 +36,7 @@ use super::*;
 
 mod data_file_system;
 mod data_storage;
-mod graphics;
+pub(crate) mod graphics;
 
 /// Where the process's memory is: four pages the guest may read and write.
 const BASE: u64 = 0x8000_0000;
