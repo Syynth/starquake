@@ -1035,12 +1035,11 @@ impl<M: GpuMemory + ?Sized, B: BackWork + ?Sized> MacroHost for RunHost<'_, M, B
 
     fn data_ram_load(&mut self) -> Option<DataRamLoad<'_>> {
         let index = self.ram_load.take()?;
-        let words: &[u32] = if self.status == RunStatus::Running {
-            &self.scratch.ram_words
-        } else {
-            &[]
-        };
-        Some(DataRamLoad { index, words })
+        // Empty unless this write's read succeeded: `method` cleared it first.
+        Some(DataRamLoad {
+            index,
+            words: &self.scratch.ram_words,
+        })
     }
 }
 
