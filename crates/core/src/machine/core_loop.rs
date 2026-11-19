@@ -16,7 +16,7 @@ use starquake_kernel::sched::CoreId;
 use starquake_memory::Access;
 use starquake_trace::{EventKind, FaultAction, HostClock, LifecyclePhase, ThreadId};
 
-use super::cores::Parked;
+use super::cores::{self, Parked};
 use super::{Ending, LogSink, Machine, PROCESS_ID, UNDEFINED, WAITING, lock};
 use crate::crash::Exception;
 use crate::space::Touch;
@@ -52,9 +52,12 @@ pub(super) fn run<V: Vcpu, C: HostClock + Clone>(
             Ok(Stepped::Parked) => {
                 // The graphics server's turn can still end a wait the kernel thinks nothing can
                 // (`crate::hle::graphics`, "Telling a stalled run"); asked first, outside the
-                // kernel lock.
+                // kernel lock. A busy answer from the GPU alone is asked again at the GPU's next
+                // quiet signal (`machine/cores.rs`, "Telling a stalled run").
                 let parked = machine.cores.park(core, || {
-                    machine.graphics.is_idle() && machine.dispatcher.is_stalled()
+                    cores::stall(machine.graphics.idleness(), || {
+                        machine.dispatcher.is_stalled()
+                    })
                 });
                 match parked {
                     Parked::Woken | Parked::Stopped => {}

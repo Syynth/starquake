@@ -111,11 +111,25 @@
 //! leaves the GPU idle (`a_channel_parked_on_an_unreleased_acquire_is_idle`). A channel that
 //! still waits after that poll waits on something only the guest can end.
 //!
-//! **Owner question**, the trade-off of that wait: `core` asks once, as the last vCPU parks,
-//! with its cores' idle lock held, so the wait holds that lock for up to [`IDLE_POLL_WAIT`];
-//! and a front thread the host does not run within it makes the answer "busy", so `core` does
-//! not end a run it would have called stalled. The other choice is to count a scheduled poll as
-//! busy, which never calls a run with a channel parked on an acquire stalled.
+//! **Owner question**, the trade-off of that wait: `core` asks as the last vCPU parks, with its
+//! cores' idle lock held, so the wait holds that lock for up to [`IDLE_POLL_WAIT`]; and a front
+//! thread the host does not run within it makes the answer "busy", so `core` does not end a run
+//! it would have called stalled on that question (it asks again at the next quiet signal, below,
+//! a bounded number of times). The other choice is to count a scheduled poll as busy, which
+//! never calls a run with a channel parked on an acquire stalled.
+//!
+//! **The quiet signal** ([`Gpu::set_quiet_wake`], [`QuietWake`]). The front thread tells the
+//! one wake it was given each time it ends a turn idle: after it published the turn's counters
+//! and marked itself quiet, with no lock of this crate held. That includes the turn each
+//! [`crate::front::IDLE_PARK`] safety-net wake starts, which reads busy while it runs, so a
+//! question that landed in it can be asked again once it has ended (gpu-protocol, "Idleness":
+//! "the parked core asks again when the GPU next reports quiet"; `core`'s `machine/cores.rs`).
+//! A busy answer that comes from the back alone (an entry not taken, a list in flight) is
+//! signalled by the front's next idle turn: a report of what the back performed
+//! ([`FrontWake`]) wakes the front, and with no report the next safety-net turn comes at most
+//! `IDLE_PARK` later.
+//! (`the_production_front_thread_tells_its_one_quiet_wake`;
+//! `the_quiet_wake_is_told_after_the_front_is_quiet_with_no_lock_held` pins the order.)
 //!
 //! It can answer "busy" for a GPU that is idle (a look that overlaps a completion or a turn, or
 //! a poll the host is slow to run); it does not answer "idle" while an entry is unapplied or a
@@ -169,6 +183,7 @@ use crate::back::exec::{ExecConfig, Executor, ShaderCache};
 use crate::back::fence::{FenceClock, FenceEnv, Fences, FrontWake, Mode, Report};
 use crate::channel::ChannelError;
 use crate::front::Front;
+use crate::front::{QuietWake, QuietWakeTaken};
 use crate::front::{
     FrontClock, FrontCounters, FrontDeps, FrontError, FrontShared, FrontThread, HostClock,
     OrderedTable, POLL_LONGEST_SLEEP, spawn_observed,
@@ -785,6 +800,16 @@ impl Gpu {
         }
         let left = IDLE_POLL_WAIT.saturating_sub(started.elapsed());
         self.shared.wait_quiet(left) && self.look().is_some()
+    }
+
+    /// Tells `wake` each time the front thread ends a turn idle (module docs, "Idleness", "The
+    /// quiet signal"): `core`'s parked cores ask again then. One GPU has at most one.
+    ///
+    /// # Errors
+    ///
+    /// [`QuietWakeTaken`] if a wake was set before; the first one is kept.
+    pub fn set_quiet_wake(&self, wake: Arc<dyn QuietWake>) -> Result<(), QuietWakeTaken> {
+        self.shared.set_quiet_wake(wake)
     }
 
     /// One look (module docs, "Idleness"): what the front published, if the GPU is idle but for

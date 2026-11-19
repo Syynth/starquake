@@ -439,6 +439,30 @@ pub struct GpuParts {
     pub config: GpuConfig,
 }
 
+/// What [`Graphics::idleness`] found (module docs, "Telling a stalled run").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Idleness {
+    /// Nothing left could signal an event without a guest's call first: what
+    /// [`Graphics::is_idle`] calls idle.
+    Idle,
+    /// Everything but the GPU is idle, and the GPU answered busy: a question that can be asked
+    /// again when the GPU next reports quiet (gpu-protocol, "Idleness").
+    GpuBusy,
+    /// Something besides the GPU is busy; the GPU may be busy too.
+    Busy,
+}
+
+/// The graphics server's [`Idleness`] from whether the GPU answered busy (`false` with no GPU)
+/// and whether everything else is idle.
+#[must_use]
+pub(crate) const fn idleness(gpu_busy: bool, rest_idle: bool) -> Idleness {
+    match (gpu_busy, rest_idle) {
+        (false, true) => Idleness::Idle,
+        (true, true) => Idleness::GpuBusy,
+        (_, false) => Idleness::Busy,
+    }
+}
+
 /// Why a note could not be fed back ([`Graphics::replay`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ReplayError {
@@ -710,16 +734,22 @@ impl Graphics {
     /// so it waits for a drain in progress, whose signals are then made.
     #[must_use]
     pub fn is_idle(&self) -> bool {
+        self.idleness() == Idleness::Idle
+    }
+
+    /// [`Graphics::is_idle`], saying whether a busy answer came from the GPU alone (module docs,
+    /// "Telling a stalled run"): the GPU is asked first, then the rest is asked whatever the
+    /// GPU answered.
+    #[must_use]
+    pub fn idleness(&self) -> Idleness {
         // The GPU first: a completion it pushes while this asks is then seen as work in flight
         // or found queued below (module docs, "Telling a stalled run").
-        if self.gpu.as_ref().is_some_and(|gpu| !gpu.is_idle()) {
-            return false;
-        }
+        let gpu_busy = self.gpu.as_ref().is_some_and(|gpu| !gpu.is_idle());
         let ticking = match self.mode {
             FrontMode::Live => self.shared.vsync_deadline().is_some(),
             FrontMode::Replay => false,
         };
-        !ticking && self.is_idle_but_the_clock()
+        idleness(gpu_busy, !ticking && self.is_idle_but_the_clock())
     }
 
     /// Whether the timer thread should run [`Graphics::turn`] at `now`, the loop's own reading

@@ -1216,6 +1216,17 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
             held: Mutex::new(BTreeMap::new()),
             date: None,
         };
+        // The GPU's quiet signal reaches the parked cores (`machine/cores.rs`, "Telling a
+        // stalled run"). A run's GPU is made fresh above, so it never refuses.
+        if let Err(error) = machine.cores.listen_to(&machine.graphics) {
+            let log = take_log(&machine.log);
+            return Err(Box::new((
+                Ending::Failed(format!("the GPU could not be wired to the cores: {error}")),
+                log,
+                Tally::default(),
+                None,
+            )));
+        }
         let rtc = session.options.rtc;
         let started = set_up_services(date_at_boot(rtc, &**env), |time| {
             let given = Given {
