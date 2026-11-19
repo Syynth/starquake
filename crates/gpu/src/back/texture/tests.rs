@@ -456,6 +456,7 @@ fn an_unmapped_render_target_is_found_again_by_its_address() {
     let entry = rig.entry(first.texture);
     assert_eq!(entry.source, Source::HostOnly);
     assert_eq!(entry.watch, Watch::Unwatched);
+    assert!(!rig.watch.has_requests());
     assert!(entry.gpu_modified);
     // A sampled use of the same image finds it, and uploads nothing.
     let sampled = rig.texture(&header(page(40))).unwrap();
@@ -1280,11 +1281,19 @@ fn an_ordered_unmap_drops_overlapping_images_and_keeps_neighbours() {
             .target(&header(page(IMAGE_PAGES)).image)
             .unwrap()
             .texture;
+        // A second image at the dropped one's address, of another layout.
+        let also = rig
+            .texture(&decode(
+                bl_header(page(IMAGE_PAGES)).set(tex::TEXHEAD_BL_GOBS_PER_BLOCK_HEIGHT, 1),
+            ))
+            .unwrap()
+            .texture;
         let after = rig.texture(&header(page(2 * IMAGE_PAGES))).unwrap().texture;
         rig.cache.apply_update(&update);
         let left: Vec<TextureId> = rig.cache.entries().map(|e| e.texture).collect();
         assert_eq!(left, [before, after], "{update:?}");
         assert!(rig.cache.entry(dropped).is_none());
+        assert!(rig.cache.entry(also).is_none());
     }
 }
 
