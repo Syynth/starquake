@@ -1573,6 +1573,30 @@ fn the_chain_limit_is_reported_before_a_second_dependent() {
     );
 }
 
+/// The last QMD a chain allows has an unsupported dependent action: the action is reported,
+/// not the chain limit (`native_qmd.h` line 107 comes before line 108).
+#[test]
+fn an_unsupported_dependent_action_is_reported_before_the_chain_limit() {
+    let mem = memory();
+    chain(&mem, MAX_CHAIN as u64);
+    let last = qmd_at(MAX_CHAIN as u64 - 1);
+    put(
+        &mem,
+        last,
+        &Spec::new(0x2000).dependent(qmd_at(MAX_CHAIN as u64), 0),
+    );
+    let mut table = QmdTable::new();
+    let mut sink = Recorder::default();
+    assert_eq!(
+        table.signal(qmd_at(0), PcasAction::Schedule, &mem, &mut sink),
+        Err(QmdError::DependentAction {
+            address: last,
+            action: 0
+        })
+    );
+    assert_eq!(sink.completions().len(), MAX_CHAIN);
+}
+
 #[test]
 fn the_table_holds_exactly_the_limit() {
     let mem = memory();

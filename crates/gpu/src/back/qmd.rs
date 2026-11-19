@@ -57,12 +57,12 @@
 //!   (line 108).
 //! - A QMD that runs is read again from memory first, because NVN2 patches its release payloads
 //!   while it waits (the comment above line 72). Its release slots are all checked before any
-//!   is made visible (line 77).
+//!   is made visible (lines 75 to 86).
 //! - A grid with a zero dimension (`!(qmd[12] && (qmd[13] & 0xffff) && (qmd[14] & 0xffff))`,
 //!   line 89) completes and releases without a dispatch ([`Outcome::EmptyGrid`]). A block with a
 //!   zero dimension is refused as `DispatchNativeCompute` refuses it ([`Outcome::EmptyBlock`]),
 //!   without reaching the sink. A program the sink rejects ([`Program::Rejected`]) still
-//!   completes and releases (row 61; line 86).
+//!   completes and releases (row 61; the comment at lines 87–88, and line 89).
 //! - The dependent QMD: enable bit 512 with action 1 (`QMD_SCHEDULE`), 3
 //!   (`QMD_INVALIDATE_COPY_SCHEDULE`) or 4 (`QMD_DECREMENT_DEPENDENCE`) becomes PCAS action 2, 3
 //!   or 7 with a count of one at `DEPENDENT_QMD0_POINTER << 8` (lines 105 to 110). Another
@@ -99,8 +99,8 @@
 //!   divergence. Pinned by
 //!   `divergence_inline_qmd_without_require_scheduling_pcas_is_scheduled`.
 //! - **Every reduction the header defines.** Eden-NX2 refuses a release with reduction enabled
-//!   and an op other than `RED_ADD`, or with any reduction format bit set (`native_qmd.h` line
-//!   79); here the op and format are decoded as the header defines them (`RED_ADD` to `RED_XOR`,
+//!   and an op other than `RED_ADD`, or with any reduction format bit set (`native_qmd.h` lines
+//!   80–81); here the op and format are decoded as the header defines them (`RED_ADD` to `RED_XOR`,
 //!   unsigned or signed; [`crate::sema`]), and a format the header does not define is
 //!   [`ReleaseRefusal::Reduction`]. Pinned by `divergence_every_header_reduction_is_released`.
 //! - **The reduction format is ignored without reduction enable**, where Eden-NX2 refuses it
@@ -124,7 +124,7 @@
 //!
 //! A release slot whose `STRUCTURE_SIZE` is not `SEMAPHORE_ONE_WORD`, whose `PAYLOAD64B` is set
 //! or whose `TRAP_TYPE` is not `TRAP_NONE` is [`QmdError::Release`], checked in that order
-//! (Eden-NX2 checks them as one condition, line 79). The header defines these forms, but not how
+//! (Eden-NX2 checks them as one condition, lines 80–81). The header defines these forms, but not how
 //! they combine with each other or with a reduction, so they stay refused until a trace shows one.
 //!
 //! # Guesses and what is not here
