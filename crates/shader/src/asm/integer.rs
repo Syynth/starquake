@@ -22,9 +22,10 @@ use crate::decode::{
     OpPLop3, OpPopC, OpPrmt, OpR2P, OpSel, OpSgxt, OpShf, PLop3Src, Pred, SRC0,
 };
 
-/// Encodes the sources of `kind` with `encode_alu` and sets the opcode: refuses a source with
-/// an absolute value, or negated where `kind` has no negation bit for it, and a form `kind`
-/// does not have. Returns the form.
+/// Encodes the sources of `kind` with `encode_alu` and sets the opcode. Refuses, in this order:
+/// two sources that need the wide slot; the lowest source with an absolute value, or negated
+/// where `kind` has no negation bit for it in the form; a form `kind` does not have
+/// (`integer_unencodable_operations_are_errors` has the last two at once). Returns the form.
 fn int_alu(
     writer: &mut Writer,
     mnemonic: &'static str,
