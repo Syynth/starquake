@@ -82,10 +82,12 @@
 //! A new image's pages are watched ([`WriteWatch::request`]), as the buffer cache watches its
 //! entries. Until [`WriteWatch::armed`] says the request took effect the image is *untracked*
 //! and every use uploads it, and **the first use after arming uploads it once more**: a write
-//! between the last untracked read and the arming is in no dirty log. This is the unvetted
-//! proposal "G16/G17 caches re-read a range on first use after arming" (`docs/proposals.md`,
-//! review notes on #197), which the buffer cache follows too; it is an **owner question**
-//! raised in the pull request. For a texture it costs a second whole-image upload per new image.
+//! between the last untracked read and the arming is in no dirty log. The owner decided this for
+//! the buffer cache (decision log 2026-11-18, "gpu-protocol errata from waves 37 and 38", item
+//! 11; the proposal "G16/G17 caches re-read a range on first use after arming" in
+//! `docs/proposals.md`); this cache follows the same rule so the two agree, which is an **owner
+//! question** raised in the pull request, since the ruling names the buffer cache only. For a
+//! texture it costs a second whole-image upload per new image.
 //! A GPU-modified image is not uploaded for being untracked: its host copy is newer than guest
 //! memory, and only a write the dirty log reports (or a back-thread write) makes guest memory
 //! win. Pinned by `tests::the_first_use_after_arming_uploads_the_image_again` and
