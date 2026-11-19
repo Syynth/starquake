@@ -13,11 +13,10 @@
 //! (`eden/src/shader_recompiler/frontend/maxwell/translate/impl/` @ cf654052,
 //! GPL-2.0-or-later): `texture_fetch.cpp`, `texture_load.cpp`, `texture_gather.cpp`,
 //! `texture_gradient.cpp`, `texture_query.cpp`, `texture_mipmap_level.cpp`,
-//! `surface_load_store.cpp` and `surface_atomic_operations.cpp`. Two facts neither Eden source
-//! gives come from NAK (`mesa-nouveau/src/nouveau/compiler/nak_nir_lower_tex.c` @ 52238762, MIT,
-//! Copyright 2022 Collabora, Ltd.; see "Level-of-detail clamp"), and the per-texel gather
-//! emulation follows the GLSL definition of `textureGatherOffsets` and Mesa's
-//! `nir_lower_tex.c` (`lower_tg4_offsets`, MIT): see "Per-texel gather offsets".
+//! `surface_load_store.cpp` and `surface_atomic_operations.cpp`. Where the level-of-detail clamp
+//! is read from, which neither Eden source gives, and the per-texel gather offsets' packing come
+//! from NAK (`mesa-nouveau/src/nouveau/compiler/nak_nir_lower_tex.c` @ 52238762, MIT, Copyright
+//! 2022 Collabora, Ltd.): see "Level-of-detail clamp" and "Per-texel gather offsets".
 //!
 //! # What each instruction becomes
 //!
@@ -134,12 +133,15 @@
 //! `ImageOperands`: "Not all arguments in PTP are immediate, ignoring") and naga not at all
 //! (the gap table). Here it is emulated in the IR, as the spec's plan says: four gathers, the
 //! `k`th with texel `k`'s offset alone, each giving its `(i0, j0)` texel (component 3,
-//! [`GATHER_BASE_TEXEL`]) as result component `k`. That is the GLSL definition of
-//! `textureGatherOffsets` ("selecting the texel i0 j0 of that footprint") and what Mesa's
-//! `lower_tg4_offsets` does. Texel `k`'s offset is fields `2k` and `2k + 1` of the eight
-//! (the first register's four, then the second's), as Eden's backend pairs them
-//! (`ImageOperands`: `read(0, 0), read(0, 1)`, ...). A single non-constant offset (`TEX.AOFFI`,
-//! `TLD4.AOFFI`) stays a value in the offset slot, for the lowering to emulate or not.
+//! [`GATHER_BASE_TEXEL`]) as result component `k`. That is how the GLSL specification defines
+//! `textureGatherOffsets` ("selecting the texel i0 j0 of that footprint"; the specification is
+//! not in the reference folder), the function Eden's GLSL backend emits for these gathers
+//! (`backend/glsl/emit_glsl_image.cpp`). Texel `k`'s offset is fields `2k` and `2k + 1` of the
+//! eight (the first register's four, then the second's), as NAK packs them
+//! (`nak_nir_lower_tex.c`: byte `i` is `tg4_offsets[i / 2][i % 2]`) and Eden's SPIR-V backend
+//! pairs them (`ImageOperands`: `read(0, 0), read(0, 1)`, ...). A single non-constant offset
+//! (`TEX.AOFFI`, `TLD4.AOFFI`) stays a value in the offset slot, for the lowering to emulate or
+//! not.
 //!
 //! # Surfaces
 //!
@@ -235,8 +237,9 @@ pub const GATHER_OFFSET_BITS: u32 = 6;
 pub const GATHER_OFFSET_STRIDE: u32 = 8;
 
 /// The component of a gather's result that holds its `(i0, j0)` texel, the one a per-texel
-/// offset moves (GLSL's `textureGatherOffsets`; Mesa's `lower_tg4_offsets`: `nir_get_scalar(..,
-/// 3)`).
+/// offset moves (the GLSL specification's `textureGatherOffsets` and `textureGather`, whose
+/// fourth component is the `(i0, j0)` texel; see the module docs, "Per-texel gather
+/// offsets").
 pub const GATHER_BASE_TEXEL: u32 = 3;
 
 /// `TXQ`'s word that holds the level count: element 3 of the dimensions, skipped unless the
