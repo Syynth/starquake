@@ -17,7 +17,14 @@
 //!   inside the word (`bitfield_uextract`, `bitfield_insert`). `BitFieldSExtract` shifts the
 //!   unsigned field up by `32 - min(count, 32)` and arithmetically back, so the sign is the
 //!   top bit of the field the count names, and a zero count gives 0 (`bitfield_sextract`).
-//! - Float to integer: naga's conversion truncates and saturates; a NaN selects 0.
+//! - Float to integer: naga's conversion truncates and saturates, but to the largest float
+//!   below the integer's maximum, so a value at or past 2^31 (2^32 unsigned) selects the
+//!   maximum; a NaN selects 0.
+//! - Float comparisons: an ordered comparison is `!(isnan(a) || isnan(b)) && a op b`, an
+//!   unordered one `isnan(a) || isnan(b) || a op b`. Measured on an Apple GPU under wgpu-hal
+//!   30.0.2's Metal backend, which leaves the Metal compiler's default fast math on: a plain
+//!   `a == b` of two NaNs is true there, while `isnan` and the selects built on it give the
+//!   interpreter's results (`tests::ops::float_operations_match_the_interpreter_on_the_gpu`).
 
 use naga::{
     BinaryOperator, Block, Expression, Handle, Literal, MathFunction, RelationalFunction,
@@ -424,6 +431,18 @@ impl Lowering {
             ScalarKind::Uint
         };
         let mut int = self.cast(body, value, kind, Some(WIDTH32));
+        // naga saturates to the largest float below the integer's maximum (`naga_f2i32` clamps
+        // to 2147483520.0, measured as 0x7fffff80), so a value at or past 2^31 (2^32 unsigned)
+        // selects the maximum itself.
+        let (limit, max) = if signed {
+            (2_147_483_648.0_f32, Literal::I32(i32::MAX))
+        } else {
+            (4_294_967_296.0_f32, Literal::U32(u32::MAX))
+        };
+        let limit = self.lit(body, Literal::F32(limit));
+        let past = self.binary(body, BinaryOperator::GreaterEqual, value, limit);
+        let max = self.lit(body, max);
+        int = self.select(body, past, max, int);
         if bits < BITS32 {
             // Saturate to 16 bits; truncation and saturation commute.
             let (low, high) = if signed {
@@ -843,8 +862,10 @@ impl Lowering {
         Ok(())
     }
 
-    /// A float comparison; an unordered one is the negation of the ordered complement, so a
-    /// NaN operand makes it true.
+    /// A float comparison: an ordered one is false and an unordered one true when either
+    /// operand is a NaN, tested with `isnan` rather than left to the comparison, because the
+    /// host compiler's fast math treats a NaN as an ordinary value in a comparison (see the
+    /// module docs).
     fn float_compare(
         &mut self,
         body: &mut Block,
@@ -853,29 +874,16 @@ impl Lowering {
         a: Handle<Expression>,
         b: Handle<Expression>,
     ) -> Handle<Expression> {
-        use BinaryOperator::{Equal, Greater, GreaterEqual, Less, LessEqual, NotEqual};
-        // The ordered complement of each operator (`a != b` ordered is `a < b || a > b`).
-        let ordered_not_equal = |this: &mut Self, body: &mut Block| {
-            let less = this.binary(body, Less, a, b);
-            let greater = this.binary(body, Greater, a, b);
-            this.binary(body, BinaryOperator::LogicalOr, less, greater)
-        };
-        if !unordered {
-            return if cmp == NotEqual {
-                ordered_not_equal(self, body)
-            } else {
-                self.binary(body, cmp, a, b)
-            };
+        let a_nan = self.is_nan(body, a);
+        let b_nan = self.is_nan(body, b);
+        let any_nan = self.binary(body, BinaryOperator::LogicalOr, a_nan, b_nan);
+        let compared = self.binary(body, cmp, a, b);
+        if unordered {
+            self.binary(body, BinaryOperator::LogicalOr, any_nan, compared)
+        } else {
+            let no_nan = self.unary(body, UnaryOperator::LogicalNot, any_nan);
+            self.binary(body, BinaryOperator::LogicalAnd, no_nan, compared)
         }
-        let complement = match cmp {
-            Equal => ordered_not_equal(self, body),
-            NotEqual => self.binary(body, Equal, a, b),
-            Less => self.binary(body, GreaterEqual, a, b),
-            Greater => self.binary(body, LessEqual, a, b),
-            LessEqual => self.binary(body, Greater, a, b),
-            _ => self.binary(body, Less, a, b),
-        };
-        self.unary(body, UnaryOperator::LogicalNot, complement)
     }
 
     /// `UDiv32` and `SDiv32` (see the module docs).

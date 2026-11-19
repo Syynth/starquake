@@ -1,6 +1,12 @@
 //! Lowering tests: the synthetic vertex/pixel pair end to end (golden tables, validation with
 //! this crate's flags and wgpu's, acceptance on a wgpu device), and each lowering error.
 
+mod compute;
+mod memory;
+mod ops;
+mod run;
+mod structured;
+
 use naga::valid::{ValidationFlags, Validator};
 use naga::{ScalarKind, UnaryOperator};
 
@@ -533,6 +539,37 @@ fn a_pixel_program_with_no_outputs_returns_nothing() {
 /// Hand-written IR in the text form.
 fn ir(text: &str) -> Function {
     Function::parse(text).expect("parses")
+}
+
+/// Lowers `function` with `inputs`, and checks that the module validates with exactly the
+/// capabilities its requirements name, both with this crate's flags and with wgpu's (every
+/// flag, experiment E1).
+fn lowered(stage: GuestStage, function: &Function, inputs: &LowerInputs) -> HostShader {
+    let shader = lower_with(stage, function, inputs).expect("lowers");
+    let caps = capabilities(shader.requirements);
+    for flags in [validation_flags(), ValidationFlags::all()] {
+        Validator::new(flags, caps)
+            .validate(naga_module(&shader))
+            .unwrap_or_else(|error| panic!("valid with {flags:?}: {error}"));
+    }
+    shader
+}
+
+/// The module written as MSL by naga's own writer (what wgpu writes on a Mac), for snapshots.
+fn msl(shader: &HostShader) -> String {
+    let HostCode::Naga { module, info } = &shader.code;
+    let options = naga::back::msl::Options {
+        lang_version: (2, 4),
+        ..naga::back::msl::Options::default()
+    };
+    let (text, _) = naga::back::msl::write_string(
+        module,
+        info,
+        &options,
+        &naga::back::msl::PipelineOptions::default(),
+    )
+    .expect("naga writes the module as MSL");
+    text
 }
 
 /// A pixel function that writes colour output `target`.`component` from a constant.

@@ -159,6 +159,7 @@
 //! | NaN handling (unordered comparisons, `FPIsNan`, NaN-aware minimum and maximum, NaN to 0 on conversion) | Written out explicitly, but wgpu-hal 30.0.2's Metal backend leaves the Metal compiler's default math mode, which is fast math, so the host compiler may assume no NaN (a guess from wgpu-hal's source; not measured) | The interpreter's results | `tests::ops` (the expression trees only) |
 //! | `f32` and `f16` from an integer | naga's conversion, rounding as the host does | Round to nearest even (the interpreter) | none |
 //! | Shared-memory word index | `offset >> 2`, logical | `OpShiftRightArithmetic` (`emit_spirv_shared_memory.cpp`), which differs only for offsets of 2^31 and up, all out of bounds here | `tests::memory::shared_offsets_at_and_past_the_end` |
+//! | `PackHalf2x16` and `UnpackHalf2x16` | Need [`Requirements::f16`] (see [`capabilities`]) | Eden needs no feature (`OpExtInst PackHalf2x16`) | `tests::ops::f16_packing_needs_f16` |
 //! | Out-of-bounds local and shared accesses | Read 0, write dropped, word by word | Eden does not check; the interpreter refuses | `tests::memory` |
 
 pub(crate) mod builder;
@@ -376,10 +377,21 @@ pub fn validation_flags() -> ValidationFlags {
 }
 
 /// The naga capabilities a shader with `requirements` is validated with.
+///
+/// [`Requirements::f16`] grants `SHADER_FLOAT16_IN_FLOAT32` too, which naga 30.0.1 needs for
+/// `pack2x16float` and `unpack2x16float` (`valid/expression.rs`), so `PackHalf2x16` and
+/// `UnpackHalf2x16` count as needing f16. wgpu grants that capability from the downlevel flag
+/// `SHADER_F16_IN_F32` (`wgpu-naga-bridge` 30.0.2, `features_to_naga_capabilities`), which
+/// `wgpu-types` 30.0.2 documents as missing only on Mesa's Vulkan drivers without
+/// `SHADER_F16`, so a device with the f16 feature has it: stricter than needed on a device
+/// with the flag but not the feature, which is listed as a divergence in the module docs.
 pub fn capabilities(requirements: Requirements) -> Capabilities {
     let mut caps = Capabilities::empty();
     caps.set(Capabilities::SUBGROUP, requirements.subgroup);
-    caps.set(Capabilities::SHADER_FLOAT16, requirements.f16);
+    caps.set(
+        Capabilities::SHADER_FLOAT16 | Capabilities::SHADER_FLOAT16_IN_FLOAT32,
+        requirements.f16,
+    );
     caps.set(Capabilities::SHADER_INT64, requirements.i64);
     caps
 }
@@ -550,6 +562,10 @@ impl Interface {
                 found.requirements.f16 |= is_f16(ty);
                 found.requirements.i64 |= ty == Type::U64;
             }
+            // naga's `pack2x16float` and `unpack2x16float` need `SHADER_FLOAT16_IN_FLOAT32`,
+            // which counts as part of the f16 requirement (see [`capabilities`]).
+            found.requirements.f16 |=
+                matches!(op.opcode, Opcode::PackHalf2x16 | Opcode::UnpackHalf2x16);
             found.local_memory |= memory::is_local(op.opcode);
             found.shared_memory |= memory::is_shared(op.opcode);
             match op.opcode {
@@ -742,7 +758,7 @@ pub fn lower_with(
 
     let info = Validator::new(validation_flags(), capabilities(requirements))
         .validate(&module)
-        .map_err(|error| LowerError::Validation(error.to_string()))?;
+        .map_err(|error| LowerError::Validation(error_chain(&error)))?;
     Ok(HostShader {
         stage: host_stage,
         code: HostCode::Naga {
@@ -973,7 +989,8 @@ impl Lowering {
 
     /// The expression of an operand of instruction `at`: a value's, or a literal made here for
     /// an immediate (where slice 1's IR had an `Imm32` instruction, so the module's
-    /// expressions keep their order). `index` names the argument in the error for an immediate
+    /// expressions keep their order); a NaN or infinite `f32` is its bits reinterpreted, since
+    /// naga refuses such literals. `index` names the argument in the error for an immediate
     /// the lowering has no literal for.
     fn operand(
         &mut self,
@@ -986,6 +1003,19 @@ impl Lowering {
             Operand::Value(value) => return self.value(value),
             Operand::Imm(Imm::U1(value)) => Literal::Bool(value),
             Operand::Imm(Imm::U32(bits)) => Literal::U32(bits),
+            // naga refuses a NaN or infinite float literal ("Float literal is NaN"), so a
+            // non-finite immediate is its bits, reinterpreted.
+            Operand::Imm(Imm::F32(bits)) if !f32::from_bits(bits).is_finite() => {
+                let bits = self.expr(body, Expression::Literal(Literal::U32(bits)));
+                return Ok(self.expr(
+                    body,
+                    Expression::As {
+                        expr: bits,
+                        kind: naga::ScalarKind::Float,
+                        convert: None,
+                    },
+                ));
+            }
             Operand::Imm(Imm::F32(bits)) => Literal::F32(f32::from_bits(bits)),
             Operand::Imm(Imm::U64(bits)) => Literal::U64(bits),
             Operand::Imm(_) => return Err(LowerError::Operand { at, index }),
@@ -1062,6 +1092,19 @@ impl Lowering {
         });
         push(body, Statement::Return { value });
     }
+}
+
+/// `error` and each of its sources, joined by ": ", so naga's nested validation errors read in
+/// full.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(inner) = source {
+        text.push_str(": ");
+        text.push_str(&inner.to_string());
+        source = inner.source();
+    }
+    text
 }
 
 /// Immediate argument `index` of `op`, if it is one.
