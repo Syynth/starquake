@@ -40,6 +40,7 @@ use starquake_testkit::nro::NroBuilder;
 use super::reads::WithTls;
 use super::*;
 
+mod frames;
 mod vsync;
 
 /// Where in the thread-local page the port's name and the waited handle are.
@@ -76,6 +77,10 @@ struct Vars {
     asked: Option<Instant>,
     /// Each of the page guest's waits for an answer: its result and how long from the signal.
     answers: Vec<(u64, Duration)>,
+    /// The presenting guest (`frames`): its native memory, its image and its vi2 session.
+    native: u32,
+    image: u32,
+    vi2: u32,
 }
 
 /// The scripted guest's view of its thread-local page and its variables.

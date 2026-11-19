@@ -40,7 +40,7 @@
 //! The timer thread asks [`Gpu::is_running`] at every turn: a GPU thread that ended (it failed
 //! or panicked) ends the run as an emulator error with the words [`GPU_STOPPED`] and the
 //! thread's error ([`stopped_message`]), so the run does not wait on a GPU that will never
-//! complete anything (`machine/timer.rs`; `a_dead_gpu_thread_ends_the_run`).
+//! complete anything (`machine/timer.rs`; `a_dead_gpu_thread_ends_the_run`, in `machine/tests/graphics/frames.rs`).
 //!
 //! # At the end
 //!
@@ -52,7 +52,8 @@
 //! flight recorder ([`Gpu::flight_recorder`], `gpu.txt`) and the frame keeper. A GPU thread that
 //! failed makes a run that otherwise reached its stop condition an emulator error
 //! ([`GPU_FAILED`]); a crash, a timeout or an emulator error keeps its own reason, which matters
-//! more, and the failure is logged.
+//! more, and the failure is logged (`after_stop`, tested for every ending with and without a
+//! failure). A GPU whose threads already ended is not waited for: it can never be idle again.
 
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -242,10 +243,22 @@ pub(crate) fn stopped_message(stopped: &Result<(), WiringError>) -> String {
 }
 
 /// Ends the run if its GPU's threads have ended (module docs, "During the run").
-pub(crate) fn check_running(graphics: &Graphics) -> Result<(), Ending> {
+pub(super) fn check_running(graphics: &Graphics) -> Result<(), Ending> {
     match graphics.gpu() {
         Some(gpu) if !gpu.is_running() => Err(Ending::Failed(stopped_message(&gpu.stop()))),
         _ => Ok(()),
+    }
+}
+
+/// How a run that ended as `ending` ends once its GPU was stopped with `stopped` (module docs,
+/// "At the end"): a GPU thread's failure replaces only an ending that reached the stop
+/// condition.
+fn after_stop(ending: Ending, stopped: &Result<(), WiringError>) -> Ending {
+    match (ending, stopped) {
+        (Ending::Exited | Ending::FramesReached, Err(error)) => {
+            Ending::Failed(format!("{GPU_FAILED}: {error}"))
+        }
+        (ending, _) => ending,
     }
 }
 
@@ -266,7 +279,7 @@ fn drain(gpu: &Gpu, wait: Duration) -> bool {
 /// What the run's graphics path leaves for its report, once every core and the timer thread
 /// have stopped (module docs, "At the end"), with `ending` changed when a GPU thread failed in a
 /// run that reached its stop condition.
-pub(crate) fn finish(
+pub(super) fn finish(
     graphics: &Graphics,
     keeper: Option<&FrameKeeper>,
     ending: &mut Ending,
@@ -276,18 +289,19 @@ pub(crate) fn finish(
         ..GraphicsReport::default()
     };
     if let Some(gpu) = graphics.gpu() {
-        if !drain(gpu, GPU_DRAIN_WAIT) {
+        // A GPU whose threads have ended is never idle again: there is nothing to wait for.
+        if gpu.is_running() && !drain(gpu, GPU_DRAIN_WAIT) {
             tracing::warn!(
                 "the GPU was still busy when the run ended; what it had not done is not in the \
                  frame dumps"
             );
         }
-        if let Err(error) = gpu.stop() {
+        let stopped = gpu.stop();
+        if let Err(error) = &stopped {
             tracing::error!(%error, "a GPU thread failed");
-            if matches!(ending, Ending::Exited | Ending::FramesReached) {
-                *ending = Ending::Failed(format!("{GPU_FAILED}: {error}"));
-            }
         }
+        let before = std::mem::replace(ending, Ending::TimedOut);
+        *ending = after_stop(before, &stopped);
         report.gpu = Some(gpu.counters());
         report.gpu_recorder = gpu.flight_recorder();
     }

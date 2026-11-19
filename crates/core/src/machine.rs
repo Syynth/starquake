@@ -236,7 +236,7 @@ use crate::space::{MapSink, Touch};
 mod core_loop;
 mod cores;
 mod environment;
-mod gpu;
+pub(crate) mod gpu;
 mod timer;
 
 use cores::Cores;

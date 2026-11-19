@@ -187,10 +187,13 @@ fn finishing_reads_the_gpu_and_keeps_a_clean_ending() {
         super::graphics(&EnvSource::Live, Some(&memory), None, Arc::new(NoWake))
             .unwrap_or_else(|error| unreachable!("{error}"));
     graphics.front().barrier(starquake_gpu::interface::Ticket(7));
-    for clean in [Ending::Exited, Ending::FramesReached] {
+    for (clean, name) in [
+        (Ending::Exited, "exited"),
+        (Ending::FramesReached, "frames reached"),
+    ] {
         let mut ending = clean;
         let report = finish(&graphics, keeper.as_deref(), &mut ending);
-        assert!(matches!(ending, Ending::Exited | Ending::FramesReached));
+        assert_eq!(said(&ending), name);
         let counters = report.gpu.unwrap();
         assert_eq!(counters.ordered, 1);
         assert_eq!(
@@ -206,4 +209,47 @@ fn finishing_reads_the_gpu_and_keeps_a_clean_ending() {
     let mut ending = Ending::Exited;
     let report = finish(&null, None, &mut ending);
     assert_eq!(report, GraphicsReport::default());
+    assert_eq!(said(&ending), "exited");
+}
+
+/// An ending in words, so that two can be compared.
+fn said(ending: &Ending) -> String {
+    match ending {
+        Ending::Exited => "exited".to_owned(),
+        Ending::FramesReached => "frames reached".to_owned(),
+        Ending::TimedOut => "timed out".to_owned(),
+        Ending::Failed(message) => format!("failed: {message}"),
+        Ending::Crashed(exception, ..) => format!("crashed: {exception:?}"),
+    }
+}
+
+#[test]
+fn a_failed_gpu_thread_replaces_only_an_ending_that_reached_the_stop_condition() {
+    let crashed = || {
+        Ending::Crashed(
+            crate::crash::Exception::UndefinedInstruction,
+            None,
+            Box::default(),
+        )
+    };
+    let endings: [(fn() -> Ending, bool); 5] = [
+        (|| Ending::Exited, true),
+        (|| Ending::FramesReached, true),
+        (|| Ending::TimedOut, false),
+        (|| Ending::Failed("the guest's own".to_owned()), false),
+        (crashed, false),
+    ];
+    let failure = Err(WiringError::Back(BackError::Panicked));
+    let expected_failure = format!("failed: {GPU_FAILED}: {}", BackError::Panicked);
+    for (ending, replaced) in endings {
+        let before = said(&ending());
+        // A clean stop changes no ending.
+        assert_eq!(said(&after_stop(ending(), &Ok(()))), before);
+        let after = said(&after_stop(ending(), &failure));
+        if replaced {
+            assert_eq!(after, expected_failure, "{before}");
+        } else {
+            assert_eq!(after, before);
+        }
+    }
 }

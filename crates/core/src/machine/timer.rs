@@ -76,7 +76,7 @@
 //! A turn that hands the GPU front the last frame the run allows
 //! ([`RunOptions::until_frames`](crate::report::RunOptions), `crate::hle::Graphics::frame_limit_reached`)
 //! ends the run as `Ending::FramesReached`, before the reschedule
-//! (`a_run_stops_at_exactly_its_frame_limit`, in `machine/tests/frames.rs`).
+//! (`a_run_stops_at_exactly_its_frame_limit`, in `machine/tests/graphics/frames.rs`).
 //!
 //! A listener starts the vsync clock with its deadline one interval (16,666,666 ns) out, more
 //! than [`PREEMPTION_INTERVAL_NS`], so a sleep that began before the start ends before the
@@ -89,7 +89,7 @@
 //!
 //! Each turn, after the graphics server's, asks whether the run's GPU threads still run
 //! (`machine/gpu.rs`, "During the run"), and ends the run as an emulator error if one has ended
-//! (`a_dead_gpu_thread_ends_the_run`, in `machine/tests/frames.rs`). A run with the null front
+//! (`a_dead_gpu_thread_ends_the_run`, in `machine/tests/graphics/frames.rs`). A run with the null front
 //! has no GPU threads and asks nothing.
 
 use std::sync::{Condvar, Mutex};
