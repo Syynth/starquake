@@ -1,12 +1,12 @@
 //! Slice 6f's encoders: NAK's `impl SM70Op` for `OpTex`, `OpTld`, `OpTld4`, `OpTmml`, `OpTxd`,
 //! `OpTxq`, `OpSuLd`, `OpSuSt` and `OpSuAtom` below SM 10.0 (`decode::op::texture`), with PR
-//! #4588's `.UR` forms and `.F16` and `.CL` bits. Where NAK writes a constant (`SUATOM`'s `.BA`,
-//! `SURED`'s destination), the encoder writes the op's field instead.
+//! #4588's `.UR` forms and `.F16` and `.CL` bits (both in every `TEX` and `TLD` form:
+//! `decode::op::texture`). Where NAK writes a constant (`SUATOM`'s `.BA`, `SURED`'s
+//! destination), the encoder writes the op's field instead.
 //!
 //! An op the forms cannot hold is refused: a handle kind the instruction has no form for (a
-//! uniform register for `TMML`, `TXD` and `TXQ`), `.F16` with a `.B` handle and `.CL` without a
-//! `.UR` one ([`EncodeError::NoBits`]: the rows leave those bits out), a constant-buffer handle
-//! past its fields ([`EncodeError::TooWide`]) or not word-aligned ([`EncodeError::Misaligned`],
+//! uniform register for `TMML`, `TXD` and `TXQ`), a constant-buffer handle past its fields
+//! ([`EncodeError::TooWide`]) or not word-aligned ([`EncodeError::Misaligned`],
 //! NAK: `assert!(cb.offset % 4 == 0)`), and an atomic operation `SUATOM`'s forms do not encode
 //! (a separate compare source, NAK: `assert!(cmp_src == AtomCmpSrc::Packed)`; a reduction that
 //! three bits cannot hold).
@@ -19,7 +19,7 @@ use crate::decode::texture::{
     TEX_BINDLESS, TEX_CBUF_INDEX, TEX_CBUF_OFFSET, TEX_CBUF_UNIT, TEX_DC, TEX_DIM, TEX_DST2,
     TEX_F16, TEX_LOD, TEX_NDV, TEX_NODEP, TEX_OFFSET, TEX_OPCODES, TEX_SCALAR, TEX_UNIFORM,
     TEX_UNIFORM_HANDLE, TLD_CLAMP, TLD_MS, TLD_OPCODES, TLD4_COMP, TLD4_OFFSET, TLD4_OPCODES,
-    TMML_OPCODES, TXD_OPCODES, TXQ_OPCODES, TXQ_QUERY, TexOpcodes, has_clamp, has_f16,
+    TMML_OPCODES, TXD_OPCODES, TXQ_OPCODES, TXQ_QUERY, TexOpcodes,
 };
 use crate::decode::{
     AtomCmpSrc, AtomOp, ChannelMask, DST, Gpr, ImageAccess, ImageDim, MemEvictionPriority,
@@ -85,27 +85,10 @@ fn fault_and_eviction(writer: &mut Writer, fault: Pred, eviction: MemEvictionPri
     writer.set(EVICT, eviction.bits());
 }
 
-/// `.F16`, which the `.B` forms have no bit for.
-fn f16(
-    writer: &mut Writer,
-    mnemonic: &'static str,
-    tex: TexRef,
-    on: bool,
-) -> Result<(), EncodeError> {
-    if on && !has_f16(tex) {
-        return Err(EncodeError::NoBits {
-            mnemonic,
-            what: ".f16 with a handle in the sources",
-        });
-    }
-    writer.flag(TEX_F16, on);
-    Ok(())
-}
-
 impl Encode for OpTex {
     fn encode(&self, writer: &mut Writer) -> Result<(), EncodeError> {
         tex_ref(writer, Self::MNEMONIC, TEX_OPCODES, self.tex)?;
-        f16(writer, Self::MNEMONIC, self.tex, self.f16)?;
+        writer.flag(TEX_F16, self.f16);
         tex_common(writer, self.dsts, self.srcs, self.dim, self.channel_mask);
         fault_and_eviction(writer, self.fault, self.eviction);
         writer.flag(TEX_SCALAR, self.scalar);
@@ -121,13 +104,7 @@ impl Encode for OpTex {
 impl Encode for OpTld {
     fn encode(&self, writer: &mut Writer) -> Result<(), EncodeError> {
         tex_ref(writer, Self::MNEMONIC, TLD_OPCODES, self.tex)?;
-        f16(writer, Self::MNEMONIC, self.tex, self.f16)?;
-        if self.clamp && !has_clamp(self.tex) {
-            return Err(EncodeError::NoBits {
-                mnemonic: Self::MNEMONIC,
-                what: ".cl without a uniform-register handle",
-            });
-        }
+        writer.flag(TEX_F16, self.f16);
         writer.flag(TLD_CLAMP, self.clamp);
         tex_common(writer, self.dsts, self.srcs, self.dim, self.channel_mask);
         fault_and_eviction(writer, self.fault, self.eviction);
