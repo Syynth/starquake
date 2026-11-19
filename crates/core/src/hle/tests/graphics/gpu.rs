@@ -187,7 +187,8 @@ fn each_front_is_reached_through_its_own_accessor() {
     assert!(null.null_front().is_some());
     // The null front never reports a channel error.
     assert_eq!(
-        null.front().channel_error(starquake_gpu::interface::ChannelId(1)),
+        null.front()
+            .channel_error(starquake_gpu::interface::ChannelId(1)),
         None
     );
 }

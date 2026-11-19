@@ -208,8 +208,7 @@ use starquake_gpu::back::exec::ShaderCache;
 use starquake_gpu::channel::ChannelError;
 use starquake_gpu::front::HostClock;
 use starquake_gpu::interface::{
-    ChannelId, Completions, GpuCompletion, GpuFront, PresentRequest, SyncpointId, Ticket,
-    VmUpdate,
+    ChannelId, Completions, GpuCompletion, GpuFront, PresentRequest, SyncpointId, Ticket, VmUpdate,
 };
 use starquake_gpu::syncpoint::Syncpoints;
 use starquake_gpu::vm::GpuVm;

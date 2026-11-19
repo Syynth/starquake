@@ -310,5 +310,8 @@ fn a_corrupt_ring_ends_the_loop_with_its_error() {
     l.producer.push_raw(&[u64::MAX]);
     l.producer.publish();
     let error = l.back.step(PATIENCE).unwrap_err();
-    assert!(matches!(error, BackError::Ring(PopError::Corrupt(_))), "{error}");
+    assert!(
+        matches!(error, BackError::Ring(PopError::Corrupt(_))),
+        "{error}"
+    );
 }

@@ -30,9 +30,7 @@ use crate::back::exec::PRESENT_FORMAT_RGBA8;
 use crate::back::fence::tests::{Clock, LateBackend};
 use crate::classes::{clc76f, clc797};
 use crate::fifo::{GpEntry, MethodMode, PushBuffer, Sync};
-use crate::interface::{
-    DisplayId, GpfifoEntry, ImageDesc, Kind, LayerId, SyncpointId, Target,
-};
+use crate::interface::{DisplayId, GpfifoEntry, ImageDesc, Kind, LayerId, SyncpointId, Target};
 use crate::ring::RingEntry;
 use crate::sema::{self, AcquireOp, HostSemaphore, PayloadSize, ReleaseForm};
 

@@ -86,7 +86,8 @@ fn ordered_updates_and_barriers_are_done_at_once_in_a_run() {
 
     let replay = graphics(FrontMode::Replay);
     replay
-        .null_front().unwrap()
+        .null_front()
+        .unwrap()
         .update_vm(AsId(1), unmap(), Some(Ticket(0x31)));
     replay.null_front().unwrap().barrier(Ticket(0x32));
     assert_eq!(queued(&replay), []);

@@ -37,8 +37,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use crate::back::fence::ReleaseFailure;
 use crate::channel::ChannelError;
 use crate::interface::{
-    AsId, ChannelId, Fence, GpuCompletion, PresentRequest, Submitted, SyncpointId, Ticket,
-    VmUpdate,
+    AsId, ChannelId, Fence, GpuCompletion, PresentRequest, Submitted, SyncpointId, Ticket, VmUpdate,
 };
 use crate::ring::RingEntry;
 
@@ -217,7 +216,11 @@ impl fmt::Display for GpuEvent {
                 markers,
                 failed,
             } => {
-                let latched = if *latched { "a waiter latched" } else { "no waiter latched" };
+                let latched = if *latched {
+                    "a waiter latched"
+                } else {
+                    "no waiter latched"
+                };
                 write!(
                     f,
                     "performed {released} releases, {incremented} increments, {markers} markers, {latched}"
@@ -228,11 +231,9 @@ impl fmt::Display for GpuEvent {
                 Ok(())
             }
             Self::Completion(completion) => match completion {
-                GpuCompletion::SyncpointChanged { id, value } => write!(
-                    f,
-                    "pushed: syncpoint {} changed to {value}",
-                    id.get()
-                ),
+                GpuCompletion::SyncpointChanged { id, value } => {
+                    write!(f, "pushed: syncpoint {} changed to {value}", id.get())
+                }
                 GpuCompletion::GpuOrdered { ticket } => {
                     write!(f, "pushed: ticket {} done", ticket.0)
                 }

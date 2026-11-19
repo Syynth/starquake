@@ -298,10 +298,9 @@ impl FrontShared {
 
     /// The front ended a turn idle ([`super::Turn::Idle`]): what it took has been acted on.
     pub(crate) fn mark_idle(&self) {
-        let mut inbox = self.lock();
-        if inbox.requests.is_empty() && inbox.reports == BackReports::default() {
-            inbox.busy = false;
-        }
+        // A request or report that came since the turn's look keeps [`FrontShared::is_quiet`]
+        // false on its own, so the flag can be cleared whatever arrived.
+        self.lock().busy = false;
     }
 
     /// Destroys `channel`: later submissions to it are dropped, and the front drops what it

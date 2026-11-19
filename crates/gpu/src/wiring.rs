@@ -110,11 +110,11 @@ use thiserror::Error;
 use crate::back::exec::{ExecConfig, Executor, ShaderCache};
 use crate::back::fence::{FenceClock, FenceEnv, Fences, FrontWake, Mode, Report};
 use crate::channel::ChannelError;
+use crate::front::Front;
 use crate::front::{
     FrontClock, FrontCounters, FrontDeps, FrontError, FrontShared, FrontThread, HostClock,
     OrderedTable, spawn_observed,
 };
-use crate::front::Front;
 use crate::interface::{
     AsId, ChannelConfig, ChannelFront, ChannelId, Completions, GpuCompletion, GpuError, GpuFront,
     GpuVmFront, PresentFront, PresentRequest, Submission, Submitted, Ticket, VmUpdate,
@@ -376,7 +376,7 @@ impl Status {
 
 /// The back's report to the front, recorded, and counted for idleness (module docs).
 struct ReportToFront {
-    front: Arc<FrontShared>,
+    front: Arc<dyn FrontWake>,
     status: Arc<Status>,
     recorder: Arc<FlightRecorder>,
 }
@@ -473,7 +473,10 @@ impl Gpu {
         .with_retired(Arc::<BackInbox>::clone(&inbox));
         let observed = Arc::clone(&status);
         let front = spawn_observed(front, move |front| {
-            *observed.front.lock().unwrap_or_else(PoisonError::into_inner) = front.counters();
+            *observed
+                .front
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = front.counters();
             observed.sent.store(front.sent(), Ordering::SeqCst);
         })?;
 
@@ -483,7 +486,7 @@ impl Gpu {
             completions,
             clock: fence_clock,
             front: Arc::new(ReportToFront {
-                front: Arc::clone(&shared),
+                front: Arc::<FrontShared>::clone(&shared),
                 status: Arc::clone(&status),
                 recorder: Arc::clone(&recorder),
             }),
@@ -598,8 +601,42 @@ impl Gpu {
         let taken = self.back.taken.load(Ordering::SeqCst);
         let in_flight = self.back.in_flight.load(Ordering::SeqCst);
         let after = self.status.activity.load(Ordering::SeqCst);
-        quiet && sent == taken && in_flight == 0 && before == after
+        idle(Looked {
+            quiet,
+            sent,
+            taken,
+            in_flight,
+            before,
+            after,
+        })
     }
+}
+
+/// What [`Gpu::is_idle`] read, in the order it read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Looked {
+    /// [`FrontShared::is_quiet`].
+    quiet: bool,
+    /// Entries the front had pushed at its last turn.
+    sent: u64,
+    /// Entries the back has taken.
+    taken: u64,
+    /// Lists in flight or open on the back.
+    in_flight: u64,
+    /// The activity counter, read first.
+    before: u64,
+    /// The activity counter, read last.
+    after: u64,
+}
+
+/// Whether what [`Gpu::is_idle`] read says the GPU is idle (module docs, "Idleness"): the front
+/// quiet, every entry it pushed taken, no list in flight or open, and no back report reaching the
+/// front while it looked.
+fn idle(looked: Looked) -> bool {
+    looked.quiet
+        && looked.sent == looked.taken
+        && looked.in_flight == 0
+        && looked.before == looked.after
 }
 
 impl Drop for Gpu {
@@ -670,8 +707,9 @@ impl ChannelFront for Gpu {
             }
             Err(error) => {
                 tracing::warn!(%error, "the GPU front refused a channel");
-                self.recorder
-                    .record(GpuEvent::ChannelRefused { space: config.space });
+                self.recorder.record(GpuEvent::ChannelRefused {
+                    space: config.space,
+                });
                 Err(GpuError)
             }
         }
@@ -713,8 +751,7 @@ impl ChannelFront for Gpu {
     }
 
     fn destroy_channel(&self, channel: ChannelId) {
-        self.recorder
-            .record(GpuEvent::ChannelDestroyed { channel });
+        self.recorder.record(GpuEvent::ChannelDestroyed { channel });
         self.shared.destroy_channel(channel);
     }
 }

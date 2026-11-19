@@ -18,7 +18,10 @@ fn it_keeps_the_last_events_up_to_its_capacity() {
     recorder.record(barrier(1));
     recorder.record(barrier(2));
     assert_eq!(recorder.events(), [barrier(1), barrier(2)]);
-    assert_eq!(recorder.text(&[]), "0 barrier, ticket 1\n1 barrier, ticket 2\n");
+    assert_eq!(
+        recorder.text(&[]),
+        "0 barrier, ticket 1\n1 barrier, ticket 2\n"
+    );
     recorder.record(barrier(3));
     assert_eq!(recorder.events(), [barrier(2), barrier(3)]);
     assert_eq!(recorder.recorded(), 3);

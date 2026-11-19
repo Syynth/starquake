@@ -109,7 +109,9 @@ fn full_and_queue_room_end_to_end() {
     acquire(&mut parked, SEM, 1);
     r.gpu
         .submit(channel, plain(vec![r.entry(CMD, &parked.into_words())]));
-    wait_until("the channel parks", || r.gpu.counters().acquires_parked == 1);
+    wait_until("the channel parks", || {
+        r.gpu.counters().acquires_parked == 1
+    });
     // The parked submission's one entry has started, so the queue is empty: a submission of
     // exactly the bound fits, and one entry more does not.
     let mut bind = PushBuffer::new();
@@ -138,7 +140,9 @@ fn an_ordered_unmap_is_reported_after_the_work_queued_before_it() {
     release(&mut stream, SEM2, 5);
     r.gpu
         .submit(channel, plain(vec![r.entry(CMD, &stream.into_words())]));
-    wait_until("the channel parks", || r.gpu.counters().acquires_parked == 1);
+    wait_until("the channel parks", || {
+        r.gpu.counters().acquires_parked == 1
+    });
     let all = PageRange::new(GPU_BASE, PAGES * PAGE_SIZE).unwrap();
     r.gpu
         .update_vm(SPACE, VmUpdate::Unmap { range: all }, Some(Ticket(0x31)));
@@ -341,9 +345,10 @@ fn a_stopped_channels_error_reaches_gsv_and_gpu_txt() {
     let channel = r.channel();
     // An entry past the mapped pages: its first word cannot be read.
     let unmapped = GPU_BASE + PAGES * PAGE_SIZE;
-    r.gpu
-        .submit(channel, plain(vec![raw_entry(unmapped, 4)]));
-    wait_until("the channel stops", || r.gpu.channel_error(channel).is_some());
+    r.gpu.submit(channel, plain(vec![raw_entry(unmapped, 4)]));
+    wait_until("the channel stops", || {
+        r.gpu.channel_error(channel).is_some()
+    });
     let error = ChannelError::ReadFault {
         va: unmapped,
         fault: GpuFault::Unmapped { va: unmapped },

@@ -144,8 +144,8 @@ use crate::syncpoint::Syncpoints;
 use crate::vm::GpuVm;
 
 pub use lane::MAX_OTHER_FILES;
-pub use ordered::OrderedTable;
 use ordered::Emit;
+pub use ordered::OrderedTable;
 pub use poll::{
     Backoff, FrontClock, HostClock, IDLE_PARK, POLL_FIRST_SLEEP, POLL_LONGEST_SLEEP, POLL_SPINS,
 };

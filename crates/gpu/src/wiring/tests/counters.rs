@@ -1,10 +1,92 @@
-//! The counters: where each comes from. Their JSON, as `summary.json` writes it, is pinned in
-//! `core` (`starquake_core::hle::graphics`'s tests), which writes it.
+//! The counters and idleness: where each counter comes from, the idleness decision for each of
+//! its inputs, and the back's report bumping the activity counter around the front's wake. The
+//! counters' JSON, as `summary.json` writes it, is pinned in `core`
+//! (`hle/tests/graphics/gpu.rs`), which has the JSON writer.
 
 use crate::back::exec::ExecCounters;
 use crate::back::fence::{ClosedCounts, FenceCounters};
 
 use super::*;
+
+/// An idle look: every input at its idle value, the counts and the activity not zero.
+const IDLE: Looked = Looked {
+    quiet: true,
+    sent: 7,
+    taken: 7,
+    in_flight: 0,
+    before: 3,
+    after: 3,
+};
+
+#[test]
+fn idleness_needs_every_input_idle() {
+    assert!(idle(IDLE));
+    // Each input made busy alone.
+    let busy = [
+        Looked {
+            quiet: false,
+            ..IDLE
+        },
+        Looked { taken: 6, ..IDLE },
+        Looked { sent: 8, ..IDLE },
+        Looked {
+            in_flight: 1,
+            ..IDLE
+        },
+        Looked { after: 4, ..IDLE },
+        Looked { before: 2, ..IDLE },
+    ];
+    for looked in busy {
+        assert!(!idle(looked), "{looked:?}");
+    }
+}
+
+/// A front double that reads the activity counter when it is woken.
+struct SeesActivity {
+    status: Arc<Status>,
+    seen: Mutex<Vec<u64>>,
+}
+
+impl FrontWake for SeesActivity {
+    fn wake(&self, _report: &Report) {
+        let now = self
+            .status
+            .activity
+            .load(std::sync::atomic::Ordering::SeqCst);
+        self.seen.lock().unwrap().push(now);
+    }
+}
+
+#[test]
+fn a_back_report_bumps_the_activity_before_and_after_it_reaches_the_front() {
+    let status = Arc::new(Status::default());
+    let front = Arc::new(SeesActivity {
+        status: Arc::clone(&status),
+        seen: Mutex::new(Vec::new()),
+    });
+    let recorder = Arc::new(FlightRecorder::new(RECORDER_EVENTS));
+    let report = ReportToFront {
+        front: Arc::<SeesActivity>::clone(&front),
+        status: Arc::clone(&status),
+        recorder: Arc::clone(&recorder),
+    };
+    report.wake(&Report {
+        incremented: 1,
+        ..Report::default()
+    });
+    assert_eq!(*front.seen.lock().unwrap(), [1]);
+    assert_eq!(status.activity.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(
+        recorder.events(),
+        [GpuEvent::Performed {
+            released: 0,
+            incremented: 1,
+            latched: false,
+            markers: 0,
+            failed: Vec::new(),
+        }]
+    );
+}
 
 #[test]
 fn each_counter_comes_from_its_source() {
