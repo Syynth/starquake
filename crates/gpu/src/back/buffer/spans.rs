@@ -89,11 +89,6 @@ impl Spans {
         self.ranges.clear();
     }
 
-    /// Whether the set holds no address.
-    pub(super) fn is_empty(&self) -> bool {
-        self.ranges.is_empty()
-    }
-
     /// The ranges, in increasing address order.
     pub(super) fn iter(&self) -> impl Iterator<Item = Range<u64>> + '_ {
         self.ranges.iter().map(|(&s, &e)| s..e)
@@ -117,11 +112,20 @@ mod tests {
     /// The universe the model tests work in: addresses `0..UNIVERSE`.
     const UNIVERSE: u64 = 64;
 
+    fn idx(a: u64) -> usize {
+        usize::try_from(a).unwrap()
+    }
+
+    /// The ranges as pairs, for comparing.
+    fn pairs(s: &Spans) -> Vec<(u64, u64)> {
+        s.iter().map(|r| (r.start, r.end)).collect()
+    }
+
     fn model_of(spans: &Spans) -> Vec<bool> {
-        let mut bits = vec![false; UNIVERSE as usize];
+        let mut bits = vec![false; idx(UNIVERSE)];
         for r in spans.iter() {
             for a in r {
-                bits[a as usize] = true;
+                bits[idx(a)] = true;
             }
         }
         bits
@@ -139,11 +143,11 @@ mod tests {
         s.insert(10..20);
         s.insert(30..40);
         s.insert(20..25); // touches the first
-        assert_eq!(s.iter().collect::<Vec<_>>(), [10..25, 30..40]);
+        assert_eq!(pairs(&s), [(10, 25), (30, 40)]);
         s.insert(24..31); // overlaps both
-        assert_eq!(s.iter().collect::<Vec<_>>(), [10..40]);
+        assert_eq!(pairs(&s), [(10, 40)]);
         s.insert(5..5);
-        assert_eq!(s.iter().collect::<Vec<_>>(), [10..40]);
+        assert_eq!(pairs(&s), [(10, 40)]);
         assert_eq!(s.len(), 30);
     }
 
@@ -153,16 +157,16 @@ mod tests {
         s.insert(0..10);
         s.insert(20..30);
         s.remove(5..25);
-        assert_eq!(s.iter().collect::<Vec<_>>(), [0..5, 25..30]);
+        assert_eq!(pairs(&s), [(0, 5), (25, 30)]);
         s.remove(1..2);
-        assert_eq!(s.iter().collect::<Vec<_>>(), [0..1, 2..5, 25..30]);
+        assert_eq!(pairs(&s), [(0, 1), (2, 5), (25, 30)]);
         // A removal ending exactly where a range starts leaves it whole.
         s.remove(20..25);
-        assert_eq!(s.iter().collect::<Vec<_>>(), [0..1, 2..5, 25..30]);
+        assert_eq!(pairs(&s), [(0, 1), (2, 5), (25, 30)]);
         s.remove(0..0);
         assert_eq!(s.len(), 9);
         s.clear();
-        assert!(s.is_empty());
+        assert_eq!(s.iter().count(), 0);
     }
 
     proptest! {
@@ -179,11 +183,11 @@ mod tests {
             (any::<bool>(), 0..UNIVERSE, 0..UNIVERSE), 0..24)
         ) {
             let mut spans = Spans::default();
-            let mut model = vec![false; UNIVERSE as usize];
+            let mut model = vec![false; idx(UNIVERSE)];
             for (add, a, b) in ops {
                 let r = a.min(b)..a.max(b);
                 for x in r.clone() {
-                    model[x as usize] = add;
+                    model[idx(x)] = add;
                 }
                 if add { spans.insert(r) } else { spans.remove(r) }
                 prop_assert!(canonical(&spans));
@@ -192,7 +196,8 @@ mod tests {
             let mut copy = Spans::default();
             copy.insert_all(&spans);
             prop_assert_eq!(copy, spans.clone());
-            prop_assert_eq!(spans.len(), model.iter().filter(|&&b| b).count() as u64);
+            let set = model.iter().filter(|&&b| b).count();
+            prop_assert_eq!(spans.len(), u64::try_from(set).unwrap());
         }
     }
 }

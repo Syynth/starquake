@@ -412,6 +412,30 @@ struct Staged {
     commands: Vec<Command>,
 }
 
+/// A checked join, before anything changes ([`BufferCache::plan_join`]).
+struct JoinPlan {
+    /// Starts of the entries joined, in address order.
+    olds: Vec<u64>,
+    /// The joined entry's range.
+    range: PageRange,
+    /// The cache's bytes once the join is done.
+    bytes: u64,
+    /// The old entries' stale pages and the pages none held.
+    stale: Spans,
+    /// The old entries' unarmed pages.
+    unarmed: Spans,
+    /// The pages no old entry held.
+    uncovered: Spans,
+    /// The newest of the old entries' pending tickets.
+    pending: Option<WatchTicket>,
+    /// Whether any old entry was streamed.
+    streamed: bool,
+    /// The most faults of any old entry.
+    faults: u32,
+    /// Whether any old entry was written since its last use.
+    written_since_use: bool,
+}
+
 impl BufferCache {
     /// An empty cache making buffers through `backend` and watching through `watch`.
     pub fn new(backend: Arc<dyn Backend>, watch: Arc<WriteWatch>) -> Self {
@@ -539,18 +563,94 @@ impl BufferCache {
         cover: PageRange,
         list: &mut CommandList,
     ) -> Result<(u64, BufferId), BufferError> {
-        // Every entry overlapping `cover`, in address order. Entries never overlap, so those
-        // between the first and last lie inside `cover`.
-        let olds: Vec<u64> = self
-            .entries
-            .range(..cover.end())
-            .rev()
-            .take_while(|(_, e)| e.range.end() > cover.start())
-            .map(|(&s, _)| s)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
+        let plan = self.plan_join(cover)?;
+        let start = plan.range.start();
+        let armed_now = plan.pending.is_some_and(|t| self.watch.armed(t));
+        let buffer = self
+            .backend
+            .create_buffer(&BufferDesc {
+                size: plan.range.size(),
+                usage: BUFFER_USAGE,
+            })
+            .map_err(BufferError::Render)?;
+        let mut staged = Staged {
+            commands: self.join_copies(&plan.olds, buffer, start),
+        };
+        let mut uploads = Spans::default();
+        if plan.streamed {
+            uploads.insert(start..plan.range.end());
+        } else {
+            uploads.insert_all(&plan.stale);
+            uploads.insert_all(&plan.unarmed);
+        }
+        if let Err(error) = self.stage(mem, buffer, start, &uploads, &mut staged) {
+            // The buffer is in no list: it can go at once.
+            self.backend
+                .destroy(ResourceId::Buffer(buffer), FenceValue::ZERO);
+            return Err(error);
+        }
+
+        // Nothing below can fail.
+        let JoinPlan {
+            olds,
+            range,
+            bytes,
+            mut unarmed,
+            uncovered,
+            mut pending,
+            streamed,
+            faults,
+            written_since_use,
+            ..
+        } = plan;
+        if armed_now || streamed {
+            unarmed.clear();
+            pending = None;
+        }
+        if !streamed {
+            for gap in uncovered.iter() {
+                if let Ok(pages) = PageRange::new(gap.start, gap.end - gap.start) {
+                    pending = Some(self.watch.request(pages));
+                    unarmed.insert(gap);
+                }
+            }
+        }
+        // The open list now reads the old buffers (the copies above), so each is destroyed
+        // after that list, whether or not it used them before.
+        for s in &olds {
+            if let Some(e) = self.entries.get_mut(s) {
+                e.in_open = true;
+            }
+            self.retire(*s);
+        }
+        let stamp = self.next_stamp();
+        let mut entry = Entry {
+            range,
+            buffer,
+            streamed,
+            unarmed,
+            pending,
+            stale: Spans::default(),
+            faults,
+            written_since_use,
+            last_fence: self.last_fence,
+            in_open: false,
+            stamp,
+            frame: self.frame,
+        };
+        Self::record_use(&mut entry, stamp, self.frame, &mut self.open);
+        self.entries.insert(start, entry);
+        self.bytes = bytes;
+        list.commands.append(&mut staged.commands);
+        Ok((start, buffer))
+    }
+
+    /// Checks a join of `cover` with the entries it overlaps and works out the joined entry's
+    /// page state: the old entries' carried over, and the pages none held stale (never read)
+    /// and waiting for a new watch. Changes nothing.
+    fn plan_join(&self, cover: PageRange) -> Result<JoinPlan, BufferError> {
+        // Entries never overlap, so those between the first and last lie inside `cover`.
+        let olds = self.overlapping(cover.start()..cover.end());
         let old = |s: &u64| self.entries.get(s);
         let start = olds
             .first()
@@ -579,109 +679,52 @@ impl BufferCache {
             va: cover.start(),
             len: cover.size(),
         })?;
-
-        // The joined entry's page state: the old entries' carried over, and the pages none held
-        // stale (never read) and waiting for a new watch.
-        let mut stale = Spans::default();
-        let mut unarmed = Spans::default();
-        let mut uncovered = Spans::default();
-        uncovered.insert(start..end);
-        let mut pending = None;
-        let mut streamed = false;
-        let mut faults = 0;
-        for e in olds.iter().filter_map(old) {
-            stale.insert_all(&e.stale);
-            unarmed.insert_all(&e.unarmed);
-            uncovered.remove(e.range.start()..e.range.end());
-            pending = pending.max(e.pending);
-            streamed |= e.streamed;
-            faults = faults.max(e.faults);
-        }
-        stale.insert_all(&uncovered);
-        let armed_now = pending.is_some_and(|t| self.watch.armed(t));
-
-        let buffer = self
-            .backend
-            .create_buffer(&BufferDesc {
-                size,
-                usage: BUFFER_USAGE,
-            })
-            .map_err(BufferError::Render)?;
-        let mut staged = Staged {
-            commands: Vec::new(),
-        };
-        for e in olds.iter().filter_map(old) {
-            staged.commands.push(Command::Copy(CopyDesc {
-                src: CopyRegion::Buffer(BufferSlice {
-                    buffer: e.buffer,
-                    offset: 0,
-                    size: e.range.size(),
-                }),
-                dst: CopyRegion::Buffer(BufferSlice {
-                    buffer,
-                    offset: e.range.start() - start,
-                    size: e.range.size(),
-                }),
-            }));
-        }
-        let mut uploads = Spans::default();
-        if streamed {
-            uploads.insert(start..end);
-        } else {
-            uploads.insert_all(&stale);
-            uploads.insert_all(&unarmed);
-        }
-        if let Err(error) = self.stage(mem, buffer, start, &uploads, &mut staged) {
-            // The buffer is in no list: it can go at once.
-            self.backend
-                .destroy(ResourceId::Buffer(buffer), FenceValue::ZERO);
-            return Err(error);
-        }
-
-        // Nothing below can fail.
-        if armed_now {
-            unarmed.clear();
-            pending = None;
-        }
-        if !streamed {
-            for gap in uncovered.iter() {
-                if let Ok(gap_range) = PageRange::new(gap.start, gap.end - gap.start) {
-                    pending = Some(self.watch.request(gap_range));
-                    unarmed.insert(gap);
-                }
-            }
-        } else {
-            unarmed.clear();
-            pending = None;
-        }
-        // The open list now reads the old buffers (the copies above), so each is destroyed
-        // after that list, whether or not it used them before.
-        for s in &olds {
-            if let Some(e) = self.entries.get_mut(s) {
-                e.in_open = true;
-            }
-            self.retire(*s);
-        }
-        let stamp = self.next_stamp();
-        let mut entry = Entry {
+        let mut plan = JoinPlan {
+            olds: Vec::new(),
             range,
-            buffer,
-            streamed,
-            unarmed,
-            pending,
+            bytes,
             stale: Spans::default(),
-            faults,
+            unarmed: Spans::default(),
+            uncovered: Spans::default(),
+            pending: None,
+            streamed: false,
+            faults: 0,
             written_since_use: false,
-            last_fence: self.last_fence,
-            in_open: false,
-            stamp,
-            frame: self.frame,
         };
-        Self::record_use(&mut entry, stamp, self.frame, &mut self.open);
-        self.entries.insert(start, entry);
-        self.bytes = bytes;
-        list.commands.append(&mut staged.commands);
-        Ok((start, buffer))
+        plan.uncovered.insert(start..end);
+        for e in olds.iter().filter_map(old) {
+            plan.stale.insert_all(&e.stale);
+            plan.unarmed.insert_all(&e.unarmed);
+            plan.uncovered.remove(e.range.start()..e.range.end());
+            plan.pending = plan.pending.max(e.pending);
+            plan.streamed |= e.streamed;
+            plan.faults = plan.faults.max(e.faults);
+            plan.written_since_use |= e.written_since_use;
+        }
+        plan.stale.insert_all(&plan.uncovered);
+        plan.olds = olds;
+        Ok(plan)
+    }
+
+    /// A copy of each old entry's buffer into its place in the joined `buffer` at `start`.
+    fn join_copies(&self, olds: &[u64], buffer: BufferId, start: u64) -> Vec<Command> {
+        olds.iter()
+            .filter_map(|s| self.entries.get(s))
+            .map(|e| {
+                Command::Copy(CopyDesc {
+                    src: CopyRegion::Buffer(BufferSlice {
+                        buffer: e.buffer,
+                        offset: 0,
+                        size: e.range.size(),
+                    }),
+                    dst: CopyRegion::Buffer(BufferSlice {
+                        buffer,
+                        offset: e.range.start() - start,
+                        size: e.range.size(),
+                    }),
+                })
+            })
+            .collect()
     }
 
     /// Reads the pages of `spans` (absolute GPU addresses inside the entry at `entry_start`)
@@ -768,7 +811,8 @@ impl BufferCache {
                 let Some(entry) = self.entries.get_mut(&start) else {
                     continue;
                 };
-                let part = range.start().max(entry.range.start())..range.end().min(entry.range.end());
+                let part =
+                    range.start().max(entry.range.start())..range.end().min(entry.range.end());
                 entry.stale.insert(part.clone());
                 if entry.streamed {
                     continue;
@@ -807,7 +851,10 @@ impl BufferCache {
             // end, so rounding `hi` up stays at or below it.
             let page = starquake_memory::PAGE_SIZE;
             let lo = lo - lo % page;
-            let hi = hi.div_ceil(page).saturating_mul(page).min(entry.range.end());
+            let hi = hi
+                .div_ceil(page)
+                .saturating_mul(page)
+                .min(entry.range.end());
             entry.stale.insert(lo..hi);
         }
     }
@@ -887,7 +934,8 @@ impl Drop for BufferCache {
         // `last_fence` is at least every entry's own last fence.
         let after = self.last_fence;
         for entry in core::mem::take(&mut self.entries).into_values() {
-            self.backend.destroy(ResourceId::Buffer(entry.buffer), after);
+            self.backend
+                .destroy(ResourceId::Buffer(entry.buffer), after);
         }
         for buffer in core::mem::take(&mut self.doomed) {
             self.backend.destroy(ResourceId::Buffer(buffer), after);

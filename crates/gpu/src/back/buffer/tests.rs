@@ -3,7 +3,9 @@
 
 use std::sync::Arc;
 
-use starquake_memory::{FakeWatchKernel, FlatMemory, GuestMemory, PAGE_SIZE, PageRange, WriteWatch};
+use starquake_memory::{
+    FakeWatchKernel, FlatMemory, GuestMemory, PAGE_SIZE, PageRange, WriteWatch,
+};
 use starquake_render::caps::{DynamicState, StageSupport};
 use starquake_render::command::{BufferSlice, CopyDesc, CopyRegion};
 use starquake_render::error::RenderError;
@@ -116,9 +118,9 @@ impl Rig {
     fn with(allowed: u64, max_staging: u64) -> Self {
         let backend = Arc::new(RecordingBackend::new(caps(max_staging), allowed));
         let watch = Arc::new(WriteWatch::new());
-        let cache = BufferCache::new(backend.clone(), watch.clone());
+        let cache = BufferCache::new(Arc::<RecordingBackend>::clone(&backend), Arc::clone(&watch));
         Self {
-            kernel: FakeWatchKernel::new(watch.clone()),
+            kernel: FakeWatchKernel::new(Arc::clone(&watch)),
             backend,
             watch,
             mem: memory(),
@@ -166,7 +168,7 @@ impl Rig {
         self.backend.submit(list).unwrap();
         match self.backend.take_readback(id) {
             Some(Readback::Bytes(bytes)) => bytes,
-            other => panic!("readback {other:?}"),
+            other => unreachable!("readback {other:?}"),
         }
     }
 
@@ -179,7 +181,9 @@ impl Rig {
     /// A guest CPU store: the bytes change, and each watched page it touches faults once.
     fn cpu_write(&self, va: u64, data: &[u8]) -> u64 {
         self.mem.guest().write(va, data).unwrap();
-        self.kernel.cpu_write(va, data.len() as u64).unwrap()
+        self.kernel
+            .cpu_write(va, u64::try_from(data.len()).unwrap())
+            .unwrap()
     }
 
     fn sync(&mut self) -> Vec<PageRange> {
@@ -199,11 +203,7 @@ impl Rig {
 
     /// The recording backend's log lines.
     fn log(&self) -> Vec<String> {
-        self.backend
-            .snapshot()
-            .lines()
-            .map(str::to_owned)
-            .collect()
+        self.backend.snapshot().lines().map(str::to_owned).collect()
     }
 }
 
@@ -215,7 +215,7 @@ fn uploads(commands: &[Command]) -> Vec<(BufferId, u64, u64)> {
                 from,
                 to: CopyRegion::Buffer(s),
             } => {
-                assert_eq!(from.len() as u64, s.size);
+                assert_eq!(u64::try_from(from.len()).unwrap(), s.size);
                 Some((s.buffer, s.offset, s.size))
             }
             _ => None,
@@ -240,7 +240,7 @@ fn chunked(buffer: BufferId, offset: u64, count: u64) -> Vec<(BufferId, u64, u64
 fn line_index(log: &[String], line: &str) -> usize {
     log.iter()
         .position(|l| l == line)
-        .unwrap_or_else(|| panic!("no line {line:?} in\n{}", log.join("\n")))
+        .unwrap_or_else(|| unreachable!("no line {line:?} in\n{}", log.join("\n")))
 }
 
 fn destroy_line(buffer: BufferId, after: u64) -> String {
@@ -272,7 +272,10 @@ fn a_first_bind_makes_one_buffer_and_uploads_every_page_it_touches() {
         "buffer {} bytes, usage VERTEX|INDEX|UNIFORM|STORAGE|INDIRECT|COPY_SRC|COPY_DST",
         4 * PAGE_SIZE
     ))));
-    assert_eq!(rig.host_bytes(slice), rig.guest_bytes(page(1) + 16, 3 * PAGE_SIZE));
+    assert_eq!(
+        rig.host_bytes(slice),
+        rig.guest_bytes(page(1) + 16, 3 * PAGE_SIZE)
+    );
 }
 
 #[test]
@@ -280,7 +283,10 @@ fn a_bind_inside_an_entry_reuses_it_and_a_touching_bind_does_not() {
     let mut rig = Rig::new();
     let a = rig.bind(page(2), 2 * PAGE_SIZE);
     let inner = rig.bind(page(3) + 8, 4);
-    assert_eq!((inner.buffer, inner.offset, inner.size), (a.buffer, PAGE_SIZE + 8, 4));
+    assert_eq!(
+        (inner.buffer, inner.offset, inner.size),
+        (a.buffer, PAGE_SIZE + 8, 4)
+    );
     // Starts exactly at the entry's end: a separate entry.
     let next = rig.bind(page(4), PAGE_SIZE);
     assert_ne!(next.buffer, a.buffer);
@@ -297,7 +303,10 @@ fn every_new_entry_asks_for_a_watch_over_its_pages() {
     rig.bind(page(5), 3 * PAGE_SIZE);
     let mut requests = Vec::new();
     rig.watch.take_requests(&mut requests);
-    assert_eq!(requests.iter().map(|r| r.range()).collect::<Vec<_>>(), [pages(5, 3)]);
+    assert_eq!(
+        requests.iter().map(|r| r.range()).collect::<Vec<_>>(),
+        [pages(5, 3)]
+    );
     rig.watch.arm(&requests).unwrap();
 }
 
@@ -349,7 +358,10 @@ fn a_bind_overlapping_entries_joins_them_by_copy_and_uploads_only_the_gap() {
     assert_eq!(entry.stale_bytes, 0);
     let mut requests = Vec::new();
     rig.watch.take_requests(&mut requests);
-    assert_eq!(requests.iter().map(|r| r.range()).collect::<Vec<_>>(), [pages(2, 1)]);
+    assert_eq!(
+        requests.iter().map(|r| r.range()).collect::<Vec<_>>(),
+        [pages(2, 1)]
+    );
     rig.watch.arm(&requests).unwrap();
     // The open list copies from the old buffers, so they last until it is submitted.
     assert!(!rig.log().iter().any(|l| l.starts_with("destroy")));
@@ -363,7 +375,10 @@ fn a_bind_overlapping_entries_joins_them_by_copy_and_uploads_only_the_gap() {
         offset: 0,
         size: 5 * PAGE_SIZE,
     };
-    assert_eq!(rig.host_bytes(whole), rig.guest_bytes(page(0), 5 * PAGE_SIZE));
+    assert_eq!(
+        rig.host_bytes(whole),
+        rig.guest_bytes(page(0), 5 * PAGE_SIZE)
+    );
 }
 
 #[test]
@@ -392,10 +407,16 @@ fn an_unarmed_range_is_re_read_at_each_use() {
     assert_eq!(first, chunked(slice.buffer, 0, 2));
     for round in 0..3u8 {
         // Not protected yet, so the store faults nothing; only re-reading sees it.
-        assert_eq!(rig.cpu_write(page(2) + u64::from(round), &[round + 1; 2]), 0);
+        assert_eq!(
+            rig.cpu_write(page(2) + u64::from(round), &[round + 1; 2]),
+            0
+        );
         let (_, ups) = rig.bind_uploads(page(1), 2 * PAGE_SIZE);
         assert_eq!(ups, chunked(slice.buffer, 0, 2));
-        assert_eq!(rig.host_bytes(slice), rig.guest_bytes(page(1), 2 * PAGE_SIZE));
+        assert_eq!(
+            rig.host_bytes(slice),
+            rig.guest_bytes(page(1), 2 * PAGE_SIZE)
+        );
     }
     assert_eq!(rig.entry(page(1)).unarmed_bytes, 2 * PAGE_SIZE);
 }
@@ -427,7 +448,10 @@ fn a_cpu_write_re_uploads_once() {
     assert_eq!(rig.cpu_write(page(2) + 5, &[0x11, 0x22, 0x33, 0x44]), 1);
     assert_eq!(rig.sync(), [pages(2, 1)]);
     let entry = rig.entry(page(0));
-    assert_eq!((entry.stale_bytes, entry.unarmed_bytes, entry.faults), (PAGE_SIZE, PAGE_SIZE, 1));
+    assert_eq!(
+        (entry.stale_bytes, entry.unarmed_bytes, entry.faults),
+        (PAGE_SIZE, PAGE_SIZE, 1)
+    );
     assert_eq!(rig.enter(), 1);
     let (_, ups) = rig.bind_uploads(page(0), 1);
     assert_eq!(ups, [(slice.buffer, 2 * PAGE_SIZE, PAGE_SIZE)]);
@@ -436,7 +460,10 @@ fn a_cpu_write_re_uploads_once() {
         size: 4 * PAGE_SIZE,
         ..slice
     };
-    assert_eq!(rig.host_bytes(whole), rig.guest_bytes(page(0), 4 * PAGE_SIZE));
+    assert_eq!(
+        rig.host_bytes(whole),
+        rig.guest_bytes(page(0), 4 * PAGE_SIZE)
+    );
 }
 
 #[test]
@@ -518,7 +545,10 @@ fn a_range_turns_streamed_at_the_fault_threshold_not_before() {
     assert_eq!(rig.cpu_write(page(1), &[0xA5]), 1);
     rig.sync();
     let entry = rig.entry(page(0));
-    assert_eq!((entry.faults, entry.streamed, entry.unarmed_bytes), (STREAMED_AFTER_FAULTS, true, 0));
+    assert_eq!(
+        (entry.faults, entry.streamed, entry.unarmed_bytes),
+        (STREAMED_AFTER_FAULTS, true, 0)
+    );
     assert!(!rig.watch.has_requests());
     // Re-read whole at every use, written or not.
     for _ in 0..2 {
@@ -528,7 +558,10 @@ fn a_range_turns_streamed_at_the_fault_threshold_not_before() {
         size: 4 * PAGE_SIZE,
         ..slice
     };
-    assert_eq!(rig.host_bytes(whole), rig.guest_bytes(page(0), 4 * PAGE_SIZE));
+    assert_eq!(
+        rig.host_bytes(whole),
+        rig.guest_bytes(page(0), 4 * PAGE_SIZE)
+    );
 }
 
 #[test]
@@ -571,14 +604,20 @@ fn a_gpu_thread_write_turns_its_pages_stale_without_a_fault_or_a_watch() {
     rig.cache.invalidate(page(3) + 10..page(4) + 1);
     let entry = rig.entry(page(2));
     assert_eq!((entry.stale_bytes, entry.faults), (2 * PAGE_SIZE, 0));
-    assert_eq!(rig.bind_uploads(page(2), 1).1, chunked(slice.buffer, PAGE_SIZE, 2));
+    assert_eq!(
+        rig.bind_uploads(page(2), 1).1,
+        chunked(slice.buffer, PAGE_SIZE, 2)
+    );
     assert!(!rig.watch.has_requests());
     assert_eq!(rig.bind_uploads(page(2), 1).1, []);
     let whole = BufferSlice {
         size: 3 * PAGE_SIZE,
         ..slice
     };
-    assert_eq!(rig.host_bytes(whole), rig.guest_bytes(page(2), 3 * PAGE_SIZE));
+    assert_eq!(
+        rig.host_bytes(whole),
+        rig.guest_bytes(page(2), 3 * PAGE_SIZE)
+    );
 }
 
 #[test]
@@ -592,9 +631,8 @@ fn an_ordered_unmap_drops_the_range_and_keeps_the_neighbours_at_its_ends() {
         rig.bind(page(n), 1);
     }
     let fence = rig.submit();
-    rig.cache.apply_update(&VmUpdate::Unmap {
-        range: pages(2, 2),
-    });
+    rig.cache
+        .apply_update(&VmUpdate::Unmap { range: pages(2, 2) });
     assert!(rig.cache.entry(page(2)).is_none());
     assert_eq!(rig.cache.bytes(), 4 * PAGE_SIZE);
     line_index(&rig.log(), &destroy_line(b.buffer, fence.get()));
@@ -612,16 +650,12 @@ fn an_ordered_unmap_drops_the_range_and_keeps_the_neighbours_at_its_ends() {
 #[test]
 fn every_kind_of_ordered_update_drops_every_entry_it_overlaps() {
     let updates = [
-        VmUpdate::Unmap {
-            range: pages(3, 1),
-        },
+        VmUpdate::Unmap { range: pages(3, 1) },
         VmUpdate::ModifyKind {
             range: pages(3, 1),
             kind: Kind(0xFE),
         },
-        VmUpdate::DestroyMemory {
-            range: pages(3, 1),
-        },
+        VmUpdate::DestroyMemory { range: pages(3, 1) },
         VmUpdate::DestroySparseRegion {
             range: pages(3, 1),
             region: RegionId(7),
@@ -646,9 +680,8 @@ fn a_buffer_dropped_while_its_list_is_open_is_destroyed_after_that_list() {
     let first = rig.bind(page(0), PAGE_SIZE);
     rig.submit();
     let used = rig.bind(page(8), PAGE_SIZE);
-    rig.cache.apply_update(&VmUpdate::Unmap {
-        range: pages(8, 1),
-    });
+    rig.cache
+        .apply_update(&VmUpdate::Unmap { range: pages(8, 1) });
     // Nothing is destroyed while the open list may still name it.
     assert!(!rig.log().iter().any(|l| l.starts_with("destroy")));
     let fence = rig.submit();
@@ -657,14 +690,12 @@ fn a_buffer_dropped_while_its_list_is_open_is_destroyed_after_that_list() {
     let destroy = line_index(&log, &destroy_line(used.buffer, fence.get()));
     assert!(submit < destroy);
     // An entry no open list uses goes after the last list that did.
-    let other = rig.bind(page(20), PAGE_SIZE);
+    rig.bind(page(20), PAGE_SIZE);
     rig.submit();
-    rig.cache.apply_update(&VmUpdate::Unmap {
-        range: pages(0, 1),
-    });
+    rig.cache
+        .apply_update(&VmUpdate::Unmap { range: pages(0, 1) });
     line_index(&rig.log(), &destroy_line(first.buffer, 1));
     assert_eq!(rig.backend.refused_destroys(), 0);
-    drop(other);
 }
 
 #[test]
@@ -673,7 +704,7 @@ fn dropping_the_cache_destroys_every_buffer_after_the_last_fence() {
     let a = rig.bind(page(0), PAGE_SIZE);
     let b = rig.bind(page(4), PAGE_SIZE);
     let fence = rig.submit();
-    let backend = rig.backend.clone();
+    let backend = Arc::clone(&rig.backend);
     drop(rig);
     let log: Vec<String> = backend.snapshot().lines().map(str::to_owned).collect();
     line_index(&log, &destroy_line(a.buffer, fence.get()));
@@ -705,7 +736,10 @@ fn the_last_page_of_the_address_space_is_out_of_range_and_the_one_before_reaches
     // read the (unmapped) page before it.
     assert_eq!(
         rig.try_bind(last - 1, 2),
-        Err(BufferError::OutOfRange { va: last - 1, len: 2 })
+        Err(BufferError::OutOfRange {
+            va: last - 1,
+            len: 2
+        })
     );
     assert_eq!(
         rig.try_bind(last - 1, 1),
@@ -715,7 +749,10 @@ fn the_last_page_of_the_address_space_is_out_of_range_and_the_one_before_reaches
     );
     assert_eq!(
         rig.try_bind(1, u64::MAX),
-        Err(BufferError::OutOfRange { va: 1, len: u64::MAX })
+        Err(BufferError::OutOfRange {
+            va: 1,
+            len: u64::MAX
+        })
     );
     assert!(rig.cache.is_empty());
     assert_eq!(rig.backend.budget().used, 0);
@@ -824,14 +861,20 @@ fn a_fault_on_a_new_entry_leaves_nothing_behind() {
     rig.mem.unmap(pages(2, 1)).unwrap();
     // Joins the entry at page 0 and reaches the unmapped page 2.
     let err = rig.try_bind(page(0), 3 * PAGE_SIZE);
-    assert_eq!(err, Err(BufferError::Fault(GpuFault::Unmapped { va: page(2) })));
+    assert_eq!(
+        err,
+        Err(BufferError::Fault(GpuFault::Unmapped { va: page(2) }))
+    );
     let entries: Vec<_> = rig.cache.entries().map(|e| (e.range, e.buffer)).collect();
     assert_eq!(entries, [(pages(0, 1), a.buffer)]);
     assert_eq!(rig.list, list_before);
     assert_eq!(rig.backend.budget().used, PAGE_SIZE);
     let mut requests = Vec::new();
     rig.watch.take_requests(&mut requests);
-    assert_eq!(requests.iter().map(|r| r.range()).collect::<Vec<_>>(), [pages(0, 1)]);
+    assert_eq!(
+        requests.iter().map(|r| r.range()).collect::<Vec<_>>(),
+        [pages(0, 1)]
+    );
     rig.watch.arm(&requests).unwrap();
     // The next attempt, with the page mapped again, works.
     rig.mem.map(pages(2, 1), page(2)).unwrap();
@@ -860,17 +903,29 @@ fn a_fault_on_an_entry_in_use_changes_nothing_and_the_next_use_works() {
 #[test]
 fn error_messages_are_plain_words() {
     let cases = [
-        (BufferError::Empty { va: 0x1000 }, "a buffer binding at 0x1000 has no bytes"),
         (
-            BufferError::OutOfRange { va: 0x10, len: 0x20 },
+            BufferError::Empty { va: 0x1000 },
+            "a buffer binding at 0x1000 has no bytes",
+        ),
+        (
+            BufferError::OutOfRange {
+                va: 0x10,
+                len: 0x20,
+            },
             "a buffer binding of 0x20 bytes at 0x10 runs past the end of the address space",
         ),
         (
-            BufferError::TooLarge { size: 0x3000, max: 0x2000 },
+            BufferError::TooLarge {
+                size: 0x3000,
+                max: 0x2000,
+            },
             "a cached buffer of 0x3000 bytes is larger than the device's largest, 0x2000",
         ),
         (
-            BufferError::OverBudget { bytes: 0, allowed: 0 },
+            BufferError::OverBudget {
+                bytes: 0,
+                allowed: 0,
+            },
             "the buffer cache would hold 0x0 bytes, more than the 0x0 allowed",
         ),
         (
@@ -895,17 +950,40 @@ fn eviction_limits_at_every_edge() {
         (0, 0, 0),
         (1, 0, 1),
         (3, 1, 3),
-        (2 * ROUTINE_LIMIT_CAP - 1, ROUTINE_LIMIT_CAP - 1, 2 * ROUTINE_LIMIT_CAP - 1),
-        (2 * ROUTINE_LIMIT_CAP, ROUTINE_LIMIT_CAP, 2 * ROUTINE_LIMIT_CAP),
-        (AGGRESSIVE_LIMIT_CAP - 1, AGGRESSIVE_LIMIT_CAP / 2 - 1, AGGRESSIVE_LIMIT_CAP - 1),
-        (AGGRESSIVE_LIMIT_CAP, AGGRESSIVE_LIMIT_CAP / 2, AGGRESSIVE_LIMIT_CAP),
-        (AGGRESSIVE_LIMIT_CAP + 2, ROUTINE_LIMIT_CAP, AGGRESSIVE_LIMIT_CAP),
+        (
+            2 * ROUTINE_LIMIT_CAP - 1,
+            ROUTINE_LIMIT_CAP - 1,
+            2 * ROUTINE_LIMIT_CAP - 1,
+        ),
+        (
+            2 * ROUTINE_LIMIT_CAP,
+            ROUTINE_LIMIT_CAP,
+            2 * ROUTINE_LIMIT_CAP,
+        ),
+        (
+            AGGRESSIVE_LIMIT_CAP - 1,
+            AGGRESSIVE_LIMIT_CAP / 2 - 1,
+            AGGRESSIVE_LIMIT_CAP - 1,
+        ),
+        (
+            AGGRESSIVE_LIMIT_CAP,
+            AGGRESSIVE_LIMIT_CAP / 2,
+            AGGRESSIVE_LIMIT_CAP,
+        ),
+        (
+            AGGRESSIVE_LIMIT_CAP + 2,
+            ROUTINE_LIMIT_CAP,
+            AGGRESSIVE_LIMIT_CAP,
+        ),
         (u64::MAX, ROUTINE_LIMIT_CAP, AGGRESSIVE_LIMIT_CAP),
     ];
     for (allowed, routine, aggressive) in cases {
         assert_eq!(
             eviction_limits(allowed),
-            EvictionLimits { routine, aggressive },
+            EvictionLimits {
+                routine,
+                aggressive
+            },
             "{allowed}"
         );
     }
@@ -917,7 +995,10 @@ fn eviction_caps_are_eden_nx2s_values() {
     // 60 ticks and 32 or 64 iterations (eden `buffer_cache.h`, `RunGarbageCollector`).
     assert_eq!(ROUTINE_LIMIT_CAP, 1_073_741_824);
     assert_eq!(AGGRESSIVE_LIMIT_CAP, 2_147_483_648);
-    assert_eq!((EVICT_AFTER_FRAMES, AGGRESSIVE_EVICT_AFTER_FRAMES), (120, 60));
+    assert_eq!(
+        (EVICT_AFTER_FRAMES, AGGRESSIVE_EVICT_AFTER_FRAMES),
+        (120, 60)
+    );
     assert_eq!((EVICT_PER_FRAME, AGGRESSIVE_EVICT_PER_FRAME), (32, 64));
 }
 
@@ -1007,7 +1088,7 @@ fn a_use_restarts_an_entrys_age() {
 #[test]
 fn collection_takes_the_least_recently_used_first_up_to_its_count() {
     // Routine: one entry more than a frame's count, bytes at the routine limit.
-    let count = EVICT_PER_FRAME as u64 + 1;
+    let count = u64::try_from(EVICT_PER_FRAME).unwrap() + 1;
     let mut rig = Rig::with_budget(2 * count * PAGE_SIZE);
     for n in 0..count {
         rig.bind(page(n), PAGE_SIZE);
@@ -1015,14 +1096,17 @@ fn collection_takes_the_least_recently_used_first_up_to_its_count() {
     // Page 0 is used again last: least recently used is page 1, not the lowest address.
     rig.bind(page(0), 1);
     rig.submit();
-    assert_eq!(frames_then_one(&mut rig, EVICT_AFTER_FRAMES), EVICT_PER_FRAME);
+    assert_eq!(
+        frames_then_one(&mut rig, EVICT_AFTER_FRAMES),
+        EVICT_PER_FRAME
+    );
     let left: Vec<_> = rig.cache.entries().map(|e| e.range).collect();
     assert_eq!(left, [pages(0, 1)]);
     // What is left is below the limit.
     assert_eq!(rig.cache.end_frame(), 0);
 
     // Aggressive: one more than its count, bytes at the aggressive limit.
-    let count = AGGRESSIVE_EVICT_PER_FRAME as u64 + 1;
+    let count = u64::try_from(AGGRESSIVE_EVICT_PER_FRAME).unwrap() + 1;
     let mut rig = Rig::with_budget(count * PAGE_SIZE);
     for n in 0..count {
         rig.bind(page(n), PAGE_SIZE);
@@ -1054,7 +1138,11 @@ fn eviction_destroys_after_the_last_list_that_used_the_entry() {
     let slice = rig.bind(page(0), PAGE_SIZE);
     let used = rig.submit();
     // Later lists that do not use it.
-    rig.list.push(Command::Marker(starquake_render::command::Marker { submit: 1, draw: 0 }));
+    rig.list
+        .push(Command::Marker(starquake_render::command::Marker {
+            submit: 1,
+            draw: 0,
+        }));
     rig.submit();
     assert_eq!(frames_then_one(&mut rig, EVICT_AFTER_FRAMES), 1);
     line_index(&rig.log(), &destroy_line(slice.buffer, used.get()));
