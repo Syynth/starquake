@@ -10,7 +10,9 @@ use proptest::test_runner::{Config, RngSeed};
 use starquake_memory::{FlatMemory, PAGE_SIZE, PageRange};
 
 use super::*;
-use crate::classes::clc7c0::SET_QMD_VIRTUALIZATION_CONTROL;
+use crate::classes::clc7c0::{
+    SEND_SIGNALING_PCAS2_B_PCAS_ACTION_INCREMENT_PUT, SET_QMD_VIRTUALIZATION_CONTROL,
+};
 use crate::memory::TestGpuMemory;
 use crate::sema::DecodeError;
 
@@ -1241,9 +1243,11 @@ fn a_rejected_program_still_completes_and_releases() {
         reject: vec![0xbad0],
         ..Recorder::default()
     };
-    table
-        .signal(a, PcasAction::Schedule, &mem, &mut sink)
-        .unwrap();
+    // A listed divergence: Eden-NX2's `Signal` reports "native shader dispatch required" here.
+    assert_eq!(
+        table.signal(a, PcasAction::Schedule, &mem, &mut sink),
+        Ok(())
+    );
     assert_eq!(
         sink.events[..3],
         [
@@ -1282,9 +1286,12 @@ fn an_empty_grid_or_block_completes_and_releases_without_reaching_the_sink() {
         put(&mem, a, &spec);
         let mut table = QmdTable::new();
         let mut sink = Recorder::default();
-        table
-            .signal(a, PcasAction::Schedule, &mem, &mut sink)
-            .unwrap();
+        // An empty block is a listed divergence: Eden-NX2's `Signal` reports it as an error.
+        assert_eq!(
+            table.signal(a, PcasAction::Schedule, &mem, &mut sink),
+            Ok(()),
+            "dim {dim}, grid {empty}"
+        );
         let outcome = if empty {
             Outcome::EmptyGrid
         } else {
@@ -1297,6 +1304,38 @@ fn an_empty_grid_or_block_completes_and_releases_without_reaching_the_sink() {
                 Event::Completed(a, outcome)
             ],
             "dim {dim}, grid {empty}"
+        );
+    }
+}
+
+/// The grid is checked before the block (`native_qmd.h` line 89 tests the grid, and
+/// `DispatchNativeCompute` refuses an empty block only after that): with both empty, the run is
+/// an empty grid, and the sink sees no dispatch.
+#[test]
+fn a_zero_grid_and_a_zero_block_together_are_an_empty_grid() {
+    for dim in 0..3 {
+        let mem = memory();
+        let a = qmd_at(1);
+        let mut spec = Spec::new(0xa000).slot(0, SlotSpec::write(target(0), 5));
+        spec.dispatch.grid = [3, 4, 5];
+        spec.dispatch.block = [6, 7, 8];
+        spec.dispatch.grid[dim] = 0;
+        spec.dispatch.block[2 - dim] = 0;
+        put(&mem, a, &spec);
+        let mut table = QmdTable::new();
+        let mut sink = Recorder::default();
+        assert_eq!(
+            table.signal(a, PcasAction::Schedule, &mem, &mut sink),
+            Ok(()),
+            "dim {dim}"
+        );
+        assert_eq!(
+            sink.events,
+            [
+                Event::Release(write_release(target(0), 5)),
+                Event::Completed(a, Outcome::EmptyGrid)
+            ],
+            "dim {dim}"
         );
     }
 }
@@ -1718,6 +1757,47 @@ fn a_qmd_that_goes_bad_while_waiting_fails_when_it_would_run() {
     );
     assert_eq!(sink.events, NOTHING, "nothing was made visible");
     assert!(!table.status(a).unwrap().completed);
+}
+
+/// A request that fails after its entry is written keeps its own change, as in Eden-NX2,
+/// which updates `states[address]` in place before it reads the QMD again to run it. Here a QMD
+/// new to the table loads (its version and queue flag pass), is scheduled with its counter at
+/// zero, and is refused at run time by a release slot: it keeps a new entry, loaded and
+/// scheduled but not completed, and nothing reaches the sink.
+#[test]
+fn a_failed_run_keeps_the_requests_own_change() {
+    let mem = memory();
+    let a = qmd_at(1);
+    let bad_release = Spec::new(0xa000).slot(
+        0,
+        SlotSpec {
+            trap: 1,
+            ..SlotSpec::write(target(0), 1)
+        },
+    );
+    put(&mem, a, &bad_release);
+    let mut table = QmdTable::new();
+    let mut sink = Recorder::default();
+    assert_eq!(
+        table.signal(a, PcasAction::Schedule, &mem, &mut sink),
+        Err(QmdError::Release {
+            address: a,
+            slot: 0,
+            refusal: ReleaseRefusal::Trap(1)
+        })
+    );
+    assert_eq!(table.len(), 1);
+    assert_eq!(
+        table.status(a),
+        Some(QmdStatus {
+            loaded: true,
+            scheduled: true,
+            completed: false,
+            dependencies: 0,
+            deferred: 0,
+        })
+    );
+    assert_eq!(sink.events, NOTHING);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2168,6 +2248,44 @@ fn divergence_a_failed_request_adds_no_entry() {
         Err(QmdError::Version { .. })
     ));
     assert_eq!(table.len(), 0);
+}
+
+/// `compute_method` decodes the `SEND_SIGNALING_PCAS2_B` action before it signals, so an
+/// unsupported action on a QMD not in a full table is `PcasAction`; Eden-NX2 checks the table
+/// limit (`native_qmd.h` line 35) before the action (line 66) and reports "QMD cache limit".
+/// A supported action on the same QMD reaches the table limit.
+#[test]
+fn divergence_an_unsupported_action_is_reported_before_the_table_limit() {
+    let mem = memory();
+    let mut table = QmdTable::new();
+    let mut sink = Recorder::default();
+    let at = |n: u64| n << QMD_ADDRESS_SHIFT;
+    for n in 0..MAX_QMDS as u64 {
+        table.signal(at(n), dec(1), &mem, &mut sink).unwrap();
+    }
+    assert_eq!(table.len(), MAX_QMDS);
+    let new = at(MAX_QMDS as u64);
+    let mut regs = vec![0u32; REGISTERS_NEEDED];
+    let pcas_a = usize::try_from(SEND_PCAS_A.method()).unwrap();
+    let pcas2_b = usize::try_from(SEND_SIGNALING_PCAS2_B.method()).unwrap();
+    regs[pcas_a] = u32::try_from(new >> QMD_ADDRESS_SHIFT).unwrap();
+    regs[pcas2_b] = SEND_SIGNALING_PCAS2_B_PCAS_ACTION
+        .insert(0, SEND_SIGNALING_PCAS2_B_PCAS_ACTION_INCREMENT_PUT)
+        .unwrap();
+    assert_eq!(
+        table.compute_method(SEND_SIGNALING_PCAS2_B.method(), &regs, &mem, &mut sink),
+        Err(QmdError::PcasAction {
+            action: SEND_SIGNALING_PCAS2_B_PCAS_ACTION_INCREMENT_PUT
+        })
+    );
+    regs[pcas2_b] = dec(1).encode().unwrap();
+    assert_eq!(
+        table.compute_method(SEND_SIGNALING_PCAS2_B.method(), &regs, &mem, &mut sink),
+        Err(QmdError::TableFull { address: new })
+    );
+    assert_eq!(table.len(), MAX_QMDS);
+    assert_eq!(table.status(new), None);
+    assert_eq!(sink.events, NOTHING);
 }
 
 #[test]

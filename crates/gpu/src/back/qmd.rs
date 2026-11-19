@@ -51,7 +51,12 @@
 //!   a counter below zero at that point is [`QmdError::DependenceUnderflow`] (`native_qmd.h`
 //!   line 69).
 //! - The table holds at most [`MAX_QMDS`] (4,096) QMDs: a request for a QMD not in a full table
-//!   is [`QmdError::TableFull`] (line 35, checked before anything else about the request).
+//!   is [`QmdError::TableFull`] (line 35). Within [`QmdTable::signal`] it is checked before
+//!   anything else about the request. [`QmdTable::compute_method`] checks, in order: the
+//!   register file ([`QmdError::Registers`]), then the `SEND_SIGNALING_PCAS2_B` action
+//!   ([`QmdError::PcasAction`]), and only then signals, so the table limit comes after the
+//!   action there; Eden-NX2 checks the limit (line 35) before the action (line 66). This is a
+//!   listed divergence below.
 //! - One [`QmdTable::signal`] handles at most [`MAX_CHAIN`] (256) requests, the first and its
 //!   dependents: a run whose dependent would be request 257 is [`QmdError::ChainTooLong`]
 //!   (line 108).
@@ -75,7 +80,22 @@
 //!   are signalled with action 3 (`kepler_compute.cpp`, the `method == 0x107` case).
 //! - When a request fails, what the requests before it did stands: a QMD that ran keeps its
 //!   dispatch, releases and completion, and a QMD loaded or scheduled by an earlier request stays
-//!   so. A failing request itself changes nothing (but see the divergence on table entries).
+//!   so. What the failing request itself leaves depends on where it fails:
+//!   - Failures before its entry is written change nothing and add no entry:
+//!     [`QmdError::TableFull`]; [`QmdError::Read`], [`QmdError::Version`] or [`QmdError::Queue`]
+//!     when the QMD is loaded; and [`QmdError::DependenceOverflow`]. Eden-NX2 adds an entry for
+//!     the load-time read, version and queue failures (a listed divergence below) and has no
+//!     overflow check.
+//!   - Failures after its entry is written keep the request's own change (loaded, scheduled,
+//!     the new counter), as Eden-NX2 does, since it updates the entry in place before these
+//!     checks: [`QmdError::DependenceUnderflow`], and [`QmdError::Read`], [`QmdError::Version`],
+//!     [`QmdError::Queue`] or [`QmdError::Release`] when the QMD is read again to run. The QMD is
+//!     not marked completed and nothing reaches the sink; a QMD new to the table keeps its new
+//!     entry. Pinned by `a_failed_run_keeps_the_requests_own_change`,
+//!     `a_counter_below_zero_when_ready_is_an_error_and_zero_runs` and
+//!     `a_qmd_that_goes_bad_while_waiting_fails_when_it_would_run`.
+//!   - [`QmdError::DependentAction`], [`QmdError::ChainTooLong`] and
+//!     [`QmdError::SecondDependent`] come after the QMD ran (above): it keeps its completion.
 //!
 //! # Divergences from Eden-NX2
 //!
@@ -112,9 +132,27 @@
 //! - **An inline QMD address that does not fit in 64 bits is refused**
 //!   ([`QmdError::InlineAddress`]), where Eden-NX2's shift drops the top eight bits of
 //!   `SET_INLINE_QMD_ADDRESS_A`. Pinned by `divergence_inline_address_overflow_is_refused`.
-//! - **A failed request adds no table entry.** Eden-NX2's `states[request.address]` adds an
-//!   empty entry before the action is checked or the QMD read, so an unmapped or unsupported QMD
-//!   still takes one of the 4,096 places. Pinned by `divergence_a_failed_request_adds_no_entry`.
+//! - **A request that fails when its QMD is loaded adds no table entry.** Eden-NX2's
+//!   `states[request.address]` adds an empty entry before the QMD is read, so a QMD that is
+//!   unmapped ([`QmdError::Read`]), not version 3.0 ([`QmdError::Version`]) or a queue
+//!   ([`QmdError::Queue`]) when it is loaded still takes one of the 4,096 places. A request that
+//!   fails after its entry is written (see above) keeps its entry, as in Eden-NX2. Pinned by
+//!   `divergence_a_failed_request_adds_no_entry` (the load-time failures) and
+//!   `a_failed_run_keeps_the_requests_own_change` (a run-time failure on a new QMD).
+//! - **An unsupported PCAS action is reported before the table limit.**
+//!   [`QmdTable::compute_method`] decodes the `SEND_SIGNALING_PCAS2_B` action before it signals,
+//!   so an unsupported action for a QMD not in a full table is [`QmdError::PcasAction`]; Eden-NX2
+//!   checks the limit first (line 35, then line 66) and reports "QMD cache limit". Pinned by
+//!   `divergence_an_unsupported_action_is_reported_before_the_table_limit`.
+//! - **A run that is not dispatched is not an error.** Eden-NX2's `Signal` sets its result to
+//!   "native shader dispatch required" (`native_qmd.h` line 90) when its dispatch callback
+//!   returns false: a program the shader path cannot run, a block with a zero dimension, or a
+//!   constant buffer upper address with bits 16:8 set (the last is not refused here at all; see
+//!   above). It still completes, releases and runs the rest of the chain, and returns that error
+//!   at the end unless a later request fails first. Here [`QmdTable::signal`] returns `Ok(())` for [`Outcome::Rejected`] and
+//!   [`Outcome::EmptyBlock`], and the outcome reaches only [`QmdSink::completed`]. Pinned by
+//!   `a_rejected_program_still_completes_and_releases` and
+//!   `an_empty_grid_or_block_completes_and_releases_without_reaching_the_sink`.
 //! - **Releases are not checked against the address map here.** Eden-NX2 fails the signal with
 //!   "unmapped QMD release" when a release address is unmapped, after the QMD completed; here a
 //!   release is handed to the sink, and its write is the fence path's (G15). Pinned by
