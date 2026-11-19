@@ -396,8 +396,9 @@ not a decision; mesh and task shaders come after milestone 3 either way (ruling 
 
 **Status: types resolved by decision 6** (render-backend's `CommandList`, `Command`,
 `FenceValue`, `completed()`; gpu-protocol's sketch replaced). **The back thread's wake on
-completion stays open** in both specs, listed under "What to verify before building"
-(gpu-protocol 13, render-backend 10); gpu-protocol slice G15 and render-backend R5 wait on it.
+completion: decided by the owner, 2026-11-18** (render-backend decision 14, "The completion
+wake"; gpu-protocol "Releases and completion"): each backend is given a wake at construction
+and calls it when `completed()` advances; the back thread sleeps on the ring's wake-up.
 
 - **gpu-protocol** ("What the back hands the render backend", "Render backend (#14)"): sketches
   `BeginPass`/`EndPass`/`Barrier` commands, a `present(PresentFrame)` trait method, and "a
@@ -490,7 +491,7 @@ No spec's port slices own these. Suggested owners in the last column.
 | Answering the shader pipeline: `EngineState`, `ProgramMemory`, building `VariantKey`, filling driver constants, calling `invalidate` | shader-pipeline ("What the GPU front/back protocol ... gets") | **Owned:** gpu G18 (widened), G16 for `invalidate` |
 | Mapping render's `EmulationFlags` into the shader `VariantKey` | M13 | **Owned:** gpu G18 |
 | The pipeline-key cache (guest state → `PipelineId`) and the list of keys to precompile next boot | render-backend ("Resources and who owns the caches") | **Owned:** gpu G23 |
-| A wake-up for the back thread on host completion | gpu-protocol G15 (M14) | Open (gpu-protocol verification 13, render-backend verification 10); render-backend R5 once settled |
+| A wake-up for the back thread on host completion | gpu-protocol G15 (M14) | **Decided 2026-11-18:** gpu G15 (the ring's wake handle, the back thread's sleep) and render-backend R5 (calling the wake) |
 | The shared compile pool | M16 | **Owned:** render-backend R12 |
 | Shader answers in the GPU capture | shader-pipeline | **Owned:** gpu G20 |
 | The semaphore mirror page, once a trace settles row 35 | graphics-server, gpu-protocol | gpu G15 |
