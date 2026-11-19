@@ -163,3 +163,69 @@ impl<S> Drop for Settle<S> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn taking_with_nothing_posted_does_not_take_the_lock() {
+        let inbox = Arc::new(Inbox::<u32>::new());
+        let held = inbox.lock();
+        let (sender, receiver) = mpsc::channel();
+        let worker = {
+            let inbox = Arc::clone(&inbox);
+            thread::spawn(move || {
+                let _sent = sender.send(inbox.take().len());
+            })
+        };
+        let taken = receiver.recv_timeout(Duration::from_secs(10));
+        drop(held);
+        worker.join().expect("the taker ends");
+        assert_eq!(taken, Ok(0));
+    }
+
+    #[test]
+    fn a_post_is_taken_once_and_wakes_a_waiter() {
+        let inbox = Arc::new(Inbox::<u32>::new());
+        assert!(!inbox.posted());
+        let poster = {
+            let inbox = Arc::clone(&inbox);
+            thread::spawn(move || {
+                Settle::new(inbox, ShaderStamp(7)).post(Ok(3));
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        assert!(inbox.wait(Some(deadline)));
+        poster.join().expect("the poster ends");
+        assert!(inbox.posted());
+        let taken = inbox.take();
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].stamp, ShaderStamp(7));
+        assert!(matches!(taken[0].result, Ok(3)));
+        assert!(!inbox.posted());
+        assert!(inbox.take().is_empty());
+        // Nothing waiting: a wait with a passed deadline gives up at once.
+        assert!(!inbox.wait(Some(Instant::now())));
+    }
+
+    #[test]
+    fn a_settler_dropped_unposted_posts_abandoned_and_a_posted_one_does_not() {
+        let inbox = Arc::new(Inbox::<u32>::new());
+        drop(Settle::new(Arc::clone(&inbox), ShaderStamp(1)));
+        Settle::new(Arc::clone(&inbox), ShaderStamp(2)).post(Ok(5));
+        let taken = inbox.take();
+        assert_eq!(taken.len(), 2);
+        assert_eq!(taken[0].stamp, ShaderStamp(1));
+        assert!(matches!(
+            taken[0].result,
+            Err(Rejection::Cache(CacheRefusal::Abandoned))
+        ));
+        assert_eq!(taken[1].stamp, ShaderStamp(2));
+        assert!(matches!(taken[1].result, Ok(5)));
+    }
+}

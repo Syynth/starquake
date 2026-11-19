@@ -21,7 +21,8 @@ use crate::translate::GuestStage;
 /// The most bytes a capture reads from its program's address: the graphics header and
 /// [`MAX_INSTRUCTIONS`] instructions (spec, "Where programs come from"). An entry's range
 /// never reaches further than this past its start.
-pub const MAX_EXTENT: u64 = HEADER_BYTES as u64 + MAX_INSTRUCTIONS as u64 * Instruction::SIZE as u64;
+pub const MAX_EXTENT: u64 =
+    HEADER_BYTES as u64 + MAX_INSTRUCTIONS as u64 * Instruction::SIZE as u64;
 
 /// What capturing the program at an address gave.
 #[derive(Clone, Debug)]

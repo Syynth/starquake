@@ -30,7 +30,7 @@ use crate::variant::VariantKey;
 
 /// A shader entry's identity: the digest of its key (module docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ShaderStamp(u128);
+pub struct ShaderStamp(pub(super) u128);
 
 impl ShaderStamp {
     /// The stamp's value.

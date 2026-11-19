@@ -262,7 +262,9 @@ pub enum CacheRefusal {
         missing: Requirements,
     },
     /// Every shader entry the cache may hold is a translation in progress.
-    #[error("the shader cache is full: all {limit} of its shader entries are translations in progress")]
+    #[error(
+        "the shader cache is full: all {limit} of its shader entries are translations in progress"
+    )]
     Full {
         /// The cap on shader entries.
         limit: usize,
@@ -442,6 +444,9 @@ struct Member {
     hash: ContentHash,
     stamp: ShaderStamp,
 }
+
+/// One request resolved: its member and, when ready, its shader; or the rejection.
+type Resolved<S> = Result<(Member, Option<Arc<S>>), Arc<ProgramRejection>>;
 
 /// Where a set stands.
 enum SetState<S> {
@@ -671,7 +676,7 @@ impl<T: Translator> ShaderCache<T> {
         variant: &VariantKey,
         memory: &dyn ProgramMemory,
         state: &dyn EngineState,
-    ) -> Result<(Member, Option<Arc<T::Shader>>), Arc<ProgramRejection>> {
+    ) -> Resolved<T::Shader> {
         let reject = |hash, reason| {
             Arc::new(ProgramRejection {
                 request,
@@ -709,7 +714,9 @@ impl<T: Translator> ShaderCache<T> {
         match self.shaders.get(&stamp).map(|entry| &entry.state) {
             Some(ShaderState::Ready(shader)) => Ok((member, Some(Arc::clone(shader)))),
             Some(ShaderState::Pending) => Ok((member, None)),
-            Some(ShaderState::Rejected(reason)) => Err(reject(Some(found.hash), Arc::clone(reason))),
+            Some(ShaderState::Rejected(reason)) => {
+                Err(reject(Some(found.hash), Arc::clone(reason)))
+            }
             None => {
                 self.queue(request.stage, stamp, found, answers, variant)
                     .map_err(|reason| reject(Some(member.hash), reason))?;
@@ -798,11 +805,7 @@ impl<T: Translator> ShaderCache<T> {
     }
 
     /// Makes the program entry of `capture`, whose hash is `hash`.
-    fn make_program(
-        &mut self,
-        hash: ContentHash,
-        capture: &Capture,
-    ) -> Found<T::Program> {
+    fn make_program(&mut self, hash: ContentHash, capture: &Capture) -> Found<T::Program> {
         let bytes = u64::try_from(capture.bytes().len()).unwrap_or(u64::MAX);
         let over_bytes = self
             .program_bytes
@@ -846,10 +849,9 @@ impl<T: Translator> ShaderCache<T> {
     /// Counts a question-round rejection of the program `hash` once per program entry.
     fn count_question_rejection(&mut self, hash: ContentHash) {
         if let Some(ProgramEntry {
-            slot:
-                ProgramSlot::Ready {
-                    questions_counted, ..
-                },
+            slot: ProgramSlot::Ready {
+                questions_counted, ..
+            },
             ..
         }) = self.programs.get_mut(&hash)
             && !*questions_counted
