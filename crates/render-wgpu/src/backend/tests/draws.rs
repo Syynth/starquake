@@ -33,7 +33,7 @@ const MAGENTA: [f32; 4] = [1.0, 0.0, 1.0, 1.0];
 const GREEN: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
 
 /// Runs each compile job at once on a thread of its own.
-struct ThreadPool;
+pub(super) struct ThreadPool;
 
 impl CompilePool for ThreadPool {
     fn spawn(&self, job: CompileJob) {
@@ -196,7 +196,7 @@ fn positions(vs: ShaderId, fs: ShaderId, topology: Topology) -> GraphicsPipeline
 }
 
 /// Per-draw state that draws into the whole 8 by 8 target.
-fn dynamic() -> DynamicValues {
+pub(super) fn dynamic() -> DynamicValues {
     DynamicValues {
         viewports: vec![Viewport {
             x: 0.0,

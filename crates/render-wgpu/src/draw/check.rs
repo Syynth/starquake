@@ -334,13 +334,9 @@ impl ListDraws {
         }
         let b = &limits.binding;
         let (binding, first) = match input {
-            None => {
-                // The last vertex number, `first + n - 1`, stays below the restart value.
-                if u64::from(first) + u64::from(n) > u64::from(rewrite::RESTART) {
-                    return Err(too_big);
-                }
-                (None, first)
-            }
+            // The vertex span check has kept `first + n` within a `u32`, so the last vertex
+            // number, `first + n - 1`, is below the restart value.
+            None => (None, first),
             Some((buffer, start)) => {
                 let alignment = u64::from(b.storage_alignment.max(1));
                 let skip = start % alignment;

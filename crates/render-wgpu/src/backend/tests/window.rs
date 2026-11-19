@@ -232,6 +232,99 @@ fn the_window_shows_the_presented_frame_after_the_image_is_written() {
     });
 }
 
+/// The ordering test with a draw as the write (slice R7): present an image, draw into it, and
+/// the window still shows the presented frame, with the draw in the same list as the present
+/// and in the next one.
+#[test]
+fn the_window_shows_the_presented_frame_after_a_draw_writes_the_image() {
+    use super::draws::{ThreadPool, dynamic};
+    use crate::fixtures::{graphics_desc, shader_desc, wgsl};
+    use starquake_render::command::{DrawDesc, DrawParams, RenderTargets};
+    use starquake_render::{ShaderInterface, ShaderStage};
+    bounded(|| {
+        for same_list in [true, false] {
+            let Some(gpu) = super::open_with("present_then_draw", || {
+                WgpuBackend::with_compile_pool(
+                    WgpuConfig::DEFAULT,
+                    CompletionWake::none(),
+                    Arc::new(ThreadPool),
+                    WhileCompiling::Wait,
+                )
+            }) else {
+                return;
+            };
+            let mut r = Rig::new(gpu, (4, 4), (4, 4));
+            let shader = |stage, source| {
+                r.gpu
+                    .create_shader(shader_desc(
+                        stage,
+                        "main",
+                        wgsl(source),
+                        ShaderInterface::default(),
+                    ))
+                    .expect("shader")
+            };
+            // One triangle that covers the whole target, in magenta.
+            let vs = shader(
+                ShaderStage::Vertex,
+                "@vertex fn main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+                     return vec4(f32(i & 1u) * 4.0 - 1.0, f32(i >> 1u) * 4.0 - 1.0, 0.0, 1.0);
+                 }",
+            );
+            let fs = shader(
+                ShaderStage::Fragment,
+                "@fragment fn main() -> @location(0) vec4<f32> { return vec4(1.0, 0.0, 1.0, 1.0); }",
+            );
+            let pipeline = r
+                .gpu
+                .create_graphics_pipeline(graphics_desc(vs, Some(fs)))
+                .expect("accepted");
+            let mut targets = RenderTargets::default();
+            targets.colors[0] = Some(r.view);
+            let mut viewport = dynamic();
+            viewport.viewports[0].width = 4.0;
+            viewport.viewports[0].height = 4.0;
+            let writes = vec![
+                Command::SetRenderTargets(targets),
+                Command::Draw(DrawDesc {
+                    pipeline,
+                    bindings: Vec::new(),
+                    vertex_buffers: Vec::new(),
+                    index_buffer: None,
+                    dynamic: viewport,
+                    params: DrawParams::Direct {
+                        vertex_count: 3,
+                        instance_count: 1,
+                        first_vertex: 0,
+                        first_instance: 0,
+                    },
+                }),
+            ];
+            let first = pattern(r.bytes(), 11);
+            let mut list = vec![
+                r.fill(first.clone()),
+                r.present(1, PresentTransform::Identity, false),
+            ];
+            if same_list {
+                list.extend(writes);
+                r.run(list);
+            } else {
+                r.run(list);
+                r.run(writes);
+            }
+            let case = format!("same list: {same_list}");
+            assert_eq!(
+                r.image_now(),
+                [255, 0, 255, 255].repeat(16),
+                "the draw wrote the image ({case})"
+            );
+            assert_eq!(r.shown(), first, "the window shows frame 1 ({case})");
+            assert_eq!(r.outcomes(), vec![(1, PresentOutcome::Shown)], "{case}");
+            assert_eq!(r.gpu.host_errors(), 0, "{case}");
+        }
+    });
+}
+
 /// Where target pixel (x, y) of a `w` by `h` image turned by `transform` comes from, from the
 /// geometry of each turn (independent of `present::corners`).
 fn source_of(transform: PresentTransform, (w, h): (u32, u32), x: u32, y: u32) -> (u32, u32) {
