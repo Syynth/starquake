@@ -550,6 +550,17 @@ The remaining shader-pipeline slices (#349 to #381, #348 before them) and render
 | proposed | **Instructions with no reference source:** no encoding source for `JMX`, `UP2UR` and `BPT`; no translator in either Switch 2 reference for `IDP4`, `UP2UR`, `DSETP`, `AL2P` and `PIXLD` (Eden's Maxwell translators cover the last three). The decoder and translator issues mark them as guesses | #351 to #371 | area:shader |
 | proposed | **Render verification 3 (wgpu on lavapipe in Linux CI)** has no owner or issue; until it runs, every GPU test stays local-only | #382 | infra |
 
+### From fixing the red macOS `main` (2026-11-19)
+
+The `ci` workflow's macOS job had failed on every push to `main` since #290 and #291 merged: two timing tests of the timer thread, which the host's timer coalescing made late (`crates/core/src/machine/timer.rs`, "Sleeping to a deadline").
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| proposed | **Run the macOS gate where a PR can see it**: the macOS job runs only on pushes to `main`, so a macOS-only failure first shows up on `main`, and nextest's fail-fast hides any second one | `main` stayed red for a day before anyone looked | owner, infra |
+| proposed | **A precise timer on macOS without extra wake-ups**: the timer thread now waits in shares of the time left, sized by how late the host has been ending its waits (a few waits per sleep on a coalescing host, at most eight against the modelled one, and one elsewhere). A Mach time-constraint policy or a `kevent` timer with `NOTE_CRITICAL` might end waits on time in one, but needs `unsafe` FFI outside the `cpu` crate; raising the thread's QoS class did not help | power and wake-ups on macOS | area:core |
+| proposed | **Time the held page answer from the flight recorder**: `a_held_page_request_is_answered_at_the_bound_by_the_timer_thread` times the guest's wake, which also waits for the core's host thread to be scheduled. On an Apple Silicon Mac oversubscribed with 16 busy processes under `taskpolicy -c utility` it failed 1 run in 40 and 9 in 60 (waits up to 21 ms), with the timer thread on time; timing from the guest's signal to the `SyncptPageAcknowledged` note, as the vsync test times its ticks, would leave the core out | flakiness under heavy load | area:core |
+| proposed | **Tighten the vsync timing test's bound**: with precise sleeps its median is under 0.2 ms, and without the sleep to the clock's deadline 4.3 to 5.9 ms, against a bound of 5 ms, so that mutation fails 19 runs of 20; a bound of a quarter of the preemption interval would separate the two | `the_timer_thread_ticks_the_vsync_clock_and_wakes_a_listener_s_waiter` | area:core |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
