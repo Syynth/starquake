@@ -30,14 +30,16 @@
 //! 3. the device is not lost;
 //! 4. each stage's shader is live and of its stage (`validate::validate_pipeline_stages`,
 //!    `validate::validate_compute_stage`);
-//! 5. the shaders' requirements ([`SUBGROUP_SIZE`], below);
+//! 5. the shaders' requirements: subgroups of 32 ([`SUBGROUP_SIZE`]), then subgroups in a vertex
+//!    shader ([`VERTEX_SUBGROUPS`]), both below;
 //! 6. the layouts ([`layout`]);
 //! 7. for a graphics pipeline, the fixed-function state ([`state`]).
 //!
 //! A compute pipeline has no description to check against `Caps` or fixed-function state, so
 //! steps 2 and 7 do not apply to it. The order is pinned by `tests::pipeline_checks_run_in_order`,
 //! `tests::nothing_is_created_once_the_device_is_lost` (step 3) and
-//! `tests::requirements_come_after_the_ids_and_before_the_layout` (step 5).
+//! `tests::requirements_come_after_the_ids_and_before_the_layout` (step 5, and the order of its two
+//! checks).
 //!
 //! Then the id is allocated, the pipeline's status is `Compiling`, and one job goes to the
 //! compile pool ([`CompilePool`]) before the call returns. wgpu's pipeline creation is
@@ -64,9 +66,25 @@
 //! there). An Intel or AMD GPU in a Mac, and every adapter outside Metal, keep the range check;
 //! `tests::the_apple_family_meets_subgroup_size_32_and_others_keep_the_range_check` pins each
 //! case, and `tests::on_an_apple_gpu_subgroup_pipelines_are_ready` builds subgroup pipelines on
-//! an Apple GPU. The other requirements (f16, i64 and the binding-array features) are wgpu's to
-//! check: it validates each module against the device's features, and a module that needs one
-//! the device lacks fails its pipeline.
+//! an Apple GPU. The backend's verdict is computed once, when it opens, from the adapter's
+//! `AdapterInfo` and the device's features ([`SubgroupVerdict`], pinned by
+//! `tests::the_backend_verdict_reads_the_device_features`).
+//!
+//! A vertex shader that uses subgroups (by the same test, [`scan`]) also needs the device's
+//! `wgpu::Features::SUBGROUP_VERTEX`, which `SUBGROUP` does not imply: wgpu-hal 30.0.2's Metal
+//! backend offers `SUBGROUP` (with `SUBGROUP_BARRIER`) where the GPU has SIMD-scoped operations
+//! and never `SUBGROUP_VERTEX` (`src/metal/adapter.rs`, `features`), so such a pipeline would
+//! pass the size check there and then fail its build in wgpu. It is refused up front instead
+//! ([`VERTEX_SUBGROUPS`]), after the size check: a pipeline that fails both is refused with
+//! [`SUBGROUP_SIZE`]. A compute or fragment shader needs only `SUBGROUP`. Pinned by
+//! `tests::vertex_subgroups_need_the_vertex_feature` (the pure rule) and
+//! `tests::a_vertex_subgroup_pipeline_follows_the_device` (on the host's GPU). A vertex shader
+//! whose only subgroup use is one [`scan`] does not count (a quad operation or a subgroup
+//! barrier, which naga allows only in other stages) is left to wgpu.
+//!
+//! The other requirements (f16, i64 and the binding-array features) are wgpu's to check: it
+//! validates each module against the device's features, and a module that needs one the device
+//! lacks fails its pipeline.
 //!
 //! # Draws: wait or skip
 //!
@@ -124,6 +142,9 @@ pub const NO_ENTRY_POINT: &str = "the shader's module has no entry point of its 
 /// A shader that needs subgroups of 32 on a device that cannot promise them.
 pub const SUBGROUP_SIZE: &str =
     "the device cannot promise the subgroup size of 32 a shader of this pipeline needs";
+/// A vertex shader that uses subgroups on a device without subgroups in vertex shaders
+/// (`wgpu::Features::SUBGROUP_VERTEX`; module docs, "Requirements").
+pub const VERTEX_SUBGROUPS: &str = "the device has no subgroup operations in vertex shaders, which this pipeline's vertex shader uses";
 /// A pipeline asked of a backend built without a compile pool.
 pub const NO_COMPILE_POOL: &str =
     "the wgpu backend was built without a compile pool and cannot build pipelines";
@@ -230,6 +251,28 @@ impl fmt::Display for SubgroupSupport {
                 "yes (the reported range is {GUEST_SUBGROUP_SIZE} to {GUEST_SUBGROUP_SIZE})"
             ),
             Self::Range { min, max } => write!(f, "no (the reported range is {min} to {max})"),
+        }
+    }
+}
+
+/// What the backend decides about subgroups when it opens (module docs, "Requirements"): whether
+/// the device meets "subgroup size 32", and whether it runs subgroup operations in vertex
+/// shaders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SubgroupVerdict {
+    /// Whether the device meets "subgroup size 32", and why.
+    pub(crate) support: SubgroupSupport,
+    /// Whether the device has `wgpu::Features::SUBGROUP_VERTEX`.
+    pub(crate) vertex: bool,
+}
+
+impl SubgroupVerdict {
+    /// The verdict for an adapter described by `info` whose device has `device_features` (the
+    /// device's, not the adapter's: the backend decides from what it was given).
+    pub(crate) fn of(info: &wgpu::AdapterInfo, device_features: wgpu::Features) -> Self {
+        Self {
+            support: SubgroupSupport::of(info, device_features),
+            vertex: device_features.contains(wgpu::Features::SUBGROUP_VERTEX),
         }
     }
 }
@@ -671,15 +714,24 @@ impl fmt::Debug for Compile {
     }
 }
 
-/// Refuses `shaders` that need subgroups of 32 when the device cannot promise them.
+/// Refuses `shaders` that need subgroups of 32 when the device cannot promise them
+/// ([`SUBGROUP_SIZE`]), then a vertex shader that uses subgroups when the device has none in
+/// vertex shaders ([`VERTEX_SUBGROUPS`]); module docs, "Requirements".
 pub(crate) fn check_requirements<'a>(
     shaders: impl IntoIterator<Item = &'a ShaderRec>,
-    subgroups: bool,
+    subgroups: SubgroupVerdict,
 ) -> Result<(), RenderError> {
-    if subgroups || !shaders.into_iter().any(ShaderRec::uses_subgroups) {
-        Ok(())
-    } else {
+    let (mut any, mut vertex) = (false, false);
+    for shader in shaders.into_iter().filter(|s| s.uses_subgroups()) {
+        any = true;
+        vertex |= shader.stage == ShaderStage::Vertex;
+    }
+    if any && !subgroups.support.honoured() {
         Err(RenderError::Unsupported(SUBGROUP_SIZE))
+    } else if vertex && !subgroups.vertex {
+        Err(RenderError::Unsupported(VERTEX_SUBGROUPS))
+    } else {
+        Ok(())
     }
 }
 

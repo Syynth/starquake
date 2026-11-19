@@ -27,6 +27,8 @@
 //! thread's encoder (slice R7). A pipeline whose shaders need subgroups of 32 is refused on a
 //! device that cannot promise them; an Apple GPU under Metal counts as promising them, although
 //! wgpu reports a range of 4 to 64 there ([`SubgroupSupport`], decided by the owner, 2026-11-19).
+//! A pipeline whose vertex shader uses subgroups is also refused on a device without subgroups in
+//! vertex shaders, which includes every Apple GPU under wgpu 30 ([`pipeline::VERTEX_SUBGROUPS`]).
 //! No driver cache blob is made: wgpu's is Vulkan only and needs an `unsafe` call ([`pipeline`],
 //! "Not here").
 //!
@@ -78,7 +80,9 @@
 //!   entry point of its name for its stage ([`pipeline::NO_ENTRY_POINT`]), or whose blocks nest
 //!   deeper than [`pipeline::MAX_SHADER_NESTING`] ([`pipeline::NESTING`]); a pipeline asked of a
 //!   backend without a compile pool ([`pipeline::NO_COMPILE_POOL`]), or with a shader that needs
-//!   subgroups of 32 on a device that cannot promise them ([`pipeline::SUBGROUP_SIZE`]); layouts
+//!   subgroups of 32 on a device that cannot promise them ([`pipeline::SUBGROUP_SIZE`]), or with a
+//!   vertex shader that uses subgroups on a device without them in vertex shaders
+//!   ([`pipeline::VERTEX_SUBGROUPS`]); layouts
 //!   where two stages bind one group and binding as different resources
 //!   ([`pipeline::layout::STAGE_CONFLICT`]), with a binding array whose size is not a constant
 //!   ([`pipeline::layout::UNSIZED_BINDING_ARRAY`]), with a 1D array texture
