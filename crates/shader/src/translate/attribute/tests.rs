@@ -13,7 +13,9 @@ use crate::decode::{
 use crate::interp::{Input, InterpError, Machine};
 use crate::ir::Function;
 use crate::sph::{Components, PixelIo};
-use crate::testing::{any_gpr, any_pred, any_pred_src, any_uniform_reg, any_unmodified_src, config};
+use crate::testing::{
+    any_gpr, any_pred, any_pred_src, any_uniform_reg, any_unmodified_src, config,
+};
 use crate::translate::{
     COLOR_TARGETS, ColorOutputs, GuestStage, REGISTER_LIMIT, Stage, TranslateError,
     translate as translate_program, translate_with_header,
@@ -242,7 +244,11 @@ fn ald_and_ast_move_each_word_count() {
             } else {
                 0
             };
-            assert_eq!(machine.regs[usize::from(20 + word)], expected, "{comps} words");
+            assert_eq!(
+                machine.regs[usize::from(20 + word)],
+                expected,
+                "{comps} words"
+            );
         }
 
         let ir = one(Op::ASt(ast(r(20), addr(base), comps))).expect("translates");
@@ -264,8 +270,11 @@ fn ald_and_ast_move_each_word_count() {
 #[test]
 fn ast_from_rz_stores_zero_for_every_word() {
     let ir = one(Op::ASt(ast(Gpr::RZ, addr(28), 4))).expect("translates");
-    let mut machine = Machine::default();
-    machine.regs = [u32::MAX; crate::interp::REG_SLOTS];
+    // Every register holds non-zero bits, so a store that read one would show it.
+    let mut machine = Machine {
+        regs: [u32::MAX; crate::interp::REG_SLOTS],
+        ..Machine::default()
+    };
     run(&ir, &mut machine);
     let written: Vec<_> = machine.outputs.into_iter().collect();
     let expected: Vec<_> = (28..32).map(|word| ((attr(word), 0), 0)).collect();
@@ -282,7 +291,9 @@ fn ipa_value(header: &PixelIo, op: OpIpa, word: u16, value: f32, w: f32) -> u32 
     assert_eq!(ir.verify(), Ok(()));
     let mut machine = Machine::default();
     machine.attributes.insert((attr(word), 0), f32_bits(value));
-    machine.attributes.insert((attr(POSITION_W), 0), f32_bits(w));
+    machine
+        .attributes
+        .insert((attr(POSITION_W), 0), f32_bits(w));
     run(&ir, &mut machine);
     machine.regs[usize::from(op.dst.index())]
 }
@@ -477,7 +488,10 @@ fn ipa_offset_is_carried_in_the_ir() {
     );
     // A value the test does not give is a missing input, naming the attribute and the offset.
     let mut machine = Machine::default();
-    let error = machine.run(&ir).map(|_| ()).expect_err("the value is not given");
+    let error = machine
+        .run(&ir)
+        .map(|_| ())
+        .expect_err("the value is not given");
     assert!(
         matches!(
             error,
@@ -515,7 +529,10 @@ fn ipa_checks_report_in_order() {
     let predicate = OpIpa { pred: p(1), ..base };
     let cases = [
         (offset_reg, AttributeRejection::IpaOffsetRegister(r(4))),
-        (centroid_offset_reg, AttributeRejection::IpaOffsetRegister(r(4))),
+        (
+            centroid_offset_reg,
+            AttributeRejection::IpaOffsetRegister(r(4)),
+        ),
         (state, AttributeRejection::IpaFrequency(InterpFreq::State)),
         (predicate, AttributeRejection::IpaPredicate(p(1))),
         (base, AttributeRejection::IpaNoHeader(attr(word))),
@@ -528,7 +545,10 @@ fn ipa_checks_report_in_order() {
             AttributeRejection::IpaOffsetRegister(r(4)),
         ),
         (
-            OpIpa { pred: p(1), ..state },
+            OpIpa {
+                pred: p(1),
+                ..state
+            },
             AttributeRejection::IpaFrequency(InterpFreq::State),
         ),
         (predicate, AttributeRejection::IpaPredicate(p(1))),
@@ -626,11 +646,11 @@ fn s2r_and_s2ur_read_each_special_register() {
         run(&ir, &mut machine);
         assert_eq!(machine.regs[7], value, "{sr}");
 
-        let s2ur = Op::S2R(OpS2R {
+        let uniform = Op::S2R(OpS2R {
             dst: S2RDst::Uniform(ur(9)),
             sr,
         });
-        let ir = one(s2ur).expect("translates");
+        let ir = one(uniform).expect("translates");
         let mut machine = system_machine(5);
         run(&ir, &mut machine);
         assert_eq!(machine.uniform_regs[9], value, "{sr} to ur9");
@@ -762,10 +782,16 @@ fn cs2r_reads_zero_into_one_or_two_registers() {
     machine.regs[usize::from(last_pair)] = 1;
     machine.regs[usize::from(last_pair) + 1] = 1;
     run(&ir, &mut machine);
-    assert_eq!(machine.regs[usize::from(last_pair)..=usize::from(last_pair) + 1], [0, 0]);
+    assert_eq!(
+        machine.regs[usize::from(last_pair)..=usize::from(last_pair) + 1],
+        [0, 0]
+    );
     for dst in [r(last_pair + 1), Gpr::RZ] {
         let op = cs2r(dst, SpecialReg::SRZ, true);
-        assert_eq!(one(op), rejected(op, AttributeRejection::Cs2rDestination(dst)));
+        assert_eq!(
+            one(op),
+            rejected(op, AttributeRejection::Cs2rDestination(dst))
+        );
         // One register is fine there.
         assert!(one(cs2r(dst, SpecialReg::SRZ, false)).is_ok());
     }
@@ -805,9 +831,15 @@ fn pixld_my_index_reads_the_sample_id() {
         assert_eq!(one(op), rejected(op, AttributeRejection::PixLdValue(val)));
     }
     let op = pixld(r(2), PixVal::MyIndex, p(4));
-    assert_eq!(one(op), rejected(op, AttributeRejection::PixLdPredicate(p(4))));
+    assert_eq!(
+        one(op),
+        rejected(op, AttributeRejection::PixLdPredicate(p(4)))
+    );
     let op = pixld(r(2), PixVal::CovMask, p(4));
-    assert_eq!(one(op), rejected(op, AttributeRejection::PixLdPredicate(p(4))));
+    assert_eq!(
+        one(op),
+        rejected(op, AttributeRejection::PixLdPredicate(p(4)))
+    );
 }
 
 /// `AL2P` adds the offset register to the address (Eden's Maxwell `AL2P`); the output bit
@@ -938,7 +970,10 @@ fn deferred_instructions_are_rejected_by_name() {
         use_c: false,
         ureg: UniformReg::URZ,
     });
-    assert_eq!(one(ldtram), rejected(ldtram, Unsupported::Instruction("ldtram")));
+    assert_eq!(
+        one(ldtram),
+        rejected(ldtram, Unsupported::Instruction("ldtram"))
+    );
 }
 
 /// Every rejection of the group reads as plain words.
@@ -1023,8 +1058,12 @@ fn pr_vertex_transform_attribute_words() {
     let ir = translate_program(vertex(), &[load, store, exit()]).expect("translates");
     for (x, y) in [(2.0_f32, 4.0_f32), (-4.0, 0.5)] {
         let mut machine = Machine::default();
-        machine.attributes.insert((attr(GENERIC_0_X), 0), f32_bits(x));
-        machine.attributes.insert((attr(GENERIC_0_X + 1), 0), f32_bits(y));
+        machine
+            .attributes
+            .insert((attr(GENERIC_0_X), 0), f32_bits(x));
+        machine
+            .attributes
+            .insert((attr(GENERIC_0_X + 1), 0), f32_bits(y));
         run(&ir, &mut machine);
         assert_eq!(
             machine.outputs.into_iter().collect::<Vec<_>>(),
@@ -1177,8 +1216,14 @@ fn any_group_op() -> impl Strategy<Value = Op> {
                 pred,
             })
         });
-    let al2p = (any_gpr(), any_gpr(), any::<u16>(), any::<u8>(), any::<bool>()).prop_map(
-        |(dst, offset, addr, comps, output)| {
+    let al2p = (
+        any_gpr(),
+        any_gpr(),
+        any::<u16>(),
+        any::<u8>(),
+        any::<bool>(),
+    )
+        .prop_map(|(dst, offset, addr, comps, output)| {
             Op::AL2P(OpAL2P {
                 dst,
                 offset,
@@ -1186,8 +1231,12 @@ fn any_group_op() -> impl Strategy<Value = Op> {
                 comps,
                 output,
             })
-        },
-    );
+        });
+    prop_oneof![ald, ast, ipa, al2p, any_system_value_op()]
+}
+
+/// Any system-value or geometry operation of the group, with arbitrary field values.
+fn any_system_value_op() -> impl Strategy<Value = Op> {
     let s2r = (
         prop_oneof![
             any_gpr().prop_map(S2RDst::Reg),
@@ -1215,22 +1264,28 @@ fn any_group_op() -> impl Strategy<Value = Op> {
             pred,
         })
     });
-    let out = (any_gpr(), any_gpr(), any_unmodified_src(), 0..=OutType::ALL.len()).prop_map(
-        |(dst, handle, stream, out_type)| match OutType::ALL.get(out_type) {
-            Some(&out_type) => Op::Out(OpOut {
-                dst,
-                handle,
-                stream,
-                out_type,
-            }),
-            None => Op::OutFinal(OpOutFinal {
-                dst,
-                handle,
-                stream,
-            }),
-        },
-    );
-    prop_oneof![ald, ast, ipa, al2p, s2r, cs2r, pixld, out]
+    let out = (
+        any_gpr(),
+        any_gpr(),
+        any_unmodified_src(),
+        0..=OutType::ALL.len(),
+    )
+        .prop_map(
+            |(dst, handle, stream, out_type)| match OutType::ALL.get(out_type) {
+                Some(&out_type) => Op::Out(OpOut {
+                    dst,
+                    handle,
+                    stream,
+                    out_type,
+                }),
+                None => Op::OutFinal(OpOutFinal {
+                    dst,
+                    handle,
+                    stream,
+                }),
+            },
+        );
+    prop_oneof![s2r, cs2r, pixld, out]
 }
 
 proptest! {

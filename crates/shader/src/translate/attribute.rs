@@ -143,7 +143,7 @@ pub enum AttributeRejection {
     /// pair destination", `dest + 1 < 255`).
     #[error("a cs2r.64 to {0}")]
     Cs2rDestination(Gpr),
-    /// `AL2P` of more than one word (Eden: "BitSize", `bitsize != BitSize::B32`).
+    /// `AL2P` of more than one word (Eden throws when `bitsize != BitSize::B32`).
     #[error("an al2p of {0} words")]
     Al2pWidth(u8),
     /// `PIXLD` with a predicate output (Eden: "Destination predicate").
@@ -212,7 +212,10 @@ enum Special {
 /// The value the PR's `S2R` reads for `sr`, or `None` when it reads none.
 fn special(sr: SpecialReg) -> Option<Special> {
     let component = |opcode, base: SpecialReg| {
-        Some(Special::Component(opcode, u32::from(sr.0.wrapping_sub(base.0))))
+        Some(Special::Component(
+            opcode,
+            u32::from(sr.0.wrapping_sub(base.0)),
+        ))
     };
     match sr {
         SpecialReg::LANE_ID => Some(Special::Op(Opcode::LaneId)),
@@ -254,9 +257,8 @@ fn generic_is_perspective(map: [PixelImap; 4]) -> bool {
 
 /// The group's translator: translates `op` when it is one of the group's, else `None`.
 pub(super) fn translate(t: &mut Translator<'_>, op: Op) -> Option<Result<(), Failure>> {
-    let deferred = |mnemonic, deferral| {
-        Err(AttributeRejection::Deferred { mnemonic, deferral }.into())
-    };
+    let deferred =
+        |mnemonic, deferral| Err(AttributeRejection::Deferred { mnemonic, deferral }.into());
     Some(match op {
         Op::ALd(op) => t.ald(op),
         Op::ASt(op) => t.ast(op),
@@ -338,7 +340,11 @@ impl Translator<'_> {
             let attribute = Attribute(first.saturating_add(u16::from(element)));
             self.op(
                 Opcode::SetAttribute,
-                &[Operand::Imm(Imm::Attribute(attribute)), value.into(), vertex],
+                &[
+                    Operand::Imm(Imm::Attribute(attribute)),
+                    value.into(),
+                    vertex,
+                ],
             )?;
         }
         Ok(())
@@ -468,7 +474,10 @@ impl Translator<'_> {
 
     /// `PIXLD.MY_INDEX`: the sample's index.
     fn pixld(&mut self, op: OpPixLd) -> Result<(), Failure> {
-        require_attr(op.pred.is_true(), AttributeRejection::PixLdPredicate(op.pred))?;
+        require_attr(
+            op.pred.is_true(),
+            AttributeRejection::PixLdPredicate(op.pred),
+        )?;
         require_attr(
             op.val == PixVal::MyIndex,
             AttributeRejection::PixLdValue(op.val),

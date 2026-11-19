@@ -823,6 +823,9 @@ impl Run<'_> {
         if let Handled::Done(effect) = self.io(&args, opcode)? {
             return Ok(effect);
         }
+        if let Handled::Done(effect) = self.masks_and_offsets(&args, opcode)? {
+            return Ok(effect);
+        }
         let value = match float_op(&args, op)? {
             Some(value) => Some(value),
             None => match bits_op(&args, opcode)? {
@@ -1038,30 +1041,6 @@ impl Run<'_> {
             O::IsHelperInvocation => Val::U1(machine.system.is_helper || machine.demoted),
             O::YDirection => Val::F32(machine.system.y_direction),
             O::LaneId => Val::U32(machine.system.lane_id),
-            O::SubgroupEqMask => Val::U32(lane_masks(machine.system.lane_id).0),
-            O::SubgroupLtMask => Val::U32(lane_masks(machine.system.lane_id).1),
-            O::SubgroupLeMask => {
-                let (equal, below) = lane_masks(machine.system.lane_id);
-                Val::U32(below | equal)
-            }
-            O::SubgroupGtMask => {
-                let (equal, below) = lane_masks(machine.system.lane_id);
-                Val::U32(!(below | equal))
-            }
-            O::SubgroupGeMask => Val::U32(!lane_masks(machine.system.lane_id).1),
-            O::InterpolateAtOffset => {
-                let attribute = args.attribute(0)?;
-                let offset = args.u32(1)?;
-                let bits = machine
-                    .interpolated
-                    .get(&(attribute, offset))
-                    .copied()
-                    .ok_or(InterpError::MissingInput {
-                        at,
-                        input: Input::Interpolated { attribute, offset },
-                    })?;
-                Val::F32(bits)
-            }
 
             O::LoadLocal => {
                 let word = args.u32(0)?;
@@ -1080,6 +1059,36 @@ impl Run<'_> {
                     None => return Err(local_out_of_bounds(at, word, len)),
                 }
                 return Ok(Handled::Done(None));
+            }
+            _ => return Ok(Handled::Not),
+        };
+        Ok(Handled::Done(Some(value)))
+    }
+
+    /// The lane masks and the interpolation at an offset (see the module docs): whether the
+    /// opcode is one of them and, if so, its value.
+    fn masks_and_offsets(&mut self, args: &Args, opcode: Opcode) -> Result<Handled, InterpError> {
+        use Opcode as O;
+        let machine = &*self.machine;
+        let (equal, below) = lane_masks(machine.system.lane_id);
+        let value = match opcode {
+            O::SubgroupEqMask => Val::U32(equal),
+            O::SubgroupLtMask => Val::U32(below),
+            O::SubgroupLeMask => Val::U32(below | equal),
+            O::SubgroupGtMask => Val::U32(!(below | equal)),
+            O::SubgroupGeMask => Val::U32(!below),
+            O::InterpolateAtOffset => {
+                let attribute = args.attribute(0)?;
+                let offset = args.u32(1)?;
+                let bits = machine
+                    .interpolated
+                    .get(&(attribute, offset))
+                    .copied()
+                    .ok_or(InterpError::MissingInput {
+                        at: args.at,
+                        input: Input::Interpolated { attribute, offset },
+                    })?;
+                Val::F32(bits)
             }
             _ => return Ok(Handled::Not),
         };

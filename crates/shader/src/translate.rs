@@ -19,8 +19,12 @@
 //! instead (`visitor.cpp`, `Visitor::Run`: `guard_select`) and makes only a guarded side effect
 //! its own conditional block (`flow.cpp`: "Guarded side effect: becomes its own conditional
 //! block"); the two give the same registers, since the block that does not run leaves them as
-//! the select's other side does. Pinned by `tests::guarded_instructions_become_conditional_blocks`
-//! and `tests::never_guarded_instructions_are_skipped`.
+//! the select's other side does. The guard of a uniform datapath instruction names a uniform
+//! predicate (the PR's `classify.h`, `OpInfo::uniform`, which `flow`'s `classify` mirrors by
+//! opcode); of the operations translated so far that is `S2UR` alone, whose guard reads
+//! `GetUniformPred`. Pinned by `tests::guarded_instructions_become_conditional_blocks`,
+//! `tests::a_guarded_s2ur_reads_a_uniform_predicate`, `tests::a_guarded_exit_is_rejected` and
+//! `tests::never_guarded_instructions_are_skipped`.
 //!
 //! Slice 1 handles linear flow only (spec, port slice 1). Where starquake is stricter than the
 //! PR, because the PR resolves the case in a part not built yet:
@@ -249,12 +253,12 @@ pub fn translate_with_header(
     header: &PixelIo,
     program: &[Instr],
 ) -> Result<Function, TranslateError> {
-    translate_inner(stage, Some(*header), program)
+    translate_inner(stage, Some(header), program)
 }
 
 fn translate_inner(
     stage: Stage,
-    header: Option<PixelIo>,
+    header: Option<&PixelIo>,
     program: &[Instr],
 ) -> Result<Function, TranslateError> {
     if !matches!(stage.stage, GuestStage::Vertex | GuestStage::Pixel) {
@@ -265,7 +269,7 @@ fn translate_inner(
     let mut t = Translator {
         b: Builder::new(&mut function, entry),
         stage,
-        header,
+        header: header.copied(),
     };
     for (index, instr) in program.iter().enumerate() {
         let fail = |what| TranslateError::Unsupported {
@@ -381,9 +385,10 @@ const fn uniform_guard(op: Op) -> bool {
 /// when negated (PR #4588's `UPred`); `UPT` is the immediate.
 fn read_uniform_guard(b: &mut Builder<'_>, guard: PredSrc) -> Result<Operand, TranslateError> {
     let value = match UniformPred::new(guard.reg.index()) {
-        Some(pred) if !pred.is_true() => {
-            b.op(Opcode::GetUniformPred, &[Operand::Imm(Imm::UniformPred(pred))])?
-        }
+        Some(pred) if !pred.is_true() => b.op(
+            Opcode::GetUniformPred,
+            &[Operand::Imm(Imm::UniformPred(pred))],
+        )?,
         _ => return Ok(Operand::Imm(Imm::U1(!guard.negated))),
     };
     if !guard.negated {

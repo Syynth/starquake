@@ -249,11 +249,9 @@ fn s2ur_writes_the_uniform_register() {
 #[test]
 fn guarded_instructions_become_conditional_blocks() {
     let p2 = Pred::new(2).expect("p2");
-    let guarded = |negated| {
-        Instr {
-            guard: PredSrc { reg: p2, negated },
-            ..mov(r(0), MovSrc::Imm(7))
-        }
+    let guarded = |negated| Instr {
+        guard: PredSrc { reg: p2, negated },
+        ..mov(r(0), MovSrc::Imm(7))
     };
     let ir = translate(VERTEX, &[guarded(false), mov(r(1), MovSrc::Imm(9)), exit()])
         .expect("translates");
@@ -291,7 +289,11 @@ fn guarded_instructions_become_conditional_blocks() {
             machine.preds[usize::from(p2.index())] = p;
             machine.run(&ir).expect("runs");
             let runs = p != negated;
-            assert_eq!(machine.regs[0], if runs { 7 } else { 3 }, "p2 {p}, negated {negated}");
+            assert_eq!(
+                machine.regs[0],
+                if runs { 7 } else { 3 },
+                "p2 {p}, negated {negated}"
+            );
         }
     }
     // A side effect too: the attribute is written only when the guard holds.
@@ -308,7 +310,10 @@ fn guarded_instructions_become_conditional_blocks() {
         machine.preds[usize::from(p2.index())] = p;
         machine.regs[0] = 1.5_f32.to_bits();
         machine.run(&ir).expect("runs");
-        let written = machine.outputs.get(&(crate::ir::Attribute(0x20), 0)).copied();
+        let written = machine
+            .outputs
+            .get(&(crate::ir::Attribute(0x20), 0))
+            .copied();
         assert_eq!(written, p.then_some(1.5_f32.to_bits()));
     }
 }
@@ -374,15 +379,18 @@ fn a_guarded_s2ur_reads_a_uniform_predicate() {
         machine.run(&ir).expect("runs");
         assert_eq!(machine.uniform_regs[1], if up { 0 } else { 6 });
     }
-    let s2r = Instr {
+    let per_thread = Instr {
         guard,
         op: Op::S2R(OpS2R {
             dst: S2RDst::Reg(r(1)),
             sr: SpecialReg::LANE_ID,
         }),
     };
-    let ir = one(s2r).expect("translates");
-    assert!(ir.to_string().starts_with("block0:\n    %0: u1 = GetPred p3\n"));
+    let ir = one(per_thread).expect("translates");
+    assert!(
+        ir.to_string()
+            .starts_with("block0:\n    %0: u1 = GetPred p3\n")
+    );
 }
 
 /// `@!PT` never runs: it translates to nothing, as the PR skips it (`Visitor::Run`,
