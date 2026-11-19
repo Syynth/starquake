@@ -1003,7 +1003,6 @@ passed to build agents as a provisional rule for the next wave.
 - Encodings come from a cited reference; conflicts and skipped paths are divergence rows with tests.
 - A timing test runs at low priority (`taskpolicy -c utility` on macOS) before it is trusted on a hosted runner.
 
-
 ### From waves 44 and 45 (ledger: #22)
 
 - Every pass that rewrites IR is total over unreachable code, and refusals happen before any state changes.
