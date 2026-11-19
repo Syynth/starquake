@@ -3,27 +3,22 @@
 //! and the relative branch offsets (from bit 34), plus the few control-instruction bits
 //! `ProgramCaptureState::Observe` compares.
 //!
-//! Every position is named once here, or in the decoder where it already is ([`OPCODE`],
-//! [`GUARD`], [`GUARD_NOT`] and `EXIT`'s fields), and shared by the scan and the tests' encoder.
-//! The values are PR #4588's: `eden-pr4588/src/shader_recompiler/frontend/ampere/
-//! program_capture.h` @ e5fb3b97 (`Observe`), `instruction.h` (`RelativeOffset48`) and the
-//! opcode rows of `ampere_isa_table.h`. The decoder slice for control instructions (6h) decodes
-//! these instructions fully; it should take its opcodes and offset fields from here, or this
-//! module from it, so each stays named once.
+//! Every position is named once. The decoder names the opcode ([`OPCODE`]), the guard
+//! ([`GUARD`], [`GUARD_NOT`]) and, in its control group (slice 6h, `decode::op::control`), the
+//! opcodes of `CALL`, `BSSY`, `BRA`, `RET` and `EXIT`, the branch offset fields
+//! ([`BRANCH_OFFSET`], [`BSSY_OFFSET`]), the control predicate ([`COND`], [`COND_NOT`]) and
+//! `EXIT`'s mode bits; this module imports them. It names only what `Observe` reads and the
+//! decoder does not: the low two displacement bits and `BRA.DIV`'s mode bits. The scan and the
+//! tests' encoder share all of them. The values are PR #4588's: `eden-pr4588/src/
+//! shader_recompiler/frontend/ampere/program_capture.h` @ e5fb3b97 (`Observe`), `instruction.h`
+//! (`RelativeOffset48`) and the opcode rows of `ampere_isa_table.h`; the capture tests pin each
+//! one against those literals.
 
 use crate::decode::{
-    EXIT_KEEP_REF_COUNT, EXIT_NO_AT_EXIT, EXIT_OPCODE, EXIT_PRED, EXIT_PRED_NOT, Field, GUARD,
-    GUARD_NOT, Instruction, OPCODE, Pred,
+    BRA_OPCODE, BRANCH_OFFSET, BSSY_OFFSET, BSSY_OPCODE, BranchOffset, CALL_OPCODE, COND, COND_NOT,
+    EXIT_KEEP_REF_COUNT, EXIT_NO_AT_EXIT, EXIT_OPCODE, Field, GUARD, GUARD_NOT, Instruction,
+    OPCODE, Pred, RET_OPCODE,
 };
-
-/// `CALL` (`ampere_isa_table.h`: `{0x944, {"CALL", ..}}`; `Observe`: `opcode == 0x944`).
-pub(crate) const CALL_OPCODE: u16 = 0x944;
-/// `BSSY` (`ampere_isa_table.h`: `{0x945, {"BSSy", ..}}`; `Observe`: `opcode == 0x945`).
-pub(crate) const BSSY_OPCODE: u16 = 0x945;
-/// `BRA` (`ampere_isa_table.h`: `{0x947, {"Bra", ..}}`; `Observe`: `opcode == 0x947`).
-pub(crate) const BRA_OPCODE: u16 = 0x947;
-/// `RET` (`ampere_isa_table.h`: `{0x950, {"RET", ..}}`; `Observe`: `opcode == 0x950`).
-pub(crate) const RET_OPCODE: u16 = 0x950;
 
 /// The low two bits of a relative branch's byte displacement. `Observe` reads the displacement
 /// of `CALL` and `BRA` as bits 32..82 whole (`words[1] | (words[2] & 0x3ffff) << 32`) and of
@@ -31,13 +26,6 @@ pub(crate) const RET_OPCODE: u16 = 0x950;
 /// displacement with either set is not a whole instruction and is refused. `BRA.DIV` keeps two
 /// mode bits here instead ([`BRA_DIV_LOW`]).
 pub(crate) const BRANCH_LOW: Field = Field::new(32, 2);
-/// The relative offset of `CALL` and `BRA`: a signed count of 32-bit words, 48 bits from bit 34
-/// (`instruction.h`, `RelativeOffset48`: `words[1] & ~3U | (words[2] & 0x3ffffU) << 32`, sign
-/// extended from bit 49 of that value).
-pub(crate) const BRANCH_OFFSET: Field = Field::new(34, 48);
-/// `BSSY`'s relative offset: a signed count of 32-bit words, the 30 bits from bit 34 to the end
-/// of the second word (`Observe`: `static_cast<s32>(instruction.words[1])`).
-pub(crate) const BSSY_OFFSET: Field = Field::new(34, 30);
 /// The bits from the end of [`BRANCH_OFFSET`] to the end of the third word, which `Observe`
 /// compares whole to recognise `BRA.DIV` (`(instruction.words[2] & ~0x3ffffU) == 0x0b800000U`).
 pub(crate) const BRANCH_MODE: Field = Field::new(82, 14);
@@ -48,10 +36,6 @@ pub(crate) const BRA_DIV_MODE: u64 = 0x0b80_0000 >> (BRANCH_MODE.start - 64);
 /// [`BRANCH_LOW`] of a `BRA.DIV`: both mode bits set (`(instruction.words[1] & 3) == 3`), which
 /// `Observe` subtracts from the displacement (`- (divergence ? 3 : 0)`).
 pub(crate) const BRA_DIV_LOW: u64 = 3;
-
-/// Bytes per unit of a relative offset: offsets count 32-bit words (`instruction.h`: "expressed
-/// in 32-bit words").
-pub(crate) const OFFSET_UNIT: i64 = 4;
 
 /// The instruction's 12-bit opcode.
 pub(crate) fn opcode(word: Instruction) -> u16 {
@@ -77,7 +61,7 @@ pub(crate) fn always_runs(word: Instruction) -> bool {
 pub(crate) fn is_final_exit(word: Instruction) -> bool {
     opcode(word) == EXIT_OPCODE
         && always_runs(word)
-        && is_always(word, EXIT_PRED, EXIT_PRED_NOT)
+        && is_always(word, COND, COND_NOT)
         && !word.flag(EXIT_KEEP_REF_COUNT)
         && !word.flag(EXIT_NO_AT_EXIT)
 }
@@ -105,7 +89,7 @@ pub(crate) fn branch_displacement(word: Instruction) -> Option<i64> {
         && word.field(BRANCH_MODE) == BRA_DIV_MODE
         && word.field(BRANCH_LOW) == BRA_DIV_LOW;
     // Never saturates: the offset is at most 48 bits, so four times it plus three fits.
-    let bytes = words.saturating_mul(OFFSET_UNIT);
+    let bytes = words.saturating_mul(BranchOffset::WORD_BYTES);
     Some(if divergence {
         bytes
     } else {

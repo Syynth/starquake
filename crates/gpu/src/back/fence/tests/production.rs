@@ -77,6 +77,38 @@ fn a_release_to_the_shim_increments_its_syncpoint_after_its_list_completes() {
     assert_eq!(u32::from_le_bytes(word), 1);
 }
 
+/// A release to the shim latches its waiters with the words read back after the write (the
+/// counter's new value), not with its payload: the wiring note of slice G19 ("read the words back
+/// through memory after the write").
+#[test]
+fn a_release_to_the_shim_latches_with_the_counter_it_reads_back() {
+    let mut r = rig();
+    let (_vm, mem) = production(&r);
+    let address = SHIM + 9 * SHIM_STRIDE;
+    // Waits for the counter to reach 1; the payload is not 1, so latching on the payload words
+    // would leave the channel parked.
+    r.waiters.register(Waiter {
+        space: SPACE,
+        channel: ChannelId(5),
+        address,
+        op: AcquireOp::Equal,
+        payload: 1,
+    });
+    let release = FencedAction::Release {
+        memory: Arc::<VmMemory<FlatMemory>>::clone(&mem),
+        space: SPACE,
+        release: four(address, 0xdead_beef),
+    };
+    // Nothing in flight: the release is performed at once.
+    let attached = r.fences.attach(release);
+    assert!(
+        matches!(&attached, Ok(Attached::Performed(report)) if report.latched),
+        "{attached:?}"
+    );
+    assert!(r.waiters.is_latched(ChannelId(5)));
+    assert_eq!(r.syncpoints.read(syncpoint(9)), 1);
+}
+
 #[test]
 fn a_release_the_shim_cannot_take_is_reported_and_increments_nothing() {
     let mut r = rig();
@@ -114,6 +146,7 @@ fn a_sparse_region_destroy_frees_its_store_only_once_its_marker_is_performed() {
         token: MarkerToken(3),
         ordered: Some(OrderedUpdate {
             change: Some(VmChange {
+                space: SPACE,
                 vm: Arc::clone(&vm),
                 update: VmUpdate::DestroySparseRegion {
                     range: PageRange::new(SPARSE, SPARSE_PAGES * PAGE_SIZE).unwrap(),

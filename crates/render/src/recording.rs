@@ -89,7 +89,6 @@ use crate::backend::{
     Readback, WaitOutcome,
 };
 use crate::caps::Caps;
-use crate::capture::Capture;
 use crate::command::{CommandList, PresentTransform, StagingSlice};
 use crate::error::RenderError;
 use crate::format::PixelFormat;
@@ -101,7 +100,7 @@ use crate::id::{
 use crate::pipeline::{ComputePipelineDesc, GraphicsPipelineDesc};
 use crate::resource::{BufferDesc, SamplerDesc, TextureDesc, ViewDesc};
 use crate::shader::{ShaderDesc, ShaderStage};
-use crate::validate;
+use crate::validate::{self, NO_PIPELINE};
 use crate::wake::CompletionWake;
 use plan::{Op, Place};
 use slots::Slots;
@@ -249,8 +248,6 @@ const NO_BUFFER: &str = "no live buffer has this id";
 const NO_TEXTURE: &str = "no live texture has this id";
 const NO_VIEW: &str = "no live view has this id";
 const NO_SAMPLER: &str = "no live sampler has this id";
-const NO_SHADER: &str = "no live shader has this id";
-const NO_PIPELINE: &str = "no live pipeline has this id";
 
 /// The block layout of `desc`'s mip level `mip`.
 fn level_shape(desc: &TextureDesc, mip: u32) -> Result<LevelShape, RenderError> {
@@ -293,7 +290,7 @@ impl State {
         self.shaders
             .get(id.index(), id.generation())
             .map(|s| s.stage)
-            .ok_or(gone(NO_SHADER))
+            .ok_or(gone(validate::NO_SHADER))
     }
 
     fn is_live(&self, id: ResourceId) -> bool {
@@ -460,22 +457,13 @@ fn readback(packed: Packed) -> Readback {
         .map_or(Readback::Unknown, Readback::Bytes)
 }
 
-/// Bytes a texture's host object takes: every level, every sample.
+/// Bytes a texture's host object takes ([`validate::texture_size`]: every level, every sample),
+/// and one store per mip level.
 fn texture_bytes(desc: &TextureDesc) -> Result<(u64, Vec<Store>), RenderError> {
-    let mut total: u64 = 0;
-    let mut levels = Vec::new();
-    for mip in 0..desc.mip_levels {
-        let len = level_shape(desc, mip)?.len()?;
-        let bytes = u64::try_from(len)
-            .ok()
-            .and_then(|b| b.checked_mul(desc.sample_count.into()))
-            .ok_or(RenderError::Overflow {
-                what: "texture size",
-            })?;
-        total = total.saturating_add(bytes);
-        levels.push(Store::new(len));
-    }
-    Ok((total, levels))
+    let levels = (0..desc.mip_levels)
+        .map(|mip| level_shape(desc, mip)?.len().map(Store::new))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((validate::texture_size(desc)?, levels))
 }
 
 impl RecordingBackend {
@@ -518,12 +506,6 @@ impl RecordingBackend {
                 _ => None,
             })
             .collect()
-    }
-
-    /// Every list submitted so far, as a [`Capture`] ready to be written out: what
-    /// [`RecordingBackend::lists`] returns. Refused lists are not in it.
-    pub fn capture(&self) -> Capture {
-        Capture::new(self.lists())
     }
 
     /// Makes [`Backend::pipeline_status`] for `id` report `steps` in turn, one per call, then
@@ -729,40 +711,7 @@ impl Backend for RecordingBackend {
     ) -> Result<PipelineId, RenderError> {
         validate::validate_graphics_pipeline(&self.caps, &desc)?;
         let mut state = self.state();
-        let s = &desc.stages;
-        for (id, stage, wrong) in [
-            (
-                Some(s.vertex),
-                ShaderStage::Vertex,
-                "a pipeline's vertex shader is not a vertex shader",
-            ),
-            (
-                s.tess_control,
-                ShaderStage::TessControl,
-                "a pipeline's tessellation control shader is not one",
-            ),
-            (
-                s.tess_eval,
-                ShaderStage::TessEval,
-                "a pipeline's tessellation evaluation shader is not one",
-            ),
-            (
-                s.geometry,
-                ShaderStage::Geometry,
-                "a pipeline's geometry shader is not a geometry shader",
-            ),
-            (
-                s.fragment,
-                ShaderStage::Fragment,
-                "a pipeline's fragment shader is not a fragment shader",
-            ),
-        ] {
-            if let Some(id) = id
-                && state.shader_stage(id)? != stage
-            {
-                return Err(RenderError::Invalid(wrong));
-            }
-        }
+        validate::validate_pipeline_stages(&desc.stages, |id| state.shader_stage(id))?;
         let line = snapshot::graphics_pipeline(&desc);
         let (index, generation) = state.pipelines.insert(PipelineRec {
             kind: PipelineKind::Graphics,
@@ -780,11 +729,7 @@ impl Backend for RecordingBackend {
         desc: ComputePipelineDesc,
     ) -> Result<PipelineId, RenderError> {
         let mut state = self.state();
-        if state.shader_stage(desc.shader)? != ShaderStage::Compute {
-            return Err(RenderError::Invalid(
-                "a compute pipeline's shader is not a compute shader",
-            ));
-        }
+        validate::validate_compute_stage(&desc, |id| state.shader_stage(id))?;
         let (index, generation) = state.pipelines.insert(PipelineRec {
             kind: PipelineKind::Compute,
             script: VecDeque::new(),

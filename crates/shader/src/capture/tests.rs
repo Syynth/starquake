@@ -5,18 +5,16 @@ use std::cell::Cell;
 
 use proptest::prelude::*;
 
-use super::layout::{
-    BRA_DIV_LOW, BRA_DIV_MODE, BRA_OPCODE, BRANCH_LOW, BRANCH_MODE, BRANCH_OFFSET, BSSY_OFFSET,
-    BSSY_OPCODE, CALL_OPCODE, OFFSET_UNIT, RET_OPCODE, branch_displacement,
-};
+use super::layout::{BRA_DIV_LOW, BRA_DIV_MODE, BRANCH_LOW, BRANCH_MODE, branch_displacement};
 use super::scan::{Scan, Step, branch_target};
 use super::{
     Capture, CaptureError, ContentHash, Extension, JumpTables, MAX_INSTRUCTIONS, ProgramReader,
     Unreadable, capture, header_bytes, table_entry,
 };
 use crate::decode::{
-    EXIT_KEEP_REF_COUNT, EXIT_NO_AT_EXIT, EXIT_OPCODE, EXIT_PRED, EXIT_PRED_NOT, Field, GUARD,
-    GUARD_NOT, Instruction, OPCODE, Pred,
+    BRA_OPCODE, BRANCH_OFFSET, BSSY_OFFSET, BSSY_OPCODE, BranchOffset, CALL_OPCODE, COND, COND_NOT,
+    EXIT_KEEP_REF_COUNT, EXIT_NO_AT_EXIT, EXIT_OPCODE, Field, GUARD, GUARD_NOT, Instruction,
+    OPCODE, Pred, RET_OPCODE,
 };
 use crate::sph::HEADER_BYTES;
 use crate::testing::config;
@@ -56,7 +54,7 @@ fn filler() -> Instruction {
 
 /// An `EXIT` that ends the program where the rules allow.
 fn exit() -> Instruction {
-    guarded(EXIT_OPCODE, PT).with_field(EXIT_PRED, u64::from(PT))
+    guarded(EXIT_OPCODE, PT).with_field(COND, u64::from(PT))
 }
 
 /// A `RET` whose guard is `PT`.
@@ -72,8 +70,14 @@ fn branch_by(opcode: u16, guard: u8, bytes: i64) -> Instruction {
         BRANCH_OFFSET
     };
     guarded(opcode, guard)
-        .with_field(offset, bytes.div_euclid(OFFSET_UNIT).cast_unsigned())
-        .with_field(BRANCH_LOW, bytes.rem_euclid(OFFSET_UNIT).cast_unsigned())
+        .with_field(
+            offset,
+            bytes.div_euclid(BranchOffset::WORD_BYTES).cast_unsigned(),
+        )
+        .with_field(
+            BRANCH_LOW,
+            bytes.rem_euclid(BranchOffset::WORD_BYTES).cast_unsigned(),
+        )
 }
 
 /// The displacement from the end of instruction `from` to instruction `to`.
@@ -177,8 +181,8 @@ fn layout_matches_the_reference() {
     assert_eq!(GUARD_NOT, Field::new(15, 1));
     assert_eq!(PT, 7);
     // `Bits(87, 4) == 7` and `!Bits(84, 2)`.
-    assert_eq!(EXIT_PRED, Field::new(87, 3));
-    assert_eq!(EXIT_PRED_NOT, Field::new(90, 1));
+    assert_eq!(COND, Field::new(87, 3));
+    assert_eq!(COND_NOT, Field::new(90, 1));
     assert_eq!(EXIT_KEEP_REF_COUNT, Field::new(84, 1));
     assert_eq!(EXIT_NO_AT_EXIT, Field::new(85, 1));
     // `words[1] | (words[2] & 0x3ffff) << 32`: bits 32..82, the low two below the offset.
@@ -189,7 +193,7 @@ fn layout_matches_the_reference() {
     let div = Instruction::default().with_field(BRANCH_MODE, BRA_DIV_MODE);
     assert_eq!(div.bits() >> 64, 0x0b80_0000);
     assert_eq!(BRA_DIV_LOW, 3);
-    assert_eq!(OFFSET_UNIT, 4);
+    assert_eq!(BranchOffset::WORD_BYTES, 4);
     assert_eq!(MAX_INSTRUCTIONS, 65_536);
     assert_eq!(header_bytes(GuestStage::Compute), 0);
     for stage in GRAPHICS {
@@ -449,8 +453,8 @@ fn exit_predicate_must_be_pt() {
     for pred in 0..16_u8 {
         let expected = if pred == PT { 1 } else { 2 };
         let word = exit()
-            .with_field(EXIT_PRED, u64::from(pred & 7))
-            .with_flag(EXIT_PRED_NOT, pred & 8 != 0);
+            .with_field(COND, u64::from(pred & 7))
+            .with_flag(COND_NOT, pred & 8 != 0);
         assert_eq!(captured(&[word, exit()]), expected, "predicate {pred}");
     }
 }

@@ -219,6 +219,7 @@ pub fn shader(b: &RecordingBackend, stage: ShaderStage) -> ShaderId {
         entry: "main".to_owned(),
         source: ShaderSource::SpirV(vec![0x0723_0203]),
         interface: ShaderInterface::default(),
+        origin: None,
     }))
 }
 

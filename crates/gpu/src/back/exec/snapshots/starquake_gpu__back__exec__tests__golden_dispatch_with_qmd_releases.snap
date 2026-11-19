@@ -1,0 +1,10 @@
+---
+source: crates/gpu/src/back/exec/tests.rs
+expression: snapshot
+---
+create sh0: shader compute "main", naga module (0 functions, 1 entry points), resources [ResourceBinding { group: 0, binding: 0, kind: UniformBuffer }], inputs [], outputs []
+create b0: buffer 4096 bytes, usage VERTEX|INDEX|UNIFORM|STORAGE|INDIRECT|COPY_SRC|COPY_DST
+create p0: compute pipeline of sh0
+submit fence 1:
+  upload 4096 bytes fnv1a 0x2d8ec6c0c86ec1c8 to b0[0..4096]
+  dispatch p0 2x3x1 groups, bindings [0:0=b0[0..64]]

@@ -5,9 +5,9 @@
 //! The state is three values, so each step is constant time and the scan is linear in the
 //! program's length (row 121).
 
-use super::layout::{CALL_OPCODE, always_runs, branch_displacement, is_final_exit, is_final_ret};
+use super::layout::{always_runs, branch_displacement, is_final_exit, is_final_ret};
 use super::{CaptureError, MAX_INSTRUCTIONS};
-use crate::decode::Instruction;
+use crate::decode::{CALL_OPCODE, Instruction};
 
 /// What one instruction tells the scan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

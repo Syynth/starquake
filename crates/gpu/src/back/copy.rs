@@ -16,7 +16,9 @@
 //!   trace, confirms it).
 //!
 //! These are the CPU paths. When the texture cache (slice G17) holds a surface, the spec turns a
-//! copy or blit into a host command instead; that choice joins with the executor (G19). Every
+//! copy or blit into a host command instead; that is not built: the executor (G19,
+//! `back::exec`) writes such an image back before the CPU copy reads it, as its module docs
+//! say ("Copies of images the texture cache holds"). Every
 //! block-linear byte offset comes from the layout crate ([`starquake_layout`]; decision 5), and
 //! the shared walker ([`surface`]) is the one place that turns a region into GPU addresses.
 //!

@@ -1,468 +1,390 @@
-//! The capture file: golden bytes, round trips, and every way a file is refused.
+//! Render capture v2: golden bytes for every record kind, every reading check and its order,
+//! every bound at its edge, a generated round trip, the capturing backend and replay.
 
-use super::{Capture, CaptureError, CapturedList, MAGIC, VERSION};
-use crate::command::tests::{GOLDEN, every_command, every_command_from, hex};
-use crate::command::{Command, CommandList, Marker};
-use crate::id::FenceValue;
-use proptest::prelude::*;
-use proptest::test_runner::{Config, RngSeed};
+mod bounds;
+mod golden;
+mod read;
+mod replay;
+mod roundtrip;
+mod wrap;
+mod writer;
 
-/// The bytes a hex string stands for.
-fn unhex(text: &str) -> Vec<u8> {
-    (0..text.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).expect("hex"))
-        .collect()
-}
+use super::{
+    CaptureBuffer, CaptureError, CaptureLimits, CaptureReader, CaptureSink, CaptureWriter, Record,
+    Start, WaitSetting,
+};
+use crate::backend::{
+    Backend, MemoryBudget, PipelineStatus, PresentFeedback, PresentTarget, Readback, WaitOutcome,
+};
+use crate::caps::{
+    Caps, DynamicState, Features, FormatFeatures, FormatTable, Limits, SampleCounts, StageSupport,
+};
+use crate::command::{CommandList, StagingSlice};
+use crate::error::RenderError;
+use crate::format::PixelFormat;
+use crate::id::{
+    BufferId, FenceValue, PipelineId, ReadbackId, ResourceId, SamplerId, ShaderId, TextureId,
+    ViewId,
+};
+use crate::pipeline::{ComputePipelineDesc, GraphicsPipelineDesc};
+use crate::recording::RecordingBackend;
+use crate::resource::{
+    AddressMode, BorderColor, BufferDesc, Extent3d, FilterMode, ReductionMode, SamplerDesc,
+    Swizzle, TextureDesc, TextureDimension, TextureUsage, ViewDesc, ViewDimension,
+};
+use crate::shader::{ShaderDesc, ShaderInterface, ShaderOrigin, ShaderSource, ShaderStage};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-fn marker(submit: u64, draw: u64) -> CommandList {
-    CommandList {
-        commands: vec![Command::Marker(Marker { submit, draw })],
+/// A device with room for what the tests make.
+pub(super) fn caps() -> Caps {
+    Caps {
+        limits: Limits {
+            max_buffer_size: 1 << 16,
+            max_staging_size: 1 << 12,
+            max_texture_dimension_1d: 256,
+            max_texture_dimension_2d: 256,
+            max_texture_dimension_3d: 64,
+            max_texture_array_layers: 8,
+            max_sampler_anisotropy: 16,
+            max_vertex_attributes: 16,
+            max_vertex_buffers: 8,
+            max_vertex_buffer_stride: 2048,
+            max_color_attachments: 8,
+            max_viewports: 4,
+            max_bind_groups: 4,
+            max_bindings_per_bind_group: 16,
+            max_compute_workgroups_per_dimension: 65_535,
+            max_uniform_buffers_per_stage: 12,
+            max_storage_buffers_per_stage: 8,
+            max_sampled_textures_per_stage: 16,
+            max_storage_textures_per_stage: 4,
+            max_samplers_per_stage: 16,
+        },
+        features: Features::ALL,
+        stages: StageSupport::ALL,
+        dynamic_state: DynamicState::ALL,
+        sample_counts: SampleCounts::X1,
+        view_swizzle: true,
+        formats: FormatTable::uniform(FormatFeatures::ALL),
     }
 }
 
-fn captured(fence: u64, list: CommandList) -> CapturedList {
-    CapturedList {
-        fence: FenceValue::new(fence),
-        list,
+/// A `Start` for the tests' device.
+pub(super) fn start() -> Start {
+    Start {
+        build: "test".to_owned(),
+        backend: "recording".to_owned(),
+        caps: caps(),
+        wait: WaitSetting::Wait,
+        memory_limit: 1 << 20,
     }
 }
 
-/// A capture of two lists: every command and every variant inside one (the list whose own
-/// bytes `command::tests::golden_bytes` pins), then a second list, so that the order of lists
-/// and the place of each fence value show. The fence values take two and three bytes.
-fn golden_capture() -> Capture {
-    Capture {
-        lists: vec![
-            captured(300, every_command()),
-            captured(70_000, marker(7, 11)),
-        ],
+/// A writer with `limits` into a fresh buffer, and the buffer.
+pub(super) fn writer_with(limits: CaptureLimits) -> (CaptureWriter, Arc<CaptureBuffer>) {
+    let buffer = Arc::new(CaptureBuffer::new());
+    let sink: Arc<dyn CaptureSink> = Arc::<CaptureBuffer>::clone(&buffer);
+    let writer =
+        CaptureWriter::with_limits(sink, start(), u64::MAX, limits).expect("the start fits");
+    (writer, buffer)
+}
+
+/// A writer with the shipped bounds.
+pub(super) fn writer() -> (CaptureWriter, Arc<CaptureBuffer>) {
+    writer_with(CaptureLimits::SHIPPED)
+}
+
+/// The header and `Start` the tests' writer writes.
+pub(super) fn prefix() -> Vec<u8> {
+    writer().1.bytes()
+}
+
+/// Every record of `bytes`, read with `limits`, or the first error.
+pub(super) fn read_with(bytes: &[u8], limits: CaptureLimits) -> Result<Vec<Record>, CaptureError> {
+    let len = u64::try_from(bytes.len()).expect("small");
+    let mut reader = CaptureReader::with_limits(bytes, len, limits)?;
+    let mut records = Vec::new();
+    while let Some(record) = reader.next_record()? {
+        records.push(record);
     }
+    Ok(records)
 }
 
-/// The file of [`golden_capture`], written out by hand from the layout in the module docs.
-fn golden_file() -> Vec<u8> {
-    let mut file = b"SQRC".to_vec();
-    // The version.
-    file.push(0x01);
-    // A list follows; its fence value, 300, as a varint; the list.
-    file.extend([0x01, 0xAC, 0x02]);
-    file.extend(unhex(GOLDEN));
-    // A list follows; its fence value, 70 000; one command, the tenth kind (a marker), with
-    // its two numbers.
-    file.extend([0x01, 0xF0, 0xA2, 0x04]);
-    file.extend([0x01, 0x09, 0x07, 0x0B]);
-    // The end.
-    file.push(0x00);
-    file
+/// Every record of `bytes`, with the shipped bounds.
+pub(super) fn read(bytes: &[u8]) -> Result<Vec<Record>, CaptureError> {
+    read_with(bytes, CaptureLimits::SHIPPED)
 }
 
-#[test]
-fn golden_bytes() {
-    let bytes = golden_capture().to_bytes().expect("a valid capture");
-    assert_eq!(hex(&bytes), hex(&golden_file()));
-    // The header is the shipping constants.
-    assert_eq!(bytes[..4], MAGIC);
-    assert_eq!(u32::from(bytes[4]), VERSION);
+/// A record framed by hand: its tag, a one-byte length (below 128), and its body.
+pub(super) fn framed(tag: u8, body: &[u8]) -> Vec<u8> {
+    let len = u8::try_from(body.len()).expect("short body");
+    assert!(len < 0x80, "a one-byte length");
+    let mut out = vec![tag, len];
+    out.extend_from_slice(body);
+    out
 }
 
-#[test]
-fn golden_bytes_decode_to_the_capture() {
-    assert_eq!(Capture::from_bytes(&golden_file()), Ok(golden_capture()));
+/// A record of any length: its tag, its length as postcard writes a `u32`, and its body.
+pub(super) fn framed_any(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    out.extend(length(u64::try_from(body.len()).expect("small")));
+    out.extend_from_slice(body);
+    out
 }
 
-/// Files written by hand, one for each thing the layout can hold: no list, an empty list, and
-/// several lists.
-#[test]
-fn hand_built_files() {
-    let cases: [(&[u8], Capture); 3] = [
-        (b"SQRC\x01\x00", Capture::default()),
-        (
-            b"SQRC\x01\x01\x05\x00\x00",
-            Capture {
-                lists: vec![captured(5, CommandList::new())],
-            },
-        ),
-        (
-            // Fence values 1, 2 and 200 (a two-byte varint); a marker, an empty list, a marker.
-            b"SQRC\x01\x01\x01\x01\x09\x03\x04\x01\x02\x00\x01\xC8\x01\x01\x09\x05\x06\x00",
-            Capture {
-                lists: vec![
-                    captured(1, marker(3, 4)),
-                    captured(2, CommandList::new()),
-                    captured(200, marker(5, 6)),
-                ],
-            },
-        ),
-    ];
-    for (file, capture) in cases {
-        assert_eq!(
-            Capture::from_bytes(file),
-            Ok(capture.clone()),
-            "{file:02x?}"
-        );
-        assert_eq!(capture.to_bytes().as_deref(), Ok(file), "{file:02x?}");
+/// A length as a record's varint.
+pub(super) fn length(len: u64) -> Vec<u8> {
+    postcard::to_allocvec(&u32::try_from(len).expect("a u32 length")).expect("encode")
+}
+
+/// The `End` record.
+pub(super) const END: [u8; 2] = [0, 0];
+
+/// `prefix()`, then `records`, then `End`.
+pub(super) fn file(records: &[&[u8]]) -> Vec<u8> {
+    let mut out = prefix();
+    for record in records {
+        out.extend_from_slice(record);
     }
+    out.extend_from_slice(&END);
+    out
 }
 
-#[test]
-fn new_keeps_the_lists_in_order() {
-    let capture = Capture::new([
-        (FenceValue::new(3), marker(1, 2)),
-        (FenceValue::new(9), every_command()),
-    ]);
-    assert_eq!(
-        capture,
-        Capture {
-            lists: vec![captured(3, marker(1, 2)), captured(9, every_command())],
-        }
-    );
-    assert_eq!(Capture::new([]), Capture::default());
+/// What a [`Spy`] does differently from the recording backend it wraps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Knob {
+    /// Nothing.
+    Plain,
+    /// Every `create_buffer` and `create_compute_pipeline` returns the same id.
+    RepeatIds,
+    /// Every pipeline reports `Compiling`.
+    Compiling,
+    /// Every `create_buffer` reports a lost device.
+    Lost,
+    /// Every `wait` times out.
+    TimeOut,
+    /// `completed` reports no fence past the largest a `wait` was asked for, so a destroy is
+    /// reached only once something waits for it.
+    Lagging,
 }
 
-proptest! {
-    #![proptest_config(Config {
-        rng_seed: RngSeed::Fixed(0x5ee_d164),
-        cases: 64,
-        failure_persistence: None,
-        ..Config::default()
-    })]
-
-    /// A capture that is written and read back is the same capture, and writes the same bytes
-    /// again. Each list has its own values and its own fence value, so a reader that took two
-    /// fields in the wrong order, or lists in the wrong order, would not give it back.
-    #[test]
-    fn a_written_capture_reads_back(
-        lists in proptest::collection::vec((1..5_000_u64, 0..9_000_u32, any::<bool>()), 0..5),
-    ) {
-        let mut fence = 0;
-        let capture = Capture {
-            lists: lists
-                .into_iter()
-                .map(|(gap, start, empty)| {
-                    fence += gap;
-                    let list = if empty { CommandList::new() } else { every_command_from(start) };
-                    captured(fence, list)
-                })
-                .collect(),
-        };
-        let bytes = capture.to_bytes().expect("a valid capture");
-        let read = Capture::from_bytes(&bytes).expect("the bytes just written");
-        prop_assert_eq!(&read, &capture);
-        prop_assert_eq!(read.to_bytes().expect("a valid capture"), bytes);
-    }
+/// A recording backend with a [`Knob`], which keeps every `destroy` call and every shader origin
+/// it is given. With
+/// [`Knob::Plain`] it behaves as the recording backend does, call for call.
+#[derive(Debug)]
+pub(super) struct Spy {
+    pub(super) inner: RecordingBackend,
+    knob: Knob,
+    destroys: Mutex<Vec<(ResourceId, FenceValue)>>,
+    origins: Mutex<Vec<Option<ShaderOrigin>>>,
+    /// The largest fence a `wait` was asked for ([`Knob::Lagging`]).
+    waited: Mutex<FenceValue>,
+    /// Sampler creates, destroys and waits, in call order.
+    log: Mutex<Vec<String>>,
 }
 
-/// Every file that stops short of its end is truncated, wherever it stops: inside the header,
-/// inside a list, between two lists, or just before the end mark.
-#[test]
-fn every_truncated_file_is_refused() {
-    let file = golden_file();
-    assert!(Capture::from_bytes(&file).is_ok());
-    for len in 0..file.len() {
-        assert_eq!(
-            Capture::from_bytes(&file[..len]),
-            Err(CaptureError::Truncated),
-            "{len} of {} bytes",
-            file.len()
-        );
-    }
-    // A command count that promises more than the file holds is a truncation too, and is not
-    // believed: this returns at once.
-    let mut promising = b"SQRC\x01\x01\x05".to_vec();
-    promising.extend([0xFF; 9]);
-    promising.push(0x01);
-    assert_eq!(
-        Capture::from_bytes(&promising),
-        Err(CaptureError::Truncated)
-    );
-    assert_eq!(
-        CaptureError::Truncated.to_string(),
-        "the capture ends early"
-    );
-}
-
-/// A file that does not start with the magic is not a capture, whatever else is wrong with it.
-#[test]
-fn another_kind_of_file_is_refused() {
-    let file = golden_file();
-    for at in 0..MAGIC.len() {
-        let mut other = file.clone();
-        other[at] ^= 0x20;
-        assert_eq!(
-            Capture::from_bytes(&other),
-            Err(CaptureError::BadMagic),
-            "{at}"
-        );
-    }
-    // The magic is checked first: a wrong version and a missing body do not hide it.
-    assert_eq!(
-        Capture::from_bytes(b"SQRX\x02"),
-        Err(CaptureError::BadMagic)
-    );
-    // A flight-recorder dump and a PNG.
-    assert_eq!(
-        Capture::from_bytes(b"SQFR\x01\x00"),
-        Err(CaptureError::BadMagic)
-    );
-    assert_eq!(
-        Capture::from_bytes(b"\x89PNG\r\n\x1a\n"),
-        Err(CaptureError::BadMagic)
-    );
-    // A file too short to hold the magic is another kind of file too, unless it is the start
-    // of the magic (`every_truncated_file_is_refused` has those).
-    let short: [&[u8]; 9] = [
-        b"P", b"\0", b"s", b"PN", b"SX", b"XQ", b"abc", b"SQX", b"SXR",
-    ];
-    for file in short {
-        assert_eq!(
-            Capture::from_bytes(file),
-            Err(CaptureError::BadMagic),
-            "{file:?}"
-        );
-    }
-    assert_eq!(
-        CaptureError::BadMagic.to_string(),
-        "not a render capture (bad magic)"
-    );
-}
-
-/// What reading accepts beyond what writing produces: `postcard` reads a number written with
-/// more bytes than it needs, so more than one file holds the same capture, and reading such a
-/// file and writing it again gives the shortest (module docs, "What reading checks").
-#[test]
-fn longer_numbers_are_read_and_written_short() {
-    // The version, 1, in two bytes and in five (the most a 32-bit number takes).
-    for file in [&b"SQRC\x81\x00\x00"[..], b"SQRC\x81\x80\x80\x80\x00\x00"] {
-        let capture = Capture::from_bytes(file).expect("a capture with no list");
-        assert_eq!(capture, Capture::default());
-        assert_eq!(capture.to_bytes().as_deref(), Ok(&b"SQRC\x01\x00"[..]));
-    }
-    // A fence value, 5, and a command count, 0, in two bytes each.
-    let capture = Capture::from_bytes(b"SQRC\x01\x01\x85\x00\x80\x00\x00").expect("one list");
-    assert_eq!(
-        capture,
-        Capture {
-            lists: vec![captured(5, CommandList::new())]
-        }
-    );
-    assert_eq!(
-        capture.to_bytes().as_deref(),
-        Ok(&b"SQRC\x01\x01\x05\x00\x00"[..])
-    );
-    // A longer version is still the version it says: 2 in two bytes is refused as 2.
-    assert_eq!(
-        Capture::from_bytes(b"SQRC\x82\x00\x00"),
-        Err(CaptureError::UnsupportedVersion { found: 2 })
-    );
-    // More bytes than a 32-bit number takes is not a version at all.
-    assert_eq!(
-        Capture::from_bytes(b"SQRC\x81\x80\x80\x80\x80\x00\x00"),
-        Err(CaptureError::Decode(postcard::Error::DeserializeBadVarint))
-    );
-}
-
-/// The capture's version and the command layout go together. A capture holds lists as
-/// `postcard` writes them, and `command::tests::golden_bytes` pins those bytes; this pins which
-/// version of the capture they belong to. A change to the command layout changes [`GOLDEN`],
-/// and this test then fails until [`VERSION`] is bumped and the three numbers below are
-/// updated with it, so the golden tests above cannot stay green across such a change.
-#[test]
-fn the_version_goes_with_the_command_layout() {
-    // FNV-1a, 64 bits, over the golden list's hex text.
-    let hash = GOLDEN
-        .bytes()
-        .fold(0xCBF2_9CE4_8422_2325_u64, |hash, byte| {
-            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01B3)
-        });
-    assert_eq!(
-        (VERSION, GOLDEN.len(), hash),
-        (1, 2276, 0xDB5A_415C_D700_176F)
-    );
-}
-
-/// The memory a capture takes when read is bounded by the file's size, and the module docs
-/// say by how much: a decoded command takes `size_of::<Command>()` bytes however few bytes
-/// encode it. The shortest command is a marker of two small numbers, three bytes, and the
-/// docs' "about seventy times" holds while a command is between 180 and 240 bytes.
-#[test]
-fn a_decoded_command_is_a_bounded_multiple_of_its_bytes() {
-    let shortest = Command::Marker(Marker { submit: 0, draw: 0 });
-    assert_eq!(
-        postcard::to_allocvec(&shortest).as_deref(),
-        Ok(&[0x09, 0x00, 0x00][..])
-    );
-    let decoded = size_of::<Command>();
-    assert!(
-        decoded <= 240,
-        "{decoded} bytes: the docs' multiple is stale"
-    );
-    assert!(
-        decoded >= 180,
-        "{decoded} bytes: the docs' multiple is stale"
-    );
-}
-
-/// A capture of another version is refused by its version, not misread: whatever follows the
-/// header is not looked at.
-#[test]
-fn another_version_is_refused() {
-    let with_version = |version: &[u8], body: &[u8]| [&MAGIC[..], version, body].concat();
-    let body = &golden_file()[5..];
-    // This version is read; the ones either side of it are not.
-    assert!(Capture::from_bytes(&with_version(&[0x01], body)).is_ok());
-    for (version, found) in [
-        (&[0x00][..], VERSION - 1),
-        (&[0x02], VERSION + 1),
-        (&[0x7F], 127),
-        (&[0x80, 0x01], 128),
-        (&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F], u32::MAX),
-    ] {
-        let refused = Err(CaptureError::UnsupportedVersion { found });
-        // With a body this build could read, with none, and with one that is not a capture.
-        assert_eq!(Capture::from_bytes(&with_version(version, body)), refused);
-        assert_eq!(Capture::from_bytes(&with_version(version, &[])), refused);
-        assert_eq!(
-            Capture::from_bytes(&with_version(version, &[0xEE; 7])),
-            refused
-        );
-    }
-    assert_eq!(
-        CaptureError::UnsupportedVersion { found: 2 }.to_string(),
-        "capture layout version 2 is not supported (this build reads 1)"
-    );
-    // A version that is not a 32-bit number at all.
-    assert_eq!(
-        Capture::from_bytes(&with_version(&[0xFF, 0xFF, 0xFF, 0xFF, 0x1F], body)),
-        Err(CaptureError::Decode(postcard::Error::DeserializeBadVarint))
-    );
-}
-
-/// Bytes after the end mark are an error, even when they look like more of a capture.
-#[test]
-fn trailing_bytes_are_refused() {
-    let file = golden_file();
-    for extra in [&[0x00][..], &[0xEE, 0xEE, 0xEE], b"\x01\x05\x00\x00"] {
-        let long = [&file[..], extra].concat();
-        assert_eq!(
-            Capture::from_bytes(&long),
-            Err(CaptureError::TrailingBytes { count: extra.len() }),
-            "{extra:02x?}"
-        );
-    }
-    assert_eq!(
-        CaptureError::TrailingBytes { count: 3 }.to_string(),
-        "3 trailing bytes after the capture"
-    );
-}
-
-/// Bytes that are all there but are not an encoding of a capture.
-#[test]
-fn malformed_files_are_refused() {
-    // Neither "a list follows" nor "the end".
-    assert_eq!(
-        Capture::from_bytes(b"SQRC\x01\x02"),
-        Err(CaptureError::Decode(postcard::Error::DeserializeBadOption))
-    );
-    // A command of a kind that does not exist (there are ten, numbered from zero).
-    assert_eq!(
-        Capture::from_bytes(b"SQRC\x01\x01\x05\x01\x0A\x00\x00\x00"),
-        Err(CaptureError::Decode(postcard::Error::SerdeDeCustom))
-    );
-    // A fence value that does not fit in 64 bits.
-    let mut wide = b"SQRC\x01\x01".to_vec();
-    wide.extend([0xFF; 9]);
-    wide.extend([0x7F, 0x00, 0x00]);
-    assert_eq!(
-        Capture::from_bytes(&wide),
-        Err(CaptureError::Decode(postcard::Error::DeserializeBadVarint))
-    );
-    assert_eq!(
-        CaptureError::Decode(postcard::Error::DeserializeBadOption).to_string(),
-        "could not decode the capture: Found an Option discriminant that wasn't 0 or 1"
-    );
-}
-
-/// A file with one empty list for each fence value given.
-fn file_with_fences(fences: &[u8]) -> Vec<u8> {
-    let mut file = b"SQRC\x01".to_vec();
-    for fence in fences {
-        file.extend([0x01, *fence, 0x00]);
-    }
-    file.push(0x00);
-    file
-}
-
-/// Fence values rise from list to list and start above zero, as a backend's do. Both writing
-/// and reading check it, at the edge on both sides.
-#[test]
-fn fence_values_must_rise() {
-    let capture = |fences: &[u8]| Capture {
-        lists: fences
-            .iter()
-            .map(|fence| captured((*fence).into(), CommandList::new()))
-            .collect(),
-    };
-    for (fences, refused) in [
-        (&[1][..], None),
-        (&[1, 2], None),
-        (&[1, 2, 3], None),
-        (&[4, 9, 100], None),
-        (&[0], Some((0, 0))),
-        (&[5, 5], Some((1, 5))),
-        (&[5, 4], Some((1, 4))),
-        (&[5, 6, 6], Some((2, 6))),
-        (&[5, 7, 6, 8], Some((2, 6))),
-        (&[5, 0], Some((1, 0))),
-        // Two faults: the first is reported.
-        (&[0, 0], Some((0, 0))),
-    ] {
-        let expected = refused.map(|(list, fence)| CaptureError::FenceOrder { list, fence });
-        let written = capture(fences).to_bytes();
-        assert_eq!(written.as_ref().err(), expected.as_ref(), "{fences:?}");
-        let file = file_with_fences(fences);
-        assert_eq!(
-            Capture::from_bytes(&file).err(),
-            expected,
-            "reading {fences:?}"
-        );
-        if expected.is_none() {
-            assert_eq!(written, Ok(file), "{fences:?}");
+impl Spy {
+    /// A spy over a recording backend for [`caps`] with 1 MiB of memory.
+    pub(super) fn new(knob: Knob) -> Self {
+        Self {
+            inner: RecordingBackend::new(caps(), 1 << 20),
+            knob,
+            destroys: Mutex::default(),
+            origins: Mutex::default(),
+            waited: Mutex::default(),
+            log: Mutex::default(),
         }
     }
-    assert_eq!(
-        CaptureError::FenceOrder { list: 2, fence: 6 }.to_string(),
-        "list 2 of the capture has fence value 6, not above the one before it"
-    );
+
+    /// Sampler creates, destroys and waits so far, in words.
+    pub(super) fn log(&self) -> Vec<String> {
+        self.log.lock().expect("unpoisoned").clone()
+    }
+
+    fn note(&self, event: String) {
+        self.log.lock().expect("unpoisoned").push(event);
+    }
+
+    /// The `destroy` calls so far.
+    pub(super) fn destroys(&self) -> Vec<(ResourceId, FenceValue)> {
+        self.destroys.lock().expect("unpoisoned").clone()
+    }
+
+    /// The origin of every shader made so far.
+    pub(super) fn origins(&self) -> Vec<Option<ShaderOrigin>> {
+        self.origins.lock().expect("unpoisoned").clone()
+    }
 }
 
-/// The checks run in the order the module docs give. Each file here has two faults.
-#[test]
-fn the_first_fault_is_the_one_reported() {
-    let bad_fences = file_with_fences(&[5, 5]);
-    // Fence values that do not rise, and trailing bytes: the trailing bytes.
-    let long = [&bad_fences[..], &[0xEE]].concat();
-    assert_eq!(
-        Capture::from_bytes(&long),
-        Err(CaptureError::TrailingBytes { count: 1 })
-    );
-    // Fence values that do not rise, and no end mark: truncated.
-    assert_eq!(
-        Capture::from_bytes(&bad_fences[..bad_fences.len() - 1]),
-        Err(CaptureError::Truncated)
-    );
-    // Fence values that do not rise, then something that is not a list: the decoding.
-    let mut odd = bad_fences.clone();
-    *odd.last_mut().expect("not empty") = 0x02;
-    assert_eq!(
-        Capture::from_bytes(&odd),
-        Err(CaptureError::Decode(postcard::Error::DeserializeBadOption))
-    );
-    // Another version with any of these: the version.
-    let mut other = long;
-    other[4] = 0x02;
-    assert_eq!(
-        Capture::from_bytes(&other),
-        Err(CaptureError::UnsupportedVersion { found: 2 })
-    );
+impl Backend for Spy {
+    fn caps(&self) -> &Caps {
+        self.inner.caps()
+    }
+    fn budget(&self) -> MemoryBudget {
+        self.inner.budget()
+    }
+    fn create_buffer(&self, desc: &BufferDesc) -> Result<BufferId, RenderError> {
+        if self.knob == Knob::Lost {
+            return Err(RenderError::DeviceLost);
+        }
+        if self.knob == Knob::RepeatIds {
+            return Ok(BufferId::new(1, 1));
+        }
+        self.inner.create_buffer(desc)
+    }
+    fn create_texture(&self, desc: &TextureDesc) -> Result<TextureId, RenderError> {
+        self.inner.create_texture(desc)
+    }
+    fn create_view(&self, texture: TextureId, desc: &ViewDesc) -> Result<ViewId, RenderError> {
+        self.inner.create_view(texture, desc)
+    }
+    fn create_sampler(&self, desc: &SamplerDesc) -> Result<SamplerId, RenderError> {
+        self.note("sampler".to_owned());
+        self.inner.create_sampler(desc)
+    }
+    fn create_shader(&self, desc: ShaderDesc) -> Result<ShaderId, RenderError> {
+        self.origins
+            .lock()
+            .expect("unpoisoned")
+            .push(desc.origin.clone());
+        self.inner.create_shader(desc)
+    }
+    fn destroy(&self, resource: ResourceId, after: FenceValue) {
+        self.destroys
+            .lock()
+            .expect("unpoisoned")
+            .push((resource, after));
+        self.note(format!("destroy after {}", after.get()));
+        self.inner.destroy(resource, after);
+    }
+    fn create_graphics_pipeline(
+        &self,
+        desc: GraphicsPipelineDesc,
+    ) -> Result<PipelineId, RenderError> {
+        self.inner.create_graphics_pipeline(desc)
+    }
+    fn create_compute_pipeline(
+        &self,
+        desc: ComputePipelineDesc,
+    ) -> Result<PipelineId, RenderError> {
+        if self.knob == Knob::RepeatIds {
+            return Ok(PipelineId::new(2, 2));
+        }
+        self.inner.create_compute_pipeline(desc)
+    }
+    fn pipeline_status(&self, id: PipelineId) -> PipelineStatus {
+        if self.knob == Knob::Compiling {
+            return PipelineStatus::Compiling;
+        }
+        self.inner.pipeline_status(id)
+    }
+    fn staging(&self, size: u64) -> Result<StagingSlice, RenderError> {
+        self.inner.staging(size)
+    }
+    fn submit(&self, list: CommandList) -> Result<FenceValue, RenderError> {
+        self.inner.submit(list)
+    }
+    fn completed(&self) -> FenceValue {
+        let done = self.inner.completed();
+        if self.knob == Knob::Lagging {
+            return done.min(*self.waited.lock().expect("unpoisoned"));
+        }
+        done
+    }
+    fn wait(&self, value: FenceValue, timeout: Duration) -> Result<WaitOutcome, RenderError> {
+        self.note(format!("wait {}", value.get()));
+        if self.knob == Knob::TimeOut {
+            return Ok(WaitOutcome::TimedOut);
+        }
+        let mut waited = self.waited.lock().expect("unpoisoned");
+        *waited = (*waited).max(value);
+        drop(waited);
+        self.inner.wait(value, timeout)
+    }
+    fn take_readback(&self, id: ReadbackId) -> Option<Readback> {
+        self.inner.take_readback(id)
+    }
+    fn set_present_target(&self, target: PresentTarget) -> Result<(), RenderError> {
+        self.inner.set_present_target(target)
+    }
+    fn take_present_feedback(&self) -> Vec<PresentFeedback> {
+        self.inner.take_present_feedback()
+    }
+}
+
+/// A 2 by 2 RGBA8 texture with every usage.
+pub(super) fn texture_desc() -> TextureDesc {
+    TextureDesc {
+        dimension: TextureDimension::D2,
+        format: PixelFormat::A8B8G8R8Unorm,
+        size: Extent3d {
+            width: 2,
+            height: 2,
+            depth_or_layers: 1,
+        },
+        mip_levels: 1,
+        sample_count: 1,
+        usage: TextureUsage::ALL,
+    }
+}
+
+/// A view of all of [`texture_desc`].
+pub(super) fn view_desc() -> ViewDesc {
+    ViewDesc {
+        format: PixelFormat::A8B8G8R8Unorm,
+        dimension: ViewDimension::D2,
+        base_mip: 0,
+        mip_count: 1,
+        base_layer: 0,
+        layer_count: 1,
+        swizzle: Swizzle::IDENTITY,
+    }
+}
+
+/// A plain sampler.
+pub(super) fn sampler_desc() -> SamplerDesc {
+    SamplerDesc {
+        mag_filter: FilterMode::Linear,
+        min_filter: FilterMode::Linear,
+        mip_filter: FilterMode::Nearest,
+        address: [AddressMode::Repeat; 3],
+        border_color: BorderColor::TransparentBlack,
+        lod_bias: 0.0,
+        min_lod: 0.0,
+        max_lod: 4.0,
+        max_anisotropy: 1,
+        compare: None,
+        reduction: ReductionMode::Average,
+    }
+}
+
+/// A shader with entry `main` and no interface.
+pub(super) fn shader(
+    stage: ShaderStage,
+    source: ShaderSource,
+    origin: Option<ShaderOrigin>,
+) -> ShaderDesc {
+    ShaderDesc {
+        stage,
+        entry: "main".to_owned(),
+        source,
+        interface: ShaderInterface::default(),
+        origin,
+    }
+}
+
+/// An empty, validated naga module.
+pub(super) fn naga() -> ShaderSource {
+    let module = naga::Module::default();
+    let info = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&module)
+    .expect("an empty module validates");
+    ShaderSource::Naga {
+        module: Box::new(module),
+        info: Box::new(info),
+    }
 }

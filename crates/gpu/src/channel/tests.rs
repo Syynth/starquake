@@ -304,15 +304,18 @@ fn a_fresh_channel_is_idle_with_zero_registers() {
     assert_eq!(rig.run(), Ok(RunOutcome::EntryDone));
     assert_eq!(
         rig.take(),
-        [Event::Entry(RingEntry::Release(Release {
-            address: 0,
-            payload: 0,
-            form: ReleaseForm {
-                size: PayloadSize::Four,
-                timestamp: false
+        [Event::Entry(RingEntry::Release {
+            channel: ID,
+            release: Release {
+                address: 0,
+                payload: 0,
+                form: ReleaseForm {
+                    size: PayloadSize::Four,
+                    timestamp: false
+                },
+                op: ReleaseOp::Write,
             },
-            op: ReleaseOp::Write,
-        }))]
+        })]
     );
     assert_eq!(rig.channel.state(), ChannelState::Idle);
 }
@@ -502,15 +505,18 @@ fn a_data_word_after_a_parked_acquire_is_read_again() {
     assert_eq!(rig.run(), Ok(RunOutcome::EntryDone));
     assert_eq!(
         rig.take(),
-        [Event::Entry(RingEntry::Release(Release {
-            address: SEM,
-            payload: 1,
-            form: ReleaseForm {
-                size: PayloadSize::Four,
-                timestamp: false
+        [Event::Entry(RingEntry::Release {
+            channel: ID,
+            release: Release {
+                address: SEM,
+                payload: 1,
+                form: ReleaseForm {
+                    size: PayloadSize::Four,
+                    timestamp: false
+                },
+                op: ReleaseOp::Write,
             },
-            op: ReleaseOp::Write,
-        }))]
+        })]
     );
 }
 
@@ -703,12 +709,15 @@ fn an_unreadable_semaphore_stops_the_channel() {
 // ---------------------------------------------------------------------------------------------
 
 fn release(address: u64, payload: u64, form: ReleaseForm, op: ReleaseOp) -> Event {
-    Event::Entry(RingEntry::Release(Release {
-        address,
-        payload,
-        form,
-        op,
-    }))
+    Event::Entry(RingEntry::Release {
+        channel: ID,
+        release: Release {
+            address,
+            payload,
+            form,
+            op,
+        },
+    })
 }
 
 #[test]

@@ -10,13 +10,19 @@
 //! `2.0` written as `2`; `test_nop` and the other tests pin the `mnemonic operands;` shape,
 //! registers as `r1` and `rz`, predicates as `p0`/`pt`, uniform registers as `ur2`, uniform
 //! predicates as `up1`, and constant buffers as `c[0x5][0x100]` and `cx[ur2][0x100]`
-//! (`test_ldc`, `test_nanosleep`). **Everything else is a guess** in `nvdisasm`'s usual style
-//! that a developer with `nvdisasm` should check (spec, "`nvdisasm` cross-check"): `urz` and
-//! `upt`, the `.rm`/`.rp` rounding names (taken from NAK's own `FRndMode` printer), `.fmz` for
-//! the `dnz` bit, float immediates other than small integers, `-`/`|..|` source modifiers (on
-//! registers, uniform registers and constant buffers alike), the guard prefix `@p0 `/`@!p0 `,
-//! `MOV`'s hex immediate and lane mask, the `ALD`/`AST` operand syntax and width suffixes,
-//! `EXIT`'s modifiers and predicate, the special-register names, and every shell's mnemonic.
+//! (`test_ldc`, `test_nanosleep`). Of the control group (`op::control`), `test_nop`,
+//! `test_redux`, `test_match` and `test_nanosleep` pin `nop`, every `redux` operation, `match`
+//! with and without its predicate and `.u64`, and `nanosleep` with each source kind and a hex
+//! immediate. **Everything else is a guess** in `nvdisasm`'s usual style that a developer with
+//! `nvdisasm` should check (spec, "`nvdisasm` cross-check"): `urz` and `upt`, the `.rm`/`.rp`
+//! rounding names (taken from NAK's own `FRndMode` printer), `.fmz` for the `dnz` bit, float
+//! immediates other than small integers, `-`/`|..|` source modifiers (on registers, uniform
+//! registers and constant buffers alike), the guard prefix `@p0 `/`@!p0 `, `MOV`'s hex immediate
+//! and lane mask, the `ALD`/`AST` operand syntax and width suffixes, `EXIT`'s modifiers and
+//! predicate, the special-register names, the text of every other control instruction (branch
+//! offsets in particular print as a signed byte displacement from the next instruction, where
+//! `nvdisasm` prints the absolute target: `op::control`, `BranchOffset`), and every shell's
+//! mnemonic.
 
 use std::fmt::{self, Display, Formatter};
 
@@ -159,6 +165,21 @@ impl Display for FloatOperand {
             AluSrc::UniformReg { reg, abs, neg } => modified(f, &reg, abs, neg),
             AluSrc::CBuf { cbuf, abs, neg } => modified(f, &cbuf, abs, neg),
             AluSrc::Imm(bits) => write!(f, "{}", FloatImm(bits)),
+        }
+    }
+}
+
+/// An ALU source of an integer or bit instruction: an immediate prints in hexadecimal (NAK's
+/// `test_nanosleep`: `0x87654321`), the other kinds as themselves under their modifiers.
+pub(crate) struct IntOperand(pub(crate) AluSrc);
+
+impl Display for IntOperand {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            AluSrc::Reg { reg, abs, neg } => modified(f, &reg, abs, neg),
+            AluSrc::UniformReg { reg, abs, neg } => modified(f, &reg, abs, neg),
+            AluSrc::CBuf { cbuf, abs, neg } => modified(f, &cbuf, abs, neg),
+            AluSrc::Imm(bits) => write!(f, "{bits:#x}"),
         }
     }
 }

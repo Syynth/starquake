@@ -26,6 +26,10 @@
 //! Slice 3 captures a guest program ([`capture`]): it finds where the program ends, holds it to
 //! the instruction cap, extends it through jump-table targets, and hashes its bytes.
 //!
+//! Slice 6h decodes the control and warp group (`decode`'s `OpBra` to `OpNanosleep`):
+//! branches with their [`decode::BranchOffset`], convergence barriers, calls and returns, and
+//! warp votes, shuffles, matches and reductions; `JMX` and `BPT` stay shells.
+//!
 //! Experiment E1, run before this slice, lives in `lower`'s tests and its results in the spec.
 
 #[cfg(feature = "test-support")]
