@@ -1,0 +1,24 @@
+---
+source: crates/shader/src/opt/tests/ssa.rs
+expression: text
+---
+block0:
+    %0 = SetRegister r0, u32 0x0
+    %1: u32 = GetCbufU32 u32 0x0, u32 0x0
+    %2 = SetRegister r1, %1
+    jump block1
+block1:
+    %12: u32 = Phi [block0: u32 0x0], [block1: %5]
+    %13: u32 = Phi [block0: %1], [block1: %7]
+    %3: opaque = Identity %12
+    %4: opaque = Identity %13
+    %5: u32 = IAdd32 %3, %4
+    %6 = SetRegister r0, %5
+    %7: u32 = ISub32 %4, u32 0x1
+    %8 = SetRegister r1, %7
+    %9: u1 = INotEqual %7, u32 0x0
+    branch %9, block1, block2
+block2:
+    %10: opaque = Identity %5
+    %11 = SetRegister r2, %10
+    return

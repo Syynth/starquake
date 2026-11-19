@@ -45,6 +45,10 @@
 //! spec): it runs one invocation of an IR function on plain machine state, so translator and
 //! IR-pass tests can compare the IR's results with values derived from documented behaviour.
 //!
+//! Slice 8 is the first IR passes ([`opt`]): the SSA rewrite, identity removal, constant
+//! propagation and dead code elimination, ported by behaviour from Eden and run in its order,
+//! with the verifier after each pass in tests and debug builds.
+//!
 //! Slice 10 rebuilds a captured program's control flow ([`flow`]): it finds and resolves the
 //! jump tables of `BRX`, walks the program under both convergence-barrier models, splits it
 //! into blocks, inlines every call, and builds the IR's basic blocks from the flow graph.
@@ -71,6 +75,7 @@ pub mod interp;
 pub mod ir;
 pub mod lookup;
 pub mod lower;
+pub mod opt;
 pub mod program;
 pub mod sph;
 pub mod structure;

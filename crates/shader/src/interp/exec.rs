@@ -1260,6 +1260,37 @@ impl Run<'_> {
     }
 }
 
+/// The value operation `op` (instruction `at`) gives when every argument is an immediate, with
+/// the semantics a run gives it: `None` when an argument is not an immediate, when the
+/// operation reads or writes machine state (context, memory, inputs, outputs, images) or is not
+/// supported, and when the run would refuse it. Constant propagation folds through this, so a
+/// folded constant is what the interpreter computes (`opt`'s `constant` module).
+pub(crate) fn eval_immediates(at: Value, op: &Operation) -> Option<Val> {
+    if op.args.len() > MAX_ARGS
+        || op.opcode.flags_kind() == FlagsKind::Texture
+        || atomic32(op.opcode).is_some()
+        || memory_width(op.opcode).is_some()
+        || cbuf_read(op.opcode).is_some()
+    {
+        return None;
+    }
+    let mut slots = [Err(Type::Void); MAX_ARGS];
+    let mut names = [None; MAX_ARGS];
+    for ((slot, name), &operand) in slots.iter_mut().zip(names.iter_mut()).zip(&op.args) {
+        let imm = operand.imm()?;
+        *slot = Val::from_imm(imm).ok_or(imm.ty());
+        *name = Some(imm);
+    }
+    let args = Args { at, slots, names };
+    match float_op(&args, op).ok()? {
+        Some(value) => Some(value),
+        None => match bits_op(&args, op.opcode).ok()? {
+            Some(value) => Some(value),
+            None => int_op(&args, op.opcode).ok()?,
+        },
+    }
+}
+
 /// The float operations: `None` for any other opcode.
 fn float_op(args: &Args, op: &Operation) -> Result<Option<Val>, InterpError> {
     use Opcode as O;

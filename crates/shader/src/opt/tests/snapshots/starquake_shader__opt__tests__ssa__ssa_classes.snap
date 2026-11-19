@@ -1,0 +1,39 @@
+---
+source: crates/shader/src/opt/tests/ssa.rs
+expression: text
+---
+block0:
+    %30: u1 = UndefU1
+    %29: opaque = Identity %30
+    %0 = SetPred p1, u1 true
+    %1 = SetUniformRegister ur2, u32 0x9
+    %2 = SetUniformPred up3, u1 true
+    %3 = SetZFlag u1 true
+    %4 = SetSFlag u1 true
+    %5 = SetCFlag u1 true
+    %6 = SetOFlag u1 true
+    %7 = SetGotoVariable u32 0x4, u1 true
+    %8 = SetIndirectBranchVariable u32 0xb
+    jump block1
+block1:
+    %9: opaque = Identity u1 true
+    %10: opaque = Identity u32 0x9
+    %11: opaque = Identity u1 true
+    %12: opaque = Identity u1 true
+    %13: opaque = Identity u1 true
+    %14: opaque = Identity u1 true
+    %15: opaque = Identity u1 true
+    %16: opaque = Identity u1 true
+    %17: opaque = Identity u32 0xb
+    %18: opaque = Identity %30
+    %19 = SetPred p0, %9
+    %20 = SetRegister r0, %10
+    %21 = SetPred p4, %11
+    %22 = SetPred p5, %12
+    %23 = SetPred p6, %13
+    %24 = SetUniformPred up0, %14
+    %25 = SetUniformPred up1, %15
+    %26 = SetUniformPred up2, %16
+    %27 = SetRegister r1, %17
+    %28 = SetUniformPred up4, %18
+    return

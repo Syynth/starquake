@@ -1271,6 +1271,7 @@ dependencies = [
 name = "starquake-shader"
 version = "0.0.0"
 dependencies = [
+ "insta",
  "naga",
  "proptest",
  "starquake-shader",
