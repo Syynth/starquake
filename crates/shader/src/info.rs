@@ -65,12 +65,15 @@
 //! [`collect`] checks the header against the stage first ([`check_header`]: the four
 //! [`InfoError`] header variants), then the pixel header's interpolation
 //! ([`InfoError::MixedInterpolation`], the lowest generic first), then the instructions in
-//! [`Function::listed`] order, reporting the first that fails: an argument that must be an
-//! immediate and is not ([`InfoError::Operand`]), an attribute word no slot names
-//! ([`InfoError::UnknownAttribute`]), a colour output past the targets
+//! [`Function::listed`] order, reporting the first that fails: an argument that is missing or
+//! not of the kind read ([`InfoError::Operand`]: an attribute immediate, a 32-bit immediate, or
+//! for a constant-buffer bank and offset a 32-bit immediate or a register), an attribute word
+//! no slot names ([`InfoError::UnknownAttribute`]), a colour output past the targets
 //! ([`InfoError::ColorOutput`]), a constant-buffer bank past [`CBUF_BANKS`]
 //! ([`InfoError::ConstantBufferBank`]) or a read whose end overflows
 //! ([`InfoError::ConstantBufferOffset`]). Pinned by `tests::checks_run_in_the_documented_order`.
+//! Within one constant-buffer read the bank's kind is checked, then the offset's, then the
+//! bank's range, then the end (`tests::constant_buffer_arguments_of_the_wrong_immediate_kind_are_refused`).
 //!
 //! # Where this differs from Eden
 //!
@@ -85,7 +88,10 @@
 //! | A constant-buffer read whose end overflows `u32` | Refused, [`InfoError::ConstantBufferOffset`] | Wraps | `tests::constant_buffer_ends_overflow_is_refused` |
 //! | The header against the stage | Checked ([`check_header`]) | Not checked: Eden reads the header layout its stage names | `tests::the_header_must_name_the_slots_stage` |
 //! | `IAbs64`, `ConvertF16S64`, `ConvertF32S64`, `ConvertF64S64` | Need [`Requirements::i64`]: each takes or gives a `u64` | Missing from `uses_int64`'s list | `tests::requirement_lists_agree_with_the_opcode_types` |
-//! | `uses_int8`, `uses_int16`, the float denormal and atomic-kind flags, texture and image flags, the NVN storage buffers | Not collected. 8- and 16-bit integers are not host requirements here: a guess that the lowering (slices 16 and 17) reads them through 32-bit values, since naga has no 8-bit integer type. The rest serve Eden's own SPIR-V capabilities, or slices 13, 14 and 18 | Collected | — |
+//! | When the interpolation is checked | Before the instructions are walked, so a pixel program with mixed interpolation and a faulty instruction reports [`InfoError::MixedInterpolation`] | `CollectInterpolationInfo` runs after `CollectShaderInfoPass` (`frontend/maxwell/translate_program.cpp` @ cf654052, lines 407 and 411), so the instruction's fault would be met first. Only the error reported for a program with both faults differs | `tests::checks_run_in_the_documented_order` |
+//! | A constant-buffer bank or offset that is an immediate of another kind than `u32`, or a missing offset | Refused, [`InfoError::Operand`] | `Value::U32` has only `DEBUG_ASSERT(type == Type::U32)` (`frontend/ir/value.h`), so a release build reads the immediate's bits; Eden's opcode table fixes the argument count | `tests::constant_buffer_arguments_of_the_wrong_immediate_kind_are_refused` |
+//! | `GetPatch`, `SetPatch` | Not collected, and not refused: the walk ignores both opcodes, whatever the patch word. The translator emits neither yet | `GetPatch` and `SetPatch` set `uses_patches`, and `SetPatch` of a tessellation level sets `stores_tess_level_outer` or `stores_tess_level_inner`; Eden throws on a `GetPatch` of a non-generic patch and on a `SetPatch` of any other patch | `tests::patch_operations_are_not_collected` |
+//! | Every other `Info` field `collect_shader_info_pass.cpp` writes: `uses_int8`, `uses_int16`; the float denormal flags (`uses_fp16_denorms_flush`, `uses_fp16_denorms_preserve`, `uses_fp32_denorms_flush`, `uses_fp32_denorms_preserve`, from `VisitFpModifiers`); the atomic-kind flags (`uses_atomic_s32_min`, `uses_atomic_s32_max`, `uses_atomic_f32_add`, `uses_atomic_f16x2_add`, `uses_atomic_f32x2_add`, `uses_atomic_f16x2_min`, `uses_atomic_f32x2_min`, `uses_atomic_f16x2_max`, `uses_atomic_f32x2_max`, `uses_shared_increment`, `uses_shared_decrement`, `uses_global_increment`, `uses_global_decrement`); the texture and image flags (`uses_sampled_1d`, `uses_sparse_residency`, `uses_shadow_lod`, `uses_typeless_image_reads`, `uses_typeless_image_writes`, `uses_image_buffers`, `uses_image_1d`, `uses_atomic_image_u32`); `uses_global_memory`, `stores_global_memory`, `used_storage_buffer_types`, `uses_local_memory`; `uses_demote_to_helper_invocation`; `uses_derivatives`; `uses_rescaling_uniform` (the spec deliberately does not port Eden's rescaling pass: resolution scaling is a later feature); `used_constant_buffer_types`, `used_indirect_cbuf_types`, `constant_buffer_descriptors` and `constant_buffer_mask` (the banks and sizes of [`ShaderInfo::constant_buffers`] stand in for the last two); `used_clip_distances` (`GatherInfoFromHeader`); the NVN storage buffers (`nvn_buffer_base`, `nvn_buffer_used`); and the `uses_is_helper_invocation` Eden also sets for `GetAttributeIndexed` (here only `IsHelperInvocation` records [`SystemValue::IsHelperInvocation`]) | Not collected. 8- and 16-bit integers are not host requirements here: a guess that the lowering (slices 16 and 17) reads them through 32-bit values, since naga has no 8-bit integer type. The rest serve Eden's own SPIR-V capabilities, or slices 13, 14, 16 to 18 | Collected | — |
 //!
 //! # Open, for the owner
 //!
@@ -279,8 +285,10 @@ pub enum InfoError {
         /// The generic attribute.
         generic: u8,
     },
-    /// An argument that must be an immediate of a particular kind is something else.
-    #[error("{at}: argument {index} is not the immediate collect info reads")]
+    /// An argument is missing, or is not of the kind collect info reads: an attribute
+    /// immediate for an attribute access, a 32-bit immediate for a colour output's target and
+    /// component, and a 32-bit immediate or a register for a constant-buffer bank and offset.
+    #[error("{at}: argument {index} is missing or not of the kind collect info reads")]
     Operand {
         /// The instruction.
         at: Value,
@@ -941,10 +949,11 @@ impl Walk {
     }
 
     fn cbuf(&mut self, at: Value, op: &Operation, element: u32) -> Result<(), InfoError> {
-        let Some(&bank) = op.args.first() else {
-            return Err(InfoError::Operand { at, index: 0 });
-        };
-        let Operand::Imm(Imm::U32(bank)) = bank else {
+        // Both arguments' kinds first (bank, then offset), then the bank's range, then the
+        // read's end.
+        let bank = cbuf_arg(at, op, 0)?;
+        let offset = cbuf_arg(at, op, 1)?;
+        let Some(bank) = bank else {
             // A register bank: every bank, whole (Eden's `AddRegisterIndexedLdc`, over the
             // spec's 32 banks).
             self.constant_buffers.indexed_bank = true;
@@ -957,16 +966,12 @@ impl Walk {
             .ok()
             .and_then(|b| self.constant_buffers.sizes.get_mut(b))
             .ok_or(InfoError::ConstantBufferBank { at, bank })?;
-        let size = match op.args.get(1) {
-            Some(Operand::Imm(Imm::U32(offset))) => offset
+        let size = match offset {
+            Some(offset) => offset
                 .checked_add(element)
                 .and_then(|end| end.checked_next_multiple_of(CBUF_ALIGNMENT))
-                .ok_or(InfoError::ConstantBufferOffset {
-                    at,
-                    offset: *offset,
-                })?,
-            Some(_) => INDEXED_CBUF_SIZE,
-            None => return Err(InfoError::Operand { at, index: 1 }),
+                .ok_or(InfoError::ConstantBufferOffset { at, offset })?,
+            None => INDEXED_CBUF_SIZE,
         };
         grow(slot, size);
         Ok(())
@@ -1048,6 +1053,17 @@ fn attribute_arg(at: Value, op: &Operation) -> Result<u16, InfoError> {
         });
     }
     Ok(attribute.0)
+}
+
+/// Argument `index` of a constant-buffer read, a bank or an offset: `Some` for a 32-bit
+/// immediate, `None` for a register (an instruction's value). A missing argument or an
+/// immediate of another kind is [`InfoError::Operand`].
+fn cbuf_arg(at: Value, op: &Operation, index: usize) -> Result<Option<u32>, InfoError> {
+    match op.args.get(index) {
+        Some(Operand::Imm(Imm::U32(value))) => Ok(Some(*value)),
+        Some(Operand::Value(_)) => Ok(None),
+        Some(Operand::Imm(_)) | None => Err(InfoError::Operand { at, index }),
+    }
 }
 
 /// Argument `index` as a 32-bit immediate.

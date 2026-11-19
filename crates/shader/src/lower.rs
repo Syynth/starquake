@@ -8,8 +8,12 @@
 //!   `GetReg` and `SetReg` load and store it.
 //! - A vertex function's input attributes become vertex inputs: generic attribute `n` is a
 //!   `vec4<f32>` at location `n`. Its outputs are one struct: the position built-in, then
-//!   generic `n` at location `n`, with perspective interpolation at the pixel centre (a guess
-//!   until the SPH's interpolation modes are read, slice 15). Components the program does not
+//!   generic `n` at location `n`, with perspective interpolation at the pixel centre. That is
+//!   still slice 1's guess: slice 15 now collects the pixel header's modes
+//!   ([`crate::info::ShaderInfo::interpolation`]), but nothing here reads them yet. Slice 17
+//!   lowers them, subject to the open owner question on where a vertex program's outputs get
+//!   the pixel program's modes ([`crate::info`], "Open, for the owner"). Pixel generic inputs
+//!   are refused here ([`LowerError::Input`]) until then. Components the program does not
 //!   write are zero. Generics from [`HOST_LOCATIONS`] up (generic 31) are refused, read or
 //!   written, because wgpu on Metal binds no location past 30.
 //! - A pixel function's colour target `n` is a `vec4<f32>` output at location `n`; unwritten
@@ -290,7 +294,9 @@ impl Interface {
     }
 }
 
-/// A location binding; varyings get perspective interpolation at the pixel centre.
+/// A location binding; varyings (a vertex program's generic outputs, the only ones slice 1
+/// lowers) get perspective interpolation at the pixel centre, slice 1's guess. The modes slice
+/// 15 collects ([`crate::info::ShaderInfo::interpolation`]) replace it in slice 17.
 fn location(location: u8, varying: bool) -> Binding {
     Binding::Location {
         location: u32::from(location),

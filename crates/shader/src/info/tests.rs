@@ -13,7 +13,7 @@ use crate::decode::{
     Gpr, Instr, InterpFreq, InterpLoc, Op, OpALd, OpASt, OpExit, OpIpa, Pred, PredSrc,
 };
 use crate::host::Requirements;
-use crate::ir::{ATTRIBUTE_WORD_BYTES, POSITION_W, Terminator, Type};
+use crate::ir::{ATTRIBUTE_WORD_BYTES, POSITION_W, Patch, Terminator, Type};
 use crate::lower::capabilities;
 use crate::program::{Rejection, graphics_program_ir};
 use crate::sph::encode::encode_bytes;
@@ -734,6 +734,37 @@ fn pixel_outputs_record_each_component() {
     assert_eq!(info.color_outputs(), ColorOutputs { targets });
 }
 
+#[test]
+fn the_sample_mask_and_depth_each_reach_the_output_table_alone() {
+    let header = pixel_header(&PixelIo::default());
+    let mask = (Opcode::SetSampleMask, vec![imm(0)]);
+    let depth = (Opcode::SetFragDepth, vec![Operand::Imm(Imm::F32(0))]);
+    let outputs = |ops: &[(Opcode, Vec<Operand>)]| {
+        collect(GuestStage::Pixel, Some(&header), &function(ops))
+            .expect("collects")
+            .outputs()
+            .to_vec()
+    };
+    assert_eq!(
+        outputs(std::slice::from_ref(&depth)),
+        [entry(Slot::FragDepth, 1, None)]
+    );
+    assert_eq!(
+        outputs(std::slice::from_ref(&mask)),
+        [entry(Slot::SampleMask, 1, None)]
+    );
+    // Both, in either order: the sample mask first.
+    for ops in [[mask.clone(), depth.clone()], [depth, mask]] {
+        assert_eq!(
+            outputs(&ops),
+            [
+                entry(Slot::SampleMask, 1, None),
+                entry(Slot::FragDepth, 1, None)
+            ]
+        );
+    }
+}
+
 /// The IR of a pixel program with `targets`, the sample mask and depth as given, and an exit.
 fn exit_ir(targets: [u8; COLOR_TARGETS], sample_mask: bool, depth: bool) -> String {
     let io = pixel_io(targets, sample_mask, depth);
@@ -974,6 +1005,23 @@ fn unreachable_blocks_are_collected() {
     assert_eq!(words(info.loads()), [GENERIC_0_X]);
 }
 
+#[test]
+fn patch_operations_are_not_collected() {
+    // Eden sets `uses_patches` and the tessellation level flags, and throws on a non-generic
+    // `GetPatch` and an unknown `SetPatch`; the walk here ignores both opcodes, whatever the
+    // patch word (a listed divergence: the translator emits neither yet).
+    let empty = compute(&[]).expect("collects");
+    for index in [0, Patch::COUNT - 1] {
+        let patch = Operand::Imm(Imm::Patch(Patch::new(index).expect("exists")));
+        let info = compute(&[
+            (Opcode::GetPatch, vec![patch]),
+            (Opcode::SetPatch, vec![patch, Operand::Imm(Imm::F32(0))]),
+        ])
+        .expect("collects");
+        assert_eq!(info, empty, "patch {index}");
+    }
+}
+
 // The header fill.
 
 #[test]
@@ -988,6 +1036,10 @@ fn a_pixel_header_fills_loads_only_with_indexed_loads() {
         z: u,
         w: p,
     };
+    // Every mode other than unused sets its word: generic 4's x is constant, generic 7's z
+    // screen-linear.
+    io.generic[4].x = PixelImap::Constant;
+    io.generic[7].z = PixelImap::ScreenLinear;
     let header = pixel_header(&io);
     let direct = (Opcode::GetAttribute, vec![attr(GENERIC_0_X), imm(0)]);
     let indexed = (Opcode::GetAttributeIndexed, vec![imm(0), imm(0)]);
@@ -1008,7 +1060,12 @@ fn a_pixel_header_fills_loads_only_with_indexed_loads() {
     .expect("collects");
     assert!(info.loads_indexed());
     let generic2 = GENERIC_0_X + 2 * ATTRIBUTE_COMPONENTS;
-    assert_eq!(words(info.loads()), [generic2 + 1, generic2 + 3]);
+    let generic4 = GENERIC_0_X + 4 * ATTRIBUTE_COMPONENTS;
+    let generic7 = GENERIC_0_X + 7 * ATTRIBUTE_COMPONENTS;
+    assert_eq!(
+        words(info.loads()),
+        [generic2 + 1, generic2 + 3, generic4, generic7 + 2]
+    );
 }
 
 /// A vertex map with each filled field set to a distinct value.
@@ -1110,6 +1167,81 @@ fn a_vertex_header_fills_loads_and_stores_from_their_own_maps() {
     let info = collect(GuestStage::Vertex, Some(&header), &function(&ops)).expect("collects");
     assert_eq!(words(info.loads()), [LAYER]);
     assert!(info.stores_indexed() && !info.loads_indexed());
+}
+
+/// A setter of one field of a vertex map.
+type SetField = fn(&mut VtgMap);
+
+/// Each field the vertex fill reads, as a setter on a map, and the one word it fills.
+fn vtg_fields() -> Vec<(SetField, u16)> {
+    let generic3 = GENERIC_0_X + 3 * ATTRIBUTE_COMPONENTS;
+    vec![
+        (|m| m.generic[3].x = true, generic3),
+        (|m| m.generic[3].y = true, generic3 + 1),
+        (|m| m.generic[3].z = true, generic3 + 2),
+        (|m| m.generic[3].w = true, generic3 + 3),
+        (
+            |m| m.system_values_c.clip_distances = 1 << 4,
+            CLIP_DISTANCE_0 + 4,
+        ),
+        (|m| m.system_values_ab.primitive_id = true, PRIMITIVE_ID),
+        (|m| m.system_values_ab.rt_array_index = true, LAYER),
+        (|m| m.system_values_ab.viewport_index = true, VIEWPORT_INDEX),
+        (|m| m.system_values_ab.point_size = true, POINT_SIZE),
+        (|m| m.system_values_ab.position.x = true, POSITION_X),
+        (|m| m.system_values_ab.position.y = true, POSITION_X + 1),
+        (|m| m.system_values_ab.position.z = true, POSITION_X + 2),
+        (|m| m.system_values_ab.position.w = true, POSITION_W),
+        (|m| m.system_values_c.point_sprite_s = true, POINT_SPRITE_S),
+        (
+            |m| m.system_values_c.point_sprite_t = true,
+            POINT_SPRITE_S + 1,
+        ),
+        (|m| m.system_values_c.fog_coordinate = true, FOG_COORDINATE),
+        (
+            |m| m.system_values_c.tessellation_point_u = true,
+            TESSELLATION_POINT_U,
+        ),
+        (
+            |m| m.system_values_c.tessellation_point_v = true,
+            TESSELLATION_POINT_U + 1,
+        ),
+        (|m| m.system_values_c.instance_id = true, INSTANCE_ID),
+        (|m| m.system_values_c.vertex_id = true, VERTEX_ID),
+    ]
+}
+
+#[test]
+fn each_vertex_map_field_fills_exactly_its_own_word() {
+    // One field set in one map, the other map empty: exactly that field's word is filled, in
+    // the loads from the input map and in the stores from the output map.
+    let indexed = [
+        (Opcode::GetAttributeIndexed, vec![imm(0), imm(0)]),
+        (
+            Opcode::SetAttributeIndexed,
+            vec![imm(0), Operand::Imm(Imm::F32(0)), imm(0)],
+        ),
+    ];
+    let fields = vtg_fields();
+    for &(set, word) in &fields {
+        let mut map = VtgMap::default();
+        set(&mut map);
+        let header = vtg_header(VtgStage::Vertex, map, VtgMap::default());
+        let info =
+            collect(GuestStage::Vertex, Some(&header), &function(&indexed)).expect("collects");
+        assert_eq!(words(info.loads()), [word], "input word {word}");
+        assert_eq!(words(info.stores()), Vec::<u16>::new(), "input word {word}");
+        let header = vtg_header(VtgStage::Vertex, VtgMap::default(), map);
+        let info =
+            collect(GuestStage::Vertex, Some(&header), &function(&indexed)).expect("collects");
+        assert_eq!(words(info.loads()), Vec::<u16>::new(), "output word {word}");
+        assert_eq!(words(info.stores()), [word], "output word {word}");
+    }
+    // Each field fills a different word.
+    let mut filled: Vec<u16> = fields.iter().map(|&(_, word)| word).collect();
+    filled.sort_unstable();
+    filled.dedup();
+    assert_eq!(filled.len(), fields.len());
 }
 
 // System values.
@@ -1350,6 +1482,82 @@ fn constant_buffer_ends_overflow_is_refused() {
     );
 }
 
+#[test]
+fn constant_buffer_arguments_of_the_wrong_immediate_kind_are_refused() {
+    // A bank or offset is a 32-bit immediate or a register; any other immediate kind is an
+    // operand fault, never read as a register.
+    let register = Operand::Value(value(0));
+    let lane = (Opcode::LaneId, vec![]);
+    for wrong in [
+        Imm::F32(0),
+        Imm::Attribute(Attribute(GENERIC_0_X)),
+        Imm::U8(0),
+    ] {
+        assert_eq!(
+            compute(&[(Opcode::GetCbufU32, vec![Operand::Imm(wrong), imm(0)])]),
+            Err(InfoError::Operand {
+                at: value(0),
+                index: 0
+            }),
+            "bank {wrong:?}"
+        );
+        assert_eq!(
+            compute(&[(Opcode::GetCbufU32, vec![imm(0), Operand::Imm(wrong)])]),
+            Err(InfoError::Operand {
+                at: value(0),
+                index: 1
+            }),
+            "offset {wrong:?}"
+        );
+        // With a register bank too.
+        assert_eq!(
+            compute(&[
+                lane.clone(),
+                (Opcode::GetCbufU32, vec![register, Operand::Imm(wrong)])
+            ]),
+            Err(InfoError::Operand {
+                at: value(1),
+                index: 1
+            }),
+            "offset {wrong:?} with a register bank"
+        );
+    }
+    // A register bank still needs its offset argument.
+    assert_eq!(
+        compute(&[lane.clone(), (Opcode::GetCbufU32, vec![register])]),
+        Err(InfoError::Operand {
+            at: value(1),
+            index: 1
+        })
+    );
+    // The arguments' kinds are checked before the bank's range: a bank past the last with an
+    // offset of the wrong kind is an operand fault.
+    assert_eq!(
+        compute(&[(
+            Opcode::GetCbufU32,
+            vec![imm(u32::from(CBUF_BANKS)), Operand::Imm(Imm::F32(0))]
+        )]),
+        Err(InfoError::Operand {
+            at: value(0),
+            index: 1
+        })
+    );
+    // Both arguments wrong: the bank is reported.
+    assert_eq!(
+        compute(&[(
+            Opcode::GetCbufU32,
+            vec![Operand::Imm(Imm::F32(0)), Operand::Imm(Imm::F32(0))]
+        )]),
+        Err(InfoError::Operand {
+            at: value(0),
+            index: 0
+        })
+    );
+    // A register offset and a register bank of the right kinds are accepted.
+    let info = compute(&[lane, (Opcode::GetCbufU32, vec![register, register])]).expect("collects");
+    assert!(info.indexed_constant_buffer_bank());
+}
+
 // Colour outputs.
 
 #[test]
@@ -1451,6 +1659,95 @@ fn requirements_for_f16_f64_and_subgroup_operations() {
         })
     );
     assert_eq!(alone(Opcode::FPAdd32), Requirements::default());
+}
+
+#[test]
+fn exactly_edens_subgroup_and_i64_atomic_opcodes_set_their_flags() {
+    use Opcode as O;
+    // Eden's lists, written out: `uses_subgroup_invocation_id`, `uses_subgroup_mask`,
+    // `uses_subgroup_vote`, `uses_subgroup_shuffles`, `uses_quad_shuffles` and `uses_fswzadd`
+    // (17 opcodes), and `uses_int64_bit_atomics` (18 opcodes)
+    // (`eden/src/shader_recompiler/ir_opt/collect_shader_info_pass.cpp` @ cf654052).
+    let subgroup = [
+        O::LaneId,
+        O::SubgroupEqMask,
+        O::SubgroupLtMask,
+        O::SubgroupLeMask,
+        O::SubgroupGtMask,
+        O::SubgroupGeMask,
+        O::VoteAll,
+        O::VoteAny,
+        O::VoteEqual,
+        O::SubgroupBallot,
+        O::ShuffleIndex,
+        O::ShuffleUp,
+        O::ShuffleDown,
+        O::ShuffleButterfly,
+        O::QuadBroadcast,
+        O::QuadSwap,
+        O::FSwizzleAdd,
+    ];
+    let i64_atomics = [
+        O::SharedAtomicExchange64,
+        O::GlobalAtomicIAdd64,
+        O::GlobalAtomicSMin64,
+        O::GlobalAtomicUMin64,
+        O::GlobalAtomicSMax64,
+        O::GlobalAtomicUMax64,
+        O::GlobalAtomicAnd64,
+        O::GlobalAtomicOr64,
+        O::GlobalAtomicXor64,
+        O::GlobalAtomicExchange64,
+        O::StorageAtomicIAdd64,
+        O::StorageAtomicSMin64,
+        O::StorageAtomicUMin64,
+        O::StorageAtomicSMax64,
+        O::StorageAtomicUMax64,
+        O::StorageAtomicAnd64,
+        O::StorageAtomicOr64,
+        O::StorageAtomicXor64,
+    ];
+    let set = |flag: fn(Requirements) -> bool| -> Vec<Opcode> {
+        Opcode::ALL
+            .iter()
+            .copied()
+            .filter(|&opcode| flag(opcode_requirements(opcode)))
+            .collect()
+    };
+    let mut expected = subgroup.to_vec();
+    expected.sort_by_key(|opcode| Opcode::ALL.iter().position(|o| o == opcode));
+    assert_eq!(set(|r| r.subgroup), expected);
+    let mut expected = i64_atomics.to_vec();
+    expected.sort_by_key(|opcode| Opcode::ALL.iter().position(|o| o == opcode));
+    assert_eq!(set(|r| r.i64_atomics), expected);
+}
+
+#[test]
+fn a_later_operation_keeps_each_requirement_already_collected() {
+    use Opcode as O;
+    // One operation per flag, then one that needs nothing, and the other way round: the
+    // requirements are the first operation's either way.
+    let plain = (O::FPAdd32, vec![]);
+    for opcode in [
+        O::VoteAll,
+        O::FPAdd16,
+        O::FPMul64,
+        O::IAdd64,
+        O::StorageAtomicXor64,
+    ] {
+        let wanted = opcode_requirements(opcode);
+        assert_ne!(wanted, Requirements::default(), "{opcode}");
+        for ops in [
+            [(opcode, vec![]), plain.clone()],
+            [plain.clone(), (opcode, vec![])],
+        ] {
+            assert_eq!(
+                compute(&ops).expect("collects").requirements(),
+                wanted,
+                "{opcode}"
+            );
+        }
+    }
 }
 
 /// Whether `ty` is a 16-bit float type, a 64-bit float type, or a 64-bit integer.
@@ -1609,7 +1906,7 @@ fn errors_read_as_words() {
             index: 1
         }
         .to_string(),
-        "%3: argument 1 is not the immediate collect info reads"
+        "%3: argument 1 is missing or not of the kind collect info reads"
     );
     assert_eq!(
         InfoError::ColorOutput {
