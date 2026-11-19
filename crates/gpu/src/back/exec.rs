@@ -223,6 +223,7 @@ use compute::ComputeSink;
 use sinks::{CacheSink, Drained};
 
 pub use compute::ComputeError;
+pub use present::{PRESENT_FORMAT_RGB10A2, PRESENT_FORMAT_RGBA8};
 
 /// The shader cache as the executor sees it: the draw path's lookups ([`ShaderLookup`]) and the
 /// invalidations the back thread sends it for CPU writes, GPU writes and unmaps
@@ -665,9 +666,7 @@ impl Executor {
         ring: &mut crate::ring::Consumer,
         timeout: Duration,
     ) -> Result<Step, FenceError> {
-        let woke = self.fences.wait(ring, timeout);
-        self.after_fences();
-        match woke? {
+        match self.wait(ring, timeout)? {
             crate::back::fence::Woke::Entry(entry) => Ok(match self.apply(&entry) {
                 Ok(()) => Step::Applied,
                 Err(error) => Step::Refused(error),
@@ -675,6 +674,25 @@ impl Executor {
             crate::back::fence::Woke::Completed(_) => Ok(Step::Completed),
             crate::back::fence::Woke::TimedOut => Ok(Step::TimedOut),
         }
+    }
+
+    /// The first half of [`Executor::step`]: the back thread's wait for its next piece of work
+    /// ([`Fences::wait`]), with what it applied handed on, but an entry not yet applied. For a
+    /// caller with something to do between taking an entry and applying it (the wiring's back
+    /// thread, `crate::wiring`, adds and forgets channels by ring position), which then calls
+    /// [`Executor::apply`].
+    ///
+    /// # Errors
+    ///
+    /// [`FenceError`] from the wait itself, as for [`Executor::step`].
+    pub fn wait(
+        &mut self,
+        ring: &mut crate::ring::Consumer,
+        timeout: Duration,
+    ) -> Result<crate::back::fence::Woke, FenceError> {
+        let woke = self.fences.wait(ring, timeout);
+        self.after_fences();
+        woke
     }
 
     /// Applies one ring entry (module docs, "Routing"). An error is logged at debug level and

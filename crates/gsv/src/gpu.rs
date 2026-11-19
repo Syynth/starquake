@@ -237,8 +237,6 @@ mod tests;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use starquake_gpu::interface::{Ticket, VmUpdate};
-use starquake_gpu::vm::GpuVm;
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::result::KernelError;
 use starquake_services::commands;
@@ -322,24 +320,11 @@ pub const MAX_SYNC: u8 = 1;
 /// re-exported here.
 pub use starquake_gpu::interface::AsId;
 
-/// What gsv asks of the GPU's front for its address tables: the part of the spec's `GpuFront`
-/// this slice uses, with the spec's names and signatures (graphics-server, "What this spec
-/// offers and assumes of the GPU front/back"). `crates/gpu` does not define `GpuFront` yet; when
-/// it does, it implements this, or this becomes it.
-///
-/// Called with gsv's shared lock held: an implementation must not block on the GPU or call into
-/// gsv (it reports only through `Completions::push`).
-pub trait GpuVmFront: Send + Sync {
-    /// A new address space with its table.
-    fn create_address_space(&self, space: AsId, vm: Arc<GpuVm>);
-
-    /// An ordered update of `space`'s table, applied once no work queued before it can use the
-    /// old mapping; `done` is reported back when it is applied, if given.
-    fn update_vm(&self, space: AsId, update: VmUpdate, done: Option<Ticket>);
-
-    /// Reports `done` once all work and updates queued before it are finished.
-    fn barrier(&self, done: Ticket);
-}
+/// What gsv asks of the GPU's front for its address tables: the address-table part of the spec's
+/// `GpuFront`, defined in `crates/gpu` with the front that implements it (gpu-protocol slice
+/// G21, `starquake_gpu::interface`, "`GpuFront` in parts") and re-exported here, where gsv's
+/// code names it. gsv defined it until the GPU crate had a front.
+pub use starquake_gpu::interface::GpuVmFront;
 
 /// The gpu server's family: its wiring, the state it reaches and the GPU's front. It holds no
 /// guest state of its own (module docs, "The server"), so its snapshot is empty.

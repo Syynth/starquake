@@ -479,31 +479,11 @@ pub use starquake_gpu::interface::{
 /// entries. The inline input of `SubmitGPFIFO` 0x1B is read up to this.
 pub const MAX_ENTRY_BYTES: usize = CHANNEL_QUEUE_ENTRIES * GP_ENTRY_BYTES;
 
-/// The GPU front refused a request (graphics-server's `GpuError`; what it holds is #12's).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("the GPU front refused the request")]
-pub struct GpuError;
-
-/// What gsv asks of the GPU's front for channels: the part of the spec's `GpuFront` this slice
-/// uses, with the spec's names and signatures (graphics-server, "What this spec offers and
-/// assumes of the GPU front/back"). `crates/gpu` does not define `GpuFront` yet; when it does,
-/// it implements this, or this becomes part of it, with [`crate::gpu::GpuVmFront`].
-///
-/// Called with gsv's shared lock held: an implementation must not block on the GPU or call into
-/// gsv (it reports only through `Completions::push`).
-pub trait ChannelFront: Send + Sync {
-    /// A new channel in `config`'s address space, incrementing `config`'s syncpoint.
-    fn create_channel(&self, config: ChannelConfig) -> Result<ChannelId, GpuError>;
-
-    /// Binds object class `class` on `channel`.
-    fn bind_class(&self, channel: ChannelId, class: u32) -> Result<(), GpuError>;
-
-    /// Queues `submission` on `channel`, or answers [`Submitted::Full`] and queues nothing.
-    fn submit(&self, channel: ChannelId, submission: Submission) -> Submitted;
-
-    /// Destroys `channel`.
-    fn destroy_channel(&self, channel: ChannelId);
-}
+/// The channel part of the spec's `GpuFront` and the error it refuses with: graphics-server's
+/// `ChannelFront` and `GpuError`, defined in `crates/gpu` with the front that implements them
+/// (gpu-protocol slice G21, `starquake_gpu::interface`, "`GpuFront` in parts") and re-exported
+/// here, where gsv's code names them. gsv defined them until the GPU crate had a front.
+pub use starquake_gpu::interface::{ChannelFront, GpuError};
 
 /// Eden's object-context classes (`nvhost_gpu.h`: `enum class CtxClasses`), the Maxwell engine
 /// slots NX2 maps the Switch 2 classes onto.

@@ -10,9 +10,9 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use starquake_gpu::interface::{Completions, GpuCompletion, RegionId, Target};
+use starquake_gpu::interface::{Completions, GpuCompletion, RegionId, Target, Ticket, VmUpdate};
 use starquake_gpu::syncpoint::Syncpoints;
-use starquake_gpu::vm::Mapping;
+use starquake_gpu::vm::{GpuVm, Mapping};
 use starquake_ipc::{BUFFER_SIZE, Body, Message, SessionKind, TIPC_COMMAND_OFFSET};
 use starquake_kernel::dispatch::DeviceShareError;
 use starquake_kernel::id::SlabId;

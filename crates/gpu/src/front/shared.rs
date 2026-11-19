@@ -49,8 +49,8 @@ use thiserror::Error;
 use crate::back::fence::{FrontWake, Report};
 use crate::channel::ChannelError;
 use crate::interface::{
-    AsId, CHANNEL_QUEUE_ENTRIES, ChannelConfig, ChannelId, Submission, Submitted, Ticket, VmUpdate,
-    charge,
+    AsId, CHANNEL_QUEUE_ENTRIES, ChannelConfig, ChannelId, PresentRequest, Submission, Submitted,
+    Ticket, VmUpdate, charge,
 };
 use crate::memory::GpuMemory;
 use crate::ring::MarkerToken;
@@ -99,6 +99,9 @@ pub(super) enum Request {
     Barrier {
         ticket: Ticket,
     },
+    Present {
+        request: PresentRequest,
+    },
     Destroy {
         channel: ChannelId,
     },
@@ -138,6 +141,9 @@ struct Inbox {
     /// Something happened since the front last parked or took the inbox.
     signalled: bool,
     stopping: bool,
+    /// The front took requests or reports and has not yet ended a turn idle since
+    /// ([`FrontShared::is_quiet`]).
+    busy: bool,
 }
 
 /// What the front takes in one look.
@@ -257,6 +263,47 @@ impl FrontShared {
         self.queue(&mut inbox, Request::Barrier { ticket: done });
     }
 
+    /// Shows `request` once every submission queued before it has been read: the front pushes
+    /// it as a `Present` entry then (`super::ordered`, "Presents").
+    pub fn present(&self, request: PresentRequest) {
+        let mut inbox = self.lock();
+        self.queue(&mut inbox, Request::Present { request });
+    }
+
+    /// Whether `channel` was made and not destroyed.
+    pub fn has_channel(&self, channel: ChannelId) -> bool {
+        self.lock().queues.contains_key(&channel)
+    }
+
+    /// Every channel a structural error stopped, with its error, in channel order.
+    pub fn channel_errors(&self) -> Vec<(ChannelId, ChannelError)> {
+        self.lock()
+            .errors
+            .iter()
+            .map(|(&channel, &error)| (channel, error))
+            .collect()
+    }
+
+    /// Whether the front has nothing to do that it knows of: no request or back report waits to
+    /// be taken, and the front has ended a turn idle ([`FrontShared::mark_idle`]) since it last
+    /// took any. Read under the inbox's lock, so a request the front has taken but not yet
+    /// acted on reads as busy.
+    pub fn is_quiet(&self) -> bool {
+        let inbox = self.lock();
+        inbox.requests.is_empty()
+            && inbox.reports == BackReports::default()
+            && !inbox.busy
+            && !inbox.stopping
+    }
+
+    /// The front ended a turn idle ([`super::Turn::Idle`]): what it took has been acted on.
+    pub(crate) fn mark_idle(&self) {
+        let mut inbox = self.lock();
+        if inbox.requests.is_empty() && inbox.reports == BackReports::default() {
+            inbox.busy = false;
+        }
+    }
+
     /// Destroys `channel`: later submissions to it are dropped, and the front drops what it
     /// still holds of it when it reaches this call.
     pub fn destroy_channel(&self, channel: ChannelId) {
@@ -287,6 +334,9 @@ impl FrontShared {
     pub(super) fn take(&self) -> Taken {
         let mut inbox = self.lock();
         inbox.signalled = false;
+        if !inbox.requests.is_empty() || inbox.reports != BackReports::default() {
+            inbox.busy = true;
+        }
         Taken {
             requests: std::mem::take(&mut inbox.requests),
             reports: std::mem::take(&mut inbox.reports),

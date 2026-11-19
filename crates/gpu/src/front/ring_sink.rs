@@ -47,6 +47,9 @@ pub(crate) struct RingSink {
     reported: Option<MarkerToken>,
     /// The first push that failed (module docs).
     error: Option<PushError>,
+    /// Entries of every kind pushed so far, markers included: the ring position the back
+    /// counts its entries against ([`RingSink::sent`]).
+    sent: u64,
 }
 
 impl RingSink {
@@ -54,6 +57,7 @@ impl RingSink {
     pub(crate) fn new(producer: Producer) -> Self {
         Self {
             producer,
+            sent: 0,
             pushed: 0,
             performed: 0,
             markers: VecDeque::new(),
@@ -66,6 +70,12 @@ impl RingSink {
     /// The first failed push, if any (module docs).
     pub(crate) fn error(&self) -> Option<PushError> {
         self.error
+    }
+
+    /// Entries of every kind pushed so far, markers included. The back takes entries in push
+    /// order, so the entry the back takes `n`-th (from 0) is the one pushed when this was `n`.
+    pub(crate) fn sent(&self) -> u64 {
+        self.sent
     }
 
     /// Makes everything pushed so far visible to the back.
@@ -133,6 +143,7 @@ impl RingSink {
         }
         match self.producer.push(entry) {
             Ok(()) => {
+                self.sent = self.sent.saturating_add(1);
                 if !matches!(entry, RingEntry::Marker { .. }) {
                     self.pushed = self.pushed.saturating_add(1);
                 }

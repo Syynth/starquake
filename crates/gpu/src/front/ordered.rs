@@ -41,12 +41,22 @@
 //! An update of an address space the front was never given covers no channel, so it is ready at
 //! once; its marker carries no table change, only the ticket, since there is no table to change
 //! (`an_update_of_an_unknown_space_is_reported_without_a_change`).
+//!
+//! # Presents
+//!
+//! A present (`FrontShared::present`, which the wiring's `GpuFront::present` calls) waits here
+//! too, covering every channel as a barrier does, and is emitted as a `Present` entry instead of
+//! a marker: "submissions, ordered updates, barriers and presents take effect in the order the
+//! `GpuFront` methods were called" (spec, "Ordering guarantees" 7). So a present is pushed after
+//! every entry of every submission queued before it, and the back records it after the work
+//! those entries made (guarantee 6). It needs no report, so it files nothing in the
+//! [`OrderedTable`] (`a_present_waits_for_the_submissions_queued_before_it`).
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crate::back::fence::OrderedUpdate;
-use crate::interface::ChannelId;
+use crate::interface::{ChannelId, PresentRequest};
 use crate::ring::MarkerToken;
 
 /// The ordered updates the front has pushed markers for and the back has not taken yet, by
@@ -90,10 +100,20 @@ impl OrderedTable {
     }
 }
 
-/// An update or barrier waiting for the channels it covers.
+/// What a [`Pending`] call emits once it is ready.
+pub(super) enum Emit {
+    /// An update or barrier: a marker carrying it.
+    Ordered(OrderedUpdate),
+    /// A present (`GpuFront::present`, the wiring): a `Present` entry. It covers every channel,
+    /// as a barrier does, so it is ordered after every submission queued before it (spec,
+    /// "Ordering guarantees" 6 and 7).
+    Present(PresentRequest),
+}
+
+/// An update, barrier or present waiting for the channels it covers.
 pub(super) struct Pending {
-    /// What the marker carries.
-    pub(super) update: OrderedUpdate,
+    /// What it emits.
+    pub(super) what: Emit,
     /// Each covered channel with the sequence number of the last submission it took before the
     /// call.
     pub(super) positions: Vec<(ChannelId, u64)>,

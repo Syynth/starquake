@@ -19,10 +19,22 @@ pub struct FrontThread {
 ///
 /// The host's error if the thread cannot be made.
 pub fn spawn(front: Front) -> io::Result<FrontThread> {
+    spawn_observed(front, |_| {})
+}
+
+/// [`spawn`], running [`Front::run_observed`] with `observe`.
+///
+/// # Errors
+///
+/// The host's error if the thread cannot be made.
+pub fn spawn_observed(
+    front: Front,
+    observe: impl FnMut(&Front) + Send + 'static,
+) -> io::Result<FrontThread> {
     let shared = Arc::clone(front.shared());
     let handle = thread::Builder::new()
         .name("gpu-front".to_owned())
-        .spawn(move || front.run())?;
+        .spawn(move || front.run_observed(observe))?;
     Ok(FrontThread { shared, handle })
 }
 

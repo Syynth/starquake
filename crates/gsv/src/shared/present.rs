@@ -231,15 +231,11 @@ pub fn write_slots(reply: &mut Reply, available: u64) {
     }
 }
 
-/// Where the GPU front takes a latched frame: the part of the spec's `GpuFront` the latch uses
-/// (graphics-server, "What this spec offers and assumes of the GPU front/back": `fn present(&self,
-/// request: PresentRequest)`, "no fence: gsv latched it after its fence was reached"). As
-/// [`crate::gpu::GpuVmFront`] is for the address tables, `crates/gpu` does not define `GpuFront`
-/// yet; when it does, it implements this, or this becomes it.
-pub trait PresentFront: Send + Sync {
-    /// Shows `request`, ordered after the work queued before it.
-    fn present(&self, request: PresentRequest);
-}
+/// Where the GPU front takes a latched frame: the present part of the spec's `GpuFront`,
+/// defined in `crates/gpu` with the front that implements it (gpu-protocol slice G21,
+/// `starquake_gpu::interface`, "`GpuFront` in parts") and re-exported here, where gsv's code
+/// names it. gsv defined it until the GPU crate had a front.
+pub use starquake_gpu::interface::PresentFront;
 
 /// One presented frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
