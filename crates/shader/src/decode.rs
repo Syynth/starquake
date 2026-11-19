@@ -96,6 +96,8 @@ pub(crate) use op::control::{
     BRA_OPCODE, BRANCH_OFFSET, BSSY_OFFSET, BSSY_OPCODE, CALL_OPCODE, COND, COND_NOT,
     EXIT_KEEP_REF_COUNT, EXIT_NO_AT_EXIT, EXIT_OPCODE, RET_OPCODE,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use op::texture;
 pub use op::*;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use op::{Named, attribute, control, float, integer, op_list};
