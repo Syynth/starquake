@@ -905,6 +905,27 @@ pub fn packed_size(format: PixelFormat, extent: Extent3d) -> Result<u64, RenderE
         .ok_or(overflow)
 }
 
+/// Bytes a texture's host object takes: the [`packed_size`] of every mip level, times the
+/// sample count. What the recording backend's budget counts, and what a render capture's
+/// replay sums against its memory limit ([`crate::capture`]).
+///
+/// The loop runs once per mip level, so a caller holding an untrusted description checks it
+/// with [`validate_texture`] first, which bounds the level count by the largest dimension.
+pub fn texture_size(desc: &TextureDesc) -> Result<u64, RenderError> {
+    let overflow = RenderError::Overflow {
+        what: "texture size",
+    };
+    let mut total: u64 = 0;
+    for mip in 0..desc.mip_levels {
+        let extent = desc.mip_extent(mip).ok_or(overflow.clone())?;
+        total = packed_size(desc.format, extent)?
+            .checked_mul(desc.sample_count.into())
+            .and_then(|level| total.checked_add(level))
+            .ok_or(overflow.clone())?;
+    }
+    Ok(total)
+}
+
 /// Checks that `slice` is non-empty and lies inside the buffer `desc` describes.
 pub fn validate_buffer_slice(desc: &BufferDesc, slice: &BufferSlice) -> Result<(), RenderError> {
     in_range("buffer range size", slice.size, 1, desc.size)?;

@@ -508,6 +508,7 @@ pub fn shader_desc(shader: &HostShader, resources: &[ResourceUse]) -> ShaderDesc
             inputs: slots(&shader.inputs),
             outputs: slots(&shader.outputs),
         },
+        origin: None,
     }
 }
 

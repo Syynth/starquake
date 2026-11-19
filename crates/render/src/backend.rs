@@ -19,6 +19,7 @@ use crate::pipeline::{ComputePipelineDesc, GraphicsPipelineDesc};
 use crate::resource::{BufferDesc, SamplerDesc, TextureDesc, ViewDesc};
 use crate::shader::ShaderDesc;
 use crate::window::WindowHandles;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 /// Host memory the device allows and what the backend uses, for the GPU crate's eviction.
@@ -50,8 +51,9 @@ pub enum WaitOutcome {
     TimedOut,
 }
 
-/// The bytes a `Readback` command copied out.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The bytes a `Readback` command copied out. Serialisable, for a render capture's
+/// `ReadbackResult` record ([`crate::capture`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Readback {
     /// Tightly packed bytes of the region read.
     Bytes(Vec<u8>),

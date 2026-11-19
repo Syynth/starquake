@@ -102,6 +102,7 @@ fn only_written_levels_hold_memory() {
             entry: "main".to_owned(),
             source: ShaderSource::Msl(String::new()),
             interface: ShaderInterface::default(),
+            origin: None,
         })
         .expect("valid");
     let p = b
@@ -291,6 +292,7 @@ fn shader_lines_name_their_code() {
         entry: "fs".to_owned(),
         source,
         interface: ShaderInterface::default(),
+        origin: None,
     };
     assert_eq!(
         snapshot::shader(&desc(ShaderSource::Naga {

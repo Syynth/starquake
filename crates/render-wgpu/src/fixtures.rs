@@ -166,6 +166,7 @@ pub(crate) fn shader_desc(
         entry: entry.into(),
         source,
         interface,
+        origin: None,
     }
 }
 

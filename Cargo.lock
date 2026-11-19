@@ -1228,6 +1228,7 @@ dependencies = [
  "proptest",
  "raw-window-handle",
  "serde",
+ "sha2",
  "thiserror",
 ]
 

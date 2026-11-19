@@ -13,6 +13,8 @@
 
 use crate::flags::flag_set;
 use crate::format::{PIXEL_FORMAT_COUNT, PixelFormat};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 /// Colour render targets the guest's 3D engine has (`NumRenderTargets`,
 /// `eden/src/video_core/engines/maxwell_3d.h` @ cf654052).
@@ -31,7 +33,7 @@ pub const GUEST_VERTEX_BUFFERS: u32 = 32;
 pub const GUEST_VIEWPORTS: u32 = 16;
 
 /// Numeric limits of the device.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Limits {
     /// Largest buffer, in bytes.
     pub max_buffer_size: u64,
@@ -234,9 +236,38 @@ impl SampleCounts {
 }
 
 /// What the device can do with each [`PixelFormat`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Serialised as a list of one [`FormatFeatures`] per format in [`PixelFormat::index`] order, and
+/// read back through [`FormatTable::try_from`], which refuses a list of any other length (a
+/// render capture's `Start` record holds one: [`crate::capture`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "Vec<FormatFeatures>", try_from = "Vec<FormatFeatures>")]
 pub struct FormatTable {
     features: [FormatFeatures; PIXEL_FORMAT_COUNT],
+}
+
+/// A list read as a [`FormatTable`] does not hold one entry per [`PixelFormat`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+#[error("a format table needs {PIXEL_FORMAT_COUNT} entries, not {found}")]
+pub struct FormatTableLength {
+    /// How many entries the list held.
+    pub found: usize,
+}
+
+impl TryFrom<Vec<FormatFeatures>> for FormatTable {
+    type Error = FormatTableLength;
+    fn try_from(list: Vec<FormatFeatures>) -> Result<Self, Self::Error> {
+        let found = list.len();
+        let features = <[FormatFeatures; PIXEL_FORMAT_COUNT]>::try_from(list)
+            .map_err(|_| FormatTableLength { found })?;
+        Ok(Self { features })
+    }
+}
+
+impl From<FormatTable> for Vec<FormatFeatures> {
+    fn from(table: FormatTable) -> Self {
+        table.features.to_vec()
+    }
 }
 
 impl FormatTable {
@@ -259,7 +290,7 @@ impl FormatTable {
 }
 
 /// What the host device can do. Fixed for the backend's lifetime.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Caps {
     /// Numeric limits.
     pub limits: Limits,
@@ -281,8 +312,35 @@ pub struct Caps {
 
 #[cfg(test)]
 mod tests {
-    use super::{FormatFeatures, FormatTable, SampleCounts};
-    use crate::format::PixelFormat;
+    use super::{FormatFeatures, FormatTable, FormatTableLength, SampleCounts};
+    use crate::format::{PIXEL_FORMAT_COUNT, PixelFormat};
+
+    #[test]
+    fn format_table_reads_back_through_its_length_check() {
+        let mut table = FormatTable::uniform(FormatFeatures::SAMPLE);
+        table.set(PixelFormat::R8Unorm, FormatFeatures::ALL);
+        let bytes = postcard::to_allocvec(&table).expect("serialise");
+        assert_eq!(
+            postcard::from_bytes::<FormatTable>(&bytes).expect("deserialise"),
+            table
+        );
+        for found in [0, PIXEL_FORMAT_COUNT - 1, PIXEL_FORMAT_COUNT + 1] {
+            let list = vec![FormatFeatures::COPY; found];
+            assert_eq!(
+                FormatTable::try_from(list.clone()),
+                Err(FormatTableLength { found })
+            );
+            let bytes = postcard::to_allocvec(&list).expect("serialise");
+            assert!(
+                postcard::from_bytes::<FormatTable>(&bytes).is_err(),
+                "{found}"
+            );
+        }
+        assert_eq!(
+            FormatTableLength { found: 3 }.to_string(),
+            format!("a format table needs {PIXEL_FORMAT_COUNT} entries, not 3")
+        );
+    }
 
     #[test]
     fn sample_count_flags() {
