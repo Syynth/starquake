@@ -541,6 +541,15 @@ fn ir(text: &str) -> Function {
     Function::parse(text).expect("parses")
 }
 
+/// The id of the `index`th listed instruction of `function`.
+fn value_at(function: &Function, index: usize) -> Value {
+    function
+        .listed()
+        .nth(index)
+        .map(|(value, _)| value)
+        .expect("listed")
+}
+
 /// Lowers `function` with `inputs`, and checks that the module validates with exactly the
 /// capabilities its requirements name, both with this crate's flags and with wgpu's (every
 /// flag, experiment E1).
