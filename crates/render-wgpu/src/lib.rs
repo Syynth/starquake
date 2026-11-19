@@ -55,10 +55,15 @@ mod convert;
 #[cfg(test)]
 mod fixtures;
 pub mod format;
+pub mod pipeline;
 pub mod plan;
 pub mod rules;
 mod thread;
 
 pub use adapter::AdapterReport;
-pub use backend::{NewError, OPEN_TIMEOUT, PIPELINES_NOT_YET, SHADERS_NOT_YET, WgpuBackend};
+pub use backend::{NewError, OPEN_TIMEOUT, WgpuBackend};
 pub use config::{WgpuConfig, queue_full};
+pub use pipeline::{
+    DrawAction, DrawPipeline, PipelineCounts, ReadyPipeline, SkipReason, on_draw,
+    subgroups_honoured,
+};

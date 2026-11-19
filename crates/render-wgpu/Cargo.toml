@@ -15,3 +15,8 @@ starquake-render.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 wgpu.workspace = true
+
+[dev-dependencies]
+# naga's WGSL front end, for the pipeline tests' hand-written shader modules
+# (src/pipeline/tests.rs); the library takes naga IR only, through wgpu's re-export.
+naga = { workspace = true, features = ["wgsl-in"] }
