@@ -1,0 +1,17 @@
+[package]
+name = "starquake-render-wgpu"
+description = "The wgpu render backend: the only crate that names a wgpu type"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+starquake-render.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+wgpu.workspace = true
