@@ -10,6 +10,7 @@ mod float;
 mod image;
 mod integer;
 mod memory;
+mod warp;
 
 use super::{Finished, InterpError, Machine, Val};
 use crate::ir::Function;
