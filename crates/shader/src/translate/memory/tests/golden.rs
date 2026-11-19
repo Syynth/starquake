@@ -225,8 +225,8 @@ fn ldgsts() {
         }
         next += 10;
     }
-    expected.push_str(&format!(
-        "    %{next} = WorkgroupMemoryBarrier\n    return\n"
-    ));
+    expected.push_str("    %");
+    expected.push_str(&next.to_string());
+    expected.push_str(" = WorkgroupMemoryBarrier\n    return\n");
     assert_eq!(text(op), expected);
 }

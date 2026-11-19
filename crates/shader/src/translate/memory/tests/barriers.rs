@@ -87,10 +87,10 @@ fn ldgsts_copies_four_words_or_zero_fills() {
                 let target = usize::try_from(0x40 + i32::from(shared) * 16).expect("inside");
                 for k in 0..4_u32 {
                     let at = target + usize::try_from(k * 4).expect("small");
-                    let expected = if enabled != negated {
-                        0x1111_1111 * (k + 1)
-                    } else {
+                    let expected = if enabled == negated {
                         0
+                    } else {
+                        0x1111_1111 * (k + 1)
                     };
                     assert_eq!(shared_word(&machine, at), expected, "{global} {shared} {k}");
                 }

@@ -113,7 +113,7 @@ fn a_store_from_rz_writes_zeros() {
 
 /// The word index is the byte address shifted right arithmetically: a negative register plus
 /// offset gives a negative index, which the interpreter refuses as out of bounds rather than
-/// reading word 0x3fff_ffff.
+/// reading word `0x3fff_ffff`.
 #[test]
 fn the_word_index_shifts_arithmetically() {
     let function = build_op(Op::Ld(ldl(1, MemType::B32, 2, -4))).expect("translates");

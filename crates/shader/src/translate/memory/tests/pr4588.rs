@@ -544,13 +544,17 @@ fn global_to_shared_copy_retains_its_source_predicate() {
             // PT reads as an immediate: no predicate is read.
             assert!(!matches!(first, Some(Inst::Op(ref op)) if op.opcode == Opcode::GetPred));
         } else {
-            match first {
-                Some(Inst::Op(op)) => {
-                    assert_eq!(op.opcode, Opcode::GetPred);
-                    assert_eq!(op.args, [Operand::Imm(Imm::Pred(p(condition & 7)))]);
-                }
-                other => panic!("{other:?}"),
-            }
+            let read = match first {
+                Some(Inst::Op(op)) => Some((op.opcode, op.args)),
+                _ => None,
+            };
+            assert_eq!(
+                read,
+                Some((
+                    Opcode::GetPred,
+                    vec![Operand::Imm(Imm::Pred(p(condition & 7)))]
+                ))
+            );
         }
         assert_eq!(
             build_op(copy(3)),

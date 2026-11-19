@@ -5,21 +5,21 @@ use super::*;
 use crate::decode::{AtomCmpSrc, OpLdGsts};
 
 /// What translating `op`, through its word, is refused with.
-fn refused(op: Op) -> MemoryUnsupported {
+fn refused(op: Op) -> Option<MemoryUnsupported> {
     match build_op(op) {
-        Err(MemoryError::Unsupported(what)) => what,
-        other => panic!("{op}: expected a refusal, got {other:?}"),
+        Err(MemoryError::Unsupported(what)) => Some(what),
+        _ => None,
     }
 }
 
 /// What translating `op`, built by hand (no word), is refused with.
-fn refused_by_hand(op: Op) -> MemoryUnsupported {
+fn refused_by_hand(op: Op) -> Option<MemoryUnsupported> {
     let mut function = Function::new();
     let entry = function.entry();
     let mut builder = Builder::new(&mut function, entry);
     match translate_memory(&mut builder, &Instr::new(op), GuardMode::Honour) {
-        Err(MemoryError::Unsupported(what)) => what,
-        other => panic!("{op}: expected a refusal, got {other:?}"),
+        Err(MemoryError::Unsupported(what)) => Some(what),
+        _ => None,
     }
 }
 
@@ -76,19 +76,24 @@ fn red_with(enabled: bool, uniform: u8, ignored: u8, reg_64: bool, order: MemOrd
     })
 }
 
-/// Each refusal's exact message, one case per variant.
+/// A compare-and-swap in `space` at `addr`.
+fn cas(space: MemSpace, addr: MemAddr) -> Op {
+    Op::Atom(atom(
+        1,
+        AtomOp::CmpExch(AtomCmpSrc::Separate { cmpr: r(3) }),
+        AtomType::U32,
+        space,
+        addr,
+        4,
+    ))
+}
+
+/// The system-scope order, which the PR's translator does not read (bit 80).
+const SYSTEM: MemOrder = MemOrder::Strong(MemScope::System);
+
+/// Each refusal's exact message, one case per variant (part 1 of 3).
 #[test]
-fn every_refusal_has_its_message() {
-    let cas = |space, addr| {
-        Op::Atom(atom(
-            1,
-            AtomOp::CmpExch(AtomCmpSrc::Separate { cmpr: r(3) }),
-            AtomType::U32,
-            space,
-            addr,
-            4,
-        ))
-    };
+fn every_refusal_has_its_message_1() {
     let cases: Vec<(Op, MemoryUnsupported, &str)> = vec![
         (
             cas(GLOBAL, plain(2, true, 0)),
@@ -179,6 +184,17 @@ fn every_refusal_has_its_message() {
             },
             "a global address in uniform register urz",
         ),
+    ];
+    for (op, what, text) in cases {
+        assert_eq!(refused(op), Some(what), "{op}");
+        assert_eq!(message(op), format!("{text} is not supported"), "{op}");
+    }
+}
+
+/// Each refusal's exact message, one case per variant (part 2 of 3).
+#[test]
+fn every_refusal_has_its_message_2() {
+    let cases: Vec<(Op, MemoryUnsupported, &str)> = vec![
         (
             Op::Ld(ldg(
                 1,
@@ -263,6 +279,17 @@ fn every_refusal_has_its_message() {
             },
             "ldgsts registers r6 (shared) and r5 (global pair)",
         ),
+    ];
+    for (op, what, text) in cases {
+        assert_eq!(refused(op), Some(what), "{op}");
+        assert_eq!(message(op), format!("{text} is not supported"), "{op}");
+    }
+}
+
+/// Each refusal's exact message, one case per variant (part 3 of 3).
+#[test]
+fn every_refusal_has_its_message_3() {
+    let cases: Vec<(Op, MemoryUnsupported, &str)> = vec![
         (
             Op::St(st(
                 1,
@@ -316,7 +343,7 @@ fn every_refusal_has_its_message() {
         ),
     ];
     for (op, what, text) in cases {
-        assert_eq!(refused(op), what, "{op}");
+        assert_eq!(refused(op), Some(what), "{op}");
         assert_eq!(message(op), format!("{text} is not supported"), "{op}");
     }
 }
@@ -332,7 +359,7 @@ fn a_local_atomic_is_refused() {
         plain(2, false, 0),
         3,
     ));
-    assert_eq!(refused_by_hand(op), MemoryUnsupported::LocalAtomic);
+    assert_eq!(refused_by_hand(op), Some(MemoryUnsupported::LocalAtomic));
     assert_eq!(
         MemoryError::from(MemoryUnsupported::LocalAtomic).to_string(),
         "a local atomic, which no encoding has, is not supported"
@@ -357,7 +384,7 @@ fn ldl_refuses_any_uniform_field() {
     for (uniform, enabled) in [(0, true), (1, false), (63, false), (63, true)] {
         assert_eq!(
             refused(local(uniform, enabled)),
-            MemoryUnsupported::UniformAddress(Space::Local),
+            Some(MemoryUnsupported::UniformAddress(Space::Local)),
             "{uniform} {enabled}"
         );
     }
@@ -396,7 +423,7 @@ fn atomic_types_past_s32_are_refused() {
             } else {
                 assert_eq!(
                     refused(op),
-                    MemoryUnsupported::AtomicType { space, atom_type },
+                    Some(MemoryUnsupported::AtomicType { space, atom_type }),
                     "{op}"
                 );
             }
@@ -415,7 +442,7 @@ fn ldc_modes_past_indexed_are_refused() {
         if mode == LdcMode::Indexed {
             assert!(accepted(op));
         } else {
-            assert_eq!(refused(op), MemoryUnsupported::ConstantLoadMode(mode));
+            assert_eq!(refused(op), Some(MemoryUnsupported::ConstantLoadMode(mode)));
         }
     }
 }
@@ -433,7 +460,7 @@ fn bindless_ldc_is_refused_for_every_handle() {
         });
         assert_eq!(
             refused(op),
-            MemoryUnsupported::BindlessConstantLoad,
+            Some(MemoryUnsupported::BindlessConstantLoad),
             "ur{handle}"
         );
     }
@@ -445,7 +472,7 @@ fn only_the_sm_barrier_scope_is_refused() {
     for &scope in MemBarScope::ALL {
         let op = membar(scope, false, false);
         if scope == MemBarScope::Sm {
-            assert_eq!(refused(op), MemoryUnsupported::BarrierScope(scope));
+            assert_eq!(refused(op), Some(MemoryUnsupported::BarrierScope(scope)));
         } else {
             assert!(accepted(op), "{op}");
         }
@@ -476,7 +503,7 @@ fn the_system_order_is_refused_in_every_global_form() {
         ]
     };
     for op in forms(system) {
-        assert_eq!(refused(op), MemoryUnsupported::SystemOrder, "{op}");
+        assert_eq!(refused(op), Some(MemoryUnsupported::SystemOrder), "{op}");
     }
     for op in forms(gpu) {
         assert!(accepted(op), "{op}");
@@ -528,11 +555,11 @@ fn load_destinations_at_their_edges() {
             } else {
                 assert_eq!(
                     refused(op),
-                    MemoryUnsupported::LoadDestination {
+                    Some(MemoryUnsupported::LoadDestination {
                         space,
                         dst: r(dst),
                         words: words_of(mem_type),
-                    },
+                    }),
                     "{op}"
                 );
             }
@@ -565,11 +592,11 @@ fn store_data_at_their_edges() {
             } else {
                 assert_eq!(
                     refused(op),
-                    MemoryUnsupported::StoreData {
+                    Some(MemoryUnsupported::StoreData {
                         space: which,
                         data: r(data),
                         words: words_of(mem_type),
-                    },
+                    }),
                     "{op}"
                 );
             }
@@ -598,10 +625,10 @@ fn ldc_destinations_at_their_edges() {
         } else {
             assert_eq!(
                 refused(op),
-                MemoryUnsupported::ConstantLoadDestination {
+                Some(MemoryUnsupported::ConstantLoadDestination {
                     dst: r(dst),
                     words: words_of(mem_type),
-                },
+                }),
                 "{op}"
             );
         }
@@ -625,7 +652,7 @@ fn global_register_pairs_at_their_edges() {
         } else {
             assert_eq!(
                 refused(op),
-                MemoryUnsupported::GlobalRegisterAddress(r(reg))
+                Some(MemoryUnsupported::GlobalRegisterAddress(r(reg)))
             );
         }
     }
@@ -654,10 +681,10 @@ fn global_uniform_registers_at_their_edges() {
         } else {
             assert_eq!(
                 refused(op),
-                MemoryUnsupported::GlobalUniformAddress {
+                Some(MemoryUnsupported::GlobalUniformAddress {
                     reg: ur(uniform),
                     pair: wide,
-                }
+                })
             );
         }
     }
@@ -681,10 +708,10 @@ fn copy_registers_at_their_edges() {
         } else {
             assert_eq!(
                 refused(op),
-                MemoryUnsupported::CopyRegisters {
+                Some(MemoryUnsupported::CopyRegisters {
                     shared: r(shared),
                     global: r(global),
-                }
+                })
             );
         }
     }
@@ -693,10 +720,10 @@ fn copy_registers_at_their_edges() {
 // ---------------------------------------------------------------------------------------------
 // Order: two faults at once, the first in the documented order reported.
 
-/// Each pair of faults in one instruction reports the one the module docs order first.
+/// Each pair of faults in one instruction reports the one the module docs order first (part
+/// 1 of 3).
 #[test]
-fn faults_report_in_the_documented_order() {
-    let system = MemOrder::Strong(MemScope::System);
+fn faults_report_in_the_documented_order_1() {
     let cases: Vec<(Op, MemoryUnsupported)> = vec![
         // LDG: residency, uniform address, register address, destination, order.
         (
@@ -723,7 +750,7 @@ fn faults_report_in_the_documented_order() {
         ),
         (
             Op::Ld(OpLd {
-                space: global_with(system),
+                space: global_with(SYSTEM),
                 ..ldg(3, MemType::B64, plain(2, true, 0))
             }),
             MemoryUnsupported::LoadDestination {
@@ -738,7 +765,7 @@ fn faults_report_in_the_documented_order() {
             MemoryUnsupported::GlobalRegisterAddress(r(3)),
         ),
         (
-            Op::St(st(3, MemType::B64, global_with(system), plain(2, true, 0))),
+            Op::St(st(3, MemType::B64, global_with(SYSTEM), plain(2, true, 0))),
             MemoryUnsupported::StoreData {
                 space: Space::Global,
                 data: r(3),
@@ -772,6 +799,17 @@ fn faults_report_in_the_documented_order() {
             }),
             MemoryUnsupported::SharedUniformField(ur(1)),
         ),
+    ];
+    for (op, what) in cases {
+        assert_eq!(refused(op), Some(what), "{op}");
+    }
+}
+
+/// Each pair of faults in one instruction reports the one the module docs order first (part
+/// 2 of 3).
+#[test]
+fn faults_report_in_the_documented_order_2() {
+    let cases: Vec<(Op, MemoryUnsupported)> = vec![
         // LDL: uniform address, destination.
         (
             Op::Ld(OpLd {
@@ -845,7 +883,7 @@ fn faults_report_in_the_documented_order() {
                 1,
                 AtomOp::Add,
                 AtomType::U32,
-                global_with(system),
+                global_with(SYSTEM),
                 plain(3, true, 0),
                 4,
             )),
@@ -863,6 +901,17 @@ fn faults_report_in_the_documented_order() {
             )),
             MemoryUnsupported::UniformSharedAtomic,
         ),
+    ];
+    for (op, what) in cases {
+        assert_eq!(refused(op), Some(what), "{op}");
+    }
+}
+
+/// Each pair of faults in one instruction reports the one the module docs order first (part
+/// 3 of 3).
+#[test]
+fn faults_report_in_the_documented_order_3() {
+    let cases: Vec<(Op, MemoryUnsupported)> = vec![
         // RED: uniform address, type, register address, destination field, uniform field,
         // order, bit 90.
         (
@@ -895,15 +944,15 @@ fn faults_report_in_the_documented_order() {
             MemoryUnsupported::GlobalRegisterAddress(r(3)),
         ),
         (
-            red_with(false, 2, 1, true, system),
+            red_with(false, 2, 1, true, SYSTEM),
             MemoryUnsupported::ReductionDestination(r(1)),
         ),
         (
-            red_with(false, 2, 0, true, system),
+            red_with(false, 2, 0, true, SYSTEM),
             MemoryUnsupported::ReductionUniformField(ur(2)),
         ),
         (
-            red_with(false, 0, 0, true, system),
+            red_with(false, 0, 0, true, SYSTEM),
             MemoryUnsupported::SystemOrder,
         ),
         // MEMBAR: scope, .MMIO, .SC.
@@ -917,6 +966,6 @@ fn faults_report_in_the_documented_order() {
         ),
     ];
     for (op, what) in cases {
-        assert_eq!(refused(op), what, "{op}");
+        assert_eq!(refused(op), Some(what), "{op}");
     }
 }

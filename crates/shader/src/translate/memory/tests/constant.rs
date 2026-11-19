@@ -101,7 +101,7 @@ fn only_a_register_offset_is_indexed() {
                     _ => None,
                 })
                 .collect();
-            assert!(!reads.is_empty());
+            assert_ne!(reads.len(), 0);
             assert!(
                 reads.iter().all(|&read| read == indexed),
                 "{offset_reg} {mem_type:?}"
