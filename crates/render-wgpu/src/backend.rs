@@ -96,6 +96,7 @@ use crate::draw::{DrawLimits, PipelineInfo, extra_buffer_usages};
 use crate::pipeline::{
     self as pipelines, Compile, ComputeBuild, Counters, DrawPipeline, GraphicsBuild,
     NO_COMPILE_POOL, PipelineCell, PipelineCounts, PipelineEntry, Registry, ShaderRec,
+    SubgroupSupport, SubgroupVerdict,
 };
 use crate::plan::{self, Tables, TextureRec, ViewRec};
 use crate::rules;
@@ -428,8 +429,9 @@ pub struct WgpuBackend {
     device: wgpu::Device,
     /// The compile pool and the wait-while-compiling setting, if the backend was given them.
     compile: Option<Compile>,
-    /// Whether the device runs every subgroup 32 wide (`pipeline::subgroups_honoured`).
-    subgroups: bool,
+    /// Whether the device meets "subgroup size 32", and why, and whether it runs subgroups in
+    /// vertex shaders (`pipeline::SubgroupVerdict`).
+    subgroups: SubgroupVerdict,
     /// What the device allows a draw beyond `Caps` (`crate::draw`).
     limits: DrawLimits,
 }
@@ -501,8 +503,7 @@ impl WgpuBackend {
         );
         let info = adapter.get_info();
         let report = AdapterReport::new(&info, adapter.features(), &limits);
-        let subgroups =
-            pipelines::subgroups_honoured(features, info.subgroup_min_size, info.subgroup_max_size);
+        let subgroups = SubgroupVerdict::of(&info, features);
         let host_device = device.clone();
         let draw_limits = DrawLimits::new(&device.limits(), features, caps.limits.max_buffer_size);
         let shared = Arc::new(Shared {
@@ -582,10 +583,37 @@ impl WgpuBackend {
         self.shared.encode_skips.load(Ordering::Relaxed)
     }
 
-    /// Whether the device runs every subgroup 32 wide, so pipelines whose shaders use subgroups
-    /// are accepted (`crate::pipeline`, "Requirements").
+    /// Whether the device meets "subgroup size 32" (an Apple GPU, or a range of exactly 32 to 32),
+    /// so pipelines whose shaders use subgroups are accepted (`crate::pipeline`, "Requirements").
     pub fn honours_subgroups(&self) -> bool {
-        self.subgroups
+        self.subgroups.support.honoured()
+    }
+
+    /// Whether the device meets "subgroup size 32", and why, as decided from the adapter's
+    /// `AdapterInfo` and the device's features when the backend opened.
+    pub fn subgroup_support(&self) -> SubgroupSupport {
+        self.subgroups.support
+    }
+
+    /// Whether the device runs subgroup operations in vertex shaders
+    /// (`wgpu::Features::SUBGROUP_VERTEX`), so a pipeline whose vertex shader uses subgroups is
+    /// accepted (`crate::pipeline`, "Requirements").
+    pub fn honours_vertex_subgroups(&self) -> bool {
+        self.subgroups.vertex
+    }
+
+    /// Replaces the subgroup verdict, so a test can check the requirement's refusal and its
+    /// place in the order of checks on a device that meets it.
+    #[cfg(test)]
+    pub(crate) fn set_subgroup_support(&mut self, support: SubgroupSupport) {
+        self.subgroups.support = support;
+    }
+
+    /// Replaces whether the device runs subgroups in vertex shaders, so a test can check that
+    /// refusal and its acceptance on any device.
+    #[cfg(test)]
+    pub(crate) fn set_vertex_subgroups(&mut self, vertex: bool) {
+        self.subgroups.vertex = vertex;
     }
 
     fn pipeline_cell(&self, id: PipelineId) -> Result<Arc<PipelineCell>, RenderError> {
