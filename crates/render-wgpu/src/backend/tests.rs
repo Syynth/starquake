@@ -1919,3 +1919,5 @@ fn pending_ids_of_different_kinds_or_generations_differ() {
 }
 
 mod window;
+
+mod draws;

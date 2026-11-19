@@ -127,9 +127,11 @@ const fn is_strip(topology: Topology) -> bool {
 ///    restart off (the restart value is drawn as a vertex: `draw` module docs, "Divergences");
 /// 2. 8-bit indices (wgpu has none) are widened, with restart kept on a strip whose pipeline
 ///    restarts;
-/// 3. 16-bit indices of a strip whose pipeline does not restart are widened, so their value
-///    `0xFFFF` is a vertex and not wgpu's restart value (render-backend, "Primitive restart
-///    off"); 32-bit indices cannot be widened (`draw` module docs, "Divergences").
+/// 3. 16-bit indices of a strip are widened, since a strip pipeline takes 32-bit indices only
+///    (`crate::pipeline::state::STRIP_INDEX_FORMAT`): `0xFFFF` becomes the 32-bit restart value
+///    when the pipeline restarts, and stays a vertex when it does not (render-backend,
+///    "Primitive restart off"). 32-bit strip indices are drawn as they are, and cannot be
+///    widened when restart is off (`draw` module docs, "Divergences").
 pub const fn plan(
     topology: Topology,
     primitive_restart: bool,
@@ -156,10 +158,10 @@ pub const fn plan(
             source,
             restart: primitive_restart && is_strip(topology),
         }),
-        Some(IndexFormat::U16) if is_strip(topology) && !primitive_restart => Some(Rewrite {
+        Some(IndexFormat::U16) if is_strip(topology) => Some(Rewrite {
             mode,
             source,
-            restart: false,
+            restart: primitive_restart,
         }),
         _ => None,
     }

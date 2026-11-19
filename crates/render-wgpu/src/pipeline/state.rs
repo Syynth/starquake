@@ -42,11 +42,21 @@
 //! `PrimitiveTopology` maps them; triangle fans and polygons as triangle lists too, since wgpu
 //! has no fans (Eden keeps fans native, and maps polygons to fans); line loops as line strips
 //! closed by repeating the first index (Eden maps them to triangle lists, which draws no line;
-//! guess: R7 settles it). The topologies with adjacency are refused ([`ADJACENCY`]): wgpu has
-//! none, and without a geometry shader nothing reads the extra vertices. Patches never reach
-//! here: the shared checks need tessellation shaders for them, which a wgpu device cannot run.
-//! `strip_index_format` is left unset: the pipeline does not know the index format, and wgpu then
-//! restarts strips at the index format's restart value (render-backend's table).
+//! slice R7 settled it: `backend::tests::draws::a_line_loop_draws_as_its_closed_strip` draws a
+//! loop as the strip that returns to its first vertex). The topologies with adjacency are
+//! refused ([`ADJACENCY`]): wgpu has none, and without a geometry shader nothing reads the extra
+//! vertices. Patches never reach here: the shared checks need tessellation shaders for them,
+//! which a wgpu device cannot run.
+//!
+//! A strip pipeline (line or triangle strip, and so a line loop's) gets [`STRIP_INDEX_FORMAT`],
+//! 32-bit indices, and every other pipeline none. wgpu-core 30.0.2 refuses an indexed draw of a
+//! strip pipeline whose `strip_index_format` is not the index buffer's format
+//! (`UnmatchedStripIndexFormat`, `src/command/render.rs`), so a pipeline that names none can
+//! draw no indexed strip at all (slice R6 left it unset; R7 found it). The pipeline does not
+//! know the draws' index format, so it names 32 bits, and the draw rewrites 8-bit and 16-bit
+//! strip indices into 32-bit ones (`crate::draw`, "The index rewrite"). Naming a format also
+//! turns primitive restart on under Vulkan (wgpu-hal sets `primitive_restart_enable` from it),
+//! where Metal always restarts, so both hosts restart strips at `0xFFFFFFFF`.
 //!
 //! # Rasterisation, depth and stencil
 //!
@@ -98,6 +108,9 @@ use starquake_render::pipeline::{
     DepthStencilState, FrontFace, GraphicsPipelineDesc, PolygonMode, StencilFace, StencilOperation,
     Topology, VertexAttribute, VertexComponents, VertexKind, VertexStepMode,
 };
+
+/// The index format of every strip pipeline (module docs, "Topology").
+pub const STRIP_INDEX_FORMAT: wgpu::IndexFormat = wgpu::IndexFormat::Uint32;
 
 /// A vertex attribute wgpu has no format for.
 pub const VERTEX_FORMAT: &str =
@@ -437,7 +450,7 @@ pub(crate) fn graphics(desc: &GraphicsPipelineDesc) -> Result<GraphicsPlan, Rend
     };
     let primitive = wgpu::PrimitiveState {
         topology,
-        strip_index_format: None,
+        strip_index_format: topology.is_strip().then_some(STRIP_INDEX_FORMAT),
         front_face: match raster.front_face {
             FrontFace::Ccw => wgpu::FrontFace::Ccw,
             FrontFace::Cw => wgpu::FrontFace::Cw,
