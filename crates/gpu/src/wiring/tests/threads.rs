@@ -11,8 +11,8 @@ use crate::interface::CHANNEL_QUEUE_ENTRIES;
 use crate::memory::GpuFault;
 
 /// The homebrew-style stream of the end-to-end test: a release, two increments after it (one
-/// `Syncpoint` entry with a count of 2), a present and a barrier, each waited for before the next call so the flight recorder's text is
-/// in one order.
+/// `Syncpoint` entry with a count of 2), a present and a barrier, each waited for before the next
+/// call so the flight recorder's text is in one order.
 fn run_the_synthetic_stream(r: &Rig) -> ChannelId {
     r.syncpoints.watch(syncpoint());
     r.space();

@@ -30,7 +30,7 @@ use crate::back::qmd::tests::{SlotSpec, Spec, encode};
 use crate::back::qmd::{CONSTANT_BUFFER_SIZE_SHIFT, ConstantBuffer, QMD_ADDRESS_SHIFT, QMD_WORDS};
 use crate::classes::{Method, cl902d, cla140, clc7b5, clc7c0, clc797};
 use crate::field::Field;
-use crate::interface::{DisplayId, ImageDesc, LayerId, Rect, VmUpdate};
+use crate::interface::{DisplayId, ImageDesc, LayerId, Rect, SyncpointId, VmUpdate};
 use crate::memory::TestGpuMemory;
 use crate::ring::{MarkerToken, parse_text};
 use crate::syncpoint::Syncpoints;
@@ -226,6 +226,7 @@ struct Rig {
     watch: Arc<WriteWatch>,
     shaders: Arc<Mutex<ShaderLog>>,
     ordered: Arc<OrderedTable>,
+    syncpoints: Arc<Syncpoints>,
 }
 
 impl Rig {
@@ -258,8 +259,9 @@ impl Rig {
         let clock = Arc::new(Clock::default());
         let pushed = Arc::new(Pushed::default());
         let waiters = Arc::new(WaiterTable::new());
+        let syncpoints = Arc::new(Syncpoints::new(Arc::<Pushed>::clone(&pushed)));
         let env = FenceEnv {
-            syncpoints: Arc::new(Syncpoints::new(Arc::<Pushed>::clone(&pushed))),
+            syncpoints: Arc::clone(&syncpoints),
             waiters,
             completions: pushed,
             clock: Arc::<Clock>::clone(&clock),
@@ -295,6 +297,7 @@ impl Rig {
             watch,
             shaders,
             ordered,
+            syncpoints,
         }
     }
 
@@ -1857,6 +1860,21 @@ fn deferred_instances_are_drawn_before_each_boundary() {
             last_draw_has_instances(&commands, 2),
             "{name}: {commands:?}"
         );
+    }
+}
+
+#[test]
+fn a_syncpoint_entry_increments_by_exactly_its_count() {
+    // The count goes through the executor unchanged: a count above 16 bits and `u32::MAX` each
+    // reach the counter whole, and 0 changes nothing. Each count runs on a fresh rig, so the
+    // counter starts at 0.
+    let id = SyncpointId::new(5).unwrap();
+    for count in [0, 0x1_0000, u32::MAX] {
+        let mut rig = Rig::new();
+        rig.run(&format!("syncpoint id={} count={count}\n", id.get()));
+        rig.submit();
+        rig.exec.complete();
+        assert_eq!(rig.syncpoints.read(id), count, "count {count}");
     }
 }
 

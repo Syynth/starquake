@@ -509,7 +509,7 @@ fn wait_for_idle_comes_before_the_increments_and_only_with_them() {
 #[test]
 fn u32_max_increments_go_out_as_one_entry_in_one_turn() {
     // One entry with the count, so the front's cost does not grow with it: the submission and
-    // another channel's both finish in one turn, and the counter wraps to `u32::MAX` from 0.
+    // another channel's both finish in one turn, and the counter goes from 0 to `u32::MAX`.
     let mut r = rig();
     let a = r.channel(5);
     let b = r.channel(6);
@@ -585,6 +585,31 @@ fn the_increments_entry_costs_one_unit_of_the_quantum() {
     r.front.turn().unwrap();
     assert_eq!(r.front.counters().words, u64::from(QUANTUM));
     assert_eq!(r.front.counters().submissions, 2);
+    r.settle();
+    assert_eq!(r.take(), ["syncpoint id=5 count=7"]);
+}
+
+#[test]
+fn the_increments_entry_costs_no_more_than_one_unit_of_the_quantum() {
+    // A quantum less two of words, then the entry, which takes one unit: one is left, so the
+    // channel's next submission, one word long, finishes in the same turn. An entry that cost
+    // two units would leave nothing and hold it to the next turn.
+    let quantum = usize::try_from(QUANTUM).unwrap();
+    let mut r = rig();
+    let a = r.channel(5);
+    let nops = vec![0u32; quantum - 2];
+    r.shared.submit(
+        a,
+        Submission {
+            increments: 7,
+            ..plain(vec![r.entry(CMD_A, &nops)])
+        },
+    );
+    r.submit(a, vec![r.entry(CMD_FAR, &[0])]);
+    r.front.turn().unwrap();
+    assert_eq!(r.front.counters().submissions, 2);
+    assert_eq!(r.front.counters().words, u64::from(QUANTUM) - 1);
+    assert_eq!(r.front.counters().increments, 7);
     r.settle();
     assert_eq!(r.take(), ["syncpoint id=5 count=7"]);
 }

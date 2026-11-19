@@ -17,10 +17,11 @@
 //! ```
 //!
 //! [`RingEntry`]'s `Display` writes this form, with addresses, classes, methods, values, payloads,
-//! tokens and run words in hexadecimal and the rest (a syncpoint's count among them) in decimal; [`parse_entry`] reads it back and
-//! accepts every number in either base (`0x` marks hexadecimal). A run with no words is
-//! `words=`, and a run of more than [`MAX_RUN_WORDS`] words is an error
-//! ([`ParseError::RunTooLong`]), as it is for [`super::encode()`]. Blank lines are skipped by [`parse_text`].
+//! tokens and run words in hexadecimal and the rest (a syncpoint's count among them) in decimal;
+//! [`parse_entry`] reads it back and accepts every number in either base (`0x` marks
+//! hexadecimal). A run with no words is `words=`, and a run of more than [`MAX_RUN_WORDS`] words
+//! is an error ([`ParseError::RunTooLong`]), as it is for [`super::encode()`]. Blank lines are
+//! skipped by [`parse_text`].
 
 use std::borrow::Cow;
 use std::fmt::{self, Write as _};
