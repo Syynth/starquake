@@ -587,13 +587,38 @@ Landed: G18 (from 3D state to a draw, #329, PR #404), G22 (production GPU memory
 | awaiting the owner | **`MME_DMA_READ` (0x157) in the spec:** gpu-protocol's "Macros" section names only the FIFO form (0x158). PR #400 performs 0x157 at the write, as Eden-NX2 does, and the memo stores no call (3D or compute) that writes it. The compute class's MME DMA methods are register writes only, following Eden-NX2's compute front; a trace of a compute macro would decide. Add a sentence for each | #393 | gpu-protocol |
 | proposed | **Stencil mask reset values** are 0xFFFFFFFF, as Eden writes them, while `clc797.h`'s field is 7:0 (decision 10: values follow Eden-NX2). A trace of a fresh channel's register reads would settle it | #392 | area:gpu |
 | awaiting the owner | **Local memory size:** Eden computes `low \| high << 24`; NAK stores bits 32..55 in the high field. PR #402 follows Eden. Verification E3 with a large-local-memory shader would settle it. The CRS size (which PR #4588 adds) is exposed raw for slice 16 to decide | #349 | shader-pipeline |
-| awaiting the owner | **A compute program's header:** the spec says a compute program has no header, but PR #4588's native compute path starts at `sizeof(sph)` (0x50). Check in E3 and in slice 3 | #349 | shader-pipeline |
+| proposed: no change | **A compute program's header:** the spec says a compute program has no header, but PR #4588's native compute path starts at `sizeof(sph)` (0x50). Wave 41 settled it: those offsets are into PR #4588's lowered code buffer, and its capture reads a compute program's instruction 0 at the program address, which agrees with the spec (slice 3's scope note, #350) | #349 | shader-pipeline |
 | proposed | **Slice 15 wiring:** `program::translate_program` still takes the stage and colour outputs by hand; slice 15 should call `ProgramHeader::from_program`, check the header's stage against the pipeline slot, and build `ColorOutputs` from the header | #349 | area:shader |
 | proposed | **Render backend gaps for R6 and R7:** vertex divisors; null view and sampler bindings; a scratch path for copies within one resource (wgpu refuses them even when regions do not overlap); depth and stencil through buffers, which the D24S8 to D32FS8 conversion needs; unaligned buffer ranges (wgpu needs 4-byte alignment); `max_viewports` below 16; non-finite dynamic state; a shared list resolver for the recording and wgpu backends, which both resolve ids and apply the readback and render-target rules | #382, #329 | area:render |
 | awaiting the owner | **Render backend choices R5 made:** sampler LOD bias is dropped (it probably belongs in the shader, R7), anisotropy is 1 when any filter is nearest, negative LOD clamps are raised to 0; guest 1D arrays have no wgpu equivalent (2D textures of height 1 is a shader-side decision); the stencil aspect of `D32_FLOAT_S8_UINT` is not copied because copy commands carry no aspect | #382 | render-backend |
 | awaiting the owner | **render-backend errata from R5:** the spec pins wgpu 30.0.1, the workspace uses 30.0.2; wgpu refuses depth clear values outside 0..=1, and compressed formats cannot be cleared, settling two guesses in `view_ops` | #382 | render-backend |
 | proposed | **Report upstream:** wgpu-hal 30.0.2's Metal encoder turns a missing `bytes_per_row` into 0 | #382 | owner |
 | proposed | **Chore:** `crates/gpu/src/macros/tests.rs` keeps its own tracing capture; switch it to `crate::test_log` | #329 | area:gpu |
+
+### From wave 41 (ledger: #22)
+
+Landed: G19 (the back-thread executor, #330, PR #408; #330 stays open for host copies and blits between cached textures), R6 (pipelines on the compile pool, PR #407; #383 stays open for the driver cache blob), R8 (window presentation, #385, PR #406), R11b (render capture v2 in the render crate, #388, PR #409) and shader slice 6h (control and warp instructions, #358, PR #405). Shader slice 3 (#350) was built and pushed but stopped before its checks; wave 42 resumes it from its branch. Wiring notes are comments on #332, #384, #389, #397 and #362.
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| awaiting the owner | **Subgroups on the Mac:** wgpu-hal 30.0.2's Metal backend reports a subgroup size range of 4..64 on every Mac, and wgpu cannot request a size, so R6 refuses every pipeline that uses subgroup operations (the lane id included) on the Mac. The spec already says Apple GPUs run 32-wide SIMD groups (shader-pipeline, "Compute programs"). Recommendation: the wgpu backend treats the Apple GPU family as meeting "subgroup size 32" | #383 | render-backend |
+| awaiting the owner | **The driver pipeline cache:** wgpu 30's `create_pipeline_cache` is `unsafe`, and the spec allows `unsafe` in render-wgpu only for surface creation. The cache is Vulkan-only, so the Mac gains nothing either way. Recommendation: no driver cache under wgpu for now; revisit with a direct Vulkan backend | #383 | render-backend |
+| awaiting the owner | **`ShaderDesc` lacks `requirements` and binding-array counts:** the GPU crate's conversion drops `HostShader::requirements`, and `ResourceBinding` has no array count, so R6 reads both from the naga module, departing from "layouts from `ShaderInterface`". Recommendation: carry both in the interface (touches the GPU crate's conversion and R11b's capture records) | #383 | render-backend, shader-pipeline |
+| awaiting the owner | **No macro-end entry in the ring:** Eden-NX2 draws deferred instances at each macro's end (`FinishFrontMacro`); G19 draws them at other boundaries | #330 | gpu-protocol |
+| awaiting the owner | **Present requests:** `PresentRequest` names no address space (G19 uses `set_present_space`, which G21 sets); the format mapping (1 to A8B8G8R8, 4 to A2B10G10R10 unorm) and ignoring the pitch are guesses | #330 | gpu-protocol |
+| proposed | **Compute dispatches are all rejected** until the shader crate has a compute `HostStage` (slice 16, #375, lowers compute entry points); compute texture and sampler pools and compute driver constants are not read yet. Check that #375 and a GPU-side follow-up cover all three | #330 | area:shader, area:gpu |
+| awaiting the owner | **`LOAD_CONSTANT_BUFFER` data is not written to guest memory** (Eden's `ProcessCBMultiData`); no slice in gpu-protocol's table owns it. Recommendation: a small GPU slice after G19 | #330 | gpu-protocol |
+| proposed | **Host copies and blits between cached textures:** a DMA copy or 2D blit over a cached surface still runs on the CPU after a write-back; row 137 makes the host path the default. The rest of #330 | #330 | area:gpu |
+| proposed | **Report semaphores** (`SET_REPORT_SEMAPHORE_A`-`D`): the spec defers queries, but conditional render reads their results, and no slice writes even the values the front can know | #330 | area:gpu |
+| proposed | **Invalidate drain timing:** the drain runs at `MEM_OP_D` for every operation; Eden-NX2 drains at the `MEM_OP_B` write. Listed as a divergence | #330 | area:gpu |
+| proposed | **Nesting depth across crates:** R6 refuses naga modules nested deeper than 256 (measured on this Mac: Metal compiles 256 and refuses 257, and 1536 overflowed a 2 MiB thread). Whether the shader crate's output stays within it, and the compile pool's stack size, are unverified; no layer owns the bound end to end | #383 | area:shader, area:render |
+| proposed | **One wait setting:** `render::compile::WhileCompiling` and `capture::WaitSetting` mirror the GPU crate's `WaitWhileCompiling`; `core` and the GPU crate convert in one place (noted on #389 and #397) | #383, #388 | area:render |
+| awaiting the owner | **R8's choices:** `WindowSize` is added to the spec's handles-only `WindowHandles`; the rotation corner mapping (no reference rotates), `FRAME_LATENCY` = 2 and the letterbox aspect taken from the presented rectangle (Eden uses a 16:9 setting) are guesses | #385 | render-backend |
+| awaiting the owner | **render-backend errata from R8 and R11b:** verification 11 is settled (no `unsafe`: an owned window goes through wgpu's safe `create_surface`), and the surface is made in `set_present_target` on the main thread on macOS; "Render capture v2" still says "a draft for the owner" though it was approved on 2026-11-18 | #385, #388 | render-backend |
+| awaiting the owner | **R11b's bounds and departures:** per-kind body caps (stricter than one `MAX_RECORD_BYTES`); a 1 GiB shader-source budget, 2 GiB `MAX_LIST_DECODED_BYTES` and 4096 `MAX_COMMAND_BINDINGS` (guesses); a 2 MiB `MAX_SHADER_SOURCE_BYTES` until R11c pins it to slice 20's constant; `Limit` written for any writer refusal; "only `End` after `Limit`" as a reading check; a memory-limit refusal counted rather than stopping the replay; held destroys; frames from late lists can still evict each other in the shared sink | #388 | render-backend |
+| awaiting the owner | **Slice 3's hash seed:** the content hash is seeded with the header length (0 or 128), so a compute and a graphics program with equal bytes never share a cache entry | #350 | shader-pipeline |
+| proposed | **nvdisasm check (E2)** of BRX/BRXU, CALL, RET, DEPBAR and BAR 0xb1d, whose encodings come from PR #4588 alone; JMX and BPT have no encoding source; BAR 0x31d and some WARPSYNC/NANOSLEEP forms wait for an E4 census | #358 | area:shader (M4) |
+| proposed | **Hand check of a real window** on a Mac and a Linux desktop (resize, the main-thread layer), with R12's `--window` (noted on #389) | #385 | area:render |
 
 ## House-rule candidates
 
@@ -871,3 +896,13 @@ passed to build agents as a provisional rule for the next wave.
 - Every resource a layer creates is destroyed on drop and counted in the budget; per-operation scratch is reused.
 - No allocation or linear scan per draw or call on hot paths, with a test that per-call cost does not grow.
 - A claim that a rule matches a host API or reference cites the exact check in its source.
+
+### From wave 41 (ledger: #22)
+
+- A failure in deferred work that an entry drains first is logged and counted; the entry's own action still happens.
+- Before destroying an object that queued commands may use, flush its deferred work and fence the open list.
+- Cleanup and invalidation happen on every outcome of a guest-memory write, error paths after bytes were written included.
+- Every check that can drop an output runs before the resource it outputs to is acquired.
+- Hostile-input bounds cover nesting depth, with a named constant tested at the limit and one past it.
+- Items a reader holds back from a hostile file count toward the same bound as live items.
+- A claim naming a set is checked against the code and the reference, with each refused case listed as a divergence.
