@@ -392,10 +392,39 @@ fn a_join_with_a_streamed_entry_is_streamed() {
     assert!(entry.streamed);
     assert_eq!(entry.unarmed_bytes, 0);
     // Streamed: all of it, at this use and the next.
-    assert_eq!(ups.len(), chunked(joined.buffer, 0, 5).len());
+    assert_eq!(ups, chunked(joined.buffer, 0, 5));
     assert!(!rig.watch.has_requests());
     let (_, again) = rig.bind_uploads(page(0), 1);
     assert_eq!(again, chunked(joined.buffer, 0, 5));
+}
+
+#[test]
+fn a_join_carries_the_fault_count_of_an_entry_written_since_its_use() {
+    let mut rig = Rig::new();
+    rig.bind(page(0), PAGE_SIZE);
+    rig.enter();
+    rig.bind(page(0), 1);
+    for fault in 1..STREAMED_AFTER_FAULTS {
+        rig.cpu_write(page(0), &[1]);
+        rig.sync();
+        rig.enter();
+        // The last write is not followed by a use of this entry before the join.
+        if fault + 1 < STREAMED_AFTER_FAULTS {
+            rig.bind(page(0), 1);
+        }
+    }
+    rig.bind(page(1), PAGE_SIZE);
+    rig.enter();
+    rig.bind(page(0), 2 * PAGE_SIZE);
+    let entry = rig.entry(page(0));
+    assert_eq!(entry.range, pages(0, 2));
+    assert_eq!(
+        (entry.faults, entry.streamed),
+        (STREAMED_AFTER_FAULTS - 1, false)
+    );
+    rig.cpu_write(page(1), &[2]);
+    rig.sync();
+    assert!(rig.entry(page(0)).streamed);
 }
 
 // --- Learning of CPU writes ---
