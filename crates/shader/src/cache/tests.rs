@@ -709,6 +709,21 @@ fn a_changed_answer_or_variant_is_another_shader_and_an_unchanged_one_is_not() {
     assert_eq!(rig.counters().translations, 3);
 }
 
+#[test]
+fn questions_are_answered_for_the_requests_stage() {
+    let mut rig = Rig::new();
+    let hash = rig.place(A, GuestStage::Pixel, &program(GuestStage::Pixel, &[1]));
+    rig.fake
+        .script()
+        .questions
+        .insert(hash, vec![Question::CbufWord { bank: 2, offset: 4 }]);
+    pending(rig.lookup(&[pixel(A)]));
+    assert_eq!(
+        *rig.state.asked.lock().unwrap_or_else(PoisonError::into_inner),
+        [(GuestStage::Pixel, 2, 4)]
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // Waiting.
 
