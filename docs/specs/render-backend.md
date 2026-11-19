@@ -83,7 +83,7 @@ crate"):
 | Crate | Contains | `unsafe` |
 |---|---|---|
 | `starquake-render` | The trait, every type in it, the recording backend, format tables, the choice of format fallbacks and shader emulation (pure functions), the host shaders' WGSL sources | Denied |
-| `starquake-render-wgpu` (working name) | The wgpu backend: the only crate that names a wgpu type | Denied if wgpu's safe API is enough. Creating a surface from the frontend's raw window handles may need wgpu's unsafe surface constructor (guess; open, verification 11, settled in slice R8); if so, a crate-level opt-in for that one call |
+| `starquake-render-wgpu` (working name) | The wgpu backend: the only crate that names a wgpu type | Denied. Surface creation needs no `unsafe`: an owned window goes through wgpu's safe `create_surface` (verification 11, settled in slice R8; decided by the owner, 2026-11-19) |
 | `starquake-render-vulkan` | Later, when scheduled: a direct Vulkan backend | Crate-level opt-in |
 | `starquake-render-metal` | Later, only if measurements call for it: a native Metal backend (`objc2-metal`) | Crate-level opt-in |
 
@@ -204,8 +204,10 @@ pub enum Command {
 
 - **Render passes are the backend's business.** The guest has no render passes; it changes
   render targets through state. The backend opens a host pass at the first draw after
-  `SetRenderTargets` and closes it when the targets change, a copy or readback touches an
-  attachment, or the list ends. Load and store actions start conservative (load, store); hints
+  `SetRenderTargets` and closes it when the targets change, a command that is not a draw comes,
+  or the list ends: wgpu needs every non-draw command outside a pass, so under wgpu no copy,
+  clear, readback or dispatch is ever inside one (settled in R7; decided by the owner,
+  2026-11-19). Load and store actions start conservative (load, store); hints
   from the guest's own invalidate methods can make them cheaper later, which matters on Apple's
   tile-based GPUs.
 - **Barriers and image layouts are the backend's business.** Every command says which resources
@@ -214,10 +216,12 @@ pub enum Command {
   backend needs layout transitions and pipeline barriers.
 - **Draw state that is dynamic on the host is in `DrawDesc`**: viewports, scissors, blend
   constants, stencil reference and masks, depth bias, line width. Everything else is in the
-  pipeline. `Caps` says which of these the device can set dynamically, and the gpu side keys
-  pipelines only on what is not dynamic. Under wgpu only viewport, scissor, blend constant and
-  stencil reference are dynamic (decision 1's table); the rest goes into the pipeline key, which
-  means more pipelines to compile.
+  pipeline. Viewport, scissor, blend constant and stencil reference are always dynamic:
+  `GraphicsPipelineDesc` has no field for them, and wgpu, Vulkan and Metal all set them per draw
+  (decided by the owner, 2026-11-19). For the others, `Caps` says which the device can set
+  dynamically, and the gpu side keys pipelines only on what is not dynamic. Under wgpu only the
+  four always-dynamic states are dynamic (decision 1's table); the rest goes into the pipeline
+  key, which means more pipelines to compile.
 
 ### Handles, lifetimes and fences
 
@@ -241,7 +245,9 @@ Every description is derived from guest state, so every one is checked against `
 before a host object exists: sizes, mip and layer counts, sample counts, format support,
 binding counts, copy extents (start, end and the whole region, in checked arithmetic). A bad
 description is a `RenderError`, logged and counted; the gpu side skips the draw or copy. A lost
-host device is the one error that ends the run (emulator error, exit code 2).
+host device is the one error that ends the run (emulator error, exit code 2). Under wgpu, a depth
+clear value outside 0..=1 and a clear of a compressed format are refused, since wgpu refuses
+both; R5 settled these two guesses (decided by the owner, 2026-11-19).
 
 Guest shaders are untrusted input to the host driver. Under wgpu, wgpu writes the final shader
 code from the naga module on its safe path and applies its own checks (owner's decision of
@@ -287,7 +293,9 @@ removes it. Readbacks go through a buffer mapped with `map_async` after the list
 
 - `TextureDesc`: dimension (1D, 2D, 3D, cube, arrays), `PixelFormat`, size, mip count, layer
   count, sample count, usage (sampled, storage, render target, copy). Render targets are
-  textures with that usage; there is no separate type.
+  textures with that usage; there is no separate type. wgpu has no 1D array textures, so a
+  guest 1D array becomes a 2D array texture of height 1, and the shader samples it so (decided
+  by the owner, 2026-11-19).
 - `ViewDesc`: format (for reinterpreting views), mip and layer range, component swizzle. The
   guest's texture headers carry a per-texture swizzle. A direct Vulkan backend would express it
   in the view and a direct Metal backend in its texture swizzle, at no shader cost. wgpu has no
@@ -298,7 +306,10 @@ removes it. Readbacks go through a buffer mapped with `map_async` after the list
   shader applies it to what it samples. This is the one wgpu gap that bites at first frames; it
   costs shader variants, which the owner accepted with decision 1.
 - `SamplerDesc`: filters, address modes (including clamp-to-border with a border colour), LOD
-  bias and clamps, anisotropy, compare function, reduction mode.
+  bias and clamps, anisotropy, compare function, reduction mode. wgpu samplers have no LOD
+  bias, so the bias is applied in the shader (shader-pipeline slice 17, which R7 uses) and the
+  wgpu backend does not set it. As R5 built them, anisotropy is 1 when any filter is nearest,
+  and a negative LOD clamp is raised to 0, as wgpu requires (decided by the owner, 2026-11-19).
 
 ### Formats
 
@@ -316,7 +327,7 @@ synthetic capability tables, for every backend. Known conversions:
 | Guest format | When | Host form |
 |---|---|---|
 | ASTC (all block sizes) | No native ASTC | RGBA8 decoded on the GPU (below) |
-| D24 + S8 | Device lacks it (Apple GPUs, guess: confirmed by the device query; under wgpu D24S8 is not guaranteed and D32 float + S8 is an optional feature, decision 1's table) | D32 float + S8; converted on upload and readback |
+| D24 + S8 | Device lacks it (Apple GPUs, guess: confirmed by the device query; under wgpu D24S8 is not guaranteed and D32 float + S8 is an optional feature, decision 1's table) | D32 float + S8; converted on upload and readback. Copying the stencil aspect of `D32_FLOAT_S8_UINT` is added with this conversion; until then copy commands carry no aspect and that stencil aspect is not copied (decided by the owner, 2026-11-19) |
 | Formats the host can't render to or blend | Per report | A wider format, converted where it crosses guest memory |
 
 ### Block-linear data
@@ -405,6 +416,12 @@ A shader is created once (`create_shader`) from what #13 hands over (carried by 
 shared by every pipeline that uses it. A stage the backend cannot run (geometry or tessellation
 under wgpu) makes pipeline creation fail with a `RenderError`; `gpu` skips and counts the draw.
 
+A shader whose requirements include "subgroup size 32" (shader-pipeline, "Compute shaders") is
+refused where the device cannot meet it. wgpu-hal 30.0.2's Metal backend reports a subgroup size
+range of 4..64 on every Mac, and wgpu cannot request a size, so the wgpu backend treats the
+Apple GPU family as meeting "subgroup size 32": Apple GPUs run 32-wide SIMD groups (decided by
+the owner, 2026-11-19).
+
 ### Fixed-function state the host lacks
 
 A console GPU has fixed-function features some hosts do not. For each, `Caps` says whether it is
@@ -420,11 +437,12 @@ backends that may follow:
 | Alpha test | Not in wgpu, Vulkan or Metal | Fragment shader discard (Eden: pipeline key `alpha_test_func`, `vk_pipeline_cache.cpp`) |
 | Depth range −1..1 | No switch in wgpu or Metal (decision 1's table); Vulkan needs `VK_EXT_depth_clip_control` | Vertex shader rewrites z (Eden: `convert_depth_mode`) |
 | Quads, line loops | Not in any of them | Index rewrite by a compute pass (Eden: `host_shaders/vulkan_quad_indexed.comp`) |
-| Primitive restart off | wgpu: restart is implied by `strip_index_format` and cannot be turned off for strips (decision 1's table); MoltenVK and Metal always restart (Eden: `vk_graphics_pipeline.cpp`, "MoltenVK/Metal always has primitive restart enabled") | Rewrite indices that equal the restart value |
+| Primitive restart off | wgpu: restart is implied by `strip_index_format` and cannot be turned off for strips (decision 1's table); MoltenVK and Metal always restart (Eden: `vk_graphics_pipeline.cpp`, "MoltenVK/Metal always has primitive restart enabled"). wgpu restarting strips with no index format held on Metal only, so R7 sets `strip_index_format` (`Uint32`) for strip draws (decided by the owner, 2026-11-19) | Rewrite indices that equal the restart value |
 | Logic ops | Not in wgpu or Metal; not in MoltenVK (Eden: `vulkan_device.cpp`, MoltenVK fallback list) | None exact; draw without it and count it (later: framebuffer fetch on Apple GPUs) |
 | Geometry shaders | Not in wgpu, Metal or MoltenVK (same list) | Skipped and counted; later a direct Vulkan backend (decision 1's trigger) or compute emulation |
 | More than 16 vertex attributes | The guest allows 32. wgpu reports the device's `max_vertex_attributes` (the value on this Mac is checked in verification 1); MoltenVK caps at 16 (Eden: `vulkan_device.cpp`, "MVK driver breaks ...") | Fetch extra attributes in the vertex shader from a storage buffer |
-| Integer render target outputs | MoltenVK needs the shader's output type to match (Eden: `vk_pipeline_cache.cpp`, `color_output_types`); whether wgpu's pipeline validation demands the same is a guess, settled in slice R7 | Typed outputs in the fragment shader |
+| Integer render target outputs | MoltenVK needs the shader's output type to match (Eden: `vk_pipeline_cache.cpp`, `color_output_types`); wgpu's pipeline validation demands the same (settled in slice R7; decided by the owner, 2026-11-19) | Typed outputs in the fragment shader |
+| Guest y-flip (negative viewport height); reversed or out-of-range depth range | wgpu refuses a negative viewport height and a depth range that is reversed or outside 0..1 | An `EmulationFlags` field and a driver constant: the vertex shader flips y and remaps depth (shader-pipeline slice 17), and the backend sets the host viewport positive (decided by the owner, 2026-11-19) |
 | Per-texture component swizzle | No view swizzle in wgpu (decision 1's table) | Not an `EmulationFlags` item: `gpu` reads `Caps::view_swizzle` and puts the swizzle of each binding into the shader variant key (see "Textures, views, samplers, render targets") |
 | Transform feedback | Not in wgpu or Metal; unverified for MoltenVK | Deferred |
 
@@ -442,7 +460,9 @@ in `ShaderDesc` as `ShaderSource::Naga` and converts the tables into the backend
 - **wgpu backend:** passes the module to wgpu (`ShaderSource::Naga` in wgpu, feature `naga-ir`),
   which validates it and writes the final code for its own backend on its safe, checked path. The
   render crate runs no naga writer on guest shaders. It builds bind group layouts and pipeline
-  layouts from `ShaderInterface`.
+  layouts from `ShaderInterface`, which carries the shader's requirements and each binding's
+  array count, so the backend reads neither from the naga module (decided by the owner,
+  2026-11-19; R11b's capture records carry them with the interface).
 - **A direct backend, later:** does not run naga's writers itself either. It states the form it
   wants (SPIR-V with its descriptor-set map, or MSL with its buffer, texture and sampler indices)
   and its bounds-check policy in the target it gives the shader crate when the shader cache is
@@ -472,10 +492,12 @@ with naga at startup. Naga is pure Rust, so neither path needs a build step.
   per pipeline, not logged per draw (row 90 and 112: cache rejections negatively).
 - Two disk caches, both outside the repository, both versioned and refused on mismatch: the gpu
   side's list of pipeline keys seen (to precompile at the next boot, the way Eden's
-  `LoadDiskResources` does), and the backend's own driver cache blob where the API has one
-  (wgpu's `PIPELINE_CACHE` is Vulkan only and unimplemented on Metal, decision 1's table, so on
-  the Mac there is none at first; a direct backend would use `VkPipelineCache` or Metal's binary
-  archives).
+  `LoadDiskResources` does), and the backend's own driver cache blob where the API has one (a
+  direct backend would use `VkPipelineCache` or Metal's binary archives). The wgpu backend keeps
+  no driver cache for now: wgpu 30's `create_pipeline_cache` is `unsafe`, which
+  `starquake-render-wgpu` does not allow, and wgpu's `PIPELINE_CACHE` is Vulkan only and
+  unimplemented on Metal (decision 1's table), so the Mac would gain nothing either way. It is
+  revisited with a direct Vulkan backend (decided by the owner, 2026-11-19).
 
 Eden-NX2 saw compile stalls push the game far ahead of the GPU when the present wait timed out
 (row 59). Waiting on the render thread rather than the back thread keeps that bounded without
@@ -518,7 +540,13 @@ pub enum PresentTarget {
 The frontend owns the window and its event loop; the backend owns the surface and swapchain made
 from the window's handles (a wgpu surface and its configuration). On macOS the surface's Metal
 layer is attached on the main thread (AppKit requires view changes there), and the render thread
-presents into it; where the wgpu surface is created so that this holds is settled in slice R8.
+presents into it. The surface is made in `set_present_target`, which runs on the main thread on
+macOS (settled in slice R8; decided by the owner, 2026-11-19).
+
+As R8 built them (decided by the owner, 2026-11-19): `WindowHandles` carries the window's size
+(`WindowSize`) besides its handles. Three choices stay **guesses**: how the present transform's
+rotations map the image's corners (no reference rotates), `FRAME_LATENCY` = 2, and the letterbox
+aspect, taken from the presented rectangle (Eden uses a 16:9 setting).
 
 The swapchain uses a mode that never makes the render thread wait for the host's vblank when a
 newer frame is ready (mailbox, or immediate where mailbox is missing; FIFO as the last resort;
@@ -563,22 +591,28 @@ The observability spec's `frames/` folder and `--until frames=N` need pixels wit
 `PresentDesc` has a `dump` flag; for a dumped frame the render thread reads back the presented
 view at the guest's own resolution (not the window's, so dumps don't depend on window size) and
 hands an RGBA8 image to a `FrameSink` the app installs. The app writes the PNG (the `png` crate,
-0.18.1, pure Rust); the render crate does no file I/O. How `core` asks the GPU crate to set the
-`dump` flag is decided in R9's second part (decided by the owner, 2026-11-18).
+0.18.1, pure Rust); the render crate does no file I/O. `core` asks the GPU crate to set the
+`dump` flag through the executor's `ExecConfig::dumps`, carried in the `Gpu`'s config
+(`GpuConfig::exec`), as R9's second part built it (decided by the owner, 2026-11-18 and
+2026-11-19). Which frames a run keeps is the observability spec's ("Headless runs").
 
 ## The recording backend
 
 `RecordingBackend` implements the trait with no GPU:
 
-- It keeps every submitted list and every resource description, and renders them as a text
-  snapshot (`insta`) for tests on the gpu side: "this method stream produced these draws with
-  this state".
+- With its call log, it keeps every submitted list and every resource description, and renders
+  them as a text snapshot (`insta`) for tests on the gpu side: "this method stream produced these
+  draws with this state".
 - It models on the CPU the commands that have exact answers: uploads, copies, clears, unscaled
   blits, readbacks and presents, for uncompressed colour formats. Draws and dispatches are
   recorded, not executed; a texture a draw has written is marked *unknown*, and a readback of an
   unknown region returns `Unknown`, not wrong pixels.
 - Fences complete when a list is submitted; pipelines are ready at once, or follow a script, so a
   test can exercise the wait and skip policies.
+- **Without its call log**, the mode a live run uses (R9b), it keeps no submitted list, no record
+  of a create or destroy and no present feedback. It holds only the CPU copy of each live
+  resource, pending destroys and readbacks not yet taken, so what it holds does not grow with the
+  number of presents (decided by the owner, 2026-11-19).
 
 It serves three purposes: tests of `gpu` and of the present path on any host and in CI; the
 `null` backend for runs that need no pixels (Eden has one, `renderer_null`); and a differential
@@ -587,9 +621,9 @@ bit-identical readbacks wherever the recording backend has an answer.
 
 ## Render capture v2
 
-Status: **a draft for the owner** (design PR, 2026-11-18). Decisions 15 to 19 below are open;
-until the owner rules, nothing in this section is approved, and slice R11's second part waits for
-it (decision log, 2026-11-18, "Render capture v2 no longer gates R5").
+Status: **approved by the owner, 2026-11-18** (design PR #395; decision log, 2026-11-18, "Render
+capture v2: the design in PR #395, as recommended"), with decisions 15 to 19 as recommended. R11b
+built the render crate's part; R11c follows (errata decided by the owner, 2026-11-19).
 
 ### Why version 1 is not enough
 
@@ -793,7 +827,11 @@ checked against the bytes left before anything is allocated, as v1 already does 
 |---|---|---|
 | `MAX_RECORD_BYTES` | 1 GiB | The largest list, uploads included. A guess: confirmed by the largest list in a local title capture. A list that would encode larger is not written; the capture closes with `Limit`, and the run's summary says so |
 | `MAX_LIST_COMMANDS` | 2^20 | Bounds a list's decoded size (`size_of::<Command>()` per command, from as few as three bytes). A guess: about 200 times verification 6's synthetic 5,000 draws a frame |
-| `MAX_SHADER_SOURCE_BYTES` | slice 20's own maximum record size | Program capture caps a program at 65,536 instructions (shader-pipeline, "Where programs come from"), so about 1 MiB of instructions plus the header and the answers; slice 20 owns the exact figure and the render capture uses its constant |
+| Per-kind body caps | 1 GiB (`MAX_RECORD_BYTES`) for `Submit` and `ReadbackResult`; 64 KiB (`MAX_DESCRIPTION_BYTES`) for every other kind, plus the code or source of the two shader kinds | Stricter than one `MAX_RECORD_BYTES` for every record, so a description record, whose lists decode several times larger than they encode, cannot cost gigabytes. A guess (decided by the owner, 2026-11-19) |
+| `MAX_LIST_DECODED_BYTES` | 2 GiB | A list's decoded size, charged after each command; the command count alone does not bound the lists nested in a draw. A guess (decided by the owner, 2026-11-19) |
+| `MAX_COMMAND_BINDINGS` | 4096 | The elements of each list nested in one command, while it is decoded. A guess (decided by the owner, 2026-11-19) |
+| `MAX_SHADER_SOURCE_BYTES` | 2 MiB until R11c pins it to slice 20's own maximum record size | Program capture caps a program at 65,536 instructions (shader-pipeline, "Where programs come from"), so about 1 MiB of instructions, doubled for the header and the answers. The render crate cannot see the shader crate's constant, so R11c, in a crate that sees both, pins the value to it (decided by the owner, 2026-11-19) |
+| `MAX_SHADER_SOURCES_BYTES` | 1 GiB | Every `ShaderSource` a capture gives, since replay keeps them all for the shaders that name them. A guess (decided by the owner, 2026-11-19) |
 | `MAX_SHADER_CODE_BYTES` | 16 MiB | SPIR-V or MSL stored as is. A guess, for direct backends that do not exist yet |
 | `MAX_TEXT_BYTES` | 4 KiB | Build id, backend name, entry names, refusal messages |
 | `MAX_LIVE_RESOURCES` | 2^20 per id kind | Bounds the replay tables. A guess: confirmed by the peak live count in a local title capture |
@@ -802,6 +840,21 @@ checked against the bytes left before anything is allocated, as v1 already does 
 The fence pairs grow by one per `Submit` (16 bytes), at most a few times the file's size.
 Interface tables and descriptions are bounded by their record's length and then checked against
 `Caps` by the backend, as live calls are.
+
+**R11b's departures, accepted as built** (decided by the owner, 2026-11-19; module docs of
+`crates/render/src/capture.rs`):
+
+- The capturing backend closes with `Limit` whenever any writer check refuses a record (a bound
+  passed, or a wrapped backend handing out a live id), not only at the size cap, so the file
+  always ends well formed.
+- Reading checks that nothing but `End` follows `Limit`.
+- A create past replay's memory limit is refused and counted, and the replay goes on, as for any
+  other id it does not hold, rather than stopping the replay.
+- Replay holds a `Destroy` whose fence is past every list captured so far until a captured list
+  reaches that fence, and forwards it then.
+- Frames of an earlier list whose `FrameResult` records come after a later `Submit` share the
+  frame sink with that list's, so they can still evict each other; replay reports an evicted
+  frame as missing.
 
 **Tests** (R11b): golden bytes for the header and for every record kind, each with distinct
 non-zero values in every field, written out by hand in the test (so they are also the hand-built
@@ -999,7 +1052,7 @@ Assumed of #12:
   `Caps::view_swizzle` is false, each texture binding's swizzle too.
 - It carries the shader crate's naga module into `ShaderDesc` as `ShaderSource::Naga` and
   converts the shader's resource, input and output tables into `ShaderInterface`.
-- Proposed with render capture v2 (draft): that conversion is one function (G18), which the
+- With render capture v2 (approved 2026-11-18): that conversion is one function (G18), which the
   replay's `ShaderResolver` also calls; and when `core` says the run captures, the back thread
   fills `ShaderDesc::origin` (slice R11c).
 
@@ -1043,7 +1096,7 @@ lavapipe if the experiment passes, decision 9).
 wgpu, guest shaders always come as `Naga`; SPIR-V and MSL serve a later direct backend, captures
 and experiments.
 
-Proposed with render capture v2 (draft, decision 15): `ShaderDesc` carries an optional
+With render capture v2 (approved 2026-11-18, decision 15): `ShaderDesc` carries an optional
 `ShaderOrigin`, the shader crate's slice 20 record for the shader entry, opaque to the render
 crate and ignored by backends, so that a render capture can name a shader by its inputs. Assumed
 of #13 for it: slice 20 encodes and decodes one record at a time and includes the host target;
@@ -1067,11 +1120,11 @@ then it is local-only, like the hypervisor tests (decision 9).
 | R2 | Format fallback choice and `emulation()` as pure functions | R0 | Eden's MoltenVK paths cited above; `vulkan_device.cpp` format checks; decision 1's wgpu table | No GPU: synthetic capability tables, every combination, including a wgpu-shaped table | B |
 | R3 | CPU ASTC decoder | R0 | `eden/src/video_core/textures/astc.cpp` | No GPU: blocks encoded by hand from the ASTC specification, checked against an independent decoder as a dev-dependency (`astc-decode` 0.3.1, guess: suitability to check) | B |
 | R4 | Host shaders: WGSL sources and their naga validation; the present blit and clear shaders | R0 | `eden/src/video_core/host_shaders/vulkan_present.*`, `full_screen_triangle.vert` | No GPU: every host shader parses and validates with naga | B |
-| R5 | wgpu backend core (`starquake-render-wgpu`): instance, adapter and device choice, `Caps` from the adapter's features and limits, resources, staging through `write_buffer`/`write_texture`, uploads, copies, clears, readbacks, fences from wgpu's completion reports, the render thread, `Offscreen` target, the completion wake ("The completion wake"), called from the render thread after it stores each new completed value | R0, R1 | wgpu 30.0.1 (crates.io); `eden/src/video_core/renderer_vulkan/vk_scheduler.*`, `vk_staging_buffer_pool.*` for the shape of a render thread and staging | Needs a GPU: the same lists run on the recording backend and on wgpu give bit-identical readbacks | C |
-| R6 | Pipelines: shader modules from naga modules, bind group and pipeline layouts from `ShaderInterface`, graphics and compute pipeline creation on the compile pool, wait and skip per the GPU crate's setting, failed-pipeline cache, driver cache blob where wgpu offers one | R4, R5 | `renderer_vulkan/vk_pipeline_cache.*`, `vk_graphics_pipeline.*`, `fixed_pipeline_state.*` (policy only) | Needs a GPU: hand-built naga test modules; scripted compile delays exercise both policies | D |
+| R5 | wgpu backend core (`starquake-render-wgpu`): instance, adapter and device choice, `Caps` from the adapter's features and limits, resources, staging through `write_buffer`/`write_texture`, uploads, copies, clears, readbacks, fences from wgpu's completion reports, the render thread, `Offscreen` target, the completion wake ("The completion wake"), called from the render thread after it stores each new completed value | R0, R1 | wgpu 30.0.2 (crates.io; the workspace's pin, decided by the owner, 2026-11-19); `eden/src/video_core/renderer_vulkan/vk_scheduler.*`, `vk_staging_buffer_pool.*` for the shape of a render thread and staging | Needs a GPU: the same lists run on the recording backend and on wgpu give bit-identical readbacks | C |
+| R6 | Pipelines: shader modules from naga modules, bind group and pipeline layouts from `ShaderInterface`, graphics and compute pipeline creation on the compile pool, wait and skip per the GPU crate's setting, failed-pipeline cache; no driver cache blob under wgpu ("Compiling without stalling a frame"; decided by the owner, 2026-11-19) | R4, R5 | `renderer_vulkan/vk_pipeline_cache.*`, `vk_graphics_pipeline.*`, `fixed_pipeline_state.*` (policy only) | Needs a GPU: hand-built naga test modules; scripted compile delays exercise both policies | D |
 | R7 | Draws and dispatches: render targets and lazy passes, bind groups, vertex and index buffers, dynamic state, direct and indirect draws, quad and line-loop index rewrite, typed outputs | R6 | `renderer_vulkan/vk_rasterizer.*`, `vk_render_pass_cache.*`, `vk_update_descriptor.*` (policy only) | Needs a GPU: synthetic scenes with exactly computable pixels (axis-aligned rectangles covering whole pixels, flat colours) | E |
 | R8 | Window presentation: wgpu surface from window handles, present modes, resize, newest-frame-wins queue, `PresentFeedback`; the present-then-write ordering test ("Submit") | R4, R5 | `renderer_vulkan/vk_swapchain.*`, `vk_present_manager.*`, `vk_blit_screen.*` (policy only) | Mode choice and the frame queue are pure functions, tested with no GPU; the ordering test needs a GPU; the window path is checked by hand on a Mac and a Linux desktop | D (with R6) |
-| R9 | Frame dumps: `dump` flag, `FrameSink`, PNG writing and `frames/` in the app, `--until frames=N`. The second part (R9b: `frames/` and `--until frames=N` in `core`) runs on G21's recording-backend wiring in `core`, not R12's, and decides the `dump` flag's path from `core` to the GPU crate (decided by the owner, 2026-11-18) | R1 (pixels from R5); R9b also gpu-protocol G21 | observability spec, "Headless runs" | No GPU: a present of an uploaded image through the recording backend gives a known PNG | C (with R5) |
+| R9 | Frame dumps: `dump` flag, `FrameSink`, PNG writing and `frames/` in the app, `--until frames=N`. The second part (R9b: `frames/` and `--until frames=N` in `core`) runs on G21's recording-backend wiring in `core`, not R12's, and decides the `dump` flag's path from `core` to the GPU crate (decided by the owner, 2026-11-18): `ExecConfig::dumps` in `GpuConfig::exec` (decided by the owner, 2026-11-19) | R1 (pixels from R5); R9b also gpu-protocol G21 | observability spec, "Headless runs" | No GPU: a present of an uploaded image through the recording backend gives a known PNG | C (with R5) |
 | R10 | GPU ASTC decode (WGSL compute) for devices without native ASTC | R3, R4, R5 | `eden/src/video_core/host_shaders/astc_decoder.comp` | Needs a GPU, with native ASTC switched off in `Caps` on the Mac: bit-identical to the CPU decoder on the same blocks | D |
 | R11 | Host-level capture and replay, first part (done, #164): version 1 of the format, the submitted lists and their staging bytes, replayed on a backend that already holds the resources | R1 | none (new) | No GPU: golden bytes, version refused on mismatch; replay on the recording backend in the gate | D |
 | R11b | Render capture v2 in the render crate ("Render capture v2"): format version 2 with creation records and results, `CapturingBackend` and `CaptureSink`, the streaming reader, `ShaderOrigin` and the `ShaderResolver` trait, the replay driver with id and fence mapping and comparison, `CaptureBuilder` in `test-support` | R1 | none (new) | No GPU: golden bytes for every record kind, version 1 refused, every bound at its edge; a capture through the wrapper replays on a fresh recording backend to the same results, with no resources made by hand | D |
@@ -1080,9 +1133,9 @@ then it is local-only, like the hypervisor tests (decision 9).
 
 Group A lands first. Group B is four slices in parallel. R5 and R9 can run together (C); R6, R8,
 R10 and R11 can run together after R5 (D). R7 follows R6. R9b waits for G21 rather than R12, so
-R12 can follow it. R11's second part waits for the capture v2 design PR; nothing else does
-(decided by the owner, 2026-11-18). The draft splits it into R11b, which needs only R1 and the
-owner's ruling, and R11c, which follows R12, slice 20 and G18; R5 and R6 owe it no code ("Render
+R12 can follow it. R11's second part waited for the capture v2 design PR; nothing else did
+(decided by the owner, 2026-11-18). The approved design splits it into R11b, which needs only R1,
+and R11c, which follows R12, slice 20 and G18; R5 and R6 owe it no code ("Render
 capture v2", "Who builds it"). Up to four build agents fit the machine limits in
 `roadmap.md`.
 
@@ -1132,15 +1185,14 @@ In order of how much each could change the design:
    release relies on. Slice R8's test; listed here because a failure changes #11's release rule.
 10. **The completion wake-up:** decided by the owner, 2026-11-18 (decision 14, "The completion
     wake"). R5 implements it for wgpu.
-11. **Whether surface creation needs `unsafe`:** whether wgpu 30 can create a surface from the
-    frontend's raw window handles through its safe API, or only through its unsafe constructor.
-    If only the latter, `starquake-render-wgpu` opts in at crate level for that one call ("Where
-    the backend sits"). Settled in slice R8.
-12. **Whether wgpu replays drawn content identically on one device** (render capture v2, draft):
+11. **Whether surface creation needs `unsafe`:** settled in slice R8 (decided by the owner,
+    2026-11-19): it does not. An owned window goes through wgpu's safe `create_surface`, so
+    `starquake-render-wgpu` denies `unsafe` ("Where the backend sits").
+12. **Whether wgpu replays drawn content identically on one device** (render capture v2):
     replay one capture with draws twice on the wgpu backend on the same Mac and compare every
     readback and frame. Decides whether `render-replay` reports a drawn-content difference on
     the same backend as a finding or as noise. Slice R11c.
-13. **Whether translation is deterministic** (render capture v2, draft, decision 15 (c)):
+13. **Whether translation is deterministic** (render capture v2, decision 15 (c)):
     translate the same inputs twice, in one process and in two, and compare the modules' `Debug`
     text (`naga::Module` has no `PartialEq` outside naga's own tests). The persistent cache's
     retranslation (shader-pipeline decision 7) relies on the same property. A shader-crate test,
@@ -1378,8 +1430,8 @@ are in `docs/decision-log.md` (2026-11-12).
     `wait()` and splits release writes across two threads; (c) adds delay to every semaphore the
     guest waits on.
 
-Decisions 15 to 19 come from the render capture v2 draft (2026-11-18) and are **open**; each
-section of "Render capture v2" gives the detail.
+Decisions 15 to 19 come from the render capture v2 design (2026-11-18), approved by the owner
+that day as recommended; each section of "Render capture v2" gives the detail.
 
 15. **Decided by the owner, 2026-11-18:** (c), as recommended.
 

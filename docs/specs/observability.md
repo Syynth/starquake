@@ -90,6 +90,9 @@ A snapshot is everything needed to resume a run: guest memory (only pages that w
 every thread's saved context, the kernel arena, each service's state, and later GPU state.
 
 - **Kernel:** the arena refers to objects by id, so serialising it is direct.
+- **GPU:** the GPU front has no snapshot yet, so a restored run, like a replay, uses the null
+  front (it runs no command and completes ordered updates and barriers at once) until a front
+  snapshot exists (`gpu-protocol.md`, "Deferred"; decided by the owner, 2026-11-19).
 - **Services:** each session keeps its state in a plain serialisable struct. Shared state is
   serialised once and re-linked by id. Deferred-reply tokens are ids, not pointers.
 - **Format:** versioned; a snapshot from another build is refused, not misread.
@@ -177,6 +180,30 @@ ring peak occupancy, and fenced actions with how many were skipped as empty; fro
 pipeline, rejections counted once per program with their reason; from the render backend,
 skipped draws and failed pipelines. (`gpu.txt` and the counters approved by the owner,
 2026-11-12.)
+
+**Frames**, as slice R9b built them (decided by the owner, 2026-11-19). A frame is a present the
+graphics server hands the GPU, one for each frame a vsync tick latches; `summary.json`'s `frames`
+and `--until frames=N` count them. A tick latches a present only once its fence is reached, so
+for a present whose fence the GPU itself reaches, the tick that counts it is the first after the
+host GPU finishes that work: when such a frame counts, and the guest time at which
+`--until frames=N` stops, depend on host GPU timing. With the null front, in a replay, and for
+presents with no fence or a fence already reached, they do not. A run with a GPU dumps every
+present (under wgpu, one readback per frame), and `frames/` keeps the newest frames whose RGBA8
+pixels together fit in 64 MiB, dropping the oldest: a run that stops at `--until frames=N` keeps
+its last frames up to frame `N`, any other run the frames it ended on. What was dropped is
+counted in `summary.json` (`frames_dropped`).
+
+**Stalls and host timing** (decided by the owner, 2026-11-19). A run in which every guest thread
+waits and nothing left can end the wait stops as an emulator error (2) rather than at its
+timeout (`architecture.md`, provisional parts). With a GPU, the last core to park asks the GPU
+whether it is idle; when the GPU answers busy, the parked core asks again when the GPU next
+reports quiet, up to a named retry count, so a question that lands in a busy moment is not lost
+(`gpu-protocol.md`, "Idleness"). The host timer thread, which holds the guest's deadlines
+(`execution-model.md`, "Timers"), sleeps in pieces sized by the measured lateness of its waits,
+since macOS ends timed waits late at low priority, and one precise wait would need `unsafe`
+outside `cpu`. The test of a held page request answered at its bound times the timer thread's
+recorded note, not the guest's wake, which adds the core thread's scheduling; the vsync test's
+bound is not tightened for now.
 
 No window is needed for any of this. Configuration comes from flags and one file, not from
 scattered environment variables.
