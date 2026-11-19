@@ -42,7 +42,8 @@
 //!    [`DecodeError::MissingBit`] naming the lowest clear one;
 //! 4. the form's function reads its fields, else [`DecodeError::UnknownValue`] for a field whose
 //!    value names nothing (a vote or reduction operation past the defined ones: `op::control`;
-//!    a `MUFU` function or a comparison's combine operation past them: `op::float`; an
+//!    a `MUFU` function or a comparison's combine operation past them, `FMUL`'s scale 0 and a
+//!    conversion's float size 0: `op::float`; an
 //!    interpolation mode, pixel value or stage-buffer type past NAK's: `op::attribute`;
 //!    `ISETP`'s combining operation 3 and `PRMT`'s mode 7: `op::integer`; a memory type, order,
 //!    eviction priority, atomic type or operation, cache operation or `MEMBAR` scope past the
@@ -77,14 +78,25 @@
 //! module docs and pinned in `tests::control`. The attribute group's (`OUT`'s forms 2, 3 and 7,
 //! and its sources' modifier bits) are listed in `op::attribute`'s module docs and pinned in
 //! `tests::attribute`; the float group's (the forms NAK never encodes, the modifier bits of
-//! slots without modifiers) in `op::float`'s and pinned in `tests::float32`; the integer
+//! slots without modifiers, and the high-half bit 60 its forms add) in `op::float`'s and pinned
+//! in `tests::float32`; the integer
 //! group's (the absolute-value and modifier bits its sources do not have, forms 2, 3 and 7 of
 //! the instructions without source 2, and the bits PR #4588's translator requires clear) in
 //! `op::integer`'s, pinned in `tests::integer`; the memory group's (bit 91 of the forms
 //! without a uniform register, `ATOMG` `0x3a8`'s uniform-register bits, and the bits PR #4588's
 //! translator requires clear or set in `LDGSTS` and `ATOMS.POPC`) in `op::memory`'s, pinned in
-//! `tests::memory`; the texture group's (bit 89 of `TLD4.UR`, and the surface forms with a
-//! constant-buffer handle left unknown) in `op::texture`'s, pinned in `tests::texture`.
+//! `tests::memory`; the texture group's (bit 89 of `TLD4.UR`, the surface forms with a
+//! constant-buffer handle left unknown, and the `.F16` and `.CL` bits its `TEX` and `TLD` forms
+//! add) in `op::texture`'s, pinned in `tests::texture`.
+//!
+//! **Known bits and canonical words** (slice 4b; owner's ruling 33, 2026-11-19). A form may know
+//! a bit its PR #4588 row leaves out when another reference names it (NAK's encoder, a comment
+//! in NAK's encoder, or PR #4588's own translator), each such bit listed with its reference in
+//! the group's rows and divergence table (`form`'s module docs;
+//! `tests::framework::added_bits_are_the_listed_cases`). And a form whose bare word (the opcode
+//! and fixed bits alone) holds a field value that names nothing gives a canonical word, so the
+//! decoder refuses that value at step 4 where a reference refuses it
+//! (`tests::framework::canonical_words_decode`).
 
 mod alu;
 mod fields;

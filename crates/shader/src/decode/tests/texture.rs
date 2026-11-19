@@ -1469,7 +1469,8 @@ fn f16_and_clamp_in_every_form_that_names_them() {
         (0xf66, 77, ".cl"),
     ] {
         let (word, decoded) = with(opcode, bit);
-        let instr = decoded.unwrap_or_else(|error| panic!("{opcode:#x} bit {bit}: {error}"));
+        assert!(decoded.is_ok(), "{opcode:#x} bit {bit}: {decoded:?}");
+        let instr = decoded.expect("decodes");
         let text = instr.to_string();
         assert!(text.contains(flag), "{opcode:#x}: {text}");
         let plain = decode(Instruction::from_bits(word.bits() & !(1 << bit)));
@@ -1563,7 +1564,7 @@ fn encoder_writes_f16_and_clamp_with_every_handle() {
             ..
         }) = decode(on)
         else {
-            panic!("{handle:?}: a TEX word");
+            unreachable!("{handle:?}: a TEX word");
         };
         assert!(decoded.f16 && decoded.tex == handle, "{handle:?}");
     }
@@ -1595,7 +1596,7 @@ fn encoder_writes_f16_and_clamp_with_every_handle() {
                 ..
             }) = decode(word)
             else {
-                panic!("{handle:?}: a TLD word");
+                unreachable!("{handle:?}: a TLD word");
             };
             assert_eq!((decoded.f16, decoded.clamp), (f16, clamp), "{handle:?}");
             assert_eq!(decoded.tex, handle);

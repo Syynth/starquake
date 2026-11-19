@@ -262,7 +262,10 @@ fn added_bits_accumulate_per_namer() {
     assert_eq!(row.added_by(Namer::NakComment), 0);
     assert_eq!(row.added_by(Namer::Pr4588Translator), 0b100);
     assert_eq!(row.added(), 0b111);
-    assert_eq!(super::super::form::ReferenceRow::new(0x123, [0; 4]).added(), 0);
+    assert_eq!(
+        super::super::form::ReferenceRow::new(0x123, [0; 4]).added(),
+        0
+    );
 }
 
 /// Every bit a form adds to its row decodes, prints and round-trips: for each, a word of the
@@ -289,12 +292,13 @@ fn added_bits_decode_print_and_round_trip() {
                     Some([(decode(with).ok()?, with), (decode(without).ok()?, without)])
                 });
                 let opcode = row.opcode;
-                let [(with, _), (without, _)] =
-                    found.unwrap_or_else(|| panic!("{opcode:#x} bit {bit}: no word decodes"));
+                let Some([(with, _), (without, _)]) = found else {
+                    unreachable!("{opcode:#x} bit {bit}: no word decodes with and without it");
+                };
                 assert_ne!(with.to_string(), without.to_string(), "{opcode:#x} {bit}");
                 for (instr, word) in found.into_iter().flatten() {
                     assert_eq!(
-                        assemble(&instr).map(|again| again.bits()),
+                        assemble(&instr).map(Instruction::bits),
                         Ok(word.bits() & !SCHEDULING.mask()),
                         "{opcode:#x} bit {bit}"
                     );
@@ -326,18 +330,21 @@ fn canonical_words_decode() {
                 continue;
             }
             with_canonical += 1;
-            match decode(bare) {
-                Err(DecodeError::UnknownValue {
-                    opcode: refused,
-                    bit,
-                    width,
-                    value: 0,
-                }) => {
-                    assert_eq!(refused, opcode);
-                    assert_ne!(Field::new(bit, width).mask() & row.canonical, 0);
-                }
-                other => panic!("{opcode:#x}: {other:?}"),
-            }
+            let Err(DecodeError::UnknownValue {
+                opcode: refused,
+                bit,
+                width,
+                value,
+            }) = decode(bare)
+            else {
+                unreachable!("{opcode:#x}: the bare word is not refused for a value");
+            };
+            assert_eq!((refused, value), (opcode, 0));
+            assert_ne!(
+                Field::new(bit, width).mask() & row.canonical,
+                0,
+                "{opcode:#x}"
+            );
         }
     }
     // FMUL's four forms; FRND, F2F, F2I and I2F, eight each (two opcodes of four forms); I2FP's

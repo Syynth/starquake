@@ -1193,6 +1193,17 @@ fn layout_bits_are_read_only_where_documented() {
     unknown(word(0xb08, &[(60, 1)]), 0xb08, 60);
 }
 
+/// The high-half select of an op that has one, and the op with it cleared.
+fn split_high(op: Op) -> (bool, Op) {
+    match op {
+        Op::F2F(op) => (op.high, Op::F2F(OpF2F { high: false, ..op })),
+        Op::FRnd(op) => (op.high, Op::FRnd(OpFRnd { high: false, ..op })),
+        Op::MuFu(op) => (op.high, Op::MuFu(OpMuFu { high: false, ..op })),
+        Op::F2I(op) => (op.high, Op::F2I(OpF2I { high: false, ..op })),
+        other => unreachable!("{other:?}"),
+    }
+}
+
 /// NAK writes a 16-bit source's high-half select (bit 60) in every form and opcode but the
 /// immediate one (`encode_alu_base` passes `src_types()[0]`, and `encode_alu_reg`,
 /// `encode_alu_cb` and `encode_alu_ureg` each call `set_swizzle(60..62, ..)` for an `F16`
@@ -1231,16 +1242,6 @@ fn nak_high_halves_decode_in_every_form_with_bit_60() {
         // The wide F2I.S32.F16 (a 64-bit opcode NAK does not emit for these types).
         (0x311, &[(84, 1), (75, 2), (72, 1)]),
     ];
-    /// The op's high-half select, and the op with it cleared.
-    fn split(op: Op) -> (bool, Op) {
-        match op {
-            Op::F2F(op) => (op.high, Op::F2F(OpF2F { high: false, ..op })),
-            Op::FRnd(op) => (op.high, Op::FRnd(OpFRnd { high: false, ..op })),
-            Op::MuFu(op) => (op.high, Op::MuFu(OpMuFu { high: false, ..op })),
-            Op::F2I(op) => (op.high, Op::F2I(OpF2I { high: false, ..op })),
-            other => unreachable!("{other:?}"),
-        }
-    }
     for (opcode, fields) in cases {
         let clear = word(u128::from(opcode), fields);
         let clear_instr = decode(clear).expect("decodes without bit 60");
@@ -1248,8 +1249,16 @@ fn nak_high_halves_decode_in_every_form_with_bit_60() {
         with.push((60, 1));
         let high = word(u128::from(opcode), &with);
         let high_instr = decode(high).expect("decodes with bit 60");
-        assert_eq!(split(clear_instr.op), (false, clear_instr.op), "{opcode:#x}");
-        assert_eq!(split(high_instr.op), (true, clear_instr.op), "{opcode:#x}");
+        assert_eq!(
+            split_high(clear_instr.op),
+            (false, clear_instr.op),
+            "{opcode:#x}"
+        );
+        assert_eq!(
+            split_high(high_instr.op),
+            (true, clear_instr.op),
+            "{opcode:#x}"
+        );
         let text = high_instr.to_string();
         assert!(text.ends_with(".h1;"), "{opcode:#x}: {text}");
         assert_eq!(assemble(&high_instr), Ok(high), "{opcode:#x}");
@@ -1269,11 +1278,17 @@ fn nak_high_halves_decode_in_every_form_with_bit_60() {
         "f2f.f32.f16 r1, r2.h1;"
     );
     assert_eq!(
-        text(word(0xd13, &[(16, 1), (32, 5), (75, 3), (84, 1), (91, 1), (60, 1)])),
+        text(word(
+            0xd13,
+            &[(16, 1), (32, 5), (75, 3), (84, 1), (91, 1), (60, 1)]
+        )),
         "frnd.f64.f16 r1, ur5.h1;"
     );
     assert_eq!(
-        text(word(0xb08, &[(16, 1), (38, 0x10), (54, 2), (73, 1), (60, 1)])),
+        text(word(
+            0xb08,
+            &[(16, 1), (38, 0x10), (54, 2), (73, 1), (60, 1)]
+        )),
         "mufu.cos.f16 r1, c[0x2][0x10].h1;"
     );
 }
@@ -1562,8 +1577,11 @@ fn float_sizes_of_zero_are_refused() {
         assert!(decode(word(op, &all_f32)).is_ok(), "{opcode:#x}");
         for &zero in fields {
             for (size, ok) in [(0, false), (1, true)] {
-                let mut set: Vec<(u32, u128)> =
-                    fields.iter().filter(|&&bit| bit != zero).map(|&bit| (bit, 2)).collect();
+                let mut set: Vec<(u32, u128)> = fields
+                    .iter()
+                    .filter(|&&bit| bit != zero)
+                    .map(|&bit| (bit, 2))
+                    .collect();
                 set.push((zero, size));
                 let result = decode(word(op, &set));
                 if ok {
@@ -1834,36 +1852,6 @@ fn float_enumerations_match_the_references() {
         assert_eq!(op.bits(), bits);
         assert_eq!(FSwzAddOp::from_bits(bits), op);
     }
-    // NAK's `FloatType`: F16, F32 and F64, sized `(bits / 8).ilog2()`; size 0 names none.
-    let floats = [
-        (FloatType::F16, 1, 16),
-        (FloatType::F32, 2, 32),
-        (FloatType::F64, 3, 64),
-    ];
-    assert_eq!(FloatType::ALL.len(), floats.len());
-    for (ty, bits, width) in floats {
-        assert_eq!((ty.bits(), ty.width()), (bits, width));
-        assert_eq!(FloatType::from_bits(bits), Some(ty));
-    }
-    assert_eq!(FloatType::from_bits(0), None);
-    assert_eq!(FloatType::from_bits(4), None);
-    // PR #4588's `FMUL` scales 1 to 7 (`ScaleFactor`: `2^(code - 4)`); 0 names none.
-    let scales = [
-        (FMulScale::D8, 1, -3),
-        (FMulScale::D4, 2, -2),
-        (FMulScale::D2, 3, -1),
-        (FMulScale::None, 4, 0),
-        (FMulScale::M2, 5, 1),
-        (FMulScale::M4, 6, 2),
-        (FMulScale::M8, 7, 3),
-    ];
-    assert_eq!(FMulScale::ALL.len(), scales.len());
-    for (scale, bits, exponent) in scales {
-        assert_eq!((scale.bits(), scale.exponent()), (bits, exponent));
-        assert_eq!(FMulScale::from_bits(bits), Some(scale));
-    }
-    assert_eq!(FMulScale::from_bits(0), None);
-    assert_eq!(FMulScale::from_bits(8), None);
     for (size, width) in [(0, 8), (1, 16), (2, 32), (3, 64)] {
         for signed in [false, true] {
             let ty = IntType::new(size, signed).expect("a size of 0 to 3");
@@ -1891,9 +1879,41 @@ fn float_enumerations_match_the_references() {
     assert_eq!(IntType::S32, int(2, true));
     assert_eq!(IntType::S32.to_string(), ".s32");
     assert_eq!(int(0, false).to_string(), ".u8");
-    assert_eq!(FMulScale::None.bits(), 4);
-    assert_eq!(FMulScale::D2.exponent(), -1);
-    assert_eq!(FMulScale::M8.exponent(), 3);
+}
+
+/// The float types against NAK's `FloatType` (F16, F32 and F64, sized `(bits / 8).ilog2()`),
+/// and the `FMUL` scales against PR #4588's `ScaleFactor` (`2^(code - 4)` for codes 1 to 7),
+/// written out: each code names its value, and 0 and one past the field name none.
+#[test]
+fn float_types_and_fmul_scales_match_the_references() {
+    let floats = [
+        (FloatType::F16, 1, 16),
+        (FloatType::F32, 2, 32),
+        (FloatType::F64, 3, 64),
+    ];
+    assert_eq!(FloatType::ALL.len(), floats.len());
+    for (ty, bits, width) in floats {
+        assert_eq!((ty.bits(), ty.width()), (bits, width));
+        assert_eq!(FloatType::from_bits(bits), Some(ty));
+    }
+    assert_eq!(FloatType::from_bits(0), None);
+    assert_eq!(FloatType::from_bits(4), None);
+    let scales = [
+        (FMulScale::D8, 1, -3),
+        (FMulScale::D4, 2, -2),
+        (FMulScale::D2, 3, -1),
+        (FMulScale::None, 4, 0),
+        (FMulScale::M2, 5, 1),
+        (FMulScale::M4, 6, 2),
+        (FMulScale::M8, 7, 3),
+    ];
+    assert_eq!(FMulScale::ALL.len(), scales.len());
+    for (scale, bits, exponent) in scales {
+        assert_eq!((scale.bits(), scale.exponent()), (bits, exponent));
+        assert_eq!(FMulScale::from_bits(bits), Some(scale));
+    }
+    assert_eq!(FMulScale::from_bits(0), None);
+    assert_eq!(FMulScale::from_bits(8), None);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1966,23 +1986,12 @@ fn unencodable_comparisons_are_refused() {
     assert!(select(imm(1.0)).is_ok());
 }
 
-/// A high half outside a 16-bit register in the narrow form is refused exactly, and a clear one
-/// leaves an immediate's bit 60 alone.
-#[test]
-fn unencodable_high_halves_are_refused() {
-    let r = Gpr::new;
-    let mufu = |src, f16, high| {
-        assemble(&Instr::new(Op::MuFu(OpMuFu {
-            dst: r(1),
-            op: MuFuOp::Cos,
-            src,
-            f16,
-            high,
-        })))
-    };
-    let what = "the high half of a source other than a 16-bit register, constant buffer or \
-                uniform register";
-    let half_refusal = |mnemonic| Err(EncodeError::NoBits { mnemonic, what });
+/// The refusal of a high half the operation's form has no bit for.
+const HIGH_HALF_REFUSAL: &str =
+    "the high half of a source other than a 16-bit register, constant buffer or uniform register";
+
+/// A constant-buffer source `c[1][8]` and a uniform-register source `ur3`, unmodified.
+fn wide_sources() -> [AluSrc; 2] {
     let cbuf = AluSrc::CBuf {
         cbuf: CBufRef {
             buf: CBuf::Binding(1),
@@ -1996,6 +2005,31 @@ fn unencodable_high_halves_are_refused() {
         abs: false,
         neg: false,
     };
+    [cbuf, ureg]
+}
+
+/// `MUFU`'s high half is refused exactly without `.f16` or on an immediate, and accepted with
+/// `.f16` on a register, constant buffer or uniform register; a clear one leaves an immediate's
+/// bit 60 alone.
+#[test]
+fn unencodable_high_halves_are_refused() {
+    let r = Gpr::new;
+    let mufu = |src, f16, high| {
+        assemble(&Instr::new(Op::MuFu(OpMuFu {
+            dst: r(1),
+            op: MuFuOp::Cos,
+            src,
+            f16,
+            high,
+        })))
+    };
+    let half_refusal = |mnemonic| {
+        Err(EncodeError::NoBits {
+            mnemonic,
+            what: HIGH_HALF_REFUSAL,
+        })
+    };
+    let [cbuf, ureg] = wide_sources();
     assert_eq!(mufu(AluSrc::reg(r(2)), false, true), half_refusal("mufu"));
     assert_eq!(mufu(imm(1.0), true, true), half_refusal("mufu"));
     for src in [AluSrc::reg(r(2)), cbuf, ureg] {
@@ -2005,6 +2039,21 @@ fn unencodable_high_halves_are_refused() {
     // A clear high half leaves an immediate's bit 60 alone.
     let imm_word = mufu(AluSrc::Imm(1 << 28), true, false).expect("encodable");
     assert!(imm_word.flag(Field::bit(60)));
+}
+
+/// The high half of `F2I`, `F2F` and `FRND`, both opcodes, is accepted for an `F16` register,
+/// constant buffer or uniform register, and refused exactly for an `F32` or `F64` source or an
+/// immediate.
+#[test]
+fn unencodable_conversion_high_halves_are_refused() {
+    type Encoder = fn(AluSrc, FloatType, bool, bool) -> Result<Instruction, EncodeError>;
+    let half_refusal = |mnemonic| {
+        Err(EncodeError::NoBits {
+            mnemonic,
+            what: HIGH_HALF_REFUSAL,
+        })
+    };
+    let [cbuf, ureg] = wide_sources();
     let f2i = |src, src_type, wide, high| {
         assemble(&Instr::new(Op::F2I(OpF2I {
             dst: Gpr::new(1),
@@ -2042,12 +2091,14 @@ fn unencodable_high_halves_are_refused() {
             wide,
         })))
     };
-    type Encoder = fn(AluSrc, FloatType, bool, bool) -> Result<Instruction, EncodeError>;
     let conversions: [(&str, Encoder); 3] = [("f2i", f2i), ("f2f", f2f), ("frnd", frnd)];
     for (mnemonic, encode) in conversions {
         for wide in [false, true] {
-            for src in [AluSrc::reg(r(2)), cbuf, ureg] {
-                assert!(encode(src, FloatType::F16, wide, true).is_ok(), "{mnemonic}");
+            for src in [AluSrc::reg(Gpr::new(2)), cbuf, ureg] {
+                assert!(
+                    encode(src, FloatType::F16, wide, true).is_ok(),
+                    "{mnemonic}"
+                );
                 for src_type in [FloatType::F32, FloatType::F64] {
                     assert_eq!(
                         encode(src, src_type, wide, true),
@@ -2216,6 +2267,48 @@ fn unconfirmed_text_of_the_float_group() {
     }
 }
 
+/// The printer's guess for a high half (`.h1` after the operand, its modifiers included) on the
+/// sources slice 4b added it for: a uniform register and a constant buffer.
+#[test]
+fn unconfirmed_text_of_high_halves_beyond_registers() {
+    let frnd = Op::FRnd(OpFRnd {
+        dst: Gpr::new(0),
+        src: AluSrc::UniformReg {
+            reg: ur(4),
+            abs: false,
+            neg: true,
+        },
+        dst_type: FloatType::F16,
+        src_type: FloatType::F16,
+        rnd: RoundMode::Zero,
+        ftz: false,
+        high: true,
+        wide: false,
+    });
+    assert_eq!(round_text(Instr::new(frnd)), "frnd.f16.trunc r0, -ur4.h1;");
+    let f2f = Op::F2F(OpF2F {
+        dst: Gpr::new(2),
+        src: AluSrc::CBuf {
+            cbuf: CBufRef {
+                buf: CBuf::Binding(3),
+                offset: 0x10,
+            },
+            abs: true,
+            neg: false,
+        },
+        dst_type: FloatType::F32,
+        src_type: FloatType::F16,
+        rnd: RoundMode::NearestEven,
+        ftz: true,
+        high: true,
+        wide: false,
+    });
+    assert_eq!(
+        round_text(Instr::new(f2f)),
+        "f2f.ftz.f32.f16 r2, |c[0x3][0x10]|.h1;"
+    );
+}
+
 /// More of the printer's guesses: the conversions, `F2FP`'s `.merge_c`, `FSEL` and `FSET`'s
 /// always-true comparison.
 #[test]
@@ -2234,43 +2327,6 @@ fn unconfirmed_text_of_the_float_conversions() {
                 wide: false,
             }),
             "frnd.f16.f32.floor r0, r1;",
-        ),
-        (
-            Op::FRnd(OpFRnd {
-                dst: r(0),
-                src: AluSrc::UniformReg {
-                    reg: ur(4),
-                    abs: false,
-                    neg: true,
-                },
-                dst_type: FloatType::F16,
-                src_type: FloatType::F16,
-                rnd: RoundMode::Zero,
-                ftz: false,
-                high: true,
-                wide: false,
-            }),
-            "frnd.f16.trunc r0, -ur4.h1;",
-        ),
-        (
-            Op::F2F(OpF2F {
-                dst: r(2),
-                src: AluSrc::CBuf {
-                    cbuf: CBufRef {
-                        buf: CBuf::Binding(3),
-                        offset: 0x10,
-                    },
-                    abs: true,
-                    neg: false,
-                },
-                dst_type: FloatType::F32,
-                src_type: FloatType::F16,
-                rnd: RoundMode::NearestEven,
-                ftz: true,
-                high: true,
-                wide: false,
-            }),
-            "f2f.ftz.f32.f16 r2, |c[0x3][0x10]|.h1;",
         ),
         (
             Op::F2I(OpF2I {
@@ -2382,10 +2438,7 @@ fn layout_bit(opcode: u16, bit: u32) -> bool {
     let cbuf_layout = matches!(form, 3 | 5) && matches!(bit, 32..38 | 54..59);
     let half = bit == 60
         && matches!(form, 1 | 5 | 6)
-        && matches!(
-            base,
-            0x108 | 0x105 | 0x111 | 0x104 | 0x110 | 0x107 | 0x113
-        );
+        && matches!(base, 0x108 | 0x105 | 0x111 | 0x104 | 0x110 | 0x107 | 0x113);
     let select = matches!(bit, 60 | 61) && matches!(base, 0x106 | 0x112);
     let h1 = bit == 72 && base == 0x03e;
     cbuf_layout || half || select || h1

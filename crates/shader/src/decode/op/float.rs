@@ -28,9 +28,10 @@
 //!
 //! # Forms
 //!
-//! Each instruction is decoded in the operand forms NAK's encoder produces for it, with one
-//! exception: NAK writes a 16-bit source's high-half select (bit 60) in words this decoder
-//! refuses (the divergence table's "high half" rows, and the owner question below). `FADD` puts
+//! Each instruction is decoded in the operand forms NAK's encoder produces for it, a 16-bit
+//! source's high-half select (bit 60) included wherever NAK writes it: forms 1, 5 and 6 of
+//! `MUFU`, `F2I`, `F2F` and `FRND`, both opcodes of each conversion (the divergence table's
+//! "high half" rows: the forms add the bit where PR #4588's rows leave it out). `FADD` puts
 //! its second operand in the wide slot in every form: as source 1 when it is a register (form
 //! 1), as source 2 otherwise (forms 2, 3 and 7; NAK: `src_is_zero_or_gpr` picks
 //! `encode_alu(0x021, .., src1, None)` or `encode_alu(0x021, .., ZERO, src1)`). `FMUL`,
@@ -51,24 +52,24 @@
 //!   translator ignores it (`Ignore(64, 8)`: "the unused zero register of a two-source
 //!   encoding"). It is decoded as [`OpFAdd::ignored`] and [`OpFMul::ignored`], so any value
 //!   re-assembles, and not printed: two words that differ only there print the same text.
-//! - **Size fields decode every value.** The conversions' size fields (bits 75..77 and 84..86)
-//!   hold the log2 of the type's byte count (NAK: `(bits / 8).ilog2()`). A float size of 0 (one
-//!   byte) is [`FloatType::F8`], which neither reference defines on SM86 (NAK's `FloatType` stops
-//!   at `F16`; PR #4588 refuses it); it is decoded so the field reads every value, and is the
-//!   translator's to refuse. Likewise the 64-bit opcode with no 64-bit type, and the narrow one
-//!   with a 64-bit type, are decoded as written and keep their opcode (`wide`), though NAK emits
-//!   neither.
+//! - **Size fields.** The conversions' size fields (bits 75..77 and 84..86) hold the log2 of
+//!   the type's byte count (NAK: `(bits / 8).ilog2()`). A float size of 0 (one byte) names no
+//!   type: NAK's `FloatType` has `F16`, `F32` and `F64` only, and PR #4588's translator refuses
+//!   it in every conversion, so the decoder refuses it ([`DecodeError::UnknownValue`]; slice 4b's
+//!   canonical words let a form's bare word be refused). An integer size of 0 is an 8-bit
+//!   integer, which both references have. The 64-bit opcode with no 64-bit type, and the narrow
+//!   one with a 64-bit type, are decoded as written and keep their opcode (`wide`), though NAK
+//!   emits neither.
 //! - **The 64-bit opcode is not printed.** `OpFRnd`, `OpF2F`, `OpF2I` and `OpI2F` keep it as
 //!   `wide`, so any word re-assembles, but their printers write only the types: a word whose
 //!   opcode disagrees with its types (the 64-bit opcode with no 64-bit type, or the narrow one
 //!   with a 64-bit type) prints the same text as the word with the matching opcode. That text
 //!   reaches rejection messages and golden files, which therefore cannot tell the two apart
-//!   (`decode::tests::float32::conversion_sizes_decode_every_value`).
+//!   (`decode::tests::float32::conversion_sizes_decode_every_type`).
 //! - **`FMUL`'s scale** (bits 84..87, NAK's `set_field(84..87, 0x4); // TODO: PDIV`) is read as
 //!   PR #4588's series, a power of two around 4 (`ops_float.cpp`, `ScaleFactor`: 3 halves, 5
-//!   doubles; 2 and 1 divide by 4 and 8, 7 multiplies by 8). Value 0, which PR #4588 refuses
-//!   (`Require(scale >= 1 && scale <= 7)`), is decoded as the series' next value, a divide by
-//!   16: a guess.
+//!   doubles; 2 and 1 divide by 4 and 8, 7 multiplies by 8). Value 0 is refused, as PR #4588
+//!   refuses it (`Require(scale >= 1 && scale <= 7, "native FMUL scale")`).
 //! - **The `FMNMX` bits 65..69** (NAK: `.IS_A`, "SM90+", written false, and a commented-out
 //!   predicate destination at 66..69) are rejected: SM86 predates them and PR #4588's translator
 //!   does not read them.
@@ -84,39 +85,41 @@
 //! | Bits 62 and 63 of `I2F` and `I2FP` forms 1, 5 and 6 | Rejected: an integer source has no modifiers (PR #4588: `Source(1, false)`) | `float_rows_drop_exactly_the_listed_bits` |
 //! | Bit 91 of `I2FP` forms 1 and 4 (`0x245`, `0x845`) | Rejected: neither form has a constant buffer or uniform register for it to qualify, and PR #4588's translator does not read it there | `float_rows_drop_exactly_the_listed_bits` |
 //! | Bits 62, 63, 73, 74 and 75 of `F2FP` (62 and 63 not in form 4) | Rejected: `F2FP`'s sources have no modifiers (NAK: `SrcType::ALU`; PR #4588: `Source(.., false)`) | `float_rows_drop_exactly_the_listed_bits` |
-//! | `FMUL` scale 0 | Decoded (a divide by 16, a guess); PR #4588 refuses it | `fmul_scales_decode_every_value` |
-//! | Float size 0, a 64-bit type in the narrow opcode, no 64-bit type in the wide one | Decoded (see above); PR #4588's translator refuses every size but the ones it converts | `conversion_sizes_decode_every_value` |
+//! | Float sizes 1 to 3 that PR #4588's translator does not convert (every pair but `F2F`'s `F16` from `F32`, `FRND`'s `F32` to `F32`, `F2I`'s `F16` and `F32` sources and `I2F`'s `F32` destination), a 64-bit type in the narrow opcode, no 64-bit type in the wide one | Decoded (see above); PR #4588's translator refuses them | `conversion_sizes_decode_every_type` |
 //! | `MUFU` functions 6, 7 and 9 (`RCP64H`, `RSQ64H`, `TANH`), form 4 (`0x908`) | Decoded (NAK encodes them); PR #4588's translator refuses them | `mufu_functions_and_refusals` |
 //! | `FSWZADD` operations other than `0x5a` and `0x66`, and bits 77..81 not zero | Decoded (NAK encodes every operation, `.NDV`, the rounding mode and `.FTZ`); PR #4588 refuses them | `hand_built_words_of_each_form_decode` |
 //! | `FFMA`'s and `FMUL`'s bit 76 (`.FMZ`), `F2FP`'s rounding and `.H1` | Decoded (NAK writes them); PR #4588's translator refuses them set | `hand_built_words_pin_each_modifier_bit` |
-//! | High half (bit 60) of an `F16` source of `F2F`, every form (1, 5, 6) and both opcodes (`0x104`, `0x110`) | Refused, [`DecodeError::UnknownBit`] naming bit 60, though NAK writes it (`encode_alu_base` passes `src_types()[0]`, `F16` for an `F16` source, to `encode_alu_reg`, `encode_alu_cb` and `encode_alu_ureg`, each of which calls `set_swizzle(60..62, ..)`; `opt_copy_prop`'s `prop_to_scalar_src` emits `SrcSwizzle::Yy`, for example in `f2f32` of `unpackHalf2x16`'s high half). PR #4588's rows leave bit 60 out | `decode::tests::float32::nak_high_halves_outside_the_decoded_forms_are_refused` |
-//! | High half (bit 60) of an `F16` source of `FRND`, every form and both opcodes (`0x107`, `0x113`) | Refused as for `F2F`, though NAK writes it the same way; PR #4588's rows leave it out | `nak_high_halves_outside_the_decoded_forms_are_refused` |
-//! | High half (bit 60) of `MUFU.F16` in forms 5 and 6 (`0xb08`, `0xd08`) | Refused, though NAK writes it from `encode_alu_cb` and `encode_alu_ureg`; PR #4588's rows for those forms leave it out | `nak_high_halves_outside_the_decoded_forms_are_refused` |
-//! | High half (bit 60) of the narrow `F2I`'s `F16` source in forms 5 and 6 (`0xb05`, `0xd05`) | Refused, though NAK writes it from `encode_alu_cb` and `encode_alu_ureg`; PR #4588's rows for those forms leave it out | `nak_high_halves_outside_the_decoded_forms_are_refused` |
-//! | High half (bit 60) of the 64-bit `F2I`'s `F16` source (`0x111`), every form | Refused, though NAK writes it for an `F16` source converted to a 64-bit integer; PR #4588's rows leave it out | `nak_high_halves_outside_the_decoded_forms_are_refused` |
+//! | High half (bit 60) of an `F16` source of `F2F`, forms 1, 5 and 6 of both opcodes (`0x304`, `0xb04`, `0xd04`, `0x310`, `0xb10`, `0xd10`) | Decoded as [`OpF2F::high`]: the forms add bit 60, which NAK writes (`encode_alu_base` passes `src_types()[0]`, `F16` for an `F16` source, to `encode_alu_reg`, `encode_alu_cb` and `encode_alu_ureg`, each of which calls `set_swizzle(60..62, ..)`; `opt_copy_prop`'s `prop_to_scalar_src` emits `SrcSwizzle::Yy`, for example in `f2f32` of `unpackHalf2x16`'s high half). PR #4588's rows leave bit 60 out | `decode::tests::float32::nak_high_halves_decode_in_every_form_with_bit_60`, `decode::tests::framework::added_bits_decode_print_and_round_trip` |
+//! | High half (bit 60) of an `F16` source of `FRND`, forms 1, 5 and 6 of both opcodes (`0x307`, `0xb07`, `0xd07`, `0x313`, `0xb13`, `0xd13`) | Decoded as [`OpFRnd::high`], added as for `F2F`: NAK writes it the same way; PR #4588's rows leave it out | as above |
+//! | High half (bit 60) of `MUFU.F16` in forms 5 and 6 (`0xb08`, `0xd08`) | Decoded as [`OpMuFu::high`], added: NAK writes it from `encode_alu_cb` and `encode_alu_ureg`; PR #4588's rows for those forms leave it out | as above |
+//! | High half (bit 60) of the narrow `F2I`'s `F16` source in forms 5 and 6 (`0xb05`, `0xd05`) | Decoded as [`OpF2I::high`], added: NAK writes it from `encode_alu_cb` and `encode_alu_ureg`; PR #4588's rows for those forms leave it out | as above |
+//! | High half (bit 60) of the 64-bit `F2I`'s `F16` source, forms 1, 5 and 6 (`0x311`, `0xb11`, `0xd11`) | Decoded as [`OpF2I::high`], added: NAK writes it for an `F16` source converted to a 64-bit integer; PR #4588's rows leave it out | as above |
 //!
-//! Every other row of a decoded form is matched exactly
-//! (`decode::tests::masks_match_the_reference_table`). That test compares the masks with PR
-//! #4588's rows, so it cannot see a bit that NAK writes and the rows leave out, such as the high
-//! halves above.
-//!
-//! **Owner question (the high halves).** Strict decoding takes each form's known bits from PR
-//! #4588's rows (owner's decision 4), and those rows omit bit 60 in the cases listed above, so
-//! words NAK emits are refused there. Accepting them needs a way to mark a bit known beyond PR
-//! #4588's row (a `ReferenceRow` addition, with `masks_match_the_reference_table` taught the
-//! difference), which is a design call left to the owner. Until then the refusal is pinned by
-//! `nak_high_halves_outside_the_decoded_forms_are_refused`.
+//! Every other row of a decoded form is matched exactly, and the rows above differ from their
+//! forms by exactly the bits listed (`decode::tests::masks_match_the_reference_table`, with each
+//! row's dropped and added bits; `decode::tests::framework::added_bits_are_the_listed_cases`
+//! lists every added bit and the reference that names it). Bit 61, the swizzle's other bit,
+//! which NAK sets only for an `F16v2` source (`set_swizzle`: 2 and 3), stays unknown in every
+//! form.
 //!
 //! # Values and bits the decoder refuses
 //!
 //! A field whose value names nothing is [`DecodeError::UnknownValue`]: `MUFU`'s function 10 to
-//! 63 (NAK's `MuFuOp` encodes 0 to 9), and the combine operation 3 of `FSET` and `FSETP` (NAK's
-//! `PredSetOp` encodes 0 to 2; PR #4588: `Require(set_op <= 2)`). Some bits are read only in
-//! some of a form's layouts, so set in another they are unknown bits (`decode`'s step 5):
-//! the high-half select (bit 60) of `MUFU` and the narrow `F2I`, read only for a 16-bit source in
-//! form 1 (NAK writes the swizzle only for an `F16` source, though in every form; PR #4588 takes
-//! bit 60 only for a half source, and its rows mark it only in form 1); `I2F`'s byte select (bits 60..62), of which an 8-bit source reads two bits, a
-//! 16-bit one bit 60 and a wider one none (PR #4588: `select < (32 >> (3 + src_size))`); and
+//! 63 (NAK's `MuFuOp` encodes 0 to 9), the combine operation 3 of `FSET` and `FSETP` (NAK's
+//! `PredSetOp` encodes 0 to 2; PR #4588: `Require(set_op <= 2)`), `FMUL`'s scale 0 (PR #4588:
+//! `Require(scale >= 1 && scale <= 7, "native FMUL scale")`), and a float size of 0 in the
+//! float size fields of `FRND` and `F2F` (75 and 84), `F2I` (84), `I2F` and `I2FP` (75) (see
+//! "Size fields"). Each conversion reads its float size fields in ascending bit order, so with
+//! both 0 the one at bit 75 is reported (`decode::tests::float32::float_sizes_of_zero_are_refused`,
+//! `fmul_scales_decode_and_zero_is_refused`). Their forms' bare words hold these zeros, so the
+//! forms' rows give canonical words (scale 4; `F32` in each float size field) from which tests
+//! build valid words (`bare_words_refuse_the_zeros_pr_4588_refuses`). Some bits are read only in
+//! some of a form's layouts, so set in another they are unknown bits (`decode`'s step 5): the
+//! high-half select (bit 60) of `MUFU`, `F2I`, `F2F` and `FRND`, read only for a 16-bit source
+//! (`MUFU`'s `.F16`, a conversion's `F16` source type; NAK writes the swizzle only for an `F16`
+//! source, and PR #4588 takes bit 60 only for a half source); `I2F`'s byte select (bits
+//! 60..62), of which an 8-bit source reads two bits, a 16-bit one bit 60 and a wider one none
+//! (PR #4588: `select < (32 >> (3 + src_size))`); and
 //! `F2FP`'s `.H1` (bit 72), read only with `.MERGE_C` (NAK: "`MERGE_C` only"). PR #4588's rows
 //! leave out `FMNMX`'s `.NAN` and `FSET`'s combine operation in form 6 (`0xc09`, `0xc0a`), so
 //! there they are unknown bits (step 2) and the assembler refuses them.
@@ -156,8 +159,8 @@ pub(crate) const DNZ: Field = Field::bit(76);
 /// an `F16` source, `Xx` 0 and `Yy` 1, from `encode_alu_reg`, `encode_alu_cb` and
 /// `encode_alu_ureg`, so in forms 1, 5 and 6 of every op whose `src_types()[0]` is `F16`: `MUFU`,
 /// `F2I`, `F2F` and `FRND`). PR #4588's rows mark bit 60 only in `MUFU`'s and the narrow `F2I`'s
-/// form 1, and its `MUFU` and `F2I` take only bit 60; this decoder reads it only there, and the
-/// other cases are module-doc divergences.
+/// form 1, and its `MUFU` and `F2I` take only bit 60; this decoder reads it in every form NAK
+/// writes it in, the forms adding it where the rows leave it out (module docs).
 pub(crate) const HIGH_HALF: Field = Field::bit(60);
 /// A conversion's destination size, log2 of its byte count (NAK: `set_field(75..77, (bits /
 /// 8).ilog2())` in `OpF2F`, `OpF2I`, `OpI2F` and `OpFRnd`; PR #4588: `Take(75, 2)`, also for

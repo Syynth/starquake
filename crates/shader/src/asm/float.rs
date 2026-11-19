@@ -61,7 +61,8 @@ fn high_half(
     half: bool,
     src: AluSrc,
 ) -> Result<(), EncodeError> {
-    if high && !(half && !matches!(src, AluSrc::Imm(_))) {
+    let has_bit = half && !matches!(src, AluSrc::Imm(_));
+    if high && !has_bit {
         return Err(no_bits(
             mnemonic,
             "the high half of a source other than a 16-bit register, constant buffer or \
