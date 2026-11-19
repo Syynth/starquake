@@ -550,6 +550,24 @@ The remaining shader-pipeline slices (#349 to #381, #348 before them) and render
 | proposed | **Instructions with no reference source:** no encoding source for `JMX`, `UP2UR` and `BPT`; no translator in either Switch 2 reference for `IDP4`, `UP2UR`, `DSETP`, `AL2P` and `PIXLD` (Eden's Maxwell translators cover the last three). The decoder and translator issues mark them as guesses | #351 to #371 | area:shader |
 | proposed | **Render verification 3 (wgpu on lavapipe in Linux CI)** has no owner or issue; until it runs, every GPU test stays local-only | #382 | infra |
 
+### From wave 39 (ledger: #22)
+
+Landed: G14 (the front loop, #325, PR #394), G17 (the texture cache, #328, PR #396), G23 (the pipeline-key cache, #334, PR #391) and shader slice 9 (questions, answers, the variant key and driver constants, #348, PR #390). G23's fix agent squashed and force-pushed its own PR branch before landing, against the house rule; the result was reviewed and is correct, and from wave 40 the rules forbid any history rewrite explicitly. Also fixed here: gpu-protocol's "Render backend (#14)" list still called the completion wake open.
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| proposed | **Pipeline lifetimes:** the pipeline-key cache never destroys a pipeline, and a failed pipeline keeps its id reserved in the backend; no slice owns this | #334 | area:gpu |
+| proposed | **Texture cache follow-ups:** depth textures read from guest memory need verification item 9 or a FermiZS byte order in `starquake-layout`; host copies for a DMA copy or 2D blit over a cached image (G11 still copies through guest memory); render's `host_format` fallback is not consulted; no joins or aliases between images of different layouts over the same memory; 1D buffer textures and row-87 huge images are refused | #328 | area:gpu |
+| proposed | **Environment members slice 9 does not cover:** the texture type's dimension, array and rect; `TextureBoundBuffer`; `ReadViewportTransformState` (the row-65 position pass); compute `LocalMemorySize` from the QMD; `HasHLEMacroState`, `GetReplaceConstBuffer`, `GpPassthroughMask`. The slice that first needs each adds its question or key field (13, 15 or 17) | #348 | area:shader |
+| awaiting the owner | **G14's guesses and departures** (in `front.rs`): the "process" for ordered updates and the macro store is the address space; `SYNC_WAIT` waits before the entry, as `clc76f.h`'s names read (Eden-NX2 waits after, behind a setting); a submission to an unknown or destroyed channel is dropped and answered `Queued`; an update after a barrier can be reported before it when the barrier waits on another space's channel; `BackWork` is answered from reported markers, so the first macro DMA read after any pushed work costs a catch-up; an empty submission is charged one queue place; the Eden-NX2 path's `WaitForIdle` difference | #325 | gpu-protocol |
+| awaiting the owner | **`Syncpoint` ring entries carry no count,** so a guest asking for `u32::MAX` increments costs time linear in the count (pushed a quantum at a time). Give the entry a count | #325 | gpu-protocol |
+| awaiting the owner | **GPU-modified images stay until the budget refuses new ones** (no write-back eviction yet) | #328 | gpu-protocol |
+| awaiting the owner | **Shader identity across boots:** the precompile list keys each stage by a caller-supplied 128-bit `ShaderStamp`; what it holds (a digest of the shader cache's entry key, defined with shader slice 21) and how `core` maps stamps back to shaders at start-up are undecided; 128 bits is a guess | #334 | gpu-protocol, shader-pipeline |
+| awaiting the owner | **Four render states are always dynamic:** `GraphicsPipelineDesc` has no field for the viewport, scissor, blend constant or stencil reference (only `DynamicValues`), so "keys only on what is not dynamic" cannot hold for a device that cannot set them per draw. wgpu, Vulkan and Metal all set them per draw | #334 | render-backend |
+| awaiting the owner | **Pipeline-key cache choices:** `MAX_PIPELINES` = 65,536 (a guess, stricter than both references, which have no cap); a key is recorded when the backend accepts the pipeline, not after its build succeeds, because builds finish asynchronously | #334 | gpu-protocol |
+| awaiting the owner | **`TextureKind` has no usage field,** so its answer always carries the header's format bits and a shader that only samples is retranslated when the format changes but the kind does not. Add a usage field to the question | #348 | shader-pipeline |
+| awaiting the owner | **Interface specialisation:** the spec specialises a stage on what the next stage reads; Eden specialises on what the previous stage stores (`MakeRuntimeInfo`), and the GPU crate cannot build the next stage's reads from engine state. Slice 9 follows the spec provisionally | #348 | shader-pipeline |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
@@ -807,3 +825,13 @@ passed to build agents as a provisional rule for the next wave.
 - Every documented ordering between a signal and another side effect is pinned by a test double that observes the effect at the moment of the signal.
 - Every pool holding live bytes counts toward a documented memory cap, tested with a hostile growing sequence.
 - A doc that cites a reference name is checked against the reference tree; a doc that says code is generated or mirrors a spec sentence is checked literally.
+
+### From wave 39 (ledger: #22)
+
+- Anything a hostile guest can repeat costs a nonzero unit of every queue, cap and budget, with one charge function shared by the fit check and the release path.
+- When a change makes an object stale, every later pass that writes back, uploads or clears flags re-checks it when it acts.
+- Every counter or queue bound has a test that fails when the release on any exit path is removed.
+- Every documented wake, recheck, reset or poll-schedule rule has a test that fails when that line is removed, with the fake clock held still.
+- Per-item lookups on hot paths are indexed, never a scan of the whole container.
+- PR bodies and docs make no "all", "every" or "row for row" claim that was not checked literally.
+- Published history is never rewritten: no rebase, squash, amend or force-push of a pushed branch.

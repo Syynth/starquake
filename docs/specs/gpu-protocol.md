@@ -963,7 +963,8 @@ back thread:
 - resource creation and destruction by description (buffers, images with format, extent, levels,
   layers, views, samplers, shaders from `ShaderDesc`, pipelines), returning typed ids;
 - `submit(CommandList)`, which hands a list to the render thread and returns its `FenceValue`,
-  and `completed()`; the wake on completion is open (see "Releases and completion");
+  and `completed()`; the back thread wakes on completion through the backend's completion wake
+  (decision of 2026-11-18; "Releases and completion", render-backend "The completion wake");
 - `budget()`, which the caches read for eviction;
 - `Caps`, including `view_swizzle`, and `emulation()`;
 - a present as `Command::Present(PresentDesc)` with a host view, the source rectangle, the
