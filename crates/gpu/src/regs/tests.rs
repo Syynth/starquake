@@ -414,6 +414,32 @@ fn data_loads_end_at_their_neighbours() {
     }
 }
 
+#[test]
+fn data_load_methods_are_the_headers_constant_buffer_and_inline_data_methods() {
+    // Written out from `classes/clc797.h`: `NVC797_LOAD_CONSTANT_BUFFER(i)` is
+    // `(0x2390+(i)*4)` for i in 0..16, and `NVC797_LOAD_INLINE_DATA` is 0x01b4 (byte
+    // addresses; a method number is the byte address over 4).
+    let mut expected: Vec<u32> = (0..16).map(|i| (0x2390 + i * 4) / 4).collect();
+    expected.push(0x01b4 / 4);
+    let numbers: Vec<u32> = DATA_LOADS_3D.iter().flat_map(MethodSpan::numbers).collect();
+    assert_eq!(numbers, expected);
+    assert_eq!(numbers, data_loads());
+    assert_eq!(THREE_D.data_loads(), DATA_LOADS_3D);
+    assert_eq!(COMPUTE.data_loads().len(), 0);
+    assert_eq!(OTHER.data_loads().len(), 0);
+    let file = three_d();
+    for &method in &expected {
+        assert!(THREE_D.is_data_load(method), "{method:#x}");
+        assert!(!file.is_state(method), "{method:#x} is a trigger");
+        assert!(!COMPUTE.is_data_load(method), "{method:#x}");
+        assert!(!OTHER.is_data_load(method), "{method:#x}");
+    }
+    // The neighbours of each span are not data loads.
+    for method in [0x238c / 4, 0x23d0 / 4, 0x01b0 / 4, 0x01b8 / 4] {
+        assert!(!THREE_D.is_data_load(method), "{method:#x}");
+    }
+}
+
 /// Whether `method` is a plain-state method of a new 3D file.
 fn file_is_state(method: u32) -> bool {
     three_d().is_state(method)

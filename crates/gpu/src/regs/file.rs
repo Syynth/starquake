@@ -358,6 +358,9 @@ impl RegFile {
                 }
                 word
             }
+            // A data load takes the word written even in replay (gpu-protocol, "Engine methods:
+            // the register file", step 1; a guess, decided by the owner, 2026-11-18).
+            ShadowMode::Replay if self.rules.is_data_load(method) => word,
             ShadowMode::Replay => self.shadow.get(index).copied().unwrap_or(word),
             ShadowMode::Passthrough => word,
         };
