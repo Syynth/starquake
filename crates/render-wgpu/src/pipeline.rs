@@ -7,8 +7,9 @@
 //! (SPIR-V and MSL serve a later direct backend, [`NAGA_ONLY`]); it checks the description against
 //! `Caps` (`validate::validate_shader`, which refuses a geometry or tessellation shader with
 //! `RenderError::StageUnsupported`), checks that the module has an entry point of the shader's name
-//! for its stage ([`NO_ENTRY_POINT`]), reads what the layouts and the requirements need from the
-//! module ([`scan`]), refuses a module whose blocks nest deeper than [`MAX_SHADER_NESTING`]
+//! for its stage ([`NO_ENTRY_POINT`]), reads what the cross-check, the layouts and the draw
+//! check need from the module ([`scan`]), refuses a module whose blocks nest deeper than
+//! [`MAX_SHADER_NESTING`]
 //! ([`NESTING`]), and keeps the module. The three module checks (a naga module, the entry point,
 //! the nesting) run in that order, pinned by `tests::shader_checks_run_in_order`. A module refused here or by the shared checks is taken
 //! apart without recursion (`scan::dismantle`), since naga's own `Drop` recurses once per nesting
@@ -30,15 +31,20 @@
 //! 3. the device is not lost;
 //! 4. each stage's shader is live and of its stage (`validate::validate_pipeline_stages`,
 //!    `validate::validate_compute_stage`);
-//! 5. the shaders' requirements: subgroups of 32 ([`SUBGROUP_SIZE`]), then subgroups in a vertex
+//! 5. each shader's interface agrees with its module, shader by shader in stage order
+//!    ([`agreement`]: [`layout::UNSIZED_BINDING_ARRAY`], [`ARRAY_COUNT_MISMATCH`],
+//!    [`UNDECLARED_SUBGROUPS`]; below, "The interface and the module");
+//! 6. the shaders' requirements: subgroups of 32 ([`SUBGROUP_SIZE`]), then subgroups in a vertex
 //!    shader ([`VERTEX_SUBGROUPS`]), both below;
-//! 6. the layouts ([`layout`]);
-//! 7. for a graphics pipeline, the fixed-function state ([`state`]).
+//! 7. the layouts ([`layout`]);
+//! 8. for a graphics pipeline, the fixed-function state ([`state`]).
 //!
 //! A compute pipeline has no description to check against `Caps` or fixed-function state, so
-//! steps 2 and 7 do not apply to it. The order is pinned by `tests::pipeline_checks_run_in_order`,
-//! `tests::nothing_is_created_once_the_device_is_lost` (step 3) and
-//! `tests::requirements_come_after_the_ids_and_before_the_layout` (step 5, and the order of its two
+//! steps 2 and 8 do not apply to it. The order is pinned by `tests::pipeline_checks_run_in_order`,
+//! `tests::nothing_is_created_once_the_device_is_lost` (step 3),
+//! `tests::the_interface_check_comes_after_the_ids_and_before_the_requirements` (step 5, and the
+//! order of its checks across two stages) and
+//! `tests::requirements_come_after_the_ids_and_before_the_layout` (step 6, and the order of its two
 //! checks).
 //!
 //! Then the id is allocated, the pipeline's status is `Compiling`, and one job goes to the
@@ -51,7 +57,33 @@
 //! pipeline is cached as failed: nothing builds it again (rows 90 and 112: cache rejections
 //! negatively), and `pipeline_status` says `Failed` from then on.
 //!
-//! **Requirements.** A shader that uses subgroup operations or built-ins ([`scan`]) needs every
+//! **The interface and the module.** Layouts and requirements come from each shader's
+//! `ShaderInterface`, which carries the shader's requirements and each binding's array count, so
+//! the backend reads neither from the naga module (render-backend, "Shader emission"; decided by
+//! the owner, 2026-11-19, ruling 20). The module scan ([`scan`]) stays as a cross-check, run at
+//! step 5 by [`agreement`], because a wrong interface would otherwise reach wgpu (which refuses
+//! a layout whose array count is not the module's, with a message about wgpu's internals) or, for
+//! subgroups, skip the size check below on a device that cannot promise 32. For each interface
+//! row whose group and binding the module binds, in table order, the module's binding-array size
+//! must be the row's count: a module array whose size is not a constant is refused with
+//! [`layout::UNSIZED_BINDING_ARRAY`] (an interface cannot describe one), and any other difference
+//! (another size, an array against a lone resource, or the reverse) with
+//! [`ARRAY_COUNT_MISMATCH`]. Then a module that uses subgroups ([`scan`], "Subgroups") must have
+//! `requirements.subgroup` set, or the pipeline is refused with [`UNDECLARED_SUBGROUPS`]. Not
+//! cross-checked:
+//!
+//! - **An interface that declares more than the module uses.** A row the module does not bind is
+//!   left out of the comparison (wgpu accepts a layout entry no shader uses), and a set
+//!   `requirements.subgroup` with a module that uses no size-dependent subgroup operation (a quad
+//!   operation alone, say, which the shader crate's flag also covers: it mirrors naga's
+//!   `Capabilities::SUBGROUP`) is honoured as declared. The backend is then stricter than the
+//!   scan alone was: such a pipeline is refused where the size of 32 is not met
+//!   (`tests::the_interface_and_module_must_agree`).
+//! - **A module binding the interface does not list.** As before this slice, wgpu refuses the
+//!   pipeline's layout for it when it builds.
+//!
+//! **Requirements.** A shader whose interface requires subgroups (the cross-check above holds
+//! every module that uses subgroup operations or built-ins to declaring it) needs every
 //! subgroup to be 32 invocations wide, the guest's warp (shader-pipeline, "What the render
 //! backend (#14) gets": "It honours `requirements` (for example, a subgroup size of 32) or
 //! refuses the pipeline"). wgpu cannot ask for a subgroup size, so a pipeline with such a shader
@@ -70,7 +102,7 @@
 //! `AdapterInfo` and the device's features ([`SubgroupVerdict`], pinned by
 //! `tests::the_backend_verdict_reads_the_device_features`).
 //!
-//! A vertex shader that uses subgroups (by the same test, [`scan`]) also needs the device's
+//! A vertex shader that requires subgroups (by the same flag) also needs the device's
 //! `wgpu::Features::SUBGROUP_VERTEX`, which `SUBGROUP` does not imply: wgpu-hal 30.0.2's Metal
 //! backend offers `SUBGROUP` (with `SUBGROUP_BARRIER`) where the GPU has SIMD-scoped operations
 //! and never `SUBGROUP_VERTEX` (`src/metal/adapter.rs`, `features`), so such a pipeline would
@@ -78,9 +110,7 @@
 //! ([`VERTEX_SUBGROUPS`]), after the size check: a pipeline that fails both is refused with
 //! [`SUBGROUP_SIZE`]. A compute or fragment shader needs only `SUBGROUP`. Pinned by
 //! `tests::vertex_subgroups_need_the_vertex_feature` (the pure rule) and
-//! `tests::a_vertex_subgroup_pipeline_follows_the_device` (on the host's GPU). A vertex shader
-//! whose only subgroup use is one [`scan`] does not count (a quad operation or a subgroup
-//! barrier, which naga allows only in other stages) is left to wgpu.
+//! `tests::a_vertex_subgroup_pipeline_follows_the_device` (on the host's GPU).
 //!
 //! The other requirements (f16, i64 and the binding-array features) are wgpu's to check: it
 //! validates each module against the device's features, and a module that needs one the device
@@ -119,8 +149,8 @@ pub mod state;
 
 use crate::backend::{NewError, block_on};
 use crate::draw::PipelineInfo;
-use layout::{LayoutPlan, Stage};
-use scan::ModuleFacts;
+use layout::{LayoutPlan, Stage, UNSIZED_BINDING_ARRAY};
+use scan::{ArrayCount, ModuleFacts};
 use starquake_render::shader::ShaderInterface;
 use starquake_render::{
     CompileJob, CompilePool, PipelineStatus, RenderError, ShaderDesc, ShaderSource, ShaderStage,
@@ -145,6 +175,14 @@ pub const SUBGROUP_SIZE: &str =
 /// A vertex shader that uses subgroups on a device without subgroups in vertex shaders
 /// (`wgpu::Features::SUBGROUP_VERTEX`; module docs, "Requirements").
 pub const VERTEX_SUBGROUPS: &str = "the device has no subgroup operations in vertex shaders, which this pipeline's vertex shader uses";
+/// A shader whose interface gives a binding another array count than its module declares
+/// (module docs, "The interface and the module").
+pub const ARRAY_COUNT_MISMATCH: &str =
+    "a shader's interface gives a binding a different array count from its module";
+/// A shader whose module uses subgroups that its interface's requirements leave out (module
+/// docs, "The interface and the module").
+pub const UNDECLARED_SUBGROUPS: &str =
+    "a shader's module uses subgroups that its interface's requirements do not list";
 /// A pipeline asked of a backend built without a compile pool.
 pub const NO_COMPILE_POOL: &str =
     "the wgpu backend was built without a compile pool and cannot build pipelines";
@@ -451,9 +489,9 @@ impl ShaderRec {
         })
     }
 
-    /// Whether the module uses subgroups.
+    /// Whether the shader's interface requires subgroups (module docs, "Requirements").
     pub(crate) fn uses_subgroups(&self) -> bool {
-        self.facts.subgroups
+        self.interface.requirements.subgroup
     }
 
     /// The size the module declares for the buffer bound at `group` and `binding`, if it binds
@@ -712,6 +750,42 @@ impl fmt::Debug for Compile {
             .field("setting", &self.setting)
             .finish_non_exhaustive()
     }
+}
+
+/// Whether a shader's `interface` agrees with what its module declares (`facts`): module docs,
+/// "The interface and the module". The rows are checked in table order and the first
+/// disagreement is returned; the subgroup check comes after every row.
+pub(crate) fn agreement(
+    interface: &ShaderInterface,
+    facts: &ModuleFacts,
+) -> Result<(), RenderError> {
+    for row in &interface.resources {
+        let Some(bound) = facts.bindings.get(&(row.group, row.binding)) else {
+            continue;
+        };
+        let module = match bound.count {
+            ArrayCount::Single => None,
+            ArrayCount::Sized(n) => Some(n),
+            ArrayCount::Unsized => return Err(RenderError::Unsupported(UNSIZED_BINDING_ARRAY)),
+        };
+        if module != row.count {
+            return Err(RenderError::Invalid(ARRAY_COUNT_MISMATCH));
+        }
+    }
+    if facts.subgroups && !interface.requirements.subgroup {
+        return Err(RenderError::Invalid(UNDECLARED_SUBGROUPS));
+    }
+    Ok(())
+}
+
+/// Refuses the first of `shaders`, in the order given, whose interface and module disagree
+/// ([`agreement`]).
+pub(crate) fn check_interfaces<'a>(
+    shaders: impl IntoIterator<Item = &'a ShaderRec>,
+) -> Result<(), RenderError> {
+    shaders
+        .into_iter()
+        .try_for_each(|shader| agreement(&shader.interface, &shader.facts))
 }
 
 /// Refuses `shaders` that need subgroups of 32 when the device cannot promise them

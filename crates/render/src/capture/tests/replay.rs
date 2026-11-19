@@ -19,13 +19,14 @@ use crate::command::{
 use crate::frame::{Frame, FramePixels, FrameSink};
 use crate::id::{BufferId, FenceValue, PipelineId, ReadbackId, ResourceId, ShaderId};
 use crate::pipeline::ComputePipelineDesc;
-use crate::resource::{BufferDesc, BufferUsage, Origin3d};
+use crate::resource::{BufferDesc, BufferUsage, Origin3d, ViewDimension};
 use crate::shader::{
-    InterfaceVariable, Interpolation, ScalarKind, ShaderDesc, ShaderInterface, ShaderOrigin,
-    ShaderSource, ShaderStage,
+    InterfaceVariable, Interpolation, ResourceBinding, ResourceKind, SampleKind, ScalarKind,
+    ShaderDesc, ShaderInterface, ShaderOrigin, ShaderRequirements, ShaderSource, ShaderStage,
 };
 use std::cell::RefCell;
 use std::collections::HashSet;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,8 +40,9 @@ fn options() -> ReplayOptions {
 }
 
 /// Translates origins by their first byte: `X` cannot be translated, `F` stops the replay,
-/// `E` gives another entry name, `S` another stage, `I` another interface, anything else a
-/// compute shader named `main`.
+/// `E` gives another entry name, `S` another stage, `I` another interface, `A` a compute shader
+/// with [`arrayed`]'s interface, `C` and `R` that interface with another array count or another
+/// requirement, anything else a compute shader named `main`.
 struct Stub;
 
 impl ShaderResolver for Stub {
@@ -65,8 +67,44 @@ impl ShaderResolver for Stub {
                 },
                 ..shader(ShaderStage::Compute, naga(), None)
             }),
+            Some(b'A') => Ok(ShaderDesc {
+                interface: arrayed(),
+                ..shader(ShaderStage::Compute, naga(), None)
+            }),
+            Some(b'C') => {
+                let mut interface = arrayed();
+                interface.resources[0].count = NonZeroU32::new(5);
+                Ok(ShaderDesc {
+                    interface,
+                    ..shader(ShaderStage::Compute, naga(), None)
+                })
+            }
+            Some(b'R') => Ok(ShaderDesc {
+                interface: ShaderInterface {
+                    requirements: ShaderRequirements { subgroup: true },
+                    ..arrayed()
+                },
+                ..shader(ShaderStage::Compute, naga(), None)
+            }),
             _ => Ok(shader(ShaderStage::Compute, naga(), None)),
         }
+    }
+}
+
+/// An interface with a binding array of four sampled textures and no requirements.
+fn arrayed() -> ShaderInterface {
+    ShaderInterface {
+        resources: vec![ResourceBinding {
+            group: 0,
+            binding: 1,
+            kind: ResourceKind::SampledTexture {
+                dimension: ViewDimension::D2,
+                sample: SampleKind::Float { filterable: true },
+                multisampled: false,
+            },
+            count: NonZeroU32::new(4),
+        }],
+        ..ShaderInterface::default()
     }
 }
 
@@ -725,6 +763,39 @@ fn a_shader_whose_stage_or_interface_alone_changed_is_a_difference() {
             "{arm}"
         );
         assert_eq!((report.differences, report.refused), (1, 0), "{arm}");
+    }
+}
+
+/// The interface's array counts and requirements are compared with the rest of it: a shader
+/// retranslated with the same interface is no difference, and one whose array count alone or
+/// requirements alone changed is one (render-backend, "Shaders": replay checks "the same entry
+/// and interface").
+#[test]
+fn a_changed_array_count_or_requirement_is_a_difference() {
+    for (first, differs) in [(b'A', false), (b'C', true), (b'R', true)] {
+        let mut b = builder();
+        b.create_shader(&ShaderDesc {
+            interface: arrayed(),
+            ..shader(
+                ShaderStage::Compute,
+                naga(),
+                Some(ShaderOrigin {
+                    record: Arc::from(vec![first]),
+                    stage_index: 0,
+                }),
+            )
+        })
+        .expect("shader");
+        let bytes = b.finish().expect("end");
+        let report = run(&bytes, &Spy::new(Knob::Plain)).expect("replays");
+        let arm = char::from(first);
+        let expected = differs.then(|| finding(2, FindingKind::ShaderChanged));
+        assert_eq!(report.first_difference, expected, "{arm}");
+        assert_eq!(
+            (report.differences, report.refused),
+            (u64::from(differs), 0),
+            "{arm}"
+        );
     }
 }
 

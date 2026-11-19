@@ -2,7 +2,7 @@
 source: crates/gpu/src/back/exec/tests.rs
 expression: snapshot
 ---
-create sh0: shader compute "main", naga module (0 functions, 1 entry points), resources [ResourceBinding { group: 0, binding: 0, kind: UniformBuffer }], inputs [], outputs []
+create sh0: shader compute "main", naga module (0 functions, 1 entry points), resources [ResourceBinding { group: 0, binding: 0, kind: UniformBuffer, count: None }], inputs [], outputs []
 create b0: buffer 4096 bytes, usage VERTEX|INDEX|UNIFORM|STORAGE|INDIRECT|COPY_SRC|COPY_DST
 create p0: compute pipeline of sh0
 submit fence 1:

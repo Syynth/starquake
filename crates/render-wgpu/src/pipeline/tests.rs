@@ -11,11 +11,12 @@ use crate::fixtures::{graphics_desc, shader_desc, wgsl};
 use crate::{WgpuBackend, WgpuConfig};
 use starquake_render::pipeline::{CullMode, Topology};
 use starquake_render::resource::ViewDimension;
-use starquake_render::shader::{ResourceBinding, ResourceKind, SampleKind};
+use starquake_render::shader::{ResourceBinding, ResourceKind, SampleKind, ShaderRequirements};
 use starquake_render::{
     Backend, CompletionWake, ComputePipelineDesc, FenceValue, PipelineId, PixelFormat, ResourceId,
     ShaderId,
 };
+use std::num::NonZeroU32;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -502,8 +503,18 @@ fn storage_out() -> ShaderInterface {
             group: 0,
             binding: 0,
             kind: ResourceKind::StorageBuffer { writable: true },
+            count: None,
         }],
         ..ShaderInterface::default()
+    }
+}
+
+/// `interface` with `requirements.subgroup` set, as the GPU crate's conversion fills it for a
+/// shader that uses subgroups.
+fn subgroups(interface: ShaderInterface) -> ShaderInterface {
+    ShaderInterface {
+        requirements: ShaderRequirements { subgroup: true },
+        ..interface
     }
 }
 
@@ -525,19 +536,20 @@ fn verdict(honoured: bool, vertex: bool) -> SubgroupVerdict {
 
 #[test]
 fn a_subgroup_shader_needs_a_device_that_honours_them() {
-    let rec = |source| {
+    let rec = |source, interface| {
         ShaderRec::new(shader_desc(
             ShaderStage::Compute,
             "main",
             wgsl(source),
-            storage_out(),
+            interface,
         ))
         .expect("accepted")
     };
-    let ballot = rec(BALLOT);
+    let ballot = rec(BALLOT, subgroups(storage_out()));
     let plain = rec(
         "@group(0) @binding(0) var<storage, read_write> out: array<u32>;
         @compute @workgroup_size(1) fn main() { out[0] = 1u; }",
+        storage_out(),
     );
     for vertex in [false, true] {
         assert_eq!(check_requirements([&ballot], verdict(true, vertex)), Ok(()));
@@ -582,11 +594,15 @@ fn vertex_subgroups_need_the_vertex_feature() {
     let vertex_ballot = rec(
         ShaderStage::Vertex,
         VERTEX_BALLOT,
-        ShaderInterface::default(),
+        subgroups(ShaderInterface::default()),
     );
     let plain_vertex = rec(ShaderStage::Vertex, BARE_VERTEX, ShaderInterface::default());
-    let subgroup_fragment = rec(ShaderStage::Fragment, SUBGROUP_FRAGMENT, storage_out());
-    let compute_ballot = rec(ShaderStage::Compute, BALLOT, storage_out());
+    let subgroup_fragment = rec(
+        ShaderStage::Fragment,
+        SUBGROUP_FRAGMENT,
+        subgroups(storage_out()),
+    );
+    let compute_ballot = rec(ShaderStage::Compute, BALLOT, subgroups(storage_out()));
     assert!(vertex_ballot.uses_subgroups() && !plain_vertex.uses_subgroups());
     // The refusal's reason, or `None` for accepted.
     let (refused, size) = (Some(VERTEX_SUBGROUPS), Some(SUBGROUP_SIZE));
@@ -795,6 +811,7 @@ fn rows(rows: &[(u32, ResourceKind)]) -> ShaderInterface {
                 group: 0,
                 binding,
                 kind,
+                count: None,
             })
             .collect(),
         ..ShaderInterface::default()
@@ -810,6 +827,8 @@ fn texture(filterable: bool) -> ResourceKind {
 }
 
 const SAMPLER: ResourceKind = ResourceKind::Sampler { comparison: false };
+
+const UNIFORM: ResourceKind = ResourceKind::UniformBuffer;
 
 fn vertex(gpu: &WgpuBackend) -> ShaderId {
     gpu.create_shader(shader_desc(
@@ -1057,11 +1076,9 @@ fn a_binding_array_becomes_a_pipeline_with_an_explicit_layout() {
             return;
         }
         let vs = bare_vertex(&gpu);
-        let fs = fragment(
-            &gpu,
-            BINDING_ARRAY,
-            rows(&[(0, texture(true)), (1, SAMPLER)]),
-        );
+        let mut interface = rows(&[(0, texture(true)), (1, SAMPLER)]);
+        interface.resources[0].count = NonZeroU32::new(4);
+        let fs = fragment(&gpu, BINDING_ARRAY, interface);
         let id = gpu
             .create_graphics_pipeline(graphics_desc(vs, Some(fs)))
             .expect("accepted");
@@ -1399,7 +1416,7 @@ fn a_subgroup_pipeline_follows_the_device() {
                 ShaderStage::Compute,
                 "main",
                 wgsl(BALLOT),
-                storage_out(),
+                subgroups(storage_out()),
             ))
             .expect("the shader itself is accepted");
         let result = gpu.create_compute_pipeline(ComputePipelineDesc { shader: cs });
@@ -1451,7 +1468,7 @@ fn a_compute_subgroup_pipeline_is_refused_where_the_size_is_not_met() {
                 ShaderStage::Compute,
                 "main",
                 wgsl(BALLOT),
-                storage_out(),
+                subgroups(storage_out()),
             ))
             .expect("the shader itself is accepted");
         let plain = gpu
@@ -1515,7 +1532,7 @@ fn a_vertex_subgroup_pipeline_follows_the_device() {
                 ShaderStage::Vertex,
                 "main",
                 wgsl(VERTEX_BALLOT),
-                ShaderInterface::default(),
+                subgroups(ShaderInterface::default()),
             ))
             .expect("the shader itself is accepted");
         let mut desc = graphics_desc(vs, None);
@@ -1540,7 +1557,7 @@ fn a_vertex_subgroup_pipeline_follows_the_device() {
         );
         // Only where the device really has subgroups, so the build that follows can succeed.
         if honours {
-            let fs = fragment(&gpu, SUBGROUP_FRAGMENT, storage_out());
+            let fs = fragment(&gpu, SUBGROUP_FRAGMENT, subgroups(storage_out()));
             let id = gpu
                 .create_graphics_pipeline(graphics_desc(bare_vertex(&gpu), Some(fs)))
                 .expect("a fragment shader needs only the size");
@@ -1590,7 +1607,7 @@ fn on_an_apple_gpu_subgroup_pipelines_are_ready() {
                 ShaderStage::Compute,
                 "main",
                 wgsl(BALLOT),
-                storage_out(),
+                subgroups(storage_out()),
             ))
             .expect("the shader itself is accepted");
         let compute = gpu
@@ -1598,7 +1615,7 @@ fn on_an_apple_gpu_subgroup_pipelines_are_ready() {
             .expect("a subgroup compute pipeline is accepted on an Apple GPU");
         assert_eq!(settled(&gpu, compute), PipelineStatus::Ready);
         let vs = bare_vertex(&gpu);
-        let fs = fragment(&gpu, SUBGROUP_FRAGMENT, storage_out());
+        let fs = fragment(&gpu, SUBGROUP_FRAGMENT, subgroups(storage_out()));
         let graphics = gpu
             .create_graphics_pipeline(graphics_desc(vs, Some(fs)))
             .expect("a subgroup graphics pipeline is accepted on an Apple GPU");
@@ -1732,7 +1749,7 @@ fn nothing_is_created_once_the_device_is_lost() {
     });
 }
 
-/// Checks 4, 5 and 6 of the module docs' order with two faults at once. The backend is told its
+/// Checks 4, 6 and 7 of the module docs' order with two faults at once. The backend is told its
 /// device cannot promise subgroups of 32 (as a 4 to 64 adapter outside the Apple family), so the
 /// order is checked on every device, an Apple GPU included.
 #[test]
@@ -1750,7 +1767,7 @@ fn requirements_come_after_the_ids_and_before_the_layout() {
         let vs = vertex(&gpu);
         // A fragment shader that uses subgroups and binds (0, 0) as a storage buffer, which the
         // vertex shader binds as a uniform buffer.
-        let fs = fragment(&gpu, SUBGROUP_FRAGMENT, storage_out());
+        let fs = fragment(&gpu, SUBGROUP_FRAGMENT, subgroups(storage_out()));
         assert_eq!(
             gpu.create_graphics_pipeline(graphics_desc(vs, Some(fs))),
             Err(RenderError::Unsupported(SUBGROUP_SIZE)),
@@ -1768,6 +1785,209 @@ fn requirements_come_after_the_ids_and_before_the_layout() {
             gpu.create_graphics_pipeline(graphics_desc(bare, Some(fs))),
             Err(RenderError::Unsupported(SUBGROUP_SIZE)),
             "alone"
+        );
+    });
+}
+
+/// The cross-check of each interface against its module (module docs, "The interface and the
+/// module"), with no GPU: one case per rule, each refusal with its exact error, the accepted
+/// side of each beside it, and the two faults of one shader at once (the rows first).
+#[test]
+fn the_interface_and_module_must_agree() {
+    let ok = Ok(());
+    let invalid = |m| Err(RenderError::Invalid(m));
+    let check = |source: &str, interface: ShaderInterface| {
+        let rec = ShaderRec::new(shader_desc(
+            ShaderStage::Fragment,
+            "main",
+            wgsl(source),
+            interface,
+        ))
+        .expect("the shader is accepted");
+        check_interfaces([&rec])
+    };
+    let arrayed = |n| {
+        let mut interface = rows(&[(0, texture(true)), (1, SAMPLER)]);
+        interface.resources[0].count = NonZeroU32::new(n);
+        interface
+    };
+    // The module's array of 4 against the interface's counts: 4 (the edge), 3 and 5 on either
+    // side, and a lone resource.
+    assert_eq!(check(BINDING_ARRAY, arrayed(4)), ok);
+    assert_eq!(check(BINDING_ARRAY, arrayed(3)), invalid(ARRAY_COUNT_MISMATCH));
+    assert_eq!(check(BINDING_ARRAY, arrayed(5)), invalid(ARRAY_COUNT_MISMATCH));
+    assert_eq!(
+        check(BINDING_ARRAY, rows(&[(0, texture(true)), (1, SAMPLER)])),
+        invalid(ARRAY_COUNT_MISMATCH),
+        "an array the interface calls one resource"
+    );
+    // A lone resource the interface calls an array.
+    let mut lone = rows(&[(0, UNIFORM), (1, texture(true)), (2, SAMPLER)]);
+    assert_eq!(check(FRAGMENT, lone.clone()), ok);
+    lone.resources[1].count = NonZeroU32::new(2);
+    assert_eq!(check(FRAGMENT, lone), invalid(ARRAY_COUNT_MISMATCH));
+    // A row the module does not bind is not compared, count or none.
+    let mut extra = rows(&[(0, UNIFORM), (1, texture(true)), (2, SAMPLER), (3, SAMPLER)]);
+    extra.resources[3].count = NonZeroU32::new(2);
+    assert_eq!(check(FRAGMENT, extra), ok);
+    // A binding array whose size is not a constant: the interface cannot describe it.
+    let runtime_sized = "
+        enable wgpu_binding_array;
+        struct B { d: array<u32> }
+        @group(0) @binding(0) var<storage> bufs: binding_array<B>;
+        @fragment fn main() -> @location(0) vec4<f32> {
+            return vec4(f32(arrayLength(&bufs[0].d)));
+        }";
+    let storage = ResourceKind::StorageBuffer { writable: false };
+    for count in [None, NonZeroU32::new(1)] {
+        let mut i = rows(&[(0, storage)]);
+        i.resources[0].count = count;
+        assert_eq!(
+            check(runtime_sized, i),
+            Err(RenderError::Unsupported(UNSIZED_BINDING_ARRAY)),
+            "{count:?}"
+        );
+    }
+    // Subgroups: a module that uses them must declare them; one that does not may.
+    assert_eq!(check(SUBGROUP_FRAGMENT, storage_out()), invalid(UNDECLARED_SUBGROUPS));
+    assert_eq!(check(SUBGROUP_FRAGMENT, subgroups(storage_out())), ok);
+    let plain = rows(&[(0, UNIFORM), (1, texture(true)), (2, SAMPLER)]);
+    assert_eq!(check(FRAGMENT, subgroups(plain.clone())), ok);
+    assert_eq!(check(FRAGMENT, plain), ok);
+    // A quad operation alone is no subgroup use to the scan, so an interface without the
+    // requirement agrees; one with it is honoured as declared (module docs).
+    let quad = "
+        @group(0) @binding(0) var<storage, read_write> out: array<u32>;
+        @compute @workgroup_size(32) fn main(@builtin(local_invocation_index) l: u32) {
+            out[l] = quadBroadcast(l, 1u);
+        }";
+    let quad_rec = |interface| {
+        ShaderRec::new(shader_desc(ShaderStage::Compute, "main", wgsl(quad), interface))
+            .expect("accepted")
+    };
+    let undeclared = quad_rec(storage_out());
+    let declared = quad_rec(subgroups(storage_out()));
+    assert_eq!(check_interfaces([&undeclared]), ok);
+    assert_eq!(check_interfaces([&declared]), ok);
+    let unmet = verdict(false, true);
+    assert_eq!(check_requirements([&undeclared], unmet), ok);
+    assert_eq!(
+        check_requirements([&declared], unmet),
+        Err(RenderError::Unsupported(SUBGROUP_SIZE)),
+        "the declared requirement is honoured"
+    );
+    // Both faults in one shader: a row's count, then subgroups.
+    let subgroup_array = "
+        enable wgpu_binding_array;
+        @group(0) @binding(0) var textures: binding_array<texture_2d<f32>, 4>;
+        @group(0) @binding(1) var s: sampler;
+        @fragment fn main(@builtin(subgroup_invocation_id) lane: u32) -> @location(0) vec4<f32> {
+            return textureSample(textures[lane % 4u], s, vec2(0.5));
+        }";
+    assert_eq!(
+        check(subgroup_array, rows(&[(0, texture(true)), (1, SAMPLER)])),
+        invalid(ARRAY_COUNT_MISMATCH),
+        "both faults: the rows first"
+    );
+    assert_eq!(
+        check(subgroup_array, arrayed(4)),
+        invalid(UNDECLARED_SUBGROUPS),
+        "the subgroups alone"
+    );
+    assert_eq!(check(subgroup_array, subgroups(arrayed(4))), ok);
+    // Rows in table order: two mismatched rows, the unsized one first in the table, then last.
+    let two_faults = "
+        enable wgpu_binding_array;
+        struct B { d: array<u32> }
+        @group(0) @binding(0) var<storage> bufs: binding_array<B>;
+        @group(0) @binding(1) var textures: binding_array<texture_2d<f32>, 4>;
+        @fragment fn main() -> @location(0) vec4<f32> {
+            return vec4(f32(arrayLength(&bufs[0].d))) + textureLoad(textures[0], vec2(0), 0);
+        }";
+    let forward = rows(&[(0, storage), (1, texture(true))]);
+    let mut backward = forward.clone();
+    backward.resources.reverse();
+    assert_eq!(
+        check(two_faults, forward),
+        Err(RenderError::Unsupported(UNSIZED_BINDING_ARRAY))
+    );
+    assert_eq!(check(two_faults, backward), invalid(ARRAY_COUNT_MISMATCH));
+}
+
+/// Shaders are cross-checked in the order given (stage order for a pipeline): of two shaders
+/// with different faults, the first's is reported, whichever it is.
+#[test]
+fn the_first_shader_that_disagrees_is_reported() {
+    let rec = |stage, source, interface| {
+        ShaderRec::new(shader_desc(stage, "main", wgsl(source), interface)).expect("accepted")
+    };
+    let vertex_ballot = rec(
+        ShaderStage::Vertex,
+        VERTEX_BALLOT,
+        ShaderInterface::default(),
+    );
+    let lone_array = rec(
+        ShaderStage::Fragment,
+        BINDING_ARRAY,
+        rows(&[(0, texture(true)), (1, SAMPLER)]),
+    );
+    assert_eq!(
+        check_interfaces([&vertex_ballot, &lone_array]),
+        Err(RenderError::Invalid(UNDECLARED_SUBGROUPS))
+    );
+    assert_eq!(
+        check_interfaces([&lone_array, &vertex_ballot]),
+        Err(RenderError::Invalid(ARRAY_COUNT_MISMATCH))
+    );
+}
+
+/// Check 5 of the module docs' order on a device: after the ids (check 4) and before the
+/// requirements (check 6), with two faults at once each way. The backend is told its device
+/// cannot promise subgroups of 32, so the requirement fails on every device.
+#[test]
+fn the_interface_check_comes_after_the_ids_and_before_the_requirements() {
+    bounded(|| {
+        let Some(mut gpu) = gpu(
+            "interface order",
+            Arc::new(ThreadPool),
+            WhileCompiling::Wait,
+        ) else {
+            return;
+        };
+        gpu.set_subgroup_support(SubgroupSupport::Range { min: 4, max: 64 });
+        let bare = bare_vertex(&gpu);
+        // Uses subgroups without declaring them: refused by the cross-check before the size.
+        let undeclared = fragment(&gpu, SUBGROUP_FRAGMENT, storage_out());
+        assert_eq!(
+            gpu.create_graphics_pipeline(graphics_desc(bare, Some(undeclared))),
+            Err(RenderError::Invalid(UNDECLARED_SUBGROUPS)),
+            "the interface before the requirements"
+        );
+        assert_eq!(
+            gpu.create_graphics_pipeline(graphics_desc(undeclared, Some(undeclared))),
+            Err(RenderError::Invalid(
+                "a pipeline's vertex shader is not a vertex shader"
+            )),
+            "the stages before the interface"
+        );
+        let declared = fragment(&gpu, SUBGROUP_FRAGMENT, subgroups(storage_out()));
+        assert_eq!(
+            gpu.create_graphics_pipeline(graphics_desc(bare, Some(declared))),
+            Err(RenderError::Unsupported(SUBGROUP_SIZE)),
+            "the declared requirement, refused for the size"
+        );
+        let cs = gpu
+            .create_shader(shader_desc(
+                ShaderStage::Compute,
+                "main",
+                wgsl(BALLOT),
+                storage_out(),
+            ))
+            .expect("the shader itself is accepted");
+        assert_eq!(
+            gpu.create_compute_pipeline(ComputePipelineDesc { shader: cs }),
+            Err(RenderError::Invalid(UNDECLARED_SUBGROUPS)),
+            "a compute pipeline too"
         );
     });
 }

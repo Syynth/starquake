@@ -96,7 +96,8 @@ pub use recording::slots::Slots;
 pub use recording::{FrameDump, RecordingBackend};
 pub use resource::{BufferDesc, BufferUsage, SamplerDesc, TextureDesc, TextureUsage, ViewDesc};
 pub use shader::{
-    ResourceBinding, ShaderDesc, ShaderInterface, ShaderOrigin, ShaderSource, ShaderStage,
+    ResourceBinding, ShaderDesc, ShaderInterface, ShaderOrigin, ShaderRequirements, ShaderSource,
+    ShaderStage,
 };
 pub use wake::{CompletionWake, WakeContractError, WakeCounter, check_completion_wake};
 pub use window::{WindowHandles, WindowSize, WindowSource};

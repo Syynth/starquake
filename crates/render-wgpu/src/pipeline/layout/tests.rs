@@ -1,5 +1,6 @@
 use super::*;
-use crate::pipeline::scan::{BindingFacts, scan};
+use crate::pipeline::agreement;
+use crate::pipeline::scan::{ArrayCount, BindingFacts, scan};
 use starquake_render::PixelFormat;
 use starquake_render::resource::ViewDimension;
 use starquake_render::shader::ResourceBinding;
@@ -10,6 +11,15 @@ fn row(group: u32, binding: u32, kind: ResourceKind) -> ResourceBinding {
         group,
         binding,
         kind,
+        count: None,
+    }
+}
+
+/// A row for a binding array of `count`.
+fn arrayed(group: u32, binding: u32, kind: ResourceKind, count: u32) -> ResourceBinding {
+    ResourceBinding {
+        count: Some(n(count)),
+        ..row(group, binding, kind)
     }
 }
 
@@ -260,38 +270,33 @@ fn bindings_wgpu_cannot_make_are_refused() {
     }
 }
 
+/// Each entry's count is its row's: the plan reads no count from the module, so module facts
+/// that say otherwise (checked earlier, by `crate::pipeline::agreement`) change nothing here.
 #[test]
-fn binding_arrays_get_their_size_and_unsized_ones_are_refused() {
-    let i = interface(vec![row(0, 0, TEX2D), row(0, 1, TEX2D)]);
-    let f = facts(&[
+fn binding_arrays_get_their_size_from_the_interface() {
+    let i = interface(vec![arrayed(0, 0, TEX2D, 4), row(0, 1, TEX2D)]);
+    let agreeing = facts(&[
         ((0, 0), ArrayCount::Sized(n(4)), false),
         ((0, 1), ArrayCount::Single, false),
     ]);
-    let stage = Stage {
-        visibility: S::FRAGMENT,
-        interface: &i,
-        facts: &f,
-    };
-    let plan = plan(&[stage]).expect("accepted");
-    assert_eq!(plan.groups[0][0].count, Some(n(4)));
-    assert_eq!(plan.groups[0][1].count, None);
-
-    let unsized_ = facts(&[((0, 1), ArrayCount::Unsized, false)]);
-    assert_eq!(
-        super::plan(&[Stage {
-            facts: &unsized_,
-            ..stage
-        }]),
-        Err(RenderError::Unsupported(UNSIZED_BINDING_ARRAY))
-    );
-    // A row the module does not declare is a single binding.
-    let none = ModuleFacts::default();
-    let plan = super::plan(&[Stage {
-        facts: &none,
-        ..stage
-    }])
-    .expect("accepted");
-    assert_eq!(plan.groups[0][0].count, None);
+    let other = facts(&[
+        ((0, 0), ArrayCount::Single, false),
+        ((0, 1), ArrayCount::Sized(n(3)), false),
+    ]);
+    for (what, f) in [
+        ("facts that agree", &agreeing),
+        ("facts that do not", &other),
+        ("no facts", &ModuleFacts::default()),
+    ] {
+        let plan = plan(&[Stage {
+            visibility: S::FRAGMENT,
+            interface: &i,
+            facts: f,
+        }])
+        .expect("accepted");
+        let counts: Vec<_> = plan.groups[0].iter().map(|e| e.count).collect();
+        assert_eq!(counts, [Some(n(4)), None], "{what}");
+    }
 }
 
 #[test]
@@ -354,12 +359,35 @@ fn stages_that_disagree_are_refused() {
         ])
     };
     assert_eq!(stages(&b, &none), Err(RenderError::Invalid(STAGE_CONFLICT)));
-    let arrayed = facts(&[((0, 0), ArrayCount::Sized(n(2)), false)]);
+    let two = interface(vec![arrayed(0, 0, TEX2D, 2)]);
+    let three = interface(vec![arrayed(0, 0, TEX2D, 3)]);
     assert_eq!(
-        stages(&a, &arrayed),
+        stages(&two, &none),
         Err(RenderError::Invalid(STAGE_CONFLICT)),
-        "same kind, different array size"
+        "same kind, an array against a lone resource"
     );
+    let arrays = |first: &ShaderInterface, second: &ShaderInterface| {
+        plan(&[
+            Stage {
+                visibility: S::VERTEX,
+                interface: first,
+                facts: &none,
+            },
+            Stage {
+                visibility: S::FRAGMENT,
+                interface: second,
+                facts: &none,
+            },
+        ])
+    };
+    assert_eq!(
+        arrays(&two, &three),
+        Err(RenderError::Invalid(STAGE_CONFLICT)),
+        "same kind, different array sizes"
+    );
+    let merged = arrays(&two, &two).expect("the same array twice");
+    assert_eq!(merged.groups[0][0].count, Some(n(2)));
+    assert_eq!(merged.groups[0][0].visibility, S::VERTEX | S::FRAGMENT);
     assert!(stages(&a, &none).is_ok(), "the same row twice");
 }
 
@@ -399,44 +427,56 @@ fn a_storage_texture_is_write_only_only_when_every_stage_only_writes() {
     assert_eq!(access(&rw, &rw), wgpu::StorageTextureAccess::ReadWrite);
 }
 
+/// A conflict between stages is refused as the rows are merged, so it wins over a row whose
+/// binding type wgpu cannot make, even one earlier in stage and table order; and binding types
+/// are made in group and binding order, so of two such rows the one at the lower slot is
+/// refused, whatever the table order (`plan`'s docs).
 #[test]
-fn the_first_refusal_in_stage_and_table_order_wins() {
-    // Stage one has an unsized array; stage two conflicts with stage one. The array is found
-    // first.
-    let a = interface(vec![row(0, 0, TEX2D), row(0, 1, TEX2D)]);
-    let unsized_ = facts(&[((0, 1), ArrayCount::Unsized, false)]);
-    let b = interface(vec![row(0, 0, ResourceKind::UniformBuffer)]);
+fn conflicts_come_first_then_binding_types_in_slot_order() {
+    let one_d = ResourceKind::SampledTexture {
+        dimension: ViewDimension::D1Array,
+        sample: SampleKind::Float { filterable: true },
+        multisampled: false,
+    };
+    let bad_storage = ResourceKind::StorageTexture {
+        dimension: ViewDimension::D2,
+        format: PixelFormat::R5G6B5Unorm,
+        writable: false,
+    };
     let none = ModuleFacts::default();
+    let first = interface(vec![row(0, 0, one_d), row(0, 1, TEX2D)]);
+    let second = interface(vec![row(0, 1, ResourceKind::UniformBuffer)]);
     assert_eq!(
         plan(&[
             Stage {
                 visibility: S::VERTEX,
-                interface: &a,
-                facts: &unsized_,
-            },
-            Stage {
-                visibility: S::FRAGMENT,
-                interface: &b,
-                facts: &none,
-            },
-        ]),
-        Err(RenderError::Unsupported(UNSIZED_BINDING_ARRAY))
-    );
-    // Swapped: the conflict is found while the second stage is merged, before the array row.
-    assert_eq!(
-        plan(&[
-            Stage {
-                visibility: S::FRAGMENT,
-                interface: &b,
+                interface: &first,
                 facts: &none,
             },
             Stage {
-                visibility: S::VERTEX,
-                interface: &a,
-                facts: &unsized_,
+                visibility: S::FRAGMENT,
+                interface: &second,
+                facts: &none,
             },
         ]),
         Err(RenderError::Invalid(STAGE_CONFLICT))
+    );
+    let one_stage = |rows| {
+        let i = interface(rows);
+        plan(&[Stage {
+            visibility: S::COMPUTE,
+            interface: &i,
+            facts: &none,
+        }])
+    };
+    let refused = |m| Err(RenderError::Unsupported(m));
+    assert_eq!(
+        one_stage(vec![row(0, 1, bad_storage), row(0, 0, one_d)]),
+        refused(ONE_D_ARRAY)
+    );
+    assert_eq!(
+        one_stage(vec![row(0, 1, one_d), row(0, 0, bad_storage)]),
+        refused(STORAGE_FORMAT)
     );
 }
 
@@ -592,8 +632,9 @@ fn only_filtering_samplers_at_the_slots_change() {
     );
 }
 
-/// The scan and the plan together, on a hand-written module with a binding array: the plan's
-/// count is the module's size.
+/// The scan as the cross-check, on a hand-written module with a binding array: an interface
+/// that says what the module declares agrees with the scan's facts and its count reaches the
+/// layout; one that leaves the count out does not agree (`crate::pipeline::agreement`).
 #[test]
 fn a_module_s_binding_array_reaches_the_layout() {
     let module = naga::front::wgsl::parse_str(
@@ -607,9 +648,10 @@ fn a_module_s_binding_array_reaches_the_layout() {
     .expect("parses");
     let f = scan(&module);
     let i = interface(vec![
-        row(0, 0, TEX2D),
+        arrayed(0, 0, TEX2D, 4),
         row(0, 1, ResourceKind::Sampler { comparison: false }),
     ]);
+    assert_eq!(agreement(&i, &f), Ok(()));
     let plan = plan(&[Stage {
         visibility: S::FRAGMENT,
         interface: &i,
@@ -618,4 +660,12 @@ fn a_module_s_binding_array_reaches_the_layout() {
     .expect("accepted");
     assert_eq!(plan.groups[0][0].count, Some(n(4)));
     assert_eq!(plan.groups[0][1].count, None);
+    let lone = interface(vec![
+        row(0, 0, TEX2D),
+        row(0, 1, ResourceKind::Sampler { comparison: false }),
+    ]);
+    assert_eq!(
+        agreement(&lone, &f),
+        Err(RenderError::Invalid(crate::pipeline::ARRAY_COUNT_MISMATCH))
+    );
 }

@@ -5,7 +5,7 @@ expression: rig.submit()
 create t0: texture D2 D32_FLOAT_S8_UINT 8x6x1, 1 mips, 1 samples, usage SAMPLED|RENDER_TARGET|COPY_SRC|COPY_DST
 create v0: view of t0 as D32_FLOAT_S8_UINT D2, mips 0+1, layers 0+1, swizzle RGBA
 create sh0: shader vertex "vs_main", naga module (0 functions, 5 entry points), resources [], inputs [], outputs []
-create sh1: shader fragment "fs_depth", naga module (0 functions, 5 entry points), resources [ResourceBinding { group: 0, binding: 0, kind: UniformBuffer }], inputs [], outputs []
+create sh1: shader fragment "fs_depth", naga module (0 functions, 5 entry points), resources [ResourceBinding { group: 0, binding: 0, kind: UniformBuffer, count: None }], inputs [], outputs []
 create p0: graphics pipeline vertex sh0, fragment sh1, Triangles, restart false, vertex input VertexLayout { buffers: [], attributes: [] }, raster RasterState { cull: None, front_face: Ccw, polygon_mode: Fill, depth_clamp: false, depth_bias: DepthBias { constant: 0.0, slope_scale: 0.0, clamp: 0.0 }, line_width: 1.0 }, depth/stencil DepthStencilState { depth_test: Some(Always), depth_write: true, stencil: Some(StencilState { front: StencilFace { compare: Always, fail: Keep, depth_fail: Keep, pass: Replace }, back: StencilFace { compare: Always, fail: Keep, depth_fail: Keep, pass: Replace }, read_mask: 255, write_mask: 15 }) }, colour [], depth/stencil target D32_FLOAT_S8_UINT, 1 samples, logic op None, emulation none
 create b0: buffer 16 bytes, usage UNIFORM|COPY_DST
 submit fence 1:

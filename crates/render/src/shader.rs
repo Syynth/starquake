@@ -7,6 +7,12 @@
 //! module; this crate never assigns them. SPIR-V and MSL serve a later direct backend, captures
 //! and experiments.
 //!
+//! The interface also carries what the backend would otherwise read from the module: the
+//! shader's [`ShaderRequirements`] and each binding's array count ([`ResourceBinding::count`]),
+//! so a backend builds its layouts and checks its requirements from the interface alone
+//! (render-backend, "Shader emission"; shader-pipeline, "What the render backend (#14) gets";
+//! decided by the owner, 2026-11-19, ruling 20).
+//!
 //! A shader may carry its [`ShaderOrigin`]: the inputs the shader crate translated it from, which
 //! a render capture stores so that a replay can translate it again (render-backend, "Render
 //! capture v2", "Shaders"; the owner's decision 15 of 2026-11-18). Backends ignore it.
@@ -14,6 +20,7 @@
 use crate::format::PixelFormat;
 use crate::resource::ViewDimension;
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 /// A shader stage.
@@ -158,6 +165,23 @@ pub struct ResourceBinding {
     pub binding: u32,
     /// What is bound there.
     pub kind: ResourceKind,
+    /// How many resources of `kind` the binding holds: `None` for one, `Some(n)` for a binding
+    /// array of `n` (a layout entry's count; render-backend, "Shader emission"). A binding array
+    /// whose size is not a constant has no count, so an interface cannot describe one.
+    pub count: Option<NonZeroU32>,
+}
+
+/// Device features a shader needs beyond the baseline: the render crate's form of the shader
+/// crate's `Requirements`, which the GPU crate copies field by field (shader-pipeline, "What the
+/// render backend (#14) gets": `requirements`). A backend honours each one or refuses the
+/// pipeline.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ShaderRequirements {
+    /// The shader uses subgroup operations or built-ins (naga's `Capabilities::SUBGROUP`), and
+    /// so needs subgroups 32 invocations wide, the guest's warp (shader-pipeline, "Compute
+    /// shaders": every stage that uses subgroup operations "records 'needs subgroup size 32'
+    /// in its requirements").
+    pub subgroup: bool,
 }
 
 /// The backend-neutral tables of a shader's resources, inputs and outputs, from which a backend
@@ -170,6 +194,8 @@ pub struct ShaderInterface {
     pub inputs: Vec<InterfaceVariable>,
     /// Stage outputs, each at a distinct location.
     pub outputs: Vec<InterfaceVariable>,
+    /// What the device must support to run the shader.
+    pub requirements: ShaderRequirements,
 }
 
 /// Where a shader came from: the shader crate's encoded capture record of the shader entry

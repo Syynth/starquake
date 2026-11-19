@@ -36,7 +36,14 @@
 //! that a writer can encode a call's input before the call consumes it. The bytes of every record
 //! kind are pinned by `capture::tests::golden`; any change to them, or to the field order or
 //! types of anything a record holds ([`Caps`](crate::Caps), the descriptions, [`Command`](crate::Command)), needs a new
-//! [`VERSION`] in the same change.
+//! [`VERSION`] in the same change, once a version has shipped.
+//!
+//! Version 2 has not shipped: nothing writes a capture outside tests until the wiring slice
+//! (R11c) lands. So a `CreateShader` record's interface gained each binding's array count and the
+//! shader's requirements ([`crate::shader::ResourceBinding::count`],
+//! [`crate::shader::ShaderRequirements`]; the owner's ruling 20 of 2026-11-19) without a new
+//! version: the version stays 2, and the golden bytes pin the new layout
+//! (`capture::tests::golden`). The rule above applies from the first build that writes captures.
 //!
 //! # What a capture holds
 //!

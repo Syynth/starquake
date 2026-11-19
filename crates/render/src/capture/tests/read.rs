@@ -328,6 +328,39 @@ fn an_unknown_tag_is_refused() {
     );
 }
 
+/// A binding's array count is a `NonZeroU32`: a `CreateShader` whose row says `Some(0)` does not
+/// decode, and the same body with `Some(1)` reads (the pair differs in that byte only).
+#[test]
+fn a_zero_binding_array_count_does_not_decode() {
+    let shader = |count: u8| {
+        framed(
+            RecordKind::CreateShader.tag(),
+            &[
+                0x05, 0x01, b'm', // compute, entry "m"
+                0x01, 0x00, 0x00, 0x00, // one uniform buffer at group 0, binding 0
+                0x01, count, // its array count, `Some(count)`
+                0x00, 0x00, 0x00, // no inputs, no outputs, no requirements
+                0x03, 0x00, 0x01, 0x00, // no origin; made shader 1, generation 0
+            ],
+        )
+    };
+    let records = read(&file(&[&shader(1)])).expect("a count of one reads");
+    let Record::CreateShader(made) = &records[1] else {
+        panic!("not a shader: {:?}", records[1]);
+    };
+    assert_eq!(
+        made.interface.resources[0].count,
+        std::num::NonZeroU32::new(1)
+    );
+    assert_eq!(
+        read(&file(&[&shader(0)])),
+        Err(CaptureError::Decode {
+            record: 1,
+            source: postcard::Error::SerdeDeCustom
+        })
+    );
+}
+
 #[test]
 fn a_body_that_does_not_decode_is_refused() {
     // A buffer size whose varint runs past the body.
