@@ -102,8 +102,9 @@
 //!   geometry stage gets the empty mask. A **guess** until those stages are translated.
 //!   `tests::previous_stage_stores_follow_the_request_order`.
 //! - **Learned from a first lookup's ready set only**, as the swizzles are: a set first given
-//!   by a wait is drawn with the stores its key carried (none for a set never seen, so the pixel
-//!   stage declares no generic inputs), and the next draw looks it up with the learned ones.
+//!   by a wait is drawn with the stores its key carried (none for a set never seen; Eden's
+//!   SPIR-V backend declares no generic input the previous stage does not store), and the next
+//!   draw looks it up with the learned ones.
 //!   `tests::stores_are_not_learned_from_a_waited_set`.
 //!
 //! The texture swizzles go in only when `Caps::view_swizzle` is false, keyed by binding order,

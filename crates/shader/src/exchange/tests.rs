@@ -422,6 +422,19 @@ impl EngineState for OneHeader {
     }
 }
 
+/// Engine state that answers every handle with one fixed kind.
+struct OtherKind(TextureKind);
+
+impl EngineState for OtherKind {
+    fn cbuf_word(&self, _: GuestStage, _: u8, _: u32) -> Option<u32> {
+        None
+    }
+
+    fn texture_kind(&self, _: GuestStage, _: u32) -> Option<TextureKind> {
+        Some(self.0)
+    }
+}
+
 /// Two format words with distinct non-zero bits in every format field (the components and the
 /// four data types), so a field that is dropped still differs.
 const FORMAT_A: u32 = 0x0004_6888;
@@ -452,15 +465,6 @@ fn a_format_change_keeps_a_sampled_answer() {
         depth: !kind_for(HANDLE).depth,
         ..kind_for(HANDLE)
     };
-    struct OtherKind(TextureKind);
-    impl EngineState for OtherKind {
-        fn cbuf_word(&self, _: GuestStage, _: u8, _: u32) -> Option<u32> {
-            None
-        }
-        fn texture_kind(&self, _: GuestStage, _: u32) -> Option<TextureKind> {
-            Some(self.0)
-        }
-    }
     assert_ne!(a.answers.reanswer(STAGE, &OtherKind(other)), a.answers);
 }
 
