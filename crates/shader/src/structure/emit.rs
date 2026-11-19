@@ -10,17 +10,13 @@
 //! (Eden's continue block).
 
 use super::tree::{Expr, ExprId, Id, Kind, ROOT, Tree};
-use super::{StructureError, nests};
-use crate::ir::{BlockId, Builder, Function, Imm, Node, Opcode, Operand};
+use super::{Invariant, StructureError};
+use crate::ir::{BlockId, Builder, Function, Imm, MAX_NESTING, Node, Opcode, Operand};
 
 /// Emits the tree into `function` and returns the structured tree's nodes.
 pub(super) fn emit(tree: &mut Tree, function: &mut Function) -> Result<Vec<Node>, StructureError> {
     let mut emitter = Emitter { tree, function };
-    let mut list = List {
-        nodes: Vec::new(),
-        glue: None,
-        open: false,
-    };
+    let mut list = List::new();
     // Eden puts `Prologue` at the start of the first block it makes, which holds the goto
     // variables' first resets.
     emitter.glue_op(&mut list, Opcode::Prologue, &[])?;
@@ -41,6 +37,18 @@ struct List {
     open: bool,
 }
 
+impl List {
+    /// An empty list, with no glue block open and nothing to fall off the end of yet.
+    const fn new() -> Self {
+        Self {
+            nodes: Vec::new(),
+            glue: None,
+            open: false,
+        }
+    }
+}
+
+/// The tree being emitted and the function it is emitted into.
 struct Emitter<'a> {
     tree: &'a mut Tree,
     function: &'a mut Function,
@@ -54,7 +62,7 @@ impl Emitter<'_> {
             self.tree.charge()?;
             match self.tree.kind(id)? {
                 Kind::Root | Kind::Goto { .. } => {
-                    return Err(StructureError::Internal(super::Invariant::Kind));
+                    return Err(StructureError::Internal(Invariant::Kind));
                 }
                 Kind::Label(_) => {}
                 Kind::Code(block) => {
@@ -72,22 +80,15 @@ impl Emitter<'_> {
                 }
                 Kind::If { cond } => {
                     let cond = self.condition_ref(list, cond)?;
-                    let body = self.body(id, depth)?;
+                    let body = self.body(id, depth)?.nodes;
                     list.glue = None;
                     list.nodes.push(Node::If { cond, body });
                     list.open = true;
                 }
                 Kind::Loop { cond } => {
-                    let inner = self.inner(depth)?;
-                    let mut body = List {
-                        nodes: Vec::new(),
-                        glue: None,
-                        open: false,
-                    };
-                    self.list(id, inner, &mut body)?;
                     // The repeat condition goes in a block of its own at the end of the body
                     // (Eden's continue block).
-                    body.glue = None;
+                    let mut body = self.body(id, depth)?;
                     let repeat = self.condition_ref(&mut body, cond)?;
                     list.glue = None;
                     list.nodes.push(Node::Loop {
@@ -119,24 +120,19 @@ impl Emitter<'_> {
         Ok(())
     }
 
-    /// The nesting level of a body inside a list at `depth`, if it is allowed.
-    fn inner(&self, depth: usize) -> Result<usize, StructureError> {
-        depth
+    /// The body of `parent`, an `if` or loop in a list at `depth`: its nesting level is checked
+    /// against [`MAX_NESTING`] before it is emitted, so the recursion is bounded.
+    fn body(&mut self, parent: Id, depth: usize) -> Result<List, StructureError> {
+        let inner = depth
             .checked_add(1)
-            .filter(|&inner| nests(inner))
-            .ok_or(StructureError::TooDeep)
-    }
-
-    /// The nodes of the body of `parent`, inside a list at `depth`.
-    fn body(&mut self, parent: Id, depth: usize) -> Result<Vec<Node>, StructureError> {
-        let inner = self.inner(depth)?;
-        let mut body = List {
-            nodes: Vec::new(),
-            glue: None,
-            open: false,
-        };
+            .filter(|&inner| inner <= MAX_NESTING)
+            .ok_or(StructureError::TooDeep)?;
+        let mut body = List::new();
         self.list(parent, inner, &mut body)?;
-        Ok(body.nodes)
+        // Whatever follows the body's last statement (a loop's repeat condition) goes in a new
+        // block.
+        body.glue = None;
+        Ok(body)
     }
 
     /// `ConditionRef` of the condition `cond`, in the list's glue block (Eden wraps the
@@ -164,8 +160,11 @@ impl Emitter<'_> {
                 Step::Visit(id) => match self.tree.expr_of(id)? {
                     Expr::Operand(operand) => values.push(operand),
                     Expr::Variable(label) => {
-                        let value =
-                            self.glue_op(list, Opcode::GetGotoVariable, &[Operand::Imm(Imm::U32(label))])?;
+                        let value = self.glue_op(
+                            list,
+                            Opcode::GetGotoVariable,
+                            &[Operand::Imm(Imm::U32(label))],
+                        )?;
                         values.push(value);
                     }
                     Expr::Not(operand) => {
@@ -195,7 +194,7 @@ impl Emitter<'_> {
         if values.is_empty() {
             Ok(value)
         } else {
-            Err(StructureError::Internal(super::Invariant::Kind))
+            Err(StructureError::Internal(Invariant::Kind))
         }
     }
 
@@ -206,15 +205,14 @@ impl Emitter<'_> {
         opcode: Opcode,
         args: &[Operand],
     ) -> Result<Operand, StructureError> {
-        let block = match list.glue {
-            Some(block) => block,
-            None => {
-                let block = self.function.add_block()?;
-                list.nodes.push(Node::Block(block));
-                list.glue = Some(block);
-                list.open = true;
-                block
-            }
+        let block = if let Some(block) = list.glue {
+            block
+        } else {
+            let block = self.function.add_block()?;
+            list.nodes.push(Node::Block(block));
+            list.glue = Some(block);
+            list.open = true;
+            block
         };
         let value = Builder::new(self.function, block).op(opcode, args)?;
         Ok(Operand::Value(value))
@@ -225,5 +223,5 @@ impl Emitter<'_> {
 fn pop(values: &mut Vec<Operand>) -> Result<Operand, StructureError> {
     values
         .pop()
-        .ok_or(StructureError::Internal(super::Invariant::Kind))
+        .ok_or(StructureError::Internal(Invariant::Kind))
 }

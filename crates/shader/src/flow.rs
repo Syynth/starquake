@@ -31,7 +31,8 @@
 //! 5. **The IR's blocks** ([`FlowGraph::build_ir`]): one IR block per flow block, which the
 //!    translators fill from its instructions ([`IrBlocks::sources`]), and the tests that end
 //!    the blocks. Building the structured IR the translators fill is slice 11's (owner's
-//!    decision, 2026-11-18: "the IR build step in slices 10 (blocks) and 11").
+//!    decision, 2026-11-18: "the IR build step in slices 10 (blocks) and 11"):
+//!    [`IrBlocks::structure`] (`crate::structure`) keeps the sources.
 //!
 //! # Sources
 //!

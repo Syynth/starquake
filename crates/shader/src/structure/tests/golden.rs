@@ -12,7 +12,10 @@ fn check(graph: &str, golden: &str) -> crate::ir::Function {
     if std::env::var_os("STARQUAKE_BLESS").is_some() {
         println!("---- golden ----\n{text}---- end ----");
     }
-    assert_eq!(text, golden, "the structured text differs from its golden file");
+    assert_eq!(
+        text, golden,
+        "the structured text differs from its golden file"
+    );
     tree
 }
 

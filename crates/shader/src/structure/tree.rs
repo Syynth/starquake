@@ -9,6 +9,9 @@
 //! out of the tree stays in the arena, unlinked. Every step is charged to the work budget
 //! (parent module docs, "Limits").
 
+#[cfg(test)]
+mod tests;
+
 use super::{Invariant, StructureError};
 use crate::ir::{BlockId, Function, Imm, Operand, Terminator};
 
@@ -200,7 +203,10 @@ impl Tree {
                         })?;
                         tree.insert(ROOT, first, reset_front)?;
                         let value = tree.expr(Expr::Operand(cond))?;
-                        let set = tree.make(Kind::SetVariable { id: variable, value })?;
+                        let set = tree.make(Kind::SetVariable {
+                            id: variable,
+                            value,
+                        })?;
                         tree.insert(ROOT, ip, set)?;
                         tree.goto(ip, Expr::Variable(variable), label_of(then)?)?;
                         tree.goto(ip, always, label_of(otherwise)?)?;
@@ -415,16 +421,16 @@ impl Tree {
         self.insert(parent, Some(goto), set_var)?;
 
         let variable = self.expr(Expr::Variable(label_id))?;
-        let neg_cond = self.expr(Expr::Not(variable))?;
-        let if_stmt = self.make(Kind::If { cond: neg_cond })?;
+        let skip = self.expr(Expr::Not(variable))?;
+        let if_stmt = self.make(Kind::If { cond: skip })?;
         let start = self.stmt(goto)?.next;
         self.splice(if_stmt, start, None)?;
         self.insert(parent, Some(goto), if_stmt)?;
         self.unlink(goto)?;
 
-        let new_cond = self.expr(Expr::Variable(label_id))?;
+        let retest = self.expr(Expr::Variable(label_id))?;
         let new_goto = self.make(Kind::Goto {
-            cond: new_cond,
+            cond: retest,
             label,
         })?;
         let grandparent = self.parent(parent)?;
@@ -449,9 +455,9 @@ impl Tree {
         self.insert(parent, Some(goto), break_stmt)?;
         self.unlink(goto)?;
 
-        let new_cond = self.expr(Expr::Variable(label_id))?;
+        let retest = self.expr(Expr::Variable(label_id))?;
         let new_goto = self.make(Kind::Goto {
-            cond: new_cond,
+            cond: retest,
             label,
         })?;
         let grandparent = self.parent(parent)?;
@@ -677,12 +683,7 @@ impl Tree {
 
     /// Moves the siblings from `start` up to, not including, `end` (to the end of the list for
     /// `None`) to the end of `to`'s children (Eden's `splice` and `UpdateTreeUp`).
-    fn splice(
-        &mut self,
-        to: Id,
-        start: Option<Id>,
-        end: Option<Id>,
-    ) -> Result<(), StructureError> {
+    fn splice(&mut self, to: Id, start: Option<Id>, end: Option<Id>) -> Result<(), StructureError> {
         let mut current = start;
         while current != end {
             let Some(id) = current else {

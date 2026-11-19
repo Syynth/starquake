@@ -24,7 +24,7 @@ fn structured(text: &str) -> Structured {
 /// How a run ended, for comparing a graph's run with its structured form's: the sites of an
 /// error differ between the forms, so only its kind is kept.
 #[derive(Debug, PartialEq, Eq)]
-enum Ending {
+pub(crate) enum Ending {
     /// The program returned.
     Returned,
     /// Control reached an `unreachable`.
@@ -45,7 +45,7 @@ fn ending(function: &Function, machine: &mut Machine) -> Ending {
 /// Runs `graph` and `tree` from `machine`'s state and checks they end the same way and leave
 /// the same state, except the goto variables, which only structuring adds. Returns the
 /// graph's ending and final state.
-fn same_run(graph: &Function, tree: &Function, machine: &Machine) -> (Ending, Machine) {
+pub(crate) fn same_run(graph: &Function, tree: &Function, machine: &Machine) -> (Ending, Machine) {
     let mut by_graph = machine.clone();
     let mut by_tree = machine.clone();
     let graph_ending = ending(graph, &mut by_graph);

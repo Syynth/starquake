@@ -42,7 +42,9 @@ pub struct BlockSource {
     pub flow: BlockIndex,
 }
 
-/// The IR's blocks for a flow graph: a control-flow graph whose blocks the translators fill.
+/// The IR's blocks for a flow graph: a control-flow graph whose blocks the translators fill,
+/// once [`IrBlocks::structure`] (slice 11, `crate::structure`) has structured it, keeping
+/// [`IrBlocks::sources`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IrBlocks {
     /// The function: every block terminated, the test blocks holding their tests and each

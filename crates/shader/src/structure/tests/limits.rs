@@ -22,13 +22,13 @@ fn depth(nodes: &[Node]) -> usize {
 /// branch becomes an `if` around the rest, so the tree nests `count - 2` levels deep (from two
 /// blocks on).
 fn skips(count: usize) -> Function {
-    let mut text = String::new();
+    let mut text = Vec::new();
     for index in 0..count {
-        text.push_str(&format!("block{index}:\n"));
+        text.push(format!("block{index}:\n"));
         if index + 1 == count {
-            text.push_str("    return\n");
+            text.push("    return\n".to_owned());
         } else {
-            text.push_str(&format!(
+            text.push(format!(
                 "    %{index} = SetRegister r{reg}, u32 {index}\n    %{cond} = GetPred p0\n    \
                  branch %{cond}, block{last}, block{next}\n",
                 reg = 1 + index % 8,
@@ -38,7 +38,7 @@ fn skips(count: usize) -> Function {
             ));
         }
     }
-    parse(&text)
+    parse(&text.concat())
 }
 
 #[test]
@@ -85,18 +85,18 @@ fn a_large_graph_stops_at_a_small_limit() {
 /// `count` diamonds one after another: each tests p0 and runs one of two arms, which join at
 /// the next diamond's test; the last join returns.
 fn diamonds(count: usize) -> Function {
-    let mut text = String::new();
+    let mut text = Vec::new();
     for index in 0..count {
-        let (test, then, otherwise, join) =
+        let (head, then, otherwise, join) =
             (3 * index, 3 * index + 1, 3 * index + 2, 3 * index + 3);
-        text.push_str(&format!(
-            "block{test}:\n    %{test} = GetPred p0\n    branch %{test}, block{then}, block{otherwise}\n\
+        text.push(format!(
+            "block{head}:\n    %{head} = GetPred p0\n    branch %{head}, block{then}, block{otherwise}\n\
              block{then}:\n    %{then} = SetRegister r1, u32 {index}\n    jump block{join}\n\
              block{otherwise}:\n    %{otherwise} = SetRegister r2, u32 {index}\n    jump block{join}\n"
         ));
     }
-    text.push_str(&format!("block{}:\n    return\n", 3 * count));
-    parse(&text)
+    text.push(format!("block{}:\n    return\n", 3 * count));
+    parse(&text.concat())
 }
 
 #[test]

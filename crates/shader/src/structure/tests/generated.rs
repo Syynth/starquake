@@ -44,7 +44,11 @@ enum End {
     /// A jump forward.
     Jump(usize),
     /// A branch to any block, else forward.
-    Branch { cond: Cond, then: usize, otherwise: usize },
+    Branch {
+        cond: Cond,
+        then: usize,
+        otherwise: usize,
+    },
 }
 
 /// A generated block.
