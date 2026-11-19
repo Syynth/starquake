@@ -739,8 +739,8 @@ impl<T: Translator> ShaderCache<T> {
                     if let Some(found) = self.program_entry(*hash) {
                         return found;
                     }
-                    // The program entries were flushed: the bytes are needed again.
-                    self.addresses.remove(request);
+                    // The program entries were flushed: the bytes are needed again, and the
+                    // capture replaces this entry.
                 }
             }
         }

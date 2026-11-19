@@ -35,6 +35,22 @@ fn a_range_ending_where_an_entry_starts_leaves_it_and_one_byte_more_drops_it() {
 }
 
 #[test]
+fn a_range_ending_where_an_entry_of_the_first_stage_starts_leaves_it() {
+    // The first stage in the map's key order sits exactly on the range's exclusive end.
+    let mut rig = Rig::new();
+    let request = ProgramRequest {
+        stage: GuestStage::VertexCullBeforeFetch,
+        address: A,
+    };
+    rig.place(A, request.stage, &small());
+    pending(rig.lookup(&[request]));
+    rig.cache.invalidate(A - 0x100..A);
+    assert_eq!(rig.cache.addresses.len(), 1);
+    rig.cache.invalidate(A - 0x100..A + 1);
+    assert_eq!(rig.cache.addresses.len(), 0);
+}
+
+#[test]
 fn a_range_starting_at_an_entrys_end_leaves_it_and_one_byte_earlier_drops_it() {
     let (mut rig, end) = rig_with_entry();
     rig.cache.invalidate(end..end + 0x100);
@@ -178,6 +194,39 @@ fn tracked_ranges_are_sorted_and_merged_and_include_refused_reads() {
             unreadable..unreadable + 17,
         ]
     );
+}
+
+#[test]
+fn a_tracked_range_keeps_the_end_of_an_entry_that_contains_a_shorter_one() {
+    let mut rig = Rig::new();
+    // A vertex program whose header starts with an `EXIT` word: captured as compute from the
+    // same address, it ends after 16 bytes, inside the vertex program's range.
+    let mut bytes = small();
+    bytes[..16].copy_from_slice(&exit().to_le_bytes());
+    rig.place(A, GuestStage::Vertex, &bytes);
+    rig.lookup(&[vertex(A)]);
+    rig.lookup(&[ProgramRequest {
+        stage: GuestStage::Compute,
+        address: A,
+    }]);
+    assert_eq!(rig.cache.addresses.len(), 2);
+    let ranges = rig.cache.tracked_ranges();
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(ranges.first(), Some(&(A..A + bytes.len() as u64)));
+}
+
+#[test]
+fn a_refused_read_at_a_huge_offset_reaches_at_most_the_longest_capture() {
+    let memory = Watched::default();
+    let reader = super::super::address::GuestReader::new(&memory, A);
+    let mut out = [0; 16];
+    assert_eq!(
+        reader.read(u64::MAX - 1, &mut out),
+        Err(Unreadable {
+            offset: u64::MAX - 1
+        })
+    );
+    assert_eq!(reader.end(), A + MAX_EXTENT);
 }
 
 /// Memory that reports an unmapped address outside the read it refuses.

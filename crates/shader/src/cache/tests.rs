@@ -719,7 +719,10 @@ fn questions_are_answered_for_the_requests_stage() {
         .insert(hash, vec![Question::CbufWord { bank: 2, offset: 4 }]);
     pending(rig.lookup(&[pixel(A)]));
     assert_eq!(
-        *rig.state.asked.lock().unwrap_or_else(PoisonError::into_inner),
+        *rig.state
+            .asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner),
         [(GuestStage::Pixel, 2, 4)]
     );
 }
@@ -804,7 +807,10 @@ fn a_wait_blocks_until_a_worker_posts() {
         thread::sleep(Duration::from_millis(50));
         executor.run_all();
     });
+    let started = std::time::Instant::now();
     assert_eq!(ready(rig.cache.wait_timeout(ticket, WATCHDOG)).len(), 1);
+    // Woken by the post, not by the deadline.
+    assert!(started.elapsed() < WATCHDOG / 2, "{:?}", started.elapsed());
     worker.join().expect("the worker ends");
 }
 
