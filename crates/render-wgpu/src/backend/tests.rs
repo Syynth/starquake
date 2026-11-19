@@ -1122,6 +1122,7 @@ fn what_the_backend_refuses() {
                 entry: "main".into(),
                 source: starquake_render::ShaderSource::SpirV(Vec::new()),
                 interface: starquake_render::ShaderInterface::default(),
+                origin: None,
             }),
             Err(RenderError::Unsupported(SHADERS_NOT_YET))
         ));

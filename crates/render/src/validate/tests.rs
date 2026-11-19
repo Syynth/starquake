@@ -932,6 +932,7 @@ fn shader(stage: ShaderStage, interface: ShaderInterface) -> ShaderDesc {
         entry: "main".to_owned(),
         source: ShaderSource::SpirV(vec![0x0723_0203]),
         interface,
+        origin: None,
     }
 }
 

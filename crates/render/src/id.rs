@@ -72,6 +72,44 @@ pub enum ResourceId {
     Pipeline(PipelineId),
 }
 
+impl ResourceId {
+    /// The kind of resource, in words ("buffer").
+    pub const fn kind_name(self) -> &'static str {
+        match self {
+            Self::Buffer(_) => "buffer",
+            Self::Texture(_) => "texture",
+            Self::View(_) => "view",
+            Self::Sampler(_) => "sampler",
+            Self::Shader(_) => "shader",
+            Self::Pipeline(_) => "pipeline",
+        }
+    }
+
+    /// The slot and generation of the id inside, whatever its kind.
+    pub const fn parts(self) -> (u32, u32) {
+        match self {
+            Self::Buffer(id) => (id.index(), id.generation()),
+            Self::Texture(id) => (id.index(), id.generation()),
+            Self::View(id) => (id.index(), id.generation()),
+            Self::Sampler(id) => (id.index(), id.generation()),
+            Self::Shader(id) => (id.index(), id.generation()),
+            Self::Pipeline(id) => (id.index(), id.generation()),
+        }
+    }
+}
+
+/// In plain words, as errors print it: "buffer 3 (generation 1)".
+impl std::fmt::Display for ResourceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (index, generation) = self.parts();
+        write!(
+            f,
+            "{} {index} (generation {generation})",
+            self.kind_name()
+        )
+    }
+}
+
 /// A point on the backend's one completion counter. A submitted list signals its value when the
 /// host GPU has finished it; [`crate::Backend::completed`] is the highest value reached.
 #[derive(
@@ -104,7 +142,28 @@ impl FenceValue {
 
 #[cfg(test)]
 mod tests {
-    use super::{BufferId, FenceValue, ReadbackId};
+    use super::{
+        BufferId, FenceValue, PipelineId, ReadbackId, ResourceId, SamplerId, ShaderId, TextureId,
+        ViewId,
+    };
+
+    #[test]
+    fn resource_ids_in_words() {
+        let cases = [
+            (ResourceId::Buffer(BufferId::new(1, 2)), "buffer 1 (generation 2)"),
+            (ResourceId::Texture(TextureId::new(3, 4)), "texture 3 (generation 4)"),
+            (ResourceId::View(ViewId::new(5, 6)), "view 5 (generation 6)"),
+            (ResourceId::Sampler(SamplerId::new(7, 8)), "sampler 7 (generation 8)"),
+            (ResourceId::Shader(ShaderId::new(9, 10)), "shader 9 (generation 10)"),
+            (
+                ResourceId::Pipeline(PipelineId::new(11, 12)),
+                "pipeline 11 (generation 12)",
+            ),
+        ];
+        for (id, words) in cases {
+            assert_eq!(id.to_string(), words);
+        }
+    }
 
     #[test]
     fn id_parts() {

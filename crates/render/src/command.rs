@@ -16,6 +16,15 @@
 //! Texture data in a staging slice, a buffer copy or a readback is tightly packed: rows of whole
 //! blocks with no padding, row after row, then slice or layer after slice
 //! ([`crate::validate::packed_size`]).
+//!
+//! Decoding a list caps the lists nested in a draw or dispatch ([`MAX_COMMAND_BINDINGS`] and the
+//! guest's own counts; `command/bounded.rs` has the table), so that a render capture cannot make
+//! one command allocate without bound. Encoding is unchanged by it.
+
+mod bounded;
+
+pub use bounded::MAX_COMMAND_BINDINGS;
+pub(crate) use bounded::{check_nested, decoded_bytes};
 
 use crate::caps::GUEST_COLOR_TARGETS;
 use crate::id::{BufferId, PipelineId, ReadbackId, SamplerId, TextureId, ViewId};
@@ -204,8 +213,10 @@ pub struct Viewport {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DynamicValues {
     /// Viewports, at least one.
+    #[serde(deserialize_with = "bounded::viewports")]
     pub viewports: Vec<Viewport>,
     /// Scissor rectangles, one per viewport or none.
+    #[serde(deserialize_with = "bounded::scissors")]
     pub scissors: Vec<Rect>,
     /// Blend constant colour.
     pub blend_constant: [f32; 4],
@@ -312,8 +323,10 @@ pub struct DrawDesc {
     /// The graphics pipeline.
     pub pipeline: PipelineId,
     /// Resources bound for the pipeline's shaders.
+    #[serde(deserialize_with = "bounded::bindings")]
     pub bindings: Vec<Binding>,
     /// Vertex buffers, by the pipeline's vertex buffer index.
+    #[serde(deserialize_with = "bounded::vertex_buffers")]
     pub vertex_buffers: Vec<BufferSlice>,
     /// Index buffer, for indexed draws.
     pub index_buffer: Option<IndexBufferBinding>,
@@ -350,6 +363,7 @@ pub struct DispatchDesc {
     /// The compute pipeline.
     pub pipeline: PipelineId,
     /// Resources bound for its shader.
+    #[serde(deserialize_with = "bounded::bindings")]
     pub bindings: Vec<Binding>,
     /// Counts.
     pub params: DispatchParams,

@@ -89,7 +89,6 @@ use crate::backend::{
     Readback, WaitOutcome,
 };
 use crate::caps::Caps;
-use crate::capture::Capture;
 use crate::command::{CommandList, PresentTransform, StagingSlice};
 use crate::error::RenderError;
 use crate::format::PixelFormat;
@@ -460,22 +459,13 @@ fn readback(packed: Packed) -> Readback {
         .map_or(Readback::Unknown, Readback::Bytes)
 }
 
-/// Bytes a texture's host object takes: every level, every sample.
+/// Bytes a texture's host object takes ([`validate::texture_size`]: every level, every sample),
+/// and one store per mip level.
 fn texture_bytes(desc: &TextureDesc) -> Result<(u64, Vec<Store>), RenderError> {
-    let mut total: u64 = 0;
-    let mut levels = Vec::new();
-    for mip in 0..desc.mip_levels {
-        let len = level_shape(desc, mip)?.len()?;
-        let bytes = u64::try_from(len)
-            .ok()
-            .and_then(|b| b.checked_mul(desc.sample_count.into()))
-            .ok_or(RenderError::Overflow {
-                what: "texture size",
-            })?;
-        total = total.saturating_add(bytes);
-        levels.push(Store::new(len));
-    }
-    Ok((total, levels))
+    let levels = (0..desc.mip_levels)
+        .map(|mip| level_shape(desc, mip)?.len().map(Store::new))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((validate::texture_size(desc)?, levels))
 }
 
 impl RecordingBackend {
@@ -518,12 +508,6 @@ impl RecordingBackend {
                 _ => None,
             })
             .collect()
-    }
-
-    /// Every list submitted so far, as a [`Capture`] ready to be written out: what
-    /// [`RecordingBackend::lists`] returns. Refused lists are not in it.
-    pub fn capture(&self) -> Capture {
-        Capture::new(self.lists())
     }
 
     /// Makes [`Backend::pipeline_status`] for `id` report `steps` in turn, one per call, then

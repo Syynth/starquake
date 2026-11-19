@@ -104,6 +104,7 @@ impl Spy {
                 entry: "main".to_owned(),
                 source: ShaderSource::Msl(String::new()),
                 interface: ShaderInterface::default(),
+                origin: None,
             })
             .unwrap()
     }
