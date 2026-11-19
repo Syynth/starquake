@@ -56,9 +56,14 @@ mod convert;
 mod fixtures;
 pub mod format;
 pub mod plan;
+pub mod present;
 pub mod rules;
 mod thread;
+mod window;
 
 pub use adapter::AdapterReport;
-pub use backend::{NewError, OPEN_TIMEOUT, PIPELINES_NOT_YET, SHADERS_NOT_YET, WgpuBackend};
+pub use backend::{
+    NewError, OPEN_TIMEOUT, PIPELINES_NOT_YET, SHADERS_NOT_YET, UNKNOWN_TARGET, WgpuBackend,
+};
 pub use config::{WgpuConfig, queue_full};
+pub use window::{FRAME_LATENCY, NO_SURFACE, NOT_MAIN_THREAD, SURFACE_UNSUPPORTED};

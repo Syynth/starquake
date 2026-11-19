@@ -59,6 +59,8 @@
 use crate::backend::Shared;
 use crate::convert::TextureSpec;
 use crate::plan::{ClearOps, ClearStep, Layers, ReadFrom, Rows, Step, TexelBox};
+use crate::present::frame_outcome;
+use crate::window::{Presenter, Target};
 use starquake_render::command::PresentDesc;
 use starquake_render::{
     BufferId, FenceValue, Frame, FrameDump, FrameSink, PixelFormat, PresentFeedback,
@@ -122,6 +124,11 @@ pub struct ListWork {
     pub steps: Vec<Step>,
     /// Where its dumped frames go, or `None` to keep them.
     pub sink: Option<Arc<dyn FrameSink>>,
+    /// How many presents it holds, counted in the backend's `queued_presents` while it waits.
+    pub presents: u64,
+    /// Whether a list queued after it holds a present, set when the render thread takes it
+    /// (`crate::present::frame_outcome`).
+    pub newer_queued: bool,
 }
 
 /// Work for the render thread, in the order it was queued.
@@ -133,6 +140,8 @@ pub enum Message {
     Free(ResourceId),
     /// Encode and submit a list.
     List(ListWork),
+    /// Send shown frames here from now on (`crate::window`).
+    Target(Target),
     /// Destroy the device, as a driver failure would lose it (tests only).
     #[cfg(test)]
     LoseDevice,
@@ -229,6 +238,8 @@ struct Scratch {
 struct PresentRec {
     desc: PresentDesc,
     format: PixelFormat,
+    /// Shown or dropped (`crate::window`); always shown on the offscreen target.
+    outcome: PresentOutcome,
     /// Index in the list's reads of a dumped frame's pixels.
     read: Option<usize>,
 }
@@ -270,6 +281,8 @@ struct Render {
     finished: Arc<Mutex<Vec<FenceValue>>>,
     /// The origin of present feedback's host time.
     origin: Instant,
+    /// Where shown frames go, and the window blit's objects.
+    presenter: Presenter,
 }
 
 /// What the thread does next.
@@ -305,6 +318,7 @@ pub fn start(
         in_flight: VecDeque::new(),
         finished: Arc::default(),
         origin: Instant::now(),
+        presenter: Presenter::new(),
     };
     std::thread::Builder::new()
         .name("starquake-render".into())
@@ -346,8 +360,13 @@ impl Render {
             if state.lost {
                 // Nothing completes on a lost device; drop the work and wait for the end.
                 state.queue.clear();
+                state.queued_presents = 0;
                 self.in_flight.clear();
-            } else if let Some(message) = state.queue.pop_front() {
+            } else if let Some(mut message) = state.queue.pop_front() {
+                if let Message::List(work) = &mut message {
+                    state.queued_presents = state.queued_presents.saturating_sub(work.presents);
+                    work.newer_queued = state.queued_presents > 0;
+                }
                 return Next::Message(message);
             } else if !self.in_flight.is_empty() {
                 return Next::Poll;
@@ -372,6 +391,7 @@ impl Render {
             Message::Create(create) => self.create(create),
             Message::Free(id) => self.free(id),
             Message::List(work) => self.encode(work),
+            Message::Target(target) => self.presenter.set_target(target),
             #[cfg(test)]
             Message::LoseDevice => {
                 self.device.destroy();
@@ -553,7 +573,12 @@ impl Render {
             sizes: scratch_sizes(&work.steps),
             made: HashMap::new(),
         };
-        for step in work.steps {
+        let last_present = work
+            .steps
+            .iter()
+            .rposition(|s| matches!(s, Step::Present { .. }));
+        for (index, step) in work.steps.into_iter().enumerate() {
+            let queued = frame_outcome(Some(index) == last_present, work.newer_queued);
             let upload = matches!(step, Step::WriteBuffer { .. } | Step::WriteTexture { .. });
             if upload && recorded {
                 let finished = std::mem::replace(&mut encoder, self.encoder());
@@ -561,9 +586,12 @@ impl Render {
             }
             // An upload leaves the encoder empty of commands: none before it, or just submitted.
             recorded = !upload;
-            self.step(&mut encoder, step, &mut reads, &mut presents, &mut scratch);
+            let out = (&mut reads, &mut presents);
+            self.step(&mut encoder, step, out, &mut scratch, queued);
         }
         let submission = self.queue.submit([encoder.finish()]);
+        // The window's texture this list drew into, after the submission that draws it.
+        self.presenter.finish(&self.queue);
         for read in &reads {
             if let Some(buffer) = &read.buffer {
                 let slot = Arc::clone(&read.mapped);
@@ -590,14 +618,15 @@ impl Render {
         });
     }
 
-    /// Encodes one step (an upload goes to the queue instead).
+    /// Encodes one step (an upload goes to the queue instead). `queued` is what the frame queue
+    /// says of the step if it is a present to a window.
     fn step(
-        &self,
+        &mut self,
         encoder: &mut wgpu::CommandEncoder,
         step: Step,
-        reads: &mut Vec<Read>,
-        presents: &mut Vec<PresentRec>,
+        (reads, presents): (&mut Vec<Read>, &mut Vec<PresentRec>),
         scratch: &mut Scratch,
+        queued: PresentOutcome,
     ) {
         match step {
             Step::WriteBuffer {
@@ -664,13 +693,76 @@ impl Render {
             Step::Readback { id, from } => {
                 reads.push(self.read(encoder, ReadTarget::Readback(id), from));
             }
-            Step::Present { desc, format, read } => {
+            Step::Present {
+                desc,
+                format,
+                host,
+                source,
+                read,
+            } => {
                 let read = read.map(|(at, rows)| {
                     let from = ReadFrom::Texture { at, rows };
                     reads.push(self.read(encoder, ReadTarget::Dump, from));
                     reads.len() - 1
                 });
-                presents.push(PresentRec { desc, format, read });
+                let outcome = self.present(encoder, &desc, host, source, queued);
+                presents.push(PresentRec {
+                    desc,
+                    format,
+                    outcome,
+                    read,
+                });
+            }
+        }
+    }
+
+    /// Shows a present in the window, if there is one and the frame queue keeps it
+    /// (`crate::window`); the offscreen target shows every present.
+    fn present(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        desc: &PresentDesc,
+        format: wgpu::TextureFormat,
+        source: TexelBox,
+        queued: PresentOutcome,
+    ) -> PresentOutcome {
+        if self.presenter.offscreen() {
+            return PresentOutcome::Shown;
+        }
+        if queued == PresentOutcome::Dropped {
+            return queued;
+        }
+        let dst = match self.presenter.target() {
+            Target::Offscreen | Target::Window(_) => self.presenter.acquire(&self.device),
+            Target::Lost => Err("the window's surface was lost"),
+            #[cfg(test)]
+            Target::Texture(id) => self
+                .textures
+                .get(id.index(), id.generation())
+                .cloned()
+                .ok_or("the test target is not a live texture"),
+        };
+        let shown = dst.and_then(|dst| {
+            let src = self
+                .textures
+                .get(source.texture.index(), source.texture.generation())
+                .ok_or("the presented texture had no host object")?;
+            self.presenter.blit(
+                &self.device,
+                &self.queue,
+                encoder,
+                src,
+                source,
+                desc,
+                format,
+                &dst,
+            )
+        });
+        match shown {
+            Ok(()) => PresentOutcome::Shown,
+            Err(why) => {
+                tracing::debug!("frame {} dropped: {why}", desc.frame);
+                PresentOutcome::Dropped
             }
         }
     }
@@ -796,7 +888,7 @@ impl Render {
             for present in entry.presents {
                 feedback.push(PresentFeedback {
                     frame: present.desc.frame,
-                    outcome: PresentOutcome::Shown,
+                    outcome: present.outcome,
                     host_time,
                 });
                 if !present.desc.dump {

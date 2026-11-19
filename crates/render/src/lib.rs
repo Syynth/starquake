@@ -64,6 +64,7 @@ pub mod resource;
 pub mod shader;
 pub mod validate;
 pub mod wake;
+pub mod window;
 
 pub use backend::{
     Backend, MemoryBudget, PipelineStatus, PresentFeedback, PresentOutcome, PresentTarget,
@@ -88,3 +89,4 @@ pub use recording::{FrameDump, RecordingBackend};
 pub use resource::{BufferDesc, BufferUsage, SamplerDesc, TextureDesc, TextureUsage, ViewDesc};
 pub use shader::{ResourceBinding, ShaderDesc, ShaderInterface, ShaderSource, ShaderStage};
 pub use wake::{CompletionWake, WakeContractError, WakeCounter, check_completion_wake};
+pub use window::{WindowHandles, WindowSize, WindowSource};

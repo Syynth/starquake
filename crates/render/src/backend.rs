@@ -18,6 +18,7 @@ use crate::id::{
 use crate::pipeline::{ComputePipelineDesc, GraphicsPipelineDesc};
 use crate::resource::{BufferDesc, SamplerDesc, TextureDesc, ViewDesc};
 use crate::shader::ShaderDesc;
+use crate::window::WindowHandles;
 use std::time::Duration;
 
 /// Host memory the device allows and what the backend uses, for the GPU crate's eviction.
@@ -60,13 +61,18 @@ pub enum Readback {
 }
 
 /// Where presents go.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+///
+/// Not `Copy`, `Eq` or `Hash` since slice R8: a window target holds the frontend's window.
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum PresentTarget {
+    /// A window the frontend created: its `raw-window-handle` 0.6.2 display and window handles
+    /// and its size ([`crate::window`]).
+    Window(WindowHandles),
     /// No window: presents are counted and dumped on request. Headless runs and tests.
     Offscreen,
-    // `Window(WindowHandles)` (raw-window-handle display and window handles) arrives with the
-    // window presentation slice, R8; `Exported(..)` for an embedding frontend later.
+    // `Exported(..)`, shared images for an embedding frontend, later (render-backend,
+    // "Deferred").
 }
 
 /// Whether a presented frame reached the screen.
