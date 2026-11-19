@@ -120,6 +120,12 @@ pub(crate) struct Journal {
 }
 
 impl Journal {
+    /// The number of words saved.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
     /// Forgets every saved word: the writes it covered stand.
     pub(crate) fn clear(&mut self) {
         for undo in &self.entries {

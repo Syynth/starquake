@@ -446,6 +446,30 @@ fn takes_names_the_macro_and_upload_methods_of_3d_and_compute() {
     }
 }
 
+#[test]
+fn new_state_starts_empty() {
+    // Eden-NX2's NativeMacroContext and MacroEngine are value-initialised (`{}`): code, starts,
+    // offset and generation all zero; Maxwell3D's data RAM is zeroed.
+    let process = ProcessMacros::new();
+    for store in Engine::ALL {
+        assert!((0..CODE_WORDS).all(|offset| process.code_word(store, offset) == Some(0)));
+        assert_eq!(process.code_writer(store, 0), None);
+        assert_eq!(process.starts(store), [0; START_ENTRIES]);
+        assert_eq!(process.upload_offset(store), 0);
+        assert_eq!(process.code_generation(store), 0);
+        assert_eq!(process.uploads(A, store), ChannelUploads::default());
+    }
+    assert_eq!(process.cross_channel_rewrites(), 0);
+    let channel = MacroChannel::new(A);
+    assert_eq!(channel.id(), A);
+    assert_eq!(channel.data_ram(), &DataRam::new());
+    assert!(!channel.is_waiting());
+    assert!(!channel.compute_uploaded());
+    for engine in Engine::ALL {
+        assert_eq!(channel.collected(engine), []);
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Uploads and calls
 // ---------------------------------------------------------------------------------------------
@@ -905,8 +929,15 @@ fn compute_uses_the_3d_store_until_it_uploads() {
     );
     rig.stream(&mut c, Engine::ThreeD, THREE_D_METHODS.start_pointer, &[0]);
     assert!(!c.macros.compute_uploaded());
+    let generation = rig.process.code_generation(Engine::ThreeD);
     rig.stream(&mut c, Engine::Compute, COMPUTE_METHODS.instruction, &[0]);
     assert!(!c.macros.compute_uploaded());
+    // Before the switch, a compute upload word goes to the 3D store.
+    assert_eq!(rig.process.code_generation(Engine::ThreeD), generation + 1);
+    assert_eq!(
+        rig.process.code_writer(Engine::ThreeD, 0),
+        Some(ChannelId(11))
+    );
     rig.stream(&mut c, Engine::Compute, COMPUTE_METHODS.start_pointer, &[0]);
     assert!(c.macros.compute_uploaded());
 }
@@ -1290,6 +1321,13 @@ fn failures_are_logged_once_per_store_and_start() {
         &[past - 1],
     );
     assert_eq!(first(&mut rig, &mut chan, Engine::ThreeD, 7), Some(true));
+    // A compute call on the 3D store is the 3D store's macro: already logged.
+    assert_eq!(first(&mut rig, &mut chan, Engine::Compute, 0), Some(false));
+    // The compute store's macro at the same start is another macro.
+    rig.upload(&mut chan, Engine::Compute, 0x10, &failing, 0);
+    rig.take();
+    assert_eq!(first(&mut rig, &mut chan, Engine::Compute, 0), Some(true));
+    assert_eq!(first(&mut rig, &mut chan, Engine::Compute, 0), Some(false));
 }
 
 #[test]
@@ -1955,4 +1993,145 @@ fn other_classes_write_their_file_and_never_call() {
         .unwrap();
     assert_eq!(rig.process.code_generation(Engine::ThreeD), 0);
     assert_eq!(rig.out.len(), 2);
+}
+
+#[test]
+fn the_dma_address_is_the_one_held_at_the_read_write() {
+    // A write to SET_MME_MEM_ADDRESS_B after MME_DMA_READ_FIFOED does not move the read.
+    let mut rig = make_rig();
+    let mut chan = Chan::new(A);
+    let program = finish(vec![
+        emit_param(m16(MEM_ADDRESS_A)),
+        emit_param(m16(MEM_ADDRESS_B)),
+        emit_param(m16(DMA_READ_FIFOED)),
+        emit_param(m16(MEM_ADDRESS_B)),
+        barrier(),
+        mov_reg(0, Reg::Load0),
+        emit_reg(out_method(0), 0),
+    ]);
+    rig.upload(&mut chan, Engine::ThreeD, 0, &program, 0);
+    rig.take();
+    rig.write_memory(SOURCE, &[0x1010]);
+    rig.write_memory(SOURCE + 0x100, &[0x2020]);
+    let [upper, lower, _] = source_parameters(SOURCE, 0);
+    let report = rig.call(
+        &mut chan,
+        Engine::ThreeD,
+        0,
+        &[upper, lower, 1, lower + 0x100],
+    );
+    assert!(matches!(report.result, CallResult::Committed(_)));
+    assert_eq!(
+        rig.take().last(),
+        Some(&write_entry(A, Engine::ThreeD, out_method(0), 0x1010))
+    );
+}
+
+#[test]
+fn dma_reads_fill_the_fifo_in_queue_order() {
+    let mut rig = make_rig();
+    let mut chan = Chan::new(A);
+    let program = finish(vec![
+        emit_param(m16(MEM_ADDRESS_A)),
+        emit_param(m16(MEM_ADDRESS_B)),
+        emit_param(m16(DMA_READ_FIFOED)),
+        emit_param(m16(MEM_ADDRESS_B)),
+        emit_param(m16(DMA_READ_FIFOED)),
+        barrier(),
+        mov_reg(0, Reg::Load0),
+        mov_reg(1, Reg::Load0),
+        mov_reg(2, Reg::Load0),
+        emit_reg(out_method(0), 0),
+        emit_reg(out_method(1), 1),
+        emit_reg(out_method(2), 2),
+    ]);
+    rig.upload(&mut chan, Engine::ThreeD, 0, &program, 0);
+    rig.take();
+    rig.write_memory(SOURCE, &[0xa1, 0xa2]);
+    rig.write_memory(SOURCE + 0x100, &[0xb1]);
+    let [upper, lower, _] = source_parameters(SOURCE, 0);
+    let report = rig.call(
+        &mut chan,
+        Engine::ThreeD,
+        0,
+        &[upper, lower, 2, lower + 0x100, 1],
+    );
+    assert!(matches!(report.result, CallResult::Committed(_)));
+    let sent = rig.take();
+    assert_eq!(
+        sent[sent.len() - 3..],
+        [
+            write_entry(A, Engine::ThreeD, out_method(0), 0xa1),
+            write_entry(A, Engine::ThreeD, out_method(1), 0xa2),
+            write_entry(A, Engine::ThreeD, out_method(2), 0xb1),
+        ]
+    );
+}
+
+#[test]
+fn a_macros_uploads_and_binds_apply_in_order_when_it_commits() {
+    let mut rig = make_rig();
+    let mut chan = Chan::new(A);
+    let methods = &THREE_D_METHODS;
+    let program = finish(vec![
+        emit_imm(m16(methods.instruction_pointer), 0x50),
+        emit_param(m16(methods.instruction)),
+        emit_param(m16(methods.instruction)),
+        emit_param(m16(methods.instruction)),
+        emit_imm(m16(methods.start_pointer), 6),
+        emit_imm(m16(methods.start), 0x50),
+        // Fails when a fourth parameter is missing.
+        mov_reg(0, Reg::Load0),
+    ]);
+    rig.upload(&mut chan, Engine::ThreeD, 0, &program, 0);
+    rig.take();
+    let generation = rig.process.code_generation(Engine::ThreeD);
+    let mut b = Chan::new(B);
+    let report = rig.call(&mut b, Engine::ThreeD, 0, &[0xa, 0xb, 0xc]);
+    assert!(matches!(report.result, CallResult::Failed { .. }));
+    assert_eq!(
+        rig.process
+            .code_word(Engine::ThreeD, 0x50 * INSTRUCTION_WORDS),
+        Some(0)
+    );
+    assert_eq!(rig.process.starts(Engine::ThreeD)[6], 0);
+    assert_eq!(rig.process.code_generation(Engine::ThreeD), generation);
+    assert_eq!(
+        rig.process.uploads(B, Engine::ThreeD),
+        ChannelUploads::default()
+    );
+
+    let report = rig.call(&mut b, Engine::ThreeD, 0, &[0xa, 0xb, 0xc, 0]);
+    assert!(matches!(report.result, CallResult::Committed(_)));
+    let base = 0x50 * INSTRUCTION_WORDS;
+    for (offset, value) in [(base, 0xa), (base + 1, 0xb), (base + 2, 0xc), (base + 3, 0)] {
+        assert_eq!(rig.process.code_word(Engine::ThreeD, offset), Some(value));
+    }
+    assert_eq!(rig.process.starts(Engine::ThreeD)[6], 0x50);
+    assert_eq!(rig.process.code_generation(Engine::ThreeD), generation + 3);
+    assert_eq!(
+        rig.process.uploads(B, Engine::ThreeD),
+        ChannelUploads {
+            code_words: 3,
+            start_entries: 1,
+        }
+    );
+}
+
+#[test]
+fn the_journal_keeps_one_value_per_word() {
+    // However many writes it covers, the journal holds each word's first value once.
+    let mut file = RegFile::new(A, three_d());
+    let mut journal = Journal::default();
+    let cbuf = clc797::LOAD_CONSTANT_BUFFER.method_at(&[0]).unwrap();
+    let mut sink = Vec::new();
+    for value in 1..100 {
+        file.save(cbuf, &mut journal);
+        file.write(cbuf, value, &mut sink).unwrap();
+    }
+    // The register, its shadow word and LOAD_CONSTANT_BUFFER_OFFSET.
+    assert_eq!(journal.len(), 3);
+    file.undo(&mut journal);
+    assert_eq!(snapshot(&file), snapshot(&RegFile::new(A, three_d())));
+    assert_eq!(journal.len(), 0);
 }

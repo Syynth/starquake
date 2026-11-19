@@ -71,7 +71,7 @@
 //!   `ClearCode`, `native_write_offset = pointer * 3`, `eden-nx2/src/video_core/macro.h`; PR
 //!   #4588's `ProcessMethodCall` likewise), and leave `LOAD_MME_INSTRUCTION_RAM_POINTER`
 //!   (method 0x45) as written. An MME64 instruction is three words, so no register value can
-//!   hold the word offset; it belongs with the macro code store (G13). Owner question.
+//!   hold the word offset; it belongs with the macro code store (G13, `crate::macros`). Owner question.
 //!   `instruction_upload_leaves_its_pointer_alone`.
 //! - **The compute bind pointer is a register here.** The spec's "macro bind pointers" advance
 //!   `LOAD_MME_START_ADDRESS_RAM_POINTER` (0x47) in both classes; Eden-NX2's compute engine keeps
@@ -107,7 +107,7 @@
 //!   every write; their state tables are empty. `compute_and_other_classes_drop_nothing`.
 //!
 //! Not here: register defaults (Eden's `InitializeRegisterDefaults` sets some 3D registers to
-//! non-zero values at boot; every file here starts zeroed), the macro calls themselves (G13),
+//! non-zero values at boot; every file here starts zeroed), the macro calls themselves (G13, `crate::macros`),
 //! and counters of dropped writes.
 
 mod file;
