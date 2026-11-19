@@ -5,6 +5,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
+#[cfg(any(test, feature = "test-support"))]
 use std::time::{Duration, Instant};
 
 use super::format::ContentHash;
@@ -94,6 +95,7 @@ impl Collector {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     /// Waits until `count` entries have been popped, or the ring ended, at most `timeout`;
     /// whether `count` were.
     pub(crate) fn wait_taken(&self, count: u64, timeout: Duration) -> bool {
@@ -113,6 +115,7 @@ impl Collector {
         state.taken >= count
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     /// The entries popped and kept since the last call, in ring order.
     pub(crate) fn drain(&self) -> Vec<RingEntry<'static>> {
         let mut state = lock(&self.shared.0);
@@ -120,6 +123,7 @@ impl Collector {
         state.entries.drain(..).collect()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     /// Whether an entry was dropped past the limit.
     pub(crate) fn overflowed(&self) -> bool {
         lock(&self.shared.0).overflowed
