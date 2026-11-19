@@ -879,9 +879,11 @@ fn a_new_mirror_starts_from_the_same_values_as_the_front_file() {
             mirror.registers().len(),
             usize::try_from(registers).unwrap()
         );
-        // No register default is seeded yet (Eden's `InitializeRegisterDefaults` is an open
-        // follow-up): every starting value is zero, on both sides.
-        assert!(mirror.registers().iter().all(|&value| value == 0));
+        // The class's starting values (zero but for its reset values), on both sides.
+        assert_eq!(
+            mirror.registers(),
+            &*ClassRules::for_class(class).initial_values()
+        );
         for method in 0..registers {
             assert_eq!(Some(mirror.value(method).unwrap()), front.get(method));
         }
@@ -1658,7 +1660,11 @@ fn a_field_of_another_method_is_refused() {
     };
     assert_eq!(reg.field(foreign), Err(no_field));
     assert_eq!(reg.named(foreign), Err(no_field));
-    assert_eq!(reg.field(clc797::SET_DEPTH_FUNC_V), Ok(0));
+    // Its reset value (`regs::DEFAULTS_3D`).
+    assert_eq!(
+        reg.field(clc797::SET_DEPTH_FUNC_V),
+        Ok(clc797::SET_DEPTH_FUNC_V_OGL_ALWAYS)
+    );
     // A field with no named values defines none.
     let clip = mirror
         .reg(&clc797::SET_VIEWPORT_CLIP_HORIZONTAL, &[0])
