@@ -1,0 +1,82 @@
+block0:
+block1:
+    %0: u32 = GetRegister r1
+    %1: u32 = IAdd32 %0, u32 0x1
+    %2 = SetRegister r1, %1
+block2:
+    %3: u32 = GetRegister r2
+    %4: u32 = IAdd32 %3, u32 0x1
+    %5 = SetRegister r2, %4
+    %6: u32 = GetRegister r4
+    %7: u1 = ULessThan %4, %6
+block3:
+    %8: u32 = GetRegister r3
+    %9: u32 = IAdd32 %8, u32 0x1
+    %10 = SetRegister r3, %9
+    %11: u32 = GetRegister r5
+    %12: u1 = ULessThan %9, %11
+block4:
+block5:
+    %13 = Prologue
+    %14 = SetGotoVariable u32 0x4, u1 false
+    %15 = SetGotoVariable u32 0x6, u1 false
+    %16 = SetGotoVariable u32 0x3, u1 false
+    %17 = SetGotoVariable u32 0x5, u1 false
+    %18 = SetGotoVariable u32 0x2, u1 false
+    %19 = SetGotoVariable u32 0x1, u1 false
+    %20 = SetGotoVariable u32 0x0, u1 false
+    %21 = SetGotoVariable u32 0x0, u1 false
+block6:
+    %22 = SetGotoVariable u32 0x1, u1 true
+block7:
+    %23 = SetGotoVariable u32 0x1, u1 false
+block8:
+    %24 = SetGotoVariable u32 0x2, u1 true
+block9:
+    %25 = SetGotoVariable u32 0x2, u1 false
+block10:
+    %26 = SetGotoVariable u32 0x5, %7
+    %27: u1 = GetGotoVariable u32 0x5
+    %28 = SetGotoVariable u32 0x1, %27
+    %29: u1 = GetGotoVariable u32 0x1
+    %30: u1 = ConditionRef %29
+block11:
+    %31 = SetGotoVariable u32 0x3, u1 false
+block12:
+    %32 = SetGotoVariable u32 0x6, %12
+    %33: u1 = GetGotoVariable u32 0x6
+    %34 = SetGotoVariable u32 0x2, %33
+block13:
+    %35: u1 = GetGotoVariable u32 0x2
+    %36: u1 = ConditionRef %35
+block14:
+    %37: u1 = GetGotoVariable u32 0x1
+    %38: u1 = ConditionRef %37
+block15:
+    %39 = SetGotoVariable u32 0x4, u1 false
+block16:
+    %40 = Epilogue
+structure:
+    block5
+    block0
+    block6
+    loop {
+        block7
+        block1
+        block8
+        loop {
+            block9
+            block2
+            block10
+            break %30
+            block11
+            block3
+            block12
+            block13
+        } repeat %36
+        block14
+    } repeat %38
+    block15
+    block4
+    block16
+    return
