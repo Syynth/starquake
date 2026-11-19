@@ -474,6 +474,7 @@ fn a_new_fence_path_has_nothing_recorded_in_flight_or_counted() {
                 elapsed: 0,
                 set_reference: 0,
                 catch_up: 0,
+                channel_removed: 0,
             },
             lost_wakes: 0,
             failed_releases: 0,
@@ -764,6 +765,7 @@ fn each_close_reason_is_counted_on_its_own() {
         CloseReason::Elapsed,
         CloseReason::SetReference,
         CloseReason::CatchUp,
+        CloseReason::ChannelRemoved,
     ];
     for reason in reasons {
         let mut r = rig();
@@ -778,6 +780,7 @@ fn each_close_reason_is_counted_on_its_own() {
             CloseReason::Elapsed => expected.elapsed = 1,
             CloseReason::SetReference => expected.set_reference = 1,
             CloseReason::CatchUp => expected.catch_up = 1,
+            CloseReason::ChannelRemoved => expected.channel_removed = 1,
         }
         assert_eq!(r.fences.counters().closed, expected, "{reason:?}");
     }

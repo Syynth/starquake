@@ -155,7 +155,8 @@ pub(super) struct ComputeSink<'a> {
     pub(super) counters: &'a mut ExecCounters,
     pub(super) scratch: &'a mut CommandList,
     /// The inline QMD's bytes, written before the first callback: dropped from the caches at
-    /// the first callback, or by the executor when there is none.
+    /// the first callback, or by the executor after the scheduler returns, whatever it returned
+    /// (`tests::a_refused_inline_qmd_is_still_invalidated_in_the_caches`).
     pub(super) inline: Option<Range<u64>>,
     /// The first fence-path failure, reported when the signal is done.
     pub(super) error: Option<FenceError>,

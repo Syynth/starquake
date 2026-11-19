@@ -6,16 +6,32 @@ use core::ops::Range;
 use std::time::Duration;
 
 use starquake_memory::{PAGE_SIZE, PageRange};
-use starquake_render::{Backend, CommandList, WaitOutcome};
+use starquake_render::CommandList;
+use thiserror::Error;
 
 use super::{ExecCounters, ShaderCache};
 use crate::back::buffer::{BufferCache, InvalidationSink};
 use crate::back::copy::CopySink;
-use crate::back::fence::{CloseReason, Fences};
+use crate::back::fence::{FenceError, Fences};
 use crate::back::readback::ReadbackIds;
 use crate::back::texture::{TextureCache, WriteBackError};
-use crate::memory::GpuMemory;
+use crate::memory::{GpuFault, GpuMemory};
 use crate::ring::Release;
+
+/// Why a write-back before a copy failed; logged, and the copy reads guest memory as it is.
+#[derive(Debug, Error)]
+pub(super) enum WriteBackFailed {
+    /// Recording, closing or waiting for the list holding the readbacks failed
+    /// ([`Fences::catch_up`]).
+    #[error(transparent)]
+    Fence(#[from] FenceError),
+    /// Writing an image back faulted; the ranges written before it were dropped from the caches.
+    #[error("writing an image back to guest memory faulted: {0}")]
+    Fault(GpuFault),
+    /// The texture cache could not write the images back.
+    #[error(transparent)]
+    WriteBack(WriteBackError),
+}
 
 /// The ranges one CPU-write drain reported, in order.
 pub(super) struct Drained(pub(super) Vec<PageRange>);
@@ -51,7 +67,6 @@ pub(super) struct CacheSink<'a> {
     pub(super) shaders: &'a mut dyn ShaderCache,
     pub(super) fences: &'a mut Fences,
     pub(super) readbacks: &'a mut ReadbackIds,
-    pub(super) backend: &'a dyn Backend,
     pub(super) catch_up: Duration,
     pub(super) counters: &'a mut ExecCounters,
     pub(super) scratch: &'a mut CommandList,
@@ -69,7 +84,7 @@ impl CacheSink<'_> {
     }
 
     /// The write-back of `range` (module docs), or the reason it failed.
-    fn write_back(&mut self, range: Range<u64>) -> Result<(), String> {
+    fn write_back(&mut self, range: Range<u64>) -> Result<(), WriteBackFailed> {
         let write_back = self
             .textures
             .begin_write_back(range, self.readbacks, self.scratch);
@@ -77,31 +92,15 @@ impl CacheSink<'_> {
             self.scratch.commands.clear();
             return Ok(());
         }
-        self.fences
-            .record_list(self.scratch)
-            .map_err(|e| e.to_string())?;
-        self.fences
-            .close(CloseReason::CatchUp)
-            .map_err(|e| e.to_string())?;
-        // The list holding the readbacks is the newest submitted: `record_list` may have closed
-        // it already for the elapsed time, and then `close` had nothing to submit.
-        let fence = self.fences.newest_submitted();
-        match self.backend.wait(fence, self.catch_up) {
-            Ok(WaitOutcome::Reached) => {}
-            Ok(WaitOutcome::TimedOut) => {
-                return Err(format!(
-                    "the host GPU did not finish command list {} in time",
-                    fence.get()
-                ));
-            }
-            Err(error) => return Err(error.to_string()),
-        }
-        self.fences.complete();
+        self.fences.record_list(self.scratch)?;
+        self.fences.catch_up(self.catch_up)?;
         let finished = self.textures.finish_write_back(self.memory, write_back);
         let (written, failure) = match finished {
             Ok(written) => (written, None),
-            Err(WriteBackError::Fault { fault, written }) => (written, Some(fault.to_string())),
-            Err(error) => (Vec::new(), Some(error.to_string())),
+            Err(WriteBackError::Fault { fault, written }) => {
+                (written, Some(WriteBackFailed::Fault(fault)))
+            }
+            Err(error) => (Vec::new(), Some(WriteBackFailed::WriteBack(error))),
         };
         for range in written {
             // The texture cache has marked its own images; the others drop the range.

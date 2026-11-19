@@ -27,7 +27,7 @@ use crate::back::fence::tests::{Clock, Front, LateBackend, Pushed};
 use crate::back::fence::{FenceEnv, Mode, OrderedUpdate, VmChange, WaiterTable};
 use crate::back::pipeline::ShaderStamp;
 use crate::back::qmd::tests::{SlotSpec, Spec, encode};
-use crate::back::qmd::{CONSTANT_BUFFER_SIZE_SHIFT, ConstantBuffer, QMD_WORDS};
+use crate::back::qmd::{CONSTANT_BUFFER_SIZE_SHIFT, ConstantBuffer, QMD_ADDRESS_SHIFT, QMD_WORDS};
 use crate::classes::{Method, cl902d, cla140, clc7b5, clc7c0, clc797};
 use crate::field::Field;
 use crate::interface::{DisplayId, ImageDesc, LayerId, Rect, VmUpdate};
@@ -552,8 +552,12 @@ fn golden_draw() {
     insta::assert_snapshot!(rig.submit());
 }
 
+/// The size [`compute_qmd`] binds constant buffer 0 with.
+const COMPUTE_BANK_SIZE: u32 = 0x100;
+
 /// A QMD at [`QMD`] dispatching [`COMPUTE_PROGRAM`] over a 2x3x1 grid of 8x4x1 blocks, binding
-/// constant buffer 0 at [`UNIFORMS`], with releases in slots 0 and 2.
+/// [`COMPUTE_BANK_SIZE`] bytes of constant buffer 0 at [`UNIFORMS`], with releases in slots 0
+/// and 2.
 fn compute_qmd() -> [u32; QMD_WORDS] {
     let mut spec = Spec::new(COMPUTE_PROGRAM)
         .slot(0, SlotSpec::write(SEM, 0x11))
@@ -564,7 +568,7 @@ fn compute_qmd() -> [u32; QMD_WORDS] {
     spec.dispatch.constant_buffers[0] = ConstantBuffer {
         valid: true,
         address: UNIFORMS,
-        size: 0x100,
+        size: COMPUTE_BANK_SIZE,
     };
     encode(&spec)
 }
@@ -999,8 +1003,8 @@ fn spaces_and_channels_are_checked_when_added() {
         rig.exec.add_channel(ChannelId(1), AsId(1)),
         Err(ExecError::UnknownSpace { space: AsId(1) })
     );
-    assert!(rig.exec.remove_channel(OTHER));
-    assert!(!rig.exec.remove_channel(OTHER));
+    assert_eq!(rig.exec.remove_channel(OTHER), Ok(true));
+    assert_eq!(rig.exec.remove_channel(OTHER), Ok(false));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1728,4 +1732,620 @@ fn an_unmapped_buffer_is_destroyed_after_the_list_that_used_it() {
         snapshot.contains("destroy b0 after fence 1: now"),
         "{snapshot}"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review findings: deferred draws at every boundary, failed deferred draws, removed channels,
+// the inline QMD, the drain before a copy, write-backs and edges.
+
+/// A general draw (`BEGIN` `FIRST` ... `END`), then an instanced one (`BEGIN` `SUBSEQUENT` with
+/// topology `op` ... `END`) whose two instances wait for a flush.
+fn instanced(op: u32) -> String {
+    let c = THREE_D;
+    write(c, &clc797::SET_VERTEX_ARRAY_START, &[], 0)
+        + &write(c, &clc797::DRAW_VERTEX_ARRAY, &[], 3)
+        + &write(c, &clc797::BEGIN, &[], clc797::BEGIN_OP_TRIANGLES)
+        + &write(c, &clc797::END, &[], 0)
+        + &write(
+            c,
+            &clc797::BEGIN,
+            &[],
+            fields(&[
+                (clc797::BEGIN_OP, op),
+                (
+                    clc797::BEGIN_INSTANCE_ID,
+                    clc797::BEGIN_INSTANCE_ID_SUBSEQUENT,
+                ),
+            ]),
+        )
+        + &write(c, &clc797::END, &[], 0)
+}
+
+/// A `BEGIN_OP` no topology has: the draw path refuses it only when the instances are drawn.
+const UNDEFINED_OP: u32 = clc797::BEGIN_OP_PATCH + 1;
+
+/// The DMA copy of [`dma_copy_with_semaphore`] split into its setup and its `LAUNCH_DMA` word.
+fn dma_setup_and_launch(payload: u32) -> (String, String) {
+    let text = dma_copy_with_semaphore(payload);
+    let (setup, launch) = text.trim_end().rsplit_once('\n').unwrap();
+    (format!("{setup}\n"), format!("{launch}\n"))
+}
+
+/// Whether the last `Draw` of `commands` draws `instances` instances.
+fn last_draw_has_instances(commands: &[Command], instances: u32) -> bool {
+    commands.iter().rev().find_map(|c| match c {
+        Command::Draw(desc) => Some(desc.params),
+        _ => None,
+    }) == Some(starquake_render::command::DrawParams::Direct {
+        vertex_count: 3,
+        instance_count: instances,
+        first_vertex: 0,
+        first_instance: 0,
+    })
+}
+
+#[test]
+fn deferred_instances_are_drawn_before_each_boundary() {
+    // A marker and a syncpoint flush every channel's instances; a word to the channel's DMA or
+    // inline-to-memory class flushes that channel's.
+    let (setup, launch) = dma_setup_and_launch(1);
+    let inline_word = write(cla140::CLASS, &cla140::LINE_COUNT, &[], 1);
+    let boundaries: [(&str, String, String); 4] = [
+        ("marker", String::new(), "marker token=0x7\n".to_owned()),
+        ("syncpoint", String::new(), "syncpoint id=5\n".to_owned()),
+        ("dma", setup, launch),
+        ("inline", String::new(), inline_word),
+    ];
+    for (name, before, boundary) in boundaries {
+        let mut rig = Rig::new();
+        rig.write_words(SRC, &[1, 2, 3, 4]);
+        rig.run(&(draw_state() + &before + &instanced(clc797::BEGIN_OP_TRIANGLES)));
+        assert!(rig.exec.draws(CHANNEL).unwrap().has_deferred(), "{name}");
+        rig.run(&boundary);
+        assert!(!rig.exec.draws(CHANNEL).unwrap().has_deferred(), "{name}");
+        rig.submit();
+        let commands = rig.commands();
+        assert_eq!(draws(&commands), 2, "{name}: {commands:?}");
+        assert!(
+            last_draw_has_instances(&commands, 2),
+            "{name}: {commands:?}"
+        );
+    }
+}
+
+#[test]
+fn a_failed_deferred_draw_does_not_stop_the_entry_after_it() {
+    let refused = || {
+        ExecError::Draw(DrawError::Topology {
+            value: UNDEFINED_OP,
+        })
+    };
+    let release =
+        format!("release channel=3 address={SEM:#x} payload=0x1 size=4 timestamp=no op=write\n");
+    let (setup, launch) = dma_setup_and_launch(0x5);
+    let entries: [(&str, String, String); 5] = [
+        ("syncpoint", String::new(), "syncpoint id=5\n".to_owned()),
+        ("marker", String::new(), "marker token=0x7\n".to_owned()),
+        ("release", String::new(), release),
+        (
+            "bind",
+            String::new(),
+            "bind channel=3 subchannel=4 class=0xc7b5\n".to_owned(),
+        ),
+        ("dma", setup, launch),
+    ];
+    for (name, before, entry) in entries {
+        let mut rig = Rig::new();
+        rig.write_words(SRC, &[1, 2, 3, 4]);
+        rig.run(&(draw_state() + &before + &instanced(UNDEFINED_OP)));
+        assert!(rig.exec.draws(CHANNEL).unwrap().has_deferred(), "{name}");
+        let fenced = rig.exec.fences().counters().fenced;
+        let parsed = parse_text(&entry).unwrap();
+        assert_eq!(rig.exec.apply(&parsed[0]), Err(refused()), "{name}");
+        assert!(!rig.exec.draws(CHANNEL).unwrap().has_deferred(), "{name}");
+        let attached = rig.exec.fences().counters().fenced - fenced;
+        match name {
+            "syncpoint" | "marker" => assert_eq!(attached, 1, "{name}"),
+            "release" => {
+                assert_eq!(attached, 1);
+                rig.submit();
+                rig.exec.complete();
+                assert_eq!(rig.word(SEM), 1);
+            }
+            "bind" => {
+                assert_eq!(attached, 0);
+                assert_eq!(
+                    rig.exec.bound(CHANNEL, Subchannel::new(4).unwrap()),
+                    Some(ClassId(clc7b5::CLASS))
+                );
+            }
+            _ => {
+                // The copy ran and its semaphore was attached.
+                assert_eq!(attached, 1);
+                assert_eq!(
+                    (0..4).map(|i| rig.word(DST + i * 4)).collect::<Vec<_>>(),
+                    vec![1, 2, 3, 4]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_failed_deferred_draw_and_a_failed_entry_return_the_entrys_error_and_count_both() {
+    let mut rig = Rig::new();
+    rig.run(&(draw_state() + &instanced(UNDEFINED_OP)));
+    let failed = rig.exec.counters().failed;
+    // The entry's own work fails too: a present with no present space.
+    let entry = parse_text(&present()).unwrap();
+    let ((), events) = captured(|| {
+        assert_eq!(rig.exec.apply(&entry[0]), Err(ExecError::NoPresentSpace));
+    });
+    assert!(!rig.exec.draws(CHANNEL).unwrap().has_deferred());
+    // One for the entry, one for the deferred draw logged beside it.
+    assert_eq!(rig.exec.counters().failed - failed, 2);
+    assert!(
+        at(&events, tracing::Level::DEBUG).iter().any(|e| e
+            .contains("could not draw a channel's deferred instances")
+            && e.contains("topology")),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn a_removed_channels_draw_path_is_destroyed_after_the_list_that_used_it() {
+    let mut rig = Rig::new();
+    rig.run(&(draw_state() + &instanced(clc797::BEGIN_OP_TRIANGLES)));
+    assert_eq!(rig.exec.remove_channel(CHANNEL), Ok(true));
+    assert_eq!(rig.exec.fences().counters().closed.channel_removed, 1);
+    // Nothing is left to close: the removal closed the list holding the draws.
+    assert_eq!(rig.exec.close(CloseReason::RingEmpty), Ok(None));
+    let lists = rig.recording.as_ref().unwrap().lists();
+    assert_eq!(lists.len(), 1);
+    let (fence, list) = &lists[0];
+    // The deferred instances were drawn into it, not lost.
+    assert!(last_draw_has_instances(&list.commands, 2), "{list:?}");
+    let snapshot = rig.recording.as_ref().unwrap().snapshot();
+    let destroyed: Vec<u64> = snapshot
+        .lines()
+        .filter(|l| l.starts_with("destroy "))
+        .map(|l| {
+            let after = l.split("after fence ").nth(1).unwrap();
+            after.split(':').next().unwrap().parse().unwrap()
+        })
+        .collect();
+    // The draw path's two host shaders, at least.
+    assert!(destroyed.len() >= 2, "{snapshot}");
+    assert!(
+        destroyed.iter().all(|&after| after >= fence.get()),
+        "{snapshot}"
+    );
+}
+
+#[test]
+fn removing_a_channel_with_no_3d_engine_closes_nothing() {
+    let mut rig = Rig::new();
+    rig.run(&(draw_state() + &draw()));
+    assert_eq!(rig.exec.remove_channel(OTHER), Ok(true));
+    assert_eq!(rig.exec.fences().counters().closed.channel_removed, 0);
+    assert_eq!(rig.exec.fences().open_commands(), 4);
+}
+
+/// Binds the compute class and writes `words` as the inline QMD at `address`, every word but
+/// the last; returns the ring text of the last word, which writes it.
+fn inline_qmd(rig: &mut Rig, address: u64, words: &[u32; QMD_WORDS]) -> String {
+    let c = COMPUTE;
+    let mut text = String::from("bind channel=3 subchannel=1 class=0xc7c0\n");
+    text += &address_text(
+        c,
+        &clc7c0::SET_INLINE_QMD_ADDRESS_A,
+        &clc7c0::SET_INLINE_QMD_ADDRESS_B,
+        address >> crate::back::qmd::QMD_ADDRESS_SHIFT,
+    );
+    let (last, rest) = words.split_last().unwrap();
+    for (index, word) in (0u32..).zip(rest) {
+        text += &write(c, &clc7c0::LOAD_INLINE_QMD_DATA, &[index], *word);
+    }
+    rig.run(&text);
+    let index = u32::try_from(QMD_WORDS - 1).unwrap();
+    write(c, &clc7c0::LOAD_INLINE_QMD_DATA, &[index], *last)
+}
+
+/// [`address`] for a class with no indices.
+fn address_text(class: u32, upper: &Method, lower: &Method, value: u64) -> String {
+    address(class, upper, lower, &[], value)
+}
+
+#[test]
+fn a_refused_inline_qmd_is_still_invalidated_in_the_caches() {
+    // Every word zero: version 0, and no scheduling action needed, so the scheduler loads the
+    // QMD it has just written and refuses its version, with no sink callback.
+    let mut rig = Rig::new();
+    let last = parse_text(&inline_qmd(&mut rig, INLINE_QMD, &[0; QMD_WORDS])).unwrap();
+    assert_eq!(
+        rig.exec.apply(&last[0]),
+        Err(ExecError::Qmd(QmdError::Version {
+            address: INLINE_QMD,
+            major: 0,
+            minor: 0,
+        }))
+    );
+    assert_eq!(
+        rig.log().invalidated,
+        vec![PageRange::new(INLINE_QMD - INLINE_QMD % PAGE_SIZE, PAGE_SIZE).unwrap()]
+    );
+}
+
+/// Arms every page the caches asked the write watch to watch, as the kernel would: a page that
+/// is watched and not written stays clean, so the buffer cache does not upload it again.
+fn arm_requests(watch: &WriteWatch) {
+    let mut requests = Vec::new();
+    watch.take_requests(&mut requests);
+    watch.arm(&requests).unwrap();
+}
+
+/// How many uploads to a buffer `snapshot` holds.
+fn buffer_uploads(snapshot: &str) -> usize {
+    snapshot
+        .lines()
+        .filter(|l| l.trim_start().starts_with("upload ") && l.contains(" to b"))
+        .count()
+}
+
+#[test]
+fn the_inline_qmd_is_dropped_from_the_buffer_cache() {
+    // The inline QMD written over the vertex buffer a draw uploaded: the next draw uploads it
+    // again. With no inline QMD in between, it does not. The first draw uploads the buffer, and
+    // the first after the watch is armed reads it once more (`back::buffer`, "The first use
+    // after arming reads the pages once more"): two uploads before the case begins.
+    for (write_qmd, uploads) in [(false, 2), (true, 3)] {
+        let mut rig = Rig::new();
+        rig.run(&(draw_state() + &draw()));
+        arm_requests(&rig.watch);
+        rig.run(&draw());
+        if write_qmd {
+            let mut words = [0u32; QMD_WORDS];
+            // Needs a scheduling action: written, not scheduled.
+            words[4] = 1 << 12;
+            let last = inline_qmd(&mut rig, VERTICES, &words);
+            rig.run(&last);
+        }
+        rig.run(&draw());
+        let snapshot = rig.submit();
+        assert_eq!(
+            buffer_uploads(&snapshot),
+            uploads,
+            "{write_qmd}: {snapshot}"
+        );
+    }
+}
+
+#[test]
+fn starts_draw_is_exactly_the_draw_path_tables() {
+    for method in 0..=u32::from(u16::MAX) {
+        let listed = DRAW_METHODS
+            .iter()
+            .chain(UNHANDLED_METHODS.iter())
+            .any(|m| m.method() == method);
+        assert_eq!(starts_draw(method), listed, "{method:#x}");
+    }
+    assert!(!starts_draw(u32::MAX));
+    // Each table's first and last entry, written out (`draw::call`'s tables).
+    for method in [
+        &clc797::BEGIN,
+        &clc797::DRAW_VERTEX_ARRAY_BEGIN_END_B,
+        &clc797::DRAW_INLINE_INDEX,
+        &clc797::DRAW_AUTO,
+    ] {
+        assert!(starts_draw(method.method()), "{}", method.name);
+    }
+    assert!(!starts_draw(clc797::SET_COLOR_TARGET_WIDTH.method()));
+}
+
+#[test]
+fn a_copy_launch_drains_cpu_writes_first() {
+    let page = |va: u64| PageRange::new(va - va % PAGE_SIZE, PAGE_SIZE).unwrap();
+    // A DMA launch: the drain's range, then the copy's destination.
+    let mut rig = Rig::new();
+    let (setup, launch) = dma_setup_and_launch(1);
+    rig.run(&setup);
+    cpu_write(&rig.watch, UNIFORMS);
+    assert_eq!(rig.log().invalidated, vec![]);
+    rig.run(&launch);
+    assert_eq!(rig.log().invalidated, vec![page(UNIFORMS), page(DST)]);
+    // A 2D launch drains before the blit engine runs, even when it refuses the blit.
+    let mut rig = Rig::new();
+    let c = cl902d::CLASS;
+    rig.run(
+        &("bind channel=3 subchannel=3 class=0x902d\n".to_owned()
+            + &write(
+                c,
+                &cl902d::SET_CLIP_ENABLE,
+                &[],
+                fields(&[(cl902d::SET_CLIP_ENABLE_V, 1)]),
+            )
+            + &write(
+                c,
+                &cl902d::SET_OPERATION,
+                &[],
+                cl902d::SET_OPERATION_V_SRCCOPY,
+            )),
+    );
+    cpu_write(&rig.watch, UNIFORMS);
+    let launch = parse_text(&write(c, &cl902d::PIXELS_FROM_MEMORY_SRC_Y0_INT, &[], 0)).unwrap();
+    assert_eq!(
+        rig.exec.apply(&launch[0]),
+        Err(ExecError::Copy(CopyError::BlitClip))
+    );
+    assert_eq!(rig.log().invalidated, vec![page(UNIFORMS)]);
+}
+
+/// The byte a [`Painter`] answers each unknown readback byte with.
+const PAINT: u8 = 0x5c;
+
+/// The recording backend, answering a readback whose bytes it cannot know with [`PAINT`] bytes
+/// of the [`SIZE`]-square RGBA8 target's level, as a host GPU would answer with what it drew.
+struct Painter(RecordingBackend);
+
+impl Backend for Painter {
+    fn caps(&self) -> &Caps {
+        self.0.caps()
+    }
+    fn budget(&self) -> starquake_render::MemoryBudget {
+        self.0.budget()
+    }
+    fn create_buffer(
+        &self,
+        desc: &starquake_render::BufferDesc,
+    ) -> Result<starquake_render::BufferId, starquake_render::RenderError> {
+        self.0.create_buffer(desc)
+    }
+    fn create_texture(
+        &self,
+        desc: &starquake_render::TextureDesc,
+    ) -> Result<starquake_render::TextureId, starquake_render::RenderError> {
+        self.0.create_texture(desc)
+    }
+    fn create_view(
+        &self,
+        texture: starquake_render::TextureId,
+        desc: &starquake_render::ViewDesc,
+    ) -> Result<starquake_render::ViewId, starquake_render::RenderError> {
+        self.0.create_view(texture, desc)
+    }
+    fn create_sampler(
+        &self,
+        desc: &starquake_render::SamplerDesc,
+    ) -> Result<starquake_render::SamplerId, starquake_render::RenderError> {
+        self.0.create_sampler(desc)
+    }
+    fn create_shader(
+        &self,
+        desc: starquake_render::ShaderDesc,
+    ) -> Result<starquake_render::ShaderId, starquake_render::RenderError> {
+        self.0.create_shader(desc)
+    }
+    fn destroy(&self, resource: starquake_render::ResourceId, after: FenceValue) {
+        self.0.destroy(resource, after);
+    }
+    fn create_graphics_pipeline(
+        &self,
+        desc: starquake_render::GraphicsPipelineDesc,
+    ) -> Result<starquake_render::PipelineId, starquake_render::RenderError> {
+        self.0.create_graphics_pipeline(desc)
+    }
+    fn create_compute_pipeline(
+        &self,
+        desc: starquake_render::ComputePipelineDesc,
+    ) -> Result<starquake_render::PipelineId, starquake_render::RenderError> {
+        self.0.create_compute_pipeline(desc)
+    }
+    fn pipeline_status(
+        &self,
+        id: starquake_render::PipelineId,
+    ) -> starquake_render::PipelineStatus {
+        self.0.pipeline_status(id)
+    }
+    fn staging(
+        &self,
+        size: u64,
+    ) -> Result<starquake_render::StagingSlice, starquake_render::RenderError> {
+        self.0.staging(size)
+    }
+    fn submit(
+        &self,
+        list: starquake_render::CommandList,
+    ) -> Result<FenceValue, starquake_render::RenderError> {
+        self.0.submit(list)
+    }
+    fn completed(&self) -> FenceValue {
+        self.0.completed()
+    }
+    fn wait(
+        &self,
+        value: FenceValue,
+        timeout: Duration,
+    ) -> Result<starquake_render::WaitOutcome, starquake_render::RenderError> {
+        self.0.wait(value, timeout)
+    }
+    fn take_readback(
+        &self,
+        id: starquake_render::ReadbackId,
+    ) -> Option<starquake_render::Readback> {
+        match self.0.take_readback(id)? {
+            starquake_render::Readback::Unknown => {
+                let pixel = starquake_render::PixelFormat::A8B8G8R8Unorm.bytes_per_block();
+                let len = usize::try_from(SIZE * SIZE * pixel).unwrap();
+                Some(starquake_render::Readback::Bytes(vec![PAINT; len]))
+            }
+            known @ starquake_render::Readback::Bytes(_) => Some(known),
+        }
+    }
+    fn set_present_target(
+        &self,
+        target: starquake_render::PresentTarget,
+    ) -> Result<(), starquake_render::RenderError> {
+        self.0.set_present_target(target)
+    }
+    fn take_present_feedback(&self) -> Vec<starquake_render::PresentFeedback> {
+        self.0.take_present_feedback()
+    }
+}
+
+#[test]
+fn a_write_back_writes_the_drawn_bytes_before_the_copy_reads_them() {
+    let backend = Arc::new(Painter(RecordingBackend::new(caps(), 1 << 40)));
+    let mut rig = Rig::on(backend, compute_set(vec![]));
+    let (_, launch) = dma_setup_and_launch(0);
+    let c = clc7b5::CLASS;
+    let mut copy = String::from("bind channel=3 subchannel=4 class=0xc7b5\n");
+    copy += &address_text(
+        c,
+        &clc7b5::OFFSET_IN_UPPER,
+        &clc7b5::OFFSET_IN_LOWER,
+        TARGET,
+    );
+    copy += &address_text(c, &clc7b5::OFFSET_OUT_UPPER, &clc7b5::OFFSET_OUT_LOWER, DST);
+    copy += &write(c, &clc7b5::LINE_LENGTH_IN, &[], 16);
+    copy += &write(c, &clc7b5::LINE_COUNT, &[], 1);
+    // The launch of `dma_copy_with_semaphore` also releases a semaphore at SEM; keep it.
+    copy += &address_text(c, &clc7b5::SET_SEMAPHORE_A, &clc7b5::SET_SEMAPHORE_B, SEM2);
+    copy += &launch;
+    // A release after the draw, in the list the write-back closes.
+    let release =
+        format!("release channel=3 address={SEM:#x} payload=0x31 size=4 timestamp=no op=write\n");
+    rig.run(&(draw_state() + &draw() + &release));
+    assert_eq!(rig.word(SEM), 0);
+    let ((), events) = captured(|| rig.run(&copy));
+    let counters = rig.exec.counters();
+    assert_eq!(
+        (counters.write_backs, counters.write_back_failures),
+        (1, 0),
+        "{events:?}"
+    );
+    // The copy read the bytes the write-back wrote.
+    let painted = u32::from_le_bytes([PAINT; 4]);
+    assert_eq!(
+        (0..4).map(|i| rig.word(DST + i * 4)).collect::<Vec<_>>(),
+        vec![painted; 4]
+    );
+    // The write-back ran completion after its wait: the release in its list is performed.
+    assert_eq!(rig.word(SEM), 0x31);
+    assert_eq!(rig.exec.fences().lists_in_flight(), 0);
+}
+
+#[test]
+fn a_compute_constant_buffer_is_bound_at_most_at_the_qmds_size() {
+    let bound = COMPUTE_BANK_SIZE;
+    // Larger than the QMD binds: capped. Zero: the whole binding. Smaller: as declared.
+    for (declared, expected) in [
+        (bound * 2, u64::from(bound)),
+        (bound + 4, u64::from(bound)),
+        (0, u64::from(bound)),
+        (bound - 4, u64::from(bound - 4)),
+    ] {
+        let backend = Arc::new(RecordingBackend::new(caps(), 1 << 40));
+        let mut rig = Rig::on(
+            Arc::<RecordingBackend>::clone(&backend),
+            compute_set(vec![uniform_bank(0, declared)]),
+        );
+        rig.recording = Some(backend);
+        rig.write_words(QMD, &compute_qmd());
+        rig.run(&compute_signal());
+        assert_eq!(rig.exec.counters().dispatches, 1, "{declared:#x}");
+        rig.submit();
+        let sizes: Vec<u64> = rig
+            .commands()
+            .iter()
+            .filter_map(|c| match c {
+                Command::Dispatch(desc) => Some(desc),
+                _ => None,
+            })
+            .flat_map(|desc| desc.bindings.iter())
+            .filter_map(|b| match b.resource {
+                starquake_render::command::BindingResource::Buffer(slice) => Some(slice.size),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sizes, vec![expected], "{declared:#x}");
+    }
+}
+
+#[test]
+fn compute_answers_read_words_up_to_the_exact_end_of_the_binding() {
+    let rig = Rig::new();
+    let size = 0x100;
+    rig.write_words(UNIFORMS + u64::from(size - 8), &[0x1111_2222, 0x3333_4444]);
+    let bound = [ConstantBuffer {
+        valid: true,
+        address: UNIFORMS,
+        size,
+    }];
+    let answers = compute::ComputeAnswers {
+        memory: &*rig.mem,
+        constant_buffers: &bound,
+    };
+    let word = |offset: u32| answers.cbuf_word(GuestStage::Compute, 0, offset);
+    // The last whole word ends exactly at the size; one byte later it would pass it.
+    assert_eq!(word(size - 4), Some(0x3333_4444));
+    assert_eq!(word(size - 8), Some(0x1111_2222));
+    assert_eq!(word(size - 3), None);
+    assert_eq!(word(size), None);
+    assert_eq!(word(u32::MAX - 2), None);
+    // A bank the QMD does not bind, or binds invalid, answers nothing.
+    assert_eq!(answers.cbuf_word(GuestStage::Compute, 1, 0), None);
+    let invalid = [ConstantBuffer {
+        valid: false,
+        ..bound[0]
+    }];
+    let answers = compute::ComputeAnswers {
+        memory: &*rig.mem,
+        constant_buffers: &invalid,
+    };
+    assert_eq!(answers.cbuf_word(GuestStage::Compute, 0, size - 4), None);
+}
+
+#[test]
+fn the_inline_qmd_range_is_refused_exactly_past_the_shift() {
+    let mut registers =
+        vec![0u32; usize::try_from(crate::back::qmd::LAST_INLINE_QMD_METHOD).unwrap() + 1];
+    let set = |registers: &mut Vec<u32>, upper: u32, lower: u32| {
+        let a = usize::try_from(clc7c0::SET_INLINE_QMD_ADDRESS_A.method()).unwrap();
+        let b = usize::try_from(clc7c0::SET_INLINE_QMD_ADDRESS_B.method()).unwrap();
+        registers[a] = upper;
+        registers[b] = lower;
+    };
+    let qmd_bytes = u64::try_from(QMD_BYTES).unwrap();
+    // The highest bit the shift keeps: leading zeros exactly QMD_ADDRESS_SHIFT.
+    let upper = 1 << (u32::BITS - QMD_ADDRESS_SHIFT - 1);
+    set(&mut registers, upper, 0);
+    let start = 1u64 << (u64::BITS - 1);
+    assert_eq!(
+        (u64::from(upper) << u32::BITS).leading_zeros(),
+        QMD_ADDRESS_SHIFT
+    );
+    assert_eq!(inline_qmd_range(&registers), Some(start..start + qmd_bytes));
+    // One bit higher: leading zeros QMD_ADDRESS_SHIFT - 1, which the shift would drop.
+    set(&mut registers, upper << 1, 0);
+    assert_eq!(
+        (u64::from(upper << 1) << u32::BITS).leading_zeros(),
+        QMD_ADDRESS_SHIFT - 1
+    );
+    assert_eq!(inline_qmd_range(&registers), None);
+    // The last QMD of the address space: its end would pass 2^64.
+    set(&mut registers, u32::MAX >> QMD_ADDRESS_SHIFT, u32::MAX);
+    assert_eq!(inline_qmd_range(&registers), None);
+    // The lower word counts: the same upper word with a lower word one less fits.
+    set(&mut registers, u32::MAX >> QMD_ADDRESS_SHIFT, u32::MAX - 1);
+    let start = u64::MAX - (2 * qmd_bytes - 1);
+    assert_eq!(inline_qmd_range(&registers), Some(start..start + qmd_bytes));
+}
+
+#[test]
+fn a_present_with_no_space_and_a_bad_format_is_no_present_space() {
+    // Both faults at once: the missing present space is reported first.
+    let mut rig = Rig::new();
+    let bad = present().replace("format=1", "format=2");
+    let entry = parse_text(&bad).unwrap();
+    assert_eq!(rig.exec.apply(&entry[0]), Err(ExecError::NoPresentSpace));
 }

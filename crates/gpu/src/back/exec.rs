@@ -23,7 +23,8 @@
 //!   inline-to-memory ([`crate::channel::initial_binding`], row 49), with no `Bind` entry.
 //!   A class other than the five below can be bound but gets no engine and no mirror, so a
 //!   guest binding many classes costs nothing; its words are counted
-//!   ([`ExecCounters::unhandled_words`]) and dropped.
+//!   ([`ExecCounters::unhandled_words`]) and dropped. [`Executor::remove_channel`] forgets a
+//!   channel once its draw path's host objects are sure to outlive the lists that used them.
 //! - **One QMD table for every channel** ([`QmdTable`], row 84), read through the signalling
 //!   channel's memory.
 //! - The pipeline-key cache, the compute path's host shaders, the readback ids, and the fence
@@ -83,11 +84,13 @@
 //!
 //! When a copy reads or partly overwrites memory the texture cache holds a GPU-modified image
 //! of ([`CopySink::make_current`](crate::back::copy::CopySink::make_current), [`TextureCache::needs_write_back`]), the image is written
-//! back first: its readbacks are recorded, the open list is closed ([`CloseReason::CatchUp`]),
-//! the executor waits for it ([`Backend::wait`], at most [`ExecConfig::catch_up`]) and writes
-//! the readbacks to guest memory ([`TextureCache::finish_write_back`]); then the copy runs on the
-//! CPU. A write-back that fails is logged and counted ([`ExecCounters::write_back_failures`]),
-//! and the copy runs on what guest memory holds.
+//! back first: its readbacks are recorded, the open list is closed and waited for, at most
+//! [`ExecConfig::catch_up`], and completion runs ([`Fences::catch_up`], the same wait as the
+//! conditional-render catch-up's); then the readbacks are written to guest memory
+//! ([`TextureCache::finish_write_back`]) and the copy runs on the CPU
+//! (`tests::a_write_back_writes_the_drawn_bytes_before_the_copy_reads_them`). A write-back that
+//! fails is logged and counted ([`ExecCounters::write_back_failures`]), and the copy runs on
+//! what guest memory holds.
 //!
 //! **This departs from the issue's scope, for the owner.** Issue #330 asks for "copies, inline
 //! writes and 2D to G11, using the host copy or blit command when G17 holds either surface",
@@ -105,7 +108,17 @@
 //! its 3D class, and every channel's before a `Syncpoint`, `Marker` or `Present`, so the work
 //! after them in the stream comes after the draw. A **divergence**, and an owner question: a
 //! ring entry for the end of a macro would let the back draw them where Eden-NX2 does.
-//! Pinned by `tests::deferred_instances_are_drawn_before_the_channels_next_release`.
+//! Pinned by `tests::deferred_instances_are_drawn_before_the_channels_next_release` and, for a
+//! marker, a syncpoint, a DMA word and an inline-to-memory word, by
+//! `tests::deferred_instances_are_drawn_before_each_boundary`.
+//!
+//! A deferred draw that fails (a topology only checked when it is drawn, a non-finite
+//! viewport) does not stop the entry that drew it: the release, increment or marker is still
+//! attached, the bind still applied, the list still closed and the word still handed to its
+//! engine, since one channel's bad draw must not drop another channel's fence or ordered
+//! update. The entry's own error is returned first; the deferred draw's is returned when the
+//! entry's own work succeeded, and logged and counted otherwise
+//! (`tests::a_failed_deferred_draw_does_not_stop_the_entry_after_it`).
 //!
 //! # Conditional rendering
 //!
@@ -195,12 +208,12 @@ use crate::back::draw::shaders::{HostShaders, ShaderLookup};
 use crate::back::draw::{DrawContext, DrawError, Draws, Outcome, WaitWhileCompiling};
 use crate::back::fence::{CloseReason, FenceError, FencedAction, Fences, Settled};
 use crate::back::pipeline::PipelineCache;
-use crate::back::qmd::{LAST_INLINE_QMD_METHOD, QMD_ADDRESS_SHIFT, QMD_BYTES, QmdError, QmdTable};
+use crate::back::qmd::{LAST_INLINE_QMD_METHOD, QMD_BYTES, QmdError, QmdTable, inline_qmd_address};
 use crate::back::readback::ReadbackIds;
 use crate::back::state::{Mirror, StateError};
 use crate::back::texture::{TextureCache, TextureError};
 use crate::channel::initial_binding;
-use crate::classes::{cl902d, cla140, clc7b5, clc7c0, clc797};
+use crate::classes::{Method, cl902d, cla140, clc7b5, clc7c0, clc797};
 use crate::front::OrderedTable;
 use crate::interface::{AsId, ChannelId, PresentRequest};
 use crate::memory::GpuMemory;
@@ -548,12 +561,43 @@ impl Executor {
         Ok(())
     }
 
-    /// Forgets channel `channel` and its engines; `false` if it was not known.
-    pub fn remove_channel(&mut self, channel: ChannelId) -> bool {
+    /// Forgets channel `channel` and its engines; `Ok(false)` if it was not known.
+    ///
+    /// When the channel has a 3D engine, its deferred instances are drawn first, and the open
+    /// list, if it holds commands, is closed ([`CloseReason::ChannelRemoved`]) and the draw
+    /// path told of the newest fence submitted ([`Draws::submitted`]): the host objects the draw
+    /// path destroys when it is dropped (its constants buffer, samplers and shaders) are then
+    /// destroyed after every list that used them
+    /// (`tests::a_removed_channels_draw_path_is_destroyed_after_the_list_that_used_it`). The
+    /// channel is forgotten whatever the error.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecError::Fence`] when closing the list failed, else the deferred draw's error; when
+    /// both failed, the deferred draw's is logged and counted.
+    pub fn remove_channel(&mut self, channel: ChannelId) -> Result<bool, ExecError> {
+        let Some(state) = self.channels.get(&channel) else {
+            return Ok(false);
+        };
+        let mut result = Ok(());
+        if state.engines.contains_key(&ClassId(clc797::CLASS)) {
+            let deferred = self.flush_deferred(Some(channel));
+            let own = self.close_list(CloseReason::ChannelRemoved);
+            self.after_fences();
+            result = self.then_deferred(own, deferred);
+        }
         if self.last_drawer.is_some_and(|(c, _)| c == channel) {
             self.last_drawer = None;
         }
-        self.channels.remove(&channel).is_some()
+        let newest = self.fences.newest_submitted();
+        if let Some(mut state) = self.channels.remove(&channel) {
+            for engine in state.engines.values_mut() {
+                if let Role::ThreeD { draws, .. } = &mut engine.role {
+                    draws.submitted(newest);
+                }
+            }
+        }
+        result.map(|()| true)
     }
 
     /// Names the address space presents read their images through (module docs, "Presents").
@@ -695,55 +739,96 @@ impl Executor {
             } => self.words(*channel, *class, *method, words),
             RingEntry::Release { channel, release } => {
                 let space = self.space_of(*channel)?;
-                self.flush_deferred(Some(*channel))?;
-                let memory = self.memory(space)?;
-                self.fences.attach(FencedAction::Release {
-                    memory,
-                    space,
-                    release: *release,
-                })?;
-                Ok(())
+                let deferred = self.flush_deferred(Some(*channel));
+                let own = self.memory(space).and_then(|memory| {
+                    self.attach(FencedAction::Release {
+                        memory,
+                        space,
+                        release: *release,
+                    })
+                });
+                self.then_deferred(own, deferred)
             }
             RingEntry::Syncpoint { id } => {
-                self.flush_deferred(None)?;
-                self.fences.attach(FencedAction::Increment(*id))?;
-                Ok(())
+                let deferred = self.flush_deferred(None);
+                let own = self.attach(FencedAction::Increment(*id));
+                self.then_deferred(own, deferred)
             }
             RingEntry::Marker { token } => {
-                self.flush_deferred(None)?;
+                let deferred = self.flush_deferred(None);
                 let ordered = self.ordered.take(*token);
-                self.fences.attach(FencedAction::Marker {
+                let own = self.attach(FencedAction::Marker {
                     token: *token,
                     ordered,
-                })?;
-                Ok(())
+                });
+                self.then_deferred(own, deferred)
             }
             RingEntry::WaitForIdle { channel } => {
                 self.space_of(*channel)?;
-                self.flush_deferred(Some(*channel))?;
-                self.fences.close(CloseReason::WaitForIdle)?;
-                Ok(())
+                let deferred = self.flush_deferred(Some(*channel));
+                let own = self.close_list(CloseReason::WaitForIdle);
+                self.then_deferred(own, deferred)
             }
             RingEntry::SetReference { channel, .. } => {
                 self.space_of(*channel)?;
-                self.flush_deferred(Some(*channel))?;
-                self.fences.close(CloseReason::SetReference)?;
-                Ok(())
+                let deferred = self.flush_deferred(Some(*channel));
+                let own = self.close_list(CloseReason::SetReference);
+                self.then_deferred(own, deferred)
             }
             RingEntry::Invalidate { channel, .. } => {
                 let space = self.space_of(*channel)?;
-                self.flush_deferred(Some(*channel))?;
-                self.drain(space)
+                let deferred = self.flush_deferred(Some(*channel));
+                let own = self.drain(space);
+                self.then_deferred(own, deferred)
             }
             RingEntry::Present(request) => {
-                self.flush_deferred(None)?;
-                self.present(request)
+                let deferred = self.flush_deferred(None);
+                let own = self.present(request);
+                self.then_deferred(own, deferred)
             }
             RingEntry::CaptureControl(_) => {
                 self.counters.captures = self.counters.captures.saturating_add(1);
                 Ok(())
             }
         }
+    }
+
+    /// Attaches `action` to the fence path.
+    fn attach(&mut self, action: FencedAction) -> Result<(), ExecError> {
+        self.fences.attach(action)?;
+        Ok(())
+    }
+
+    /// Closes the open list for `reason`.
+    fn close_list(&mut self, reason: CloseReason) -> Result<(), ExecError> {
+        self.fences.close(reason)?;
+        Ok(())
+    }
+
+    /// The outcome of an entry whose deferred instances were drawn before its own work (module
+    /// docs, "Deferred instanced draws"): `own`, the entry's own work's result, comes first,
+    /// then `deferred`, the deferred draw's. A deferred draw that failed did not stop the
+    /// entry's own work. When both failed, only `own` is returned, so the deferred failure is
+    /// logged at debug level and counted ([`ExecCounters::failed`]) here.
+    fn then_deferred(
+        &mut self,
+        own: Result<(), ExecError>,
+        deferred: Result<(), ExecError>,
+    ) -> Result<(), ExecError> {
+        match (own, deferred) {
+            (Ok(()), deferred) => deferred,
+            (Err(own), Ok(())) => Err(own),
+            (Err(own), Err(deferred)) => {
+                self.deferred_failed(&deferred);
+                Err(own)
+            }
+        }
+    }
+
+    /// Logs and counts a deferred draw's failure that is not returned.
+    fn deferred_failed(&mut self, error: &ExecError) {
+        self.counters.failed = self.counters.failed.saturating_add(1);
+        tracing::debug!(%error, "the back could not draw a channel's deferred instances");
     }
 
     /// The address space of `channel`.
@@ -769,7 +854,19 @@ impl Executor {
         subchannel: Subchannel,
         class: ClassId,
     ) -> Result<(), ExecError> {
-        self.flush_deferred(Some(channel))?;
+        self.space_of(channel)?;
+        let deferred = self.flush_deferred(Some(channel));
+        let own = self.set_binding(channel, subchannel, class);
+        self.then_deferred(own, deferred)
+    }
+
+    /// The binding change of a `Bind`, once the channel's deferred instances are drawn.
+    fn set_binding(
+        &mut self,
+        channel: ChannelId,
+        subchannel: Subchannel,
+        class: ClassId,
+    ) -> Result<(), ExecError> {
         let state = self
             .channels
             .get_mut(&channel)
@@ -832,7 +929,8 @@ impl Executor {
     /// (module docs, "Deferred instanced draws").
     ///
     /// Every channel's deferred instances are drawn even when one fails; the first failure is
-    /// returned. Allocates only when some channel has deferred instances.
+    /// returned, and each later one logged and counted ([`Executor::deferred_failed`]).
+    /// Allocates only when some channel has deferred instances.
     fn flush_deferred(&mut self, channel: Option<ChannelId>) -> Result<(), ExecError> {
         let Some(channel) = channel else {
             let deferred: Vec<ChannelId> = self
@@ -843,10 +941,12 @@ impl Executor {
                 .collect();
             let mut first_error = None;
             for channel in deferred {
-                if let Err(error) = self.flush_deferred(Some(channel))
-                    && first_error.is_none()
-                {
-                    first_error = Some(error);
+                if let Err(error) = self.flush_deferred(Some(channel)) {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    } else {
+                        self.deferred_failed(&error);
+                    }
                 }
             }
             return first_error.map_or(Ok(()), Err);
@@ -888,10 +988,24 @@ impl Executor {
             self.counters.unhandled_words = self.counters.unhandled_words.saturating_add(count);
             return Ok(());
         }
-        if class.0 != clc797::CLASS {
-            self.flush_deferred(Some(channel))?;
-        }
-        let method = u32::from(method);
+        let deferred = if class.0 == clc797::CLASS {
+            Ok(())
+        } else {
+            self.flush_deferred(Some(channel))
+        };
+        let own = self.engine_words(channel, class, u32::from(method), words);
+        self.then_deferred(own, deferred)
+    }
+
+    /// The words of a `Write` or `Run` to a class with an engine, once the channel's deferred
+    /// instances are drawn.
+    fn engine_words(
+        &mut self,
+        channel: ChannelId,
+        class: ClassId,
+        method: u32,
+        words: &[u32],
+    ) -> Result<(), ExecError> {
         if class.0 == clc797::CLASS && method == clc797::LOAD_ROOT_TABLE.method() {
             return self.root_table(channel, words);
         }
@@ -1003,7 +1117,6 @@ impl Executor {
             fences,
             shaders,
             readbacks,
-            backend,
             config,
             counters,
             scratch,
@@ -1031,7 +1144,6 @@ impl Executor {
             shaders: &mut **shaders,
             fences,
             readbacks,
-            backend: &**backend,
             catch_up: config.catch_up,
             counters,
             scratch,
@@ -1242,10 +1354,10 @@ impl Executor {
             error: None,
         };
         let result = qmds.compute_method(method, registers, &*memory, &mut sink);
-        // The inline QMD was written even when nothing ran.
-        if result.is_ok() {
-            sink.written();
-        }
+        // The inline QMD may have been written whatever the result: nothing ran, or the
+        // scheduler refused it after the write (a wrong version, a full table) with no callback.
+        // Dropping bytes that were not written only costs a later upload.
+        sink.written();
         let fence_error = sink.error.take();
         if sink.counters.dispatches != dispatched {
             // A dispatch between draws: the next draw sets its targets again.
@@ -1330,12 +1442,64 @@ enum DrawStep {
     Flush,
 }
 
-/// Whether a word to 3D method `method` may start a draw (module docs).
+/// The 3D methods a word to which may start a draw (module docs).
+const DRAW_STARTER_TABLES: [&[&Method]; 2] = [&DRAW_METHODS, &UNHANDLED_METHODS];
+
+/// The bits in one word of [`DRAW_STARTERS`].
+const STARTER_WORD_BITS: usize = u64::BITS as usize;
+
+/// One more than the highest method number of [`DRAW_STARTER_TABLES`].
+const fn draw_starter_end() -> usize {
+    let mut end = 0;
+    let mut t = 0;
+    while t < DRAW_STARTER_TABLES.len() {
+        let table = DRAW_STARTER_TABLES[t];
+        let mut i = 0;
+        while i < table.len() {
+            let next = table[i].method() as usize + 1;
+            if next > end {
+                end = next;
+            }
+            i += 1;
+        }
+        t += 1;
+    }
+    end
+}
+
+/// The words of [`DRAW_STARTERS`].
+const DRAW_STARTER_WORDS: usize = draw_starter_end().div_ceil(STARTER_WORD_BITS);
+
+/// [`DRAW_STARTER_TABLES`] as a bitset by method number, built at compile time.
+const fn draw_starters() -> [u64; DRAW_STARTER_WORDS] {
+    let mut bits = [0; DRAW_STARTER_WORDS];
+    let mut t = 0;
+    while t < DRAW_STARTER_TABLES.len() {
+        let table = DRAW_STARTER_TABLES[t];
+        let mut i = 0;
+        while i < table.len() {
+            let method = table[i].method() as usize;
+            bits[method / STARTER_WORD_BITS] |= 1 << (method % STARTER_WORD_BITS);
+            i += 1;
+        }
+        t += 1;
+    }
+    bits
+}
+
+/// The methods of [`DRAW_STARTER_TABLES`], one bit each: every word written to the 3D class is
+/// looked up here, so this is one index, not a scan of the tables.
+const DRAW_STARTERS: [u64; DRAW_STARTER_WORDS] = draw_starters();
+
+/// Whether a word to 3D method `method` may start a draw (module docs). Checked against the
+/// tables by `tests::starts_draw_is_exactly_the_draw_path_tables`.
 fn starts_draw(method: u32) -> bool {
-    DRAW_METHODS
-        .iter()
-        .chain(UNHANDLED_METHODS.iter())
-        .any(|m| m.method() == method)
+    let Ok(index) = usize::try_from(method) else {
+        return false;
+    };
+    DRAW_STARTERS
+        .get(index / STARTER_WORD_BITS)
+        .is_some_and(|word| (word >> (index % STARTER_WORD_BITS)) & 1 != 0)
 }
 
 /// Tells `space`'s caches of `newest`, the newest fence submitted, if they have not been told
@@ -1364,18 +1528,10 @@ fn catch_up(
     }
 }
 
-/// The bytes the inline QMD is written to: `SET_INLINE_QMD_ADDRESS_A/B` shifted by
-/// [`QMD_ADDRESS_SHIFT`], [`QMD_BYTES`] long, as [`QmdTable::compute_method`] writes them;
-/// `None` when the address does not fit in 64 bits (the scheduler refuses it) or the range would
-/// pass the end of the address space.
+/// The bytes the inline QMD is written to: [`QMD_BYTES`] from [`inline_qmd_address`], the
+/// address [`QmdTable::compute_method`] writes them at; `None` when the address does not fit in
+/// 64 bits (the scheduler refuses it) or the range would pass the end of the address space.
 fn inline_qmd_range(registers: &[u32]) -> Option<Range<u64>> {
-    let register = |method: u32| registers.get(usize::try_from(method).ok()?).copied();
-    let upper = register(clc7c0::SET_INLINE_QMD_ADDRESS_A.method())?;
-    let lower = register(clc7c0::SET_INLINE_QMD_ADDRESS_B.method())?;
-    let shifted = (u64::from(upper) << u32::BITS) | u64::from(lower);
-    if shifted.leading_zeros() < QMD_ADDRESS_SHIFT {
-        return None;
-    }
-    let start = shifted << QMD_ADDRESS_SHIFT;
+    let start = inline_qmd_address(registers).ok()?;
     Some(start..start.checked_add(u64::try_from(QMD_BYTES).ok()?)?)
 }

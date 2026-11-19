@@ -273,6 +273,27 @@ fn settle_waits_for_the_newest_list_holding_a_release() {
 }
 
 #[test]
+fn settle_waits_for_the_newest_list_holding_a_release_not_the_oldest() {
+    // Two lists hold a release of the range; only the older completes. Waiting for the older
+    // would report the catch-up done while the newer release is still pending.
+    let mut r = rig();
+    let first = r.list_with_release(SEM, 1);
+    let second = r.list_with_release(SEM, 2);
+    assert!(first < second);
+    r.backend.finish(first);
+    assert_eq!(
+        r.fences
+            .settle(SPACE, SEM..SEM + 1, Duration::from_millis(1)),
+        Err(FenceError::CatchUpTimedOut {
+            fence: second.get()
+        })
+    );
+    // The older list's release was performed on the way; the newer one waits.
+    assert_eq!(word(&r.mem, SEM), 1);
+    assert_eq!(r.fences.lists_in_flight(), 1);
+}
+
+#[test]
 fn a_settle_that_times_out_is_the_exact_error_and_performs_what_completed() {
     let mut r = rig();
     let first = r.list_with_release(SEM2, 1);
@@ -323,4 +344,28 @@ fn settle_sees_a_range_at_both_edges_of_a_release() {
             "{range:x?}"
         );
     }
+}
+
+#[test]
+fn catch_up_closes_the_open_list_and_waits_for_the_newest_submitted() {
+    let mut r = rig();
+    let before = word(&r.mem, SEM);
+    r.fences.record(command(1)).unwrap();
+    let action = r.action(four(SEM, 5));
+    r.fences.attach(action).unwrap();
+    // The host never finishes: the exact error, with the list closed and still in flight.
+    assert_eq!(
+        r.fences.catch_up(Duration::from_millis(1)),
+        Err(FenceError::CatchUpTimedOut { fence: 1 })
+    );
+    assert_eq!(r.fences.counters().closed.catch_up, 1);
+    assert_eq!(r.fences.lists_in_flight(), 1);
+    assert_eq!(word(&r.mem, SEM), before);
+    // Once it finishes, a catch-up with nothing open waits for the newest list submitted and
+    // performs its release.
+    r.backend.finish(FenceValue::new(1));
+    assert_eq!(r.fences.catch_up(PATIENCE), Ok(released(1)));
+    assert_eq!(r.fences.counters().closed.catch_up, 1);
+    assert_eq!(word(&r.mem, SEM), 5);
+    assert_eq!(r.fences.lists_in_flight(), 0);
 }

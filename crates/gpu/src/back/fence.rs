@@ -45,8 +45,10 @@
 //!   `SET_REFERENCE` ([`CloseReason::SetReference`], decided by the owner on 2026-11-18): the
 //!   executor (slice G19) calls [`Fences::close`];
 //! - a catch-up ([`CloseReason::CatchUp`]): the executor must see the host GPU finish the open
-//!   list before it goes on, for a write-back's readbacks or a conditional-render report a
-//!   release will write ([`Fences::settle`], below);
+//!   list before it goes on, for a write-back's readbacks ([`Fences::catch_up`]) or a
+//!   conditional-render report a release will write ([`Fences::settle`], below);
+//! - a channel removed ([`CloseReason::ChannelRemoved`]): the executor closes a list its 3D
+//!   engine may have drawn into before that engine's draw path destroys its host objects;
 //! - a fenced release one of whose 32-bit words has an unlatched registered waiter of the
 //!   release's address space ([`CloseReason::Waiter`]): [`Fences::attach`] closes after
 //!   attaching it, so the parked channel is not left waiting on recording. An 8-byte release
@@ -124,7 +126,9 @@
 //! ([`CloseReason::CatchUp`]), waits for the newest list in flight that holds one
 //! ([`starquake_render::Backend::wait`], bounded by its caller's timeout), and runs completion.
 //! A wait that times out is [`FenceError::CatchUpTimedOut`], after completion has performed what
-//! did complete. Pinned in `fence/tests/seams.rs`.
+//! did complete. [`Fences::catch_up`] is the same wait for everything recorded so far: it closes
+//! the open list and waits for the newest list submitted (the write-back before a copy). Pinned
+//! in `fence/tests/seams.rs`.
 //!
 //! **The debugging switch.** Under [`Mode::AtRecord`] every action is performed when it is
 //! attached, whatever is recorded or in flight (the owner's ruling: "performing at record time is
@@ -324,8 +328,11 @@ pub enum CloseReason {
     SetReference,
     /// The executor must see the host GPU finish the open list before it goes on: a write-back
     /// whose readbacks the list holds, or a conditional-render catch-up whose release the list
-    /// holds ([`Fences::settle`]).
+    /// holds ([`Fences::settle`], [`Fences::catch_up`]).
     CatchUp,
+    /// A channel with a 3D engine was removed: the executor closes the list its draw path may
+    /// have recorded into, so the host objects the draw path destroys outlive it.
+    ChannelRemoved,
 }
 
 /// When fenced actions are performed.
@@ -394,10 +401,12 @@ pub enum FenceError {
     /// The ring failed.
     #[error(transparent)]
     Ring(#[from] PopError),
-    /// The render backend's wait for a catch-up failed ([`Fences::settle`]).
+    /// The render backend's wait for a catch-up failed ([`Fences::settle`],
+    /// [`Fences::catch_up`]).
     #[error("the render backend's wait for a catch-up failed: {0}")]
     Wait(RenderError),
-    /// The host GPU did not reach the fence a catch-up waited for in time ([`Fences::settle`]).
+    /// The host GPU did not reach the fence a catch-up waited for in time ([`Fences::settle`],
+    /// [`Fences::catch_up`]).
     #[error("the host GPU did not finish command list {fence} in time for a catch-up")]
     CatchUpTimedOut {
         /// The fence value waited for.
@@ -443,6 +452,8 @@ pub struct ClosedCounts {
     pub set_reference: u64,
     /// [`CloseReason::CatchUp`].
     pub catch_up: u64,
+    /// [`CloseReason::ChannelRemoved`].
+    pub channel_removed: u64,
 }
 
 impl ClosedCounts {
@@ -455,6 +466,7 @@ impl ClosedCounts {
             CloseReason::Elapsed => &mut self.elapsed,
             CloseReason::SetReference => &mut self.set_reference,
             CloseReason::CatchUp => &mut self.catch_up,
+            CloseReason::ChannelRemoved => &mut self.channel_removed,
         };
         *slot = slot.saturating_add(1);
     }
@@ -703,11 +715,18 @@ impl Fences {
         if commands.commands.is_empty() {
             return Ok(());
         }
+        self.record_with(|open| open.commands.append(&mut commands.commands))
+    }
+
+    /// Adds commands to the open list with `add`, then closes it if it has recorded for
+    /// [`CLOSE_AFTER`]: the open time and the close rule of [`Fences::record`] and
+    /// [`Fences::record_list`], in one place.
+    fn record_with(&mut self, add: impl FnOnce(&mut CommandList)) -> Result<(), FenceError> {
         let now = self.env.clock.elapsed();
         if self.open.commands.is_empty() {
             self.opened_at = now;
         }
-        self.open.commands.append(&mut commands.commands);
+        add(&mut self.open);
         if now.saturating_sub(self.opened_at) >= CLOSE_AFTER {
             self.close(CloseReason::Elapsed)?;
         }
@@ -726,8 +745,8 @@ impl Fences {
     /// # Errors
     ///
     /// [`FenceError::Submit`] when closing failed; [`FenceError::Wait`] when the backend's wait
-    /// failed or `timeout` passed first. Completion runs in every case once anything was waited
-    /// for, so what did complete is performed.
+    /// failed; [`FenceError::CatchUpTimedOut`] when `timeout` passed first. Completion runs in
+    /// every case once anything was waited for, so what did complete is performed.
     pub fn settle(
         &mut self,
         space: AsId,
@@ -752,10 +771,38 @@ impl Fences {
         else {
             return Ok(Settled::Nothing);
         };
+        self.wait_and_complete(fence, timeout)
+            .map(Settled::Performed)
+    }
+
+    /// Closes the open list ([`CloseReason::CatchUp`]) and waits at most `timeout` for the
+    /// newest list submitted, which then holds everything recorded so far (the list closed here,
+    /// or one [`Fences::record_list`] closed for the elapsed time, when this had nothing to
+    /// submit), then runs completion: the write-back before a copy, whose readbacks the executor
+    /// has just recorded (its module docs, "Copies of images the texture cache holds").
+    ///
+    /// # Errors
+    ///
+    /// As [`Fences::settle`]: [`FenceError::Submit`], [`FenceError::Wait`] or
+    /// [`FenceError::CatchUpTimedOut`]. Completion runs once the wait has returned, whatever it
+    /// returned.
+    pub fn catch_up(&mut self, timeout: Duration) -> Result<Report, FenceError> {
+        self.close(CloseReason::CatchUp)?;
+        self.wait_and_complete(self.newest, timeout)
+    }
+
+    /// Waits at most `timeout` for `fence`, then runs completion whatever the wait returned, so
+    /// what did complete is performed: the wait of [`Fences::settle`] and
+    /// [`Fences::catch_up`].
+    fn wait_and_complete(
+        &mut self,
+        fence: FenceValue,
+        timeout: Duration,
+    ) -> Result<Report, FenceError> {
         let waited = self.backend.wait(fence, timeout);
         let report = self.complete();
         match waited {
-            Ok(WaitOutcome::Reached) => Ok(Settled::Performed(report)),
+            Ok(WaitOutcome::Reached) => Ok(report),
             Ok(WaitOutcome::TimedOut) => Err(FenceError::CatchUpTimedOut { fence: fence.get() }),
             Err(error) => Err(FenceError::Wait(error)),
         }
@@ -779,15 +826,7 @@ impl Fences {
     /// Records `command` on the open list, and closes the list if it has recorded for
     /// [`CLOSE_AFTER`] (module docs, "Closing the open list").
     pub fn record(&mut self, command: Command) -> Result<(), FenceError> {
-        let now = self.env.clock.elapsed();
-        if self.open.commands.is_empty() {
-            self.opened_at = now;
-        }
-        self.open.push(command);
-        if now.saturating_sub(self.opened_at) >= CLOSE_AFTER {
-            self.close(CloseReason::Elapsed)?;
-        }
-        Ok(())
+        self.record_with(|open| open.push(command))
     }
 
     /// Attaches `action` by the empty-fence rule, or performs it at once under

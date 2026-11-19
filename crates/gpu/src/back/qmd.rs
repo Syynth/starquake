@@ -359,6 +359,32 @@ fn shifted_address(word: u32) -> u64 {
     u64::from(word) << QMD_ADDRESS_SHIFT
 }
 
+/// The address the inline QMD is written to: `SET_INLINE_QMD_ADDRESS_A/B` as one 64-bit value
+/// shifted left by [`QMD_ADDRESS_SHIFT`] (module docs, the inline QMD); a register past the
+/// end of `registers` reads as 0. The one derivation of it: [`QmdTable::compute_method`] writes
+/// the inline QMD there, and the executor (slice G19) drops those bytes from its caches.
+///
+/// # Errors
+///
+/// [`QmdError::InlineAddress`] when the shifted address does not fit in 64 bits (a listed
+/// divergence, `divergence_inline_address_overflow_is_refused`).
+pub(crate) fn inline_qmd_address(registers: &[u32]) -> Result<u64, QmdError> {
+    let register = |method: u32| {
+        usize::try_from(method)
+            .ok()
+            .and_then(|index| registers.get(index))
+            .copied()
+            .unwrap_or(0)
+    };
+    let upper = register(SET_INLINE_QMD_ADDRESS_A.method());
+    let lower = register(SET_INLINE_QMD_ADDRESS_B.method());
+    let shifted = (u64::from(upper) << u32::BITS) | u64::from(lower);
+    if shifted.leading_zeros() < QMD_ADDRESS_SHIFT {
+        return Err(QmdError::InlineAddress { upper });
+    }
+    Ok(shifted << QMD_ADDRESS_SHIFT)
+}
+
 /// What a QMD asks the GPU to run, as `DispatchNativeCompute` reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Dispatch {
@@ -806,13 +832,7 @@ impl QmdTable {
             let address = shifted_address(register(SEND_PCAS_A.method()));
             return self.signal(address, action, memory, sink);
         }
-        let upper = register(SET_INLINE_QMD_ADDRESS_A.method());
-        let lower = register(SET_INLINE_QMD_ADDRESS_B.method());
-        let shifted = (u64::from(upper) << u32::BITS) | u64::from(lower);
-        if shifted.leading_zeros() < QMD_ADDRESS_SHIFT {
-            return Err(QmdError::InlineAddress { upper });
-        }
-        let address = shifted << QMD_ADDRESS_SHIFT;
+        let address = inline_qmd_address(registers)?;
         let mut words = [0u32; QMD_WORDS];
         for (word, method) in words.iter_mut().zip(LOAD_INLINE_QMD_DATA.method()..) {
             *word = register(method);
