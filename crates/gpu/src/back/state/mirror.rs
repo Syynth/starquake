@@ -98,6 +98,18 @@ pub struct ConstantBufferBinding {
     pub size: u32,
 }
 
+/// The constant buffer `SET_CONSTANT_BUFFER_SELECTOR_A` to `_C` select now
+/// ([`Mirror::constant_buffer_selector`]): what a bind records and where a constant-buffer load
+/// writes (Eden-NX2's `regs.const_buffer.Address()` and `regs.const_buffer.size`, read by
+/// `ProcessCBBind` and `ProcessCBMultiData`, `eden-nx2/src/video_core/engines/maxwell_3d.cpp`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ConstantBufferSelector {
+    /// The GPU address: `ADDRESS_UPPER` (`_B`, 7:0) above `ADDRESS_LOWER` (`_C`).
+    pub address: u64,
+    /// The size in bytes: `SIZE` (`_A`, 16:0).
+    pub size: u32,
+}
+
 /// The back thread's mirror of one class's registers on one channel (gpu-protocol spec,
 /// "Mirrors and dirty flags"): written only from the front's `Write` and `Run` entries, never by
 /// the back itself (owner's decision 1), with a dirty bit per state group. The `state` module
@@ -166,6 +178,21 @@ impl Mirror {
     /// Register `method`'s value; `None` outside the file.
     pub fn value(&self, method: u32) -> Option<u32> {
         self.values.get(usize::try_from(method).ok()?).copied()
+    }
+
+    /// The constant buffer the selector registers name now. The bits above each register's
+    /// field are ignored; a register outside the file (every class but 3D) reads as zero.
+    pub fn constant_buffer_selector(&self) -> ConstantBufferSelector {
+        let register = |method: &Method| self.value(method.method()).unwrap_or(0);
+        let upper = clc797::SET_CONSTANT_BUFFER_SELECTOR_B_ADDRESS_UPPER
+            .get(register(&clc797::SET_CONSTANT_BUFFER_SELECTOR_B));
+        let lower = clc797::SET_CONSTANT_BUFFER_SELECTOR_C_ADDRESS_LOWER
+            .get(register(&clc797::SET_CONSTANT_BUFFER_SELECTOR_C));
+        ConstantBufferSelector {
+            address: join(upper, lower),
+            size: clc797::SET_CONSTANT_BUFFER_SELECTOR_A_SIZE
+                .get(register(&clc797::SET_CONSTANT_BUFFER_SELECTOR_A)),
+        }
     }
 
     /// The dirty groups.
@@ -337,17 +364,12 @@ impl Mirror {
     /// Records a bind of the selected constant buffer to bind group `group` (Eden-NX2's
     /// `ProcessCBBind`).
     fn bind(&mut self, group: usize, word: u32) {
-        let register = |method: &Method| self.value(method.method()).unwrap_or(0);
-        let upper = clc797::SET_CONSTANT_BUFFER_SELECTOR_B_ADDRESS_UPPER
-            .get(register(&clc797::SET_CONSTANT_BUFFER_SELECTOR_B));
-        let lower = clc797::SET_CONSTANT_BUFFER_SELECTOR_C_ADDRESS_LOWER
-            .get(register(&clc797::SET_CONSTANT_BUFFER_SELECTOR_C));
+        let selected = self.constant_buffer_selector();
         let binding = ConstantBufferBinding {
             valid: clc797::BIND_GROUP_CONSTANT_BUFFER_VALID.get(word)
                 == clc797::BIND_GROUP_CONSTANT_BUFFER_VALID_TRUE,
-            address: join(upper, lower),
-            size: clc797::SET_CONSTANT_BUFFER_SELECTOR_A_SIZE
-                .get(register(&clc797::SET_CONSTANT_BUFFER_SELECTOR_A)),
+            address: selected.address,
+            size: selected.size,
         };
         let slot = clc797::BIND_GROUP_CONSTANT_BUFFER_SHADER_SLOT.get(word);
         let Some(index) = u32::try_from(group)

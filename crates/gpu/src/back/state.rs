@@ -156,7 +156,9 @@ pub use group::{
     GroupKind, GroupSet, PIPELINES, SCISSORS, VERTEX_ATTRIBUTES, VERTEX_ATTRIBUTES_PER_HALF,
     VERTEX_STREAM_SIZES, VERTEX_STREAMS, VERTEX_STREAMS_PER_HALF, VIEWPORTS,
 };
-pub use mirror::{ConstantBufferBinding, Mirror, Reg, RunPositions, StateError};
+pub use mirror::{
+    ConstantBufferBinding, ConstantBufferSelector, Mirror, Reg, RunPositions, StateError,
+};
 pub use table::{GROUPS_3D, GROUPS_COMPUTE, GroupEntry, GroupMap, Marks, group_table};
 pub use views::{
     BindGroup, Blend, BlendPerTarget, ColorTarget, Compute, CtSelect, DepthStencil, IndexBuffer,
