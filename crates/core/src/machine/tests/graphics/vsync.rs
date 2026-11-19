@@ -262,18 +262,21 @@ fn ticked_guest(
 ///
 /// The median is what fails if the timer thread did not sleep to the clock's deadline
 /// (`Graphics::deadline` without it): a tick then waits for the next preemption turn, up to
-/// [`PREEMPTION_INTERVAL_NS`] later, so the median comes 4.3 to 5.9 ms late (19 of 20 runs of
-/// [`ROUNDS`] ticks on an Apple Silicon Mac at or over the bound), against 0.03 to 0.06 ms with
-/// it (30 runs). It times the timer thread's own tick, read from the recorded note, and not the
-/// guest's wake, which also waits for a second host thread (the core's) and was seen over 5 ms
-/// late, by the median, on a loaded host.
+/// [`PREEMPTION_INTERVAL_NS`] later, so the median comes 4.9 to 6.1 ms late (18 of 20 runs of
+/// [`ROUNDS`] ticks on an Apple Silicon Mac at or over the bound), against a median of 0.06 ms
+/// with it, 0.8 ms at worst (30 runs, with other builds loading the Mac). The bound is not
+/// tightened for now (`observability.md`, "Stalls and host timing"). It times the timer thread's
+/// own tick, read from the recorded note, and not the guest's wake, which also waits for a
+/// second host thread (the core's) and was seen over 5 ms late, by the median, on a loaded host.
 ///
 /// It is also what fails where the host ends the timer thread's timed waits late on purpose
 /// (macOS timer coalescing; `machine/timer.rs`, "Sleeping to a deadline") and the thread asks
 /// for each sleep in one wait, as it did before it measured that lateness: CI's hosted macOS
 /// runners then saw medians of 14 to 44 ms and the latest tick 33 to 69 ms late (12 runs), and
 /// the Mac under `taskpolicy -c utility` failed 20 runs of 20; with the waits sized by the
-/// measured lateness it passed 30 of 30 there, the worst median 0.19 ms.
+/// measured lateness, medians there were 0.2 to 0.65 ms (20 runs on an otherwise idle Mac). A
+/// timer thread starved by busier work at a higher priority is late all the same: under the
+/// clamp while other builds kept the Mac's load near 100, 29 runs of 30 failed.
 #[test]
 fn the_timer_thread_ticks_the_vsync_clock_and_wakes_a_listener_s_waiter() {
     let guest = Guest::new(&programs::hello().unwrap());

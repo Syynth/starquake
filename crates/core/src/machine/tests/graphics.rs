@@ -707,7 +707,11 @@ fn page_guest(script: &Script, page: &Arc<FlatMemory>, writable: u64) -> Scripte
 /// The thread must also sleep *to* the bound where the host ends timed waits late on purpose
 /// (macOS timer coalescing; `machine/timer.rs`, "Sleeping to a deadline"). Asking for each sleep
 /// in one wait, as it did before it measured that lateness, CI's hosted macOS runners saw
-/// medians of 5.07 to 5.19 ms by the guest's clock (held waits of 1.75 to 5.68 ms, 5 runs).
+/// medians of 5.07 to 5.19 ms by the guest's clock (held waits of 1.75 to 5.68 ms, 5 runs), and
+/// this test failed 17 runs of 20 under `taskpolicy -c utility` on an Apple Silicon Mac. With
+/// the waits sized by the measured lateness its median was 1.14 ms, 2.6 ms at worst (30 runs,
+/// with other builds loading the Mac); without the sleep to the page's deadline it failed 20
+/// runs of 20.
 #[test]
 fn a_held_page_request_is_answered_at_the_bound_by_the_timer_thread() {
     let guest = super::Guest::new(&page_program());
