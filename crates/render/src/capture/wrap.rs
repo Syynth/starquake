@@ -27,12 +27,12 @@
 //! and from then on forwards every call unrecorded. The file always closes well formed; the
 //! wrapped call's result is returned whatever happened to its record.
 
+use super::CaptureError;
 use super::record::{
     CapturedTarget, Create, CreateShader, CreateView, Created, Destroy, FrameResult,
     PipelineOutcome, PipelineResult, ReadbackResult, Record, Start, TargetRecord,
 };
 use super::write::{CaptureSink, CaptureWriter};
-use super::CaptureError;
 use crate::backend::{
     Backend, MemoryBudget, PipelineStatus, PresentFeedback, PresentTarget, Readback, WaitOutcome,
 };
@@ -106,7 +106,10 @@ impl CapturingBackend {
 
     /// Wraps `inner` around a writer that has written its `Start` (for a writer built with
     /// lowered [`super::CaptureLimits`]).
-    pub fn with_writer(inner: Arc<dyn Backend>, writer: CaptureWriter) -> Result<Self, CaptureError> {
+    pub fn with_writer(
+        inner: Arc<dyn Backend>,
+        writer: CaptureWriter,
+    ) -> Result<Self, CaptureError> {
         if writer.is_finished() {
             return Err(CaptureError::Finished);
         }
@@ -287,7 +290,8 @@ impl Backend for CapturingBackend {
                     }
                 }
             };
-            let (stage, entry, interface) = (desc.stage, desc.entry.clone(), desc.interface.clone());
+            let (stage, entry, interface) =
+                (desc.stage, desc.entry.clone(), desc.interface.clone());
             let result = self.inner.create_shader(desc);
             let rec = code.map(|code| {
                 Record::CreateShader(CreateShader {
@@ -308,7 +312,13 @@ impl Backend for CapturingBackend {
             if let ResourceId::Pipeline(id) = resource {
                 state.settled.remove(&id);
             }
-            ((), Some(Record::Destroy(Destroy { id: resource, after })))
+            (
+                (),
+                Some(Record::Destroy(Destroy {
+                    id: resource,
+                    after,
+                })),
+            )
         });
     }
 

@@ -7,31 +7,18 @@ use super::super::{
     Created, FrameResult, PipelineOutcome, PipelineResult, ReadbackResult, Record, RecordKind,
     ShaderCode, WaitSetting,
 };
-use super::{
-    Knobs, Spy, caps, naga, read, sampler_desc, shader, start, texture_desc, view_desc,
-};
-use crate::backend::{
-    Backend, MemoryBudget, PipelineStatus, PresentFeedback, PresentTarget, Readback, WaitOutcome,
-};
-use crate::caps::Caps;
+use super::{Knob, Spy, caps, naga, read, sampler_desc, shader, start, texture_desc, view_desc};
+use crate::backend::{Backend, PipelineStatus, PresentTarget, WaitOutcome};
 use crate::command::{
     BufferSlice, Command, CommandList, CopyRegion, Marker, PresentDesc, PresentTransform, Rect,
     StagingSlice,
 };
-use crate::error::RenderError;
-use crate::format::PixelFormat;
 use crate::frame::{Frame, FramePixels, FrameSink};
-use crate::id::{
-    BufferId, FenceValue, PipelineId, ReadbackId, ResourceId, SamplerId, ShaderId, TextureId,
-    ViewId,
-};
-use crate::pipeline::{ComputePipelineDesc, GraphicsPipelineDesc};
+use crate::id::{BufferId, FenceValue, PipelineId, ReadbackId, ResourceId, SamplerId};
+use crate::pipeline::ComputePipelineDesc;
 use crate::recording::RecordingBackend;
-use crate::resource::{
-    AddressMode, BorderColor, BufferDesc, BufferUsage, Extent3d, FilterMode, ReductionMode,
-    SamplerDesc, Swizzle, TextureDesc, TextureDimension, TextureUsage, ViewDesc, ViewDimension,
-};
-use crate::shader::{ShaderDesc, ShaderInterface, ShaderOrigin, ShaderSource, ShaderStage};
+use crate::resource::{BufferDesc, BufferUsage, Extent3d, TextureDesc};
+use crate::shader::{ShaderOrigin, ShaderSource, ShaderStage};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -39,7 +26,13 @@ use std::time::Duration;
 const MEMORY: u64 = 1 << 20;
 
 /// A recording backend wrapped in a capturing one, writing to a buffer.
-fn wrapped(limit: u64) -> (Arc<RecordingBackend>, Arc<CapturingBackend>, Arc<CaptureBuffer>) {
+fn wrapped(
+    limit: u64,
+) -> (
+    Arc<RecordingBackend>,
+    Arc<CapturingBackend>,
+    Arc<CaptureBuffer>,
+) {
     let inner = Arc::new(RecordingBackend::new(caps(), MEMORY));
     let buffer = Arc::new(CaptureBuffer::new());
     let dyn_inner: Arc<dyn Backend> = Arc::<RecordingBackend>::clone(&inner);
@@ -81,25 +74,53 @@ fn kinds(records: &[Record]) -> Vec<RecordKind> {
 const PIXELS: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 
 #[test]
-fn every_state_changing_call_is_recorded_in_order_with_its_result() {
+fn calls_that_change_nothing_are_forwarded_unrecorded() {
     let (inner, capture, buffer) = wrapped(u64::MAX);
-    tee(&inner, &capture);
-    let b: &dyn Backend = &*capture;
+    let backend: &dyn Backend = &*capture;
+    assert_eq!(backend.caps(), inner.caps());
+    assert_eq!(backend.budget(), inner.budget());
+    assert_eq!(backend.completed(), FenceValue::ZERO);
+    assert_eq!(backend.staging(4).map(|s| s.len()), Ok(4));
+    assert_eq!(
+        backend.wait(FenceValue::ZERO, Duration::ZERO),
+        Ok(WaitOutcome::Reached)
+    );
+    assert_eq!(backend.take_present_feedback().len(), 0);
+    capture.finish().expect("end");
+    let records = read(&buffer.bytes()).expect("a well-formed capture");
+    assert_eq!(kinds(&records), [RecordKind::Start, RecordKind::End]);
+    let Record::Start(start) = &records[0] else {
+        unreachable!("start")
+    };
+    assert_eq!(
+        (
+            start.build.as_str(),
+            start.backend.as_str(),
+            &start.caps,
+            start.wait,
+            start.memory_limit
+        ),
+        ("build 7", "recording", &caps(), WaitSetting::Skip, MEMORY)
+    );
+}
 
-    // Calls that change nothing are forwarded unrecorded.
-    assert_eq!(b.caps(), inner.caps());
-    assert_eq!(b.budget(), inner.budget());
-    assert_eq!(b.completed(), FenceValue::ZERO);
-    assert_eq!(b.staging(4).map(|s| s.len()), Ok(4));
-    assert_eq!(b.wait(FenceValue::ZERO, Duration::ZERO), Ok(WaitOutcome::Reached));
-    assert!(b.take_present_feedback().is_empty());
+/// The id a `Create*` record says was made.
+fn made(record: &Record) -> Option<ResourceId> {
+    match record {
+        Record::CreateBuffer(c) => c.result.made().map(ResourceId::Buffer),
+        Record::CreateTexture(c) => c.result.made().map(ResourceId::Texture),
+        Record::CreateView(c) => c.result.made().map(ResourceId::View),
+        Record::CreateSampler(c) => c.result.made().map(ResourceId::Sampler),
+        Record::CreateShader(c) => c.result.made().map(ResourceId::Shader),
+        Record::CreateComputePipeline(c) => c.result.made().map(ResourceId::Pipeline),
+        _ => None,
+    }
+}
 
-    let buf = b
-        .create_buffer(&BufferDesc {
-            size: 64,
-            usage: BufferUsage::ALL,
-        })
-        .expect("buffer");
+#[test]
+fn creates_are_recorded_in_order_with_what_they_returned() {
+    let (_, capture, buffer) = wrapped(u64::MAX);
+    let backend: &dyn Backend = &*capture;
     let too_big = TextureDesc {
         size: Extent3d {
             width: 1 << 20,
@@ -107,73 +128,24 @@ fn every_state_changing_call_is_recorded_in_order_with_its_result() {
         },
         ..texture_desc()
     };
-    let refused = b.create_texture(&too_big).expect_err("too wide");
-    let tex = b.create_texture(&texture_desc()).expect("texture");
-    let view = b.create_view(tex, &view_desc()).expect("view");
-    let sampler = b.create_sampler(&sampler_desc()).expect("sampler");
+    let refused = backend.create_texture(&too_big).expect_err("too wide");
+    let tex = backend.create_texture(&texture_desc()).expect("texture");
+    let view = backend.create_view(tex, &view_desc()).expect("view");
+    let sampler = backend.create_sampler(&sampler_desc()).expect("sampler");
     let origin = ShaderOrigin {
         record: Arc::from(vec![9, 9]),
         stage_index: 3,
     };
-    let from_origin = b
-        .create_shader(shader(ShaderStage::Compute, naga(), Some(origin)))
-        .expect("shader");
-    let spirv = b
-        .create_shader(shader(ShaderStage::Vertex, ShaderSource::SpirV(vec![7]), None))
-        .expect("shader");
-    let no_origin = b
-        .create_shader(shader(ShaderStage::Compute, naga(), None))
-        .expect("shader");
-    let pipeline = b
-        .create_compute_pipeline(ComputePipelineDesc {
-            shader: from_origin,
-        })
-        .expect("pipeline");
+    let shaders = [
+        shader(ShaderStage::Compute, naga(), Some(origin)),
+        shader(ShaderStage::Vertex, ShaderSource::SpirV(vec![7]), None),
+        shader(ShaderStage::Compute, naga(), None),
+    ]
+    .map(|desc| backend.create_shader(desc).expect("shader"));
     let bad_pipeline = super::golden::golden_pipeline();
-    let refused_pipeline = b
+    let refused_pipeline = backend
         .create_graphics_pipeline(bad_pipeline.clone())
         .expect_err("not this device's");
-    let fence = b
-        .submit(CommandList {
-            commands: vec![
-                Command::Upload {
-                    from: StagingSlice::from_bytes(PIXELS.to_vec()),
-                    to: CopyRegion::Texture(crate::command::TextureRegion {
-                        texture: tex,
-                        mip: 0,
-                        origin: crate::resource::Origin3d::default(),
-                        extent: texture_desc().size,
-                    }),
-                },
-                Command::Readback {
-                    from: CopyRegion::Buffer(BufferSlice {
-                        buffer: buf,
-                        offset: 0,
-                        size: 4,
-                    }),
-                    id: ReadbackId::new(5, 0),
-                },
-                Command::Present(PresentDesc {
-                    view,
-                    src_rect: Rect {
-                        x: 0,
-                        y: 0,
-                        width: 2,
-                        height: 2,
-                    },
-                    transform: PresentTransform::Identity,
-                    frame: 7,
-                    dump: true,
-                }),
-            ],
-        })
-        .expect("list");
-    let readback = b.take_readback(ReadbackId::new(5, 0));
-    let nothing = b.take_readback(ReadbackId::new(5, 0));
-    assert_eq!(b.pipeline_status(pipeline), PipelineStatus::Ready);
-    assert_eq!(b.pipeline_status(pipeline), PipelineStatus::Ready);
-    assert_eq!(b.set_present_target(PresentTarget::Offscreen), Ok(()));
-    b.destroy(ResourceId::Sampler(sampler), fence);
     capture.finish().expect("end");
 
     let records = read(&buffer.bytes()).expect("a well-formed capture");
@@ -181,7 +153,6 @@ fn every_state_changing_call_is_recorded_in_order_with_its_result() {
         kinds(&records),
         [
             RecordKind::Start,
-            RecordKind::CreateBuffer,
             RecordKind::CreateTexture,
             RecordKind::CreateTexture,
             RecordKind::CreateView,
@@ -190,56 +161,32 @@ fn every_state_changing_call_is_recorded_in_order_with_its_result() {
             RecordKind::CreateShader,
             RecordKind::CreateShader,
             RecordKind::CreateShader,
-            RecordKind::CreateComputePipeline,
             RecordKind::CreateGraphicsPipeline,
-            RecordKind::Submit,
-            RecordKind::FrameResult,
-            RecordKind::ReadbackResult,
-            RecordKind::ReadbackResult,
-            RecordKind::PipelineOutcome,
-            RecordKind::PresentTarget,
-            RecordKind::Destroy,
             RecordKind::End,
         ]
     );
-    let Record::Start(s) = &records[0] else {
-        unreachable!("start")
-    };
-    assert_eq!(
-        (s.build.as_str(), s.backend.as_str(), &s.caps, s.wait, s.memory_limit),
-        ("build 7", "recording", &caps(), WaitSetting::Skip, MEMORY)
-    );
-    let made = |r: &Record| match r {
-        Record::CreateBuffer(c) => c.result.made().map(ResourceId::Buffer),
-        Record::CreateTexture(c) => c.result.made().map(ResourceId::Texture),
-        Record::CreateView(c) => c.result.made().map(ResourceId::View),
-        Record::CreateSampler(c) => c.result.made().map(ResourceId::Sampler),
-        Record::CreateShader(c) => c.result.made().map(ResourceId::Shader),
-        Record::CreateComputePipeline(c) => c.result.made().map(ResourceId::Pipeline),
-        _ => None,
-    };
-    assert_eq!(made(&records[1]), Some(ResourceId::Buffer(buf)));
-    let Record::CreateTexture(t) = &records[2] else {
+    let Record::CreateTexture(first) = &records[1] else {
         unreachable!("texture")
     };
     assert_eq!(
-        (t.desc, &t.result),
+        (first.desc, &first.result),
         (too_big, &Created::Refused(refused.to_string()))
     );
-    assert_eq!(made(&records[3]), Some(ResourceId::Texture(tex)));
-    let Record::CreateView(v) = &records[4] else {
+    assert_eq!(made(&records[2]), Some(ResourceId::Texture(tex)));
+    let Record::CreateView(made_view) = &records[3] else {
         unreachable!("view")
     };
-    assert_eq!((v.texture, v.desc), (tex, view_desc()));
-    assert_eq!(made(&records[4]), Some(ResourceId::View(view)));
-    assert_eq!(made(&records[5]), Some(ResourceId::Sampler(sampler)));
-    let codes: Vec<(ShaderCode, Option<ResourceId>)> = records[7..10]
+    assert_eq!((made_view.texture, made_view.desc), (tex, view_desc()));
+    assert_eq!(made(&records[3]), Some(ResourceId::View(view)));
+    assert_eq!(made(&records[4]), Some(ResourceId::Sampler(sampler)));
+    let codes: Vec<(ShaderCode, Option<ResourceId>)> = records[6..9]
         .iter()
         .map(|r| match r {
             Record::CreateShader(c) => (c.code.clone(), made(r)),
             _ => unreachable!("a shader"),
         })
         .collect();
+    let [from_origin, spirv, no_origin] = shaders.map(ResourceId::Shader);
     assert_eq!(
         codes,
         [
@@ -248,64 +195,142 @@ fn every_state_changing_call_is_recorded_in_order_with_its_result() {
                     source: 0,
                     stage_index: 3
                 },
-                Some(ResourceId::Shader(from_origin))
+                Some(from_origin)
             ),
-            (ShaderCode::SpirV(vec![7]), Some(ResourceId::Shader(spirv))),
-            (ShaderCode::Missing, Some(ResourceId::Shader(no_origin))),
+            (ShaderCode::SpirV(vec![7]), Some(spirv)),
+            (ShaderCode::Missing, Some(no_origin)),
         ]
     );
-    assert_eq!(made(&records[10]), Some(ResourceId::Pipeline(pipeline)));
-    let Record::CreateGraphicsPipeline(g) = &records[11] else {
+    let Record::CreateGraphicsPipeline(pipeline) = &records[9] else {
         unreachable!("pipeline")
     };
     assert_eq!(
-        (&g.desc, &g.result),
-        (&bad_pipeline, &Created::Refused(refused_pipeline.to_string()))
+        (&pipeline.desc, &pipeline.result),
+        (
+            &bad_pipeline,
+            &Created::Refused(refused_pipeline.to_string())
+        )
     );
-    let Record::Submit(sub) = &records[12] else {
-        unreachable!("submit")
-    };
-    assert_eq!(sub.result, Created::Made(fence));
-    assert_eq!(sub.list.commands.len(), 3);
-    assert_eq!(
-        records[13],
-        Record::FrameResult(FrameResult::of(&Frame {
-            frame: 7,
-            width: 2,
-            height: 2,
-            transform: PresentTransform::Identity,
-            pixels: FramePixels::Rgba8(PIXELS.to_vec()),
-        }))
-    );
-    assert_eq!(
-        records[14],
-        Record::ReadbackResult(ReadbackResult {
-            id: ReadbackId::new(5, 0),
-            value: readback,
+}
+
+/// A list that uploads [`PIXELS`] to `tex`, reads `buf` back as `rb`, and presents `view` as
+/// dumped frame 7.
+fn upload_read_present(
+    tex: crate::id::TextureId,
+    buf: BufferId,
+    view: crate::id::ViewId,
+    rb: ReadbackId,
+) -> CommandList {
+    CommandList {
+        commands: vec![
+            Command::Upload {
+                from: StagingSlice::from_bytes(PIXELS.to_vec()),
+                to: CopyRegion::Texture(crate::command::TextureRegion {
+                    texture: tex,
+                    mip: 0,
+                    origin: crate::resource::Origin3d::default(),
+                    extent: texture_desc().size,
+                }),
+            },
+            Command::Readback {
+                from: CopyRegion::Buffer(BufferSlice {
+                    buffer: buf,
+                    offset: 0,
+                    size: 4,
+                }),
+                id: rb,
+            },
+            Command::Present(PresentDesc {
+                view,
+                src_rect: Rect {
+                    width: 2,
+                    height: 2,
+                    ..Rect::default()
+                },
+                transform: PresentTransform::Identity,
+                frame: 7,
+                dump: true,
+            }),
+        ],
+    }
+}
+
+#[test]
+fn lists_and_results_are_recorded_in_order_with_frames_after_their_list() {
+    let (inner, capture, buffer) = wrapped(u64::MAX);
+    tee(&inner, &capture);
+    let backend: &dyn Backend = &*capture;
+    let buf = backend
+        .create_buffer(&BufferDesc {
+            size: 64,
+            usage: BufferUsage::ALL,
         })
-    );
-    assert_eq!(
-        records[15],
-        Record::ReadbackResult(ReadbackResult {
-            id: ReadbackId::new(5, 0),
-            value: nothing,
-        })
-    );
-    assert_eq!(
-        records[16],
-        Record::PipelineOutcome(PipelineOutcome {
-            pipeline,
-            outcome: PipelineResult::Ready
-        })
-    );
-    let Record::PresentTarget(p) = &records[17] else {
-        unreachable!("target")
+        .expect("buffer");
+    let tex = backend.create_texture(&texture_desc()).expect("texture");
+    let view = backend.create_view(tex, &view_desc()).expect("view");
+    let sampler = backend.create_sampler(&sampler_desc()).expect("sampler");
+    let cs = backend
+        .create_shader(shader(
+            ShaderStage::Compute,
+            ShaderSource::Msl(String::new()),
+            None,
+        ))
+        .expect("shader");
+    let pipeline = backend
+        .create_compute_pipeline(ComputePipelineDesc { shader: cs })
+        .expect("pipeline");
+    let rb = ReadbackId::new(5, 0);
+    let fence = backend
+        .submit(upload_read_present(tex, buf, view, rb))
+        .expect("list");
+    let readback = backend.take_readback(rb);
+    let nothing = backend.take_readback(rb);
+    assert_eq!(backend.pipeline_status(pipeline), PipelineStatus::Ready);
+    assert_eq!(backend.pipeline_status(pipeline), PipelineStatus::Ready);
+    assert_eq!(backend.set_present_target(PresentTarget::Offscreen), Ok(()));
+    backend.destroy(ResourceId::Sampler(sampler), fence);
+    capture.finish().expect("end");
+
+    let records = read(&buffer.bytes()).expect("a well-formed capture");
+    let Record::Submit(submitted) = &records[7] else {
+        unreachable!("submit: {records:?}")
     };
-    assert_eq!((p.target, &p.result), (CapturedTarget::Offscreen, &Created::Made(())));
-    let Record::Destroy(d) = records[18] else {
-        unreachable!("destroy")
+    assert_eq!(submitted.result, Created::Made(fence));
+    assert_eq!(submitted.list.commands.len(), 3);
+    let frame = Frame {
+        frame: 7,
+        width: 2,
+        height: 2,
+        transform: PresentTransform::Identity,
+        pixels: FramePixels::Rgba8(PIXELS.to_vec()),
     };
-    assert_eq!((d.id, d.after), (ResourceId::Sampler(sampler), fence));
+    assert_eq!(
+        records[8..],
+        [
+            Record::FrameResult(FrameResult::of(&frame)),
+            Record::ReadbackResult(ReadbackResult {
+                id: rb,
+                value: readback,
+            }),
+            Record::ReadbackResult(ReadbackResult {
+                id: rb,
+                value: nothing,
+            }),
+            Record::PipelineOutcome(PipelineOutcome {
+                pipeline,
+                outcome: PipelineResult::Ready
+            }),
+            Record::PresentTarget(super::super::TargetRecord {
+                target: CapturedTarget::Offscreen,
+                result: Created::Made(()),
+            }),
+            Record::Destroy(super::super::Destroy {
+                id: ResourceId::Sampler(sampler),
+                after: fence
+            }),
+            Record::End,
+        ]
+    );
     assert_eq!(capture.stopped(), None);
 }
 
@@ -345,7 +370,11 @@ fn a_pipeline_outcome_is_recorded_once_when_it_settles() {
     let (inner, capture, buffer) = wrapped(u64::MAX);
     let b: &dyn Backend = &*capture;
     let shader_id = b
-        .create_shader(shader(ShaderStage::Compute, ShaderSource::Msl(String::new()), None))
+        .create_shader(shader(
+            ShaderStage::Compute,
+            ShaderSource::Msl(String::new()),
+            None,
+        ))
         .expect("shader");
     let p = b
         .create_compute_pipeline(ComputePipelineDesc { shader: shader_id })
@@ -404,7 +433,10 @@ fn a_frame_recorded_while_the_lock_is_free_is_written_at_once() {
         transform: PresentTransform::Identity,
         pixels: FramePixels::Unknown,
     });
-    assert!(buffer.bytes().len() > before, "written before record_frame returned");
+    assert!(
+        buffer.bytes().len() > before,
+        "written before record_frame returned"
+    );
     // Finishing writes nothing more than End.
     capture.finish().expect("end");
     assert_eq!(
@@ -510,7 +542,10 @@ fn a_list_past_its_bounds_stops_the_capture_and_is_submitted() {
     };
     // The recording backend refuses it (no such pipeline); the refusal is returned unchanged.
     let expected = inner.submit(list.clone());
-    assert_eq!(b.submit(list).map_err(|e| e.to_string()), expected.map_err(|e| e.to_string()));
+    assert_eq!(
+        b.submit(list).map_err(|e| e.to_string()),
+        expected.map_err(|e| e.to_string())
+    );
     assert!(matches!(
         capture.stopped(),
         Some(CaptureError::TooLarge {
@@ -524,13 +559,9 @@ fn a_list_past_its_bounds_stops_the_capture_and_is_submitted() {
     );
 }
 
-
 #[test]
 fn a_backend_handing_out_a_live_id_stops_the_capture() {
-    let inner: Arc<dyn Backend> = Arc::new(Spy::new(Knobs {
-        repeat_buffer: true,
-        ..Knobs::default()
-    }));
+    let inner: Arc<dyn Backend> = Arc::new(Spy::new(Knob::RepeatBuffer));
     let buffer = Arc::new(CaptureBuffer::new());
     let sink: Arc<dyn CaptureSink> = Arc::<CaptureBuffer>::clone(&buffer);
     let capture = CapturingBackend::new(

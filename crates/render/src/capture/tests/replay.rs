@@ -2,14 +2,14 @@
 //! their mapped fence, the memory limit, shaders through a resolver, and every comparison,
 //! on captures made with `CaptureBuilder` and replayed on a fresh recording backend.
 
+use super::super::replay::MAX_REPLAY_FRAMES;
 use super::super::{
     CaptureBuilder, CaptureError, CaptureReader, Create, Created, Finding, FindingKind, Record,
     ReplayError, ReplayFrames, ReplayOptions, ReplayReport, ResolveError, ShaderResolver, Start,
     Submit, WaitSetting, map_ids, replay,
 };
-use super::super::replay::MAX_REPLAY_FRAMES;
 use super::super::{CapturedTarget, Limit, PipelineResult, TargetRecord};
-use super::{Knobs, Spy, caps, naga, sampler_desc, shader, texture_desc, view_desc};
+use super::{Knob, Spy, caps, naga, shader, texture_desc, view_desc};
 use crate::backend::{Backend, PipelineStatus, Readback};
 use crate::command::tests::every_command;
 use crate::command::{
@@ -105,8 +105,8 @@ fn readback(buffer: BufferId, size: u64, id: ReadbackId) -> Command {
     }
 }
 
-fn finding(record: u64, kind: FindingKind) -> Option<Finding> {
-    Some(Finding { record, kind })
+fn finding(record: u64, kind: FindingKind) -> Finding {
+    Finding { record, kind }
 }
 
 #[test]
@@ -114,12 +114,15 @@ fn ids_and_fences_are_mapped_and_results_compared() {
     let mut b = builder();
     let buf = b.create_buffer(buffer_desc(4)).expect("buffer");
     let rb = ReadbackId::new(9, 2);
-    b.submit(&list(vec![upload(buf, &[1, 2, 3, 4]), readback(buf, 4, rb)]))
-        .expect("list");
+    b.submit(&list(vec![
+        upload(buf, &[1, 2, 3, 4]),
+        readback(buf, 4, rb),
+    ]))
+    .expect("list");
     b.readback_result(rb, Some(Readback::Bytes(vec![1, 2, 3, 4])))
         .expect("result");
     let bytes = b.finish().expect("end");
-    let spy = Spy::new(Knobs::default());
+    let spy = Spy::new(Knob::Plain);
     let report = run(&bytes, &spy).expect("replays");
     assert_eq!(
         report,
@@ -141,6 +144,7 @@ fn ids_and_fences_are_mapped_and_results_compared() {
 
 #[test]
 fn map_ids_visits_and_rewrites_every_id_field() {
+    const SHIFT: u32 = 1 << 30;
     let original = every_command();
     // Every id field of `every_command`, counted by hand: 16 in the transfers, 35 in the
     // drawing commands, 8 in the outputs. Readback ids are not mapped.
@@ -176,7 +180,6 @@ fn map_ids_visits_and_rewrites_every_id_field() {
         Err(ResourceId::Buffer(_))
     ));
     // Every field is rewritten: shifted once, every id seen the second time is shifted.
-    const SHIFT: u32 = 1 << 30;
     let shift = |id: ResourceId| {
         let (index, generation) = id.parts();
         let index = index + SHIFT;
@@ -190,9 +193,7 @@ fn map_ids_visits_and_rewrites_every_id_field() {
                 ResourceId::Sampler(crate::id::SamplerId::new(index, generation))
             }
             ResourceId::Shader(_) => ResourceId::Shader(ShaderId::new(index, generation)),
-            ResourceId::Pipeline(_) => {
-                ResourceId::Pipeline(PipelineId::new(index, generation))
-            }
+            ResourceId::Pipeline(_) => ResourceId::Pipeline(PipelineId::new(index, generation)),
         })
     };
     let mut shifted = original.clone();
@@ -226,16 +227,22 @@ fn a_record_naming_an_id_not_held_is_refused_and_replay_goes_on() {
         result: Created::Made(crate::id::ViewId::new(6, 6)),
     }))
     .expect("view");
-    b.destroy(ResourceId::Sampler(crate::id::SamplerId::new(8, 8)), FenceValue::ZERO)
-        .expect("destroy");
+    b.destroy(
+        ResourceId::Sampler(crate::id::SamplerId::new(8, 8)),
+        FenceValue::ZERO,
+    )
+    .expect("destroy");
     let bytes = b.finish().expect("end");
-    let spy = Spy::new(Knobs::default());
+    let spy = Spy::new(Knob::Plain);
     let report = run(&bytes, &spy).expect("replays");
     assert_eq!(report.lists, 1);
     assert_eq!(report.refused, 3);
     assert_eq!(
         report.first_refused,
-        finding(1, FindingKind::Unmapped(ResourceId::Buffer(stranger)))
+        Some(finding(
+            1,
+            FindingKind::Unmapped(ResourceId::Buffer(stranger))
+        ))
     );
     assert_eq!(report.differences, 0);
     assert_eq!(spy.inner.lists().len(), 1);
@@ -253,12 +260,15 @@ fn a_destroyed_id_is_forgotten_once_its_fence_passes() {
     b.destroy(ResourceId::Buffer(buf), fence).expect("destroy");
     b.submit(&list(vec![upload(buf, &[2])])).expect("list");
     let bytes = b.finish().expect("end");
-    let spy = Spy::new(Knobs::default());
+    let spy = Spy::new(Knob::Plain);
     let report = run(&bytes, &spy).expect("replays");
-    assert_eq!(spy.destroys(), [(ResourceId::Buffer(BufferId::new(0, 0)), fence)]);
+    assert_eq!(
+        spy.destroys(),
+        [(ResourceId::Buffer(BufferId::new(0, 0)), fence)]
+    );
     assert_eq!(
         report.first_refused,
-        finding(4, FindingKind::Unmapped(ResourceId::Buffer(buf)))
+        Some(finding(4, FindingKind::Unmapped(ResourceId::Buffer(buf))))
     );
     assert_eq!(report.lists, 1);
 }
@@ -273,7 +283,7 @@ fn a_destroy_past_every_captured_list_waits_for_one_to_reach_it() {
     b.submit(&list(vec![upload(buf, &[2])])).expect("fence 2");
     b.submit(&list(vec![upload(buf, &[3])])).expect("fence 3");
     let bytes = b.finish().expect("end");
-    let spy = Spy::new(Knobs::default());
+    let spy = Spy::new(Knob::Plain);
     let report = run(&bytes, &spy).expect("replays");
     // Both lists up to the fence keep the id; the destroy goes after the second, at its fence.
     assert_eq!(report.lists, 2);
@@ -283,7 +293,7 @@ fn a_destroy_past_every_captured_list_waits_for_one_to_reach_it() {
     );
     assert_eq!(
         report.first_refused,
-        finding(5, FindingKind::Unmapped(ResourceId::Buffer(buf)))
+        Some(finding(5, FindingKind::Unmapped(ResourceId::Buffer(buf))))
     );
     // Held to the end, a destroy goes at the last fence.
     let mut b = builder();
@@ -292,7 +302,7 @@ fn a_destroy_past_every_captured_list_waits_for_one_to_reach_it() {
     b.destroy(ResourceId::Buffer(buf), FenceValue::new(9))
         .expect("destroy ahead");
     let bytes = b.finish().expect("end");
-    let spy = Spy::new(Knobs::default());
+    let spy = Spy::new(Knob::Plain);
     run(&bytes, &spy).expect("replays");
     assert_eq!(
         spy.destroys(),
@@ -323,7 +333,7 @@ fn a_destroys_fence_maps_to_the_latest_list_at_or_below_it() {
             .expect("destroy");
     }
     let bytes = b.finish().expect("end");
-    let spy = Spy::new(Knobs::default());
+    let spy = Spy::new(Knob::Plain);
     run(&bytes, &spy).expect("replays");
     let mapped: Vec<u64> = spy.destroys().iter().map(|(_, f)| f.get()).collect();
     // Below the first: zero. At 10, 15, and 25 (20's list was not replayed): 1. At 30: 2.
@@ -348,18 +358,23 @@ fn the_memory_limit_refuses_a_create_past_it_and_frees_on_destroy() {
         memory_limit: Some(112),
         ..options()
     };
-    let report = run_with(&bytes, &Spy::new(Knobs::default()), &ReplayFrames::new(), &limited)
-        .expect("replays");
+    let report = run_with(
+        &bytes,
+        &Spy::new(Knob::Plain),
+        &ReplayFrames::new(),
+        &limited,
+    )
+    .expect("replays");
     assert_eq!(report.refused, 2);
     assert_eq!(
         report.first_refused,
-        finding(
+        Some(finding(
             3,
             FindingKind::MemoryLimit {
                 needed: 113,
                 limit: 112
             }
-        )
+        ))
     );
     assert_eq!(
         FindingKind::MemoryLimit {
@@ -374,14 +389,14 @@ fn the_memory_limit_refuses_a_create_past_it_and_frees_on_destroy() {
         memory_limit: Some(113 + 16),
         ..options()
     };
-    let report = run_with(&bytes, &Spy::new(Knobs::default()), &ReplayFrames::new(), &roomy)
-        .expect("replays");
+    let report =
+        run_with(&bytes, &Spy::new(Knob::Plain), &ReplayFrames::new(), &roomy).expect("replays");
     assert_eq!(report.refused, 0);
     // With no limit given, the backend's own: the spy's is 1 MiB.
     let mut b = builder();
     b.create_buffer(buffer_desc(1 << 16)).expect("buffer");
     let bytes = b.finish().expect("end");
-    let report = run(&bytes, &Spy::new(Knobs::default())).expect("replays");
+    let report = run(&bytes, &Spy::new(Knob::Plain)).expect("replays");
     assert_eq!(report.refused, 0);
 }
 
@@ -410,10 +425,13 @@ fn a_call_refused_on_one_side_only_is_a_difference() {
     }))
     .expect("refused");
     let bytes = b.finish().expect("end");
-    let spy = Spy::new(Knobs::default());
+    let spy = Spy::new(Knob::Plain);
     let report = run(&bytes, &spy).expect("replays");
     assert_eq!(report.differences, 3);
-    assert_eq!(report.first_difference, finding(1, FindingKind::RefusedInCapture));
+    assert_eq!(
+        report.first_difference,
+        Some(finding(1, FindingKind::RefusedInCapture))
+    );
     assert_eq!(
         spy.destroys(),
         [(ResourceId::Buffer(BufferId::new(0, 0)), FenceValue::ZERO)]
@@ -428,15 +446,15 @@ fn a_call_refused_on_one_side_only_is_a_difference() {
     let mut b = builder();
     b.create_buffer(buffer_desc(too_big)).expect("made");
     let bytes = b.finish().expect("end");
-    let report = run(&bytes, &Spy::new(Knobs::default())).expect("replays");
-    let expected = Spy::new(Knobs::default())
+    let report = run(&bytes, &Spy::new(Knob::Plain)).expect("replays");
+    let expected = Spy::new(Knob::Plain)
         .inner
         .create_buffer(&buffer_desc(too_big))
         .expect_err("too big")
         .to_string();
     assert_eq!(
         report.first_difference,
-        finding(1, FindingKind::RefusedOnReplay(expected))
+        Some(finding(1, FindingKind::RefusedOnReplay(expected)))
     );
 }
 
@@ -460,8 +478,12 @@ fn shaders_are_translated_again_and_their_failures_counted() {
     let missing = b
         .create_shader(&shader(ShaderStage::Compute, naga(), None))
         .expect("shader");
-    b.create_shader(&shader(ShaderStage::Vertex, ShaderSource::SpirV(vec![7, 8]), None))
-        .expect("shader");
+    b.create_shader(&shader(
+        ShaderStage::Vertex,
+        ShaderSource::SpirV(vec![7, 8]),
+        None,
+    ))
+    .expect("shader");
     let good = b
         .create_compute_pipeline(ComputePipelineDesc { shader: ok })
         .expect("pipeline");
@@ -474,15 +496,21 @@ fn shaders_are_translated_again_and_their_failures_counted() {
     b.pipeline_outcome(good, PipelineResult::Ready)
         .expect("outcome");
     let bytes = b.finish().expect("end");
-    let spy = Spy::new(Knobs::default());
+    let spy = Spy::new(Knob::Plain);
     let report = run(&bytes, &spy).expect("replays");
     // Record 3 is the second source; the shaders follow each source.
     assert_eq!(report.differences, 1);
-    assert_eq!(report.first_difference, finding(4, FindingKind::ShaderChanged));
+    assert_eq!(
+        report.first_difference,
+        Some(finding(4, FindingKind::ShaderChanged))
+    );
     assert_eq!(report.refused, 4);
     assert_eq!(
         report.first_refused,
-        finding(6, FindingKind::Unresolved("cannot translate".to_owned()))
+        Some(finding(
+            6,
+            FindingKind::Unresolved("cannot translate".to_owned())
+        ))
     );
     assert_eq!(report.compared, 1);
     let snapshot = spy.inner.snapshot();
@@ -497,7 +525,7 @@ fn shaders_are_translated_again_and_their_failures_counted() {
     b.create_shader(&shader(ShaderStage::Compute, naga(), origin(b"F")))
         .expect("shader");
     let bytes = b.finish().expect("end");
-    let error = run(&bytes, &Spy::new(Knobs::default())).expect_err("fatal");
+    let error = run(&bytes, &Spy::new(Knob::Plain)).expect_err("fatal");
     assert_eq!(
         error,
         ReplayError::Shader {
@@ -528,10 +556,13 @@ fn readbacks_are_compared_byte_for_byte_where_both_are_known() {
     b.readback_result(ids[4], Some(Readback::Bytes(vec![0])))
         .expect("missing");
     let bytes = b.finish().expect("end");
-    let report = run(&bytes, &Spy::new(Knobs::default())).expect("replays");
+    let report = run(&bytes, &Spy::new(Knob::Plain)).expect("replays");
     assert_eq!(report.compared, 2);
     assert_eq!(report.differences, 2);
-    assert_eq!(report.first_difference, finding(5, FindingKind::Readback(ids[1])));
+    assert_eq!(
+        report.first_difference,
+        Some(finding(5, FindingKind::Readback(ids[1])))
+    );
     assert_eq!(
         FindingKind::ReadbackMissing(ids[4]).to_string(),
         "readback 5 (generation 0) was not there on replay"
@@ -546,47 +577,45 @@ fn readbacks_are_compared_byte_for_byte_where_both_are_known() {
 fn pipeline_outcomes_are_compared_once_settled() {
     let mut b = builder();
     let s = b
-        .create_shader(&shader(ShaderStage::Compute, ShaderSource::Msl(String::new()), None))
+        .create_shader(&shader(
+            ShaderStage::Compute,
+            ShaderSource::Msl(String::new()),
+            None,
+        ))
         .expect("shader");
     let p = b
         .create_compute_pipeline(ComputePipelineDesc { shader: s })
         .expect("pipeline");
     b.pipeline_outcome(p, PipelineResult::Ready).expect("ready");
-    b.pipeline_outcome(p, PipelineResult::Failed).expect("failed");
+    b.pipeline_outcome(p, PipelineResult::Failed)
+        .expect("failed");
     b.pipeline_outcome(PipelineId::new(40, 0), PipelineResult::Ready)
         .expect("unknown");
     let bytes = b.finish().expect("end");
-    let report = run(&bytes, &Spy::new(Knobs::default())).expect("replays");
+    let report = run(&bytes, &Spy::new(Knob::Plain)).expect("replays");
     assert_eq!(report.compared, 2);
     assert_eq!(report.differences, 1);
     let failed = FindingKind::Pipeline {
         captured: PipelineResult::Failed,
         replayed: PipelineStatus::Ready,
     };
-    assert_eq!(report.first_difference, finding(4, failed.clone()));
+    assert_eq!(report.first_difference, Some(finding(4, failed.clone())));
     assert_eq!(
         failed.to_string(),
         "the pipeline was failed in the capture and ready on replay"
     );
     assert_eq!(report.refused, 1);
     // A pipeline still compiling when the timeout passes.
-    let report = run(
-        &bytes,
-        &Spy::new(Knobs {
-            compiling: true,
-            ..Knobs::default()
-        }),
-    )
-    .expect("replays");
+    let report = run(&bytes, &Spy::new(Knob::Compiling)).expect("replays");
     assert_eq!(
         report.first_difference,
-        finding(
+        Some(finding(
             3,
             FindingKind::Pipeline {
                 captured: PipelineResult::Ready,
                 replayed: PipelineStatus::Compiling
             }
-        )
+        ))
     );
 }
 
@@ -634,7 +663,7 @@ fn presenting(results: &[(u64, u32, Option<[u8; 32]>)]) -> Vec<u8> {
 const PIXELS: [u8; 16] = [9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 1, 2, 3, 4, 5, 6];
 
 fn replay_frames(bytes: &[u8]) -> ReplayReport {
-    let spy = Spy::new(Knobs::default());
+    let spy = Spy::new(Knob::Plain);
     let frames = Arc::new(ReplayFrames::new());
     let sink: Arc<dyn FrameSink> = Arc::<ReplayFrames>::clone(&frames);
     spy.inner.set_frame_sink(Some(sink));
@@ -654,16 +683,25 @@ fn frames_are_compared_by_size_and_hash() {
     let same = replay_frames(&presenting(&[(7, 2, hash)]));
     assert_eq!((same.compared, same.differences), (1, 0));
     let other = replay_frames(&presenting(&[(7, 2, Some([0; 32]))]));
-    assert_eq!(other.first_difference, finding(4, FindingKind::Frame(7)));
+    assert_eq!(
+        other.first_difference,
+        Some(finding(4, FindingKind::Frame(7)))
+    );
     let wider = replay_frames(&presenting(&[(7, 3, hash)]));
-    assert_eq!(wider.first_difference, finding(4, FindingKind::Frame(7)));
+    assert_eq!(
+        wider.first_difference,
+        Some(finding(4, FindingKind::Frame(7)))
+    );
     assert_eq!(wider.compared, 0);
     // Unknown pixels in the capture: sizes compared, hashes not.
     let unknown = replay_frames(&presenting(&[(7, 2, None)]));
     assert_eq!((unknown.compared, unknown.differences), (0, 0));
     // A frame never presented on replay; and frame 7 taken once only.
     let missing = replay_frames(&presenting(&[(8, 2, hash), (7, 2, hash), (7, 2, hash)]));
-    assert_eq!(missing.first_difference, finding(4, FindingKind::FrameMissing(8)));
+    assert_eq!(
+        missing.first_difference,
+        Some(finding(4, FindingKind::FrameMissing(8)))
+    );
     assert_eq!(missing.differences, 2);
     assert_eq!(
         FindingKind::FrameMissing(8).to_string(),
@@ -718,18 +756,27 @@ fn the_report_says_where_the_capture_came_from_and_where_it_stopped() {
         }
         b.finish().expect("end")
     };
-    let same = run(&finish(start("builder", WaitSetting::Wait, caps()), false), &Spy::new(Knobs::default()))
-        .expect("replays");
+    let same = run(
+        &finish(start("builder", WaitSetting::Wait, caps()), false),
+        &Spy::new(Knob::Plain),
+    )
+    .expect("replays");
     assert!(!same.other_backend && !same.captured_skipping);
     assert_eq!((same.limit, same.records), (None, 2));
-    let renamed = run(&finish(start("wgpu", WaitSetting::Skip, caps()), true), &Spy::new(Knobs::default()))
-        .expect("replays");
+    let renamed = run(
+        &finish(start("wgpu", WaitSetting::Skip, caps()), true),
+        &Spy::new(Knob::Plain),
+    )
+    .expect("replays");
     assert!(renamed.other_backend && renamed.captured_skipping);
     assert_eq!(renamed.limit, Some(FenceValue::new(3)));
     let mut other_caps = caps();
     other_caps.view_swizzle = !other_caps.view_swizzle;
-    let other_device = run(&finish(start("builder", WaitSetting::Wait, other_caps), false), &Spy::new(Knobs::default()))
-        .expect("replays");
+    let other_device = run(
+        &finish(start("builder", WaitSetting::Wait, other_caps), false),
+        &Spy::new(Knob::Plain),
+    )
+    .expect("replays");
     assert!(other_device.other_backend);
 }
 
@@ -744,10 +791,16 @@ fn a_window_target_is_replayed_offscreen() {
     b.set_present_target(crate::backend::PresentTarget::Offscreen)
         .expect("target");
     let bytes = b.finish().expect("end");
-    let spy = Spy::new(Knobs::default());
+    let spy = Spy::new(Knob::Plain);
     let report = run(&bytes, &spy).expect("replays");
     assert_eq!((report.differences, report.refused), (0, 0));
-    assert_eq!(spy.inner.snapshot().matches("present target offscreen").count(), 2);
+    assert_eq!(
+        spy.inner
+            .snapshot()
+            .matches("present target offscreen")
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -755,13 +808,7 @@ fn a_lost_device_a_fence_never_reached_and_a_malformed_capture_stop_the_replay()
     let mut b = builder();
     b.create_buffer(buffer_desc(4)).expect("buffer");
     let bytes = b.finish().expect("end");
-    let lost = run(
-        &bytes,
-        &Spy::new(Knobs {
-            lost: true,
-            ..Knobs::default()
-        }),
-    );
+    let lost = run(&bytes, &Spy::new(Knob::Lost));
     assert_eq!(lost, Err(ReplayError::DeviceLost { record: 1 }));
     assert_eq!(
         ReplayError::DeviceLost { record: 1 }.to_string(),
@@ -773,22 +820,26 @@ fn a_lost_device_a_fence_never_reached_and_a_malformed_capture_stop_the_replay()
     b.readback_result(ReadbackId::new(1, 0), Some(Readback::Unknown))
         .expect("result");
     let bytes = b.finish().expect("end");
-    let timed_out = run(
-        &bytes,
-        &Spy::new(Knobs {
-            time_out: true,
-            ..Knobs::default()
-        }),
-    );
-    assert_eq!(timed_out, Err(ReplayError::Timeout { record: 2, fence: 1 }));
+    let timed_out = run(&bytes, &Spy::new(Knob::TimeOut));
     assert_eq!(
-        ReplayError::Timeout { record: 2, fence: 1 }.to_string(),
+        timed_out,
+        Err(ReplayError::Timeout {
+            record: 2,
+            fence: 1
+        })
+    );
+    assert_eq!(
+        ReplayError::Timeout {
+            record: 2,
+            fence: 1
+        }
+        .to_string(),
         "record 2: the backend did not reach fence value 1 in time"
     );
 
     // Cut short after its first list: that list was replayed before the error.
     let cut = &bytes[..bytes.len() - 1];
-    let spy = Spy::new(Knobs::default());
+    let spy = Spy::new(Knob::Plain);
     assert_eq!(
         run(cut, &spy),
         Err(ReplayError::Capture(CaptureError::Truncated))

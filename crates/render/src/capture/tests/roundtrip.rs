@@ -11,6 +11,7 @@ use super::{read, writer};
 use crate::backend::Readback;
 use crate::command::tests::every_command_from;
 use crate::command::{Command, CommandList, Marker};
+use crate::format::PixelFormat;
 use crate::id::{
     BufferId, FenceValue, PipelineId, ReadbackId, ResourceId, SamplerId, ShaderId, TextureId,
     ViewId,
@@ -21,7 +22,6 @@ use crate::resource::{
     SamplerDesc, Swizzle, TextureDesc, TextureDimension, TextureUsage, ViewDesc, ViewDimension,
 };
 use crate::shader::{InterfaceVariable, Interpolation, ScalarKind, ShaderInterface, ShaderStage};
-use crate::format::PixelFormat;
 use proptest::prelude::*;
 use proptest::test_runner::{Config, RngSeed};
 
@@ -55,216 +55,249 @@ fn step() -> impl Strategy<Value = Step> {
         })
 }
 
+/// What the order checks need kept from step to step.
+#[derive(Default)]
+struct Kept {
+    slot: u32,
+    fence: u64,
+    sources: u32,
+    live: Vec<ResourceId>,
+}
+
 /// Turns steps into records the order checks accept: fresh ids, rising fences, sources in
 /// order, shaders naming given sources.
 fn records(steps: &[Step], limit: bool) -> Vec<Record> {
+    let mut made = Kept::default();
     let mut out = Vec::new();
-    let mut slot = 0u32;
-    let mut fence = 0u64;
-    let mut sources = 0u32;
-    let mut live: Vec<ResourceId> = Vec::new();
-    let text = |s: &Step| format!("r{}", s.b);
     for s in steps {
-        slot += 1;
-        let made = |s: &Step| s.made;
+        made.slot += 1;
         let record = match s.kind {
-            0 => Record::CreateBuffer(Create {
-                desc: BufferDesc {
-                    size: s.a,
-                    usage: BufferUsage::from_bits(s.b & BufferUsage::ALL.bits()).expect("flags"),
-                },
-                result: if made(s) {
-                    Created::Made(BufferId::new(slot, s.c))
-                } else {
-                    Created::Refused(text(s))
-                },
-            }),
-            1 => Record::CreateTexture(Create {
-                desc: TextureDesc {
-                    dimension: TextureDimension::Cube,
-                    format: PixelFormat::ALL[usize::try_from(s.c % 112).expect("small")],
-                    size: Extent3d {
-                        width: s.b,
-                        height: s.c,
-                        depth_or_layers: s.b ^ s.c,
-                    },
-                    mip_levels: s.b.rotate_left(3),
-                    sample_count: s.c.rotate_left(5),
-                    usage: TextureUsage::from_bits(s.c & TextureUsage::ALL.bits()).expect("flags"),
-                },
-                result: if made(s) {
-                    Created::Made(TextureId::new(slot, s.b))
-                } else {
-                    Created::Refused(text(s))
-                },
-            }),
-            2 => Record::CreateView(CreateView {
-                texture: TextureId::new(s.b, s.c),
-                desc: ViewDesc {
-                    format: PixelFormat::ALL[usize::try_from(s.b % 112).expect("small")],
-                    dimension: ViewDimension::D1Array,
-                    base_mip: s.b,
-                    mip_count: s.c,
-                    base_layer: s.b.wrapping_add(1),
-                    layer_count: s.c.wrapping_add(2),
-                    swizzle: Swizzle::IDENTITY,
-                },
-                result: if made(s) {
-                    Created::Made(ViewId::new(slot, s.c))
-                } else {
-                    Created::Refused(text(s))
-                },
-            }),
-            3 => Record::CreateSampler(Create {
-                desc: SamplerDesc {
-                    mag_filter: FilterMode::Nearest,
-                    min_filter: FilterMode::Linear,
-                    mip_filter: FilterMode::Nearest,
-                    address: [
-                        AddressMode::Repeat,
-                        AddressMode::MirrorClampToEdge,
-                        AddressMode::ClampToEdge,
-                    ],
-                    border_color: BorderColor::OpaqueWhite,
-                    lod_bias: f32::from(u16::try_from(s.b >> 16).expect("small")),
-                    min_lod: f32::from(u16::try_from(s.c >> 16).expect("small")),
-                    max_lod: 1.25,
-                    max_anisotropy: s.b,
-                    compare: None,
-                    reduction: ReductionMode::Min,
-                },
-                result: Created::Made(SamplerId::new(slot, s.b)),
-            }),
-            4 => {
-                let index = sources;
-                sources += 1;
-                Record::ShaderSource(SourceRecord {
-                    index,
-                    bytes: s.bytes.clone(),
-                })
-            }
-            5 => Record::CreateShader(CreateShader {
-                stage: ShaderStage::TessEval,
-                entry: text(s),
-                interface: ShaderInterface {
-                    resources: Vec::new(),
-                    inputs: vec![InterfaceVariable {
-                        location: s.b,
-                        scalar: ScalarKind::Float,
-                        components: s.c,
-                        interpolation: Interpolation::Perspective,
-                    }],
-                    outputs: Vec::new(),
-                },
-                code: match (sources, s.a % 4) {
-                    (n, 0) if n > 0 => ShaderCode::Origin {
-                        source: s.b % n,
-                        stage_index: s.c,
-                    },
-                    (_, 1) => ShaderCode::SpirV(vec![s.b, s.c]),
-                    (_, 2) => ShaderCode::Msl(text(s)),
-                    _ => ShaderCode::Missing,
-                },
-                result: if made(s) {
-                    Created::Made(ShaderId::new(slot, s.b))
-                } else {
-                    Created::Refused(text(s))
-                },
-            }),
-            6 => Record::CreateComputePipeline(Create {
-                desc: ComputePipelineDesc {
-                    shader: ShaderId::new(s.b, s.c),
-                },
-                result: Created::Made(PipelineId::new(slot, s.c)),
-            }),
-            7 => {
-                // Destroy a live id when there is one, else a made-up one.
-                let id = if live.is_empty() {
-                    ResourceId::Sampler(SamplerId::new(s.b, s.c))
-                } else {
-                    live.remove(usize::try_from(s.a).unwrap_or(0) % live.len())
-                };
-                Record::Destroy(Destroy {
-                    id,
-                    after: FenceValue::new(s.a),
-                })
-            }
-            8 => {
-                let list = if s.made {
-                    every_command_from(s.b % 5000)
-                } else {
-                    CommandList {
-                        commands: vec![Command::Marker(Marker {
-                            submit: s.a,
-                            draw: u64::from(s.c),
-                        })],
-                    }
-                };
-                let result = if s.a % 3 == 0 {
-                    Created::Refused(text(s))
-                } else {
-                    fence += 1 + u64::from(s.b % 1000);
-                    Created::Made(FenceValue::new(fence))
-                };
-                Record::Submit(Submit { list, result })
-            }
-            9 => Record::PresentTarget(TargetRecord {
-                target: if s.made {
-                    CapturedTarget::Window
-                } else {
-                    CapturedTarget::Offscreen
-                },
-                result: if s.a % 2 == 0 {
-                    Created::Made(())
-                } else {
-                    Created::Refused(text(s))
-                },
-            }),
-            10 => Record::ReadbackResult(ReadbackResult {
-                id: ReadbackId::new(s.b, s.c),
-                value: match s.a % 3 {
-                    0 => None,
-                    1 => Some(Readback::Unknown),
-                    _ => Some(Readback::Bytes(s.bytes.clone())),
-                },
-            }),
-            11 => Record::PipelineOutcome(PipelineOutcome {
-                pipeline: PipelineId::new(s.b, s.c),
-                outcome: if s.made {
-                    PipelineResult::Ready
-                } else {
-                    PipelineResult::Failed
-                },
-            }),
-            12 => Record::FrameResult(FrameResult {
-                frame: s.a,
-                width: s.b,
-                height: s.c,
-                sha256: s.made.then(|| {
-                    std::array::from_fn(|i| {
-                        u8::try_from(i).expect("small") ^ s.bytes.first().copied().unwrap_or(0)
-                    })
-                }),
-            }),
-            _ => Record::CreateComputePipeline(Create {
-                desc: ComputePipelineDesc {
-                    shader: ShaderId::new(s.c, s.b),
-                },
-                result: Created::Refused(text(s)),
-            }),
+            4 | 5 | 7 | 8 => kept(s, &mut made),
+            _ => plain(s, made.slot),
         };
         if let Some(id) = record.facts().created {
-            live.push(id);
+            made.live.push(id);
         }
         out.push(record);
     }
     if limit {
         out.push(Record::Limit(Limit {
-            fence: FenceValue::new(fence),
+            fence: FenceValue::new(made.fence),
         }));
     }
     out.push(Record::End);
     out
+}
+
+/// A refusal's text.
+fn text(s: &Step) -> String {
+    format!("r{}", s.b)
+}
+
+/// The records that need nothing kept from step to step.
+fn plain(s: &Step, slot: u32) -> Record {
+    match s.kind {
+        0 => Record::CreateBuffer(Create {
+            desc: BufferDesc {
+                size: s.a,
+                usage: BufferUsage::from_bits(s.b & BufferUsage::ALL.bits()).expect("flags"),
+            },
+            result: if s.made {
+                Created::Made(BufferId::new(slot, s.c))
+            } else {
+                Created::Refused(text(s))
+            },
+        }),
+        1 => Record::CreateTexture(Create {
+            desc: TextureDesc {
+                dimension: TextureDimension::Cube,
+                format: PixelFormat::ALL[usize::try_from(s.c % 112).expect("small")],
+                size: Extent3d {
+                    width: s.b,
+                    height: s.c,
+                    depth_or_layers: s.b ^ s.c,
+                },
+                mip_levels: s.b.rotate_left(3),
+                sample_count: s.c.rotate_left(5),
+                usage: TextureUsage::from_bits(s.c & TextureUsage::ALL.bits()).expect("flags"),
+            },
+            result: if s.made {
+                Created::Made(TextureId::new(slot, s.b))
+            } else {
+                Created::Refused(text(s))
+            },
+        }),
+        2 => Record::CreateView(CreateView {
+            texture: TextureId::new(s.b, s.c),
+            desc: ViewDesc {
+                format: PixelFormat::ALL[usize::try_from(s.b % 112).expect("small")],
+                dimension: ViewDimension::D1Array,
+                base_mip: s.b,
+                mip_count: s.c,
+                base_layer: s.b.wrapping_add(1),
+                layer_count: s.c.wrapping_add(2),
+                swizzle: Swizzle::IDENTITY,
+            },
+            result: if s.made {
+                Created::Made(ViewId::new(slot, s.c))
+            } else {
+                Created::Refused(text(s))
+            },
+        }),
+        3 => Record::CreateSampler(Create {
+            desc: SamplerDesc {
+                mag_filter: FilterMode::Nearest,
+                min_filter: FilterMode::Linear,
+                mip_filter: FilterMode::Nearest,
+                address: [
+                    AddressMode::Repeat,
+                    AddressMode::MirrorClampToEdge,
+                    AddressMode::ClampToEdge,
+                ],
+                border_color: BorderColor::OpaqueWhite,
+                lod_bias: f32::from(u16::try_from(s.b >> 16).expect("small")),
+                min_lod: f32::from(u16::try_from(s.c >> 16).expect("small")),
+                max_lod: 1.25,
+                max_anisotropy: s.b,
+                compare: None,
+                reduction: ReductionMode::Min,
+            },
+            result: Created::Made(SamplerId::new(slot, s.b)),
+        }),
+        6 => Record::CreateComputePipeline(Create {
+            desc: ComputePipelineDesc {
+                shader: ShaderId::new(s.b, s.c),
+            },
+            result: Created::Made(PipelineId::new(slot, s.c)),
+        }),
+        _ => results(s),
+    }
+}
+
+/// The result records, and a refused pipeline.
+fn results(s: &Step) -> Record {
+    match s.kind {
+        9 => Record::PresentTarget(TargetRecord {
+            target: if s.made {
+                CapturedTarget::Window
+            } else {
+                CapturedTarget::Offscreen
+            },
+            result: if s.a.is_multiple_of(2) {
+                Created::Made(())
+            } else {
+                Created::Refused(text(s))
+            },
+        }),
+        10 => Record::ReadbackResult(ReadbackResult {
+            id: ReadbackId::new(s.b, s.c),
+            value: match s.a % 3 {
+                0 => None,
+                1 => Some(Readback::Unknown),
+                _ => Some(Readback::Bytes(s.bytes.clone())),
+            },
+        }),
+        11 => Record::PipelineOutcome(PipelineOutcome {
+            pipeline: PipelineId::new(s.b, s.c),
+            outcome: if s.made {
+                PipelineResult::Ready
+            } else {
+                PipelineResult::Failed
+            },
+        }),
+        12 => Record::FrameResult(FrameResult {
+            frame: s.a,
+            width: s.b,
+            height: s.c,
+            sha256: s.made.then(|| {
+                std::array::from_fn(|i| {
+                    u8::try_from(i).expect("small") ^ s.bytes.first().copied().unwrap_or(0)
+                })
+            }),
+        }),
+        _ => Record::CreateComputePipeline(Create {
+            desc: ComputePipelineDesc {
+                shader: ShaderId::new(s.c, s.b),
+            },
+            result: Created::Refused(text(s)),
+        }),
+    }
+}
+
+/// The records that need what was kept: sources, shaders naming them, destroys of live ids
+/// and lists with rising fences.
+fn kept(s: &Step, made: &mut Kept) -> Record {
+    let slot = made.slot;
+    match s.kind {
+        4 => {
+            let index = made.sources;
+            made.sources += 1;
+            Record::ShaderSource(SourceRecord {
+                index,
+                bytes: s.bytes.clone(),
+            })
+        }
+        5 => Record::CreateShader(CreateShader {
+            stage: ShaderStage::TessEval,
+            entry: text(s),
+            interface: ShaderInterface {
+                resources: Vec::new(),
+                inputs: vec![InterfaceVariable {
+                    location: s.b,
+                    scalar: ScalarKind::Float,
+                    components: s.c,
+                    interpolation: Interpolation::Perspective,
+                }],
+                outputs: Vec::new(),
+            },
+            code: match (made.sources, s.a % 4) {
+                (n, 0) if n > 0 => ShaderCode::Origin {
+                    source: s.b % n,
+                    stage_index: s.c,
+                },
+                (_, 1) => ShaderCode::SpirV(vec![s.b, s.c]),
+                (_, 2) => ShaderCode::Msl(text(s)),
+                _ => ShaderCode::Missing,
+            },
+            result: if s.made {
+                Created::Made(ShaderId::new(slot, s.b))
+            } else {
+                Created::Refused(text(s))
+            },
+        }),
+        7 => {
+            // Destroy a made.live id when there is one, else a made-up one.
+            let id = if made.live.is_empty() {
+                ResourceId::Sampler(SamplerId::new(s.b, s.c))
+            } else {
+                made.live
+                    .remove(usize::try_from(s.a).unwrap_or(0) % made.live.len())
+            };
+            Record::Destroy(Destroy {
+                id,
+                after: FenceValue::new(s.a),
+            })
+        }
+        _ => {
+            let list = if s.made {
+                every_command_from(s.b % 5000)
+            } else {
+                CommandList {
+                    commands: vec![Command::Marker(Marker {
+                        submit: s.a,
+                        draw: u64::from(s.c),
+                    })],
+                }
+            };
+            let result = if s.a.is_multiple_of(3) {
+                Created::Refused(text(s))
+            } else {
+                made.fence += 1 + u64::from(s.b % 1000);
+                Created::Made(FenceValue::new(made.fence))
+            };
+            Record::Submit(Submit { list, result })
+        }
+    }
 }
 
 proptest! {

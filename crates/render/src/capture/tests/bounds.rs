@@ -1,13 +1,13 @@
 //! Every bound at its edge, on both sides, through the reader and the writer: the accepted
 //! side of each edge reaches the next check, so the two sides give different exact outcomes.
 
+use super::super::replay::MAX_REPLAY_FRAMES;
 use super::super::{
     CaptureError, CaptureLimits, CreateShader, Created, MAX_DESCRIPTION_BYTES, MAX_LIST_COMMANDS,
     MAX_LIST_DECODED_BYTES, MAX_LIVE_RESOURCES, MAX_RECORD_BYTES, MAX_SHADER_CODE_BYTES,
     MAX_SHADER_SOURCE_BYTES, MAX_TEXT_BYTES, Record, RecordKind, ShaderCode, SourceRecord, Start,
     Submit,
 };
-use super::super::replay::MAX_REPLAY_FRAMES;
 use super::{END, file, framed_any, length, prefix, read, read_with, start, writer, writer_with};
 use crate::caps::{GUEST_VERTEX_BUFFERS, GUEST_VIEWPORTS};
 use crate::command::{
@@ -188,10 +188,19 @@ fn texts_at_their_edge() {
         })
     };
     assert!(read(&start_with(&at, &at)).is_ok());
-    assert_eq!(read(&start_with(&over, "")).map(|_| ()), too_long("build id"));
-    assert_eq!(read(&start_with("", &over)).map(|_| ()), too_long("backend name"));
+    assert_eq!(
+        read(&start_with(&over, "")).map(|_| ()),
+        too_long("build id")
+    );
+    assert_eq!(
+        read(&start_with("", &over)).map(|_| ()),
+        too_long("backend name")
+    );
     // The build id is checked before the backend name.
-    assert_eq!(read(&start_with(&over, &over)).map(|_| ()), too_long("build id"));
+    assert_eq!(
+        read(&start_with(&over, &over)).map(|_| ()),
+        too_long("build id")
+    );
     assert_eq!(
         CaptureError::TooLarge {
             record: 0,
@@ -316,7 +325,9 @@ fn shader_source_and_code_at_their_edge() {
         })
     );
     assert_eq!(
-        w.write(&code(ShaderCode::Msl("m".repeat(usize_of(MAX_SHADER_CODE_BYTES) + 1)))),
+        w.write(&code(ShaderCode::Msl(
+            "m".repeat(usize_of(MAX_SHADER_CODE_BYTES) + 1)
+        ))),
         Err(CaptureError::TooLarge {
             record: 1,
             what: "MSL code",
@@ -555,16 +566,34 @@ fn the_lists_nested_in_a_command_at_their_edge() {
     let buffers = usize_of(GUEST_VERTEX_BUFFERS.into());
     let viewports = usize_of(GUEST_VIEWPORTS.into());
     let cases = [
-        (draw(bindings, 0, 0, 0), draw(bindings + 1, 0, 0, 0), "draw bindings"),
-        (draw(0, buffers, 0, 0), draw(0, buffers + 1, 0, 0), "draw vertex buffers"),
-        (draw(0, 0, viewports, 0), draw(0, 0, viewports + 1, 0), "draw viewports"),
-        (draw(0, 0, 0, viewports), draw(0, 0, 0, viewports + 1), "draw scissors"),
-        (dispatch(bindings), dispatch(bindings + 1), "dispatch bindings"),
+        (
+            draw(bindings, 0, 0, 0),
+            draw(bindings + 1, 0, 0, 0),
+            "draw bindings",
+        ),
+        (
+            draw(0, buffers, 0, 0),
+            draw(0, buffers + 1, 0, 0),
+            "draw vertex buffers",
+        ),
+        (
+            draw(0, 0, viewports, 0),
+            draw(0, 0, viewports + 1, 0),
+            "draw viewports",
+        ),
+        (
+            draw(0, 0, 0, viewports),
+            draw(0, 0, 0, viewports + 1),
+            "draw scissors",
+        ),
+        (
+            dispatch(bindings),
+            dispatch(bindings + 1),
+            "dispatch bindings",
+        ),
     ];
     for (at, over, what) in cases {
-        let at = CommandList {
-            commands: vec![at],
-        };
+        let at = CommandList { commands: vec![at] };
         let over = CommandList {
             commands: vec![over],
         };

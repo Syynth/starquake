@@ -2,12 +2,12 @@
 //! [`CaptureSink`] (module docs of [`crate::capture`]).
 
 use super::order::Order;
+use super::record::ShaderCode;
 use super::record::{
     Created, Facts, Limit, Record, RecordKind, SourceRecord, Start, check_fields, check_list,
     check_result, encode_body,
 };
 use super::{CaptureError, CaptureLimits, MAGIC, VERSION};
-use super::record::ShaderCode;
 use crate::command::CommandList;
 use crate::id::{FenceValue, ResourceId};
 use crate::shader::{ShaderDesc, ShaderSource};
@@ -286,16 +286,19 @@ impl CaptureWriter {
         let record = self.order.next();
         let len = len64(body.len());
         let max = self.limits.max_body(kind);
-        let short_len = u32::try_from(len).ok().filter(|_| len <= max).ok_or(
-            CaptureError::RecordTooLarge {
-                record,
-                kind,
-                len,
-                max,
-            },
-        )?;
+        let short_len =
+            u32::try_from(len)
+                .ok()
+                .filter(|_| len <= max)
+                .ok_or(CaptureError::RecordTooLarge {
+                    record,
+                    kind,
+                    len,
+                    max,
+                })?;
         self.order.check(kind, facts, self.limits.live_resources)?;
-        let prefix = prefix(kind, short_len).map_err(|source| CaptureError::Encode { record, source })?;
+        let prefix =
+            prefix(kind, short_len).map_err(|source| CaptureError::Encode { record, source })?;
         // `Limit` and `End` may use the room the others keep for them.
         let reserve = match kind {
             RecordKind::Limit | RecordKind::End => 0,

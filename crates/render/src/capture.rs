@@ -129,8 +129,8 @@ pub use builder::CaptureBuilder;
 pub use read::CaptureReader;
 pub use record::{
     CapturedTarget, Create, CreateShader, CreateView, Created, Destroy, FrameResult, Limit,
-    PipelineOutcome, PipelineResult, ReadbackResult, Record, RecordKind, ShaderCode,
-    SourceRecord, Start, Submit, TargetRecord, WaitSetting,
+    PipelineOutcome, PipelineResult, ReadbackResult, Record, RecordKind, ShaderCode, SourceRecord,
+    Start, Submit, TargetRecord, WaitSetting,
 };
 pub use replay::{
     Finding, FindingKind, ReplayError, ReplayFrames, ReplayOptions, ReplayReport, ResolveError,
@@ -210,7 +210,9 @@ impl CaptureLimits {
             RecordKind::ShaderSource => {
                 MAX_SHADER_SOURCE_BYTES.saturating_add(self.description_bytes)
             }
-            RecordKind::CreateShader => MAX_SHADER_CODE_BYTES.saturating_add(self.description_bytes),
+            RecordKind::CreateShader => {
+                MAX_SHADER_CODE_BYTES.saturating_add(self.description_bytes)
+            }
             RecordKind::Start
             | RecordKind::CreateBuffer
             | RecordKind::CreateTexture

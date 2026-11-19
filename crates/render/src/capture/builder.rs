@@ -9,12 +9,12 @@
 //! [`CaptureBuilder::record`].
 #![cfg(any(test, feature = "test-support"))]
 
+use super::CaptureError;
 use super::record::{
     CapturedTarget, Create, CreateShader, CreateView, Created, Destroy, FrameResult,
     PipelineOutcome, PipelineResult, ReadbackResult, Record, Start, TargetRecord, WaitSetting,
 };
 use super::write::{CaptureBuffer, CaptureSink, CaptureWriter};
-use super::CaptureError;
 use crate::backend::{PresentTarget, Readback};
 use crate::caps::Caps;
 use crate::command::CommandList;
@@ -56,11 +56,7 @@ impl CaptureBuilder {
     pub fn with_start(start: Start) -> Result<Self, CaptureError> {
         let sink = Arc::new(CaptureBuffer::new());
         let shared: Arc<dyn CaptureSink> = Arc::<CaptureBuffer>::clone(&sink);
-        let writer = CaptureWriter::new(
-            shared,
-            start,
-            u64::MAX,
-        )?;
+        let writer = CaptureWriter::new(shared, start, u64::MAX)?;
         Ok(Self {
             sink,
             writer,
@@ -203,7 +199,10 @@ impl CaptureBuilder {
         pipeline: PipelineId,
         outcome: PipelineResult,
     ) -> Result<(), CaptureError> {
-        self.record(&Record::PipelineOutcome(PipelineOutcome { pipeline, outcome }))
+        self.record(&Record::PipelineOutcome(PipelineOutcome {
+            pipeline,
+            outcome,
+        }))
     }
 
     /// A dumped frame.

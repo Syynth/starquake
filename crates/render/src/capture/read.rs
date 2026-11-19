@@ -33,7 +33,11 @@ impl<R: Read> CaptureReader<R> {
 
     /// Reads and checks the header of a capture of `len` bytes: the magic, then the version.
     /// No record is read yet.
-    pub fn with_limits(mut input: R, len: u64, limits: CaptureLimits) -> Result<Self, CaptureError> {
+    pub fn with_limits(
+        mut input: R,
+        len: u64,
+        limits: CaptureLimits,
+    ) -> Result<Self, CaptureError> {
         let mut magic = [0; MAGIC.len()];
         let have = usize::try_from(len).unwrap_or(usize::MAX).min(MAGIC.len());
         let start = magic.get_mut(..have).unwrap_or_default();
@@ -132,7 +136,9 @@ impl<R: Read> CaptureReader<R> {
         if want > self.left {
             return Err(CaptureError::Truncated);
         }
-        self.input.read_exact(buf).map_err(|error| io_error(&error))?;
+        self.input
+            .read_exact(buf)
+            .map_err(|error| io_error(&error))?;
         self.left -= want;
         Ok(())
     }

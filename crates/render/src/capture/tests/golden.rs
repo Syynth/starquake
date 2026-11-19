@@ -20,11 +20,11 @@ use crate::id::{
     ViewId,
 };
 use crate::pipeline::{
-    BlendComponent, BlendFactor, BlendOperation, BlendState, ColorWrites,
-    ComputePipelineDesc, CullMode, DepthBias, DepthStencilState, EmulationFlags, FrontFace,
-    GraphicsPipelineDesc, LogicOp, PolygonMode, RasterState, Stages, StencilFace,
-    StencilOperation, StencilState, TargetFormats, Topology, VertexAttribute, VertexBufferLayout,
-    VertexComponents, VertexKind, VertexLayout, VertexStepMode,
+    BlendComponent, BlendFactor, BlendOperation, BlendState, ColorWrites, ComputePipelineDesc,
+    CullMode, DepthBias, DepthStencilState, EmulationFlags, FrontFace, GraphicsPipelineDesc,
+    LogicOp, PolygonMode, RasterState, Stages, StencilFace, StencilOperation, StencilState,
+    TargetFormats, Topology, VertexAttribute, VertexBufferLayout, VertexComponents, VertexKind,
+    VertexLayout, VertexStepMode,
 };
 use crate::resource::{
     AddressMode, BorderColor, BufferDesc, BufferUsage, CompareFunction, Extent3d, FilterMode,
@@ -32,7 +32,7 @@ use crate::resource::{
     TextureUsage, ViewDesc, ViewDimension,
 };
 use crate::shader::{
-    Interpolation, InterfaceVariable, ResourceBinding, ResourceKind, SampleKind, ScalarKind,
+    InterfaceVariable, Interpolation, ResourceBinding, ResourceKind, SampleKind, ScalarKind,
     ShaderInterface, ShaderStage,
 };
 use std::sync::Arc;
@@ -80,8 +80,14 @@ fn header() {
 /// The golden capture's device: every limit distinct, the two 64-bit ones past 32 bits.
 fn golden_caps() -> Caps {
     let mut formats = FormatTable::uniform(FormatFeatures::ALL);
-    formats.set(PixelFormat::A8B8G8R8Unorm, FormatFeatures::from_bits(0x21).expect("flags"));
-    formats.set(PixelFormat::D32FloatS8Uint, FormatFeatures::from_bits(0x22).expect("flags"));
+    formats.set(
+        PixelFormat::A8B8G8R8Unorm,
+        FormatFeatures::from_bits(0x21).expect("flags"),
+    );
+    formats.set(
+        PixelFormat::D32FloatS8Uint,
+        FormatFeatures::from_bits(0x22).expect("flags"),
+    );
     Caps {
         limits: Limits {
             max_buffer_size: 0x1_0000_0001,
@@ -250,7 +256,14 @@ pub(super) fn golden_pipeline() -> GraphicsPipelineDesc {
 /// One record of every kind, and every variant of the record-level enums, in an order the
 /// reading checks accept.
 fn golden_records() -> Vec<Record> {
-    let empty = ShaderInterface::default;
+    let mut records = golden_creates();
+    records.extend(golden_shaders());
+    records.extend(golden_results());
+    records
+}
+
+/// The buffer, texture, view and sampler records.
+fn golden_creates() -> Vec<Record> {
     vec![
         Record::CreateBuffer(Create {
             desc: BufferDesc {
@@ -312,6 +325,13 @@ fn golden_records() -> Vec<Record> {
             },
             result: Created::Made(SamplerId::new(23, 24)),
         }),
+    ]
+}
+
+/// The shader sources, shaders and pipelines.
+fn golden_shaders() -> Vec<Record> {
+    let empty = ShaderInterface::default;
+    vec![
         Record::ShaderSource(SourceRecord {
             index: 0,
             bytes: vec![0xAA],
@@ -383,6 +403,12 @@ fn golden_records() -> Vec<Record> {
             },
             result: Created::Refused("x".to_owned()),
         }),
+    ]
+}
+
+/// The destroy, lists, target, results, limit and end.
+fn golden_results() -> Vec<Record> {
+    vec![
         Record::Destroy(Destroy {
             id: ResourceId::Texture(TextureId::new(34, 35)),
             after: FenceValue::new(36),
@@ -424,7 +450,9 @@ fn golden_records() -> Vec<Record> {
             frame: 43,
             width: 44,
             height: 45,
-            sha256: Some(std::array::from_fn(|i| 46 + u8::try_from(i).expect("small"))),
+            sha256: Some(std::array::from_fn(|i| {
+                46 + u8::try_from(i).expect("small")
+            })),
         }),
         Record::FrameResult(FrameResult {
             frame: 75,
@@ -457,7 +485,9 @@ fn golden_file() -> Vec<u8> {
     f.push(0x01); // wait: Skip
     f.extend([0x83, 0x80, 0x80, 0x80, 0x30]); // memory limit
     // CreateBuffer.
-    f.extend([0x02, 0x09, 0x84, 0x80, 0x80, 0x80, 0x40, 0x45, 0x00, 0x05, 0x06]);
+    f.extend([
+        0x02, 0x09, 0x84, 0x80, 0x80, 0x80, 0x40, 0x45, 0x00, 0x05, 0x06,
+    ]);
     // CreateTexture, refused "no".
     f.extend([0x03, 0x0C, 0x02, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x15]);
     f.extend([0x01, 0x02, b'n', b'o']);
@@ -486,16 +516,22 @@ fn golden_file() -> Vec<u8> {
     f.extend([0x07, 0x0C, 0x04, 0x01, b'b', 0x00, 0x00, 0x00]);
     f.extend([0x02, 0x01, b'k', 0x01, 0x01, b'r']);
     // CreateShader with no origin.
-    f.extend([0x07, 0x0A, 0x05, 0x01, b'c', 0x00, 0x00, 0x00, 0x03, 0x00, 0x45, 0x46]);
+    f.extend([
+        0x07, 0x0A, 0x05, 0x01, b'c', 0x00, 0x00, 0x00, 0x03, 0x00, 0x45, 0x46,
+    ]);
     // CreateGraphicsPipeline: 140 bytes.
     f.extend([0x08, 0x8C, 0x01]);
-    f.extend([0x32, 0x33, 0x01, 0x34, 0x35, 0x00, 0x01, 0x36, 0x37, 0x01, 0x38, 0x39]);
+    f.extend([
+        0x32, 0x33, 0x01, 0x34, 0x35, 0x00, 0x01, 0x36, 0x37, 0x01, 0x38, 0x39,
+    ]);
     f.extend([0x01, 0x3A, 0x01, 0x01, 0x3B, 0x3C, 0x3D, 0x02, 0x04]); // vertex input
     f.extend([0x07, 0x01]); // quads, primitive restart
     f.extend([0x02, 0x01, 0x01, 0x01]); // raster
     f.extend([0x00, 0x00, 0x08, 0x41, 0x00, 0x00, 0x18, 0x41]); // 8.5, 9.5
     f.extend([0x00, 0x00, 0x28, 0x41, 0x00, 0x00, 0x38, 0x41]); // 10.5, 11.5
-    f.extend([0x01, 0x03, 0x01, 0x01, 0x05, 0x02, 0x05, 0x06, 0x06, 0x01, 0x04, 0x07]);
+    f.extend([
+        0x01, 0x03, 0x01, 0x01, 0x05, 0x02, 0x05, 0x06, 0x06, 0x01, 0x04, 0x07,
+    ]);
     f.extend([0x3E, 0x3F]);
     f.extend([0x01, 0x04, 0x05, 0x01, 0x01, 0x06, 0x04, 0x0B]); // blend 0
     for _ in 1..7 {
@@ -511,7 +547,9 @@ fn golden_file() -> Vec<u8> {
     // Destroy.
     f.extend([0x0A, 0x04, 0x01, 0x22, 0x23, 0x24]);
     // Submit: one marker, fence 2^34 + 5.
-    f.extend([0x0B, 0x0A, 0x01, 0x09, 0x25, 0x26, 0x00, 0x85, 0x80, 0x80, 0x80, 0x50]);
+    f.extend([
+        0x0B, 0x0A, 0x01, 0x09, 0x25, 0x26, 0x00, 0x85, 0x80, 0x80, 0x80, 0x50,
+    ]);
     // Submit, empty and refused "q".
     f.extend([0x0B, 0x04, 0x00, 0x01, 0x01, b'q']);
     // PresentTarget: a window.

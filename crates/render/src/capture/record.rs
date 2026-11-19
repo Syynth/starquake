@@ -556,12 +556,9 @@ pub(crate) fn check_fields(record: &Record, position: u64) -> Result<(), Capture
 pub(crate) fn check_result<T>(result: &Created<T>, position: u64) -> Result<(), CaptureError> {
     match result {
         Created::Made(_) => Ok(()),
-        Created::Refused(message) => bound(
-            position,
-            "refusal message",
-            message.len(),
-            MAX_TEXT_BYTES,
-        ),
+        Created::Refused(message) => {
+            bound(position, "refusal message", message.len(), MAX_TEXT_BYTES)
+        }
     }
 }
 

@@ -9,8 +9,7 @@ use super::fixtures::{
 };
 use starquake_render::capture::{
     CaptureBuffer, CaptureReader, CaptureSink, CapturingBackend, Finding, FindingKind,
-    ReplayFrames, ReplayOptions,
-    ReplayReport, ResolveError, ShaderResolver, WaitSetting, replay,
+    ReplayFrames, ReplayOptions, ReplayReport, ResolveError, ShaderResolver, WaitSetting, replay,
 };
 use starquake_render::command::{ClearValue, PresentDesc, PresentTransform, RenderTargets};
 use starquake_render::resource::{
@@ -20,8 +19,8 @@ use starquake_render::resource::{
 use starquake_render::shader::ShaderInterface;
 use starquake_render::{
     Backend, BufferDesc, BufferUsage, Command, CommandList, ComputePipelineDesc, FenceValue, Frame,
-    FrameSink, PixelFormat, PresentTarget, RecordingBackend, ResourceId, ShaderDesc,
-    ShaderOrigin, ShaderSource, ShaderStage, ViewDesc,
+    FrameSink, PixelFormat, PresentTarget, RecordingBackend, ResourceId, ShaderDesc, ShaderOrigin,
+    ShaderSource, ShaderStage, ViewDesc,
 };
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -82,6 +81,36 @@ impl ShaderResolver for Stub {
     }
 }
 
+/// A 2D view of all of a 4 by 4 RGBA8 texture.
+fn view_desc() -> ViewDesc {
+    ViewDesc {
+        format: RGBA,
+        dimension: ViewDimension::D2,
+        base_mip: 0,
+        mip_count: 1,
+        base_layer: 0,
+        layer_count: 1,
+        swizzle: Swizzle::IDENTITY,
+    }
+}
+
+/// A plain sampler.
+fn sampler_desc() -> SamplerDesc {
+    SamplerDesc {
+        mag_filter: FilterMode::Linear,
+        min_filter: FilterMode::Nearest,
+        mip_filter: FilterMode::Nearest,
+        address: [AddressMode::ClampToEdge; 3],
+        border_color: BorderColor::OpaqueBlack,
+        lod_bias: 0.0,
+        min_lod: 0.0,
+        max_lod: 1.0,
+        max_anisotropy: 1,
+        compare: None,
+        reduction: ReductionMode::Average,
+    }
+}
+
 /// Makes and uses every kind of resource through `b`: uploads, copies, a clear, a draw, a
 /// dispatch, readbacks known and unknown, two dumped presents, destroys. With `decoys_first`,
 /// a shader with no origin and a buffer of [`DECOY_BYTES`] are made first, which a replay with
@@ -99,31 +128,8 @@ fn scene(b: &dyn Backend, decoys_first: bool) {
         usage: BufferUsage::ALL,
     }));
     let tex = ok(b.create_texture(&texture_desc(RGBA, TextureDimension::D2, (4, 4, 1), 1)));
-    let view = ok(b.create_view(
-        tex,
-        &ViewDesc {
-            format: RGBA,
-            dimension: ViewDimension::D2,
-            base_mip: 0,
-            mip_count: 1,
-            base_layer: 0,
-            layer_count: 1,
-            swizzle: Swizzle::IDENTITY,
-        },
-    ));
-    let sampler = ok(b.create_sampler(&SamplerDesc {
-        mag_filter: FilterMode::Linear,
-        min_filter: FilterMode::Nearest,
-        mip_filter: FilterMode::Nearest,
-        address: [AddressMode::ClampToEdge; 3],
-        border_color: BorderColor::OpaqueBlack,
-        lod_bias: 0.0,
-        min_lod: 0.0,
-        max_lod: 1.0,
-        max_anisotropy: 1,
-        compare: None,
-        reduction: ReductionMode::Average,
-    }));
+    let view = ok(b.create_view(tex, &view_desc()));
+    let sampler = ok(b.create_sampler(&sampler_desc()));
     let vs = ok(b.create_shader(shader(ShaderStage::Vertex, Some(b"vs"))));
     let fs = ok(b.create_shader(shader(ShaderStage::Fragment, Some(b"fs"))));
     let cs = ok(b.create_shader(shader(ShaderStage::Compute, Some(b"cs"))));
@@ -299,7 +305,10 @@ fn ids_the_fresh_backend_hands_out_differently_are_mapped() {
     let originals = original.lists();
     let replayed = fresh.lists();
     assert_eq!(replayed.len(), originals.len());
-    assert_ne!(replayed, originals, "the lists name the fresh backend's ids");
+    assert_ne!(
+        replayed, originals,
+        "the lists name the fresh backend's ids"
+    );
 }
 
 #[test]
@@ -308,7 +317,6 @@ fn a_result_replay_cannot_reproduce_is_found() {
     // A fresh backend whose budget is one byte short of the buffer: the buffer is refused for
     // the memory limit, the list and the destroy naming it are refused, and the results the
     // list made are missing on replay.
-
 
     let (report, fresh) = replay_fresh(&bytes, 255, None);
     assert_eq!(

@@ -49,11 +49,9 @@
 //! leaves the table. A description the device refuses is passed on uncharged, for the backend
 //! to refuse.
 
-use super::read::CaptureReader;
-use super::record::{
-    Created, FrameResult, PipelineResult, Record, ShaderCode, Submit,
-};
 use super::CaptureError;
+use super::read::CaptureReader;
+use super::record::{Created, FrameResult, PipelineResult, Record, ShaderCode, Submit};
 use crate::backend::{Backend, PipelineStatus, PresentTarget, Readback, WaitOutcome};
 use crate::command::{
     BindingResource, BufferSlice, Command, CommandList, CopyRegion, DispatchParams, DrawParams,
@@ -609,7 +607,9 @@ impl Replay<'_> {
         result: Result<T, RenderError>,
     ) -> Result<Compared<T>, ReplayError> {
         Ok(match (captured, result) {
-            (_, Err(RenderError::DeviceLost)) => return Err(ReplayError::DeviceLost { record: at }),
+            (_, Err(RenderError::DeviceLost)) => {
+                return Err(ReplayError::DeviceLost { record: at });
+            }
             (Created::Made(_), Ok(value)) => Compared::Both(value),
             (Created::Refused(_), Err(_)) => Compared::Not,
             (Created::Made(_), Err(error)) => {
@@ -726,7 +726,10 @@ impl Replay<'_> {
                 let index = usize::try_from(*source).unwrap_or(usize::MAX);
                 // The reader refuses a `CreateShader` naming a source not yet given.
                 let Some(record) = self.sources.get(index).map(Arc::clone) else {
-                    self.refuse(at, FindingKind::Unresolved(format!("no shader source {source}")));
+                    self.refuse(
+                        at,
+                        FindingKind::Unresolved(format!("no shader source {source}")),
+                    );
                     return Ok(None);
                 };
                 let origin = ShaderOrigin {
@@ -748,9 +751,10 @@ impl Replay<'_> {
                         self.refuse(at, FindingKind::Unresolved(message));
                         Ok(None)
                     }
-                    Err(ResolveError::Fatal(message)) => {
-                        Err(ReplayError::Shader { record: at, message })
-                    }
+                    Err(ResolveError::Fatal(message)) => Err(ReplayError::Shader {
+                        record: at,
+                        message,
+                    }),
                 };
             }
         };
@@ -789,7 +793,9 @@ impl Replay<'_> {
     /// The fresh fence of the latest captured list at or below `after` that both sides
     /// accepted; zero when there is none.
     fn map_fence(&self, after: FenceValue) -> FenceValue {
-        let at_or_below = self.fences.partition_point(|&(captured, _)| captured <= after);
+        let at_or_below = self
+            .fences
+            .partition_point(|&(captured, _)| captured <= after);
         at_or_below
             .checked_sub(1)
             .and_then(|i| self.fences.get(i))

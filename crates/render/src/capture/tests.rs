@@ -6,8 +6,8 @@ mod golden;
 mod read;
 mod replay;
 mod roundtrip;
-mod writer;
 mod wrap;
+mod writer;
 
 use super::{
     CaptureBuffer, CaptureError, CaptureLimits, CaptureReader, CaptureSink, CaptureWriter, Record,
@@ -21,13 +21,13 @@ use crate::caps::{
 };
 use crate::command::{CommandList, StagingSlice};
 use crate::error::RenderError;
+use crate::format::PixelFormat;
 use crate::id::{
     BufferId, FenceValue, PipelineId, ReadbackId, ResourceId, SamplerId, ShaderId, TextureId,
     ViewId,
 };
 use crate::pipeline::{ComputePipelineDesc, GraphicsPipelineDesc};
 use crate::recording::RecordingBackend;
-use crate::format::PixelFormat;
 use crate::resource::{
     AddressMode, BorderColor, BufferDesc, Extent3d, FilterMode, ReductionMode, SamplerDesc,
     Swizzle, TextureDesc, TextureDimension, TextureUsage, ViewDesc, ViewDimension,
@@ -152,33 +152,35 @@ pub(super) fn file(records: &[&[u8]]) -> Vec<u8> {
 }
 
 /// What a [`Spy`] does differently from the recording backend it wraps.
-#[derive(Clone, Copy, Debug, Default)]
-pub(super) struct Knobs {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Knob {
+    /// Nothing.
+    Plain,
     /// Every `create_buffer` returns the same id.
-    pub(super) repeat_buffer: bool,
+    RepeatBuffer,
     /// Every pipeline reports `Compiling`.
-    pub(super) compiling: bool,
+    Compiling,
     /// Every `create_buffer` reports a lost device.
-    pub(super) lost: bool,
+    Lost,
     /// Every `wait` times out.
-    pub(super) time_out: bool,
+    TimeOut,
 }
 
-/// A recording backend with [`Knobs`], which keeps every `destroy` call it is given. Where a
-/// knob is off it behaves as the recording backend does, call for call.
+/// A recording backend with a [`Knob`], which keeps every `destroy` call it is given. With
+/// [`Knob::Plain`] it behaves as the recording backend does, call for call.
 #[derive(Debug)]
 pub(super) struct Spy {
     pub(super) inner: RecordingBackend,
-    knobs: Knobs,
+    knob: Knob,
     destroys: Mutex<Vec<(ResourceId, FenceValue)>>,
 }
 
 impl Spy {
     /// A spy over a recording backend for [`caps`] with 1 MiB of memory.
-    pub(super) fn new(knobs: Knobs) -> Self {
+    pub(super) fn new(knob: Knob) -> Self {
         Self {
             inner: RecordingBackend::new(caps(), 1 << 20),
-            knobs,
+            knob,
             destroys: Mutex::default(),
         }
     }
@@ -197,10 +199,10 @@ impl Backend for Spy {
         self.inner.budget()
     }
     fn create_buffer(&self, desc: &BufferDesc) -> Result<BufferId, RenderError> {
-        if self.knobs.lost {
+        if self.knob == Knob::Lost {
             return Err(RenderError::DeviceLost);
         }
-        if self.knobs.repeat_buffer {
+        if self.knob == Knob::RepeatBuffer {
             return Ok(BufferId::new(1, 1));
         }
         self.inner.create_buffer(desc)
@@ -237,7 +239,7 @@ impl Backend for Spy {
         self.inner.create_compute_pipeline(desc)
     }
     fn pipeline_status(&self, id: PipelineId) -> PipelineStatus {
-        if self.knobs.compiling {
+        if self.knob == Knob::Compiling {
             return PipelineStatus::Compiling;
         }
         self.inner.pipeline_status(id)
@@ -252,7 +254,7 @@ impl Backend for Spy {
         self.inner.completed()
     }
     fn wait(&self, value: FenceValue, timeout: Duration) -> Result<WaitOutcome, RenderError> {
-        if self.knobs.time_out {
+        if self.knob == Knob::TimeOut {
             return Ok(WaitOutcome::TimedOut);
         }
         self.inner.wait(value, timeout)

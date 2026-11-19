@@ -331,7 +331,10 @@ mod tests {
                 Err(FormatTableLength { found })
             );
             let bytes = postcard::to_allocvec(&list).expect("serialise");
-            assert!(postcard::from_bytes::<FormatTable>(&bytes).is_err(), "{found}");
+            assert!(
+                postcard::from_bytes::<FormatTable>(&bytes).is_err(),
+                "{found}"
+            );
         }
         assert_eq!(
             FormatTableLength { found: 3 }.to_string(),

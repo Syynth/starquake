@@ -102,11 +102,7 @@ impl ResourceId {
 impl std::fmt::Display for ResourceId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (index, generation) = self.parts();
-        write!(
-            f,
-            "{} {index} (generation {generation})",
-            self.kind_name()
-        )
+        write!(f, "{} {index} (generation {generation})", self.kind_name())
     }
 }
 
@@ -150,11 +146,23 @@ mod tests {
     #[test]
     fn resource_ids_in_words() {
         let cases = [
-            (ResourceId::Buffer(BufferId::new(1, 2)), "buffer 1 (generation 2)"),
-            (ResourceId::Texture(TextureId::new(3, 4)), "texture 3 (generation 4)"),
+            (
+                ResourceId::Buffer(BufferId::new(1, 2)),
+                "buffer 1 (generation 2)",
+            ),
+            (
+                ResourceId::Texture(TextureId::new(3, 4)),
+                "texture 3 (generation 4)",
+            ),
             (ResourceId::View(ViewId::new(5, 6)), "view 5 (generation 6)"),
-            (ResourceId::Sampler(SamplerId::new(7, 8)), "sampler 7 (generation 8)"),
-            (ResourceId::Shader(ShaderId::new(9, 10)), "shader 9 (generation 10)"),
+            (
+                ResourceId::Sampler(SamplerId::new(7, 8)),
+                "sampler 7 (generation 8)",
+            ),
+            (
+                ResourceId::Shader(ShaderId::new(9, 10)),
+                "shader 9 (generation 10)",
+            ),
             (
                 ResourceId::Pipeline(PipelineId::new(11, 12)),
                 "pipeline 11 (generation 12)",

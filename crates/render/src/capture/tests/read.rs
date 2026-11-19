@@ -126,7 +126,9 @@ fn header() -> Vec<u8> {
 #[test]
 fn version_1_is_refused_before_its_body() {
     // A version-1 file as the old writer laid it out: a list mark, a fence, a list, the end.
-    let v1 = [b'S', b'Q', b'R', b'C', 0x01, 0x01, 0x01, 0x01, 0x09, 0x07, 0x0B, 0x00];
+    let v1 = [
+        b'S', b'Q', b'R', b'C', 0x01, 0x01, 0x01, 0x01, 0x09, 0x07, 0x0B, 0x00,
+    ];
     let error = read(&v1).expect_err("version 1");
     assert_eq!(error, CaptureError::UnsupportedVersion { found: 1 });
     assert_eq!(
@@ -147,7 +149,12 @@ fn version_1_is_refused_before_its_body() {
 
 #[test]
 fn a_foreign_file_is_bad_magic_before_its_version() {
-    for bytes in [&b"PK\x03\x04\x01"[..], b"SQRD\x02", b"sqrc\x02", b"XQRC\x01"] {
+    for bytes in [
+        &b"PK\x03\x04\x01"[..],
+        b"SQRD\x02",
+        b"sqrc\x02",
+        b"XQRC\x01",
+    ] {
         assert_eq!(read(bytes), Err(CaptureError::BadMagic), "{bytes:?}");
     }
     assert_eq!(
@@ -161,7 +168,10 @@ fn a_foreign_file_is_bad_magic_before_its_version() {
     for bytes in [&b"X"[..], b"SX", b"SQX"] {
         assert_eq!(read(bytes), Err(CaptureError::BadMagic), "{bytes:?}");
     }
-    assert_eq!(CaptureError::Truncated.to_string(), "the capture ends early");
+    assert_eq!(
+        CaptureError::Truncated.to_string(),
+        "the capture ends early"
+    );
 }
 
 #[test]
@@ -170,7 +180,9 @@ fn a_malformed_version_is_a_header_error() {
     file.extend([0x80; 5]);
     assert_eq!(
         read(&file),
-        Err(CaptureError::HeaderDecode(postcard::Error::DeserializeBadVarint))
+        Err(CaptureError::HeaderDecode(
+            postcard::Error::DeserializeBadVarint
+        ))
     );
     // A version that runs out of bytes is cut short.
     assert_eq!(read(b"SQRC\x80"), Err(CaptureError::Truncated));
@@ -212,7 +224,10 @@ fn an_input_shorter_than_its_length_is_truncated() {
     let len = u64::try_from(whole.len()).expect("small");
     let mut reader = CaptureReader::new(short, len).expect("header");
     assert!(matches!(reader.next_record(), Ok(Some(Record::Start(_)))));
-    assert!(matches!(reader.next_record(), Ok(Some(Record::CreateBuffer(_)))));
+    assert!(matches!(
+        reader.next_record(),
+        Ok(Some(Record::CreateBuffer(_)))
+    ));
     assert_eq!(reader.next_record(), Err(CaptureError::Truncated));
     assert_eq!(reader.next_record(), Err(CaptureError::Truncated));
 }
@@ -332,7 +347,13 @@ fn a_body_shorter_than_its_length_is_refused() {
     });
     long.push(0x00);
     let error = read(&file(&[&framed(RecordKind::Destroy.tag(), &long)])).expect_err("left over");
-    assert_eq!(error, CaptureError::RecordTrailingBytes { record: 1, count: 1 });
+    assert_eq!(
+        error,
+        CaptureError::RecordTrailingBytes {
+            record: 1,
+            count: 1
+        }
+    );
     assert_eq!(
         error.to_string(),
         "record 1 has 1 bytes left over after its body"
@@ -384,7 +405,10 @@ fn only_end_follows_limit() {
             kind: RecordKind::Destroy
         }
     );
-    assert_eq!(error.to_string(), "record 2 (Destroy) follows the Limit record");
+    assert_eq!(
+        error.to_string(),
+        "record 2 (Destroy) follows the Limit record"
+    );
     assert_eq!(
         read(&file(&[&limit(), &limit()])),
         Err(CaptureError::AfterLimit {
@@ -443,7 +467,13 @@ fn shader_sources_come_in_order_and_are_named_after_they_come() {
     );
     // Named before it is given; then the last given; then one past it.
     let error = read(&file(&[&shader(0, 1)])).expect_err("not given");
-    assert_eq!(error, CaptureError::UnknownSource { record: 1, index: 0 });
+    assert_eq!(
+        error,
+        CaptureError::UnknownSource {
+            record: 1,
+            index: 0
+        }
+    );
     assert_eq!(
         error.to_string(),
         "record 1: shader source 0 has not been given"
@@ -451,7 +481,10 @@ fn shader_sources_come_in_order_and_are_named_after_they_come() {
     assert!(read(&file(&[&source(0), &shader(0, 1)])).is_ok());
     assert_eq!(
         read(&file(&[&source(0), &shader(1, 1)])),
-        Err(CaptureError::UnknownSource { record: 2, index: 1 })
+        Err(CaptureError::UnknownSource {
+            record: 2,
+            index: 1
+        })
     );
 }
 
@@ -570,7 +603,10 @@ fn the_first_check_in_the_documented_order_is_reported() {
     f.extend([RecordKind::Destroy.tag(), 0x05, 0x09]);
     assert_eq!(read(&f), Err(CaptureError::Truncated));
     // Decoding, then left-over bytes: a bad enum with a byte to spare.
-    let f = file(&[&framed(RecordKind::Destroy.tag(), &[0x06, 0x01, 0x01, 0x01, 0x00])]);
+    let f = file(&[&framed(
+        RecordKind::Destroy.tag(),
+        &[0x06, 0x01, 0x01, 0x01, 0x00],
+    )]);
     assert_eq!(
         read(&f),
         Err(CaptureError::Decode {
@@ -590,12 +626,18 @@ fn the_first_check_in_the_documented_order_is_reported() {
     f.extend(END);
     assert_eq!(
         read(&f),
-        Err(CaptureError::RecordTrailingBytes { record: 0, count: 1 })
+        Err(CaptureError::RecordTrailingBytes {
+            record: 0,
+            count: 1
+        })
     );
     // Decoding, then the order checks: a malformed first record that is not Start.
     let mut f = header();
     f.extend(framed(RecordKind::Destroy.tag(), &[0x06, 0x01, 0x01, 0x01]));
-    assert!(matches!(read(&f), Err(CaptureError::Decode { record: 0, .. })));
+    assert!(matches!(
+        read(&f),
+        Err(CaptureError::Decode { record: 0, .. })
+    ));
     // Field bounds, then the order checks: a long entry name on a shader naming no source.
     let long_entry = framed_any(
         RecordKind::CreateShader.tag(),
@@ -641,7 +683,10 @@ fn the_first_check_in_the_documented_order_is_reported() {
     // Within a CreateShader: the source it names, then the id it returns.
     assert_eq!(
         read(&file(&[&source(0), &shader(0, 1), &shader(4, 1)])),
-        Err(CaptureError::UnknownSource { record: 3, index: 4 })
+        Err(CaptureError::UnknownSource {
+            record: 3,
+            index: 4
+        })
     );
     // The order checks, then bytes after End: End first, with a byte behind it.
     let mut f = header();
@@ -656,7 +701,6 @@ fn the_first_check_in_the_documented_order_is_reported() {
     );
 }
 
-
 #[test]
 fn a_submit_reads_its_list_then_its_result() {
     // Built by hand: two markers, then the fence. Swapping the two reads would fail.
@@ -668,12 +712,15 @@ fn a_submit_reads_its_list_then_its_result() {
     };
     assert_eq!(*result, Created::Made(FenceValue::new(7)));
     assert_eq!(list.commands.len(), 2);
-    assert_eq!(list, &CommandList {
-        commands: vec![
-            crate::command::Command::Marker(crate::command::Marker { submit: 1, draw: 2 }),
-            crate::command::Command::Marker(crate::command::Marker { submit: 3, draw: 4 }),
-        ],
-    });
+    assert_eq!(
+        list,
+        &CommandList {
+            commands: vec![
+                crate::command::Command::Marker(crate::command::Marker { submit: 1, draw: 2 }),
+                crate::command::Command::Marker(crate::command::Marker { submit: 3, draw: 4 }),
+            ],
+        }
+    );
 }
 
 #[test]
@@ -682,7 +729,10 @@ fn the_reader_reports_its_position() {
     let len = u64::try_from(bytes.len()).expect("small");
     let mut reader = CaptureReader::new(&bytes[..], len).expect("header");
     assert_eq!(reader.position(), 0);
-    assert!(matches!(reader.next_record(), Ok(Some(Record::Start(Start { .. })))));
+    assert!(matches!(
+        reader.next_record(),
+        Ok(Some(Record::Start(Start { .. })))
+    ));
     assert_eq!(reader.position(), 1);
     assert!(matches!(reader.next_record(), Ok(Some(Record::Destroy(_)))));
     assert_eq!(reader.position(), 2);

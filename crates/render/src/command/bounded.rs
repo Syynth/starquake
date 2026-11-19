@@ -24,8 +24,8 @@
 
 use super::{Binding, BufferSlice, Command, Rect, Viewport};
 use crate::caps::{GUEST_VERTEX_BUFFERS, GUEST_VIEWPORTS};
-use serde::de::{Deserializer, Error, SeqAccess, Visitor};
 use serde::Deserialize;
+use serde::de::{Deserializer, Error, SeqAccess, Visitor};
 use std::fmt;
 use std::marker::PhantomData;
 

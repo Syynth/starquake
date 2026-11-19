@@ -96,7 +96,7 @@ fn a_record_past_the_limit_is_refused_and_the_capture_closes_within_it() {
     // The closing records use the room kept for them.
     assert_eq!(w.close_at_limit(), Ok(()));
     let bytes = buffer.bytes();
-    assert!(u64::try_from(bytes.len()).expect("small") <= exact - 1);
+    assert!(u64::try_from(bytes.len()).expect("small") < exact);
     let records = read(&bytes).expect("a closed capture");
     assert_eq!(
         records.iter().map(Record::kind).collect::<Vec<_>>(),
@@ -210,7 +210,6 @@ fn shader(origin: Option<ShaderOrigin>, source: ShaderSource) -> ShaderDesc {
         origin,
     }
 }
-
 
 #[test]
 fn shader_code_is_its_origin_once_by_content_or_its_own_code() {
