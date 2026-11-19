@@ -690,6 +690,12 @@ fn an_unreadable_semaphore_stops_the_channel() {
     };
     assert_eq!(rig.channel.recheck(&rig.mem), Err(error));
     assert_eq!(rig.channel.state(), ChannelState::Stopped(error));
+    // Stopped while parked: the stop wins over the park in every later call.
+    assert_eq!(rig.run(), Err(error));
+    assert!(!rig.channel.resume_latched());
+    assert_eq!(rig.channel.state(), ChannelState::Stopped(error));
+    assert_eq!(rig.channel.recheck(&rig.mem), Err(error));
+    assert_eq!(rig.take(), []);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1453,6 +1459,50 @@ fn the_quantum_bounds_the_words_read_per_call() {
 }
 
 #[test]
+fn words_read_ahead_are_not_kept_across_run_calls() {
+    // Rewritten between two quanta: the second call reads the new word, not the copy read
+    // ahead by the first call.
+    let mut rig = make_rig();
+    let mut pb = PushBuffer::new();
+    pb.immediate(2, 0x100, 1).unwrap();
+    pb.immediate(2, 0x100, 2).unwrap();
+    rig.start(CMD, pb.words());
+    assert_eq!(
+        rig.channel.run(&rig.mem, &mut rig.sink, 1),
+        Ok(RunOutcome::QuantumUsed)
+    );
+    let mut new = PushBuffer::new();
+    new.immediate(2, 0x300, 3).unwrap();
+    rig.write(word_va(CMD, 1), new.words());
+    assert_eq!(rig.run(), Ok(RunOutcome::EntryDone));
+    assert_eq!(
+        rig.take(),
+        [
+            method_word(2, class_i2m(), 0x100, 1, 0),
+            method_word(2, class_i2m(), 0x300, 3, 0),
+        ]
+    );
+
+    // Unmapped between two quanta: the second call faults on the word it needs.
+    let mut rig = make_rig();
+    rig.start(CMD, pb.words());
+    assert_eq!(
+        rig.channel.run(&rig.mem, &mut rig.sink, 1),
+        Ok(RunOutcome::QuantumUsed)
+    );
+    rig.mem
+        .unmap(PageRange::new(GPU_BASE, PAGES * PAGE_SIZE).unwrap())
+        .unwrap();
+    let va = word_va(CMD, 1);
+    let error = ChannelError::ReadFault {
+        va,
+        fault: GpuFault::Unmapped { va },
+    };
+    assert_eq!(rig.run(), Err(error));
+    assert_eq!(rig.take(), [method_word(2, class_i2m(), 0x100, 1, 0)]);
+}
+
+#[test]
 fn an_entry_across_a_page_boundary_reads_both_pages() {
     let mut rig = make_rig();
     let start = GPU_BASE + PAGE_SIZE - 8;
@@ -1547,6 +1597,44 @@ fn an_entry_past_the_address_space_stops_the_channel() {
 }
 
 #[test]
+fn an_unaligned_entry_stops_the_channel() {
+    // Every misalignment is refused before anything is read.
+    for misalign in 1..WORD_BYTES {
+        let mut rig = make_rig();
+        let address = CMD + misalign;
+        let error = ChannelError::UnalignedEntry { address };
+        assert_eq!(
+            rig.channel.start_entry(entry_at(address, 2)),
+            Err(StateError::Stopped(error))
+        );
+        assert_eq!(rig.channel.state(), ChannelState::Stopped(error));
+        assert_eq!(rig.run(), Err(error));
+        assert_eq!(rig.take(), []);
+    }
+    // The aligned neighbour is accepted and runs.
+    let mut rig = make_rig();
+    let mut pb = PushBuffer::new();
+    pb.immediate(2, 0x100, 1).unwrap();
+    rig.write(CMD + WORD_BYTES, pb.words());
+    assert_eq!(
+        rig.channel.start_entry(entry_at(CMD + WORD_BYTES, 1)),
+        Ok(())
+    );
+    assert_eq!(rig.run(), Ok(RunOutcome::EntryDone));
+    assert_eq!(rig.take(), [method_word(2, class_i2m(), 0x100, 1, 0)]);
+
+    // Both faults at once: unaligned, and past the address space. Alignment is checked first.
+    let mut rig = make_rig();
+    let address = GP_ADDRESS_END - 2;
+    assert_eq!(
+        rig.channel.start_entry(entry_at(address, 2)),
+        Err(StateError::Stopped(ChannelError::UnalignedEntry {
+            address
+        }))
+    );
+}
+
+#[test]
 fn a_busy_channel_refuses_before_the_entry_is_checked() {
     let past = entry_at(GP_ADDRESS_END - 4, 2);
     let mut rig = make_rig();
@@ -1558,8 +1646,12 @@ fn a_busy_channel_refuses_before_the_entry_is_checked() {
         rig.channel.run(&rig.mem, &mut rig.sink, 1),
         Ok(RunOutcome::QuantumUsed)
     );
-    // Both faults at once: running, and an entry past the address space.
+    // Both faults at once: running, and an entry past the address space (or unaligned).
     assert_eq!(rig.channel.start_entry(past), Err(StateError::Running));
+    assert_eq!(
+        rig.channel.start_entry(entry_at(CMD + 2, 1)),
+        Err(StateError::Running)
+    );
     assert_eq!(rig.channel.state(), ChannelState::Running);
     assert_eq!(rig.run(), Ok(RunOutcome::EntryDone));
 }
@@ -1740,6 +1832,13 @@ fn errors_read_as_plain_words() {
         }
         .to_string(),
         "a method header for 3 words from method 0xffe runs past method 0xfff"
+    );
+    assert_eq!(
+        ChannelError::UnalignedEntry {
+            address: 0x12_3400_0002
+        }
+        .to_string(),
+        "the GP entry at GPU address 0x1234000002 is not 4-byte aligned"
     );
     assert_eq!(
         DroppedWord::BadHeader(fifo::DecodeError::ReservedOpcode { word: 0xc000_0000 }).to_string(),

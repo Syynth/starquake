@@ -36,11 +36,21 @@
 //!
 //! # Reading words
 //!
-//! Command words are read when they are executed, never at submission (row 50), through
-//! [`GpuMemory`] as copies, in chunks that end at the entry's end or at the end of a page
-//! ([`starquake_memory::PAGE_SIZE`]), whichever is first. A chunk never runs past the page
-//! holding the next word to execute, so a read fault is raised by the word that needs the
-//! unreadable page, not by a word read ahead (`an_unmapped_second_page_is_not_read_before_it_is_needed`).
+//! Command words are read during the [`Channel::run`] call that executes them, never at
+//! submission (row 50), through [`GpuMemory`] as copies, in chunks that end at the entry's end
+//! or at the end of a page ([`starquake_memory::PAGE_SIZE`]), whichever is first. The exact
+//! read-ahead window: when the next word to execute is not in the chunk, the channel reads
+//! from it to the end of its page or of the entry, and executes from that copy until the
+//! chunk runs out, an acquire is checked, the entry ends, or `run` returns
+//! [`RunOutcome::QuantumUsed`]; each of these drops the rest of the chunk. So no word read in
+//! one `run` call is executed by a later one, whatever the front does in between (serving
+//! other channels, changing the address table)
+//! (`words_read_ahead_are_not_kept_across_run_calls`). Within one call, a word read ahead can
+//! be up to a page older than its execution.
+//!
+//! A chunk never runs past the page holding the next word to execute, so a read fault is
+//! raised by the word that needs the unreadable page, not by a word read ahead
+//! (`an_unmapped_second_page_is_not_read_before_it_is_needed`).
 //!
 //! **After every acquire, met or not, the rest of the chunk is dropped and the words after the
 //! acquire are read again.** The CPU writes a command buffer and then releases the acquire
@@ -65,8 +75,10 @@
 //!
 //! - **The channel stops** ([`ChannelError`], returned by [`Channel::run`] and by every later
 //!   call, sticky): a command word that cannot be read ([`ChannelError::ReadFault`]), a
-//!   semaphore an acquire cannot read ([`ChannelError::SemaphoreFault`]), an entry that runs past
-//!   the GP entry's 40-bit address space ([`ChannelError::EntryPastAddressSpace`], from
+//!   semaphore an acquire cannot read ([`ChannelError::SemaphoreFault`]), an entry whose
+//!   address is not 4-byte aligned ([`ChannelError::UnalignedEntry`], from
+//!   [`Channel::start_entry`]; only a hand-built [`GpEntry`] can hold one), an entry that runs
+//!   past the GP entry's 40-bit address space ([`ChannelError::EntryPastAddressSpace`], from
 //!   [`Channel::start_entry`]), and a method header whose data would run past method 0xFFF
 //!   ([`ChannelError::MethodPastSpace`]).
 //! - **The word is dropped** ([`DroppedWord`], reported as [`Note::Dropped`] and counted per
@@ -121,13 +133,16 @@
 //! - **Old-format method headers** (opcode 0 or 2 with tertiary opcode 0, [`MethodHeader::Legacy`])
 //!   run as methods with their data words, as `clc76f.h` defines them; Eden-NX2's
 //!   `ProcessCommands` skips modes 0 and 2 as single words (`old_format_headers_run_as_methods`).
-//!   The all-zero `NOP` word is one with a count of 0 and does nothing either way.
+//!   The all-zero `NOP` word is one with a count of 0 and does nothing either way. This also
+//!   departs from the approved spec (next section).
 //! - **Opcode 7 ends the entry** (a guess, below). Eden-NX2 skips the word
 //!   (`end_segment_ends_the_entry_guess_item_9`).
-//! - **Semaphore address widths follow the header**: `SEMAPHOREA` and `SEM_ADDR_HI` give
-//!   address bits 39:32 from their bits 7:0 (decision 10). Eden-NX2 shifts all 32 bits of
-//!   `SEMAPHOREA` and 25 bits of `SEM_ADDR_HI` (`0x1FFFFFF`)
-//!   (`semaphore_address_upper_bits_follow_the_header`).
+//! - **Semaphore address widths follow the header** (decision 10): `SEMAPHOREA` and
+//!   `SEM_ADDR_HI` give address bits 39:32 from their bits 7:0, and `SEMAPHOREB` gives bits
+//!   31:2 (`OFFSET_LOWER`), so its bits 1:0 are dropped. Eden-NX2 shifts all 32 bits of
+//!   `SEMAPHOREA` and 25 bits of `SEM_ADDR_HI` (`0x1FFFFFF`), and its `SemaphoreAddress()`
+//!   (`engines/puller.h`) ORs in the whole of `SEMAPHOREB`; only its `SEM_ADDR_LO` path masks
+//!   with `~3`, as this module does (`semaphore_address_upper_bits_follow_the_header`).
 //! - **`MEM_OP_D` carries the memory operation**; Eden-NX2 invalidates its caches on
 //!   `MEM_OP_B` and ignores `MEM_OP_D` (`mem_op_d_triggers_the_operation`).
 //! - **Host methods 0x1C and 0x1D** (Maxwell's syncpoint payload and operation, which Eden-NX2
@@ -142,6 +157,23 @@
 //!   (decision 13 (c)); Eden-NX2 logs and goes on
 //!   (`malformed_words_are_dropped_and_the_stream_goes_on`,
 //!   `an_unmapped_entry_stops_the_channel_for_good`).
+//!
+//! # Departure from the spec (owner question)
+//!
+//! gpu-protocol, "The method stream", says: "Subdevice-mask operations (opcodes 0 and 2) are
+//! single-GPU no-ops and are skipped." Its facts table likewise says "0 and 2 are
+//! subdevice-mask operations". This module skips only the words `clc76f.h` defines as
+//! subdevice-mask operations (opcode 0 with tertiary opcode 1–3,
+//! [`MethodHeader::SubdeviceMask`], `subdevice_mask_operations_are_skipped`); opcode 2 with a
+//! non-zero tertiary opcode, and opcode 0 with an undefined subdevice-mask form, are dropped as
+//! [`DroppedWord::BadHeader`] (`malformed_words_are_dropped_and_the_stream_goes_on`). A word with
+//! opcode 0 or 2 and tertiary opcode 0 is an old-format method header in `clc76f.h`
+//! (`NVC76F_DMA_METHOD_ADDRESS_OLD`, `_COUNT_OLD`), and runs as one with its data words
+//! ([`MethodHeader::Legacy`], `old_format_headers_run_as_methods`). The reason is decision 10
+//! (follow the headers for layouts and field meanings). **Owner question:** keep this reading,
+//! and amend the spec sentence and the facts table to match, or skip every opcode 0 and 2 word
+//! as the spec says (Eden-NX2's behaviour), which would run an old-format header's data words
+//! as headers.
 //!
 //! # Guesses
 //!
@@ -210,8 +242,11 @@ const WORD_BYTES: u64 = 4;
 pub const INLINE_TO_MEMORY_SUBCHANNEL: u8 = 2;
 
 /// The class a fresh channel has bound on `subchannel`: inline-to-memory (`0xA140`,
-/// `classes/cla140.h`) on [`INLINE_TO_MEMORY_SUBCHANNEL`], nothing elsewhere. The back's
-/// channel state starts from the same function, so the two never disagree.
+/// `classes/cla140.h`) on [`INLINE_TO_MEMORY_SUBCHANNEL`], nothing elsewhere.
+///
+/// The intended contract, not yet in force: the back's channel state (slices G10 and G19)
+/// must start from this function, because subchannel 2's starting binding never reaches the
+/// back as a [`RingEntry::Bind`]. Nothing outside this module calls it yet.
 pub fn initial_binding(subchannel: Subchannel) -> Option<ClassId> {
     (subchannel.get() == INLINE_TO_MEMORY_SUBCHANNEL).then_some(ClassId(cla140::CLASS))
 }
@@ -336,6 +371,13 @@ pub enum ChannelError {
         address: u64,
         /// Its length in words.
         length: u32,
+    },
+    /// A GP entry whose address is not 4-byte aligned. [`GpEntry::from_words`] cannot make
+    /// one (`GP_ENTRY0_GET` is bits 31:2); only a hand-built [`GpEntry`] can.
+    #[error("the GP entry at GPU address {address:#x} is not 4-byte aligned")]
+    UnalignedEntry {
+        /// The entry's address.
+        address: u64,
     },
     /// A method header whose data words would run past method [`METHOD_MAX`].
     #[error(
@@ -497,7 +539,8 @@ struct Current {
 }
 
 /// Words read ahead from the current entry, from entry offset `start`. Emptied when the entry
-/// ends and after every acquire.
+/// ends, after every acquire and when [`Channel::run`] returns [`RunOutcome::QuantumUsed`], so
+/// it never outlives the `run` call that read it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Chunk {
     start: u32,
@@ -611,17 +654,28 @@ impl Channel {
 
     /// Gives an idle channel its next GP entry. Nothing is read yet.
     ///
-    /// An entry whose words run past [`GP_ADDRESS_END`] stops the channel
-    /// ([`ChannelError::EntryPastAddressSpace`], a **guess**, module docs). A channel that is
-    /// running an entry, parked or stopped refuses with [`StateError`] and does not change; that
-    /// check comes first, so a busy channel given an impossible entry is not stopped
-    /// (`a_busy_channel_refuses_before_the_entry_is_checked`).
+    /// The checks, in order: a channel that is running an entry, parked or stopped refuses with
+    /// [`StateError`] and does not change, so a busy channel given an impossible entry is not
+    /// stopped (`a_busy_channel_refuses_before_the_entry_is_checked`); an address that is not
+    /// 4-byte aligned stops the channel ([`ChannelError::UnalignedEntry`],
+    /// `an_unaligned_entry_stops_the_channel`); an entry whose words run past
+    /// [`GP_ADDRESS_END`] stops the channel ([`ChannelError::EntryPastAddressSpace`], a
+    /// **guess**, module docs).
     pub fn start_entry(&mut self, entry: GpEntry) -> Result<(), StateError> {
         match self.state() {
             ChannelState::Idle => {}
             ChannelState::Running => return Err(StateError::Running),
             ChannelState::Parked(_) => return Err(StateError::Parked),
             ChannelState::Stopped(error) => return Err(StateError::Stopped(error)),
+        }
+        // Alignment first, so an entry that is both unaligned and past the address space
+        // reports the alignment (`an_unaligned_entry_stops_the_channel`).
+        if !entry.address.is_multiple_of(WORD_BYTES) {
+            return Err(StateError::Stopped(self.stop(
+                ChannelError::UnalignedEntry {
+                    address: entry.address,
+                },
+            )));
         }
         // The address is at most 40 bits and the length 21, so the sum cannot overflow; the
         // checked form keeps that true whatever `GpEntry` holds.
@@ -644,7 +698,8 @@ impl Channel {
     /// acquire, or `quantum` words have been read in this call.
     ///
     /// An idle channel returns [`RunOutcome::Idle`] and a parked one
-    /// [`RunOutcome::Parked`], reading nothing. A stopped channel returns its error. The end
+    /// [`RunOutcome::Parked`], reading nothing. A stopped channel returns its error, also one
+    /// stopped while parked (`an_unreadable_semaphore_stops_the_channel`). The end
     /// of the entry is checked before the quantum, so an entry whose last word is the
     /// quantum's last returns [`RunOutcome::EntryDone`].
     pub fn run<M, S>(
@@ -673,6 +728,10 @@ impl Channel {
                 return Ok(RunOutcome::EntryDone);
             }
             if used >= quantum {
+                // Words read ahead are not kept for a later call: the front may serve other
+                // channels and the address table may change in between (module docs,
+                // "Reading words"; `words_read_ahead_are_not_kept_across_run_calls`).
+                self.chunk.clear();
                 return Ok(RunOutcome::QuantumUsed);
             }
             let (va, word) = match self.next_word(memory, current) {
