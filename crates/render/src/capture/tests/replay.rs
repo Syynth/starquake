@@ -515,6 +515,9 @@ fn shaders_are_translated_again_and_their_failures_counted() {
     assert_eq!(report.compared, 1);
     let snapshot = spy.inner.snapshot();
     assert!(snapshot.contains("SPIR-V 2 words"), "{snapshot}");
+    // A translated shader keeps its origin, so a capture of the replay holds it again; code
+    // stored as it is has none.
+    assert_eq!(spy.origins(), [origin(b"ok"), origin(b"E"), None]);
     assert_eq!(snapshot.matches("naga module").count(), 2, "{snapshot}");
     assert_eq!(
         FindingKind::MissingShader.to_string(),

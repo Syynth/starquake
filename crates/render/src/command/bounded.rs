@@ -156,7 +156,7 @@ impl<'de, T: Deserialize<'de>> Visitor<'de> for Bounded<T> {
         }
         // At the cap: one more element is too many. Postcard's sequences say their length up
         // front, so this is reached only when the claimed length was not believed.
-        match seq.next_element::<serde::de::IgnoredAny>()? {
+        match seq.next_element::<T>()? {
             None => Ok(list),
             Some(_) => Err(A::Error::invalid_length(max.saturating_add(1), &self)),
         }
@@ -183,4 +183,55 @@ pub(super) fn viewports<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Viewport>
 /// `DynamicValues::scissors`, capped at [`GUEST_VIEWPORTS`].
 pub(super) fn scissors<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Rect>, D::Error> {
     bounded(d, GUEST_VIEWPORTS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GUEST_VIEWPORTS, Rect};
+    use serde::Deserialize;
+
+    /// A capped list on its own.
+    #[derive(Debug, Deserialize)]
+    struct Probe {
+        #[serde(deserialize_with = "super::scissors")]
+        list: Vec<Rect>,
+    }
+
+    /// A list that claims `claimed` rectangles and holds `held`, four one-byte numbers each.
+    fn bytes(claimed: u8, held: u32) -> Vec<u8> {
+        let mut out = vec![claimed];
+        for i in 0..held {
+            out.extend([u8::try_from(i).expect("small"), 1, 2, 3]);
+        }
+        out
+    }
+
+    #[test]
+    fn a_length_not_believed_still_stops_at_the_cap() {
+        // Claiming 100 with fewer bytes than that, the length is not believed, so the cap is
+        // found by counting: one element past it is refused once read, whatever comes after.
+        let cap = GUEST_VIEWPORTS;
+        let over = postcard::from_bytes::<Probe>(&bytes(100, cap + 1));
+        assert_eq!(
+            over.map(|p| p.list.len()),
+            Err(postcard::Error::SerdeDeCustom)
+        );
+        // At the cap with nothing behind it, the list ends early: the input is cut short.
+        let at = postcard::from_bytes::<Probe>(&bytes(100, cap));
+        assert_eq!(
+            at.map(|p| p.list.len()),
+            Err(postcard::Error::DeserializeUnexpectedEnd)
+        );
+        // A length that is believed is checked before any element.
+        let claimed = u8::try_from(cap + 1).expect("small");
+        assert_eq!(
+            postcard::from_bytes::<Probe>(&bytes(claimed, cap + 1)).map(|p| p.list.len()),
+            Err(postcard::Error::SerdeDeCustom)
+        );
+        let exact = u8::try_from(cap).expect("small");
+        assert_eq!(
+            postcard::from_bytes::<Probe>(&bytes(exact, cap)).map(|p| p.list.len()),
+            Ok(usize::try_from(cap).expect("small"))
+        );
+    }
 }

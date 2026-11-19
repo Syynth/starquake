@@ -103,7 +103,19 @@
 //! maximum record size for [`MAX_SHADER_SOURCE_BYTES`]; this crate cannot depend on the shader
 //! crate, so the value here is a guess (65,536 instructions of 16 bytes, 1 MiB, doubled for the
 //! header and answers), which R11c should pin against slice 20's constant in a crate that sees
-//! both.
+//! both. Pinned by `capture::tests::bounds::the_bounds_are_the_documented_values`; (1) and (2)
+//! by `capture::tests::bounds::each_kind_cap_at_its_edge`,
+//! `a_lists_decoded_charge_at_its_edge` and `the_lists_nested_in_a_command_at_their_edge`.
+//!
+//! **Other departures from the spec's text, for the owner.** (4) The spec says a `Limit` record
+//! "says the capture stopped at the size cap". The capturing backend also closes with `Limit`
+//! when any other writer check refuses a record (a bound passed, or a wrapped backend handing out
+//! a live id), so the file always ends well formed; it keeps the error for the app to report
+//! ([`CapturingBackend::stopped`]; `capture::tests::wrap`). (5) "Nothing but `End` after `Limit`"
+//! is a reading check the spec does not list (`capture::tests::read::only_end_follows_limit`).
+//! (6) The spec says replay refuses a create past the memory limit "so a capture of many huge
+//! textures fails cleanly"; here the create is refused and counted and the replay goes on, as for
+//! any other id it does not hold (`capture::tests::replay`, the memory limit test).
 //!
 //! **Memory while reading.** The reader holds one record. A `Submit` takes at most its
 //! [`MAX_LIST_DECODED_BYTES`] charge (each command is charged `size_of::<Command>()` plus its

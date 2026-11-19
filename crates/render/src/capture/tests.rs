@@ -156,8 +156,8 @@ pub(super) fn file(records: &[&[u8]]) -> Vec<u8> {
 pub(super) enum Knob {
     /// Nothing.
     Plain,
-    /// Every `create_buffer` returns the same id.
-    RepeatBuffer,
+    /// Every `create_buffer` and `create_compute_pipeline` returns the same id.
+    RepeatIds,
     /// Every pipeline reports `Compiling`.
     Compiling,
     /// Every `create_buffer` reports a lost device.
@@ -166,13 +166,15 @@ pub(super) enum Knob {
     TimeOut,
 }
 
-/// A recording backend with a [`Knob`], which keeps every `destroy` call it is given. With
+/// A recording backend with a [`Knob`], which keeps every `destroy` call and every shader origin
+/// it is given. With
 /// [`Knob::Plain`] it behaves as the recording backend does, call for call.
 #[derive(Debug)]
 pub(super) struct Spy {
     pub(super) inner: RecordingBackend,
     knob: Knob,
     destroys: Mutex<Vec<(ResourceId, FenceValue)>>,
+    origins: Mutex<Vec<Option<ShaderOrigin>>>,
 }
 
 impl Spy {
@@ -182,12 +184,18 @@ impl Spy {
             inner: RecordingBackend::new(caps(), 1 << 20),
             knob,
             destroys: Mutex::default(),
+            origins: Mutex::default(),
         }
     }
 
     /// The `destroy` calls so far.
     pub(super) fn destroys(&self) -> Vec<(ResourceId, FenceValue)> {
         self.destroys.lock().expect("unpoisoned").clone()
+    }
+
+    /// The origin of every shader made so far.
+    pub(super) fn origins(&self) -> Vec<Option<ShaderOrigin>> {
+        self.origins.lock().expect("unpoisoned").clone()
     }
 }
 
@@ -202,7 +210,7 @@ impl Backend for Spy {
         if self.knob == Knob::Lost {
             return Err(RenderError::DeviceLost);
         }
-        if self.knob == Knob::RepeatBuffer {
+        if self.knob == Knob::RepeatIds {
             return Ok(BufferId::new(1, 1));
         }
         self.inner.create_buffer(desc)
@@ -217,6 +225,10 @@ impl Backend for Spy {
         self.inner.create_sampler(desc)
     }
     fn create_shader(&self, desc: ShaderDesc) -> Result<ShaderId, RenderError> {
+        self.origins
+            .lock()
+            .expect("unpoisoned")
+            .push(desc.origin.clone());
         self.inner.create_shader(desc)
     }
     fn destroy(&self, resource: ResourceId, after: FenceValue) {
@@ -236,6 +248,9 @@ impl Backend for Spy {
         &self,
         desc: ComputePipelineDesc,
     ) -> Result<PipelineId, RenderError> {
+        if self.knob == Knob::RepeatIds {
+            return Ok(PipelineId::new(2, 2));
+        }
         self.inner.create_compute_pipeline(desc)
     }
     fn pipeline_status(&self, id: PipelineId) -> PipelineStatus {

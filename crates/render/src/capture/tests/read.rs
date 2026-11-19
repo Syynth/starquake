@@ -282,6 +282,10 @@ fn bytes_after_end_are_refused_and_sticky() {
     assert_eq!(reader.next_record(), Err(error.clone()));
     assert_eq!(reader.next_record(), Err(error.clone()));
     assert_eq!(error.to_string(), "2 bytes follow the capture's End record");
+    // One byte is as many too many.
+    let mut one = file(&[]);
+    one.push(0x00);
+    assert_eq!(read(&one), Err(CaptureError::TrailingBytes { count: 1 }));
 }
 
 #[test]

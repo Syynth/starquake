@@ -391,6 +391,8 @@ fn a_pipeline_outcome_is_recorded_once_when_it_settles() {
         .expect("script");
     assert_eq!(b.pipeline_status(p), PipelineStatus::Compiling);
     assert_eq!(b.pipeline_status(p), PipelineStatus::Failed);
+    // Other calls in between do not make it settle again.
+    b.submit(CommandList::new()).expect("an empty list");
     assert_eq!(b.pipeline_status(p), PipelineStatus::Ready);
     // An id the capture never created: not recorded.
     let stranger = PipelineId::new(99, 0);
@@ -420,6 +422,44 @@ fn a_pipeline_outcome_is_recorded_once_when_it_settles() {
             }),
         ]
     );
+}
+
+#[test]
+fn a_pipeline_id_handed_out_again_after_its_destroy_is_recorded_again() {
+    // The spy hands out the same pipeline id every time, as a backend may once the id is free.
+    let buffer = Arc::new(CaptureBuffer::new());
+    let sink: Arc<dyn CaptureSink> = Arc::<CaptureBuffer>::clone(&buffer);
+    let capture = CapturingBackend::new(
+        Arc::new(Spy::new(Knob::RepeatIds)),
+        sink,
+        String::new(),
+        String::new(),
+        WaitSetting::Wait,
+        u64::MAX,
+    )
+    .expect("start");
+    let cs = capture
+        .create_shader(shader(
+            ShaderStage::Compute,
+            ShaderSource::Msl(String::new()),
+            None,
+        ))
+        .expect("shader");
+    let desc = ComputePipelineDesc { shader: cs };
+    let first = capture.create_compute_pipeline(desc).expect("pipeline");
+    // The recording backend under the spy never made this id, so it reports it failed.
+    assert_eq!(capture.pipeline_status(first), PipelineStatus::Failed);
+    capture.destroy(ResourceId::Pipeline(first), FenceValue::ZERO);
+    let second = capture.create_compute_pipeline(desc).expect("pipeline");
+    assert_eq!(first, second);
+    assert_eq!(capture.pipeline_status(second), PipelineStatus::Failed);
+    capture.finish().expect("end");
+    let outcomes = read(&buffer.bytes())
+        .expect("reads")
+        .into_iter()
+        .filter(|r| r.kind() == RecordKind::PipelineOutcome)
+        .count();
+    assert_eq!(outcomes, 2);
 }
 
 #[test]
@@ -561,7 +601,7 @@ fn a_list_past_its_bounds_stops_the_capture_and_is_submitted() {
 
 #[test]
 fn a_backend_handing_out_a_live_id_stops_the_capture() {
-    let inner: Arc<dyn Backend> = Arc::new(Spy::new(Knob::RepeatBuffer));
+    let inner: Arc<dyn Backend> = Arc::new(Spy::new(Knob::RepeatIds));
     let buffer = Arc::new(CaptureBuffer::new());
     let sink: Arc<dyn CaptureSink> = Arc::<CaptureBuffer>::clone(&buffer);
     let capture = CapturingBackend::new(
