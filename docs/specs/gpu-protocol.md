@@ -81,7 +81,7 @@ states exactly what this spec assumes of each and what it offers them.
 | Fact | Source |
 |---|---|
 | A GP entry is 8 bytes: word 0 bits 31:2 the low address, word 1 bits 7:0 the high address, bit 9 the level (main or subroutine), bits 30:10 the length in words, bit 31 sync | `classes/clc76f.h` (`NVC76F_GP_ENTRY0/1`); Eden's `CommandListHeader` in `eden-nx2/src/video_core/dma_pusher.h` agrees (address bits 0–39, size bits 42–62, sync bit 63) |
-| A method header: dword address in bits 11:0, subchannel 15:13, count (or immediate data) 28:16, opcode 31:29: 1 incrementing, 3 non-incrementing, 4 immediate, 5 increment-once, 7 end of segment; 0 and 2 are subdevice-mask operations | `classes/clc76f.h` (`NVC76F_DMA_*`). Eden reads 13 address bits (`CommandHeader` in `dma_pusher.h`); we follow the header's 12 and pin the difference with a test |
+| A method header: dword address in bits 11:0, subchannel 15:13, count (or immediate data) 28:16, opcode 31:29: 1 incrementing, 3 non-incrementing, 4 immediate, 5 increment-once, 7 end of segment; 0 and 2 read a tertiary opcode in bits 17:16, where 0 is an old-format incrementing (opcode 0) or non-incrementing (opcode 2) method and 1–3 are subdevice-mask operations | `classes/clc76f.h` (`NVC76F_DMA_*`, `NVC76F_DMA_SEC_OP`, `NVC76F_DMA_TERT_OP`); Eden's `SubmissionMode` names 0 and 2 `IncreasingOld` and `NonIncreasingOld` (decided by the owner, 2026-11-18). Eden reads 13 address bits (`CommandHeader` in `dma_pusher.h`); we follow the header's 12 and pin the difference with a test |
 | Methods below 0x40 are host methods: 0 bind object, 4–7 `SEMAPHOREA`–`D`, 8 non-stall interrupt, 0xA–0xD memory operations, 0x14 set reference, 0x17–0x1A semaphore address and payload, 0x1B `SEM_EXECUTE`, 0x1E wait for idle, 0x20 yield | `classes/clc76f.h`; `eden-nx2/src/video_core/engines/puller.cpp` |
 | `SEMAPHORED` bits 4:0 the operation (1 acquire-equal, 2 release, 4 acquire-greater-or-equal, 8 acquire-and, 0x10 reduction), bit 24 release size (4 bytes when set), bits 30:27 the reduction | `classes/clc76f.h`; the 4-byte release is row 52 |
 | Each command buffer is gated by a `SEMAPHORED` acquire the CPU releases after writing it; the GPU must stop at that word and resume there, reading the words after it again | Row 50; `eden-nx2/src/video_core/dma_pusher.cpp` (`command_resume_offset`) |
@@ -190,7 +190,10 @@ dispatched by method number: below 0x40 to the host methods, otherwise to the en
 the subchannel.
 
 - **Immediate** (opcode 4) carries 13 bits of data in the header itself.
-- **Subdevice-mask operations** (opcodes 0 and 2) are single-GPU no-ops and are skipped.
+- **Opcodes 0 and 2** read a tertiary opcode (bits 17:16). Tertiary 0 is an old-format method
+  header, incrementing for opcode 0 and non-incrementing for opcode 2, and runs like opcodes 1
+  and 3. Tertiary 1–3 are subdevice-mask operations, single-GPU no-ops that are skipped
+  (`clc76f.h`; decided by the owner, 2026-11-18).
 - **End of segment** (opcode 7) ends the current entry (**guess** from the opcode's name in
   `clc76f.h`; Eden ignores it; confirm with a trace that contains one).
 - **Opcode 6** is reserved: the word is a malformed-stream error (below).
@@ -201,7 +204,9 @@ The host methods are the `C76F` set (facts table). Bind object records the class
 subchannel and tells the back (a `Bind` ring entry); class 0 unbinds. Subchannel 2 starts bound
 to inline-to-memory, as Eden-NX2 found NVN2 expects (row 49). Releases, reductions, wait for
 idle, memory operations and set reference become ring entries for the back. Acquires are handled
-on the front.
+on the front. Set reference makes the back close its open command list with no fenced action
+attached, as Eden-NX2's back does (`puller.cpp`, `RefCnt` → `SignalReference`; decided by the
+owner, 2026-11-18).
 
 ### Semaphore acquires
 
@@ -299,12 +304,19 @@ authoritative copy (decision 1). For each incoming engine write the front:
 
 1. Applies the shadow RAM control (`SET_MME_SHADOW_RAM_CONTROL`, method 0x49) for 3D: in track
    modes the value is also stored in the shadow file; in replay mode the value written is the
-   shadow file's (behaviour from `maxwell_3d.cpp`, `ProcessShadowRam`, row 144).
+   shadow file's (behaviour from `maxwell_3d.cpp`, `ProcessShadowRam`, row 144). Data-load
+   methods (constant-buffer loads and inline-to-memory data) take the written words even in
+   replay mode; only state methods take the shadow value, as Eden-NX2's run path does
+   (`CallMultiMethod` applies the rule to a run's last word only). **Guess** until a trace shows
+   replay mode during an upload (decided by the owner, 2026-11-18).
 2. Applies the register's own side effects that change other registers. These are computed here
    and sent as ordinary writes, so the back never changes a register on its own: the constant
    buffer upload offset that advances with each `LOAD_CONSTANT_BUFFER` word, the macro bind
-   pointers (`LOAD_MME_START_ADDRESS_RAM_POINTER` and `_RAM`), the macro upload pointer, and the
-   root table offset. The list is per class and is a test fixture: Eden-NX2's verifier found
+   pointers (`LOAD_MME_START_ADDRESS_RAM_POINTER` and `_RAM`), and the root table offset. The
+   macro upload position is not among them: `LOAD_MME_INSTRUCTION_RAM_POINTER` stays as written,
+   and the macro host keeps the upload as a word offset (the pointer times 3, an MME64
+   instruction being three words), as both Switch 2 references do
+   (`eden-nx2/src/video_core/macro.h`, `native_write_offset`; decided by the owner, 2026-11-18). The list is per class and is a test fixture: Eden-NX2's verifier found
    three such cases it had missed (row 144).
 3. **Drops the write** if the method is a state method and the value equals the register's.
    Every other write updates the file and becomes a ring entry. A method is a state method only
@@ -380,6 +392,7 @@ enum RingEntry<'a> {
     Release(Release),                 // semaphore release or reduction, from any engine
     Syncpoint { id: SyncpointId },    // increment, from a submission's fence or the shim
     WaitForIdle { channel: ChannelId },
+    SetReference { channel: ChannelId, value: u32 }, // the back closes its open list; no action
     Invalidate { channel: ChannelId, what: Invalidation },
     Marker { token: MarkerToken },    // the back reports when it has performed everything before it
                                       // (ordered updates and barriers use it)
@@ -471,15 +484,20 @@ methods as ordinary writes; the back:
 
 1. On the last `LOAD_INLINE_QMD_DATA` word, writes the 256-byte inline QMD to guest memory at
    `SET_INLINE_QMD_ADDRESS` and, if `SET_QMD_VIRTUALIZATION_CONTROL` (method 0xA7) has
-   `SEND_PCAS_ENABLE` (bit 24) set, schedules it (`clc7c0.h`; Eden-NX2's `kepler_compute.cpp`
-   also schedules when bit 12 of method 0xCC is clear, a condition no header explains, kept as a
-   listed divergence).
+   `SEND_PCAS_ENABLE` (bit 24) set, schedules it (`clc7c0.h`). It also schedules it when bit 12 of method 0xCC is clear, as
+   Eden-NX2's `kepler_compute.cpp` does: 0xCC is `LOAD_INLINE_QMD_DATA(4)`, and that bit is the
+   QMD's `REQUIRE_SCHEDULING_PCAS` (QMD bit 140, `clc7c0qmd.h`), so a QMD that needs no
+   scheduling action is scheduled once it is loaded (decided by the owner, 2026-11-18).
 2. Keeps **one QMD table for all channels** (row 84): per QMD address, whether it is loaded,
    scheduled, completed, and its dependence counter plus deferred adjustments. `SEND_PCAS_A` and
    `SEND_SIGNALING_PCAS2_B` actions schedule (2, 3), decrement (7) or increment (12) a QMD; a QMD
    runs when it is loaded, scheduled, not completed and its counter is zero. The logic and its
    limits (4,096 QMDs, chains of 256) are those of `eden-nx2/src/video_core/native_qmd.h`, each
-   an `Err` here, not a silent stop.
+   an `Err` here, not a silent stop. A request that fails before its table entry is written (the
+   table is full; a read, version or queue error while loading; a dependence overflow) leaves the
+   table unchanged. One that fails after it (a dependence underflow; a read, version, queue or
+   release error while running) keeps its own change, as Eden-NX2 does (decided by the owner,
+   2026-11-18).
 3. A QMD that runs is read again from guest memory first, because NVN2 patches its release
    payloads while it waits (comment in `native_qmd.h`). It becomes a `Command::Dispatch`: program
    address (words 48–49), grid (words 12–14), block (words 18–19), shared memory, local memory,
