@@ -15,8 +15,7 @@
 //! fences from wgpu's completion reports; the render thread with its bounded queue; the
 //! offscreen present target, which counts presents and reads dumped frames back; and the
 //! completion wake. What it refuses until later slices, each with a named error: draws and
-//! dispatches (R7, [`plan::DRAWS_NOT_YET`]), blits ([`plan::BLITS_NOT_YET`]), and window targets
-//! (R8).
+//! dispatches (R7, [`plan::DRAWS_NOT_YET`]) and blits ([`plan::BLITS_NOT_YET`]).
 //!
 //! Slice R6 adds shaders and pipelines, in [`pipeline`]: shaders kept as naga modules and handed
 //! to wgpu (`ShaderSource::Naga`) by the first pipeline build that needs them; bind group and
@@ -28,6 +27,16 @@
 //! device that cannot promise them, which is every Mac under wgpu (an owner question). No driver
 //! cache blob is made: wgpu's is Vulkan only and needs an `unsafe` call ([`pipeline`], "Not
 //! here").
+//!
+//! Slice R8 adds window presentation (`window`, with its choices as pure functions in
+//! [`present`]): a wgpu surface made from the frontend's window, on the calling thread (on
+//! macOS the main thread, or [`NOT_MAIN_THREAD`]); a present mode that does not wait for the
+//! display while a newer frame is ready; the newest frame winning, the others counted as dropped
+//! in `PresentFeedback`; and the present blit, drawn into the window where the present stands in
+//! its list, so a later write to the image cannot change the frame shown (the ordering test,
+//! `backend::tests::window`). Surface creation needs no `unsafe` code: the window is handed over
+//! as an owned, shared object, which wgpu's safe constructor takes (verification 11;
+//! `starquake_render::window`).
 //!
 //! Where this backend refuses what the recording backend accepts, each a
 //! `RenderError::Unsupported` whose message names the rule ([`rules`] lists them with their
@@ -73,8 +82,10 @@ mod fixtures;
 pub mod format;
 pub mod pipeline;
 pub mod plan;
+pub mod present;
 pub mod rules;
 mod thread;
+mod window;
 
 pub use adapter::AdapterReport;
 pub use backend::{NewError, OPEN_TIMEOUT, WgpuBackend};
@@ -83,3 +94,5 @@ pub use pipeline::{
     DrawAction, DrawPipeline, PipelineCounts, ReadyPipeline, SkipReason, on_draw,
     subgroups_honoured,
 };
+pub use present::SURFACE_UNSUPPORTED;
+pub use window::{NO_SURFACE, NOT_MAIN_THREAD};

@@ -14,6 +14,7 @@ workspace = true
 naga.workspace = true
 png.workspace = true
 postcard.workspace = true
+raw-window-handle.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 
