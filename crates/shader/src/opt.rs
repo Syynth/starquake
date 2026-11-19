@@ -31,7 +31,7 @@
 //! Eden walks `post_order_blocks`, which `frontend/ir/post_order.cpp` (`PostOrder`) builds with
 //! a depth-first walk from the first block, taking each block's successors in order; Eden
 //! removes unreachable blocks first (`RemoveUnreachableBlocks`). Here a control-flow graph's
-//! post order is that same walk along the terminators ([`Terminator::successors`] order), and
+//! post order is that same walk along the terminators ([`Terminator::successors`](crate::ir::Terminator::successors) order), and
 //! blocks the entry cannot reach, which this IR keeps, come after the reachable ones in reverse
 //! post order (before them in post order), in arena order. A structured function's order is the
 //! order its tree lists its blocks (its "reverse post order"; post order is that reversed),

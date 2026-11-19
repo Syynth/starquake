@@ -7,7 +7,13 @@
 //! `Identity` of its replacement (Eden's `ReplaceUsesWith`), rewrites its arguments in place,
 //! or puts new operations in front of it, which the walk does not visit (as Eden's list walk
 //! does not). Arguments are looked through `Identity` chains as Eden's `Resolve` and
-//! `InstRecursive` do. The rules, in Eden's dispatch order (`ConstantPropagation`):
+//! `InstRecursive` do, and an argument whose chain ends at an immediate counts as that
+//! immediate, as Eden's `IsImmediate` and immediate reads (`U32()` and the rest) do, so a
+//! folded constant propagates to the operations that use it
+//! (`tests::constant::folds_see_through_identities`). Eden compares the `XMAD` patterns'
+//! immediates as written (`Arg(1) != sixteen`), so an `Identity` of 16 there does not match;
+//! here it does (no test: the passes before this one leave no such `Identity`). The rules,
+//! in Eden's dispatch order (`ConstantPropagation`):
 //!
 //! - `GetRegister RZ` is `0` and `GetPred PT` is `true` (`FoldGetRegister`, `FoldGetPred`);
 //!   here also `GetUniformRegister URZ` is `0` and `GetUniformPred UPT` is `true`. The verifier
@@ -40,8 +46,9 @@
 //! - `LogicalAnd` and `LogicalOr`: `FoldCommutative`, then `x && true` is `x`, `x && false` is
 //!   `false`, `x || true` is `true` and `x || false` is `x`. `LogicalNot` of an immediate
 //!   folds and of a `LogicalNot` is its argument.
-//! - The composite extracts with an immediate index read through a chain of inserts at other
-//!   indices to the insert at that index, or to the construct (`FoldCompositeExtract`).
+//! - The composite extracts of `u32`, `f32` and `f16` vectors (Eden's dispatch has no `f64`
+//!   ones) with an immediate index read through a chain of inserts at other indices to the
+//!   insert at that index, or to the construct (`FoldCompositeExtract`).
 //! - `FSwizzleAdd` with swizzle `0x99` or `0xA5` of a quad butterfly (a `QuadSwap`, or a
 //!   `ShuffleButterfly` with clamp 3 and segmentation mask 28) of its own second argument
 //!   becomes `DPdxFine` or `DPdyFine` of that argument (`FoldFSwizzleAdd`).
@@ -54,9 +61,10 @@
 //! - **Undefined folds are left alone.** Eden's `BitFieldUExtract` and `BitFieldSExtract` and
 //!   `BitFieldInsert` folds throw a `LogicError` (translation fails) when the field leaves the
 //!   word (`shift + count > 32`; for the signed extract also `count == 0`; for insert
-//!   `count >= 32` or `offset >= 32`), and its `ShiftRightArithmetic32` fold shifts by a
-//!   `s32`, which C++ leaves undefined from 32 up. Here those instructions are not folded
-//!   (`tests::constant::undefined_folds_are_left_alone`).
+//!   `count >= 32` or `offset >= 32`); its unsigned extract with `count == 32` computes
+//!   `1U << 32`, and its `ShiftRightArithmetic32` fold shifts an `s32` by 32 or more (or by a
+//!   negative amount), both undefined in C++. Here those instructions are not folded
+//!   (`tests::constant::undefined_folds_are_left_alone`, each edge on both sides).
 //! - **`BitFieldInsert` masks the inserted value** to the field, as SPIR-V's
 //!   `OpBitFieldInsert` and the interpreter do; Eden's fold ORs in `insert << offset`
 //!   unmasked (`tests::constant::bit_field_insert_masks_the_inserted_value`).
