@@ -137,6 +137,7 @@ use thiserror::Error;
 
 pub use analysis::{Analysis, analyze};
 pub use ir_build::{BlockSource, IrBlocks};
+pub(crate) use ir_build::read_pred;
 pub use jump_tables::{
     JumpTable, JumpTableQuestions, MAX_TABLE_ENTRIES, ResolvedTable, ResolvedTables,
     find_jump_tables, resolve_jump_tables,

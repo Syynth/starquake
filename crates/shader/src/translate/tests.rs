@@ -4,7 +4,7 @@
 use proptest::prelude::*;
 
 use super::*;
-use crate::decode::{OpExit, Pred, PredSrc, RoundMode, UniformReg};
+use crate::decode::{AluSrc, OpExit, OpFFma, Pred, PredSrc, RoundMode, UniformReg};
 use crate::testing::{any_instr, config};
 
 fn r(index: u8) -> Gpr {
@@ -295,9 +295,9 @@ fn mov_lane_mask_must_be_full() {
     assert!(one(mov(r(0), MovSrc::Imm(1))).is_ok());
 }
 
-/// The decoder reads uniform-register and constant-buffer sources of `MOV` and `FFMA`; the
-/// translator rejects them, in every source position, and keeps translating register and
-/// immediate sources.
+/// The decoder reads uniform-register and constant-buffer sources of `MOV`; the translator
+/// rejects them and keeps translating register and immediate sources. (`FFMA` reads them since
+/// slice 12b: `float::tests::sources_of_every_kind`.)
 #[test]
 fn uniform_and_constant_buffer_sources_are_rejected() {
     use crate::decode::{CBuf, CBufRef, UniformReg};
@@ -309,32 +309,6 @@ fn uniform_and_constant_buffer_sources_are_rejected() {
     for src in [MovSrc::CBuf(cbuf), MovSrc::UniformReg(ureg)] {
         let instr = mov(r(0), src);
         assert_eq!(one(instr), unsupported(instr, Unsupported::Source));
-    }
-    let wide = [
-        AluSrc::CBuf {
-            cbuf,
-            abs: false,
-            neg: false,
-        },
-        AluSrc::UniformReg {
-            reg: ureg,
-            abs: false,
-            neg: false,
-        },
-    ];
-    let reg = AluSrc::reg(r(1));
-    for src in wide {
-        for srcs in [[reg, src, reg], [reg, reg, src]] {
-            let instr = Instr::new(Op::FFma(OpFFma {
-                dst: r(0),
-                srcs,
-                saturate: false,
-                rnd: RoundMode::NearestEven,
-                ftz: false,
-                dnz: false,
-            }));
-            assert_eq!(one(instr), unsupported(instr, Unsupported::Source));
-        }
     }
     let instr = mov(r(0), MovSrc::UniformReg(ureg));
     assert_eq!(
@@ -401,7 +375,10 @@ fn ffma_multiply_zero_mode_is_rejected() {
     let instr = Instr::new(Op::FFma(op));
     assert_eq!(
         one(instr),
-        unsupported(instr, Unsupported::FfmaMultiplyZero)
+        unsupported(
+            instr,
+            Unsupported::Float(float::FloatUnsupported::FfmaMultiplyZero)
+        )
     );
     assert!(one(Instr::new(Op::FFma(OpFFma { dnz: false, ..op }))).is_ok());
 }

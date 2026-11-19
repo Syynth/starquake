@@ -101,7 +101,11 @@
 //!   texture information or argument values ([`InterpError::ImageMismatch`]), and then a reply
 //!   not of the opcode's result type ([`InterpError::ImageReply`]) are errors, checked in that
 //!   order, and a refused call leaves the script as it was. Tests stay pure.
-//! - **Warp operations**: only `LaneId` (from [`SystemValues`]); votes, shuffles, ballots and
+//! - **Warp operations**: only `LaneId` (from [`SystemValues`]) and `FSwizzleAdd`, which reads
+//!   only the lane id: Eden's `EmitFSwizzleAdd` (`emit_spirv_warp.cpp`) multiplies each operand
+//!   by a constant its table picks with the lane's two bits of the swizzle, at
+//!   `(lane_id & 3) * 2`, and adds the products, the operation's controls applying to all three
+//!   steps (added for the float translator, slice 12b). Votes, shuffles, ballots and
 //!   derivatives need the rest of the warp and are not supported yet.
 //!
 //! An operation not listed (for example `PhiMove`, `Join`, the `Get*FromOp` pseudo-operations,

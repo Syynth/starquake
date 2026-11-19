@@ -2,17 +2,22 @@
 //!
 //! Ported by behaviour from PR #4588's native frontend
 //! (`eden-pr4588/src/shader_recompiler/frontend/ampere/` @ e5fb3b97, GPL-3.0-or-later):
-//! `ops_move.cpp` (`MOV`), `ops_alu.cpp` (`FFMA`), `ops_misc.cpp` (`ALD`, `AST`, `S2R`) and
-//! `ops_attr.cpp` (`EXIT`). Each of the PR's `Require` checks on these forms is kept with its
-//! constant and turns into an [`Unsupported`] rejection naming the same thing, except the
-//! colour-register bound of `EXIT`, which cannot fail here (see `Translator::exit`).
+//! `ops_move.cpp` (`MOV`), `ops_misc.cpp` (`ALD`, `AST`, `S2R`) and `ops_attr.cpp` (`EXIT`).
+//! Each of the PR's `Require` checks on these forms is kept with its constant and turns into an
+//! [`Unsupported`] rejection naming the same thing, except the colour-register bound of `EXIT`,
+//! which cannot fail here (see `Translator::exit`).
+//!
+//! The 32-bit float and conversion group, slice 1's `FFMA` included, is translated by
+//! [`float`] (slice 12b), which turns a guarded instruction into a conditional block and
+//! reads every source kind; its refusals are [`Unsupported::Float`]. The rest of this list is
+//! about the other instructions.
 //!
 //! Slice 1 handles linear flow only (spec, port slice 1). Where starquake is stricter than the
 //! PR, because the PR resolves the case in a part not built yet:
 //!
 //! - an instruction under a guard predicate other than `PT` and `!PT` is rejected (flow analysis
-//!   is slice 10). The PR turns a guard on a pure instruction (`MOV`, `FFMA`, `ALD` and `S2R`
-//!   here; `classify.h`, `Classify`) into a select of the result (`visitor.cpp`,
+//!   is slice 10). The PR turns a guard on a pure instruction (`MOV`, `ALD` and `S2R` here;
+//!   `classify.h`, `Classify`) into a select of the result (`visitor.cpp`,
 //!   `Visitor::Run`: `guard_select`), and makes a guarded side effect (`AST` here) its own
 //!   conditional block (`flow.cpp`: "Guarded side effect: becomes its own conditional block");
 //! - an instruction under `@!PT` is rejected, where the PR skips it: `Visitor::Run` returns when
@@ -29,7 +34,7 @@
 //!   `"s2ur"`, not the op's mnemonic `s2r`. The PR accepts it: `visitor.cpp` dispatches `0x9c3`
 //!   with `0x919` to `Visitor::S2R` (`case 0x919: case 0x9c3:`), which writes the uniform
 //!   register through `Dst` (`Take(16, uniform_op ? 6 : 8)`) and `WriteDst`;
-//! - `MOV` and `FFMA` take only register and immediate sources: a uniform-register or
+//! - `MOV` takes only register and immediate sources: a uniform-register or
 //!   constant-buffer source, which the decoder reads since slice 4, is rejected (the PR reads
 //!   both, `visitor.cpp`, `Visitor::Value`; constant buffers and uniform registers come with
 //!   the passes of slices 12 and 13);
@@ -41,6 +46,7 @@
 //! `uniform_and_constant_buffer_sources_are_rejected` and
 //! `other_instructions_are_rejected_by_mnemonic`.
 
+pub mod float;
 #[cfg(test)]
 mod tests;
 
@@ -49,12 +55,10 @@ use std::fmt::{self, Display, Formatter};
 use thiserror::Error;
 
 use crate::decode::{
-    AluSrc, Gpr, Instr, MovSrc, Op, OpALd, OpASt, OpExit, OpFFma, OpMov, OpS2R, RoundMode, S2RDst,
-    SpecialReg,
+    Gpr, Instr, MovSrc, Op, OpALd, OpASt, OpExit, OpMov, OpS2R, S2RDst, SpecialReg,
 };
 use crate::ir::{
-    Attribute, BuildError, Builder, Flags, FmzMode, FpControl, FpRounding, Function, Imm, Opcode,
-    Operand, Terminator, Value,
+    Attribute, BuildError, Builder, Function, Imm, Opcode, Operand, Terminator, Value,
 };
 
 /// The guest's pipeline stage of a program (spec, "What the GPU front/back protocol and engine
@@ -130,10 +134,11 @@ pub enum Unsupported {
     /// The stage is not handled yet.
     #[error("{0} programs are not supported yet")]
     Stage(GuestStage),
-    /// An instruction the translator does not handle yet: every one but the six of slice 1.
+    /// An instruction the translator does not handle yet: every one but the five of slice 1
+    /// still here and the float group's.
     #[error("{0}")]
     Instruction(&'static str),
-    /// A uniform-register or constant-buffer source of `MOV` or `FFMA` (PR #4588 reads both:
+    /// A uniform-register or constant-buffer source of `MOV` (PR #4588 reads both:
     /// `visitor.cpp`, `Visitor::Value`).
     #[error("a uniform-register or constant-buffer source")]
     Source,
@@ -143,9 +148,6 @@ pub enum Unsupported {
     /// A `MOV` lane mask other than `0xf` (`ops_move.cpp`: "native MOV lane mask").
     #[error("a mov with a partial lane mask")]
     MovLaneMask,
-    /// `FFMA`'s multiply-by-zero mode (`ops_alu.cpp`: "native FFMA multiply-zero mode").
-    #[error("ffma's multiply-by-zero mode")]
-    FfmaMultiplyZero,
     /// An attribute access with an offset register (`ops_misc.cpp`: "native indexed attribute
     /// access").
     #[error("an indexed attribute access")]
@@ -186,6 +188,9 @@ pub enum Unsupported {
     /// A special register other than the ones handled.
     #[error("special register {0}")]
     SpecialRegister(SpecialReg),
+    /// A form of the float and conversion group that is not translated ([`float`]).
+    #[error("{0}")]
+    Float(float::FloatUnsupported),
 }
 
 /// Why a program was not translated.
@@ -246,12 +251,20 @@ pub fn translate(stage: Stage, program: &[Instr]) -> Result<Function, TranslateE
             instr: *instr,
             what,
         };
+        if float::in_group(&instr.op) {
+            match float::translate_instr(&mut t.b, *instr, false) {
+                Ok(()) => continue,
+                Err(float::FloatError::Unsupported(what)) => {
+                    return Err(fail(Unsupported::Float(what)));
+                }
+                Err(float::FloatError::Build(error)) => return Err(error.into()),
+            }
+        }
         if !instr.guard.is_true() {
             return Err(fail(Unsupported::Guard));
         }
         let done = match instr.op {
             Op::Mov(op) => t.mov(op).map(|()| false),
-            Op::FFma(op) => t.ffma(op).map(|()| false),
             Op::ALd(op) => t.ald(op).map(|()| false),
             Op::ASt(op) => t.ast(op).map(|()| false),
             Op::S2R(op) => t.s2r(op).map(|()| false),
@@ -309,16 +322,6 @@ fn register_run(first: Gpr, count: u32) -> Option<u32> {
     (end <= REGISTER_LIMIT).then_some(end)
 }
 
-/// PR #4588's `RoundingOf` (`ops_alu.cpp`): the 2-bit rounding field as an IR rounding mode.
-const fn rounding_of(mode: RoundMode) -> FpRounding {
-    match mode {
-        RoundMode::NearestEven => FpRounding::Rn,
-        RoundMode::NegInf => FpRounding::Rm,
-        RoundMode::PosInf => FpRounding::Rp,
-        RoundMode::Zero => FpRounding::Rz,
-    }
-}
-
 /// A 32-bit immediate operand.
 const fn imm32(bits: u32) -> Operand {
     Operand::Imm(Imm::U32(bits))
@@ -368,23 +371,6 @@ impl Translator<'_> {
         self.set(reg, bits.into())
     }
 
-    fn float_src(&mut self, src: AluSrc) -> Result<Value, Failure> {
-        match src {
-            AluSrc::Imm(bits) => self.op(Opcode::BitCastF32U32, &[imm32(bits)]),
-            AluSrc::Reg { reg, abs, neg } => {
-                let mut value = self.get_f32(reg)?;
-                if abs {
-                    value = self.op(Opcode::FPAbs32, &[value.into()])?;
-                }
-                if neg {
-                    value = self.op(Opcode::FPNeg32, &[value.into()])?;
-                }
-                Ok(value)
-            }
-            AluSrc::UniformReg { .. } | AluSrc::CBuf { .. } => Err(Unsupported::Source.into()),
-        }
-    }
-
     fn mov(&mut self, op: OpMov) -> Result<(), Failure> {
         require(op.quad_lanes == OpMov::ALL_LANES, Unsupported::MovLaneMask)?;
         let value = match op.src {
@@ -393,30 +379,6 @@ impl Translator<'_> {
             MovSrc::UniformReg(_) | MovSrc::CBuf(_) => return Err(Unsupported::Source.into()),
         };
         self.set(op.dst, value)
-    }
-
-    /// `FFMA` with PR #4588's controls (`ops_alu.cpp`, `FFMA`): no contraction, the rounding
-    /// field through `RoundingOf`, and `FTZ` or no flushing.
-    fn ffma(&mut self, op: OpFFma) -> Result<(), Failure> {
-        require(!op.dnz, Unsupported::FfmaMultiplyZero)?;
-        let [a, b, c] = op.srcs;
-        let a = self.float_src(a)?;
-        let b = self.float_src(b)?;
-        let c = self.float_src(c)?;
-        let control = FpControl {
-            no_contraction: true,
-            rounding: rounding_of(op.rnd),
-            fmz_mode: if op.ftz { FmzMode::Ftz } else { FmzMode::None },
-        };
-        let mut value = self.b.op_with(
-            Opcode::FPFma32,
-            &[a.into(), b.into(), c.into()],
-            Flags::Fp(control),
-        )?;
-        if op.saturate {
-            value = self.op(Opcode::FPSaturate32, &[value.into()])?;
-        }
-        self.set_f32(op.dst, value)
     }
 
     /// The address check `ALD` and `AST` share; returns the first attribute.

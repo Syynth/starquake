@@ -823,6 +823,9 @@ impl Run<'_> {
         if let Handled::Done(effect) = self.io(&args, opcode)? {
             return Ok(effect);
         }
+        if opcode == Opcode::FSwizzleAdd {
+            return swizzle_add(&args, op, self.machine.system.lane_id).map(Some);
+        }
         let value = match float_op(&args, op)? {
             Some(value) => Some(value),
             None => match bits_op(&args, opcode)? {
@@ -1560,6 +1563,45 @@ fn indexed_attribute(at: Value, offset: u32) -> Result<crate::ir::Attribute, Int
 }
 
 /// A binary32 function of argument 0 (see [`float::unary_f32`]).
+/// `FSwizzleAdd`'s multipliers of `a` and of `b`, by the lane's two bits of the swizzle: Eden's
+/// `fswzadd_lut_a` and `fswzadd_lut_b` (`spirv_emit_context.cpp` @ cf654052: `-1, 1, -1, 0` and
+/// `-1, -1, 1, -1`), as binary32 bits.
+pub(super) const SWIZZLE_ADD_FACTORS: [(u32, u32); 4] = [
+    (0xbf80_0000, 0xbf80_0000),
+    (0x3f80_0000, 0xbf80_0000),
+    (0xbf80_0000, 0x3f80_0000),
+    (0x0000_0000, 0xbf80_0000),
+];
+
+/// `FSwizzleAdd a, b, swizzle` (Eden's `EmitFSwizzleAdd`, `emit_spirv_warp.cpp`): the lane's
+/// two bits of the swizzle, at `(lane_id & 3) * 2`, pick a multiplier for each operand, and the
+/// products are added. Only the lane id is read, not other lanes' values. The operation's
+/// controls apply to the two multiplications and the addition (Eden's emitter writes plain
+/// `OpFMul` and `OpFAdd`; multiplying by `1`, `-1` or `0` is exact in every mode).
+fn swizzle_add(args: &Args, op: &Operation, lane_id: u32) -> Result<Val, InterpError> {
+    let control = match op.flags {
+        Flags::Fp(control) => Control::of(control),
+        Flags::None | Flags::Texture(_) => Control::NONE,
+    };
+    let directed = |_: DirectedF64| InterpError::DirectedRounding {
+        at: args.at,
+        opcode: op.opcode,
+    };
+    let (a, b) = (args.float(0, Format::F32)?, args.float(1, Format::F32)?);
+    let swizzle = args.u32(2)?;
+    let shift = (lane_id & 3) * 2;
+    let index = (swizzle >> shift) & 3;
+    let (factor_a, factor_b) = usize::try_from(index)
+        .ok()
+        .and_then(|slot| SWIZZLE_ADD_FACTORS.get(slot))
+        .copied()
+        .unwrap_or_default();
+    let a = float::mul(Format::F32, a, u64::from(factor_a), control).map_err(directed)?;
+    let b = float::mul(Format::F32, b, u64::from(factor_b), control).map_err(directed)?;
+    let sum = float::add(Format::F32, a, b, control).map_err(directed)?;
+    Ok(float_val(Format::F32, sum))
+}
+
 fn f32_fn(args: &Args, f: impl FnOnce(f64) -> f64) -> Result<Val, InterpError> {
     let bits = float::unary_f32(args.float(0, Format::F32)?, f);
     Ok(Val::F32(low32(bits)))
