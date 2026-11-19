@@ -1455,10 +1455,10 @@ impl Display for CCtlOp {
 }
 
 impl Display for OpCCtl {
-    /// `cctl.e.iv [r2+0x10];`, the address left out for an operation on every line when it is
-    /// `[rz]` (a guess; NAK's printer leaves out the operation, which `nvdisasm` must print).
+    /// `cctl.iv [r2+0x10];`, the address left out for an operation on every line when it is
+    /// `[rz]` (a guess; NAK's printer writes the space, `.global`, instead of the operation).
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "cctl.e.{}", self.op)?;
+        write!(f, "cctl.{}", self.op)?;
         if !self.op.is_all() || !self.addr.is_zero() || self.offset != 0 {
             write!(f, " [{}", self.addr)?;
             offset_text(f, i64::from(self.offset))?;
