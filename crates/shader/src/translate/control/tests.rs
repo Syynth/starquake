@@ -30,6 +30,14 @@
 //!   dataflow": `depbar_needs_le_sb5` (a divergence).
 //! - "Native full warp synchronization retains ordering after reconvergence" (its `WARPSYNC`,
 //!   `BSSY` and `BSYNC` words): `pr_warp_sync_words` (no IR: a divergence).
+//! - "Native quad butterfly and swizzled add retain horizontal and vertical differences" (its
+//!   `SHFL` words only): `pr_quad_butterfly`, as golden IR (`ShuffleButterfly` outside a pixel
+//!   program, `QuadSwap` in one), since every lane reads another. Its `FSWZADD` word belongs
+//!   to another group's translator and is not ported here.
+//!
+//! These cases check behaviour, not the dispatch of the visitor this slice ports: the PR's
+//! `TranslateScalarNative` (`native_shader.cpp`) lowers the native words with `LowerToMaxwell`
+//! and runs Eden's Maxwell `TranslatorVisitor` on the result, not the native `Visitor::Run`.
 
 use proptest::prelude::*;
 
@@ -259,7 +267,7 @@ fn no_ir_forms() -> Vec<Op> {
             no_dec: true,
             cond: PredSrc::TRUE,
         }),
-        depbar(DEPBAR_SCOREBOARD, true, 1),
+        depbar(DEPBAR_REQUIRED_SCOREBOARD, true, 1),
         warpsync(AluSrc::Imm(FULL_WARP_MASK), PredSrc::TRUE),
         Op::Kill(OpKill {
             pred: PredSrc::TRUE,
@@ -274,7 +282,7 @@ fn no_ir_forms() -> Vec<Op> {
 #[test]
 fn constants_match_the_reference() {
     assert_eq!(FULL_WARP_MASK, 0xffff_ffff);
-    assert_eq!(DEPBAR_SCOREBOARD, 5);
+    assert_eq!(DEPBAR_REQUIRED_SCOREBOARD, 5);
     assert_eq!(QUAD_SHUFFLE_MASK, 0x1c03);
     assert_eq!(QUAD_LAST_LANE, 3);
     assert_eq!(SHFL_FIELD_MASK, 0x1f);
@@ -695,6 +703,50 @@ fn pr_full_warp_butterfly() {
     }
 }
 
+/// PR #4588's "Native quad butterfly and swizzled add retain horizontal and vertical
+/// differences": `SHFL.BFLY PT, R16, R5, 0x1 (or 0x2), 0x1c03`, the quad mask with butterfly
+/// lane 1 (horizontal) or 2 (vertical).
+#[test]
+fn pr_quad_butterfly() {
+    for (word1, from) in [(0x0c3c_0300_u32, 1_u16), (0x0c5c_0300, 2)] {
+        let instr = decoded([0x0510_7f89, word1, 0x000e_0000, 0]);
+        assert_eq!(
+            instr,
+            Instr::new(shfl(
+                ShflOp::Bfly,
+                r(16),
+                Pred::PT,
+                r(5),
+                ShflSrc::Imm(from),
+                ShflSrc::Imm(0x1c03)
+            ))
+        );
+        let (ir, _) = accepted(COMPUTE, instr);
+        assert_eq!(
+            ir.to_string(),
+            format!(
+                "block0:\n\
+                 \x20   %0: u32 = GetRegister r5\n\
+                 \x20   %1: u32 = ShuffleButterfly %0, u32 {from:#x}, u32 0x3, u32 0x1c\n\
+                 \x20   %2 = SetRegister r16, %1\n\
+                 \x20   return\n"
+            )
+        );
+        let (ir, _) = accepted(PIXEL, instr);
+        assert_eq!(
+            ir.to_string(),
+            format!(
+                "block0:\n\
+                 \x20   %0: u32 = GetRegister r5\n\
+                 \x20   %1: u32 = QuadSwap %0, u32 {:#x}\n\
+                 \x20   %2 = SetRegister r16, %1\n\
+                 \x20   return\n",
+                from - 1
+            )
+        );
+    }
+}
+
 #[test]
 fn pr_indexed_shuffle() {
     let instr = decoded([0x181e_7589, 0x0000_1e1b, 0, 0]);
@@ -810,7 +862,17 @@ fn quad_shuffles_in_pixel_programs() {
          \x20   %3 = SetPred p3, u1 true\n\
          \x20   return\n"
     );
-    assert!(quad(ShflOp::Bfly, QUAD_LAST_LANE, mask, PIXEL).contains("QuadSwap %0, u32 0x2"));
+    // Every butterfly lane of a quad, so `lane - 1` cannot be swapped for `lane ^ 1` (they
+    // agree on lanes 1 and 3 only).
+    for from in 1..=QUAD_LAST_LANE {
+        let direction = u32::from(from) - 1;
+        assert!(
+            quad(ShflOp::Bfly, from, mask, PIXEL)
+                .contains(&format!("QuadSwap %0, u32 {direction:#x}")),
+            "butterfly lane {from}"
+        );
+    }
+    assert!(quad(ShflOp::Bfly, 2, mask, PIXEL).contains("QuadSwap %0, u32 0x1"));
     assert!(quad(ShflOp::Idx, 0, mask, PIXEL).contains("QuadBroadcast %0, u32 0x0"));
     // One step off: lane 4, butterfly lane 0, another stage, another mask, up or down.
     let plain = [
@@ -1223,7 +1285,10 @@ fn pr_dependency_wait_counts() {
     for count in [0_u32, 1, 15, 22, 63] {
         let instr = decoded([0x0000_791a, 0xd000 | (count << 6), 0, 0]);
         let count = u8::try_from(count).expect("six bits");
-        assert_eq!(instr, Instr::new(depbar(DEPBAR_SCOREBOARD, true, count)));
+        assert_eq!(
+            instr,
+            Instr::new(depbar(DEPBAR_REQUIRED_SCOREBOARD, true, count))
+        );
         assert_eq!(
             accepted(COMPUTE, instr).0.to_string(),
             "block0:\n    return\n"
@@ -1241,10 +1306,10 @@ fn pr_dependency_wait_counts() {
 fn depbar_needs_le_sb5() {
     // Every other scoreboard, and scoreboard 5 without `.LE`.
     let mut faults: Vec<Op> = (0..8)
-        .filter(|scoreboard| *scoreboard != DEPBAR_SCOREBOARD)
+        .filter(|scoreboard| *scoreboard != DEPBAR_REQUIRED_SCOREBOARD)
         .map(|scoreboard| depbar(scoreboard, true, 1))
         .collect();
-    faults.push(depbar(DEPBAR_SCOREBOARD, false, 1));
+    faults.push(depbar(DEPBAR_REQUIRED_SCOREBOARD, false, 1));
     for op in faults {
         let instr = Instr::new(op);
         assert_eq!(
@@ -1641,23 +1706,41 @@ fn refusals_read_as_words() {
 #[test]
 fn refusals_write_nothing() {
     let refused = [
-        Op::Bar(OpBar {
-            id: 1,
-            ..bar_sync()
-        }),
-        redux(ReduxOp::Sum, UniformReg::URZ, r(3)),
-        match_all(true, r(5), p(2)),
-        shfl(
-            ShflOp::Idx,
-            r(7),
-            p(3),
-            r(6),
-            ShflSrc::Imm(0),
-            ShflSrc::Reg(r(1)),
+        (
+            Op::Bar(OpBar {
+                id: 1,
+                ..bar_sync()
+            }),
+            ControlUnsupported::BarrierMode,
         ),
-        warpsync(AluSrc::Imm(1), PredSrc::TRUE),
+        (
+            redux(ReduxOp::Sum, UniformReg::URZ, r(3)),
+            ControlUnsupported::ReduxToUrz,
+        ),
+        (
+            match_all(true, r(5), p(2)),
+            ControlUnsupported::MatchSource {
+                src: r(5),
+                wide: true,
+            },
+        ),
+        (
+            shfl(
+                ShflOp::Idx,
+                r(7),
+                p(3),
+                r(6),
+                ShflSrc::Imm(0),
+                ShflSrc::Reg(r(1)),
+            ),
+            ControlUnsupported::ShuffleClampRegister,
+        ),
+        (
+            warpsync(AluSrc::Imm(1), PredSrc::TRUE),
+            ControlUnsupported::PartialWarpSync(1),
+        ),
     ];
-    for op in refused {
+    for (op, what) in refused {
         let mut function = Function::new();
         let entry = function.entry();
         let first = translate_control(
@@ -1671,8 +1754,14 @@ fn refusals_write_nothing() {
         .expect("translates");
         assert!(first.needs_subgroup_size_32);
         let before = function.clone();
-        assert!(
-            translate_control(&mut function, entry, COMPUTE, 1, Instr::new(op), false).is_err()
+        assert_eq!(
+            translate_control(&mut function, entry, COMPUTE, 1, Instr::new(op), false),
+            Err(TranslateError::Unsupported {
+                index: 1,
+                instr: Instr::new(op),
+                what: control(what),
+            }),
+            "{op:?}"
         );
         assert_eq!(function, before, "{op:?}");
         let next = translate_control(

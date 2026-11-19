@@ -132,6 +132,10 @@ fn an_index_shuffle_reads_its_lane_in_range() {
     );
     // The comparison is signed: a clamp of all ones is -1, below every lane.
     assert_eq!(shuffle("ShuffleIndex", 5, 5, 0xffff_ffff, 0), (OWN, false));
+    // The segment's bits of the index are dropped: index 21 (0b10101) under segment 0x18 on
+    // lane 13 keeps only 0b101, so the source is 8 + 5 = 13, in range; keeping bit 4 would
+    // make it 29, past lane 15.
+    assert_eq!(shuffle("ShuffleIndex", 13, 21, 0x1f, 0x18), (OWN, true));
 }
 
 #[test]
@@ -167,6 +171,8 @@ fn a_down_shuffle_counts_up_from_its_lane() {
         (INACTIVE_LANE_VALUE, true)
     );
     assert_eq!(shuffle("ShuffleDown", 5, 3, 7, 0), (OWN, false));
+    // The comparison is signed: a clamp of all ones is -1, below every lane.
+    assert_eq!(shuffle("ShuffleDown", 5, 0, 0xffff_ffff, 0), (OWN, false));
 }
 
 #[test]
@@ -182,6 +188,11 @@ fn a_butterfly_shuffle_flips_lane_bits() {
         (INACTIVE_LANE_VALUE, true)
     );
     assert_eq!(shuffle("ShuffleButterfly", 5, 8, 7, 0), (OWN, false));
+    // The comparison is signed: a clamp of all ones is -1, below every lane.
+    assert_eq!(
+        shuffle("ShuffleButterfly", 5, 0, 0xffff_ffff, 0),
+        (OWN, false)
+    );
 }
 
 #[test]

@@ -72,8 +72,9 @@
 //! sync" and "native predicated warp sync", `DEPBAR`'s "native dependency barrier mode",
 //! `BAR`'s "native workgroup barrier mode", `REDUX`'s "native warp reduction mode" (its
 //! operation bound is the decoder's), `MATCH`'s "native warp match mode" and "native warp
-//! match source". `VOTE`'s and `VOTEU`'s "native warp vote mode" checks are the decoder's
-//! (operation 3 is [`crate::decode::DecodeError::UnknownValue`]). The forms the PR's visitor
+//! match source". `VOTE`'s "native warp vote mode" and `VOTEU`'s "native uniform vote mode"
+//! checks (`vote <= 2`) are the decoder's (operation 3 is
+//! [`crate::decode::DecodeError::UnknownValue`]). The forms the PR's visitor
 //! has no case for are refused by name: `WARPSYNC` with a mask that is not an immediate (the
 //! PR dispatches only `0x948`), `SHFL` with its clamp in a register (only `0x589` and `0xf89`),
 //! `BRA` (never handed to the visitor: it ends its block), and `BMOV`, `NANOSLEEP`, `JMX` and
@@ -110,7 +111,9 @@ mod tests;
 
 use thiserror::Error;
 
-use super::{ColorOutputs, Failure, GuestStage, Stage, TranslateError, Translator, Unsupported};
+use super::{
+    ColorOutputs, Failure, GuestStage, Stage, TranslateError, Translator, Unsupported, imm32,
+};
 use crate::decode::{
     AluSrc, BarMode, BarRed, Gpr, Instr, MatchOp, Op, OpBar, OpMatch, OpRedux, OpShfl, OpVote,
     OpWarpSync, Pred, PredSrc, ReduxOp, ShflOp, ShflSrc, UniformPred, UniformReg, VoteDst, VoteOp,
@@ -123,8 +126,10 @@ use crate::ir::{BlockId, BuildError, Builder, Function, Imm, Inst, Opcode, Opera
 pub const FULL_WARP_MASK: u32 = u32::MAX;
 /// The scoreboard `DEPBAR` must wait on, with `.LE` set (`visitor.cpp`, case `0x91a`:
 /// `Require(Take(44, 4) == 0xd, "native dependency barrier mode")`, "DEPBAR.LE SB5, 1"; the
-/// decoder reads bits 44..47 as the scoreboard and bit 47 as `.LE`, a guess it lists).
-pub const DEPBAR_SCOREBOARD: u8 = 5;
+/// decoder reads bits 44..46 as the scoreboard (`decode`'s `DEPBAR_SCOREBOARD` field,
+/// `Field::new(44, 3)`) and bit 47 as `.LE`, a split of the PR's 4-bit field that the decoder
+/// lists as a guess).
+pub const DEPBAR_REQUIRED_SCOREBOARD: u8 = 5;
 /// The `SHFL` immediate that names a quad (`ops_memory.cpp`, `Visitor::SHFL`: `mask == ((28U
 /// << 8) | 3U)`; Eden's `warp_shuffle.cpp`: `QUAD_MASK = (28u << 8) | 3u`).
 pub const QUAD_SHUFFLE_MASK: u32 = (28 << 8) | 3;
@@ -311,12 +316,7 @@ fn refuse(what: ControlUnsupported) -> Failure {
 
 /// `Ok` if `ok`, else a refusal of this group.
 fn need(ok: bool, what: ControlUnsupported) -> Result<(), Failure> {
-    if ok { Ok(()) } else { Err(refuse(what)) }
-}
-
-/// A 32-bit immediate.
-const fn imm32(bits: u32) -> Operand {
-    Operand::Imm(Imm::U32(bits))
+    super::require(ok, Unsupported::Control(what))
 }
 
 /// A predicate immediate.
@@ -340,7 +340,7 @@ impl Translator<'_> {
             Op::Brx(_) | Op::BSSy(_) | Op::BSync(_) | Op::Break(_) | Op::Nop(_) => Ok(()),
             Op::WarpSync(op) => warpsync(op),
             Op::DepBar(op) => need(
-                op.scoreboard == DEPBAR_SCOREBOARD && op.le,
+                op.scoreboard == DEPBAR_REQUIRED_SCOREBOARD && op.le,
                 ControlUnsupported::DepBarMode,
             ),
             Op::Bra(_) => Err(refuse(ControlUnsupported::Branch)),
