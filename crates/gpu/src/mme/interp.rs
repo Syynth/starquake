@@ -141,6 +141,33 @@ pub trait MacroHost {
     /// `LOAD0`/`LOAD1` reads see them. The default does nothing, which is correct for a host
     /// without DMA reads.
     fn barrier(&mut self) {}
+
+    /// Data RAM words the last [`MacroHost::method`] write loaded: the hook for `MME_DMA_READ`
+    /// (3D method 0x157, which reads guest memory into data RAM at `SET_MME_DATA_RAM_ADDRESS`).
+    ///
+    /// The interpreter asks right after each `method` call, before the macro goes on. `Some`
+    /// says that the write was such a load; the interpreter then stores its words at
+    /// [`DataRamLoad::index`] onwards, in order, through the same data RAM accesses as `DWRITE`,
+    /// so that later `DREAD`s in the run see them and the memo (`memo.rs`) sees the call change
+    /// data RAM. Its words may be empty (a load of 0 words, or one the host refused); the write
+    /// was still a load. The default returns `None`, which is correct for a host without data
+    /// RAM loads.
+    ///
+    /// A host must answer `Some` after every write that can load, whatever its state (also when
+    /// the load failed or was skipped): the memo replays a remembered call's writes without
+    /// asking, so it must never remember a call that made one.
+    fn data_ram_load(&mut self) -> Option<DataRamLoad<'_>> {
+        None
+    }
+}
+
+/// Words a host loaded into data RAM for one method write ([`MacroHost::data_ram_load`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DataRamLoad<'a> {
+    /// The data RAM word the first word goes to.
+    pub index: u32,
+    /// The words, in order; empty when the write loaded nothing.
+    pub words: &'a [u32],
 }
 
 /// The most instructions one run may execute.
@@ -531,7 +558,33 @@ impl<R: RamAccess, H: MacroHost> Machine<'_, R, H> {
         if out.emit != OutOp::None {
             let data = self.out_value(inst, out.emit)?;
             self.host.method(self.method, data);
+            self.store_data_ram_load()?;
             self.method = self.method.wrapping_add(self.increment) & METHOD_MASK;
+        }
+        Ok(())
+    }
+
+    /// Stores the words the host loaded for the write just emitted, if it loaded any
+    /// ([`MacroHost::data_ram_load`]). A word past the end of data RAM fails the run with
+    /// [`MacroError::DataRamOutOfBounds`], the words before it stored, as a `DWRITE` there
+    /// would.
+    fn store_data_ram_load(&mut self) -> Result<(), MacroError> {
+        let pc = self.ip;
+        let Some(load) = self.host.data_ram_load() else {
+            return Ok(());
+        };
+        for (offset, word) in load.words.iter().enumerate() {
+            // Unreachable overflow: the word at `u32::MAX` is past the end and fails first.
+            let index = u32::try_from(offset)
+                .ok()
+                .and_then(|offset| load.index.checked_add(offset))
+                .ok_or(MacroError::DataRamOutOfBounds {
+                    pc,
+                    index: u32::MAX,
+                })?;
+            self.ram
+                .write(index, *word)
+                .ok_or(MacroError::DataRamOutOfBounds { pc, index })?;
         }
         Ok(())
     }

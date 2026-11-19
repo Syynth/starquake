@@ -6,7 +6,8 @@ use proptest::test_runner::{Config, RngSeed};
 
 use super::*;
 use crate::mme::testing::{
-    Host, alu, branch, finish, inst0, mov, mov_reg, op3, r, store, with_imm, with_out,
+    DMA_RAM_METHOD, Host, alu, branch, finish, inst0, mov, mov_reg, op3, r, store, with_imm,
+    with_out,
 };
 use crate::mme::{AluOp, LOAD_BARRIER, OutOp, Reg, run};
 
@@ -283,6 +284,102 @@ fn a_barrier_disqualifies_a_call_even_without_a_dma_read() {
         Ok(CallOutcome::NotStored(NotMemoised::Barrier))
     );
     assert!(memo.is_empty());
+}
+
+/// Writes immediate `value` to `method`.
+fn emit_imm(method: u16, value: u16) -> Instruction {
+    with_imm(
+        with_out(Instruction::default(), 0, OutOp::Imm1, OutOp::Imm0),
+        value,
+        method,
+    )
+}
+
+/// Loads the host's memory into data RAM word 2, then writes data RAM word 2.
+fn load_program() -> Vec<Instruction> {
+    finish(vec![
+        emit_imm(DMA_RAM_METHOD, 2),
+        dread(1, 2),
+        emit(METHOD, 1),
+    ])
+}
+
+#[test]
+fn a_data_ram_load_disqualifies_a_call_and_is_never_replayed() {
+    let mut memo = MacroMemo::new();
+    let mut ram = DataRam::new();
+    for word in [0x11, 0x22, 0x33] {
+        // The same call on the data RAM the last one left: a replay would write the last word.
+        let mut host = Host {
+            memory: vec![word],
+            ..Host::default()
+        };
+        assert_eq!(
+            memo.call(&load_program(), 3, &[], &mut ram, &mut host),
+            Ok(CallOutcome::NotStored(NotMemoised::DataRamLoad))
+        );
+        assert_eq!(host.calls, vec![(DMA_RAM_METHOD, 2), (METHOD, word)]);
+        assert_eq!(ram.get(2), Some(word));
+    }
+    assert!(memo.is_empty());
+    assert_eq!(memo.statistics().stores, 0);
+    assert_eq!(memo.statistics().hits, 0);
+}
+
+#[test]
+fn a_data_ram_load_without_words_still_disqualifies() {
+    let mut memo = MacroMemo::new();
+    let mut ram = DataRam::new();
+    let program = finish(vec![emit_imm(DMA_RAM_METHOD, 2), emit_imm(METHOD, 5)]);
+    let mut host = Host::default();
+    assert_eq!(
+        memo.call(&program, 3, &[], &mut ram, &mut host),
+        Ok(CallOutcome::NotStored(NotMemoised::DataRamLoad))
+    );
+    assert!(memo.is_empty());
+    // The same program with a host that loads nothing is remembered.
+    let program = finish(vec![emit_imm(DMA_RAM_METHOD + 1, 2), emit_imm(METHOD, 5)]);
+    assert_eq!(
+        memo.call(&program, 3, &[], &mut ram, &mut host),
+        Ok(CallOutcome::Stored)
+    );
+}
+
+#[test]
+fn undoing_data_ram_puts_back_the_loaded_words() {
+    let mut memo = MacroMemo::new();
+    let mut ram = DataRam::new();
+    *ram.get_mut(2).unwrap() = 0x5;
+    *ram.get_mut(3).unwrap() = 0x6;
+    let mut host = Host {
+        memory: vec![0x11, 0x12],
+        ..Host::default()
+    };
+    memo.call(&load_program(), 3, &[], &mut ram, &mut host)
+        .unwrap();
+    assert_eq!((ram.get(2), ram.get(3)), (Some(0x11), Some(0x12)));
+    memo.undo_data_ram(&mut ram);
+    assert_eq!((ram.get(2), ram.get(3)), (Some(0x5), Some(0x6)));
+}
+
+#[test]
+fn a_data_ram_load_is_reported_only_if_it_comes_first() {
+    let state_first = finish(vec![state(1, 0x20), emit_imm(DMA_RAM_METHOD, 2)]);
+    let load_first = finish(vec![emit_imm(DMA_RAM_METHOD, 2), state(1, 0x20), barrier()]);
+    let barrier_first = finish(vec![barrier(), emit_imm(DMA_RAM_METHOD, 2)]);
+    let mut memo = MacroMemo::new();
+    let mut ram = DataRam::new();
+    for (program, why) in [
+        (state_first, NotMemoised::RegisterRead),
+        (load_first, NotMemoised::DataRamLoad),
+        (barrier_first, NotMemoised::Barrier),
+    ] {
+        let mut host = Host::default();
+        assert_eq!(
+            memo.call(&program, 3, &[], &mut ram, &mut host),
+            Ok(CallOutcome::NotStored(why))
+        );
+    }
 }
 
 #[test]
