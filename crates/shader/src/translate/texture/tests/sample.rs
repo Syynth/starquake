@@ -255,6 +255,22 @@ fn lod_clamp_is_carried() {
         },
         vec![HANDLE, Val::F32x3([X, Y, LAYER]), Val::F32(clamp), NONE],
     );
+    // A 1D array gains no operand for its clamp: its two operands stay at `A` and `B`.
+    let op = OpTex {
+        lod_mode: TexLodMode::Clamp,
+        dim: TexDim::Array1D,
+        ..tex()
+    };
+    sample_rgba(
+        op,
+        &[(10, 0x0280_0003), (11, Y), (20, X)],
+        Opcode::ImageSampleImplicitLod,
+        TextureInfo {
+            has_lod_clamp: true,
+            ..info(TextureType::ColorArray1D)
+        },
+        vec![HANDLE, Val::F32x2([X, LAYER]), Val::F32(clamp), NONE],
+    );
     // With a depth reference the clamp is the `Dref` form's bias slot.
     let op = OpTex {
         lod_mode: TexLodMode::Clamp,
