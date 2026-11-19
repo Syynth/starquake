@@ -103,7 +103,10 @@ pub use modifiers::{
     TextureInfo, TextureType,
 };
 pub use opcode::{FlagsKind, Opcode};
-pub use operand::{ATTRIBUTE_WORD_BYTES, Attribute, Imm, Operand, Patch, UniformPred, UniformReg};
+pub use operand::{
+    ATTRIBUTE_COMPONENTS, ATTRIBUTE_WORD_BYTES, Attribute, GENERIC_0_X, Imm, Operand, POSITION_W,
+    POSITION_X, Patch, UniformPred, UniformReg,
+};
 pub use parse::{ParseError, ParseErrorKind};
 pub use types::Type;
 pub use verify::{Site, VerifyError};

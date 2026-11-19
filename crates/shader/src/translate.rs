@@ -9,26 +9,56 @@
 //! is kept with its constant and turns into an [`Unsupported`] rejection naming the same thing,
 //! except the colour-register bound of `EXIT`, which cannot fail here (see `Translator::exit`).
 //!
-//! **Guards.** An instruction under a guard predicate other than `PT` becomes a conditional
-//! block (spec, "Instruction translation"): the block it was in reads the predicate (through
-//! `flow`'s `read_pred`, as the flow graph's tests do) and branches to a block of its own,
-//! which holds the instruction and jumps to a new block where translation continues. An
-//! instruction under `@!PT` never runs and translates to nothing, as in the PR: `Visitor::Run`
-//! returns when `guard.Never()`, which `flow.h` defines as `index == 7 && negated`. The PR
-//! turns a guard on a pure instruction (`classify.h`, `Classify`) into a select of the result
-//! instead (`visitor.cpp`, `Visitor::Run`: `guard_select`) and makes only a guarded side effect
-//! its own conditional block (`flow.cpp`: "Guarded side effect: becomes its own conditional
-//! block"); the two give the same registers, since the block that does not run leaves them as
-//! the select's other side does. The guard of a uniform datapath instruction names a uniform
-//! predicate (the PR's `classify.h`, `OpInfo::uniform`, which `flow`'s `classify` mirrors by
-//! opcode); of the operations translated so far that is `S2UR` alone, whose guard reads
-//! `GetUniformPred`. Pinned by `tests::guarded_instructions_become_conditional_blocks`,
-//! `tests::a_guarded_s2ur_reads_a_uniform_predicate`, `tests::a_guarded_exit_is_rejected` and
+//! **Guards.** In this order: an instruction under `@!PT` never runs and translates to nothing,
+//! as PR #4588's `Visitor::Run` returns when `guard.Never()` (`visitor.cpp`; `flow.h` defines
+//! it as `index == 7 && negated`); one under `PT` is translated as is; a guarded `EXIT` is
+//! rejected ([`Unsupported::Guard`], starquake's; see the list below). Any other guard is read
+//! once, before the instruction's own IR, as `Visitor::Run` sets `guard_select` before it
+//! dispatches, and the instruction is translated by its class in flow analysis's table
+//! (`flow`'s `classify`, the PR's `classify.h`, `Classify`), looked up by the 12-bit opcode the
+//! decoder reads the operation from (`opcode`):
+//!
+//! - a **pure** instruction (`OpInfo::pure`: of the ones translated here `MOV`, `FFMA`, `ALD`,
+//!   `IPA`, `S2R`, `S2UR` and `CS2R`) keeps its guard as a select: every register it writes
+//!   gets `SelectU32` of the guard, the new value and the register's old value, and a uniform
+//!   register the same with its old uniform value, as the PR's `guard_select` does
+//!   (`visitor.cpp`, `Visitor::X` and `Visitor::UR`: `Select(*guard_select, value,
+//!   GetReg(dest))`). None of these writes a predicate. The guard of a pure uniform datapath
+//!   instruction (`OpInfo::uniform`: `S2UR` here) is read as the uniform predicate of the same
+//!   number, `GetUniformPred` (the PR's `UPred(guard.index, guard.negated)`), the others' as a
+//!   predicate through `flow`'s `read_pred`;
+//! - **any other** instruction (`AST`, `AL2P` and `PIXLD` here, and an operation `opcode` does
+//!   not name, which no translator takes) becomes a conditional block: the block it was in
+//!   branches on the guard to a block of its own, which holds the instruction and jumps to a
+//!   new block where translation continues. In the PR, flow analysis makes that block
+//!   (`flow.cpp`: "Guarded side effect: becomes its own conditional block").
+//!
+//! The conditional block is built only by [`translate`] and [`translate_with_header`], the
+//! straight-line entry, which has no flow graph and so builds the one block flow analysis
+//! would have made; it starts a new block, so it needs a block that is still open. The flow
+//! graph's fill path (slice 11) translates one instruction at a time into blocks
+//! [`crate::flow::FlowGraph::build_ir`] has already terminated, where the contract of `flow`'s
+//! "What a block holds" applies: in a block whose [`crate::flow::FlowBlock::guard_tested`] is
+//! set the graph has tested the guard, so the translator ignores it, and every other guarded
+//! instruction is pure, so only the select runs. An entry for that path takes `guard_tested`
+//! as [`control::translate_control`] does and refuses a non-pure instruction under an untested
+//! guard ([`control::ControlUnsupported::UntestedGuard`]); building it for this group is the
+//! fill path's work, not done here.
+//!
+//! **Owner question:** the spec says, of instruction translation, "an instruction under a
+//! predicate becomes a conditional block". A guarded pure instruction becomes a select instead,
+//! as in the PR and as `flow`'s block contract and [`control`]'s `VOTEU` already do; the
+//! registers come out the same, since a block that does not run leaves each register at its old
+//! value, the select's other side. Pinned by `tests::guarded_pure_instructions_become_selects`,
+//! `tests::guarded_side_effects_become_conditional_blocks`,
+//! `tests::a_guard_on_each_pure_uniform_op_reads_a_uniform_predicate`,
+//! `tests::guards_classify_by_the_flow_table`, `tests::a_guarded_exit_is_rejected` and
 //! `tests::never_guarded_instructions_are_skipped`.
 //!
 //! The instruction groups' translators (port slices 12a to 12h) each have a module here that
 //! translates one instruction of a flow block (slice 10) at a time: [`control`] for the
-//! control and warp group. [`translate`] keeps refusing those groups' instructions.
+//! control and warp group, whose instructions [`translate`] keeps refusing. The attribute group
+//! (`attribute`) is joined to [`translate`] through `GROUPS` instead.
 //!
 //! Slice 1 handles linear flow only (spec, port slice 1). Where starquake is stricter than the
 //! PR, because the PR resolves the case in a part not built yet:
@@ -57,9 +87,10 @@ use std::fmt::{self, Display, Formatter};
 use thiserror::Error;
 
 use crate::decode::{
-    AluSrc, Gpr, Instr, MovSrc, Op, OpExit, OpFFma, OpMov, OpS2R, PredSrc, RoundMode, S2RDst,
-    SpecialReg, UniformPred,
+    AluForm, AluSrc, EXIT_OPCODE, FFMA_OPCODE, Gpr, Instr, MOV_OPCODE, MovSrc, Op, OpExit, OpFFma,
+    OpMov, PredSrc, RoundMode, SpecialReg, UniformPred, UniformReg,
 };
+use crate::flow::{OpInfo, classify};
 use crate::ir::{
     BlockId, BuildError, Builder, Flags, FmzMode, FpControl, FpRounding, Function, Imm, Opcode,
     Operand, Terminator, Value,
@@ -155,7 +186,7 @@ pub enum Unsupported {
     Source,
     /// An `EXIT` under a guard other than `PT` and `!PT`: a conditional exit is control flow,
     /// which this straight-line translator does not build (every other guarded instruction
-    /// becomes a conditional block; see the module docs).
+    /// becomes a select or a conditional block; see the module docs, "Guards").
     #[error("a guarded exit")]
     Guard,
     /// A `MOV` lane mask other than `0xf` (`ops_move.cpp`: "native MOV lane mask").
@@ -176,8 +207,9 @@ pub enum Unsupported {
     #[error("an ald of an output attribute")]
     OutputRead,
     /// An attribute address that is not word aligned or runs past `0x400` (`ops_misc.cpp`:
-    /// "native attribute address").
-    #[error("attribute address {addr:#x} with {comps} words")]
+    /// "native attribute address", for `ALD` and `AST`; `IPA`'s one word is checked the same way,
+    /// starquake's).
+    #[error("attribute address {addr:#x} for a {comps}-word access")]
     AttributeAddress {
         /// The address.
         addr: u16,
@@ -247,7 +279,8 @@ pub const ATTRIBUTE_SPACE_END: u32 = 0x400;
 pub const REGISTER_LIMIT: u32 = 255;
 
 /// Translates a straight-line program that ends with its first `EXIT`, into blocks that end in
-/// a return: one block, and two more for each guarded instruction (see the module docs).
+/// a return: one block, and two more for each guarded instruction that is not pure (see the
+/// module docs, "Guards").
 /// Without the program's header, an `IPA` of a generic attribute is rejected
 /// ([`AttributeRejection::IpaNoHeader`]); [`translate_with_header`] takes it.
 pub fn translate(stage: Stage, program: &[Instr]) -> Result<Function, TranslateError> {
@@ -279,6 +312,7 @@ fn translate_inner(
         b: Builder::new(&mut function, entry),
         stage,
         header: header.copied(),
+        select: None,
     };
     for (index, instr) in program.iter().enumerate() {
         let fail = |what| TranslateError::Unsupported {
@@ -286,17 +320,17 @@ fn translate_inner(
             instr: *instr,
             what,
         };
-        if never_runs(instr.guard) {
-            continue;
-        }
-        let guarded = !instr.guard.is_true();
-        if guarded && matches!(instr.op, Op::Exit(_)) {
-            return Err(fail(Unsupported::Guard));
-        }
-        let after = if guarded {
-            Some(t.begin_guard(instr.guard, uniform_guard(instr.op))?)
-        } else {
-            None
+        let after = match guarding(*instr) {
+            Guarding::Never => continue,
+            Guarding::Always => None,
+            Guarding::Select { .. } | Guarding::Block { .. } if matches!(instr.op, Op::Exit(_)) => {
+                return Err(fail(Unsupported::Guard));
+            }
+            Guarding::Select { uniform } => {
+                t.select = Some(t.read_guard(instr.guard, uniform)?);
+                None
+            }
+            Guarding::Block { uniform } => Some(t.begin_guard(instr.guard, uniform)?),
         };
         let done = match instr.op {
             Op::Mov(op) => t.mov(op).map(|()| false),
@@ -304,6 +338,7 @@ fn translate_inner(
             Op::Exit(op) => t.exit(op).map(|()| true),
             other => t.group(other).map(|()| false),
         };
+        t.select = None;
         if let (Some(after), Ok(false)) = (after, &done) {
             t.end_guard(after)?;
         }
@@ -377,17 +412,59 @@ const fn never_runs(guard: PredSrc) -> bool {
     guard.reg.is_true() && guard.negated
 }
 
-/// Whether `op` is a uniform datapath instruction, whose guard names a uniform predicate (PR
-/// #4588's `classify.h`: "Uniform datapath instruction: its guard predicate is a uniform
-/// predicate"). Of the operations translated so far, only `S2UR` is one.
-const fn uniform_guard(op: Op) -> bool {
-    matches!(
-        op,
-        Op::S2R(OpS2R {
-            dst: S2RDst::Uniform(_),
+/// How an instruction's guard is translated (see the module docs, "Guards").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Guarding {
+    /// `PT`: no guard.
+    Always,
+    /// `@!PT`: the instruction never runs.
+    Never,
+    /// A pure instruction: each register it writes selects the new value where the guard holds;
+    /// `uniform` reads the guard as a uniform predicate.
+    Select {
+        /// Whether the guard is a uniform predicate (`OpInfo::uniform`).
+        uniform: bool,
+    },
+    /// Any other instruction: a conditional block of its own.
+    Block {
+        /// Whether the guard is a uniform predicate (`OpInfo::uniform`).
+        uniform: bool,
+    },
+}
+
+/// How `instr`'s guard is translated: by its guard, then by its operation's class in flow
+/// analysis's table ([`classify`] of [`opcode`]). An operation [`opcode`] does not name gets a
+/// conditional block, which is right whatever the operation does.
+fn guarding(instr: Instr) -> Guarding {
+    if never_runs(instr.guard) {
+        return Guarding::Never;
+    }
+    if instr.guard.is_true() {
+        return Guarding::Always;
+    }
+    match opcode(instr.op).map(classify) {
+        Some(OpInfo {
+            pure: true,
+            uniform,
             ..
-        })
-    )
+        }) => Guarding::Select { uniform },
+        Some(OpInfo { uniform, .. }) => Guarding::Block { uniform },
+        None => Guarding::Block { uniform: false },
+    }
+}
+
+/// The 12-bit opcode the decoder reads `op` from, for the operations [`translate`] takes:
+/// `MOV`, `FFMA` and `EXIT` here, the attribute group's from its module; `None` for any other.
+/// `MOV` and `FFMA` are given in their register form, since [`classify`] gives every operand
+/// form of the two the same class (its rows for them match the base operation; pinned by
+/// `tests::guards_classify_by_the_flow_table`).
+fn opcode(op: Op) -> Option<u16> {
+    match op {
+        Op::Mov(_) => Some(AluForm::Reg.opcode(MOV_OPCODE)),
+        Op::FFma(_) => Some(AluForm::Reg.opcode(FFMA_OPCODE)),
+        Op::Exit(_) => Some(EXIT_OPCODE),
+        other => attribute::opcode(other),
+    }
 }
 
 /// The value of guard `guard` read as a uniform predicate: `GetUniformPred`, then `LogicalNot`
@@ -418,6 +495,9 @@ struct Translator<'f> {
     stage: Stage,
     /// The pixel program's header, when the caller gave it ([`translate_with_header`]).
     header: Option<PixelIo>,
+    /// The guard of the pure instruction being translated, which every register write selects
+    /// on (see the module docs, "Guards"); `None` outside one.
+    select: Option<Operand>,
 }
 
 impl Translator<'_> {
@@ -435,11 +515,7 @@ impl Translator<'_> {
     /// `uniform`): branches on it to a new block and continues there. Returns the block after
     /// the instruction, for [`Translator::end_guard`].
     fn begin_guard(&mut self, guard: PredSrc, uniform: bool) -> Result<BlockId, TranslateError> {
-        let cond = if uniform {
-            read_uniform_guard(&mut self.b, guard)?
-        } else {
-            crate::flow::read_pred(&mut self.b, guard)?
-        };
+        let cond = self.read_guard(guard, uniform)?;
         let then = self.b.add_block()?;
         let after = self.b.add_block()?;
         self.b.terminate(Terminator::Branch {
@@ -449,6 +525,30 @@ impl Translator<'_> {
         })?;
         self.b.switch_to(then)?;
         Ok(after)
+    }
+
+    /// The value of `guard`: a uniform predicate when `uniform`, else a predicate.
+    fn read_guard(&mut self, guard: PredSrc, uniform: bool) -> Result<Operand, TranslateError> {
+        if uniform {
+            read_uniform_guard(&mut self.b, guard)
+        } else {
+            Ok(crate::flow::read_pred(&mut self.b, guard)?)
+        }
+    }
+
+    /// `value`, or under a guard kept as a select ([`Translator::select`]), `SelectU32` of the
+    /// guard, `value` and `old`, the destination's value before the instruction (`visitor.cpp`:
+    /// `Select(*guard_select, value, GetReg(dest))`). `old` is read only under a guard.
+    fn guarded(
+        &mut self,
+        value: Operand,
+        old: impl FnOnce(&mut Self) -> Result<Operand, Failure>,
+    ) -> Result<Operand, Failure> {
+        let Some(cond) = self.select else {
+            return Ok(value);
+        };
+        let old = old(self)?;
+        Ok(self.op(Opcode::SelectU32, &[cond, value, old])?.into())
     }
 
     /// Closes a conditional block: jumps to `after` and continues there.
@@ -473,10 +573,31 @@ impl Translator<'_> {
         }
     }
 
-    /// Writes a register's raw bits; writes to `RZ` are dropped.
+    /// Writes a register's raw bits, under a kept guard as a select ([`Translator::guarded`]);
+    /// writes to `RZ` are dropped.
     fn set(&mut self, reg: Gpr, value: Operand) -> Result<(), Failure> {
         if !reg.is_zero() {
+            let value = self.guarded(value, |t| t.get(reg))?;
             self.op(Opcode::SetRegister, &[Operand::Imm(Imm::Reg(reg)), value])?;
+        }
+        Ok(())
+    }
+
+    /// Writes a uniform register's raw bits, under a kept guard as a select
+    /// ([`Translator::guarded`]); writes to `URZ` are dropped.
+    fn set_uniform(&mut self, reg: UniformReg, value: Operand) -> Result<(), Failure> {
+        if !reg.is_zero() {
+            let value = self.guarded(value, |t| {
+                Ok(t.op(
+                    Opcode::GetUniformRegister,
+                    &[Operand::Imm(Imm::UniformReg(reg))],
+                )?
+                .into())
+            })?;
+            self.op(
+                Opcode::SetUniformRegister,
+                &[Operand::Imm(Imm::UniformReg(reg)), value],
+            )?;
         }
         Ok(())
     }

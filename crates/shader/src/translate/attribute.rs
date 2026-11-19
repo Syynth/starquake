@@ -46,7 +46,7 @@
 //! |---|---|---|
 //! | `ALD` | offset register `RZ` (`Take(24, 8) == 255`); not patch or physical (`Take(76, 2) == 0`); not an output (`Take(79, 1) == 0`); `address % 4 == 0 && address + components * 4 <= 0x400`; `dest + components <= 255` | [`Unsupported::IndexedAttribute`], [`Unsupported::PatchOrPhysical`], [`Unsupported::OutputRead`], [`Unsupported::AttributeAddress`], [`Unsupported::AttributeRegisters`] |
 //! | `AST` | the same without the output check, and `data_reg == 255 \|\| data_reg + components <= 255` | the same |
-//! | `IPA` | offset register `RZ` (`Take(32, 8) == 255`) unless `.OFFSET`; frequency `.PASS` or `.CONSTANT` (`frequency == 0 \|\| frequency == 1`); no predicate output (`Take(81, 3) == 7`); for a generic attribute, the header (starquake's) | [`AttributeRejection::IpaOffsetRegister`], [`AttributeRejection::IpaFrequency`], [`AttributeRejection::IpaPredicate`], [`AttributeRejection::IpaNoHeader`] |
+//! | `IPA` | offset register `RZ` (`Take(32, 8) == 255`) unless `.OFFSET`; frequency `.PASS` or `.CONSTANT` (`frequency == 0 \|\| frequency == 1`); no predicate output (`Take(81, 3) == 7`); the address check of `ALD` and `AST` for one word (starquake's); for a generic attribute, the header (starquake's) | [`AttributeRejection::IpaOffsetRegister`], [`AttributeRejection::IpaFrequency`], [`AttributeRejection::IpaPredicate`], [`Unsupported::AttributeAddress`], [`AttributeRejection::IpaNoHeader`] |
 //! | `S2R`, `S2UR` | a special register the PR reads: 0, 30, 31, 33 to 35, 37 to 39, 56 to 60 | [`Unsupported::SpecialRegister`] |
 //! | `CS2R` | `SRZ` (`Take(72, 8) == 255`); for `.64`, `dest + 1 < 255` | [`AttributeRejection::Cs2rRegister`], [`AttributeRejection::Cs2rDestination`] |
 //! | `AL2P` | one word (Eden: `bitsize != BitSize::B32` throws) | [`AttributeRejection::Al2pWidth`] |
@@ -60,14 +60,16 @@
 //!
 //! # Divergences from PR #4588
 //!
-//! | What | Here | PR #4588 | Pinned by |
+//! | What | Here | Reference | Pinned by |
 //! |---|---|---|---|
 //! | `IPA.OFFSET` (location 2), with its offset register | `InterpolateAtOffset` of the attribute at the register's bits, and of the position's W at the same offset for a perspective input (a guess, after NAK's `load_frag_w` at the same offset, `nak_nir_lower_fs_inputs.c`); the spec has the mode carried in the IR for the lowering ("Interpolation at an offset or a sample", the gap table) | Rejected: "native IPA sample location" (`Take(76, 2) <= 1`) and "native IPA offset register" | `tests::ipa_offset_is_carried_in_the_ir` |
 //! | `IPA` of a generic attribute without the header | Rejected, [`AttributeRejection::IpaNoHeader`] ([`super::translate`] takes no header; [`super::translate_with_header`] does) | Always has the header (`env.SPH()`) | `tests::ipa_of_a_generic_needs_the_header` |
 //! | `ISBERD`, `ISBEWR` | Rejected by name (decision 11) | Translated: `ISBERD` from global memory, an indexed input or the map; `ISBEWR` only as `.o.attr.32` | `tests::deferred_instructions_are_rejected_by_name` |
 //! | `AL2P` | Translated from Eden's Maxwell `AL2P`; the output bit is read and has no effect, as Eden reads none | No translator: rejected | `tests::al2p_adds_the_offset_register` |
 //! | `PIXLD` | `.MY_INDEX` translated from Eden's Maxwell `PIXLD` | No translator: rejected | `tests::pixld_my_index_reads_the_sample_id` |
-//! | `S2UR` under a guard | The guard reads a uniform predicate (`GetUniformPred`), as the PR's `classify.h` says of `S2UR` ("its guard predicate is a uniform predicate") | The same, through `UPred` | `super::tests::a_guarded_s2ur_reads_a_uniform_predicate` |
+//! | `IPA`'s attribute address | Checked as `ALD` and `AST` check theirs, for one word: not word aligned, or starting at or past `0x400`, is [`Unsupported::AttributeAddress`]. The decoder's byte address (an 8-bit word number times four) cannot fail it; `OpIpa`'s public fields can | No check: the PR reads an 8-bit word number (`Take(64, 8)`), which cannot leave the attribute space | `tests::ipa_addresses_outside_the_attribute_space_are_rejected` |
+//! | `AL2P`'s address | Unsigned, the 10-bit SM70 field the decoder reads (NAK `sm70_encode.rs` @ 52238762, `impl SM70Op for OpAL2P`: `set_field(40..50, self.addr)`), so at most `0x3ff` and never negative | Eden's Maxwell `AL2P` reads an 11-bit signed field (`BitField<20, 11, s64> offset`) and adds it sign-extended (`Imm32(static_cast<u32>(al2p.offset.Value()))`); the PR has no `AL2P` | `tests::al2p_adds_the_offset_register` (address `0x3ff`) |
+//! | `S2UR` under a guard | The guard reads a uniform predicate (`GetUniformPred`), as the PR's `classify.h` says of `S2UR` ("its guard predicate is a uniform predicate"), and the uniform register selects on its old value | The same, through `UPred` and `Visitor::UR` | `super::tests::a_guard_on_each_pure_uniform_op_reads_a_uniform_predicate` |
 //! | `S2UR` | Writes the uniform register class (`SetUniformRegister`) | Writes the uniform register packed into Maxwell's register file (`native.h`, `UniformLayout`) | `tests::s2r_and_s2ur_read_each_special_register` |
 //!
 //! The port follows the PR's native translator (`ops_attr.cpp`, `ops_misc.cpp`), not its
@@ -89,12 +91,15 @@ use std::fmt::{self, Display, Formatter};
 use thiserror::Error;
 
 use super::{ATTRIBUTE_SPACE_END, Failure, Translator, Unsupported, imm32, register_run, require};
+use crate::decode::attribute::{AL2P_OPCODE, AST_OPCODE, PIXLD_OPCODE};
 use crate::decode::{
-    Gpr, InterpFreq, InterpLoc, Op, OpAL2P, OpALd, OpASt, OpCS2R, OpIpa, OpPixLd, OpS2R, PixVal,
-    Pred, S2RDst, SpecialReg,
+    ALD_OPCODE, CS2R_OPCODE, Gpr, IPA_OPCODE, InterpFreq, InterpLoc, Op, OpAL2P, OpALd, OpASt,
+    OpCS2R, OpIpa, OpPixLd, OpS2R, PixVal, Pred, S2R_OPCODE, S2RDst, S2UR_OPCODE, SpecialReg,
 };
-use crate::ir::{ATTRIBUTE_WORD_BYTES, Attribute, Imm, Opcode, Operand, Value};
-use crate::lower::GENERIC_0_X;
+use crate::ir::{
+    ATTRIBUTE_COMPONENTS, ATTRIBUTE_WORD_BYTES, Attribute, GENERIC_0_X, Imm, Opcode, Operand,
+    POSITION_W, Value,
+};
 use crate::sph::PixelImap;
 
 /// Why a deferred instruction is rejected.
@@ -167,9 +172,6 @@ impl From<AttributeRejection> for Failure {
     }
 }
 
-/// The attribute word of the position's W (`attribute.h`: `PositionW = 31`), which `IPA`
-/// multiplies a perspective input by.
-pub(super) const POSITION_W: u16 = 31;
 /// The last attribute word Eden's `IsGeneric` counts (`Generic31X = 156`; `IsGeneric`:
 /// `attribute <= Attribute::Generic31X`).
 pub(super) const GENERIC_31_X: u16 = 156;
@@ -181,8 +183,6 @@ pub(super) const FOG_COORDINATE: u16 = 186;
 /// The fixed-function texture coordinates, `FixedFncTexture0S = 192` to
 /// `FixedFncTexture9Q = 231` (`IsLegacyAttribute`).
 pub(super) const LEGACY_TEXTURES: std::ops::RangeInclusive<u16> = 192..=231;
-/// Words per generic attribute (`GenericAttributeIndex`: `/ 4u`).
-pub(super) const GENERIC_WORDS: u16 = 4;
 /// How many registers `CS2R.64` writes.
 pub(super) const CS2R_PAIR: u32 = 2;
 /// The bits of `1.0`, which the PR writes for the W scale factors (`ops_misc.cpp`, `S2R`: "the
@@ -262,6 +262,31 @@ fn generic_is_perspective(map: [PixelImap; 4]) -> bool {
     matches!(first, PixelImap::Perspective | PixelImap::Unused)
 }
 
+/// The 12-bit opcode the decoder reads `op` from, for the operations of the group that
+/// [`translate`] translates (each constant is the decoder's, from NAK's encoder); `None` for the
+/// ones it rejects whatever their fields (`OUT`, `OUT.FINAL`, `ISBERD`, `ISBEWR`, `LDTRAM`) and
+/// for every other operation. The translator classifies a guard by it (`super`'s module docs,
+/// "Guards").
+pub(super) fn opcode(op: Op) -> Option<u16> {
+    Some(match op {
+        Op::ALd(_) => ALD_OPCODE,
+        Op::ASt(_) => AST_OPCODE,
+        Op::Ipa(_) => IPA_OPCODE,
+        Op::AL2P(_) => AL2P_OPCODE,
+        Op::S2R(OpS2R {
+            dst: S2RDst::Reg(_),
+            ..
+        }) => S2R_OPCODE,
+        Op::S2R(OpS2R {
+            dst: S2RDst::Uniform(_),
+            ..
+        }) => S2UR_OPCODE,
+        Op::CS2R(_) => CS2R_OPCODE,
+        Op::PixLd(_) => PIXLD_OPCODE,
+        _ => return None,
+    })
+}
+
 /// The group's translator: translates `op` when it is one of the group's, else `None`.
 pub(super) fn translate(t: &mut Translator<'_>, op: Op) -> Option<Result<(), Failure>> {
     let deferred =
@@ -282,7 +307,7 @@ pub(super) fn translate(t: &mut Translator<'_>, op: Op) -> Option<Result<(), Fai
 }
 
 impl Translator<'_> {
-    /// The address check `ALD` and `AST` share; returns the first attribute word.
+    /// The address check `ALD`, `AST` and `IPA` share; returns the first attribute word.
     fn attribute_words(addr: u16, comps: u8) -> Result<u16, Failure> {
         let end = u32::from(comps)
             .checked_mul(ATTRIBUTE_WORD_BYTES)
@@ -370,7 +395,7 @@ impl Translator<'_> {
             .as_ref()
             .ok_or(AttributeRejection::IpaNoHeader(Attribute(word)))?;
         // Cannot fail: `word` is a generic word, so its index is below 32.
-        let index = usize::from(word.saturating_sub(GENERIC_0_X) / GENERIC_WORDS);
+        let index = usize::from(word.saturating_sub(GENERIC_0_X) / ATTRIBUTE_COMPONENTS);
         let map = header
             .generic
             .get(index)
@@ -388,7 +413,8 @@ impl Translator<'_> {
     }
 
     /// `IPA`, with the PR's checks in its order (the offset register only outside `.OFFSET`),
-    /// then the header for a generic attribute.
+    /// then the address check `ALD` and `AST` share (starquake's), then the header for a generic
+    /// attribute.
     fn ipa(&mut self, op: OpIpa) -> Result<(), Failure> {
         if op.loc != InterpLoc::Offset {
             require_attr(
@@ -401,7 +427,9 @@ impl Translator<'_> {
             AttributeRejection::IpaFrequency(op.freq),
         )?;
         require_attr(op.pred.is_true(), AttributeRejection::IpaPredicate(op.pred))?;
-        let word = word_of(op.addr);
+        // Starquake's: the PR reads an 8-bit word number (`Take(64, 8)`), which cannot fail
+        // this; the decoder's byte address cannot either, but `OpIpa`'s fields are public.
+        let word = Self::attribute_words(op.addr, 1)?;
         let perspective = self.ipa_perspective(word)?;
         let offset = if op.loc == InterpLoc::Offset {
             Some(self.get(op.offset)?)
@@ -416,7 +444,9 @@ impl Translator<'_> {
         self.set_f32(op.dst, value)
     }
 
-    /// `AL2P`: the offset register plus the address, as Eden's Maxwell `AL2P` computes it.
+    /// `AL2P`: the offset register plus the address, as Eden's Maxwell `AL2P` adds them, with
+    /// the address read as the decoder reads it: unsigned, 10 bits, so never negative where
+    /// Eden's is signed (see the module docs' divergence table).
     fn al2p(&mut self, op: OpAL2P) -> Result<(), Failure> {
         require_attr(op.comps == 1, AttributeRejection::Al2pWidth(op.comps))?;
         let base = self.get(op.offset)?;
@@ -450,13 +480,7 @@ impl Translator<'_> {
         };
         match op.dst {
             S2RDst::Reg(dst) => self.set(dst, value),
-            S2RDst::Uniform(dst) => {
-                self.op(
-                    Opcode::SetUniformRegister,
-                    &[Operand::Imm(Imm::UniformReg(dst)), value],
-                )?;
-                Ok(())
-            }
+            S2RDst::Uniform(dst) => self.set_uniform(dst, value),
         }
     }
 

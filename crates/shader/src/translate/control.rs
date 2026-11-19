@@ -290,6 +290,7 @@ pub fn translate_control(
             color_outputs: ColorOutputs::default(),
         },
         header: None,
+        select: None,
     };
     match t.control(instr, guard_tested) {
         Ok(()) => {}

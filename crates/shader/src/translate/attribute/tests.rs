@@ -150,13 +150,14 @@ fn header_with(index: usize, map: [PixelImap; 4]) -> PixelIo {
 /// references (`attribute.h` and `move_special_register.cpp` @ cf654052; PR #4588's `S2R`).
 #[test]
 fn constants_match_the_references() {
+    assert_eq!(ATTRIBUTE_COMPONENTS, 4);
+    assert_eq!(crate::ir::POSITION_X, 28);
     assert_eq!(POSITION_W, 31);
     assert_eq!(GENERIC_0_X, 32);
     assert_eq!(GENERIC_31_X, 156);
     assert_eq!(LEGACY_COLORS, 160..=175);
     assert_eq!(FOG_COORDINATE, 186);
     assert_eq!(LEGACY_TEXTURES, 192..=231);
-    assert_eq!(GENERIC_WORDS, 4);
     assert_eq!(CS2R_PAIR, 2);
     assert_eq!(ONE_F32, 1.0_f32.to_bits());
     let srs = [
@@ -587,6 +588,78 @@ fn ipa_checks_report_in_order() {
     assert!(with_header(&PixelIo::default(), Op::Ipa(base)).is_ok());
 }
 
+/// `IPA` checks its attribute address as `ALD` and `AST` do (starquake's: the PR reads an
+/// 8-bit word number, the decoder a byte address that cannot fail it, but `OpIpa`'s fields are
+/// public): the last word, `0x3fc`, is accepted; an address that is not word aligned
+/// (`0x3fe`, and `0x3fd` and `0x3ff` beside it) or that starts at or past the end of the
+/// attribute space is [`Unsupported::AttributeAddress`] with one word.
+#[test]
+fn ipa_addresses_outside_the_attribute_space_are_rejected() {
+    let end = u16::try_from(ATTRIBUTE_SPACE_END).expect("fits");
+    let last = end - 4;
+    let ir = one(Op::Ipa(ipa(r(1), last))).expect("translates");
+    let mut machine = Machine::default();
+    machine
+        .attributes
+        .insert((attr(last / 4), 0), f32_bits(9.0));
+    run(&ir, &mut machine);
+    assert_eq!(machine.regs[1], f32_bits(9.0));
+    for bad in [last + 1, last + 2, last + 3, end, end + 4, u16::MAX] {
+        let op = Op::Ipa(ipa(r(1), bad));
+        assert_eq!(
+            one(op),
+            rejected(
+                op,
+                Unsupported::AttributeAddress {
+                    addr: bad,
+                    comps: 1
+                }
+            ),
+            "{bad:#x}"
+        );
+    }
+    let op = Op::Ipa(ipa(r(1), 0x3fe));
+    assert_eq!(
+        one(op).map_err(|error| error.to_string()),
+        Err(
+            "instruction 0 (ipa.pass r1, a[0x3fe];): attribute address 0x3fe for a 1-word access is \
+             not supported"
+                .into()
+        )
+    );
+    // The PR's checks come first: a frequency fault with a bad address reports the frequency.
+    let both = OpIpa {
+        freq: InterpFreq::State,
+        ..ipa(r(1), 0x3fe)
+    };
+    assert_eq!(
+        one(Op::Ipa(both)),
+        rejected(
+            Op::Ipa(both),
+            AttributeRejection::IpaFrequency(InterpFreq::State)
+        )
+    );
+    // And the address before the header: an unaligned address inside generic 0, with no
+    // header, reports the address, where the aligned one reports the header.
+    let generic = addr(GENERIC_0_X);
+    let unaligned = Op::Ipa(ipa(r(1), generic + 2));
+    assert_eq!(
+        one(unaligned),
+        rejected(
+            unaligned,
+            Unsupported::AttributeAddress {
+                addr: generic + 2,
+                comps: 1
+            }
+        )
+    );
+    let aligned = Op::Ipa(ipa(r(1), generic));
+    assert_eq!(
+        one(aligned),
+        rejected(aligned, AttributeRejection::IpaNoHeader(attr(GENERIC_0_X)))
+    );
+}
+
 /// Without the header, `IPA` of a generic attribute is rejected (starquake's: the PR always has
 /// the header); with it, it translates.
 #[test]
@@ -880,6 +953,8 @@ fn al2p_adds_the_offset_register() {
     run(&ir, &mut machine);
     assert_eq!(machine.regs[1], 0x94);
     assert_eq!(one(al2p(r(1), r(2), 0x84, 1, true)), Ok(ir));
+    // The largest address the 10-bit SM70 field holds, read unsigned (NAK); Eden's Maxwell
+    // field is signed, a divergence listed in the module docs.
     let ir = one(al2p(r(1), Gpr::RZ, 0x3ff, 1, false)).expect("translates");
     let mut machine = Machine::default();
     run(&ir, &mut machine);
