@@ -2,10 +2,10 @@
 
 Status: approved by the owner, 2026-11-12 (issue #14).
 
-Every item in "Decisions for the owner" up to 14 carries the owner's ruling
+Every item in "Decisions for the owner" carries the owner's ruling
 (`docs/decision-log.md`, 2026-11-12 and 2026-11-18), and the text follows them and the seam
 resolutions of the graphics review guide (`docs/specs/graphics-review-guide.md`). "Render capture
-v2" and decisions 15 to 19 are a draft awaiting the owner (design PR, 2026-11-18).
+v2" and decisions 15 to 19 were decided by the owner on 2026-11-18, as recommended.
 
 This spec decides what `crates/render` is: the one interface through which the emulated GPU
 (`crates/gpu`) gets work done on the host GPU, the backends behind it, the thread that submits
@@ -654,7 +654,7 @@ draw or copy): replay makes the same call and reports whether the fresh backend 
 
 ### Shaders
 
-Decision 15 (open) chooses how a `CreateShader` record holds its code. What wgpu was given
+Decision 15 (decided by the owner, 2026-11-18) chose how a `CreateShader` record holds its code. What wgpu was given
 under the owner's ruling of 2026-11-12 is a validated naga module; what the shader crate was
 given is the program bytes, the answers to its questions, the variant key and the host target
 (shader-pipeline, "Identity, caching and invalidation", layer 3), which determine that module
@@ -673,7 +673,7 @@ the same. The four ways to store it, checked against naga 30.0.1 (the workspace 
 | Shader formats in the project | A second one, beside slice 20's | A second one | Slice 20's, embedded (the owner's ruling of 2026-11-18: one shader capture format) | A second one |
 | Who can replay | The render crate alone | The render crate alone | Code that sees both the shader and render crates: `core`, through a resolver the GPU crate implements | The render crate alone |
 
-**Recommended: (c)**, with two narrow additions: a shader that a backend received as SPIR-V or
+**Decided by the owner, 2026-11-18: (c)**, with two narrow additions: a shader that a backend received as SPIR-V or
 MSL (`ShaderSource::SpirV`, `ShaderSource::Msl`: a later direct backend, experiments) is stored
 as it is, since it is plain data already; and a naga module that came with no origin (a test's
 hand-built module) is recorded as `Missing`, so replay refuses that shader with an exact error,
@@ -725,7 +725,7 @@ and builds on replay, or the reverse, is reported.
 
 ### Identity
 
-Decision 16 (open). **Recommended: replay maps ids.** The replay keeps one table per id kind from
+Decision 16 (decided by the owner, 2026-11-18). **Replay maps ids.** The replay keeps one table per id kind from
 the capture's id to the id the fresh backend returned, filled by each `Create*` record and emptied
 by `Destroy` once its fence has passed on replay. Before submitting a list it rewrites every id in
 it through the tables (a `map_ids` function over `Command`, tested with a list that holds a
@@ -748,7 +748,7 @@ backend from allocating its own way.
 
 ### The format
 
-The magic stays `SQRC`; the version becomes **2**. Decision 18 (open), **recommended: version 1
+The magic stays `SQRC`; the version becomes **2**. Decision 18 (decided by the owner, 2026-11-18): **version 1
 is refused** with `CaptureError::UnsupportedVersion { found: 1 }`, not read: nothing writes v1
 files to disk (the `render-replay` command does not exist yet), so none exist outside tests, and a
 v1 file could not replay on a fresh backend anyway. The v1 code is replaced, not kept beside v2.
@@ -840,7 +840,7 @@ compared.
 
 ### Turning capture on
 
-Decision 17 (open). **Recommended:** a flag on `starquake run`, `--capture render`, which writes
+Decision 17 (decided by the owner, 2026-11-18): a flag on `starquake run`, `--capture render`, which writes
 `render.sqrc` into the artifacts folder for the whole run, with `--capture-limit <size>`
 (default 4 GiB, a guess) after which the capture closes with `Limit` and the run continues
 uncaptured. The flag takes a list so that `gpu` (gpu-protocol's `SQGC`, which has no switch yet
@@ -867,8 +867,8 @@ handling is a pure function tested for every combination.
 
 ### Translator versions
 
-Decision 19 (open). A capture names, in each shader record, the translator version that produced
-the module. **Recommended:** replay on a build with another translator version refuses with an
+Decision 19 (decided by the owner, 2026-11-18). A capture names, in each shader record, the translator version that produced
+the module. Decided by the owner, 2026-11-18 (decision 19): replay on a build with another translator version refuses with an
 exact error naming both versions; `--retranslate` lets it go ahead, retranslating with the new
 translator and reporting every shader whose entry or interface changed. That keeps "replays what
 ran" the default, and makes "did my shader fix change this frame" one flag away. The alternative
@@ -1074,7 +1074,7 @@ then it is local-only, like the hypervisor tests (decision 9).
 | R9 | Frame dumps: `dump` flag, `FrameSink`, PNG writing and `frames/` in the app, `--until frames=N`. The second part (R9b: `frames/` and `--until frames=N` in `core`) runs on G21's recording-backend wiring in `core`, not R12's, and decides the `dump` flag's path from `core` to the GPU crate (decided by the owner, 2026-11-18) | R1 (pixels from R5); R9b also gpu-protocol G21 | observability spec, "Headless runs" | No GPU: a present of an uploaded image through the recording backend gives a known PNG | C (with R5) |
 | R10 | GPU ASTC decode (WGSL compute) for devices without native ASTC | R3, R4, R5 | `eden/src/video_core/host_shaders/astc_decoder.comp` | Needs a GPU, with native ASTC switched off in `Caps` on the Mac: bit-identical to the CPU decoder on the same blocks | D |
 | R11 | Host-level capture and replay, first part (done, #164): version 1 of the format, the submitted lists and their staging bytes, replayed on a backend that already holds the resources | R1 | none (new) | No GPU: golden bytes, version refused on mismatch; replay on the recording backend in the gate | D |
-| R11b | Render capture v2 in the render crate ("Render capture v2", draft awaiting the owner): format version 2 with creation records and results, `CapturingBackend` and `CaptureSink`, the streaming reader, `ShaderOrigin` and the `ShaderResolver` trait, the replay driver with id and fence mapping and comparison, `CaptureBuilder` in `test-support` | R1; the owner's ruling on the capture v2 design | none (new) | No GPU: golden bytes for every record kind, version 1 refused, every bound at its edge; a capture through the wrapper replays on a fresh recording backend to the same results, with no resources made by hand | D |
+| R11b | Render capture v2 in the render crate ("Render capture v2"): format version 2 with creation records and results, `CapturingBackend` and `CaptureSink`, the streaming reader, `ShaderOrigin` and the `ShaderResolver` trait, the replay driver with id and fence mapping and comparison, `CaptureBuilder` in `test-support` | R1 | none (new) | No GPU: golden bytes for every record kind, version 1 refused, every bound at its edge; a capture through the wrapper replays on a fresh recording backend to the same results, with no resources made by hand | D |
 | R11c | Render capture v2 in `core`, the GPU crate and the app: `--capture render`, `--capture-limit`, the frame tee, `ShaderDesc::origin` filled by the GPU crate, the real `ShaderResolver`, `starquake render-replay <capture> --png <dir>` on any backend (renamed from `gpu-replay`, which is gpu-protocol's command; review guide, M15) | R11b, R5, R12, shader-pipeline slice 20, gpu-protocol G18 | none (new) | No GPU: argument handling for every combination; a synthetic run's capture replays on the recording backend to the same results. Needs a GPU: wgpu replay gives bit-identical readbacks where the recording backend knows the bytes; verification 12 | G (after R12) |
 | R12 | `starquake-core` wiring: backend choice by `cfg` and features, the shared compile pool for shader translation and pipelines (review guide, M16), the CLI's `--window` (decision 11) | R5, R8, R9b | none | Runs the recording backend end to end in the gate | F |
 
@@ -1381,7 +1381,9 @@ are in `docs/decision-log.md` (2026-11-12).
 Decisions 15 to 19 come from the render capture v2 draft (2026-11-18) and are **open**; each
 section of "Render capture v2" gives the detail.
 
-15. **Open:** how a render capture stores shaders. (a) The naga module through naga's serde
+15. **Decided by the owner, 2026-11-18:** (c), as recommended.
+
+    **How a render capture stores shaders.** (a) The naga module through naga's serde
     features; (b) WGSL text from naga's writer; (c) the shader inputs, as slice 20's record,
     retranslated on replay; (d) final host code. **Recommended: (c)**, with SPIR-V and MSL a
     backend received stored as they are, and a module with no origin recorded as `Missing`. It
@@ -1394,17 +1396,25 @@ section of "Render capture v2" gives the detail.
     postcard has no depth limit. (b) is lossy and its writer panics on some subgroup scans. (d)
     is not what wgpu was given and cannot be produced under wgpu without running naga's writers
     in the render crate.
-16. **Open:** ids. **Recommended: replay maps the capture's ids and fence values to the fresh
+16. **Decided by the owner, 2026-11-18:** replay maps ids, as recommended.
+
+    **Ids.** **Recommended: replay maps the capture's ids and fence values to the fresh
     backend's**, and refuses a list naming an id it does not hold. Requiring identical ids from
     every backend would need a shared allocator that does not exist, and one refused create
     would shift every later id.
-17. **Open:** how a run captures. **Recommended: `starquake run --capture render`**, writing
+17. **Decided by the owner, 2026-11-18:** `--capture render`, as recommended.
+
+    **How a run captures.** **Recommended: `starquake run --capture render`**, writing
     `render.sqrc` into the artifacts folder for the whole run, with `--capture-limit` (default
     4 GiB, a guess). Alternatives: a path flag, or a window of frames, which needs a capture that
     starts mid-run (deferred).
-18. **Open:** version 1 files. **Recommended: refuse them** with the exact version error; none
+18. **Decided by the owner, 2026-11-18:** refuse them, as recommended.
+
+    **Version 1 files.** **Recommended: refuse them** with the exact version error; none
     exist outside tests, and one could not replay on a fresh backend anyway.
-19. **Open:** a capture from another translator version. **Recommended: refuse by default;
+19. **Decided by the owner, 2026-11-18:** refuse by default with `--retranslate`, as recommended.
+
+    **A capture from another translator version.** **Recommended: refuse by default;
     `--retranslate` replays with the new translator** and reports every shader whose entry or
     interface changed. The alternative is always to retranslate, with a notice.
 
