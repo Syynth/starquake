@@ -24,10 +24,14 @@
 //!
 //! The memory ordering, eviction priority, memory type and atomic types and operations the
 //! surface instructions carry ([`MemOrder`], [`MemEvictionPriority`], [`MemType`],
-//! [`AtomType`], [`AtomOp`]) are NAK's, which its memory instructions share
+//! [`AtomType`], [`AtomOp`] with [`AtomCmpSrc`]) are NAK's, which its memory instructions share
 //! (`set_mem_order`, `set_eviction_priority`, `set_mem_type`, `set_atom_type`,
-//! `set_atom_op`). Slice 6e (memory) decodes those instructions; whichever of the two slices
-//! lands second shares one definition with the other.
+//! `set_atom_op`). They are defined once, in slice 6e's `op::memory`, with their fields and
+//! their text, and re-exported here; so the surface instructions print them as the memory
+//! instructions do (`.s8`, nothing for 32 bits and for a weak order, `.strong.sm`, nothing for
+//! `.u32` atomics, `.cas` for the compare-and-swap), in `nvdisasm`'s style as NAK's
+//! `test_ld_st_atom` shows it, not in NAK's own printer's (`.i8`, `.b32`, `.weak`,
+//! `.strong.cta`, `.u32`, `.cmpexch.packed`). On surfaces that text is still a guess.
 //!
 //! # Decisions taken here
 //!
@@ -110,7 +114,8 @@ use super::super::instruction::Field;
 use super::super::operand::{Gpr, Pred, UniformReg};
 use super::super::print::flag;
 use super::control::PRED_DST;
-use super::{Named, Op, shells};
+pub use super::memory::{AtomCmpSrc, AtomOp, AtomType, MemEvictionPriority, MemOrder, MemType};
+use super::{Named, Op, memory, shells};
 #[cfg(test)]
 use {super::super::form::ReferenceRow, proptest::strategy::BoxedStrategy};
 
@@ -174,8 +179,9 @@ pub(crate) const TLD4_OFFSET: Field = Field::new(76, 2);
 /// `TLD4`'s gathered component (`set_field(87..89, self.comp)`: [`TexChannel`]).
 pub(crate) const TLD4_COMP: Field = Field::new(87, 2);
 /// The eviction priority of `TEX`, `TLD`, `TLD4`, `TXD` and the surface instructions
-/// (`set_eviction_priority`: `set_field(84..87, ..)`: [`MemEvictionPriority`]).
-pub(crate) const EVICT: Field = Field::new(84, 3);
+/// (`set_eviction_priority`: `set_field(84..87, ..)`: [`MemEvictionPriority`]): the memory
+/// group's field, defined once there.
+pub(crate) const EVICT: Field = memory::MEM_EVICTION;
 /// The level-of-detail mode of `TEX` and `TLD` below SM 10.0 (`set_tex_lod_mode(87..90, ..)`:
 /// [`TexLodMode`]).
 pub(crate) const TEX_LOD: Field = Field::new(87, 3);
@@ -197,21 +203,22 @@ pub(crate) const IMAGE_DIM: Field = Field::new(61, 3);
 /// The handle register of the surface instructions (`set_reg_src(64..72, &self.handle)`).
 pub(crate) const SU_HANDLE: Field = Field::new(64, Gpr::BITS);
 /// The memory type of the binary (`.D`) surface forms (`set_mem_type(73..76, ..)`:
-/// [`MemType`]).
-pub(crate) const MEM_TYPE: Field = Field::new(73, 3);
+/// [`MemType`]): the memory group's field, defined once there.
+pub(crate) const MEM_TYPE: Field = memory::MEM_TYPE;
 /// The memory order of the surface instructions from SM 8.0 (`set_mem_order`:
-/// `set_field(77..81, ..)`: [`MemOrder`]).
-pub(crate) const MEM_ORDER: Field = Field::new(77, 4);
+/// `set_field(77..81, ..)`: [`MemOrder`]): the memory group's field, defined once there.
+pub(crate) const MEM_ORDER: Field = memory::MEM_ORDER;
 /// `SUATOM`'s `.BA` bit (`set_bit(72, false); // .BA`).
 pub(crate) const SUATOM_BA: Field = Field::bit(72);
 /// `SUATOM`'s atomic type below SM 9.0 (`set_atom_type(.., true)`: `set_field(73..76, ..)`:
-/// [`AtomType`]).
-pub(crate) const ATOM_TYPE: Field = Field::new(73, 3);
-/// `SUATOM`'s atomic operation (`set_atom_op(87..91, ..)`: [`AtomOp`]).
-pub(crate) const SUATOM_OP: Field = Field::new(87, 4);
+/// [`AtomType`]): the memory group's field, defined once there.
+pub(crate) const ATOM_TYPE: Field = memory::ATOM_TYPE;
+/// `SUATOM`'s atomic operation (`set_atom_op(87..91, ..)`: [`AtomOp`]): the memory group's
+/// `ATOM_OP`.
+pub(crate) const SUATOM_OP: Field = memory::ATOM_OP;
 /// `SURED`'s atomic operation (`set_atom_op(87..90, ..)`): three bits, so not
-/// [`AtomOp::Exch`] (8).
-pub(crate) const SURED_OP: Field = Field::new(87, 3);
+/// [`AtomOp::Exch`] (8); the memory group's `RED_OP`.
+pub(crate) const SURED_OP: Field = memory::RED_OP;
 
 // ---------------------------------------------------------------------------------------------
 // Opcodes.
@@ -437,223 +444,6 @@ encoded! {
         Array2D = 4 => "array_2d",
         /// 5: three-dimensional.
         D3 = 5 => "3d",
-    }
-}
-
-encoded! {
-    /// The size and signedness of a binary memory access (NAK's `MemType`, encoded by
-    /// `set_mem_type`, with its printer's text).
-    MemType {
-        /// 0: an unsigned byte.
-        U8 = 0 => ".u8",
-        /// 1: a signed byte.
-        I8 = 1 => ".i8",
-        /// 2: an unsigned 16-bit word.
-        U16 = 2 => ".u16",
-        /// 3: a signed 16-bit word.
-        I16 = 3 => ".i16",
-        /// 4: 32 bits.
-        B32 = 4 => ".b32",
-        /// 5: 64 bits.
-        B64 = 5 => ".b64",
-        /// 6: 128 bits.
-        B128 = 6 => ".b128",
-    }
-}
-
-/// The scope of a strong memory access (NAK's `MemScope`, with its printer's text). It has no
-/// encoding of its own here: a surface access encodes it inside [`MemOrder::bits`]. NAK's
-/// stand-alone scope field (`OpMemBar`'s `set_field(76..79, ..)`: CTA 0, SM 1, GPU 2, system 3)
-/// is a different encoding, which slice 6e (MEMBAR) defines where it decodes it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum MemScope {
-    /// The workgroup.
-    Cta,
-    /// The GPU.
-    Gpu,
-    /// The whole system.
-    System,
-}
-
-impl Display for MemScope {
-    /// NAK's `MemScope` printer.
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Cta => ".cta",
-            Self::Gpu => ".gpu",
-            Self::System => ".sys",
-        })
-    }
-}
-
-encoded! {
-    /// A memory access's cache eviction priority (NAK's `MemEvictionPriority`, encoded by
-    /// `set_eviction_priority`, with its printer's text; `test_texture` confirms `.ef`).
-    MemEvictionPriority {
-        /// 0: evict first (`.EF`).
-        First = 0 => ".ef",
-        /// 1: normal, printed as nothing.
-        Normal = 1 => "",
-        /// 2: evict last (`.EL`).
-        Last = 2 => ".el",
-        /// 3: last use (`.LU`).
-        LastUse = 3 => ".lu",
-        /// 4: unchanged (`.EU`).
-        Unchanged = 4 => ".eu",
-        /// 5: no allocation (`.NA`).
-        NoAllocate = 5 => ".na",
-    }
-}
-
-encoded! {
-    /// The type of an atomic operation (NAK's `AtomType`, encoded by `set_atom_type` below SM
-    /// 9.0, with its printer's text).
-    AtomType {
-        /// 0: unsigned 32-bit.
-        U32 = 0 => ".u32",
-        /// 1: signed 32-bit.
-        I32 = 1 => ".i32",
-        /// 2: unsigned 64-bit.
-        U64 = 2 => ".u64",
-        /// 3: 32-bit float.
-        F32 = 3 => ".f32",
-        /// 4: two 16-bit floats.
-        F16v2 = 4 => ".f16v2",
-        /// 5: signed 64-bit.
-        I64 = 5 => ".i64",
-        /// 6: 64-bit float.
-        F64 = 6 => ".f64",
-    }
-}
-
-/// Where a compare-and-swap finds the value it compares with (NAK's `AtomCmpSrc`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum AtomCmpSrc {
-    /// A source of its own (not encodable for surfaces).
-    Separate,
-    /// Packed with the data, the compared value first: the only source `SUATOM.CAS` takes
-    /// (NAK: `assert!(cmp_src == AtomCmpSrc::Packed)`).
-    Packed,
-}
-
-/// An atomic operation (NAK's `AtomOp`, encoded by `set_atom_op`, with its printer's text).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum AtomOp {
-    /// 0.
-    Add,
-    /// 1.
-    Min,
-    /// 2.
-    Max,
-    /// 3: increment, wrapping at the data value.
-    Inc,
-    /// 4: decrement, wrapping at the data value.
-    Dec,
-    /// 5.
-    And,
-    /// 6.
-    Or,
-    /// 7.
-    Xor,
-    /// 8: exchange (not a reduction).
-    Exch,
-    /// Compare and swap: an opcode of its own, not a value of the operation field.
-    CmpExch(AtomCmpSrc),
-}
-
-impl AtomOp {
-    /// The operations the operation field encodes, in encoding order.
-    pub const ENCODED: [Self; 9] = [
-        Self::Add,
-        Self::Min,
-        Self::Max,
-        Self::Inc,
-        Self::Dec,
-        Self::And,
-        Self::Or,
-        Self::Xor,
-        Self::Exch,
-    ];
-
-    /// The operation field's value, or `None` for [`AtomOp::CmpExch`], which has an opcode of
-    /// its own (`set_atom_op`: "`CmpExch` is a separate opcode").
-    pub const fn bits(self) -> Option<u64> {
-        Some(match self {
-            Self::Add => 0,
-            Self::Min => 1,
-            Self::Max => 2,
-            Self::Inc => 3,
-            Self::Dec => 4,
-            Self::And => 5,
-            Self::Or => 6,
-            Self::Xor => 7,
-            Self::Exch => 8,
-            Self::CmpExch(_) => return None,
-        })
-    }
-}
-
-impl Display for AtomOp {
-    /// NAK's `AtomOp` printer.
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Add => ".add",
-            Self::Min => ".min",
-            Self::Max => ".max",
-            Self::Inc => ".inc",
-            Self::Dec => ".dec",
-            Self::And => ".and",
-            Self::Or => ".or",
-            Self::Xor => ".xor",
-            Self::Exch => ".exch",
-            Self::CmpExch(AtomCmpSrc::Separate) => ".cmpexch",
-            Self::CmpExch(AtomCmpSrc::Packed) => ".cmpexch.packed",
-        })
-    }
-}
-
-/// A memory access's ordering (NAK's `MemOrder`, encoded by `set_mem_order` from SM 8.0: one
-/// four-bit value).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum MemOrder {
-    /// 4: constant memory.
-    Constant,
-    /// 0: weak.
-    Weak,
-    /// Strong, in a scope: 5 for the workgroup, 7 for the GPU, 10 for the system.
-    Strong(MemScope),
-}
-
-impl MemOrder {
-    /// Every order, in declaration order.
-    pub const ALL: [Self; 5] = [
-        Self::Constant,
-        Self::Weak,
-        Self::Strong(MemScope::Cta),
-        Self::Strong(MemScope::Gpu),
-        Self::Strong(MemScope::System),
-    ];
-
-    /// The four-bit encoding (`set_mem_order`, `self.sm >= 80`).
-    pub const fn bits(self) -> u64 {
-        match self {
-            Self::Constant => 0x4,
-            Self::Weak => 0x0,
-            Self::Strong(MemScope::Cta) => 0x5,
-            Self::Strong(MemScope::Gpu) => 0x7,
-            Self::Strong(MemScope::System) => 0xa,
-        }
-    }
-}
-
-impl Display for MemOrder {
-    /// NAK's `MemOrder` printer.
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Constant => f.write_str(".constant"),
-            Self::Weak => f.write_str(".weak"),
-            Self::Strong(scope) => write!(f, ".strong{scope}"),
-        }
     }
 }
 
@@ -1546,7 +1336,7 @@ fn read_image_dim(reader: &mut Reader) -> Result<ImageDim, DecodeError> {
 }
 
 fn read_order(reader: &mut Reader) -> Result<MemOrder, DecodeError> {
-    read_value(reader, MEM_ORDER, &MemOrder::ALL, MemOrder::bits)
+    read_value(reader, MEM_ORDER, MemOrder::ALL, MemOrder::bits)
 }
 
 /// Reads the access the opcode picks: a memory type for the binary forms, a channel mask for

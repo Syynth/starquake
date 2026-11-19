@@ -256,7 +256,7 @@ fn surfaces() -> Vec<BoxedStrategy<Op>> {
         (any_gpr(), any_pred(), any_gpr(), any_gpr()),
         any_access(),
         select(ImageDim::ALL),
-        select(&MemOrder::ALL[..]),
+        select(MemOrder::ALL),
         any_eviction(),
     )
         .prop_map(
@@ -277,7 +277,7 @@ fn surfaces() -> Vec<BoxedStrategy<Op>> {
         (any_gpr(), any_gpr(), any_gpr()),
         any_access(),
         select(ImageDim::ALL),
-        select(&MemOrder::ALL[..]),
+        select(MemOrder::ALL),
         any_eviction(),
     )
         .prop_map(|((handle, coord, data), access, dim, order, eviction)| {
@@ -298,7 +298,7 @@ fn surfaces() -> Vec<BoxedStrategy<Op>> {
             any_atom_form(),
             select(AtomType::ALL),
         ),
-        (select(&MemOrder::ALL[..]), any_eviction()),
+        (select(MemOrder::ALL), any_eviction()),
         any::<bool>(),
     )
         .prop_map(
