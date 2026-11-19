@@ -118,7 +118,10 @@ fn tex_offset_layout_conditions() {
             scalar: false,
             ..offset
         },
-        OpTex { f16: true, ..offset },
+        OpTex {
+            f16: true,
+            ..offset
+        },
         OpTex {
             tex: TexRef::Bindless,
             ..offset
@@ -179,7 +182,7 @@ fn tex_offset_layout_conditions() {
     }
 }
 
-/// Operand, handle and result registers at `RZ` are refused; one below translates.
+/// Operand and handle registers at `RZ` are refused; one below translates.
 #[test]
 fn tex_register_edges() {
     assert_refused(
@@ -257,6 +260,11 @@ fn tex_register_edges() {
         }),
         U::HandleRegister(255),
     );
+}
+
+/// Result registers at `RZ` are refused; one below translates.
+#[test]
+fn tex_result_register_edges() {
     assert_refused(
         Op::Tex(OpTex {
             channel_mask: mask(0x3),
@@ -406,10 +414,7 @@ fn tld_refusals() {
         TexLodMode::Clamp,
         TexLodMode::BiasClamp,
     ] {
-        assert_refused(
-            Op::Tld(OpTld { lod_mode, ..tld() }),
-            U::FetchLodMode,
-        );
+        assert_refused(Op::Tld(OpTld { lod_mode, ..tld() }), U::FetchLodMode);
     }
     assert_refused(
         Op::Tld(OpTld {
@@ -790,6 +795,10 @@ fn surface_refusals() {
         dst: r(253),
         ..suld()
     }));
+}
+
+#[test]
+fn surface_store_and_atomic_refusals() {
     for bits in (0..16_u8).filter(|bits| !SURFACE_STORE_MASKS.contains(bits)) {
         assert_refused(
             Op::SuSt(OpSuSt {
@@ -858,7 +867,10 @@ fn surface_refusals() {
                 atom_op: AtomOp::Min,
                 ..suatom()
             }),
-            U::SurfaceAtomicOperation { op: "min", ty: name },
+            U::SurfaceAtomicOperation {
+                op: "min",
+                ty: name,
+            },
         );
     }
     assert_refused(
@@ -949,10 +961,17 @@ fn a_refusal_leaves_the_descriptor_buffer() {
     assert_refused(Op::Tld4(op), U::GatherNotScalar);
 }
 
-/// Each instruction's checks come in the PR's order: two faults at once give the first.
+/// Asserts each case's refusal: two faults at once give the first in the PR's order.
+fn assert_first_faults(cases: Vec<(Op, U)>) {
+    for (op, what) in cases {
+        assert_refused(op, what);
+    }
+}
+
+/// `TEX`'s checks come in the PR's order: two faults at once give the first.
 #[test]
-fn checks_come_in_the_prs_order() {
-    let cases: Vec<(Op, U)> = vec![
+fn tex_checks_come_in_the_prs_order() {
+    assert_first_faults(vec![
         (
             Op::Tex(OpTex {
                 tex: TexRef::Uniform(UniformReg::URZ),
@@ -1020,6 +1039,13 @@ fn checks_come_in_the_prs_order() {
             }),
             U::ResultLayout,
         ),
+    ]);
+}
+
+/// `TLD`'s checks come in the PR's order: two faults at once give the first.
+#[test]
+fn tld_checks_come_in_the_prs_order() {
+    assert_first_faults(vec![
         (
             Op::Tld(OpTld {
                 tex: TexRef::Bindless,
@@ -1095,6 +1121,13 @@ fn checks_come_in_the_prs_order() {
             }),
             U::FetchDimension(TexDim::Cube),
         ),
+    ]);
+}
+
+/// `TLD4`'s checks come in the PR's order: two faults at once give the first.
+#[test]
+fn tld4_checks_come_in_the_prs_order() {
+    assert_first_faults(vec![
         (
             Op::Tld4(OpTld4 {
                 tex: cb(DESCRIPTOR_BUFFERS, 0),
@@ -1145,6 +1178,13 @@ fn checks_come_in_the_prs_order() {
             }),
             U::GatherDimension(TexDim::D3),
         ),
+    ]);
+}
+
+/// `TXD`'s checks come in the PR's order: two faults at once give the first.
+#[test]
+fn txd_checks_come_in_the_prs_order() {
+    assert_first_faults(vec![
         (
             Op::Txd(OpTxd {
                 tex: cb(DESCRIPTOR_BUFFERS, 0),
@@ -1185,6 +1225,13 @@ fn checks_come_in_the_prs_order() {
             }),
             U::GradientRegisters,
         ),
+    ]);
+}
+
+/// `TMML`'s checks come in the PR's order: two faults at once give the first.
+#[test]
+fn tmml_checks_come_in_the_prs_order() {
+    assert_first_faults(vec![
         (
             Op::Tmml(OpTmml {
                 srcs: [r(10), r(11)],
@@ -1226,6 +1273,13 @@ fn checks_come_in_the_prs_order() {
             }),
             U::MipQueryRegisters,
         ),
+    ]);
+}
+
+/// `TXQ`'s checks come in the PR's order: two faults at once give the first.
+#[test]
+fn txq_checks_come_in_the_prs_order() {
+    assert_first_faults(vec![
         (
             Op::Txq(OpTxq {
                 tex: cb(DESCRIPTOR_BUFFERS, 0),
@@ -1250,6 +1304,13 @@ fn checks_come_in_the_prs_order() {
             }),
             U::QueryExtraRegister,
         ),
+    ]);
+}
+
+/// The surface instructions' checks come in the PR's order: two faults at once give the first.
+#[test]
+fn surface_checks_come_in_the_prs_order() {
+    assert_first_faults(vec![
         (
             Op::SuLd(OpSuLd {
                 access: ImageAccess::Formatted(mask(0)),
@@ -1301,17 +1362,24 @@ fn checks_come_in_the_prs_order() {
                 ty: "f32",
             },
         ),
-    ];
-    for (op, what) in cases {
-        assert_refused(op, what);
+    ]);
+}
+
+/// Asserts each error's exact text.
+fn assert_texts(cases: &[(U, &str)]) {
+    for &(what, text) in cases {
+        assert_eq!(what.to_string(), text);
     }
 }
 
-/// The exact text of every error, in plain words.
+/// The exact text of every error of the texture instructions, in plain words.
 #[test]
-fn error_text() {
-    let cases: [(U, &str); 41] = [
-        (U::OtherGroup("exit"), "exit, which is not a texture or surface instruction,"),
+fn texture_error_text() {
+    assert_texts(&[
+        (
+            U::OtherGroup("exit"),
+            "exit, which is not a texture or surface instruction,",
+        ),
         (
             U::HandleForm {
                 mnemonic: "tld",
@@ -1327,13 +1395,19 @@ fn error_text() {
             "txq with its handle in a uniform register",
         ),
         (U::UniformHandle(UniformReg::URZ), "a texture handle in urz"),
-        (U::Derivative, "a texture sample with non-divergent derivatives"),
+        (
+            U::Derivative,
+            "a texture sample with non-divergent derivatives",
+        ),
         (
             U::ClampMode,
             "a texture sample with its handle in a register and a level-of-detail clamp",
         ),
         (U::EmptyMask, "an empty texture channel mask"),
-        (U::DescriptorBuffer(18), "a texture handle in constant buffer 18"),
+        (
+            U::DescriptorBuffer(18),
+            "a texture handle in constant buffer 18",
+        ),
         (
             U::DescriptorBufferConflict { bound: 2, index: 3 },
             "a texture handle in constant buffer 3 after handles in buffer 2",
@@ -1354,14 +1428,30 @@ fn error_text() {
             "a texture result layout whose second destination does not match its channel count",
         ),
         (U::ResultRegister(256), "texture result register 256"),
-        (U::FetchNotScalar, "a texel fetch in the vector operand layout"),
+        (
+            U::FetchNotScalar,
+            "a texel fetch in the vector operand layout",
+        ),
         (U::FetchOffset, "a texel fetch with an offset"),
-        (U::FetchMultisampleOrClamp, "a multisampled or clamped texel fetch"),
+        (
+            U::FetchMultisampleOrClamp,
+            "a multisampled or clamped texel fetch",
+        ),
         (
             U::FetchLodMode,
             "a texel fetch with a level-of-detail mode other than lz and ll",
         ),
-        (U::FetchDimension(TexDim::Cube), "a texel fetch of dimension cube"),
+        (
+            U::FetchDimension(TexDim::Cube),
+            "a texel fetch of dimension cube",
+        ),
+    ]);
+}
+
+/// The exact text of every error of the gather, gradient, query and surface instructions.
+#[test]
+fn other_error_text() {
+    assert_texts(&[
         (U::GatherNotScalar, "a gather in the vector operand layout"),
         (
             U::GatherOffsetDimension(TexDim::D3),
@@ -1394,27 +1484,32 @@ fn error_text() {
             U::QueryKind(TexQuery::SamplerPos),
             "a texture query of tex_header_sampler_pos",
         ),
-        (U::QueryExtraRegister, "a texture query with a second destination"),
+        (
+            U::QueryExtraRegister,
+            "a texture query with a second destination",
+        ),
         (U::EmptyQueryMask, "an empty texture query mask"),
-        (U::QueryResultRegister(255), "texture query result register 255"),
+        (
+            U::QueryResultRegister(255),
+            "texture query result register 255",
+        ),
         (U::EmptySurfaceMask, "an empty surface channel mask"),
-        (U::SurfaceChannelMask(mask(0x5)), "a surface store of channels 0x5"),
+        (
+            U::SurfaceChannelMask(mask(0x5)),
+            "a surface store of channels 0x5",
+        ),
         (U::SurfaceRegisters, "surface operand registers past r254"),
         (U::SurfaceResultRegister(255), "surface result register 255"),
         (U::SurfaceAtomicMode, "a surface atomic with .ba"),
         (U::SurfaceCompareAndSwap, "a surface compare-and-swap"),
-    ];
-    for (what, text) in cases {
-        assert_eq!(what.to_string(), text);
-    }
-    assert_eq!(
-        U::SurfaceAtomicOperation {
-            op: "min",
-            ty: "u64"
-        }
-        .to_string(),
-        "a surface atomic min of type u64"
-    );
+        (
+            U::SurfaceAtomicOperation {
+                op: "min",
+                ty: "u64",
+            },
+            "a surface atomic min of type u64",
+        ),
+    ]);
     assert_eq!(
         TextureError::Unsupported(U::DescriptorBufferConflict { bound: 2, index: 3 }).to_string(),
         "a texture handle in constant buffer 3 after handles in buffer 2 is not supported"

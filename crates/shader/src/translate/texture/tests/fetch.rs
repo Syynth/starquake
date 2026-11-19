@@ -28,7 +28,7 @@ fn fetch(op: OpTld, regs: &[(u8, u32)], ty: TextureType, coords: Val, lod: Val) 
 /// after the coordinates.
 #[test]
 fn every_dimension_it_takes() {
-    let cases: [(TexDim, TextureType, &[(u8, u32)], Val); 5] = [
+    let cases: [DimCase<'_>; 5] = [
         (TexDim::D1, TextureType::Color1D, &[(10, X)], Val::U32(X)),
         (
             TexDim::Array1D,
@@ -81,10 +81,7 @@ fn explicit_levels() {
 /// `.F16` packs pairs of channels, as `TEX` does.
 #[test]
 fn half_precision_results() {
-    let op = OpTld {
-        f16: true,
-        ..tld()
-    };
+    let op = OpTld { f16: true, ..tld() };
     let machine = fetch(
         op,
         &[(10, X), (20, Y), (1, 9)],

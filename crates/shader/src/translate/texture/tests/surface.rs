@@ -17,9 +17,17 @@ const WORDS: [u32; 4] = [0xa0, 0xb1, 0xc2, 0xd3];
 
 /// Each dimension's coordinate registers and the coordinates read from them: integers, an array
 /// index last.
-fn dimensions() -> [(ImageDim, TextureType, Vec<(u8, u32)>, Val); 6] {
+/// A surface dimension, its IR type, its coordinate registers and the coordinates read.
+type SurfaceCase = (ImageDim, TextureType, Vec<(u8, u32)>, Val);
+
+fn dimensions() -> [SurfaceCase; 6] {
     [
-        (ImageDim::D1, TextureType::Color1D, vec![(10, X)], Val::U32(X)),
+        (
+            ImageDim::D1,
+            TextureType::Color1D,
+            vec![(10, X)],
+            Val::U32(X),
+        ),
         (
             ImageDim::Buffer1D,
             TextureType::Buffer,
@@ -144,12 +152,21 @@ fn binary_loads() {
 /// store the registers its size covers.
 #[test]
 fn stores() {
-    let data = [(20, WORDS[0]), (21, WORDS[1]), (22, WORDS[2]), (23, WORDS[3])];
+    let data = [
+        (20, WORDS[0]),
+        (21, WORDS[1]),
+        (22, WORDS[2]),
+        (23, WORDS[3]),
+    ];
     let mut cases: Vec<(ImageAccess, ImageFormat, usize)> = SURFACE_STORE_MASKS
         .iter()
         .map(|&bits| {
             let count = usize::try_from(bits.count_ones()).expect("small");
-            (ImageAccess::Formatted(mask(bits)), ImageFormat::Typeless, count)
+            (
+                ImageAccess::Formatted(mask(bits)),
+                ImageFormat::Typeless,
+                count,
+            )
         })
         .collect();
     cases.extend(

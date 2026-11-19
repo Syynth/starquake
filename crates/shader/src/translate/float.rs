@@ -412,7 +412,9 @@ pub fn translate_instr(
     guard_tested: bool,
 ) -> Result<(), FloatError> {
     check(&instr.op)?;
-    super::conditional_block(builder, instr.guard, guard_tested, |b| Emit { b }.op(&instr.op))
+    super::conditional_block(builder, instr.guard, guard_tested, |b| {
+        Emit { b }.op(&instr.op)
+    })
 }
 
 /// Whether `function` uses a quad operation of this group (`FSwizzleAdd`, from `FSWZADD`), so

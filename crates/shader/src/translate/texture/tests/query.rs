@@ -148,6 +148,10 @@ fn dimension_queries() {
                 Some(Val::U32x4(words)),
             )],
         );
-        assert_eq!(&machine.regs[4..4 + expected.len()], expected, "mask {bits:#x}");
+        assert_eq!(
+            &machine.regs[4..4 + expected.len()],
+            expected,
+            "mask {bits:#x}"
+        );
     }
 }

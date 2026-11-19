@@ -84,8 +84,12 @@
 //! translation"), through the same helper as the float group: the guard is read, the block
 //! branches to a block holding the instruction or past it, and translation continues in the
 //! block after. [`translate_instr`] skips this for `PT` and when its block already tests the
-//! guard (flow analysis's `guard_tested`). `@!PT` is checked and put in a block that never runs,
-//! as the float group does (the PR skips it unchecked: `Visitor::Run`, `guard.Never()`).
+//! guard (flow analysis's `guard_tested`). This is what the PR does too: none of this group's
+//! opcodes is pure in its flow table (`classify.h`, `Classify`), so flow analysis gives each
+//! guarded one a conditional block (`flow.cpp`); pinned by
+//! `tests::guards::a_guard_makes_a_conditional_block`. `@!PT` is checked and put in a block that
+//! never runs, as the float group does (the PR skips it unchecked: `Visitor::Run`,
+//! `guard.Never()`).
 //!
 //! # Refusals
 //!
@@ -155,13 +159,12 @@
 //!
 //! | What | PR #4588 | Here | Pinned by |
 //! |---|---|---|---|
-//! | A guard | a conditional block, from flow analysis (`flow.cpp`); none of these instructions is pure | the same, built here (spec, "Instruction translation") | `tests::guards::a_guard_makes_a_conditional_block` |
 //! | `@!PT` | skipped unchecked (`guard.Never()`) | checked, and put in a block that never runs | `tests::guards::never_guarded_instructions_are_checked` |
-//! | A fault (`.SPARSE`) predicate other than `PT` | refused ("native sparse texture residency", "native sparse surface residency") | translated; the predicate is written false, every texel reported resident (spec, gap table: "Report resident and list the divergence") | `tests::sample::sparse_results_report_resident` |
+//! | A fault (`.SPARSE`) predicate other than `PT` | refused ("native sparse texture residency", "native sparse surface residency") | translated; the predicate is written false, every texel reported resident (spec, gap table: "Report resident and list the divergence") | `tests::sample::sparse_results_report_resident`, `tests::fetch::a_uniform_handle_and_a_fault_predicate`, `tests::gather::a_fault_predicate_and_a_partial_mask`, `tests::query::gradients`, `tests::surface::formatted_loads`, `tests::surface::reductions_discard_the_old_value` |
 //! | `TEX.LC`, `TEX.LB.LC` with a constant-buffer or uniform handle | refused ("native texture clamp mode") | translated, the clamp carried (see "Level-of-detail clamp") | `tests::sample::lod_clamp_is_carried` |
 //! | `TLD4.PTP` | one gather with both offset registers | four gathers (see "Per-texel gather offsets") | `tests::gather::per_texel_offsets_take_four_gathers` |
-//! | The surface forms with a register handle (`0x998` to `0x99e`, `0x394`, `0x3a0`) | not dispatched by `Visitor::Run` | translated (see "Surfaces") | `tests::surface` |
-//! | `SUATOM.CAS` (`0x396`) | not dispatched | refused by name ([`TextureUnsupported::SurfaceCompareAndSwap`]) | `tests::refusals::surface_refusals` |
+//! | The surface forms with a register handle (`0x998` to `0x99e`, `0x394`, `0x3a0`) | not dispatched by `Visitor::Run` | translated (see "Surfaces") | `tests::surface::formatted_loads`, `binary_loads`, `stores`, `atomics`, `reductions_discard_the_old_value` |
+//! | `SUATOM.CAS` (`0x396`) | not dispatched | refused by name ([`TextureUnsupported::SurfaceCompareAndSwap`]) | `tests::refusals::surface_store_and_atomic_refusals` |
 //! | The descriptor buffer's conflict check | per program, set at the first handle even if the instruction is then refused (the program fails anyway) | the same per [`DescriptorBuffer`], which is set only when the instruction translates | `tests::refusals::a_refusal_leaves_the_descriptor_buffer` |
 //!
 //! The PR's `env.TextureBoundBuffer() == cbuf_index` check, made when it translates without a
@@ -863,7 +866,10 @@ struct TexPlan {
     targets: Targets,
 }
 
-fn plan_tex(op: OpTex, buffer: DescriptorBuffer) -> Result<(TexPlan, DescriptorBuffer), TextureUnsupported> {
+fn plan_tex(
+    op: OpTex,
+    buffer: DescriptorBuffer,
+) -> Result<(TexPlan, DescriptorBuffer), TextureUnsupported> {
     let handle = texture_handle(op.tex)?;
     let register_handle = handle.is_none();
     let (ty, coordinates) = tex_dimension(op.dim);
@@ -898,10 +904,10 @@ fn plan_tex(op: OpTex, buffer: DescriptorBuffer) -> Result<(TexPlan, DescriptorB
                     op.lod_mode,
                     TexLodMode::Auto | TexLodMode::Zero | TexLodMode::Lod
                 )
-                && a_index % 2 == 0
+                && a_index.is_multiple_of(2)
                 && a_index + 1 < REGISTER_LIMIT
                 && b_index + 1 < REGISTER_LIMIT
-                && (!lod || b_index % 2 == 0),
+                && (!lod || b_index.is_multiple_of(2)),
             TextureUnsupported::Offset,
         )?;
         let mut list = List::new();
@@ -929,10 +935,7 @@ fn plan_tex(op: OpTex, buffer: DescriptorBuffer) -> Result<(TexPlan, DescriptorB
     } else if op.scalar {
         scalar_list(a, b, count)?
     } else {
-        require(
-            count <= leading + 1,
-            TextureUnsupported::VectorOperandCount,
-        )?;
+        require(count <= leading + 1, TextureUnsupported::VectorOperandCount)?;
         split_list(a, b, leading, count)?
     };
     let targets = result_targets(op.channel_mask, op.dsts, op.f16)?;
@@ -956,7 +959,10 @@ struct TldPlan {
     targets: Targets,
 }
 
-fn plan_tld(op: OpTld, buffer: DescriptorBuffer) -> Result<(TldPlan, DescriptorBuffer), TextureUnsupported> {
+fn plan_tld(
+    op: OpTld,
+    buffer: DescriptorBuffer,
+) -> Result<(TldPlan, DescriptorBuffer), TextureUnsupported> {
     handle_form("tld", op.tex, false, true)?;
     let handle = texture_handle(op.tex)?;
     require(op.scalar, TextureUnsupported::FetchNotScalar)?;
@@ -1000,7 +1006,10 @@ struct Tld4Plan {
     targets: Targets,
 }
 
-fn plan_tld4(op: OpTld4, buffer: DescriptorBuffer) -> Result<(Tld4Plan, DescriptorBuffer), TextureUnsupported> {
+fn plan_tld4(
+    op: OpTld4,
+    buffer: DescriptorBuffer,
+) -> Result<(Tld4Plan, DescriptorBuffer), TextureUnsupported> {
     handle_form("tld4", op.tex, false, true)?;
     let handle = texture_handle(op.tex)?;
     let buffer = bind_handle(buffer, op.tex)?;
@@ -1051,7 +1060,10 @@ fn cbuf_offset(tex: TexRef) -> u32 {
     }
 }
 
-fn plan_txd(op: OpTxd, buffer: DescriptorBuffer) -> Result<(TxdPlan, DescriptorBuffer), TextureUnsupported> {
+fn plan_txd(
+    op: OpTxd,
+    buffer: DescriptorBuffer,
+) -> Result<(TxdPlan, DescriptorBuffer), TextureUnsupported> {
     handle_form("txd", op.tex, false, false)?;
     let buffer = bind_handle(buffer, op.tex)?;
     require(!op.offset, TextureUnsupported::GradientOffset)?;
@@ -1083,7 +1095,10 @@ struct TmmlPlan {
     targets: [Option<Gpr>; CHANNELS as usize],
 }
 
-fn plan_tmml(op: OpTmml, buffer: DescriptorBuffer) -> Result<(TmmlPlan, DescriptorBuffer), TextureUnsupported> {
+fn plan_tmml(
+    op: OpTmml,
+    buffer: DescriptorBuffer,
+) -> Result<(TmmlPlan, DescriptorBuffer), TextureUnsupported> {
     handle_form("tmml", op.tex, false, false)?;
     let [coords, extra] = op.srcs;
     require(extra.is_zero(), TextureUnsupported::MipQueryExtraRegister)?;
@@ -1102,11 +1117,8 @@ fn plan_tmml(op: OpTmml, buffer: DescriptorBuffer) -> Result<(TmmlPlan, Descript
         after(coords, coordinates) < REGISTER_LIMIT,
         TextureUnsupported::MipQueryRegisters,
     )?;
-    let targets = consecutive_targets(
-        mask,
-        op.dsts[0],
-        TextureUnsupported::MipQueryResultRegister,
-    )?;
+    let targets =
+        consecutive_targets(mask, op.dsts[0], TextureUnsupported::MipQueryResultRegister)?;
     let plan = TmmlPlan {
         op,
         offset: cbuf_offset(op.tex),
@@ -1123,7 +1135,10 @@ struct TxqPlan {
     targets: [Option<Gpr>; CHANNELS as usize],
 }
 
-fn plan_txq(op: OpTxq, buffer: DescriptorBuffer) -> Result<(TxqPlan, DescriptorBuffer), TextureUnsupported> {
+fn plan_txq(
+    op: OpTxq,
+    buffer: DescriptorBuffer,
+) -> Result<(TxqPlan, DescriptorBuffer), TextureUnsupported> {
     handle_form("txq", op.tex, false, false)?;
     let buffer = bind_handle(buffer, op.tex)?;
     require(
@@ -1133,11 +1148,7 @@ fn plan_txq(op: OpTxq, buffer: DescriptorBuffer) -> Result<(TxqPlan, DescriptorB
     require(op.dsts[1].is_zero(), TextureUnsupported::QueryExtraRegister)?;
     let mask = op.channel_mask.bits();
     require(mask != 0, TextureUnsupported::EmptyQueryMask)?;
-    let targets = consecutive_targets(
-        mask,
-        op.dsts[0],
-        TextureUnsupported::QueryResultRegister,
-    )?;
+    let targets = consecutive_targets(mask, op.dsts[0], TextureUnsupported::QueryResultRegister)?;
     let plan = TxqPlan {
         op,
         offset: cbuf_offset(op.tex),
@@ -1721,7 +1732,16 @@ impl Emit<'_, '_> {
             TexOffsetMode::None => None,
             TexOffsetMode::AddOffI => {
                 let [x, y, _, _] = self.gather_offsets(list.take(), 2)?;
-                Some([x, y, imm32(0), imm32(0), imm32(0), imm32(0), imm32(0), imm32(0)])
+                Some([
+                    x,
+                    y,
+                    imm32(0),
+                    imm32(0),
+                    imm32(0),
+                    imm32(0),
+                    imm32(0),
+                    imm32(0),
+                ])
             }
             TexOffsetMode::PerPx => {
                 let [x0, y0, x1, y1] = self.gather_offsets(list.take(), CHANNELS.into())?;
@@ -1750,7 +1770,8 @@ impl Emit<'_, '_> {
             }
             Some(fields) => {
                 let mut texels = [imm32(0); CHANNELS as usize];
-                for (texel, pair) in texels.iter_mut().zip(fields.chunks_exact(2)) {
+                let (pairs, _) = fields.as_chunks::<2>();
+                for (texel, pair) in texels.iter_mut().zip(pairs) {
                     let offset = self.construct_u32(pair)?;
                     let gathered = self.gather(handle, coords, offset, dref, info)?;
                     *texel = self.extract_f32x4(gathered, GATHER_BASE_TEXEL)?;
@@ -1779,11 +1800,7 @@ impl Emit<'_, '_> {
                 &[handle, coords, offset, ABSENT, dref],
                 info,
             ),
-            None => self.image(
-                Opcode::ImageGather,
-                &[handle, coords, offset, ABSENT],
-                info,
-            ),
+            None => self.image(Opcode::ImageGather, &[handle, coords, offset, ABSENT], info),
         }
     }
 
@@ -1839,11 +1856,7 @@ impl Emit<'_, '_> {
             ty,
             ..TextureInfo::default()
         };
-        let lod = self.image(
-            Opcode::ImageQueryLod,
-            &[imm32(plan.offset), coords],
-            info,
-        )?;
+        let lod = self.image(Opcode::ImageQueryLod, &[imm32(plan.offset), coords], info)?;
         for (element, target) in (0_u32..).zip(plan.targets) {
             let Some(target) = target else { continue };
             let level = self.extract_f32x4(lod, element ^ 1)?;
@@ -1865,7 +1878,11 @@ impl Emit<'_, '_> {
         let skip_levels = op.channel_mask.bits() & (1 << QUERY_LEVELS) == 0;
         let query = self.image(
             Opcode::ImageQueryDimensions,
-            &[imm32(plan.offset), level, Operand::Imm(Imm::U1(skip_levels))],
+            &[
+                imm32(plan.offset),
+                level,
+                Operand::Imm(Imm::U1(skip_levels)),
+            ],
             TextureInfo::default(),
         )?;
         for (element, target) in (0_u32..).zip(plan.targets) {

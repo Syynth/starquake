@@ -32,7 +32,7 @@ fn sample_rgba(op: OpTex, regs: &[(u8, u32)], opcode: Opcode, info: TextureInfo,
 /// `A + 1`, then `B` onwards. The array index comes first, as a float of its low 16 bits.
 #[test]
 fn every_dimension_in_the_scalar_layout() {
-    let cases: [(TexDim, TextureType, &[(u8, u32)], Val); 7] = [
+    let cases: [DimCase<'_>; 7] = [
         (TexDim::D1, TextureType::Color1D, &[(10, X)], Val::F32(X)),
         (
             TexDim::Array1D,
@@ -87,7 +87,7 @@ fn every_dimension_in_the_scalar_layout() {
 /// the one operand after them is `B`.
 #[test]
 fn every_dimension_in_the_vector_layout() {
-    let cases: [(TexDim, TextureType, &[(u8, u32)], Val); 7] = [
+    let cases: [DimCase<'_>; 7] = [
         (TexDim::D1, TextureType::Color1D, &[(10, X)], Val::F32(X)),
         (
             TexDim::Array1D,
@@ -171,7 +171,7 @@ fn level_of_detail_modes() {
         &[(10, X), (20, Y)],
         Opcode::ImageSampleExplicitLod,
         info(ty),
-        vec![HANDLE, coords.clone(), Val::F32(f(0.0)), NONE],
+        vec![HANDLE, coords, Val::F32(f(0.0)), NONE],
     );
     let lod = OpTex {
         lod_mode: TexLodMode::Lod,
@@ -182,7 +182,7 @@ fn level_of_detail_modes() {
         &[(10, X), (11, Y), (20, level)],
         Opcode::ImageSampleExplicitLod,
         info(ty),
-        vec![HANDLE, coords.clone(), Val::F32(level), NONE],
+        vec![HANDLE, coords, Val::F32(level), NONE],
     );
     let bias = OpTex {
         lod_mode: TexLodMode::Bias,
@@ -270,7 +270,13 @@ fn lod_clamp_is_carried() {
                 is_depth: true,
                 ..with_clamp
             },
-            vec![HANDLE, Val::F32x2([X, Y]), Val::F32(Z), Val::F32(clamp), NONE],
+            vec![
+                HANDLE,
+                Val::F32x2([X, Y]),
+                Val::F32(Z),
+                Val::F32(clamp),
+                NONE,
+            ],
             Some(Val::F32(f(0.5))),
         )],
     );
@@ -316,7 +322,13 @@ fn depth_comparison() {
         vec![call(
             Opcode::ImageSampleDrefExplicitLod,
             depth,
-            vec![HANDLE, Val::F32x2([X, Y]), Val::F32(dref), Val::F32(level), NONE],
+            vec![
+                HANDLE,
+                Val::F32x2([X, Y]),
+                Val::F32(dref),
+                Val::F32(level),
+                NONE,
+            ],
             Some(Val::F32(result)),
         )],
     );
@@ -340,7 +352,7 @@ fn offsets() {
         &[(10, X), (11, Y), (20, packed)],
         Opcode::ImageSampleImplicitLod,
         info(TextureType::Color2D),
-        vec![HANDLE, Val::F32x2([X, Y]), NONE, offset.clone()],
+        vec![HANDLE, Val::F32x2([X, Y]), NONE, offset],
     );
     let level = f(2.0);
     let op = OpTex {
@@ -384,13 +396,8 @@ fn every_mask_writes_its_channels_in_order() {
         );
         let mut expected = [SENTINEL; 16];
         expected[10] = X;
-        let mut stored = 0;
-        for channel in 0..4 {
-            if bits & (1 << channel) != 0 {
-                let target = if stored < 2 { 4 + stored } else { 8 + stored - 2 };
-                expected[target] = TEXEL[channel];
-                stored += 1;
-            }
+        for (reg, value) in placed(u32::from(bits), 4, 8) {
+            expected[reg] = value;
         }
         assert_eq!(machine.regs[..16], expected, "mask {bits:#x}");
     }
@@ -403,10 +410,25 @@ fn half_precision_results_pack_pairs() {
     // 0.125, 0.25, 0.5 and 0.75 as halves.
     let halves = [0x3000, 0x3400, 0x3800, 0x3a00];
     let cases = [
-        (0xf, [r(0), r(2)], [(0, halves[1] << 16 | halves[0]), (2, halves[3] << 16 | halves[2])]),
-        (0x7, [r(0), r(2)], [(0, halves[1] << 16 | halves[0]), (2, halves[2])]),
+        (
+            0xf,
+            [r(0), r(2)],
+            [
+                (0, halves[1] << 16 | halves[0]),
+                (2, halves[3] << 16 | halves[2]),
+            ],
+        ),
+        (
+            0x7,
+            [r(0), r(2)],
+            [(0, halves[1] << 16 | halves[0]), (2, halves[2])],
+        ),
         (0x1, [r(0), Gpr::RZ], [(0, halves[0]), (2, 9)]),
-        (0x6, [r(0), Gpr::RZ], [(0, halves[2] << 16 | halves[1]), (2, 9)]),
+        (
+            0x6,
+            [r(0), Gpr::RZ],
+            [(0, halves[2] << 16 | halves[1]), (2, 9)],
+        ),
     ];
     for (bits, dsts, expected) in cases {
         let op = OpTex {

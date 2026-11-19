@@ -39,9 +39,15 @@ fn a_guard_makes_a_conditional_block() {
         });
         let function = build(instr, false);
         let text = function.to_string();
-        assert!(text.starts_with("block0:\n    %0: u1 = GetPred p1\n"), "{text}");
+        assert!(
+            text.starts_with("block0:\n    %0: u1 = GetPred p1\n"),
+            "{text}"
+        );
         assert!(text.contains("block1:"), "{text}");
-        assert!(text.ends_with("    jump block2\nblock2:\n    return\n"), "{text}");
+        assert!(
+            text.ends_with("    jump block2\nblock2:\n    return\n"),
+            "{text}"
+        );
         for pred in [false, true] {
             let runs = pred != negated;
             let mut machine = machine_with(&[(10, X), (20, Y), (0, 9)]);
@@ -74,7 +80,11 @@ fn never_guarded_instructions_are_checked() {
         guard: never,
         op: Op::Tex(OpTex { ndv: true, ..tex() }),
     });
-    assert_refused_raw(refused, DescriptorBuffer::new(), TextureUnsupported::Derivative);
+    assert_refused_raw(
+        refused,
+        DescriptorBuffer::new(),
+        TextureUnsupported::Derivative,
+    );
 }
 
 /// With the guard tested by flow analysis, the instruction is translated in place: no branch,

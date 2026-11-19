@@ -69,21 +69,11 @@ fn explicit_lod_samples_with_offsets() {
                     Some(Val::F32x4(TEXEL)),
                 )],
             );
-            let mut stored = 0;
-            for channel in 0..4 {
-                if bits & (1 << channel) != 0 {
-                    let target = if stored < 2 {
-                        destination + stored
-                    } else {
-                        second + stored - 2
-                    };
-                    assert_eq!(
-                        machine.regs[usize::try_from(target).expect("small")],
-                        TEXEL[channel],
-                        "mask {bits:#x}, destination {destination}"
-                    );
-                    stored += 1;
-                }
+            for (reg, value) in placed(bits, destination, second) {
+                assert_eq!(
+                    machine.regs[reg], value,
+                    "mask {bits:#x}, destination {destination}"
+                );
             }
         }
     }
@@ -145,21 +135,8 @@ fn volume_samples_with_every_mask() {
                 Some(Val::F32x4(TEXEL)),
             )],
         );
-        let mut stored = 0;
-        for channel in 0..4 {
-            if bits & (1 << channel) != 0 {
-                let target = if stored < 2 {
-                    destination + stored
-                } else {
-                    second + stored - 2
-                };
-                assert_eq!(
-                    machine.regs[usize::try_from(target).expect("small")],
-                    TEXEL[channel],
-                    "mask {bits:#x}"
-                );
-                stored += 1;
-            }
+        for (reg, value) in placed(bits, destination, second) {
+            assert_eq!(machine.regs[reg], value, "mask {bits:#x}");
         }
     }
 }
@@ -191,7 +168,10 @@ fn half_samples_pack_pairs() {
             )],
         );
         if half {
-            assert_eq!([machine.regs[4], machine.regs[6]], [0x3400_3000, 0x3a00_3800]);
+            assert_eq!(
+                [machine.regs[4], machine.regs[6]],
+                [0x3400_3000, 0x3a00_3800]
+            );
             assert_eq!([machine.regs[5], machine.regs[7]], [0, X]);
         } else {
             assert_eq!(machine.regs[4..8], TEXEL);

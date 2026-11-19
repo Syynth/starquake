@@ -24,8 +24,8 @@ use proptest::prelude::*;
 use super::*;
 use crate::asm::assemble;
 use crate::decode::{
-    GROUP_HOOKS, GROUPS, Instruction, MemEvictionPriority, MemOrder, OPCODE, PredSrc,
-    TexCBufRef, TexChannel, decode,
+    GROUP_HOOKS, GROUPS, Instruction, MemEvictionPriority, MemOrder, OPCODE, PredSrc, TexCBufRef,
+    TexChannel, decode,
 };
 use crate::interp::{ImageCall, Machine, ScriptedImage, Val};
 use crate::ir::{Function, Terminator};
@@ -135,16 +135,33 @@ pub(super) fn info(ty: TextureType) -> TextureInfo {
     }
 }
 
+/// A texture dimension, its IR type, the registers a case sets and the coordinates read.
+pub(super) type DimCase<'a> = (TexDim, TextureType, &'a [(u8, u32)], Val);
+
+/// Where [`TEXEL`]'s channels selected by `bits` go: the first two to `first` and the
+/// register after it, the rest to `second` and the one after it; each as (register, value).
+pub(super) fn placed(bits: u32, first: u32, second: u32) -> Vec<(usize, u32)> {
+    let mut stored = 0;
+    let mut placed = Vec::new();
+    for (channel, &value) in TEXEL.iter().enumerate() {
+        if bits & (1 << channel) != 0 {
+            let target = if stored < 2 {
+                first + stored
+            } else {
+                second + stored - 2
+            };
+            placed.push((usize::try_from(target).expect("small"), value));
+            stored += 1;
+        }
+    }
+    placed
+}
+
 /// What [`ABSENT`] reads as.
 pub(super) const NONE: Val = Val::U32(0);
 
 /// A result of four distinct floats, and their bits.
-pub(super) const TEXEL: [u32; 4] = [
-    f(0.125),
-    f(0.25),
-    f(0.5),
-    f(0.75),
-];
+pub(super) const TEXEL: [u32; 4] = [f(0.125), f(0.25), f(0.5), f(0.75)];
 
 /// The rejection translating `instr` gives, and that nothing was appended and the buffer is
 /// unchanged.
@@ -353,7 +370,11 @@ fn check_generated(instr: Instr, tested: bool, bound: Option<u8>) -> Result<(), 
         Ok(()) => {
             builder.terminate(Terminator::Return).expect("terminates");
             prop_assert_eq!(function.verify(), Ok(()));
-            prop_assert!(buffer.index().is_none_or(|index| index < DESCRIPTOR_BUFFERS));
+            prop_assert!(
+                buffer
+                    .index()
+                    .is_none_or(|index| index < DESCRIPTOR_BUFFERS)
+            );
         }
         Err(TextureError::Unsupported(_)) => {
             prop_assert_eq!(builder.function(), &before);

@@ -14,7 +14,7 @@ const LAYER: u32 = f(2.0);
 /// 2D, a 2D array and a cube, with every component.
 #[test]
 fn every_dimension_and_component() {
-    let cases: [(TexDim, TextureType, &[(u8, u32)], Val); 3] = [
+    let cases: [DimCase<'_>; 3] = [
         (
             TexDim::D2,
             TextureType::Color2D,
@@ -50,7 +50,7 @@ fn every_dimension_and_component() {
                         gather_component: component,
                         ..info(ty)
                     },
-                    vec![HANDLE, coords.clone(), NONE, NONE],
+                    vec![HANDLE, coords, NONE, NONE],
                     Some(Val::F32x4(TEXEL)),
                 )],
             );
@@ -140,8 +140,8 @@ fn per_texel_offsets_take_four_gathers() {
             .iter()
             .zip(replies)
             .map(|(offset, reply)| {
-                let mut args = vec![HANDLE, coords.clone(), Val::U32x2(*offset), NONE];
-                args.extend(dref.clone());
+                let mut args = vec![HANDLE, coords, Val::U32x2(*offset), NONE];
+                args.extend(dref);
                 call(opcode, info, args, Some(Val::F32x4(reply)))
             })
             .collect()
