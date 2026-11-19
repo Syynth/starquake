@@ -70,7 +70,7 @@ use crate::channel::{
     StateError,
 };
 use crate::fifo::{GpEntry, Sync};
-use crate::interface::{ChannelConfig, ChannelId, Fence, GpfifoEntry, Submission};
+use crate::interface::{ChannelConfig, ChannelId, Fence, GpfifoEntry, Submission, charge};
 use crate::macros::{
     CallResult, Engine, MacroChannel, MacroEnv, ProcessMacros, WordOutcome, takes,
 };
@@ -233,7 +233,9 @@ pub(super) struct Lane {
     pub(super) taken: u64,
     /// The sequence number of the last submission finished.
     pub(super) finished: u64,
-    /// Entries started (or dropped) since the queue bound was last told.
+    /// What the queue bound counted ([`charge`]) and the channel started or dropped since the
+    /// bound was last told: each entry started or dropped, and one for each submission with no
+    /// entries when it is taken off the queue or dropped.
     pub(super) started: usize,
     /// Whether a structural error stopped the channel.
     pub(super) stopped: bool,
@@ -300,8 +302,10 @@ impl Lane {
         let unstarted: usize = self
             .queue
             .drain(..)
-            .map(|queued| queued.submission.entries.len())
-            .sum();
+            .map(|queued| charge(queued.submission.entries.len()))
+            .fold(0, usize::saturating_add);
+        // The active submission's charge for having no entries left the bound when it was taken
+        // off the queue (`Lane::step`); only its unstarted entries are left to release.
         let active = self.active.take().map_or(0, |active| active.unstarted());
         self.started = self
             .started
@@ -381,6 +385,12 @@ impl Lane {
             let Some(queued) = self.queue.pop_front() else {
                 return Ok(Step::Stop);
             };
+            // A submission with no entries was charged one (`charge`), which no entry start
+            // will release: it leaves the bound now.
+            let entries = queued.submission.entries.len();
+            self.started = self
+                .started
+                .saturating_add(charge(entries).saturating_sub(entries));
             self.active = Some(Active::new(queued));
         }
         let channel = self.pusher.id();

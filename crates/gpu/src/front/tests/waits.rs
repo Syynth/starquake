@@ -670,3 +670,106 @@ fn a_failing_macro_call_is_counted_and_the_stream_goes_on() {
     assert_eq!(r.front.counters().macro_failures, 1);
     assert!(has(&r.take(), &scratch_text(a, 1, 0xa2)));
 }
+
+// ---------------------------------------------------------------------------------------------
+// What restarts a recheck and the poll's schedule
+// ---------------------------------------------------------------------------------------------
+
+/// A stream that acquires `address` equal to 1.
+fn acquire_only(address: u64) -> Vec<u32> {
+    let mut pb = PushBuffer::new();
+    acquire(&mut pb, address, AcquireOp::Equal, 1);
+    pb.into_words()
+}
+
+/// Turns the front until `parks` channels have parked (at most a few turns).
+fn turn_until_parks(r: &mut Rig, parks: u64) {
+    for _ in 0..8 {
+        if r.front.counters().parks >= parks {
+            return;
+        }
+        r.turn();
+    }
+    assert!(r.front.counters().parks >= parks, "fewer than {parks} parks");
+}
+
+/// Turns the front until a turn is idle (at most a few turns); how long it may park.
+fn next_idle_park(r: &mut Rig) -> Duration {
+    for _ in 0..8 {
+        if let Turn::Idle { park } = r.turn() {
+            return park;
+        }
+    }
+    panic!("no idle turn");
+}
+
+#[test]
+fn a_release_the_back_writes_rechecks_a_parked_channel_at_once() {
+    // A waits past the poll's spins with the clock stopped, so no poll comes. B's release,
+    // written by the back, is reported, and that report alone makes the front look again.
+    let mut r = rig();
+    let a = r.channel(5);
+    let b = r.channel(6);
+    r.submit(
+        a,
+        vec![r.entry(CMD_A, &acquire_then_write(AcquireOp::Equal, 1, 0, 0xa1))],
+    );
+    turn_until_parked(&mut r);
+    for _ in 0..POLL_SPINS + 4 {
+        r.turn();
+    }
+    let polls = r.front.counters().polls;
+    let mut pb = PushBuffer::new();
+    release(&mut pb, SEM, 1);
+    r.submit(b, vec![r.entry(CMD_B, pb.words())]);
+    for _ in 0..6 {
+        r.turn();
+    }
+    assert!(has(&r.take(), &scratch_text(a, 0, 0xa1)));
+    assert_eq!(r.front.counters().polls, polls);
+}
+
+#[test]
+fn a_channel_that_newly_parks_restarts_the_polls_schedule() {
+    let mut r = rig();
+    let a = r.channel(5);
+    let b = r.channel(6);
+    r.submit(a, vec![r.entry(CMD_A, &acquire_only(SEM))]);
+    turn_until_parks(&mut r, 1);
+    for _ in 0..POLL_SPINS {
+        r.turn();
+    }
+    // A's schedule is in its sleeps.
+    assert!(!next_idle_park(&mut r).is_zero());
+    // B newly parks: the schedule is back in its spins.
+    r.submit(b, vec![r.entry(CMD_B, &acquire_only(SEM2))]);
+    turn_until_parks(&mut r, 2);
+    assert_eq!(next_idle_park(&mut r), Duration::ZERO);
+}
+
+#[test]
+fn a_channel_that_resumes_restarts_the_polls_schedule_for_the_others() {
+    let mut r = rig();
+    let a = r.channel(5);
+    let b = r.channel(6);
+    r.submit(
+        a,
+        vec![r.entry(CMD_A, &acquire_then_write(AcquireOp::Equal, 1, 0, 0xa1))],
+    );
+    r.submit(b, vec![r.entry(CMD_B, &acquire_only(SEM2))]);
+    turn_until_parks(&mut r, 2);
+    for _ in 0..POLL_SPINS {
+        r.turn();
+    }
+    let park = next_idle_park(&mut r);
+    assert!(!park.is_zero());
+    // The CPU releases A's semaphore; the poll that sees it resumes A, and B's schedule is
+    // back in its spins.
+    r.write(SEM, &[1]);
+    r.clock.advance(park);
+    assert_eq!(r.turn(), Turn::Worked);
+    assert!(r.front.lanes[&a].wait.is_none());
+    assert!(r.front.lanes[&b].wait.is_some());
+    assert_eq!(next_idle_park(&mut r), Duration::ZERO);
+    assert!(has(&r.take(), &scratch_text(a, 0, 0xa1)));
+}

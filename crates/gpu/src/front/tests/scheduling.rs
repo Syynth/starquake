@@ -351,3 +351,47 @@ fn a_destroyed_channels_stop_error_is_forgotten() {
     r.settle();
     assert_eq!(r.shared.channel_error(a), None);
 }
+
+#[test]
+fn a_met_sync_wait_starts_its_entry_while_another_channel_keeps_pushing() {
+    // B has three entries of 8,000 writes (about six quanta) and runs first; A then submits a
+    // `SYNC_WAIT` entry, which waits for the back once. When its marker is reported, A starts
+    // the entry even though B has pushed more work since: it does not wait again for every
+    // channel to go quiet, so A's write comes before B's last.
+    let writes: u16 = 8_000;
+    let mut r = rig();
+    let b = r.channel(6);
+    let a = r.channel(5);
+    let long = immediates(1, 1..=writes);
+    r.write(CMD_FAR, &long);
+    let entry = raw_entry(CMD_FAR, long.len(), Sync::Proceed);
+    r.submit(b, vec![entry; 3]);
+    r.front.turn().unwrap();
+    let words = write_scratch(0, 0xa1);
+    r.write(CMD_A, &words);
+    r.submit(a, vec![raw_entry(CMD_A, words.len(), Sync::Wait)]);
+    r.settle();
+    assert_eq!(r.front.counters().sync_waits, 1);
+    let texts = r.take();
+    let last_b = texts
+        .iter()
+        .rposition(|t| *t == scratch_text(b, 1, u32::from(writes)))
+        .unwrap();
+    assert!(position(&texts, &scratch_text(a, 0, 0xa1)) < last_b);
+}
+
+#[test]
+fn a_raw_entry_with_its_low_address_bits_set_is_not_unaligned() {
+    // `ChannelError::UnalignedEntry` cannot be reached through a submission: a raw GP entry's
+    // address is `GP_ENTRY0_GET` (bits 31:2) and `GP_ENTRY1_GET_HI`, so bits 1:0 of word 0 (the
+    // `FETCH` flag and an unused bit) are never address bits (`front` module docs, "What stops
+    // a channel"). An entry with both set runs from the aligned address.
+    let mut r = rig();
+    let a = r.channel(5);
+    let entry = r.entry(CMD_A, &write_scratch(0, 0xa1));
+    r.submit(a, vec![GpfifoEntry(entry.0 | 0b11)]);
+    r.settle();
+    assert_eq!(r.shared.channel_error(a), None);
+    assert_eq!(r.front.counters().stopped_channels, 0);
+    assert!(has(&r.take(), &scratch_text(a, 0, 0xa1)));
+}

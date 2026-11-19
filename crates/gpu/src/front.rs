@@ -100,7 +100,7 @@ use thiserror::Error;
 
 use crate::back::fence::{OrderedUpdate, VmChange, WaiterTable};
 use crate::channel::ChannelError;
-use crate::interface::{AsId, ChannelId, Completions, GpuCompletion};
+use crate::interface::{AsId, ChannelId, Completions, GpuCompletion, charge};
 use crate::macros::ProcessMacros;
 use crate::memory::GpuMemory;
 use crate::ring::{Producer, PushError};
@@ -374,7 +374,9 @@ impl Front {
             } => {
                 if let Some(lane) = self.lanes.get_mut(&channel) {
                     if lane.stopped {
-                        lane.started = lane.started.saturating_add(submission.entries.len());
+                        lane.started = lane
+                            .started
+                            .saturating_add(charge(submission.entries.len()));
                     } else {
                         lane.take(submission);
                     }

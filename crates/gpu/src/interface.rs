@@ -10,7 +10,8 @@
 //! and [`DisplayId`], graphics-server slice 2's [`Fence`], [`Ticket`], [`GpuCompletion`] and
 //! [`Completions`], slice 6's [`Target`], [`RegionId`], [`Kind`] and [`VmUpdate`], and the front
 //! loop's (G14) [`AsId`], [`GpfifoEntry`], [`Submission`], [`Submitted`], [`ChannelConfig`] and
-//! [`CHANNEL_QUEUE_ENTRIES`], which gsv defined until the front existed and now re-exports. The
+//! [`CHANNEL_QUEUE_ENTRIES`] with its [`charge`], which gsv defined until the front existed and
+//! now re-exports. The
 //! block's `Syncpoints` and `GpuVm` have behaviour, not only a shape, so they live in
 //! [`crate::syncpoint`] and [`crate::vm`]. The rest of the block (`GpuFront`, `GpuError`) belongs
 //! here too when its slice (the wiring, G21) lands.
@@ -203,6 +204,18 @@ pub struct AsId(pub u32);
 /// reaches in normal pacing). The front enforces it ([`Submitted::Full`],
 /// `crate::front`); gsv refuses a single submission larger than it, which could never be queued.
 pub const CHANNEL_QUEUE_ENTRIES: usize = 65_536;
+
+/// What a submission of `entries` GP entries counts against a channel's
+/// [`CHANNEL_QUEUE_ENTRIES`]: its entries, and **at least one**. Decision 12 counts entries; a
+/// submission with no entries would count nothing, so a title could queue such submissions
+/// behind a parked channel without bound. Charging them one entry is a departure from the
+/// decision's wording, an open question for the owner, shared by the front's queue bound
+/// (`crate::front`, "The queue bound") and gsv's cap on waiting submissions (its `submits`
+/// module, "The cap"), which both call this one definition.
+#[must_use]
+pub const fn charge(entries: usize) -> usize {
+    if entries == 0 { 1 } else { entries }
+}
 
 /// One GP entry as the guest wrote it: 8 bytes, little-endian (graphics-server's `GpfifoEntry`;
 /// [`crate::fifo::GpEntry::from_raw`] decodes it). Kept raw so that a submission is saved and

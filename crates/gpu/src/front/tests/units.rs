@@ -69,7 +69,9 @@ fn the_queue_bound_is_decision_12s_and_fits_compares_at_it() {
     assert_eq!(CHANNEL_QUEUE_ENTRIES, 65_536);
     // Exactly full fits; one more does not, from either side.
     assert!(fits(CHANNEL_QUEUE_ENTRIES - 1, 1));
-    assert!(fits(CHANNEL_QUEUE_ENTRIES, 0));
+    // A submission with no entries is charged one: it takes the last place, never one past.
+    assert!(fits(CHANNEL_QUEUE_ENTRIES - 1, 0));
+    assert!(!fits(CHANNEL_QUEUE_ENTRIES, 0));
     assert!(fits(0, CHANNEL_QUEUE_ENTRIES));
     assert!(!fits(CHANNEL_QUEUE_ENTRIES, 1));
     assert!(!fits(0, CHANNEL_QUEUE_ENTRIES + 1));

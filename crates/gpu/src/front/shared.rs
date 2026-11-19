@@ -12,9 +12,16 @@
 //!
 //! A channel's queue holds at most [`CHANNEL_QUEUE_ENTRIES`] GP entries (graphics-server
 //! decision 12): every entry of every submission [`FrontShared::submit`] accepted and the front
-//! has not yet started (`crate::channel::Channel::start_entry`). A submission that would take the
-//! count past the bound is answered [`Submitted::Full`] and nothing of it is queued; one that
-//! takes it exactly to the bound is queued ([`fits`], `a_submission_that_fills_the_queue_exactly_is_queued`).
+//! has not yet started (`crate::channel::Channel::start_entry`). Each submission is counted by
+//! [`charge`]: its entries, and at least one, so a submission with no entries counts one until
+//! the front takes it off the channel's queue (or a stopped channel drops it). Without that, a
+//! title could queue empty submissions behind a parked channel for the rest of the run. This is
+//! the departure gsv's cap on waiting submissions makes from the owner's wording, and adopts
+//! the same open owner question (`charge`'s docs;
+//! `zero_entry_submissions_fill_the_queue_one_each`,
+//! `a_zero_entry_submission_on_a_full_queue_is_full`). A submission that would take the count
+//! past the bound is answered [`Submitted::Full`] and nothing of it is queued; one that takes it
+//! exactly to the bound is queued ([`fits`], `a_submission_that_fills_the_queue_exactly_is_queued`).
 //! After a `Full`, the front pushes [`GpuCompletion::GpuQueueRoom`] for the channel once the
 //! largest submission refused since the last room report would fit
 //! (`room_is_reported_once_the_refused_submission_fits`). A submission of more entries than the
@@ -43,16 +50,18 @@ use crate::back::fence::{FrontWake, Report};
 use crate::channel::ChannelError;
 use crate::interface::{
     AsId, CHANNEL_QUEUE_ENTRIES, ChannelConfig, ChannelId, Submission, Submitted, Ticket, VmUpdate,
+    charge,
 };
 use crate::memory::GpuMemory;
 use crate::ring::MarkerToken;
 use crate::vm::GpuVm;
 
 /// Whether a submission of `entries` GP entries fits in a channel queue that holds `queued`
-/// (module docs, "The queue bound"): the sum is at most [`CHANNEL_QUEUE_ENTRIES`].
+/// (module docs, "The queue bound"): `queued` plus the submission's [`charge`] is at most
+/// [`CHANNEL_QUEUE_ENTRIES`].
 pub fn fits(queued: usize, entries: usize) -> bool {
     queued
-        .checked_add(entries)
+        .checked_add(charge(entries))
         .is_some_and(|total| total <= CHANNEL_QUEUE_ENTRIES)
 }
 
@@ -109,7 +118,8 @@ pub(super) struct BackReports {
 /// One channel's queue bound.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Queue {
-    /// Entries accepted and not yet started.
+    /// What the submissions accepted and not yet started count ([`charge`]): their entries not
+    /// yet started, and one for each submission with no entries not yet taken off the queue.
     queued: usize,
     /// The largest submission refused since the last room report.
     wanted: Option<usize>,
@@ -216,7 +226,7 @@ impl FrontShared {
             queue.wanted = Some(queue.wanted.map_or(entries, |wanted| wanted.max(entries)));
             return Submitted::Full;
         }
-        queue.queued += entries;
+        queue.queued += charge(entries);
         self.queue(
             &mut inbox,
             Request::Submit {
@@ -299,7 +309,8 @@ impl FrontShared {
         std::mem::take(&mut inbox.signalled)
     }
 
-    /// The front started `started` entries of `channel`, or dropped them: they leave its queue.
+    /// The front started or dropped what `started` counts of `channel`'s queue ([`charge`]): it
+    /// leaves the queue.
     /// Returns whether the room a refused submission waits for is now there; the caller then
     /// pushes [`GpuCompletion::GpuQueueRoom`](crate::interface::GpuCompletion::GpuQueueRoom),
     /// with the lock released.
@@ -329,7 +340,7 @@ impl FrontShared {
         self.lock().errors.remove(&channel);
     }
 
-    /// Entries `channel`'s queue holds, for tests.
+    /// What `channel`'s queue holds, counted by [`charge`], for tests.
     #[cfg(test)]
     pub(super) fn queued(&self, channel: ChannelId) -> Option<usize> {
         self.lock().queues.get(&channel).map(|queue| queue.queued)
