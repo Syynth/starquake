@@ -96,7 +96,8 @@ fn an_instruction_may_write_its_own_guard() {
     }
 }
 
-/// `@!PT` never runs: nothing is appended, not even for a form that would be refused.
+/// `@!PT` never runs: nothing is appended, not even for a form that would be refused, a
+/// bindless constant-buffer source included (the guard is checked before the sources).
 #[test]
 fn never_guarded_instructions_append_nothing() {
     let never = PredSrc {
@@ -114,7 +115,15 @@ fn never_guarded_instructions_append_nothing() {
         src: MovSrc::Reg(r(2)),
         quad_lanes: 1,
     });
-    for op in [mov(1, 2), bmsk, partial] {
+    let bindless = Op::Mov(OpMov {
+        dst: r(1),
+        src: MovSrc::CBuf(CBufRef {
+            buf: CBuf::BindlessUniform(ur(1)),
+            offset: 0,
+        }),
+        quad_lanes: OpMov::ALL_LANES,
+    });
+    for op in [mov(1, 2), bmsk, partial, bindless] {
         let mut function = Function::new();
         let entry = function.entry();
         let mut builder = Builder::new(&mut function, entry);
@@ -198,26 +207,36 @@ fn the_split_keeps_the_blocks_terminator() {
 #[test]
 fn refusals_leave_the_function_untouched() {
     let refused = [
-        Op::Mov(OpMov {
-            dst: r(1),
-            src: MovSrc::CBuf(CBufRef {
-                buf: CBuf::BindlessUniform(ur(1)),
-                offset: 0,
+        (
+            Op::Mov(OpMov {
+                dst: r(1),
+                src: MovSrc::CBuf(CBufRef {
+                    buf: CBuf::BindlessUniform(ur(1)),
+                    offset: 0,
+                }),
+                quad_lanes: OpMov::ALL_LANES,
             }),
-            quad_lanes: OpMov::ALL_LANES,
-        }),
-        Op::IMad64(crate::decode::OpIMad64 {
-            dst: r(4),
-            srcs: [reg(1), reg(2), reg(7)],
-            signed: false,
-            carry: NOT_PT,
-        }),
-        Op::IAdd3(OpIAdd3 {
-            carry: [ps(0, false), NOT_PT],
-            ..iadd3(0, [reg(1), reg(2), reg(3)])
-        }),
+            IntegerUnsupported::BindlessConstantBuffer,
+        ),
+        // The addend pair starts at an odd register.
+        (
+            Op::IMad64(crate::decode::OpIMad64 {
+                dst: r(4),
+                srcs: [reg(1), reg(2), reg(7)],
+                signed: false,
+                carry: NOT_PT,
+            }),
+            IntegerUnsupported::WideAddendRegister(r(7)),
+        ),
+        (
+            Op::IAdd3(OpIAdd3 {
+                carry: [ps(0, false), NOT_PT],
+                ..iadd3(0, [reg(1), reg(2), reg(3)])
+            }),
+            IntegerUnsupported::Iadd3CarryPredicate,
+        ),
     ];
-    for op in refused {
+    for (op, expected) in refused {
         let mut function = Function::new();
         let entry = function.entry();
         let mut builder = Builder::new(&mut function, entry);
@@ -229,10 +248,7 @@ fn refusals_leave_the_function_untouched() {
             .expect("appends");
         let before = builder.function().clone();
         let error = translate_integer(&mut builder, &guarded(op, ps(1, false)), GuardMode::Honour);
-        assert!(
-            matches!(error, Err(IntegerError::Unsupported(_))),
-            "{error:?}"
-        );
+        assert_eq!(error, Err(IntegerError::Unsupported(expected)));
         assert_eq!(builder.function(), &before);
         assert_eq!(builder.block(), entry);
         translate_integer(
@@ -243,5 +259,130 @@ fn refusals_leave_the_function_untouched() {
         .expect("translates");
         assert_ne!(builder.block(), entry);
         assert_eq!(builder.function().block_count(), 3);
+    }
+}
+
+/// `entry` jumps to `exit` directly (`direct`) or through `middle`, and `exit`'s phi names each
+/// of its predecessors: the function, `entry` and `exit`.
+fn phi_rig(direct: bool) -> (Function, BlockId, BlockId) {
+    let mut function = Function::new();
+    let entry = function.entry();
+    let mut builder = Builder::new(&mut function, entry);
+    let middle = builder.add_block().expect("adds");
+    let exit = builder.add_block().expect("adds");
+    let target = if direct { exit } else { middle };
+    builder
+        .terminate(Terminator::Jump(target))
+        .expect("terminates");
+    builder.switch_to(middle).expect("switches");
+    builder
+        .terminate(Terminator::Jump(exit))
+        .expect("terminates");
+    builder.switch_to(exit).expect("switches");
+    let mut incoming = vec![(middle, Operand::Imm(Imm::U32(2)))];
+    if direct {
+        incoming.push((entry, Operand::Imm(Imm::U32(1))));
+    }
+    builder
+        .phi(crate::ir::Type::U32, incoming)
+        .expect("appends");
+    builder.terminate(Terminator::Return).expect("terminates");
+    assert_eq!(function.verify(), Ok(()));
+    (function, entry, exit)
+}
+
+/// A guarded instruction in a block whose successor has a phi naming the block is refused
+/// before anything is appended, since the split would leave the phi naming a block that no
+/// longer jumps to it. The same instruction unguarded or with its guard tested translates
+/// there, and a guarded one splits a block whose successor has no phi, though a later block's
+/// phi names that successor.
+#[test]
+fn a_phi_on_a_successor_refuses_the_split() {
+    let (mut function, entry, exit) = phi_rig(true);
+    let mut builder = Builder::new(&mut function, entry);
+    let before = builder.function().clone();
+    let refused = translate_integer(
+        &mut builder,
+        &guarded(mov(1, 2), ps(1, false)),
+        GuardMode::Honour,
+    );
+    assert_eq!(
+        refused,
+        Err(IntegerError::SuccessorPhi {
+            block: entry,
+            successor: exit,
+        })
+    );
+    assert_eq!(
+        refused.map_err(|error| error.to_string()),
+        Err("a guarded instruction cannot split block0: block2 has a phi naming it".to_owned())
+    );
+    assert_eq!(builder.function(), &before);
+    assert_eq!(builder.block(), entry);
+    for (direct, guard, mode) in [
+        (true, PredSrc::TRUE, GuardMode::Honour),
+        (true, ps(1, false), GuardMode::Tested),
+        (false, ps(1, false), GuardMode::Honour),
+    ] {
+        let (mut function, entry, _) = phi_rig(direct);
+        let mut builder = Builder::new(&mut function, entry);
+        translate_integer(&mut builder, &guarded(mov(1, 2), guard), mode).expect("translates");
+        // Only the guarded case splits, leaving the builder in a new block.
+        let split = mode == GuardMode::Honour && !guard.is_true();
+        assert_eq!(builder.block() != entry, split);
+        assert_eq!(function.verify(), Ok(()), "{direct} {guard:?} {mode:?}");
+    }
+}
+
+/// The checks this module adds run in their documented order, each pair with both faults at
+/// once: a bindless source before a dropped modifier, a dropped modifier before a successor's
+/// phi, and a successor's phi before the instruction's own check (`BMSK`, refused by name).
+#[test]
+fn the_added_checks_come_in_their_order() {
+    let bindless_with_modifier = Op::IAbs(crate::decode::OpIAbs {
+        dst: r(0),
+        src: AluSrc::CBuf {
+            cbuf: CBufRef {
+                buf: CBuf::BindlessUniform(ur(1)),
+                offset: 0,
+            },
+            abs: false,
+            neg: true,
+        },
+    });
+    let negated_iabs = Op::IAbs(crate::decode::OpIAbs {
+        dst: r(0),
+        src: neg(2),
+    });
+    let bmsk = Op::BMsk(OpBMsk {
+        dst: r(0),
+        pos: reg(1),
+        width: reg(2),
+        wrap: false,
+    });
+    // `None` stands for the successor's phi, whose blocks each rig names.
+    let cases = [
+        (
+            bindless_with_modifier,
+            Some(IntegerError::Unsupported(
+                IntegerUnsupported::BindlessConstantBuffer,
+            )),
+        ),
+        (negated_iabs, Some(IntegerError::Modifier("iabs"))),
+        (bmsk, None),
+    ];
+    for (op, expected) in cases {
+        let (mut function, entry, exit) = phi_rig(true);
+        let expected = expected.unwrap_or(IntegerError::SuccessorPhi {
+            block: entry,
+            successor: exit,
+        });
+        let mut builder = Builder::new(&mut function, entry);
+        let before = builder.function().clone();
+        assert_eq!(
+            translate_integer(&mut builder, &guarded(op, ps(1, false)), GuardMode::Honour),
+            Err(expected)
+        );
+        assert_eq!(builder.function(), &before);
     }
 }

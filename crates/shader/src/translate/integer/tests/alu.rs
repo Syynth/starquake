@@ -226,6 +226,20 @@ fn lea_shifts_and_adds() {
             assert_eq!(machine.regs[0], lo32(wide));
             assert_eq!(machine.preds[3], wide >> 32 != 0, "{a:#x} {b:#x} {shift}");
 
+            // The carry output with `b` negated and no `.X`: `-b` (modulo 2^32, not the bitwise
+            // not) is the 64-bit sum's second term.
+            let mut machine = machine_with(&[0, a, b]);
+            run_op(
+                Op::Lea(OpLea {
+                    overflow: p(3),
+                    ..lea(0, reg(1), neg(2), shift)
+                }),
+                &mut machine,
+            );
+            let wide = u64::from(shifted) + u64::from(b.wrapping_neg());
+            assert_eq!(machine.regs[0], lo32(wide), "{a:#x} -{b:#x} {shift}");
+            assert_eq!(machine.preds[3], wide >> 32 != 0, "{a:#x} -{b:#x} {shift}");
+
             // `.X`: the carry predicate adds one, and a negated `b` is a bitwise not.
             for carry in [false, true] {
                 let mut machine = machine_with(&[0, a, b]);
@@ -616,6 +630,99 @@ fn shf_follows_naks_types_and_amounts() {
             }
         }
     }
+}
+
+/// The largest value `operand` can take, as far as the operations that bound it show: an
+/// immediate's value, the smaller bound of a `UMin32`'s or `BitwiseAnd32`'s arguments, else
+/// `u32::MAX`.
+fn amount_bound(function: &Function, operand: Operand) -> u32 {
+    match operand {
+        Operand::Imm(Imm::U32(bits)) => bits,
+        Operand::Value(value) => match function.inst(value) {
+            Some(crate::ir::Inst::Op(op))
+                if matches!(op.opcode, Opcode::UMin32 | Opcode::BitwiseAnd32) =>
+            {
+                op.args
+                    .iter()
+                    .map(|arg| amount_bound(function, *arg))
+                    .min()
+                    .unwrap_or(u32::MAX)
+            }
+            _ => u32::MAX,
+        },
+        Operand::Imm(_) => u32::MAX,
+    }
+}
+
+/// No `SHF` gives a 64-bit IR shift an amount that can reach 64, which the IR leaves undefined
+/// (SPIR-V's `OpShift*`; WGSL takes it modulo 64): `SHF.L.U64` and `SHF.R.S64` without `.W`
+/// included, for every type and flag. The largest amount each shift can take is read from the
+/// operations that bound it.
+#[test]
+fn sixty_four_bit_shift_amounts_stay_below_64() {
+    let wide_shifts = [
+        Opcode::ShiftLeftLogical64,
+        Opcode::ShiftRightLogical64,
+        Opcode::ShiftRightArithmetic64,
+    ];
+    for ty in ShfType::ALL {
+        for (wrap, right, hi) in (0..8).map(|bits| (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0)) {
+            let op = OpShf {
+                dst: r(0),
+                low: reg(1),
+                shift: reg(2),
+                high: reg(3),
+                data_type: ty,
+                wrap,
+                right,
+                dst_high: hi,
+            };
+            let function = build(&[Instr::new(Op::Shf(op))]).expect("translates");
+            let mut shifts = 0;
+            for (_, inst) in function.insts() {
+                let crate::ir::Inst::Op(op) = inst else {
+                    continue;
+                };
+                if wide_shifts.contains(&op.opcode) {
+                    shifts += 1;
+                    let amount = op.args.get(1).copied().expect("a shift amount");
+                    assert!(
+                        amount_bound(&function, amount) < 64,
+                        "{ty:?} wrap {wrap} right {right} hi {hi}: {function}"
+                    );
+                }
+            }
+            assert_eq!(shifts, 1, "{ty:?} wrap {wrap} right {right} hi {hi}");
+        }
+    }
+}
+
+/// `POPC` and `FLO` in form 4 with the immediate's bit 31 set: the decoder reads bit 63 as
+/// that bit (its decision for `0x909` and `0x900`), so this module counts and searches
+/// `0x80000000` itself, where PR #4588 reads the same bit as its bitwise not too and gives
+/// `popc(~0x80000000)` = 31 and `flo` 30.
+#[test]
+fn popc_and_flo_form_4_take_bit_63_as_the_immediates() {
+    let popc = Instr::new(Op::PopC(OpPopC {
+        dst: r(0),
+        src: AluSrc::Imm(0x8000_0000),
+    }));
+    let flo = Instr::new(Op::Flo(OpFlo {
+        dst: r(1),
+        src: AluSrc::Imm(0x8000_0000),
+        signed: false,
+        return_shift_amount: false,
+    }));
+    // The words are form 4 (`0x909`, `0x900`) with bit 63 set.
+    for (instr, opcode) in [(popc, 0x909), (flo, 0x900)] {
+        let bits = word(&instr);
+        assert_eq!(bits.field(crate::decode::OPCODE), opcode);
+        assert_eq!((bits.bits() >> 63) & 1, 1);
+    }
+    let mut machine = Machine::new();
+    run(&[popc, flo], &mut machine);
+    assert_eq!(machine.regs[0], 1);
+    assert_eq!(machine.regs[1], 31);
 }
 
 fn imad(dst: u8, srcs: [AluSrc; 3], signed: bool, mode: IMadMode) -> Op {

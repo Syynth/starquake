@@ -32,10 +32,15 @@
 //! new block holding the instruction's IR, which jumps to a second new block that takes over
 //! the first block's terminator; the builder is left in that second block. The split is made
 //! when the first IR operation is appended, after every check, so a refused instruction leaves
-//! the function untouched (`tests::guards::refusals_leave_the_function_untouched`). An
-//! instruction under `!PT` never runs and appends nothing, without its checks, as PR #4588's
-//! `Visitor::Run` returns at once when `guard.Never()`; with [`GuardMode::Tested`] the guard is
-//! ignored (flow analysis has tested it, [`crate::flow::FlowBlock::guard_tested`]).
+//! the function untouched (`tests::guards::refusals_leave_the_function_untouched`). The block
+//! after the conditional block becomes the predecessor of the original block's successors, and
+//! the builder cannot rewrite a phi there that names the original block, so a guarded
+//! instruction in a block one of whose successors has such a phi is refused before anything is
+//! appended ([`IntegerError::SuccessorPhi`];
+//! `tests::guards::a_phi_on_a_successor_refuses_the_split`). An instruction under `!PT` never
+//! runs and appends nothing, without its checks, as PR #4588's `Visitor::Run` returns at once
+//! when `guard.Never()`; with [`GuardMode::Tested`] the guard is ignored (flow analysis has
+//! tested it, [`crate::flow::FlowBlock::guard_tested`]).
 //!
 //! # Checks
 //!
@@ -47,6 +52,21 @@
 //! clear (the decoder's module docs, "Divergences from PR #4588's table"). A constant-buffer
 //! source is checked first, in every instruction, as the PR reads every operand before its
 //! other checks (`Visitor::WideSlot`: "native bindless constant buffer").
+//!
+//! [`translate_integer`] takes an [`Instr`] built by hand as well as a decoded one, so it
+//! refuses a source modifier this module would not apply ([`IntegerError::Modifier`]): an
+//! absolute-value bit on any source (the decoder never sets one in this group), and a negation
+//! on any source other than `IADD3`'s, `IADD3.X`'s, `IMAD`'s (without `.HI`) and `IDP`'s three,
+//! `LEA`'s and `LEA.X`'s `b` and `POPC`'s and `FLO`'s one
+//! (`tests::rejections::modifiers_the_form_drops_are_refused`). The decoder's table of which
+//! sources read a negation bit lists only those sources, with `IMAD`'s in its `.HI` mode
+//! excluded (its module docs, "Source modifiers"), so no decoded word is refused here; the
+//! property test `tests::generated_words_never_panic` fails on such a refusal of a generated
+//! word.
+//!
+//! The order is: the group, the guard (`!PT` appends nothing), constant-buffer sources, source
+//! modifiers, a guard's successor phis (only when the guard makes a conditional block), then
+//! the instruction's own checks (`tests::guards::the_added_checks_come_in_their_order`).
 //!
 //! The PR's `Visitor::Cbuf` refuses a bank of 32 or more; a decoded [`CBuf::Binding`] is five
 //! bits wide, so that check cannot fail here and is not repeated.
@@ -73,10 +93,11 @@
 //! | What | Here | PR #4588 | Pinned by |
 //! |---|---|---|---|
 //! | A pure instruction under a guard | A conditional block (spec, "Instruction translation") | A select of each written value (`visitor.cpp`, `guard_select`) | `tests::guards::a_guard_makes_a_conditional_block` |
-//! | `SHF`'s type field | NAK's encoding (0 `I64`, 1 `U64`, 2 `I32`, 3 `U32`) and NAK's shift amount: masked to the type's width less one with `.W`, else clamped to the width (32 or 64) | 1 `U32`, 2 `S64`, 3 `U64`, 0 refused; the amount masked to 31 or clamped to 32 for every type | `tests::alu::shf_follows_naks_types_and_amounts` |
+//! | `SHF`'s type field | NAK's encoding (0 `I64`, 1 `U64`, 2 `I32`, 3 `U32`) and NAK's shift amount: masked to the type's width less one with `.W`, else clamped to the width (32 or 64). A 64-bit IR shift by 64 or more is undefined (SPIR-V's `OpShift*`; WGSL takes the amount modulo 64), so for the 64-bit types without `.W` the amount is clamped to 63 and a logical shift by 64 or more selects 0, NAK's result (`tests::alu::sixty_four_bit_shift_amounts_stay_below_64`) | 1 `U32`, 2 `S64`, 3 `U64`, 0 refused; the amount masked to 31 or clamped to 32 for every type | `tests::alu::shf_follows_naks_types_and_amounts` |
 //! | `IADD3.X` and `LEA.X` | Bit 74 in every form (the decoder, after NAK) | `IADD3.X` is source 2's absolute-value bit (bit 62 in forms 3 and 7, none in form 2); `LEA.X` with `b` in the register slot (forms 2, 3 and 7) refused (`Require(!b.abs)`) | `tests::alu::extended_adds_in_every_form` |
 //! | `LEA`'s high word in forms 2, 3 and 7 | Source 2, the wide slot (NAK's operand order) | Bits 64..72, the same register as `b` | `tests::alu::lea_hi_reads_its_high_word_from_source_2` |
 //! | `BREV` | Every source form (1, 4, 5, 6) | Form 1 only (`case 0x301`) | `tests::alu::brev_takes_every_source_form` |
+//! | `POPC`'s and `FLO`'s form 4 (`0x909`, `0x900`) with bit 63 set | The decoder reads bit 63 as the immediate's bit 31 (its module docs, "Decisions taken here"), so `popc 0x80000000` is 1 and unsigned `flo 0x80000000` is 31 | Bit 63 is also the bitwise-not modifier (`Visitor::POPC`, `Visitor::FLO`: `not_source = Take(63, 1)`), so the same word gives `popc(~0x80000000)` = 31 and `flo` 30 | `tests::alu::popc_and_flo_form_4_take_bit_63_as_the_immediates` |
 //!
 //! `PRMT` is translated with an immediate selector only (form 4): in forms 1, 2, 3 and 7 the
 //! selector is a register, which the PR refuses too ("native register permute selector";
@@ -107,7 +128,7 @@ use crate::decode::{
     OpLop3, OpMov, OpP2R, OpPLop3, OpPopC, OpPrmt, OpR2P, OpSel, OpSgxt, OpShf, PLop3Src, Pred,
     PredSetOp, PredSrc, PrmtMode, ShfType, UniformPredSrc, UniformReg, decode,
 };
-use crate::ir::{BlockId, BuildError, Builder, Imm, Opcode, Operand, Terminator};
+use crate::ir::{BlockId, BuildError, Builder, Function, Imm, Inst, Opcode, Operand, Terminator};
 
 /// How [`translate_integer`] treats an instruction's guard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -222,6 +243,19 @@ pub enum IntegerError {
     /// The form or a field value is not translated.
     #[error("{0} is not supported")]
     Unsupported(IntegerUnsupported),
+    /// A hand-built [`Instr`] has a source modifier this module would not apply (see the
+    /// module docs, "Checks").
+    #[error("{0} has a source modifier it does not take")]
+    Modifier(&'static str),
+    /// A guarded instruction would split `block`, whose successor `successor` has a phi naming
+    /// it (see the module docs, "Guards").
+    #[error("a guarded instruction cannot split {block}: {successor} has a phi naming it")]
+    SuccessorPhi {
+        /// The block the builder is in.
+        block: BlockId,
+        /// Its successor with the phi.
+        successor: BlockId,
+    },
     /// The IR could not be built: an arena is full, or this module built a malformed
     /// instruction (a bug). The function may hold part of the instruction's IR.
     #[error(transparent)]
@@ -244,6 +278,16 @@ const MOVED_PREDICATES: u8 = Pred::PT.index();
 
 /// The rows of a three-input truth table.
 const LUT_ROWS: u8 = 8;
+
+/// The width in bits of `SHF`'s 64-bit types (`I64`, `U64`).
+const SHF_WIDE: u32 = 64;
+
+/// The width in bits of `SHF`'s 32-bit types (`I32`, `U32`).
+const SHF_NARROW: u32 = 32;
+
+/// The bytes of one constant-buffer word: the unit of `GetCbufU32` and the distance from an
+/// `IMAD.WIDE` addend's low word to its high word.
+const WORD_BYTES: u32 = 4;
 
 /// Whether `op` belongs to this group.
 pub const fn is_integer(op: &Op) -> bool {
@@ -287,8 +331,8 @@ pub fn translate_integer_word(
 
 /// Appends the IR of `instr`, an integer ALU instruction, at `builder`'s position (see the
 /// module docs). The checks run in this order: the group, then the guard (`!PT` appends
-/// nothing), then constant-buffer sources, then the instruction's own checks in PR #4588's
-/// order.
+/// nothing), then constant-buffer sources, then source modifiers, then a guard's successor
+/// phis, then the instruction's own checks in PR #4588's order.
 pub fn translate_integer(
     builder: &mut Builder<'_>,
     instr: &Instr,
@@ -316,6 +360,24 @@ pub fn translate_integer(
         )
     }) {
         return Err(IntegerUnsupported::BindlessConstantBuffer.into());
+    }
+    let dropped = sources(&instr.op)
+        .into_iter()
+        .zip(reads_negation(&instr.op))
+        .any(|(src, reads)| {
+            src.is_some_and(|src| {
+                let (abs, neg) = src.modifiers();
+                abs || (neg && !reads)
+            })
+        });
+    if dropped {
+        return Err(IntegerError::Modifier(instr.op.mnemonic()));
+    }
+    if pending.is_some() {
+        let block = builder.block();
+        if let Some(successor) = successor_phi(builder.function(), block) {
+            return Err(IntegerError::SuccessorPhi { block, successor });
+        }
     }
     let mut e = Emitter {
         b: builder,
@@ -364,6 +426,40 @@ const fn sources(op: &Op) -> [Option<AluSrc>; 3] {
         Op::Shf(op) => [Some(op.low), Some(op.shift), Some(op.high)],
         _ => [None, None, None],
     }
+}
+
+/// Which of the sources [`sources`] lists this module applies a negation to (see the module
+/// docs, "Checks"); `IDP`'s are read so that PR #4588's own check refuses them.
+const fn reads_negation(op: &Op) -> [bool; 3] {
+    match op {
+        Op::IAdd3(_)
+        | Op::IAdd3X(_)
+        | Op::IDp4(_)
+        | Op::IMad(OpIMad {
+            mode: IMadMode::Lo { .. },
+            ..
+        }) => [true; 3],
+        Op::Lea(_) | Op::LeaX(_) => [false, true, false],
+        Op::PopC(_) | Op::Flo(_) => [true, false, false],
+        _ => [false; 3],
+    }
+}
+
+/// The first successor of `block` with a phi naming `block`: the guard's split would leave that
+/// phi naming a block that no longer jumps to it.
+fn successor_phi(function: &Function, block: BlockId) -> Option<BlockId> {
+    let terminator = function.block(block)?.terminator;
+    terminator.successors().find(|successor| {
+        function.block(*successor).is_some_and(|next| {
+            next.insts
+                .iter()
+                .map_while(|value| match function.inst(*value) {
+                    Some(Inst::Phi(phi)) => Some(phi),
+                    _ => None,
+                })
+                .any(|phi| phi.incoming.iter().any(|(from, _)| *from == block))
+        })
+    })
 }
 
 /// `!PT` as a predicate source: the carry input that adds nothing.
@@ -560,7 +656,7 @@ impl Emitter<'_, '_> {
     /// of one word and the head of the next for an unaligned offset (`Visitor::Cbuf`).
     fn cbuf(&mut self, bank: u8, offset: u32) -> Result<Operand, BuildError> {
         let bank = imm32(u32::from(bank));
-        let skew = offset % 4;
+        let skew = offset % WORD_BYTES;
         let aligned = offset - skew;
         if skew == 0 {
             return self.op(Opcode::GetCbufU32, &[bank, imm32(aligned)]);
@@ -569,7 +665,7 @@ impl Emitter<'_, '_> {
         // Cannot overflow: `offset` came from a 16-bit field.
         let high = self.op(
             Opcode::GetCbufU32,
-            &[bank, imm32(aligned.saturating_add(4))],
+            &[bank, imm32(aligned.saturating_add(WORD_BYTES))],
         )?;
         let low = self.op(Opcode::ShiftRightLogical32, &[low, imm32(8 * skew)])?;
         let high = self.op(Opcode::ShiftLeftLogical32, &[high, imm32(32 - 8 * skew)])?;
@@ -1008,20 +1104,30 @@ impl Emitter<'_, '_> {
 
     /// `SHF` (NAK's `OpShf` fold for SM 7.0 and later): `high:low` shifted by the amount,
     /// masked to the type's width less one with `.W`, else clamped to the width; a signed type
-    /// shifts right arithmetically; `.HI` writes the high word.
+    /// shifts right arithmetically; `.HI` writes the high word. No 64-bit IR shift takes an
+    /// amount of 64 or more, which the IR leaves undefined: a 64-bit type's clamped amount is
+    /// 63 at most, and a logical shift by 64 or more selects 0 instead.
     fn shf(&mut self, op: OpShf) -> Result<(), IntegerError> {
         let (width, signed) = match op.data_type {
-            ShfType::I64 => (64, true),
-            ShfType::U64 => (64, false),
-            ShfType::I32 => (32, true),
-            ShfType::U32 => (32, false),
+            ShfType::I64 => (SHF_WIDE, true),
+            ShfType::U64 => (SHF_WIDE, false),
+            ShfType::I32 => (SHF_NARROW, true),
+            ShfType::U32 => (SHF_NARROW, false),
         };
         let low = self.src(op.low)?;
         let high = self.src(op.high)?;
         let packed = self.pack(low, high)?;
         let amount = self.src(op.shift)?;
+        let mut too_far = None;
         let amount = if op.wrap {
             self.op(Opcode::BitwiseAnd32, &[amount, imm32(width - 1)])?
+        } else if width == SHF_WIDE {
+            // An arithmetic shift by 63 gives what 64 or more would (the sign in every bit); a
+            // logical one by 64 or more gives 0, chosen after the shift.
+            if !(op.right && signed) {
+                too_far = Some(self.op(Opcode::UGreaterThanEqual, &[amount, imm32(width)])?);
+            }
+            self.op(Opcode::UMin32, &[amount, imm32(width - 1)])?
         } else {
             self.op(Opcode::UMin32, &[amount, imm32(width)])?
         };
@@ -1034,10 +1140,13 @@ impl Emitter<'_, '_> {
         };
         let shifted = self.op(opcode, &[packed, amount])?;
         let pair = self.op(Opcode::UnpackUint2x32, &[shifted])?;
-        let word = self.op(
+        let mut word = self.op(
             Opcode::CompositeExtractU32x2,
             &[pair, imm32(u32::from(op.dst_high))],
         )?;
+        if let Some(too_far) = too_far {
+            word = self.select(too_far, imm32(0), word)?;
+        }
         Ok(self.set(op.dst, word)?)
     }
 
@@ -1118,7 +1227,7 @@ impl Emitter<'_, '_> {
                         offset,
                     },
                 ..
-            } => self.cbuf(bank, u32::from(offset) + 4)?,
+            } => self.cbuf(bank, u32::from(offset) + WORD_BYTES)?,
             _ => imm32(0),
         };
         let a = self.src(a)?;

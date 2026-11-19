@@ -189,6 +189,17 @@ pub(super) fn signed_product(a: u32, b: u32) -> u64 {
     to_u64(i64::from(to_i32(a)) * i64::from(to_i32(b)))
 }
 
+/// The bytes a constant buffer needs for the furthest read a decoded word can make: the high
+/// word of an `IMAD.WIDE` addend, one word past a 16-bit offset, read unaligned, which takes
+/// the aligned word after it too.
+pub(super) fn furthest_cbuf_read() -> usize {
+    let word = usize::try_from(WORD_BYTES).unwrap_or(usize::MAX);
+    let high = usize::from(u16::MAX) + word;
+    // The aligned word holding the high word's first byte, then the word after it.
+    let last_word = high / word * word + word;
+    last_word + word
+}
+
 proptest! {
     #![proptest_config(config())]
 
@@ -216,8 +227,8 @@ proptest! {
                     *slot = *value;
                 }
                 machine.preds = preds;
-                // Every bank, with every offset a 16-bit field and four more bytes can name.
-                let bytes = vec![0xa5; usize::from(u16::MAX) + 8];
+                // Every bank, as long as the furthest read any word can make.
+                let bytes = vec![0xa5; furthest_cbuf_read()];
                 for bank in 0..32 {
                     machine.cbufs.insert(bank, bytes.clone());
                 }
@@ -225,6 +236,8 @@ proptest! {
                 prop_assert!(ran.is_ok(), "{:?}", ran.err());
             }
             Err(IntegerError::Build(error)) => prop_assert!(false, "build error {error}"),
+            // The decoder never sets a modifier this module refuses.
+            Err(IntegerError::Modifier(name)) => prop_assert!(false, "{name}: modifier"),
             Err(_) => prop_assert_eq!(builder.function(), &before),
         }
     }
@@ -314,4 +327,38 @@ fn a_missing_constant_buffer_fails_the_run() {
         matches!(ran, Err(InterpError::OutOfBounds { .. })),
         "{ran:?}"
     );
+}
+
+/// The furthest constant-buffer read: `IMAD.WIDE` with its addend at offset `0xffff` runs on
+/// buffers of exactly [`furthest_cbuf_read`] bytes (`0x10008`) and fails on one byte fewer.
+#[test]
+fn the_furthest_constant_buffer_read_fits() {
+    assert_eq!(furthest_cbuf_read(), 0x1_0008);
+    let function = build(&[Instr::new(Op::IMad64(crate::decode::OpIMad64 {
+        dst: r(4),
+        srcs: [reg(1), reg(2), cb(5, u16::MAX)],
+        signed: false,
+        carry: NOT_PT,
+    }))])
+    .expect("translates");
+    for (len, fits) in [
+        (furthest_cbuf_read(), true),
+        (furthest_cbuf_read() - 1, false),
+    ] {
+        let mut machine = Machine::new();
+        machine.cbufs.insert(5, vec![0xa5; len]);
+        let ran = machine.run(&function);
+        if fits {
+            assert!(ran.is_ok(), "{ran:?}");
+        } else {
+            // The last word read, at 0x10004, is the one that no longer fits.
+            let fields = match &ran {
+                Err(InterpError::OutOfBounds {
+                    offset, size, len, ..
+                }) => Some((*offset, *size, *len)),
+                _ => None,
+            };
+            assert_eq!(fields, Some((0x1_0004, 4, 0x1_0007)), "{ran:?}");
+        }
+    }
 }

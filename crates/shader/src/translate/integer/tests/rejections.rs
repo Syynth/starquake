@@ -3,8 +3,9 @@
 
 use super::*;
 use crate::decode::{
-    IMadMode, IntCmpOp, MovSrc, OpBMsk, OpIDp4, OpIMad, OpIMad64, OpISetP, OpLea, OpLeaX, OpPrmt,
-    OpSgxt, PredSetOp, PrmtMode,
+    IMadMode, IntCmpOp, MovSrc, OpBMsk, OpBRev, OpFlo, OpIAbs, OpIAdd3X, OpIDp4, OpIMad, OpIMad64,
+    OpIMnMx, OpISetP, OpLea, OpLeaX, OpLop3, OpPopC, OpPrmt, OpSel, OpSgxt, OpShf, PredSetOp,
+    PrmtMode, ShfType,
 };
 
 const BINDLESS: AluSrc = AluSrc::CBuf {
@@ -428,6 +429,24 @@ fn wide_pairs_at_their_edges() {
     accepted(Op::IMad64(wide(4, cb(1, 0xfffc))));
 }
 
+/// `WIDE_PAIR_LIMIT` against the reference's literal (`Visitor::IMAD_WIDE`: `limit = uniform_op
+/// ? 62 : 254`, the vector datapath's 254): `R252` starts the last pair, as the destination and
+/// as the addend, and `R254` is refused in both places.
+#[test]
+fn wide_pairs_match_the_reference_literal() {
+    use IntegerUnsupported as U;
+    accepted(Op::IMad64(wide(252, reg(6))));
+    accepted(Op::IMad64(wide(4, reg(252))));
+    assert_eq!(
+        refusal(Op::IMad64(wide(254, reg(6)))),
+        U::WideDestination(r(254)).into()
+    );
+    assert_eq!(
+        refusal(Op::IMad64(wide(4, reg(254)))),
+        U::WideAddendRegister(r(254)).into()
+    );
+}
+
 /// When two checks fail, the one PR #4588 makes first is reported: the bindless source before
 /// any instruction check, then each instruction's checks in the PR's order.
 #[test]
@@ -573,6 +592,278 @@ fn bindless_buffers_are_refused_in_every_position() {
     }
     let bound = Op::IAdd3(iadd3(0, [reg(1), cb(0, 0), reg(3)]));
     assert!(build(&[Instr::new(bound)]).is_ok());
+}
+
+/// Translates `op`, built by hand (not every case has a word), into a fresh function and
+/// returns the result; a refusal leaves the function untouched.
+fn translate_direct(op: Op) -> Result<(), IntegerError> {
+    let mut function = Function::new();
+    let entry = function.entry();
+    let mut builder = Builder::new(&mut function, entry);
+    let result = translate_integer(&mut builder, &Instr::new(op), GuardMode::Honour);
+    if result.is_err() {
+        assert_eq!(
+            builder.function(),
+            &Function::new(),
+            "{op:?} touched the function"
+        );
+    }
+    result
+}
+
+/// An instruction named for the failure message, how many sources it reads, and how to build
+/// it from three sources in the order the bindless check scans them.
+type SourceCase = (&'static str, usize, fn([AluSrc; 3]) -> Op);
+
+/// Every source position of every instruction that reads ALU sources.
+fn every_source_position() -> Vec<SourceCase> {
+    let mut cases = three_source_cases();
+    cases.extend(fewer_source_cases());
+    cases
+}
+
+/// The instructions with three ALU sources.
+fn three_source_cases() -> Vec<SourceCase> {
+    vec![
+        ("iadd3", 3, |s| Op::IAdd3(iadd3(0, s))),
+        ("iadd3.x", 3, |s| Op::IAdd3X(OpIAdd3X { add: iadd3(0, s) })),
+        ("lop3", 3, |s| {
+            Op::Lop3(OpLop3 {
+                pred: Pred::PT,
+                dst: r(0),
+                srcs: s,
+                lut: 0x96,
+            })
+        }),
+        ("imad", 3, |s| {
+            imad(
+                s,
+                IMadMode::Lo {
+                    x: false,
+                    carry: NOT_PT,
+                },
+            )
+        }),
+        ("imad.hi", 3, |s| imad(s, IMadMode::Hi)),
+        ("imad.wide", 3, |s| {
+            Op::IMad64(OpIMad64 {
+                srcs: s,
+                ..wide(4, AluSrc::reg(Gpr::RZ))
+            })
+        }),
+        ("idp", 3, |s| Op::IDp4(idp(true, [false; 2], s))),
+        ("lea", 3, |[a, b, a_high]| {
+            Op::Lea(OpLea {
+                a,
+                b,
+                a_high,
+                dst_high: true,
+                ..lea()
+            })
+        }),
+        ("lea.x", 3, |[a, b, a_high]| {
+            Op::LeaX(OpLeaX {
+                lea: OpLea {
+                    a,
+                    b,
+                    a_high,
+                    dst_high: true,
+                    ..lea()
+                },
+            })
+        }),
+        // The selector is the middle source: a register when another source is bindless, so a
+        // missed `b` would be refused as `PermuteSelector` instead.
+        ("prmt", 3, |[a, sel, b]| {
+            Op::Prmt(OpPrmt {
+                dst: r(0),
+                srcs: [a, b],
+                sel,
+                mode: PrmtMode::Index,
+            })
+        }),
+        ("shf", 3, |[low, shift, high]| {
+            Op::Shf(OpShf {
+                dst: r(0),
+                low,
+                shift,
+                high,
+                data_type: ShfType::U32,
+                wrap: false,
+                right: false,
+                dst_high: false,
+            })
+        }),
+    ]
+}
+
+/// The instructions with one or two ALU sources.
+fn fewer_source_cases() -> Vec<SourceCase> {
+    vec![
+        ("iabs", 1, |[src, ..]| Op::IAbs(OpIAbs { dst: r(0), src })),
+        ("brev", 1, |[src, ..]| Op::BRev(OpBRev { dst: r(0), src })),
+        ("popc", 1, |[src, ..]| Op::PopC(OpPopC { dst: r(0), src })),
+        ("flo", 1, |[src, ..]| {
+            Op::Flo(OpFlo {
+                dst: r(0),
+                src,
+                signed: false,
+                return_shift_amount: false,
+            })
+        }),
+        ("imnmx", 2, |[a, b, _]| {
+            Op::IMnMx(OpIMnMx {
+                dst: r(0),
+                srcs: [a, b],
+                signed: false,
+                min: PredSrc::TRUE,
+            })
+        }),
+        ("sel", 2, |[a, b, _]| {
+            Op::Sel(OpSel {
+                dst: r(0),
+                srcs: [a, b],
+                cond: PredSrc::TRUE,
+            })
+        }),
+        ("isetp", 2, |[a, b, _]| {
+            Op::ISetP(OpISetP {
+                srcs: [a, b],
+                ..isetp()
+            })
+        }),
+        ("sgxt", 2, |[a, bits, _]| {
+            Op::Sgxt(OpSgxt {
+                dst: r(0),
+                a,
+                bits,
+                signed: false,
+                wrap: false,
+            })
+        }),
+        ("bmsk", 2, |[pos, width, _]| {
+            Op::BMsk(OpBMsk {
+                dst: r(0),
+                pos,
+                width,
+                wrap: false,
+            })
+        }),
+    ]
+}
+
+/// A bindless constant buffer is refused in each source position of each instruction, built
+/// by hand (`IADD3`'s `a` and others have no word with a constant buffer there), whatever
+/// check the instruction would make next: `PRMT`'s `b` with a register selector included.
+#[test]
+fn bindless_buffers_are_refused_in_every_source_of_every_instruction() {
+    for (name, count, make) in every_source_position() {
+        for position in 0..count {
+            let mut srcs = [reg(2), reg(4), reg(6)];
+            if let Some(slot) = srcs.get_mut(position) {
+                *slot = BINDLESS;
+            }
+            assert_eq!(
+                translate_direct(make(srcs)),
+                Err(IntegerUnsupported::BindlessConstantBuffer.into()),
+                "{name} source {position}"
+            );
+        }
+    }
+}
+
+/// A hand-built source modifier this module would not apply is refused by the instruction's
+/// mnemonic, with the function untouched: a negation on `IMAD.WIDE`'s, `IMAD.HI`'s, `IABS`'s
+/// and `SHF`'s sources and on `LEA`'s `a` and high word (`IMAD.WIDE` with `-R2 * R4` would
+/// otherwise write the product un-negated), and an absolute value on a source that takes a
+/// negation. The negations this module applies still translate.
+#[test]
+fn modifiers_the_form_drops_are_refused() {
+    let abs = AluSrc::Reg {
+        reg: r(2),
+        abs: true,
+        neg: false,
+    };
+    let refused: [(Op, &str); 9] = [
+        (
+            Op::IMad64(OpIMad64 {
+                srcs: [neg(2), reg(4), AluSrc::reg(Gpr::RZ)],
+                ..wide(4, AluSrc::reg(Gpr::RZ))
+            }),
+            "imad.wide",
+        ),
+        (imad([reg(2), reg(4), neg(6)], IMadMode::Hi), "imad"),
+        (
+            Op::IAbs(OpIAbs {
+                dst: r(0),
+                src: neg(2),
+            }),
+            "iabs",
+        ),
+        (Op::Lea(OpLea { a: neg(1), ..lea() }), "lea"),
+        (
+            Op::Lea(OpLea {
+                a_high: neg(3),
+                dst_high: true,
+                ..lea()
+            }),
+            "lea",
+        ),
+        (
+            Op::Shf(OpShf {
+                dst: r(0),
+                low: reg(1),
+                shift: neg(2),
+                high: reg(3),
+                data_type: ShfType::U32,
+                wrap: false,
+                right: false,
+                dst_high: false,
+            }),
+            "shf",
+        ),
+        (Op::IAdd3(iadd3(0, [reg(1), abs, reg(3)])), "iadd3"),
+        (
+            Op::PopC(OpPopC {
+                dst: r(0),
+                src: abs,
+            }),
+            "popc",
+        ),
+        (Op::Lea(OpLea { b: abs, ..lea() }), "lea"),
+    ];
+    for (op, mnemonic) in refused {
+        let refusal = translate_direct(op);
+        assert_eq!(refusal, Err(IntegerError::Modifier(mnemonic)), "{op:?}");
+        assert_eq!(
+            refusal.map_err(|error| error.to_string()),
+            Err(format!("{mnemonic} has a source modifier it does not take"))
+        );
+    }
+    let applied = [
+        Op::IAdd3(iadd3(0, [neg(1), neg(2), neg(3)])),
+        imad(
+            [neg(1), neg(2), neg(3)],
+            IMadMode::Lo {
+                x: false,
+                carry: NOT_PT,
+            },
+        ),
+        Op::Lea(OpLea { b: neg(2), ..lea() }),
+        Op::PopC(OpPopC {
+            dst: r(0),
+            src: neg(2),
+        }),
+        Op::Flo(OpFlo {
+            dst: r(0),
+            src: neg(2),
+            signed: false,
+            return_shift_amount: false,
+        }),
+    ];
+    for op in applied {
+        assert_eq!(translate_direct(op), Ok(()), "{op:?}");
+    }
 }
 
 /// `PRMT`'s forms 2, 3 and 7 put the selector in the register slot (and `b` in the wide

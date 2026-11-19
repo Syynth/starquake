@@ -116,8 +116,9 @@ fn lop3_sum_of_products() {
     );
 }
 
-/// `SHF.R.S64.HI R0, R1, R2, R3`: a 64-bit arithmetic shift by the amount clamped to 64 (NAK's
-/// fold), high word.
+/// `SHF.R.S64.HI R0, R1, R2, R3`: a 64-bit arithmetic shift by the amount clamped to 63, which
+/// gives NAK's result for 64 or more (the sign in every bit) without an IR shift by 64, high
+/// word.
 #[test]
 fn shf_right_signed_64_high() {
     let op = Op::Shf(OpShf {
@@ -138,11 +139,44 @@ fn shf_right_signed_64_high() {
          \x20   %2: u32x2 = CompositeConstructU32x2 %0, %1\n\
          \x20   %3: u64 = PackUint2x32 %2\n\
          \x20   %4: u32 = GetRegister r2\n\
-         \x20   %5: u32 = UMin32 %4, u32 0x40\n\
+         \x20   %5: u32 = UMin32 %4, u32 0x3f\n\
          \x20   %6: u64 = ShiftRightArithmetic64 %3, %5\n\
          \x20   %7: u32x2 = UnpackUint2x32 %6\n\
          \x20   %8: u32 = CompositeExtractU32x2 %7, u32 0x1\n\
          \x20   %9 = SetRegister r0, %8\n\
+         \x20   return\n"
+    );
+}
+
+/// `SHF.L.U64 R0, R1, R2, R3`: a 64-bit logical shift by the amount clamped to 63, and 0
+/// selected where the amount is 64 or more (NAK's result), low word.
+#[test]
+fn shf_left_unsigned_64_low() {
+    let op = Op::Shf(OpShf {
+        dst: r(0),
+        low: reg(1),
+        shift: reg(2),
+        high: reg(3),
+        data_type: ShfType::U64,
+        wrap: false,
+        right: false,
+        dst_high: false,
+    });
+    assert_eq!(
+        text(op),
+        "block0:\n\
+         \x20   %0: u32 = GetRegister r1\n\
+         \x20   %1: u32 = GetRegister r3\n\
+         \x20   %2: u32x2 = CompositeConstructU32x2 %0, %1\n\
+         \x20   %3: u64 = PackUint2x32 %2\n\
+         \x20   %4: u32 = GetRegister r2\n\
+         \x20   %5: u1 = UGreaterThanEqual %4, u32 0x40\n\
+         \x20   %6: u32 = UMin32 %4, u32 0x3f\n\
+         \x20   %7: u64 = ShiftLeftLogical64 %3, %6\n\
+         \x20   %8: u32x2 = UnpackUint2x32 %7\n\
+         \x20   %9: u32 = CompositeExtractU32x2 %8, u32 0x0\n\
+         \x20   %10: u32 = SelectU32 %5, u32 0x0, %9\n\
+         \x20   %11 = SetRegister r0, %10\n\
          \x20   return\n"
     );
 }
