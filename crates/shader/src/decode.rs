@@ -16,10 +16,12 @@
 //!
 //! The forms decoded so far are slice 1's six instructions, grown to every operand form NAK
 //! encodes for them: `MOV` in forms 1, 4, 5 and 6 (register, immediate, constant buffer,
-//! uniform register), `FFMA` in all seven, `ALD`, `AST` and `S2R`; and slice 6h's control and
-//! warp group (`op::control`), every instruction of it but `JMX` and `BPT`; and slice 6g's
+//! uniform register), `FFMA` in all seven, `ALD`, `AST` and `S2R`; slice 6h's control and
+//! warp group (`op::control`), every instruction of it but `JMX` and `BPT`; slice 6g's
 //! attribute and system-value group (`op::attribute`), every instruction of it, `S2R` grown to
-//! its uniform form `S2UR`. Every other opcode is [`DecodeError::UnknownOpcode`].
+//! its uniform form `S2UR`; and slice 6b's 32-bit float and conversion group (`op::float`),
+//! every instruction of it in the vector datapath's forms. Every other opcode is
+//! [`DecodeError::UnknownOpcode`].
 //!
 //! **Strict decoding** (owner's decision 4, 2026-11-12): a word with a bit set that its form
 //! does not explain is rejected, never decoded with the bit ignored. The decoder checks, in this
@@ -34,13 +36,15 @@
 //!    [`DecodeError::MissingBit`] naming the lowest clear one;
 //! 4. the form's function reads its fields, else [`DecodeError::UnknownValue`] for a field whose
 //!    value names nothing (a vote or reduction operation past the defined ones: `op::control`;
-//!    an interpolation mode, pixel value or stage-buffer type past NAK's: `op::attribute`);
+//!    a `MUFU` function or a comparison's combine operation past them: `op::float`; an
+//!    interpolation mode, pixel value or stage-buffer type past NAK's: `op::attribute`);
 //! 5. every set bit was read, else [`DecodeError::UnknownBit`] naming the lowest unread one. A
 //!    form explains some bits only in some of its layouts or operations: in the constant-buffer
 //!    ALU forms a bound buffer reads its index (bits 54..59) and a bindless one its uniform
 //!    register (bits 32..38), and `REDUX` reads its signed bit (73) only for `MIN` and `MAX`
-//!    (`op::control`), so a word with a bit the decoded layout or operation does not read fails
-//!    here.
+//!    (`op::control`), and the high-half and byte selects and `F2FP`'s `.H1` are read only for
+//!    the source widths and modes that have them (`op::float`), so a word with a bit the decoded
+//!    layout or operation does not read fails here.
 //!
 //! Step 5 is what lets an accepted word re-assemble to itself, scheduling bits aside
 //! (`tests::decode_then_assemble_round_trips` checks it on generated words of every form). PR #4588's table lets those layout bits through
@@ -60,7 +64,8 @@
 //! `0x31d`, and the fixed bits of the uniform `BRA` and of `BRXU`) are listed in `op::control`'s
 //! module docs and pinned in `tests::control`. The attribute group's (`OUT`'s forms 2, 3 and 7,
 //! and its sources' modifier bits) are listed in `op::attribute`'s module docs and pinned in
-//! `tests::attribute`.
+//! `tests::attribute`; the float group's (the forms NAK never encodes, the modifier bits of
+//! slots without modifiers) in `op::float`'s and pinned in `tests::float32`.
 
 mod alu;
 mod fields;

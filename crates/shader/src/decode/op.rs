@@ -59,6 +59,7 @@ pub use control::{
     BMovDir, BarMode, BarRed, Barrier, BraCond, BranchOffset, BrxSrc, MatchOp, ReduxOp, ShflOp,
     ShflSrc, VoteDst, VoteOp,
 };
+pub use float::{FMulScale, FSwzAddOp, FloatCmpOp, FloatType, IntType, MuFuOp, PredSetOp};
 pub use integer::MovSrc;
 
 /// An operation's mnemonic, as `nvdisasm` writes it lower-cased (for a shell, a guess).

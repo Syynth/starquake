@@ -86,6 +86,16 @@ pub enum EncodeError {
     /// `ALD`, `AST` and `AL2P` move one to four words.
     #[error("an attribute access moves 1 to 4 words, not {0}")]
     Comps(u8),
+    /// The operand form or opcode the operation's other fields pick has no bits for this
+    /// operand or modifier (`decode::op::float`: `FMNMX`'s `.nan` and `FSET`'s combine
+    /// operation with a uniform-register source, among others).
+    #[error("{mnemonic} has no bits for {what}")]
+    NoBits {
+        /// The operation's mnemonic.
+        mnemonic: &'static str,
+        /// What cannot be encoded.
+        what: &'static str,
+    },
     /// `IPA` and `LDTRAM` address attributes in whole words (NAK: `assert!(self.addr % 4 ==
     /// 0)`).
     #[error("attribute address {addr:#x} is not a multiple of {align}")]

@@ -3,6 +3,7 @@
 
 mod attribute;
 mod control;
+mod float32;
 mod framework;
 
 use proptest::prelude::*;
