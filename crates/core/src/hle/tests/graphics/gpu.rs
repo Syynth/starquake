@@ -5,7 +5,6 @@ use std::time::{Duration, Instant};
 
 use starquake_gpu::back::buffer::InvalidationSink;
 use starquake_gpu::back::draw::shaders::{SetLookup, ShaderLookup};
-use starquake_gpu::interface::Ticket;
 use starquake_gpu::wiring::{GpuConfig, GpuCounters, GpuRing};
 use starquake_memory::{FlatMemory, PageRange, WriteWatch};
 use starquake_render::caps::{
@@ -166,12 +165,15 @@ fn a_run_with_the_gpu_completes_what_waits_on_it() {
 fn a_graphics_server_with_a_busy_gpu_is_not_idle() {
     let graphics = with_gpu();
     let gpu = graphics.gpu().unwrap();
+    // While its threads run, an idle GPU still takes a turn at each safety-net wake
+    // (`IDLE_PARK`) and reads busy during it, so "idle" is waited for, never asserted once.
     wait_until("a new GPU is idle", || gpu.is_idle());
-    assert!(graphics.is_idle());
-    // With its threads stopped, a barrier stays queued for the front: the GPU is busy, though
-    // gsv's queue is empty.
+    wait_until("the graphics server over an idle GPU is idle", || {
+        graphics.is_idle()
+    });
+    // A stopped GPU answers "busy" for good (`Gpu::is_idle`), so the server is busy though gsv's
+    // queue is empty: the GPU is asked, not only the queue.
     gpu.stop().unwrap();
-    graphics.front().barrier(Ticket(0x93));
     assert!(graphics.shared().queue().is_empty());
     assert!(!gpu.is_idle());
     assert!(!graphics.is_idle());
