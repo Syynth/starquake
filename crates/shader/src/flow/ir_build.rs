@@ -89,7 +89,7 @@ impl FlowGraph {
                     otherwise,
                 } => {
                     to_test_block(&mut builder, flow.code.is_empty())?;
-                    let cond = read_pred::<FlowError>(&mut builder, *cond)?;
+                    let cond = read_pred(&mut builder, *cond)?;
                     builder.terminate(Terminator::Branch {
                         cond,
                         then: ir_block(*then)?,
@@ -130,13 +130,8 @@ fn to_test_block(builder: &mut Builder<'_>, empty: bool) -> Result<(), FlowError
     Ok(())
 }
 
-/// The value of predicate `cond`: the immediate for `PT` and `!PT`, else `GetPred`, then
-/// `LogicalNot` when negated. The translators' guards read their predicate through it too
-/// (`translate`).
-pub(crate) fn read_pred<E: From<BuildError>>(
-    builder: &mut Builder<'_>,
-    cond: PredSrc,
-) -> Result<Operand, E> {
+/// The value of predicate `cond`; the translators read a predicate source with it too.
+pub(crate) fn read_pred(builder: &mut Builder<'_>, cond: PredSrc) -> Result<Operand, BuildError> {
     if cond.reg.is_true() {
         return Ok(Operand::Imm(Imm::U1(!cond.negated)));
     }

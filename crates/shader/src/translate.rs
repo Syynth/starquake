@@ -26,6 +26,10 @@
 //! `tests::a_guarded_s2ur_reads_a_uniform_predicate`, `tests::a_guarded_exit_is_rejected` and
 //! `tests::never_guarded_instructions_are_skipped`.
 //!
+//! The instruction groups' translators (port slices 12a to 12h) each have a module here that
+//! translates one instruction of a flow block (slice 10) at a time: [`control`] for the
+//! control and warp group. [`translate`] keeps refusing those groups' instructions.
+//!
 //! Slice 1 handles linear flow only (spec, port slice 1). Where starquake is stricter than the
 //! PR, because the PR resolves the case in a part not built yet:
 //!
@@ -44,6 +48,7 @@
 //! `other_instructions_are_rejected_by_mnemonic`. The group modules list their own divergences.
 
 mod attribute;
+pub mod control;
 #[cfg(test)]
 mod tests;
 
@@ -136,10 +141,14 @@ pub enum Unsupported {
     /// The stage is not handled yet.
     #[error("{0} programs are not supported yet")]
     Stage(GuestStage),
-    /// An instruction no translator handles yet: neither `MOV`, `FFMA` and `EXIT` here nor a
-    /// group of `GROUPS`.
+    /// An instruction no translator handles yet: in [`translate`], one that is neither `MOV`,
+    /// `FFMA` and `EXIT` nor taken by a group of `GROUPS`; in [`control::translate_control`],
+    /// `BMOV`, `NANOSLEEP`, `JMX` and `BPT`.
     #[error("{0}")]
     Instruction(&'static str),
+    /// A control or warp form [`control::translate_control`] does not handle.
+    #[error("{0}")]
+    Control(#[from] control::ControlUnsupported),
     /// A uniform-register or constant-buffer source of `MOV` or `FFMA` (PR #4588 reads both:
     /// `visitor.cpp`, `Visitor::Value`).
     #[error("a uniform-register or constant-buffer source")]
@@ -429,7 +438,7 @@ impl Translator<'_> {
         let cond = if uniform {
             read_uniform_guard(&mut self.b, guard)?
         } else {
-            crate::flow::read_pred::<TranslateError>(&mut self.b, guard)?
+            crate::flow::read_pred(&mut self.b, guard)?
         };
         let then = self.b.add_block()?;
         let after = self.b.add_block()?;

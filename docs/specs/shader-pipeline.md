@@ -146,11 +146,15 @@ evicted, so the same bytes written back cost a hash, not a translation. Register
 write tracking is the GPU crate's job; the cache reports which ranges it depends on.
 
 **Negative cache.** A rejected program is remembered with its reason and not translated or
-logged again until its memory is written (rows 90, 112). The reason names the first unsupported
-instruction and its index, and the rejection is counted once in the run's summary.
+logged again until its memory is written (rows 90, 112). The reason names the program that
+failed, the first unsupported instruction and its index, and the rejection is counted once in the
+run's summary; naming the program lets the GPU crate log a rejection once per program rather than
+once per set (decided by the owner, 2026-11-19).
 
 **Hash.** A fast non-cryptographic 128-bit hash of the bytes (the exact function is a slice
-detail; it must be stable across runs and platforms because the disk cache uses it). Collisions
+detail; it must be stable across runs and platforms because the disk cache uses it), seeded with
+the header's length (0 or 128), so a compute program and a graphics program with equal bytes
+never share an entry (as built in slice 3; decided by the owner, 2026-11-19). Collisions
 are treated as impossible at 128 bits; the disk cache stores the bytes anyway (below), so a
 collision can be checked for when an entry is loaded.
 
@@ -165,9 +169,12 @@ explicit exchange:
    - `CbufWord { bank, offset }`: a constant-buffer word the shader's structure depends on, such
      as a `BRX` jump table entry (rows 91, 92) or a texture handle the shader loads from a
      constant buffer.
-   - `TextureKind { handle }`: what a texture handle points to: sampled component type (float,
-     signed, unsigned), whether it is a depth format, multisampled, a buffer texture, and the
-     format of a storage image used by a formatted surface load or store (rows 83, 86).
+   - `TextureKind { handle, usage }`: what a texture handle points to: sampled component type
+     (float, signed, unsigned), whether it is a depth format, multisampled, a buffer texture, and
+     the format of a storage image used by a formatted surface load or store (rows 83, 86). The
+     usage says how the shader uses the texture, so the answer carries the header's format bits
+     only for a use that depends on them, and a shader that only samples is not retranslated when
+     the format changes but the kind does not (decided by the owner, 2026-11-19).
 2. The GPU back thread **answers** them from current engine state. Answers are small (tens of
    words) and cheap to compute.
 3. Specialising the IR with the answers and the variant key (layer 3) is again pure.
@@ -227,6 +234,31 @@ with a set bit outside its form's mask is rejected as unknown, not decoded with 
 (PR #4588 does the same: `isa.h`, `FirstUnknownBit`). A misread modifier would produce a shader
 that compiles and renders wrongly, which is far more expensive to find than a rejection.
 
+**Known bits and canonical words** (decided by the owner, 2026-11-19). A form's reference row
+(`ReferenceRow`) can only drop or require bits, so NAK's F16 swizzle at bit 60 cannot be decoded
+(`F2F`, `FRND`, `MUFU`, `F2I`, and slices 6c and 6d), and every form's bare word must decode, so
+`F8` and `FMUL` scale 0 decode where PR #4588 refuses them. The framework gains known bits, with
+their own divergence accounting, and a canonical word per form, in a small slice (4b) before 6c
+and 6d.
+
+**Where the references disagree, as built** (decided by the owner, 2026-11-19):
+
+- Integer encodings where NAK and PR #4588 conflict follow NAK until the `nvdisasm` check (E2):
+  the `SHF` type field (NAK: 0 I64, 1 U64, 2 I32, 3 U32; PR #4588: 1 U32, 2 S64, 3 U64, 0
+  refused), `IADD3.X` and `LEA.X` at bit 74 in forms 2, 3 and 7, carry inputs without `.X`, and
+  `IDP.2A` at bit 76, which comes from PR #4588.
+- `OUT.FINAL` keeps the destination and stream fields NAK writes as `RZ` instead of refusing
+  other values. `ISBEWR` accepts NAK's set where PR #4588 accepts only `.o.attr.32`; slice 12g
+  decides what it translates.
+- `MEMBAR`'s scope decodes the union of NAK's values (`CTA` 0, `SM` 1, `GPU` 2, `SYS` 3) and PR
+  #4588's 5, so that `SM`, which NAK names, is not refused: a departure from the house rule for
+  disagreeing references (graphics-server decision 8, gpu-protocol decision 10). `LDGSTS` and
+  `ATOMS.POPC` take PR #4588's translator's fixed and rejected bits. `LDCG` (0x8b8) has no owning
+  slice yet.
+- The surface forms with a constant-buffer handle (`SULD` 0xb97, `SUST` 0xb9b, `SUATOM` 0x593),
+  which PR #4588 translates and NAK cannot encode, are decoded from PR #4588 and marked for the
+  `nvdisasm` check (slice 6f).
+
 **Test assembler.** A test-support assembler, ported from NAK's encoder, builds instruction
 words from `Op` values. It is the fixture generator for every other test in the crate (the
 alternative, hex words copied from real shaders, cannot be committed). Because the assembler is
@@ -258,6 +290,9 @@ Flow analysis, ported from PR #4588 (`frontend/ampere/flow.cpp`, `flow.h`):
   not instruction addresses inside the capture are ignored; a `BRX` with no valid target is
   rejected.
 - Runs in time linear in the program's size (row 121).
+- Bounds and choices, as built in slice 10 (decided by the owner, 2026-11-19): `MAX_INLINE_DEPTH`
+  = 16 and `MAX_FLOW_BLOCKS` = 2^18 are guesses (the reference has no bound); a `CbufWord` answer
+  of "no word" reads as 0; merging paths that wait can change which fault is reported first.
 
 **Structuring.** naga, like SPIR-V and MSL, needs structured control flow: `if`, `loop`,
 `switch`, `break`, `continue`, no `goto`. The structurizer is a port of Eden's goto-elimination
@@ -356,7 +391,9 @@ In order (following Eden's order in `frontend/maxwell/translate_program.cpp`, li
    `frontend/maxwell/translate/impl/exit_program.cpp`). Port of Eden's `frontend/ir/attribute.h`
    and the attribute parts of `ir_opt/collect_shader_info_pass.cpp`, with the SPH v4 layout.
 6. **Local and shared memory.** Local memory becomes a private array sized from the SPH
-   (graphics) or the QMD (compute); shared memory a workgroup array sized from the QMD. All
+   (graphics; its size is `low | high << 24`, Eden's formula, where NAK stores bits 32..55 in the
+   high field: kept until E3 settles it with a large-local-memory shader; decided by the owner,
+   2026-11-19) or the QMD (compute); shared memory a workgroup array sized from the QMD. All
    indexed accesses are bounds-checked. Slice 16 owns this pass (decided by the owner,
    2026-11-18).
 7. **Dead code elimination**, then **collect info**: the resource table, the interface, and the
@@ -435,7 +472,10 @@ shader on a wgpu, Vulkan or Metal host has to be specialised on:
 
 - Vertex stage: the component type of each vertex attribute (float, signed, unsigned, scaled).
 - Pixel stage: the component type of each colour target; whether dual-source blending is on.
-- Every stage that feeds another: which outputs the next stage reads (interface matching).
+- Every stage after the first: what the previous stage stores (interface matching), as Eden
+  specialises (`MakeRuntimeInfo` in `eden/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp`),
+  not what the next stage reads, which the GPU crate cannot build from engine state (decided by
+  the owner, 2026-11-19).
 - Compute: workgroup size (naga needs it as a constant in the entry point) and shared-memory size.
 
 Two groups of fields come from the render backend, through the GPU crate, because only the
@@ -445,10 +485,13 @@ render backend knows what the host lacks (review guide, M13):
   copied field by field into the key by the GPU crate: alpha test function (Maxwell-class engines
   have alpha test; wgpu, Vulkan and Metal do not, so it becomes code; the reference value is not
   in the key), the depth-range rewrite and viewport origin where the host cannot express them as
-  state, fetching vertex attributes beyond the host's limit from a storage buffer, typed colour
-  outputs, and primitive-restart index handling where it is done in the shader. The render crate
-  decides this list; the shader crate cannot see its types (no dependency), so the key mirrors
-  them and a GPU-crate test checks every flag is copied.
+  state, the guest's y-flip and depth remap (a negative viewport height or a reversed or
+  out-of-range depth range, which wgpu refuses: the vertex shader flips y and remaps depth from a
+  driver constant, and the backend keeps the host viewport positive; slice 17; decided by the
+  owner, 2026-11-19), fetching vertex attributes beyond the host's limit from a storage buffer,
+  typed colour outputs, and primitive-restart index handling where it is done in the shader. The
+  render crate decides this list; the shader crate cannot see its types (no dependency), so the
+  key mirrors them and a GPU-crate test checks every flag is copied.
 - **Texture component swizzles.** The guest's texture headers carry a per-texture swizzle. wgpu
   has no per-view swizzle, so the render backend reports `Caps::view_swizzle = false`, and the
   GPU crate then puts the swizzle of each texture binding into the key; the lowering applies it
@@ -486,7 +529,10 @@ crate fills. Each new specialisation needs a reason in its PR.
   the first draw needs them (2–4 ms per shader, row 121's numbers). The shader crate serialises and
   deserialises entries; it does no file I/O itself (the core crate owns the folder). The file is
   derived from a game and lives in the user's data folder, never in the repository
-  (`specs/observability.md`, "Storage and what may be committed"). Host pipeline binaries (wgpu's
+  (`specs/observability.md`, "Storage and what may be committed"). A shader's identity across
+  boots is a `ShaderStamp`, a digest of its entry key, defined with slice 21; the GPU crate's
+  list of pipeline keys to precompile names each stage by it (gpu-protocol, "Caches"). Its
+  128-bit width is a guess (decided by the owner, 2026-11-19). Host pipeline binaries (wgpu's
   pipeline cache where it exists, Vulkan pipeline caches, Metal binary archives) are the render
   backend's and sit next to it.
 - **Translation time is a budget, not an afterthought:** every stage is linear or close to it in
@@ -501,7 +547,9 @@ local memory, shared memory and workgroup size); constant buffers come from the 
 3D engine bindings; and the variant key holds the workgroup size and shared-memory size. Warp
 instructions assume 32 lanes, so compute and every other stage that uses subgroup operations
 records "needs subgroup size 32" in its requirements (Apple GPUs run 32-wide SIMD groups; AMD
-hosts must request it; render backend's concern).
+hosts must request it; render backend's concern). wgpu cannot request a size and reports 4..64
+on every Mac, so the wgpu backend treats the Apple GPU family as meeting the requirement
+(render-backend, "What a pipeline is made of"; decided by the owner, 2026-11-19).
 
 A compute program that is rejected must still let its dispatch complete and fire its QMD
 releases, or queues waiting on it hang (row 61). That is the GPU crate's job; the shader crate's
@@ -554,6 +602,12 @@ where a word may come from a game's shader, the case is rebuilt with the test as
 There is one shader capture format (local only): slice 20 defines it, `cargo xtask
 shader-replay` reads it, and the GPU capture (`SQGC`, gpu-protocol G20) embeds it for its shader
 lookups (decided by the owner, 2026-11-18). It has a golden-bytes test of its own and a version.
+
+**The IR interpreter's choices**, as built in slice 7 (decided by the owner, 2026-11-19): the
+canonical NaN bits and the sign of an `FMZ` zero product are guesses; misaligned, out-of-bounds
+and missing-input accesses are errors (Eden aligns down, and a robust host reads zero);
+`FPClamp` of NaN gives the low bound (PR #4588 passes NaN through); `GetPatch` and `SetPatch`
+share one map; and `interp` stays a public module rather than moving behind `test-support`.
 
 ## Interfaces to neighbouring designs
 
@@ -608,6 +662,12 @@ Assumed of #12 (gpu-protocol now assumes the same; review guide, M9):
 - The back thread calls `lookup` when a stage's program address or the variant key changes, and
   decides what a draw does while a ticket is pending, through its one wait-while-compiling
   setting (decision 6).
+- The draw path also needs, for each shader of a ready set, its resource table and its
+  `ShaderStamp`, and a way to wait for a pending ticket. The GPU crate built these as its
+  `ShaderLookup` seam (gpu-protocol G18): `lookup` answers a `SetLookup` whose ready arm carries
+  the set with each shader's stamp and resources, and `wait(ticket)` blocks the back thread until
+  that translation finishes and gives its result. Slice 19 adapts the cache to that seam rather
+  than the seam to `Lookup` (decided by the owner, 2026-11-19).
 - It builds the `VariantKey` from 3D engine state, copies in the render backend's
   `EmulationFlags`, and, when the render backend's `Caps::view_swizzle` is false, each texture
   binding's swizzle. It fills the driver constants each draw.
@@ -659,7 +719,8 @@ pub enum CodeForm {
 
 The GPU crate converts a `HostShader` into the render crate's `ShaderDesc`: `HostCode::Naga`
 becomes `ShaderSource::Naga`, and `resources`, `inputs` and `outputs` become its
-`ShaderInterface`.
+`ShaderInterface`, which also carries `requirements` and each resource's binding-array count, so
+the render backend reads neither from the naga module (decided by the owner, 2026-11-19).
 
 Assumed of #14:
 
@@ -695,13 +756,14 @@ One pull request each. "Offline" means testable with no game and no GPU. Slices 
 | 2 | SPH v4 header parser | 1 | `clc797sph.h`, NAK `sph.rs`, Eden `program_header.h` | Golden bytes covering every field with distinct values | B |
 | 3 | Program capture: extent rules, cap, content hash | 1 | PR `program_capture.h` | Synthetic programs at and past each rule; proptest no-panic; the cap at its edge | B |
 | 4 | Decoder framework: form table with known-bit masks, operand types (GPR, UR, P, UP, cbuf, immediates), the full `Op` enum shell, printer, test assembler framework; `cargo xtask shader-nvdisasm` ("The offline test harness") as a follow-up tool once the printer exists | 1 | NAK `ir.rs` (op shapes), `sm70_encode.rs` (helpers), PR `isa.h` | Round trip and strictness on the framework's own forms | B |
+| 4b | Decoder framework, extended: known bits with their own divergence accounting, and a canonical word per form ("The SM86 decoder"; decided by the owner, 2026-11-19) | 4 | NAK `sm70_encode.rs` (the F16 swizzle at bit 60); PR table | A form with known bits decodes the F16 swizzle; a form whose bare word PR #4588 refuses (`F8`, `FMUL` scale 0) is refused; divergences counted | C (before 6c and 6d) |
 | 5 | IR core: arenas, types, operations, builder, text printer and parser, verifier | 1 | Eden `frontend/ir/` | Parse–print round trip; verifier rejects each malformed case | B |
 | 6a | Decoder: integer ALU (`IADD3`, `IMAD`, `IMAD.WIDE`, `LOP3`, `SHF`, `LEA`, `ISETP`, `IMNMX`, `PRMT`, `POPC`, `FLO`, `BREV`, `SGXT`, `BMSK`, `IABS`, `IDP4`, `MOV`, `SEL`, `PLOP3`, `P2R`, `R2P`) | 4 | NAK `sm70_encode.rs`; PR table for `P2R`/`R2P` | Expected text, round trip, strictness, no-panic | C |
 | 6b | Decoder: 32-bit float and conversions (`FADD`, `FMUL`, `FFMA`, `FMNMX`, `FSET`, `FSETP`, `FSEL`, `MUFU`, `FSWZADD`, `FRND`, `F2F`, `F2I`, `I2F`, `I2FP`, `F2FP`) | 4 | NAK; PR table | Same | C |
-| 6c | Decoder: half and double (`HADD2`, `HFMA2`, `HMUL2`, `HSET2`, `HSETP2`, `HMNMX2`, `DADD`, `DMUL`, `DFMA`, `DSETP`) | 4 | NAK | Same | C |
-| 6d | Decoder: uniform datapath (`R2UR`, `UMOV`, `ULDC`, `ULDC.64`, uniform forms of the ALU operations, `UP2UR`, `UPLOP3`) | 4, 6a, 6b, 6e (the forms whose uniform variants it decodes) | NAK (uniform register file forms), PR table | Same | C |
+| 6c | Decoder: half and double (`HADD2`, `HFMA2`, `HMUL2`, `HSET2`, `HSETP2`, `HMNMX2`, `DADD`, `DMUL`, `DFMA`, `DSETP`) | 4, 4b | NAK | Same | C |
+| 6d | Decoder: uniform datapath (`R2UR`, `UMOV`, `ULDC`, `ULDC.64`, uniform forms of the ALU operations, `UP2UR`, `UPLOP3`) | 4, 4b, 6a, 6b, 6e (the forms whose uniform variants it decodes) | NAK (uniform register file forms), PR table | Same | C |
 | 6e | Decoder: memory (`LD`/`ST` in every space, `LDG`, `STG`, `LDS`, `STS`, `LDL`, `STL`, `LDC`, `ATOM`, `ATOMS`, `ATOMG`, `RED`, `CCTL`, `MEMBAR`, `LDGSTS`, `LDGDEPBAR`) | 4 | NAK; PR table | Same | C |
-| 6f | Decoder: texture and surface (`TEX`, `TLD`, `TLD4`, `TMML`, `TXD`, `TXQ`, `SULD`, `SUST`, `SUATOM`, `SURED`, the `.UR` forms) | 4 | NAK; PR table | Same | C |
+| 6f | Decoder: texture and surface (`TEX`, `TLD`, `TLD4`, `TMML`, `TXD`, `TXQ`, `SULD`, `SUST`, `SUATOM`, `SURED`, the `.UR` forms, and the surface forms with a constant-buffer handle from PR #4588, marked for the `nvdisasm` check) | 4 | NAK; PR table | Same | C |
 | 6g | Decoder: attributes and system values (`ALD`, `AST`, `IPA`, `AL2P`, `S2R`, `CS2R`, `PIXLD`, `OUT`, `ISBERD`, `ISBEWR`, `LDTRAM`) | 4 | NAK | Same | C |
 | 6h | Decoder: control and warp (`BRA`, `BRX`, `JMX`, `CALL`, `RET`, `EXIT`, `KILL`, `BSSY`, `BSYNC`, `BREAK`, `BMOV`, `WARPSYNC`, `BAR`, `VOTE`, `SHFL`, `MATCH`, `REDUX`, `NOP`, `DEPBAR`, `NANOSLEEP`, `BPT`) | 4 | NAK; PR table and `flow.cpp` for `CALL`, `RET`, `BRX` | Same | C |
 | 6i | Decoder: tensor (`HMMA`, `IMMA`, `LDSM`, `MOVM`), decode only | 4 | NAK | Same | C |
@@ -715,11 +777,11 @@ One pull request each. "Offline" means testable with no game and no GPU. Slices 
 | 14 | Global memory to storage buffers | 8, 12e | Eden `global_memory_to_storage_buffer_pass.cpp` | Golden IR; linear-time test | E |
 | 15 | Inputs and outputs, collect info | 2, 8, 12g | Eden `attribute.h`, `collect_shader_info_pass.cpp`, `exit_program.cpp` | Golden interface tables per stage | E |
 | 16 | Lowering to naga: arithmetic, control flow, compute entry points; the local and shared memory pass (pass 6) | 1, 8, 11 | New | naga validation on every test module | E |
-| 17 | Lowering to naga: graphics entry points, interface, resources (group and binding assignment), textures and swizzles from the variant key, driver constants | 13, 15, 16 | New | Same, plus golden resource and interface tables for end-to-end fixtures; wgpu acceptance locally; the speed test ("The offline test harness") | F |
+| 17 | Lowering to naga: graphics entry points, interface, resources (group and binding assignment), textures and swizzles from the variant key, driver constants; the sampler LOD bias applied in the shader, guest 1D arrays sampled as 2D textures of height 1, and the guest y-flip and depth remap in the vertex shader, for the render backend's R7 (decided by the owner, 2026-11-19) | 13, 15, 16 | New | Same, plus golden resource and interface tables for end-to-end fixtures; wgpu acceptance locally; the speed test ("The offline test harness") | F |
 | 18 | Host lowering passes: f64 and f16 to f32, subgroup-size requirement | 7, 8, 16 | Eden `lower_fp64_to_fp32.cpp`, `lower_fp16_to_fp32.cpp` | Interpreter equivalence within stated precision | F |
-| 19 | Shader cache: three layers, invalidation, negative cache, tickets on an executor | 3, 9 (a fake translator before 17) | New; Eden-NX2 rows 90, 112 | Deterministic tests with a scripted executor; invalidation edges | D |
+| 19 | Shader cache: three layers, invalidation, negative cache (a rejection names the failing program), tickets on an executor; adapts to the GPU crate's `ShaderLookup` seam, `wait(ticket)` included (decided by the owner, 2026-11-19) | 3, 9 (a fake translator before 17) | New; Eden-NX2 rows 90, 112 | Deterministic tests with a scripted executor; invalidation edges | D |
 | 20 | Shader capture format (the one format; `SQGC` embeds it) and `cargo xtask shader-replay` | 3, 9 | New | Golden bytes; replay of a synthetic capture | E |
-| 21 | Persistent cache entries: inputs only (program bytes, answers, variant key), serialise, version, load and retranslate on workers | 19, 20 | New | Golden bytes; a stale translator version is refused | after M3 |
+| 21 | Persistent cache entries: inputs only (program bytes, answers, variant key), serialise, version, load and retranslate on workers; defines `ShaderStamp`, the digest of an entry's key (decided by the owner, 2026-11-19) | 19, 20 | New | Golden bytes; a stale translator version is refused | after M3 |
 | 22 | Final-code emission for a direct backend: naga's SPIR-V or MSL writer with the `HostTarget`'s binding map and bounds-check policy | 17; a direct backend scheduled (render-backend, "Deferred") | New | SPIR-V read back and `spirv-val` where installed; MSL goldens and Apple's compiler on a Mac | when a direct backend is scheduled |
 
 The critical path to a first present is 1 → 4 → 6h → 10 → 11 → 16 → 17, with 5 → 7 ahead of 8,
@@ -795,7 +857,8 @@ the slices need (decided by the owner, 2026-11-18).
 3. **E3, header and capture on homebrew.** Disassemble a shader from an NVN2-free homebrew source
    if one exists, or failing that from a local title capture, and confirm the 128-byte header in
    front of graphics programs and none in front of compute programs. A different layout changes
-   slices 2 and 3.
+   slices 2 and 3. A shader with a large local memory also settles the header's local-memory
+   size formula (pass 6).
 4. **E4, local census of titles (needs the owner's dumps; nothing committed).** Over all programs
    of the available titles: which stages appear (geometry and tessellation at all?), how many use
    mesh and task programs, `BRX`, untraceable texture handles, untraceable global addresses,

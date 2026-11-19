@@ -111,6 +111,13 @@ pub use verify::{Site, VerifyError};
 /// How deeply structured nodes may nest (see the module docs).
 pub const MAX_NESTING: usize = 256;
 
+/// The lanes of a guest warp, which the warp operations (`VoteAll` to `QuadSwap`) work over:
+/// Eden's emitter keeps a lane index in range with `& 31` (`GuestLane`,
+/// `eden/src/shader_recompiler/backend/spirv/emit_spirv_warp.cpp` @ cf654052), and PR #4588's
+/// `REDUX` walks lanes `0..32`
+/// (`eden-pr4588/src/shader_recompiler/frontend/ampere/ops_memory.cpp` @ e5fb3b97).
+pub const WARP_SIZE: u32 = 32;
+
 /// The id of an instruction and of the value it produces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Value(u32);
