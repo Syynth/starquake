@@ -942,6 +942,58 @@ fn a_ring_entry_comes_before_closing_the_list() {
     assert_eq!(r.backend.submitted(), vec![]);
 }
 
+#[test]
+fn completed_work_is_performed_while_the_ring_stays_busy() {
+    // The back thread is the bottleneck: the ring always has an entry for it. A list in flight
+    // completes; its release must not wait for the ring to drain. The first wait performs it and
+    // leaves the entry on the ring, and the entries then come in their order, none lost.
+    const ENTRIES: u32 = 4;
+    let entry = |value| RingEntry::Write {
+        channel: ChannelId(1),
+        class: ClassId(0xc797),
+        method: 0x45,
+        value,
+    };
+    let (mut producer, mut consumer) = ring(64).unwrap();
+    for value in 0..ENTRIES {
+        producer.try_push(&entry(value)).unwrap();
+    }
+    producer.publish();
+    let mut r = rig();
+    let fence = r.list_with_release(SEM, 0x7d);
+    // A second list, not complete, so the check looks only at the oldest list.
+    let later = r.list_with_release(SEM2, 0x7e);
+    r.backend.finish(fence);
+    assert_eq!(
+        r.fences.wait(&mut consumer, FOREVER),
+        Ok(Woke::Completed(released(1)))
+    );
+    assert_eq!(word(&r.mem, SEM), 0x7d);
+    assert_eq!(read(&r.mem, SEM2, 4), vec![FILL; 4]);
+    assert_eq!(r.fences.lists_in_flight(), 1);
+    // Nothing more has completed: the entries come next, in order.
+    for value in 0..ENTRIES {
+        assert_eq!(
+            r.fences.wait(&mut consumer, FOREVER),
+            Ok(Woke::Entry(entry(value)))
+        );
+    }
+    // The later list completes while entries keep arriving: again performed first.
+    producer.try_push(&entry(ENTRIES)).unwrap();
+    producer.publish();
+    r.backend.finish(later);
+    assert_eq!(
+        r.fences.wait(&mut consumer, FOREVER),
+        Ok(Woke::Completed(released(1)))
+    );
+    assert_eq!(word(&r.mem, SEM2), 0x7e);
+    assert_eq!(
+        r.fences.wait(&mut consumer, FOREVER),
+        Ok(Woke::Entry(entry(ENTRIES)))
+    );
+    assert_eq!(r.fences.lists_in_flight(), 0);
+}
+
 // ---------------------------------------------------------------------------------------------
 // A refused list
 // ---------------------------------------------------------------------------------------------
@@ -992,6 +1044,33 @@ fn a_refused_list_hands_its_actions_on() {
     r.backend.finish(older);
     assert_eq!(r.fences.complete(), released(1));
     assert_eq!(word(&r.mem, SEM), 0x32);
+}
+
+#[test]
+fn a_refused_list_hands_its_actions_to_the_newest_list_not_the_oldest() {
+    // Two lists in flight; the second releases SEM = 1. A refused third list releases SEM = 2:
+    // its release joins the newest list, so it is written after the second list's release, and
+    // completing only the oldest list performs nothing (ordering guarantee 4).
+    let mut r = rig();
+    r.fences.record(command(1)).unwrap();
+    let oldest = r.fences.close(CloseReason::Present).unwrap().unwrap();
+    let newest = r.list_with_release(SEM, 1);
+    r.fences.record(command(3)).unwrap();
+    let action = r.action(four(SEM, 2));
+    assert_eq!(r.fences.attach(action), Ok(Attached::Open));
+    r.backend.refuse_next();
+    assert_eq!(
+        r.fences.close(CloseReason::Present),
+        Err(FenceError::Submit(REFUSED))
+    );
+    assert_eq!(r.fences.lists_in_flight(), 2);
+    r.backend.finish(oldest);
+    assert_eq!(r.fences.complete(), Report::default());
+    assert_eq!(read(&r.mem, SEM, 4), vec![FILL; 4]);
+    r.backend.finish(newest);
+    assert_eq!(r.fences.complete(), released(2));
+    assert_eq!(word(&r.mem, SEM), 2);
+    assert_eq!(r.front.all(), vec![released(2)]);
 }
 
 #[test]

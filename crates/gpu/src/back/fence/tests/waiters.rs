@@ -111,6 +111,23 @@ fn removing_a_waiter_leaves_the_others() {
 }
 
 #[test]
+fn removing_the_sole_waiter_empties_the_table() {
+    // One waiter, so the count's fast path sees exactly one entry: an off-by-one there (treating
+    // a count of one as empty) would leave the waiter in the table, and its address would keep
+    // closing the open list.
+    let table = WaiterTable::new();
+    table.register(waiter(6, AcquireOp::Equal, 1));
+    assert_eq!(table.len(), 1);
+    assert!(table.has_waiter(ADDRESS));
+    assert!(table.remove(ChannelId(6)));
+    assert!(table.is_empty());
+    assert_eq!(table.len(), 0);
+    assert!(!table.has_waiter(ADDRESS));
+    assert!(!table.is_latched(ChannelId(6)));
+    assert!(!table.remove(ChannelId(6)));
+}
+
+#[test]
 fn one_write_latches_every_waiter_it_meets_and_only_those() {
     let table = WaiterTable::new();
     table.register(waiter(6, AcquireOp::GreaterOrEqual, 3));

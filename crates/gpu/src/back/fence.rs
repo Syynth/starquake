@@ -101,8 +101,16 @@
 //! # How the back thread sleeps
 //!
 //! [`Fences::wait`] is the back thread's wait for its next piece of work (gpu-protocol, "How the
-//! back thread sleeps"; decided by the owner on 2026-11-18). It returns the next ring entry if
-//! one is there; otherwise it closes the open list (the ring is empty) and waits on the ring's
+//! back thread sleeps"; decided by the owner on 2026-11-18). It first looks at `completed()`
+//! when a list is in flight: if the oldest list in flight has completed, it performs what has
+//! completed and returns [`Woke::Completed`], leaving any ring entry for the next call, so a ring
+//! that never empties (the back thread is the bottleneck) does not hold back releases,
+//! increments and markers whose work the host has finished (pinned by
+//! `completed_work_is_performed_while_the_ring_stays_busy`). This costs one `completed()` read
+//! per entry while a list is in flight, and none when nothing is. When an entry ends the sleep
+//! below while a completion is also pending, the entry is returned and the next call performs
+//! the completion before taking another entry. Otherwise it returns the next ring entry if one
+//! is there; otherwise it closes the open list (the ring is empty) and waits on the ring's
 //! wake-up ([`crate::ring::Consumer::pop_or_wake`]), which the front's publish and the render
 //! backend's completion wake both ring (`core` builds the backend with
 //! [`crate::ring::ConsumerWake::completion_wake`]). The ring asks it, before it spins and again
@@ -129,7 +137,12 @@
 //!   fences per batch (`MaxBatch`); here one [`Fences::complete`] performs every list it finds
 //!   passed, bounded by the lists in flight (`lists_completed_together_are_one_batch`).
 //! - **Releases are written on the back thread**, in ring order, not on a separate fencing
-//!   thread; the owner's decision of 2026-11-18. Nothing to pin beyond the order tests.
+//!   thread; the owner's decision of 2026-11-18. Eden-NX2's fencing thread releases a finished
+//!   fence however busy the command thread is; here the back thread performs completed work
+//!   only between ring entries, so [`Fences::wait`] puts completed work ahead of the next entry
+//!   rather than draining the ring first. A completion is still performed no sooner than the
+//!   entry the back thread is handling when it lands has been handled
+//!   (`completed_work_is_performed_while_the_ring_stays_busy`).
 //! - **A failed release is reported and skipped.** Eden-NX2's QMD callbacks refuse a release to
 //!   an unmapped range when it is requested (`IsFullyMappedRange`) and its query path writes
 //!   through a host pointer; here the memory is checked when the release is performed, and a
@@ -168,7 +181,7 @@ use thiserror::Error;
 use crate::interface::{Completions, GpuCompletion, SyncpointId, Ticket, VmUpdate};
 use crate::memory::{GpuFault, GpuMemory};
 use crate::ring::{Consumer, MarkerToken, PopError, Popped, Release, ReleaseOp, RingEntry};
-use crate::sema::PayloadSize;
+use crate::sema::{PayloadSize, RELEASE_TIMESTAMP_OFFSET, ReleaseForm};
 use crate::syncpoint::Syncpoints;
 use crate::vm::GpuVm;
 
@@ -437,16 +450,41 @@ fn write_release(
             }
         },
     };
+    // `value` already fits the payload's width, so its little-endian bytes start with the
+    // payload and the form's length cuts it to 4, 8 or (widened to 64 bits) 16 bytes.
+    let mut bytes = [0; LARGEST_RELEASE_BYTES];
+    put(&mut bytes, 0, value);
     if release.form.timestamp {
-        let bytes = [value.to_le_bytes(), clock.gpu_timestamp().to_le_bytes()].concat();
-        memory.write(address, &bytes)?;
-    } else {
-        match size {
-            PayloadSize::Four => memory.write(address, &low_word(value).to_le_bytes())?,
-            PayloadSize::Eight => memory.write(address, &value.to_le_bytes())?,
-        }
+        put(&mut bytes, TIMESTAMP_AT, clock.gpu_timestamp());
     }
+    let len = usize::try_from(release.form.bytes()).unwrap_or(LARGEST_RELEASE_BYTES);
+    memory.write(address, bytes.get(..len).unwrap_or(&bytes))?;
     Ok(value)
+}
+
+/// The largest form a release writes: the 16-byte structure with a timestamp.
+const LARGEST_RELEASE: ReleaseForm = ReleaseForm {
+    size: PayloadSize::Eight,
+    timestamp: true,
+};
+
+/// The bytes of [`LARGEST_RELEASE`]: the buffer [`write_release`] builds every form in, so a
+/// release allocates nothing. Two 64-bit words, checked against [`ReleaseForm::bytes`] when the
+/// crate is compiled.
+const LARGEST_RELEASE_BYTES: usize = 2 * size_of::<u64>();
+const _: () = assert!(LARGEST_RELEASE_BYTES as u64 == LARGEST_RELEASE.bytes());
+
+/// [`RELEASE_TIMESTAMP_OFFSET`] as an index into a release's bytes, checked against it when the
+/// crate is compiled.
+const TIMESTAMP_AT: usize = size_of::<u64>();
+const _: () = assert!(TIMESTAMP_AT as u64 == RELEASE_TIMESTAMP_OFFSET);
+
+/// Copies `word`'s little-endian bytes into `bytes` from `at`, dropping any that fall past its
+/// end.
+fn put(bytes: &mut [u8], at: usize, word: u64) {
+    for (slot, byte) in bytes.iter_mut().skip(at).zip(word.to_le_bytes()) {
+        *slot = byte;
+    }
 }
 
 impl Fences {
@@ -585,18 +623,25 @@ impl Fences {
     /// The back thread's wait for its next piece of work, at most `timeout` (module docs, "How
     /// the back thread sleeps").
     ///
+    /// When `completed()` has passed the oldest list in flight, it performs that work and
+    /// returns [`Woke::Completed`] without taking an entry, even when the ring has one, so the
+    /// executor needs no completion check of its own between entries.
+    ///
     /// # Errors
     ///
     /// [`FenceError::Ring`] from the ring; [`FenceError::Submit`] when closing the open list
     /// for an empty ring failed.
     pub fn wait(&mut self, ring: &mut Consumer, timeout: Duration) -> Result<Woke, FenceError> {
+        if self.oldest_has_completed() {
+            // Completed work first, so a ring that never empties cannot hold back the releases
+            // of lists the host has finished; the entry stays on the ring for the next call.
+            return Ok(Woke::Completed(self.complete()));
+        }
         if let Some(entry) = ring.try_pop()? {
             return Ok(Woke::Entry(entry));
         }
         self.close(CloseReason::RingEmpty)?;
-        let backend = &self.backend;
-        let oldest = self.in_flight.front().map(|list| list.fence);
-        let idle = || oldest.is_none_or(|fence| backend.completed() < fence);
+        let idle = || !self.oldest_has_completed();
         match ring.pop_or_wake(timeout, idle)? {
             Popped::Entry(entry) => Ok(Woke::Entry(entry)),
             Popped::Woken => Ok(Woke::Completed(self.complete())),
@@ -614,6 +659,14 @@ impl Fences {
             }
             Popped::TimedOut => Ok(Woke::TimedOut),
         }
+    }
+
+    /// Whether `completed()` has passed the oldest list in flight, so [`Fences::complete`] has
+    /// work to perform. Reads `completed()` only when a list is in flight.
+    fn oldest_has_completed(&self) -> bool {
+        self.in_flight
+            .front()
+            .is_some_and(|list| list.fence <= self.backend.completed())
     }
 
     /// Performs `actions` in order as one batch, outside any list.

@@ -658,3 +658,63 @@ fn a_refused_list_wakes_nothing() {
     });
     assert_eq!(seen, vec![FenceValue::new(1)]);
 }
+
+#[test]
+fn the_wake_comes_before_any_frame_is_handed_to_a_sink() {
+    use crate::frame::{Frame, FrameSink};
+    use crate::wake::CompletionWake;
+    use std::sync::{Arc, Mutex};
+
+    /// What happened, in order: the completion wake and each frame the sink took.
+    type Log = Arc<Mutex<Vec<&'static str>>>;
+
+    #[derive(Debug)]
+    struct Sink(Log);
+    impl FrameSink for Sink {
+        fn frame(&self, _frame: Frame) {
+            self.0.lock().unwrap().push("frame");
+        }
+    }
+
+    let log = bounded(|| {
+        let log: Log = Arc::default();
+        let wake = {
+            let log = Arc::clone(&log);
+            CompletionWake::new(move || log.lock().unwrap().push("wake"))
+        };
+        let b = RecordingBackend::with_completion_wake(caps(), 0, wake);
+        b.set_frame_sink(Some(Arc::new(Sink(Arc::clone(&log)))));
+        let t = b.create_texture(&texture_desc(1)).expect("valid");
+        let view = b
+            .create_view(
+                t,
+                &ViewDesc {
+                    format: PixelFormat::R8Unorm,
+                    dimension: ViewDimension::D2,
+                    base_mip: 0,
+                    mip_count: 1,
+                    base_layer: 0,
+                    layer_count: 1,
+                    swizzle: Swizzle::IDENTITY,
+                },
+            )
+            .expect("valid");
+        let mut list = CommandList::new();
+        list.push(Command::Present(PresentDesc {
+            view,
+            src_rect: Rect {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+            transform: PresentTransform::Identity,
+            frame: 1,
+            dump: true,
+        }));
+        assert_eq!(b.submit(list), Ok(FenceValue::new(1)));
+        log.lock().unwrap().clone()
+    });
+    // The back thread is woken before a sink, however slow, gets the list's frame.
+    assert_eq!(log, vec!["wake", "frame"]);
+}
