@@ -14,7 +14,7 @@
 //!   [`write_text`].
 //! - `spsc` owns the bounded single-producer, single-consumer ring itself: [`ring`] makes a
 //!   [`Producer`] for the front and a [`Consumer`] for the back, with back-pressure and batched
-//!   publishing.
+//!   publishing, and a [`ConsumerWake`] that wakes the back without an entry (slice G15).
 //!
 //! What uses the ring (the front loop, G14; the back's executor, G19) is not here yet.
 
@@ -34,7 +34,7 @@ pub use entry::{
     RingEntry, SUBCHANNEL_COUNT, Subchannel,
 };
 pub use spsc::{
-    CapacityError, Consumer, PUBLISH_EVERY, PopError, Producer, PushError, RING_WORDS,
-    SPINS_BEFORE_SLEEP, ring,
+    CapacityError, Consumer, ConsumerWake, PUBLISH_EVERY, PopError, Popped, Producer, PushError,
+    RING_WORDS, SPINS_BEFORE_SLEEP, ring,
 };
 pub use text::{ParseError, TextError, parse_entry, parse_text, write_text};

@@ -38,8 +38,13 @@ fn other_state() -> u32 {
     clc797::SET_STENCIL_FUNC_REF.method()
 }
 
-/// A 3D trigger without side effects.
+/// A 3D trigger without side effects that is not a data load.
 fn trigger() -> u32 {
+    clc797::LAUNCH_DMA.method()
+}
+
+/// `LOAD_INLINE_DATA`: a data-load trigger without side effects.
+fn inline_data() -> u32 {
     clc797::LOAD_INLINE_DATA.method()
 }
 
@@ -273,6 +278,212 @@ fn mode_is_the_mode_field() {
     assert_eq!(file.get(state()), Some(5));
 }
 
+/// The value the data-load fixtures leave in the shadow file.
+const SHADOW_VALUE: u32 = 0x5a;
+/// The value the data-load fixtures leave in the register file.
+const REGISTER_VALUE: u32 = 0x7b;
+/// The words the data-load fixtures write: distinct from each other and from both values.
+const WORDS: [u32; 2] = [0x11, 0x22];
+
+/// Every 3D data-load method, from the generated constants: `LOAD_CONSTANT_BUFFER(0..16)` and
+/// `LOAD_INLINE_DATA`.
+fn data_loads() -> Vec<u32> {
+    let mut methods: Vec<u32> = (0..LOAD_CONSTANT_BUFFER_COUNT)
+        .map(constant_buffer)
+        .collect();
+    methods.push(inline_data());
+    methods
+}
+
+/// A 3D file in `mode` where each of `methods` holds [`REGISTER_VALUE`] and its shadow copy
+/// [`SHADOW_VALUE`]: written in track mode, then again in passthrough.
+fn shadowed(methods: &[u32], mode: u32) -> RegFile {
+    let mut file = three_d();
+    for &method in methods {
+        send(&mut file, method, SHADOW_VALUE);
+    }
+    send(&mut file, control(), PASSTHROUGH);
+    for &method in methods {
+        send(&mut file, method, REGISTER_VALUE);
+    }
+    send(&mut file, control(), mode);
+    for &method in methods {
+        assert_eq!(file.get(method), Some(REGISTER_VALUE), "{method:#x}");
+        assert_eq!(file.shadow(method), Some(SHADOW_VALUE), "{method:#x}");
+    }
+    file
+}
+
+/// What a run to the data-load method `method` sends: the run as `sent`, and for a
+/// constant-buffer load the offset advanced from `offset_before` by one word per word.
+fn data_load_entries(method: u32, sent: &[u32], offset_before: u32) -> Vec<RingEntry<'static>> {
+    let mut entries = vec![run(method, sent)];
+    if method != inline_data() {
+        let words = u32::try_from(sent.len()).unwrap();
+        entries.push(write(offset(), offset_before + words * WORD_BYTES));
+    }
+    entries
+}
+
+#[test]
+fn replay_data_loads_take_the_written_words_and_state_takes_the_shadow_value() {
+    // The owner's ruling of 2026-11-18 (gpu-protocol, "Engine methods: the register file",
+    // step 1): in replay, data-load methods take the words written; a state method takes the
+    // shadow value. Both kinds in the same file and the same mode.
+    for method in data_loads() {
+        let mut file = shadowed(&[method, state()], REPLAY);
+        let offset_before = file.get(offset()).unwrap();
+        assert_eq!(
+            send_run(&mut file, method, &WORDS),
+            data_load_entries(method, &WORDS, offset_before),
+            "data load {method:#x}"
+        );
+        assert_eq!(file.get(method), Some(WORDS[1]), "{method:#x}");
+        assert_eq!(file.shadow(method), Some(SHADOW_VALUE), "{method:#x}");
+        // A single word likewise.
+        let offset_before = file.get(offset()).unwrap();
+        assert_eq!(
+            send(&mut file, method, WORDS[0])[0],
+            write(method, WORDS[0]),
+            "single word to {method:#x}"
+        );
+        let advanced = if method == inline_data() {
+            offset_before
+        } else {
+            offset_before + WORD_BYTES
+        };
+        assert_eq!(file.get(offset()), Some(advanced), "{method:#x}");
+        // The state method in the same mode replays the shadow value (once: the second word
+        // equals the register it set and is dropped).
+        assert_eq!(
+            send_run(&mut file, state(), &WORDS),
+            [write(state(), SHADOW_VALUE)],
+            "state after {method:#x}"
+        );
+        assert_eq!(file.get(state()), Some(SHADOW_VALUE));
+        assert_eq!(file.shadow(state()), Some(SHADOW_VALUE));
+    }
+}
+
+#[test]
+fn replay_triggers_that_are_not_data_loads_take_the_shadow_value() {
+    // Only the data loads are excepted: another trigger replays the shadow value, as
+    // Eden-NX2's `CallMethod` does for every method it reaches, the inline index methods
+    // among them (its `CallMultiMethod` falls through to `CallMethod` for them in replay).
+    for method in [
+        trigger(),
+        clc797::DRAW_INLINE_INDEX.method(),
+        clc797::DRAW_INLINE_INDEX2X16.method(),
+        clc797::DRAW_INLINE_INDEX4X8.method(),
+    ] {
+        let mut file = shadowed(&[method], REPLAY);
+        assert!(!file.is_state(method), "{method:#x}");
+        assert_eq!(
+            send_run(&mut file, method, &WORDS),
+            [run(method, &[SHADOW_VALUE; 2])],
+            "{method:#x}"
+        );
+        assert_eq!(file.get(method), Some(SHADOW_VALUE), "{method:#x}");
+    }
+}
+
+#[test]
+fn data_loads_end_at_their_neighbours() {
+    // The first and last data-load method of each span take the written words; the methods
+    // just outside them (a state method, the trigger `LAUNCH_DMA` and two methods the header
+    // does not name) take the shadow value.
+    let last = LOAD_CONSTANT_BUFFER_COUNT - 1;
+    for method in [constant_buffer(0), constant_buffer(last), inline_data()] {
+        let mut file = shadowed(&[method], REPLAY);
+        let offset_before = file.get(offset()).unwrap();
+        assert_eq!(
+            send_run(&mut file, method, &WORDS),
+            data_load_entries(method, &WORDS, offset_before),
+            "{method:#x}"
+        );
+    }
+    let neighbours = [
+        constant_buffer(0) - 1,
+        constant_buffer(last) + 1,
+        inline_data() - 1,
+        inline_data() + 1,
+    ];
+    assert_eq!(neighbours[0], offset());
+    assert_eq!(neighbours[2], trigger());
+    assert!(file_is_state(neighbours[0]));
+    for method in neighbours {
+        let mut file = shadowed(&[method], REPLAY);
+        let expected = if file.is_state(method) {
+            vec![write(method, SHADOW_VALUE)]
+        } else {
+            vec![run(method, &[SHADOW_VALUE; 2])]
+        };
+        assert_eq!(send_run(&mut file, method, &WORDS), expected, "{method:#x}");
+        assert_eq!(file.get(method), Some(SHADOW_VALUE), "{method:#x}");
+    }
+}
+
+#[test]
+fn data_load_methods_are_the_headers_constant_buffer_and_inline_data_methods() {
+    // Written out from `classes/clc797.h`: `NVC797_LOAD_CONSTANT_BUFFER(i)` is
+    // `(0x2390+(i)*4)` for i in 0..16, and `NVC797_LOAD_INLINE_DATA` is 0x01b4 (byte
+    // addresses; a method number is the byte address over 4).
+    let mut expected: Vec<u32> = (0..16).map(|i| (0x2390 + i * 4) / 4).collect();
+    expected.push(0x01b4 / 4);
+    let numbers: Vec<u32> = DATA_LOADS_3D.iter().flat_map(MethodSpan::numbers).collect();
+    assert_eq!(numbers, expected);
+    assert_eq!(numbers, data_loads());
+    assert_eq!(THREE_D.data_loads(), DATA_LOADS_3D);
+    assert_eq!(COMPUTE.data_loads().len(), 0);
+    assert_eq!(OTHER.data_loads().len(), 0);
+    let file = three_d();
+    for &method in &expected {
+        assert!(THREE_D.is_data_load(method), "{method:#x}");
+        assert!(!file.is_state(method), "{method:#x} is a trigger");
+        assert!(!COMPUTE.is_data_load(method), "{method:#x}");
+        assert!(!OTHER.is_data_load(method), "{method:#x}");
+    }
+    // The neighbours of each span are not data loads.
+    for method in [0x238c / 4, 0x23d0 / 4, 0x01b0 / 4, 0x01b8 / 4] {
+        assert!(!THREE_D.is_data_load(method), "{method:#x}");
+    }
+}
+
+/// Whether `method` is a plain-state method of a new 3D file.
+fn file_is_state(method: u32) -> bool {
+    three_d().is_state(method)
+}
+
+#[test]
+fn track_and_passthrough_treat_data_loads_and_state_alike() {
+    // Unchanged by the replay rule: in track the words are sent and stored in the shadow file,
+    // in passthrough they are sent and the shadow file is left alone, for both kinds.
+    for (mode, shadow_after) in [
+        (TRACK, Some(WORDS[1])),
+        (TRACK_WITH_FILTER, Some(WORDS[1])),
+        (PASSTHROUGH, Some(SHADOW_VALUE)),
+    ] {
+        for method in data_loads() {
+            let mut file = shadowed(&[method, state()], mode);
+            let offset_before = file.get(offset()).unwrap();
+            assert_eq!(
+                send_run(&mut file, method, &WORDS),
+                data_load_entries(method, &WORDS, offset_before),
+                "mode {mode} data load {method:#x}"
+            );
+            assert_eq!(file.get(method), Some(WORDS[1]));
+            assert_eq!(file.shadow(method), shadow_after, "mode {mode} {method:#x}");
+            assert_eq!(
+                send_run(&mut file, state(), &WORDS),
+                [write(state(), WORDS[0]), write(state(), WORDS[1])],
+                "mode {mode} state"
+            );
+            assert_eq!(file.get(state()), Some(WORDS[1]));
+            assert_eq!(file.shadow(state()), shadow_after, "mode {mode} state");
+        }
+    }
+}
+
 #[test]
 fn compute_has_no_shadow_ram() {
     let mut file = compute();
@@ -416,7 +627,7 @@ fn bind_pointer_advances_and_wraps() {
 
 #[test]
 fn instruction_upload_leaves_its_pointer_alone() {
-    // The spec's "macro upload pointer" stays in the macro host (module docs, "Divergences").
+    // The spec's "macro upload pointer" stays in the macro host (module docs, step 2).
     let ram = clc797::LOAD_MME_INSTRUCTION_RAM.method();
     let pointer = clc797::LOAD_MME_INSTRUCTION_RAM_POINTER.method();
     let mut file = three_d();
@@ -755,17 +966,21 @@ fn each_chunk_reports_the_offset_it_ends_on() {
 }
 
 #[test]
-fn run_in_replay_sends_the_shadow_values() {
+fn run_in_replay_sends_the_written_data_words() {
+    // A constant-buffer run in replay: the words as written (not the shadow copy, 2), and the
+    // offset advanced by all four words.
     let mut file = three_d();
     send_run(&mut file, constant_buffer(0), &[1, 2]);
     send(&mut file, control(), REPLAY);
     assert_eq!(
         send_run(&mut file, constant_buffer(0), &[7, 8]),
         [
-            run(constant_buffer(0), &[2, 2]),
+            run(constant_buffer(0), &[7, 8]),
             write(offset(), 4 * WORD_BYTES)
         ]
     );
+    assert_eq!(file.get(constant_buffer(0)), Some(8));
+    assert_eq!(file.shadow(constant_buffer(0)), Some(2));
 }
 
 #[test]
@@ -795,8 +1010,10 @@ fn any_write() -> impl Strategy<Value = (u32, Vec<u32>)> {
         state(),
         other_state(),
         trigger(),
+        inline_data(),
         constant_buffer(0),
         constant_buffer(5),
+        constant_buffer(LOAD_CONSTANT_BUFFER_COUNT - 1),
         offset(),
         control(),
         clc797::LOAD_MME_START_ADDRESS_RAM.method(),

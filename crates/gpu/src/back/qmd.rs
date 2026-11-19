@@ -77,10 +77,21 @@
 //!   Eden-NX2.
 //! - The inline QMD: on method 0x107 (`LOAD_INLINE_QMD_DATA(63)`) the 64 words go to
 //!   `((SET_INLINE_QMD_ADDRESS_A << 32) | SET_INLINE_QMD_ADDRESS_B) << 8` and, when scheduled,
-//!   are signalled with action 3 (`kepler_compute.cpp`, the `method == 0x107` case).
+//!   are signalled with action 3 (`kepler_compute.cpp`, the `method == 0x107` case). It is
+//!   scheduled when `(control & (1U << 24)) || !(native_registers[0xcc] & (1U << 12))`
+//!   (`kepler_compute.cpp`, the same case): `SET_QMD_VIRTUALIZATION_CONTROL`'s
+//!   `SEND_PCAS_ENABLE` (bit 24, `clc7c0.h`) is set, or the inline QMD's
+//!   `REQUIRE_SCHEDULING_PCAS` is clear. Method 0xCC is `LOAD_INLINE_QMD_DATA(4)`, the inline
+//!   QMD's word 4, and its bit 12 is QMD bit 140, `NVC7C0_QMDV03_00_REQUIRE_SCHEDULING_PCAS`
+//!   (`MW(140:140)`, `clc7c0qmd.h` line 504), read here through
+//!   [`crate::classes::clc7c0qmd::QMDV03_00_REQUIRE_SCHEDULING_PCAS`]; a QMD that needs no
+//!   scheduling action is scheduled once it is loaded (gpu-protocol, "Compute: QMD 3.0", step
+//!   1; decided by the owner, 2026-11-18). Pinned by
+//!   `an_inline_qmd_is_scheduled_when_send_pcas_is_set_or_require_scheduling_pcas_is_clear`.
 //! - When a request fails, what the requests before it did stands: a QMD that ran keeps its
 //!   dispatch, releases and completion, and a QMD loaded or scheduled by an earlier request stays
-//!   so. What the failing request itself leaves depends on where it fails:
+//!   so. What the failing request itself leaves depends on where it fails (gpu-protocol,
+//!   "Compute: QMD 3.0", step 2; decided by the owner, 2026-11-18):
 //!   - Failures before its entry is written change nothing and add no entry:
 //!     [`QmdError::TableFull`]; [`QmdError::Read`], [`QmdError::Version`] or [`QmdError::Queue`]
 //!     when the QMD is loaded; and [`QmdError::DependenceOverflow`]. Eden-NX2 adds an entry for
@@ -99,7 +110,7 @@
 //!
 //! # Divergences from Eden-NX2
 //!
-//! Each is pinned by the test named, in `qmd/tests.rs`. The first two are the owner's
+//! Each is pinned by the test named, in `qmd/tests.rs`. The first is the owner's
 //! reference-conflict rule (gpu-protocol decision 10) applied as the issue asks: the header's
 //! meaning, plus Eden-NX2's observed behaviour where the header does not explain it.
 //!
@@ -111,13 +122,6 @@
 //!   as in Eden-NX2. This is a **guess** until verification item 1 of the spec ("QMD release flag
 //!   bit 19") is settled: if a title's max releases always carry reduction enable with op 2, the
 //!   rule goes. Pinned by `divergence_bit_19_release_is_a_max_release`.
-//! - **An inline QMD is also scheduled when bit 12 of method 0xCC is clear.** Eden-NX2 schedules
-//!   when `(control & (1U << 24)) || !(native_registers[0xcc] & (1U << 12))`; the header defines
-//!   only the first (`SEND_PCAS_ENABLE`). Method 0xCC is `LOAD_INLINE_QMD_DATA(4)`, the inline
-//!   QMD's word 4, whose bit 12 is QMD bit 140, `REQUIRE_SCHEDULING_PCAS` (`clc7c0qmd.h` line
-//!   504); no header says a QMD without it is scheduled when loaded, so the rule stays a listed
-//!   divergence. Pinned by
-//!   `divergence_inline_qmd_without_require_scheduling_pcas_is_scheduled`.
 //! - **Every reduction the header defines.** Eden-NX2 refuses a release with reduction enabled
 //!   and an op other than `RED_ADD`, or with any reduction format bit set (`native_qmd.h` lines
 //!   80–81); here the op and format are decoded as the header defines them (`RED_ADD` to `RED_XOR`,
@@ -132,7 +136,8 @@
 //! - **An inline QMD address that does not fit in 64 bits is refused**
 //!   ([`QmdError::InlineAddress`]), where Eden-NX2's shift drops the top eight bits of
 //!   `SET_INLINE_QMD_ADDRESS_A`. Pinned by `divergence_inline_address_overflow_is_refused`.
-//! - **A request that fails when its QMD is loaded adds no table entry.** Eden-NX2's
+//! - **A request that fails when its QMD is loaded adds no table entry**, as the spec's step 2
+//!   says (decided by the owner, 2026-11-18). Eden-NX2's
 //!   `states[request.address]` adds an empty entry before the QMD is read, so a QMD that is
 //!   unmapped ([`QmdError::Read`]), not version 3.0 ([`QmdError::Version`]) or a queue
 //!   ([`QmdError::Queue`]) when it is loaded still takes one of the 4,096 places. A request that
@@ -759,8 +764,8 @@ impl QmdTable {
     ///
     /// - [`LAST_INLINE_QMD_METHOD`] writes the inline QMD (`LOAD_INLINE_QMD_DATA(0..64)`) to
     ///   the address in `SET_INLINE_QMD_ADDRESS_A/B` and, when `SET_QMD_VIRTUALIZATION_CONTROL`
-    ///   has `SEND_PCAS_ENABLE` set or (a listed divergence) the inline QMD's
-    ///   `REQUIRE_SCHEDULING_PCAS` is clear, signals it with
+    ///   has `SEND_PCAS_ENABLE` set or the inline QMD's `REQUIRE_SCHEDULING_PCAS` is clear (the
+    ///   module docs give the rule and its source), signals it with
     ///   [`PcasAction::InvalidateCopySchedule`].
     /// - `SEND_SIGNALING_PCAS2_B` signals the QMD at `SEND_PCAS_A << 8` with its action.
     ///
@@ -822,7 +827,9 @@ impl QmdTable {
         let send_pcas = SET_QMD_VIRTUALIZATION_CONTROL_SEND_PCAS_ENABLE
             .get(register(SET_QMD_VIRTUALIZATION_CONTROL.method()))
             == SET_QMD_VIRTUALIZATION_CONTROL_SEND_PCAS_ENABLE_TRUE;
-        // Eden-NX2's `!(native_registers[0xcc] & (1U << 12))`: a listed divergence.
+        // Eden-NX2's `!(native_registers[0xcc] & (1U << 12))`: method 0xCC is the inline QMD's
+        // word 4, and bit 12 of it is `REQUIRE_SCHEDULING_PCAS`, QMD bit 140 (`clc7c0qmd.h`
+        // line 504).
         let no_require_scheduling = get(&words, q::QMDV03_00_REQUIRE_SCHEDULING_PCAS)
             == q::QMDV03_00_REQUIRE_SCHEDULING_PCAS_FALSE;
         if send_pcas || no_require_scheduling {

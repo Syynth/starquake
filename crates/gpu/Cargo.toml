@@ -27,3 +27,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# `FakeWatchKernel`, for the buffer cache's tests (slice G16).
+starquake-memory = { workspace = true, features = ["test-support"] }

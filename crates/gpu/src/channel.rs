@@ -135,8 +135,8 @@
 //! - **Old-format method headers** (opcode 0 or 2 with tertiary opcode 0, [`MethodHeader::Legacy`])
 //!   run as methods with their data words, as `clc76f.h` defines them; Eden-NX2's
 //!   `ProcessCommands` skips modes 0 and 2 as single words (`old_format_headers_run_as_methods`).
-//!   The all-zero `NOP` word is one with a count of 0 and does nothing either way. This also
-//!   departs from the approved spec (next section).
+//!   The all-zero `NOP` word is one with a count of 0 and does nothing either way. This is the
+//!   spec's rule (next section).
 //! - **Opcode 7 ends the entry** (a guess, below). Eden-NX2 skips the word
 //!   (`end_segment_ends_the_entry_guess_item_9`).
 //! - **Semaphore address widths follow the header** (decision 10): `SEMAPHOREA` and
@@ -160,22 +160,20 @@
 //!   (`malformed_words_are_dropped_and_the_stream_goes_on`,
 //!   `an_unmapped_entry_stops_the_channel_for_good`).
 //!
-//! # Departure from the spec (owner question)
+//! # Opcodes 0 and 2
 //!
-//! gpu-protocol, "The method stream", says: "Subdevice-mask operations (opcodes 0 and 2) are
-//! single-GPU no-ops and are skipped." Its facts table likewise says "0 and 2 are
-//! subdevice-mask operations". This module skips only the words `clc76f.h` defines as
-//! subdevice-mask operations (opcode 0 with tertiary opcode 1–3,
+//! gpu-protocol, "The method stream", and its facts table read opcodes 0 and 2 through the
+//! tertiary opcode, as `clc76f.h` defines them (decided by the owner, 2026-11-18, under
+//! decision 10: follow the headers for layouts and field meanings). This module skips only the
+//! words `clc76f.h` defines as subdevice-mask operations (opcode 0 with tertiary opcode 1–3,
 //! [`MethodHeader::SubdeviceMask`], `subdevice_mask_operations_are_skipped`); opcode 2 with a
 //! non-zero tertiary opcode, and opcode 0 with an undefined subdevice-mask form, are dropped as
 //! [`DroppedWord::BadHeader`] (`malformed_words_are_dropped_and_the_stream_goes_on`). A word with
 //! opcode 0 or 2 and tertiary opcode 0 is an old-format method header in `clc76f.h`
 //! (`NVC76F_DMA_METHOD_ADDRESS_OLD`, `_COUNT_OLD`), and runs as one with its data words
-//! ([`MethodHeader::Legacy`], `old_format_headers_run_as_methods`). The reason is decision 10
-//! (follow the headers for layouts and field meanings). **Owner question:** keep this reading,
-//! and amend the spec sentence and the facts table to match, or skip every opcode 0 and 2 word
-//! as the spec says (Eden-NX2's behaviour), which would run an old-format header's data words
-//! as headers.
+//! ([`MethodHeader::Legacy`], `old_format_headers_run_as_methods`). Eden-NX2 skips every opcode
+//! 0 and 2 word, which runs an old-format header's data words as headers (a divergence listed
+//! above).
 //!
 //! # Guesses
 //!
