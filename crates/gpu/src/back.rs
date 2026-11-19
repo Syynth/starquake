@@ -8,10 +8,13 @@
 //! - [`qmd`]: compute dispatch through QMD 3.0 (slice G12): decoding a QMD, the PCAS scheduler
 //!   and its one QMD table for all channels, the inline QMD, and the releases a QMD makes.
 //! - [`state`]: the engine mirrors, their dirty state groups and typed views (slice G10).
+//! - [`buffer`]: the buffer cache (slice G16): guest ranges to host buffers, kept coherent with
+//!   CPU writes through the write watch, dropped by ordered unmaps, evicted by the budget.
 //!
 //! Later slices add fences and completion (G15), draws (G18) and the executor that feeds them
 //! all from the ring (G19).
 
+pub mod buffer;
 pub mod copy;
 pub mod qmd;
 pub mod state;
