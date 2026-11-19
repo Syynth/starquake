@@ -385,3 +385,36 @@ fn a_catch_up_finds_a_report_release_in_its_channels_address_space() {
     assert_eq!((read(sequence), rig.exec.counters().catch_ups), (5, 1));
 }
 
+#[test]
+fn a_report_to_address_0_is_logged_once_per_channel_and_each_failure_counted() {
+    // Three reports to address 0 on each of two channels, then two to another unmapped
+    // address: each of the eight fails and is counted; the first to address 0 on each channel
+    // is a warning, the later ones to address 0 are at debug level, and the other address
+    // warns every time.
+    const UNMAPPED: u64 = 0x7_0000_0000;
+    let mut rig = Rig::new();
+    let three = one_word(0, PAYLOAD).repeat(3);
+    let other = "bind channel=9 subchannel=0 class=0xc797\n".to_owned()
+        + &three.replace("channel=3 ", "channel=9 ");
+    let ((), events) = captured(|| {
+        rig.run(&(String::from(BIND) + &three));
+        rig.run(&other);
+        rig.run(&one_word(UNMAPPED, PAYLOAD).repeat(2));
+    });
+    assert_eq!(rig.exec.fences().counters().failed_releases, 8);
+    let failed = |level, address: &str| {
+        at(&events, level)
+            .iter()
+            .filter(|e| e.contains("fenced release failed") && e.contains(address))
+            .count()
+    };
+    assert_eq!(
+        (
+            failed(tracing::Level::WARN, "address 0x0 "),
+            failed(tracing::Level::DEBUG, "address 0x0 "),
+            failed(tracing::Level::WARN, "address 0x700000000 "),
+        ),
+        (2, 4, 2),
+        "{events:?}"
+    );
+}

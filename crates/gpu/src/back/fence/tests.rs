@@ -424,6 +424,7 @@ impl Rig {
             memory: Arc::<Memory>::clone(&self.mem),
             space: SPACE,
             release,
+            failure: FailureLog::Warn,
         }
     }
 
@@ -1847,6 +1848,7 @@ fn a_release_latches_and_closes_only_for_its_own_address_space() {
         memory: Arc::<Memory>::clone(&r.mem),
         space: other,
         release: four(SEM, 4),
+        failure: FailureLog::Warn,
     };
     r.fences.record(command(2)).unwrap();
     assert_eq!(

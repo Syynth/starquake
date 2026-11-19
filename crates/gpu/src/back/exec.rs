@@ -142,6 +142,16 @@
 //! an `ACQUIRE` or a `TRAP` does nothing. `back::report` has the fields, the reference and the
 //! divergences. Pinned in `tests/report.rs`.
 //!
+//! The native SDK writes a payload report to GPU address 0, which the title seen had not
+//! mapped, and may do so at every queue flush. Such a release fails when it is performed, as
+//! any release to an unmapped address does (`back::fence`, "A failed release is reported and
+//! skipped"), and every failure is counted
+//! ([`crate::back::fence::FenceCounters::failed_releases`]); but only the channel's first
+//! report release to address 0 is logged at warning level, and later ones of that channel at
+//! debug level ([`FailureLog::Debug`]), so a title that writes one per flush does not fill the
+//! log. A failed release to any other address warns every time.
+//! `tests::report::a_report_to_address_0_is_logged_once_per_channel_and_each_failure_counted`.
+//!
 //! # Conditional rendering
 //!
 //! Before the draw path reads a conditional-render report (`SET_RENDER_ENABLE_C` written with a
@@ -242,7 +252,7 @@ use crate::back::draw::clear::CLEAR_METHODS;
 use crate::back::draw::conditional;
 use crate::back::draw::shaders::{HostShaders, ShaderLookup};
 use crate::back::draw::{DrawContext, DrawError, Draws, WaitWhileCompiling};
-use crate::back::fence::{CloseReason, FenceError, FencedAction, Fences, Settled};
+use crate::back::fence::{CloseReason, FailureLog, FenceError, FencedAction, Fences, Settled};
 use crate::back::pipeline::PipelineCache;
 use crate::back::qmd::{LAST_INLINE_QMD_METHOD, QMD_BYTES, QmdError, QmdTable, inline_qmd_address};
 use crate::back::readback::ReadbackIds;
@@ -503,6 +513,9 @@ struct Channel {
     space: AsId,
     bound: [Option<ClassId>; SUBCHANNELS],
     engines: BTreeMap<ClassId, Engine>,
+    /// Whether a report semaphore release to GPU address 0 has been attached for this channel
+    /// (module docs, "Report semaphores").
+    zero_report_seen: bool,
 }
 
 impl Channel {
@@ -617,6 +630,7 @@ impl Executor {
             space,
             bound: [None; SUBCHANNELS],
             engines: BTreeMap::new(),
+            zero_report_seen: false,
         };
         for (index, slot) in (0u8..).zip(state.bound.iter_mut()) {
             *slot = Subchannel::new(index).and_then(initial_binding);
@@ -843,6 +857,7 @@ impl Executor {
                         memory,
                         space,
                         release: *release,
+                        failure: FailureLog::Warn,
                     })
                 });
                 self.then_deferred(own, deferred)
@@ -1229,12 +1244,14 @@ impl Executor {
         let class = ClassId(clc797::CLASS);
         match report::decide(&self.engine_mut(channel, class)?.mirror)? {
             ReportAction::Release(release) => {
+                let failure = self.report_failure_log(channel, release.address);
                 let deferred = self.flush_deferred(Some(channel));
                 let own = self.memory(space).and_then(|memory| {
                     self.attach(FencedAction::Release {
                         memory,
                         space,
                         release,
+                        failure,
                     })
                 });
                 self.then_deferred(own, deferred)
@@ -1251,6 +1268,22 @@ impl Executor {
                 Ok(())
             }
             ReportAction::Nothing => Ok(()),
+        }
+    }
+
+    /// The level at which a failure of `channel`'s report semaphore release to `address` is
+    /// logged: debug for a release to GPU address 0 after the channel's first, warning
+    /// otherwise (module docs, "Report semaphores").
+    fn report_failure_log(&mut self, channel: ChannelId, address: u64) -> FailureLog {
+        let repeat = address == 0
+            && self
+                .channels
+                .get_mut(&channel)
+                .is_some_and(|state| std::mem::replace(&mut state.zero_report_seen, true));
+        if repeat {
+            FailureLog::Debug
+        } else {
+            FailureLog::Warn
         }
     }
 
@@ -1330,6 +1363,7 @@ impl Executor {
                 memory: Arc::clone(&memory),
                 space,
                 release,
+                failure: FailureLog::Warn,
             };
             if let Err(error) = fences.attach(action)
                 && attached.is_ok()

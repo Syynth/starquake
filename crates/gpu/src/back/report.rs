@@ -83,7 +83,9 @@
 //! - **A release whose address is not mapped is a failed release**, found when it is performed
 //!   and logged and counted there (`back::fence`, "A failed release is reported and skipped").
 //!   Eden-NX2 drops it when it is asked for (`GpuToCpuAddress` gives nothing), without a word.
-//!   The native SDK does write one to address 0.
+//!   The native SDK does write one to address 0, and may at every flush: a failure of a
+//!   channel's second and later releases to address 0 is logged at debug level, not as a
+//!   warning (`back::exec`, "Report semaphores").
 //! - **The deferred instances are drawn first**, as before a `Release` entry (`back::exec`,
 //!   "Deferred instanced draws"); Eden-NX2 has drawn them by the end of the macro.
 //!
