@@ -56,8 +56,10 @@
 //! had been written alone.
 //!
 //! **Order** (spec, "Ordering guarantees" 1): entries go to the sink in the order the words were
-//! written, a trigger's entry before its side-effect writes, and those in the order of the
-//! class's list.
+//! written, and a trigger's entry before its side-effect writes. Each trigger in
+//! [`SIDE_EFFECTS_3D`] and [`SIDE_EFFECTS_COMPUTE`] has one rule today, so the order among one
+//! trigger's side-effect writes (the order of the class's list) shows only once a trigger has
+//! two, and no test pins it yet.
 //!
 //! # Divergences
 //!
@@ -91,11 +93,16 @@
 //! - **The constant-buffer offset wraps within its field.** Eden adds to the whole register;
 //!   here the offset advances within `LOAD_CONSTANT_BUFFER_OFFSET_V` (15:0) and the bits above
 //!   are kept. `constant_buffer_offset_wraps_within_its_field`.
-//! - **The root table offset wraps.** PR #4588 keeps the offset in a private variable, which
-//!   reaches 256 after the 64th word and refuses loads until the next select; here it lives in
-//!   the selector's 8-bit `OFFSET` field, so after 252 it wraps to 0 (**guess**; a trace of a
-//!   65-word root table load would settle it). An offset that is not a multiple of 4 does not
-//!   advance, as PR's `Load` refuses it. `root_table_offset_advances`.
+//! - **The root table offset lives in the selector register, and wraps.** PR #4588 keeps the
+//!   offset in a private variable (`NativeRootTables::offset`,
+//!   `eden-pr4588/src/video_core/native_root_table.h`) and leaves `SET_ROOT_TABLE_SELECTOR`
+//!   (method 0x141) as written, since its `Select` only reads the word. Here the selector's
+//!   `OFFSET` field (15:8) advances instead, so a macro `state` read of 0x141 after a load sees
+//!   the advanced offset where PR #4588 shows the written one. PR #4588's variable reaches 256
+//!   after the 64th word and refuses loads until the next select; here the 8-bit field wraps to
+//!   0 after 252 (**guess**; a trace of a 65-word root table load would settle it). An offset
+//!   that is not a multiple of 4 does not advance, as PR's `Load` refuses it (`offset % 4`).
+//!   `root_table_offset_advances` (which asserts the selector register after each load).
 //! - **Nothing is dropped for compute or the other classes**, as Eden-NX2's compute front sends
 //!   every write; their state tables are empty. `compute_and_other_classes_drop_nothing`.
 //!

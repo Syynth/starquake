@@ -167,7 +167,10 @@ pub struct SideEffect {
 /// 4. each `LOAD_ROOT_TABLE` word advances the `OFFSET` field (15:8) of
 ///    `SET_ROOT_TABLE_SELECTOR` by 4 bytes when it is a multiple of 4 (`NativeRootTables::Load`,
 ///    `eden-pr4588/src/video_core/native_root_table.h`, which keeps the offset in a private
-///    variable instead; the wrap after 252 is a **guess**, see the module docs of `regs`).
+///    variable instead and leaves the selector register as written, so a macro reading method
+///    0x141 after a load sees the advanced offset here and the written one there; the wrap after
+///    252 is a **guess**; both are divergences in the module docs of `regs`, pinned by
+///    `root_table_offset_advances`).
 ///
 /// The macro upload pointer is not here: see "Divergences" in the `regs` module docs.
 pub const SIDE_EFFECTS_3D: &[SideEffect] = &[

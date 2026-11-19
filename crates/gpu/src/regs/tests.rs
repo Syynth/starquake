@@ -340,10 +340,12 @@ fn side_effect_lists_are_the_fixtures_below() {
             clc7c0::LOAD_MME_START_ADDRESS_RAM_POINTER.method()
         )]
     );
-    assert!(std::ptr::eq(
-        SIDE_EFFECTS_COMPUTE[0].trigger.method(),
-        &clc7c0::LOAD_MME_START_ADDRESS_RAM
-    ));
+    // By value, not address: each `&CONST` is its own promoted value, and whether two of them
+    // share an address depends on codegen units (it failed under incremental builds on macOS).
+    assert_eq!(
+        *SIDE_EFFECTS_COMPUTE[0].trigger.method(),
+        clc7c0::LOAD_MME_START_ADDRESS_RAM
+    );
     assert_eq!(THREE_D.side_effects(), SIDE_EFFECTS_3D);
     assert_eq!(COMPUTE.side_effects(), SIDE_EFFECTS_COMPUTE);
     assert_eq!(OTHER.side_effects().len(), 0);
@@ -465,6 +467,10 @@ fn root_table_offset_advances() {
         (WORD_BYTES - 1, None),
         (WORD_BYTES, Some(2 * WORD_BYTES)),
         (WORD_BYTES + 1, None),
+        // Even but not word-aligned: an alignment of 2 would advance these.
+        (WORD_BYTES / 2, None),
+        (WORD_BYTES + WORD_BYTES / 2, None),
+        (field.max() + 1 - WORD_BYTES - WORD_BYTES / 2, None),
         (
             field.max() - 2 * WORD_BYTES + 1,
             Some(field.max() - WORD_BYTES + 1),
@@ -583,7 +589,8 @@ fn unknown_method_is_a_trigger() {
 fn state_array_ends_at_its_length() {
     let span = STATE_3D
         .iter()
-        .find(|span| std::ptr::eq(span.method(), &clc797::SET_VERTEX_STREAM_SIZE_A))
+        // By value, not address (see `side_effect_lists_are_the_fixtures_below`).
+        .find(|span| *span.method() == clc797::SET_VERTEX_STREAM_SIZE_A)
         .unwrap();
     let last = clc797::SET_VERTEX_STREAM_SIZE_A
         .method_at(&[span.count() - 1])
@@ -721,6 +728,30 @@ fn long_run_splits_at_the_entry_limit() {
             write(offset(), (limit + 1) * WORD_BYTES),
         ]
     );
+}
+
+#[test]
+fn each_chunk_reports_the_offset_it_ends_on() {
+    let words: Vec<u32> = (1..).take(2 * MAX_RUN_WORDS).collect();
+    let limit = u32::try_from(MAX_RUN_WORDS).unwrap();
+    let field = clc797::LOAD_CONSTANT_BUFFER_OFFSET_V;
+    // Two full chunks advance the offset by exactly its field's range, so the second chunk ends
+    // on the offset the run started from: its `Write` shows only if each chunk compares with
+    // its own starting value.
+    assert_eq!(2 * limit * WORD_BYTES, field.max() + 1);
+    let start = 0x10;
+    let mut file = three_d();
+    send(&mut file, offset(), start);
+    assert_eq!(
+        send_run(&mut file, constant_buffer(1), &words),
+        [
+            run(constant_buffer(1), &words[..MAX_RUN_WORDS]),
+            write(offset(), start + limit * WORD_BYTES),
+            run(constant_buffer(1), &words[MAX_RUN_WORDS..]),
+            write(offset(), start),
+        ]
+    );
+    assert_eq!(file.get(offset()), Some(start));
 }
 
 #[test]
@@ -1154,6 +1185,13 @@ fn method_spans_contain_exactly_their_elements() {
     let scalar = MethodSpan::array(&clc797::SET_ALPHA_REF, 2);
     assert_eq!(scalar.numbers().collect::<Vec<_>>(), [state()]);
     assert!(!scalar.contains(state() + 1));
+    // A count of zero: no element, for a method that is not an array and for an array.
+    let empty_scalar = MethodSpan::array(&clc797::SET_ALPHA_REF, 0);
+    assert_eq!(empty_scalar.numbers().count(), 0);
+    assert!(!empty_scalar.contains(state()));
+    let empty_array = MethodSpan::array(&clc797::LOAD_CONSTANT_BUFFER, 0);
+    assert_eq!(empty_array.numbers().count(), 0);
+    assert!(!empty_array.contains(first));
     // Two indices: no element.
     let two = MethodSpan::array(&clc797::SET_STREAM_OUT_LAYOUT_SELECT, 2);
     assert_eq!(two.numbers().count(), 0);
