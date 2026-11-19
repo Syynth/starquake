@@ -620,6 +620,29 @@ Landed: G19 (the back-thread executor, #330, PR #408; #330 stays open for host c
 | proposed | **nvdisasm check (E2)** of BRX/BRXU, CALL, RET, DEPBAR and BAR 0xb1d, whose encodings come from PR #4588 alone; JMX and BPT have no encoding source; BAR 0x31d and some WARPSYNC/NANOSLEEP forms wait for an E4 census | #358 | area:shader (M4) |
 | proposed | **Hand check of a real window** on a Mac and a Linux desktop (resize, the main-thread layer), with R12's `--window` (noted on #389) | #385 | area:render |
 
+### From wave 42 (ledger: #22)
+
+Landed: G21 (the `Gpu` front, its threads and wiring, #332, PR #414), R7 (draws and dispatches, #384, PR #415), shader slice 3 (program capture, #350, PR #410) and decoder slices 6a, 6b and 6g (#351, #352, #357; PRs #413, #412, #411). G21 built `Gpu` but no run constructs one yet; the lead moved that wiring into R9b (#386: `Gpu` in `machine.rs`, `gpu.txt`, GPU counters in `summary.json`, a dead-thread error), under delegation, and corrected R12's overlap note (#389). Decoder notes are comments on #353 to #356, #364 and #370.
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| awaiting the owner | **Guest y-flips and depth remaps:** wgpu cannot set a negative viewport height or a reversed or out-of-range depth range, so R7 refuses those draws, and guest y-flips are likely common. Recommendation: an `EmulationFlags` field and a driver constant that flips y and remaps depth in the vertex shader (slice 17), with the backend setting the host viewport positive | #384 | render-backend, shader-pipeline |
+| awaiting the owner | **The release timestamp** (the 16-byte semaphore release) is host monotonic nanoseconds, not "guest time" as gpu-protocol says, so replay diverges. Recommendation: guest time from the kernel's clock through the `Gpu`'s config | #332 | gpu-protocol |
+| awaiting the owner | **Idleness and the poll:** `Gpu::is_idle` waits up to `IDLE_POLL_WAIT` (10 ms) for a poll that started after the look when a channel waits on a satisfied acquire, holding core's idle lock; if the host does not run the front thread in time, the answer is "busy" | #332 | gpu-protocol |
+| awaiting the owner | **Address-space lifetime:** `GpuFront` has no `destroy_address_space`, so spaces are never forgotten; presents read through the first space made (a guess); the present space after a destroy is undefined | #332 | gpu-protocol |
+| awaiting the owner | **Restore and replay under a real `Gpu`:** the front has no snapshot, so a restored run can only use the null front | #332 | gpu-protocol, observability |
+| proposed | **G21 smaller choices:** `GpuFront` is supertraits rather than one trait; `bind_class` checks only that the channel is live; the xtask allowlist test now accepts an empty list (check that this does not weaken the gate) | #332 | area:gpu |
+| proposed | **Channel errors do not reach the guest:** nvsrv does not poll `GpuFront::channel_error` or signal the error-notifier events (ids 3 and 7) | #332 | area:services |
+| proposed | **Counters and recorder hooks the spec promises but no slice builds:** same-value drops, macro calls, memo hits, ring peak occupancy, acquires parked and resumed with the value seen, macro errors (needs hooks inside the front's lanes) | #332 | area:gpu |
+| proposed | **The kernel half of `WriteWatch` is unbuilt,** so in production the back thread reads guarded ranges again at each use | #332 | area:kernel |
+| awaiting the owner | **Decoder framework:** `ReferenceRow` can only drop or require bits, so NAK's F16 swizzle at bit 60 cannot be decoded (F2F, FRND, MUFU, F2I, and 6c and 6d), and every form's bare word must decode, so F8 and FMUL scale 0 decode where PR #4588 refuses them. Recommendation: add known bits with their own divergence accounting and a per-form canonical word, as a small slice before 6c (#353) and 6d (#354) | #351, #352 | shader-pipeline |
+| awaiting the owner | **Integer encodings where NAK and PR #4588 conflict:** the SHF type field (NAK: 0 I64, 1 U64, 2 I32, 3 U32; PR #4588: 1 U32, 2 S64, 3 U64, 0 refused); IADD3.X and LEA.X at bit 74 in forms 2, 3 and 7; carry inputs without `.X`; IDP.2A at bit 76 from PR #4588. The decoder follows NAK. Recommendation: keep NAK until the nvdisasm check (E2) | #351 | shader-pipeline |
+| awaiting the owner | **OUT.FINAL and ISBEWR:** OUT.FINAL keeps the dst and stream fields NAK writes as RZ instead of refusing other values; ISBEWR accepts NAK's set where PR #4588 accepts only `.o.attr.32` (left to 12g, noted on #370) | #357 | shader-pipeline |
+| proposed | **nvdisasm (E2) and census (E4) for wave 42's decoders:** IMAD.HI, P2R/R2P, IMAD.X, LEA.SX32, IDP.2A, FSEL, I2FP, FMNMX `.NAN`, F2FP `.MERGE_C`, FMUL scale codes, CS2R, S2UR, IPA, PIXLD, the special-register spellings; FADD forms 4 to 6 and forms 2, 3 and 7 of several groups are unknown opcodes until a census shows they occur. Extends wave 41's row | #351, #352, #357 | area:shader (M4) |
+| proposed | **Decoder tidy-up:** `SOURCE_1_FORMS`, `SOURCE_1_ONLY`, `COND`, `COND_NOT`, `PRED_DST` and `UNIFORM_DST` live in `op::control` but are shared; move them to `fields` or `alu`. `integer::MOV_FORMS` duplicates `SOURCE_1_FORMS` | #352, #357 | area:shader |
+| proposed | **R7 refusals and gaps:** indirect draws that need an index rewrite; binding arrays (`Binding` has no array element, a gap in the render crate's command); feedback draws (read-only depth attachments would allow some); 16-bit strip draws cost a compute pass and a pass break (an index format in the pipeline key would avoid it); `MAX_INDIRECT_DRAWS` = 4096 is a guess; no bind group cache; rewrite scratch is not counted in `budget()`; the rewrite shader lives in render-wgpu, not `host_shaders`; Metal's list-topology restart and quad-strip winding are unverified | #384 | area:render |
+| awaiting the owner | **render-backend errata from R7:** the typed-output row is settled (wgpu demands typed outputs); the pass-close sentence ("when a copy or readback touches an attachment") cannot hold under wgpu, which needs every non-draw command outside a pass. R6's claim that wgpu restarts strips with no index format held on Metal only; R7 sets `Uint32` | #384 | render-backend |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
@@ -906,3 +929,11 @@ passed to build agents as a provisional rule for the next wave.
 - Hostile-input bounds cover nesting depth, with a named constant tested at the limit and one past it.
 - Items a reader holds back from a hostile file count toward the same bound as live items.
 - A claim naming a set is checked against the code and the reference, with each refused case listed as a divergence.
+
+### From wave 42 (ledger: #22)
+
+- Idle and busy flags are set before any work a turn starts and cleared only after the counters they are compared with are stored.
+- A shutdown path drains or explicitly discards published work, and says which.
+- Recorded event payloads are capped in size, not only in number.
+- Every arm of a path split by mode applies the sibling arm's validations, or lists the gap as a divergence.
+- A state-closing step (close a pass, flush) runs before any early return or skip.
