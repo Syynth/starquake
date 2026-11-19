@@ -25,7 +25,7 @@ use starquake_render::{
 };
 
 use super::*;
-use crate::interface::{ChannelId, Kind, Target};
+use crate::interface::{AsId, ChannelId, Kind, Target};
 use crate::memory::TestGpuMemory;
 use crate::ring::{ClassId, ring};
 use crate::sema::{
@@ -48,6 +48,9 @@ const GPU_END: u64 = GPU_BASE + PAGES * PAGE_SIZE;
 const SEM: u64 = GPU_BASE + 0x100;
 /// A second semaphore, on another page.
 const SEM2: u64 = GPU_BASE + PAGE_SIZE + 0x40;
+/// The address space the rig's releases are issued in and its waiters belong to: not 0, so a
+/// hard-coded space fails.
+const SPACE: AsId = AsId(0x5a);
 /// A GPU address nothing maps.
 const UNMAPPED: u64 = 0x7_0000_0000;
 /// The byte the guest memory is filled with, so bytes a release must not touch are visible.
@@ -409,6 +412,7 @@ impl Rig {
     fn action(&self, release: Release) -> FencedAction {
         FencedAction::Release {
             memory: Arc::<Memory>::clone(&self.mem),
+            space: SPACE,
             release,
         }
     }
@@ -512,6 +516,7 @@ fn a_new_fence_path_has_nothing_recorded_in_flight_or_counted() {
                 wait_for_idle: 0,
                 waiter: 0,
                 elapsed: 0,
+                set_reference: 0,
             },
             lost_wakes: 0,
             failed_releases: 0,
@@ -797,6 +802,7 @@ fn each_close_reason_is_counted_on_its_own() {
         CloseReason::WaitForIdle,
         CloseReason::Waiter,
         CloseReason::Elapsed,
+        CloseReason::SetReference,
     ];
     for reason in reasons {
         let mut r = rig();
@@ -809,6 +815,7 @@ fn each_close_reason_is_counted_on_its_own() {
             CloseReason::WaitForIdle => expected.wait_for_idle = 1,
             CloseReason::Waiter => expected.waiter = 1,
             CloseReason::Elapsed => expected.elapsed = 1,
+            CloseReason::SetReference => expected.set_reference = 1,
         }
         assert_eq!(r.fences.counters().closed, expected, "{reason:?}");
     }
@@ -826,6 +833,7 @@ fn closing_a_list_with_no_commands_submits_nothing() {
 fn a_release_a_channel_waits_on_closes_the_open_list() {
     let mut r = rig();
     r.waiters.register(Waiter {
+        space: SPACE,
         channel: ChannelId(3),
         address: SEM,
         op: AcquireOp::Equal,
@@ -851,18 +859,20 @@ fn actions_nobody_waits_on_leave_the_list_open() {
     // waiter's syncpoint-free address: none closes the list.
     let mut r = rig();
     r.waiters.register(Waiter {
+        space: SPACE,
         channel: ChannelId(1),
         address: SEM + 4,
         op: AcquireOp::Equal,
         payload: 1,
     });
     r.waiters.register(Waiter {
+        space: SPACE,
         channel: ChannelId(2),
         address: SEM2,
         op: AcquireOp::Equal,
         payload: 1,
     });
-    assert!(r.waiters.on_write(SEM2, 1));
+    assert!(r.waiters.on_write(SPACE, SEM2, 1));
     r.fences.record(command(1)).unwrap();
     for action in [
         r.action(four(SEM, 1)),
@@ -1077,6 +1087,7 @@ fn a_refused_list_hands_its_actions_to_the_newest_list_not_the_oldest() {
 fn a_refused_close_for_a_waiter_performs_the_release() {
     let mut r = rig();
     r.waiters.register(Waiter {
+        space: SPACE,
         channel: ChannelId(4),
         address: SEM,
         op: AcquireOp::Equal,
@@ -1212,6 +1223,7 @@ fn a_release_latches_the_waiters_its_value_meets() {
     let mut r = rig();
     // Met by the payload.
     r.waiters.register(Waiter {
+        space: SPACE,
         channel: ChannelId(3),
         address: SEM,
         op: AcquireOp::Equal,
@@ -1219,6 +1231,7 @@ fn a_release_latches_the_waiters_its_value_meets() {
     });
     // Met only by the reduced value (8 + 2), not the payload.
     r.waiters.register(Waiter {
+        space: SPACE,
         channel: ChannelId(4),
         address: SEM2,
         op: AcquireOp::GreaterOrEqual,
@@ -1226,6 +1239,7 @@ fn a_release_latches_the_waiters_its_value_meets() {
     });
     // Met by the low word of an 8-byte payload whose high word differs.
     r.waiters.register(Waiter {
+        space: SPACE,
         channel: ChannelId(5),
         address: SEM + 0x20,
         op: AcquireOp::Equal,
@@ -1723,5 +1737,125 @@ fn the_late_backend_meets_the_wake_contract() {
     assert_eq!(
         check_completion_wake(&silent, &wakes, 1, Duration::from_millis(5)),
         Err(WakeContractError::NoWake { list: 0, fence: 1 })
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Waiters keyed by address space, and every word of a wide release (slice G14)
+// ---------------------------------------------------------------------------------------------
+
+fn waiter_on(channel: u32, space: AsId, address: u64, payload: u32) -> Waiter {
+    Waiter {
+        channel: ChannelId(channel),
+        space,
+        address,
+        op: AcquireOp::Equal,
+        payload,
+    }
+}
+
+fn eight(address: u64, payload: u64) -> Release {
+    Release {
+        form: ReleaseForm {
+            size: PayloadSize::Eight,
+            timestamp: false,
+        },
+        ..four(address, payload)
+    }
+}
+
+/// The report of an action performed at once.
+fn performed(attached: Result<Attached, FenceError>) -> Report {
+    match attached {
+        Ok(Attached::Performed(report)) => report,
+        other => panic!("not performed at once: {other:?}"),
+    }
+}
+
+#[test]
+fn a_wide_release_latches_a_waiter_on_its_high_word() {
+    // An 8-byte release at SEM writes the words at SEM and SEM + 4: a waiter on each word is
+    // latched by that word's value, and one on the word after (SEM + 8, the next neighbour) is
+    // not, though its payload is the release's low word.
+    let mut r = rig();
+    r.waiters.register(waiter_on(1, SPACE, SEM, 0x5566_7788));
+    r.waiters.register(waiter_on(2, SPACE, SEM + 4, 0x1122_3344));
+    r.waiters.register(waiter_on(3, SPACE, SEM + 8, 0x5566_7788));
+    let report = performed(r.fences.attach(r.action(eight(SEM, 0x1122_3344_5566_7788))));
+    assert!(report.latched);
+    assert!(r.waiters.is_latched(ChannelId(1)));
+    assert!(r.waiters.is_latched(ChannelId(2)));
+    assert!(!r.waiters.is_latched(ChannelId(3)));
+
+    // A 4-byte release writes only its own word: a waiter on SEM + 4 is not latched by it,
+    // whatever the payload's high half.
+    let mut r = rig();
+    r.waiters.register(waiter_on(4, SPACE, SEM + 4, 0x1122_3344));
+    let report = performed(r.fences.attach(r.action(four(SEM, 0x1122_3344_5566_7788))));
+    assert!(!report.latched);
+    assert!(!r.waiters.is_latched(ChannelId(4)));
+
+    // The 16-byte structure covers four words: the timestamp's halves at SEM + 8 and SEM + 12.
+    let mut r = rig();
+    let [t0, t1, t2, t3, t4, t5, t6, t7] = TIMESTAMP.to_le_bytes();
+    r.waiters
+        .register(waiter_on(5, SPACE, SEM + 12, u32::from_le_bytes([t4, t5, t6, t7])));
+    r.waiters
+        .register(waiter_on(6, SPACE, SEM + 8, u32::from_le_bytes([t0, t1, t2, t3])));
+    let release = Release {
+        form: ReleaseForm {
+            size: PayloadSize::Eight,
+            timestamp: true,
+        },
+        ..four(SEM, 1)
+    };
+    let report = performed(r.fences.attach(r.action(release)));
+    assert!(report.latched);
+    assert!(r.waiters.is_latched(ChannelId(5)));
+    assert!(r.waiters.is_latched(ChannelId(6)));
+}
+
+#[test]
+fn a_waiter_on_a_wide_releases_high_word_closes_the_open_list() {
+    // A waiter on SEM + 4: an 8-byte release at SEM closes the open list for it, a 4-byte one
+    // does not.
+    let mut r = rig();
+    r.waiters.register(waiter_on(1, SPACE, SEM + 4, 9));
+    r.fences.record(command(1)).unwrap();
+    assert_eq!(
+        r.fences.attach(r.action(four(SEM, 9 << 32))),
+        Ok(Attached::Open)
+    );
+    assert_eq!(
+        r.fences.attach(r.action(eight(SEM, 9 << 32))),
+        Ok(Attached::InFlight(FenceValue::new(1)))
+    );
+    assert_eq!(r.fences.counters().closed.waiter, 1);
+}
+
+#[test]
+fn a_release_latches_and_closes_only_for_its_own_address_space() {
+    // A waiter of another address space on the release's address: the release neither closes
+    // the open list for it nor latches it.
+    let mut r = rig();
+    let other = AsId(SPACE.0 + 1);
+    r.waiters.register(waiter_on(1, other, SEM, 4));
+    r.fences.record(command(1)).unwrap();
+    assert_eq!(r.fences.attach(r.action(four(SEM, 4))), Ok(Attached::Open));
+    let fence = r.fences.close(CloseReason::Present).unwrap().unwrap();
+    r.backend.finish(fence);
+    let report = r.fences.complete();
+    assert!(!report.latched);
+    assert!(!r.waiters.is_latched(ChannelId(1)));
+    // The same release issued in the waiter's space closes the list for it.
+    let action = FencedAction::Release {
+        memory: Arc::<Memory>::clone(&r.mem),
+        space: other,
+        release: four(SEM, 4),
+    };
+    r.fences.record(command(2)).unwrap();
+    assert_eq!(
+        r.fences.attach(action),
+        Ok(Attached::InFlight(FenceValue::new(2)))
     );
 }
