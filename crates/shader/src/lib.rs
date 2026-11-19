@@ -66,10 +66,15 @@
 //! [`program::graphics_program_ir`] runs a graphics program's bytes through the header, the
 //! translator, the slice 8 passes and collect info.
 //!
+//! Slice 19 is the shader cache ([`cache`]): the address map, program entries and shader
+//! entries, invalidation by guest range, the negative cache, and translations queued on the
+//! shared compile pool behind tickets, driven through a translator seam until slice 17.
+//!
 //! Experiment E1, run before this slice, lives in `lower`'s tests and its results in the spec.
 
 #[cfg(feature = "test-support")]
 pub mod asm;
+pub mod cache;
 pub mod capture;
 pub mod decode;
 pub mod driver_constants;
