@@ -137,13 +137,6 @@ impl Writer {
 
     /// Sets `field` to `value` in two's complement, which must be in the field's signed range
     /// (`width` from 1 to 64; a zero-width field holds no value).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the memory and control slices' offsets are its first users"
-        )
-    )]
     pub(crate) fn signed(
         &mut self,
         field: Field,
@@ -184,13 +177,6 @@ impl Writer {
     }
 
     /// Sets a uniform predicate field and its negation bit (`set_upred_src`).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the uniform datapath slice (6d) is its first user"
-        )
-    )]
     pub(crate) fn uniform_pred_src(&mut self, reg: Field, not: Field, src: UniformPredSrc) {
         self.set(reg, u64::from(src.reg.index()));
         self.flag(not, src.negated);
