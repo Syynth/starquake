@@ -35,13 +35,14 @@
 //!    ([`FrontShared::take`]). Markers the back reported end `SYNC_WAIT`s and catch-ups (the
 //!    waiting macro call runs again then).
 //! 2. Applies the requests in call order: address spaces and channels are made, submissions go
-//!    into their channel's queue, updates and barriers record their channels' positions, and
+//!    into their channel's queue, updates, barriers and presents record their channels'
+//!    positions (`ordered`), and
 //!    destroyed channels are dropped (their waiter removed, their process's upload record of
 //!    them forgotten, [`ProcessMacros::forget_channel`]).
 //! 3. Rechecks every waiting channel if the back reported a release or an increment, a
 //!    submission arrived, or the poll is due (spec, "Semaphore acquires", step 3). A latched
 //!    acquire resumes at once, even if the word has moved on (row 70).
-//! 4. Emits every ordered update that is ready (`ordered`).
+//! 4. Emits every ordered update, barrier and present that is ready (`ordered`).
 //! 5. Runs every runnable channel once, round robin from the channel after the one that ran
 //!    first in the previous turn, each for up to [`QUANTUM`] words.
 //! 6. Emits ordered updates again (channels may have finished the submissions they waited for),

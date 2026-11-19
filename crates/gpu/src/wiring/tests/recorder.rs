@@ -48,10 +48,9 @@ fn an_empty_recorder_writes_nothing_but_the_stopped_channels() {
     );
 }
 
-#[test]
-fn each_event_is_written_in_plain_words() {
-    let range = PageRange::new(0x10_0000, 0x2000).unwrap();
-    let cases = [
+/// The events about spaces, channels and submissions, each with its text.
+fn call_cases() -> Vec<(GpuEvent, &'static str)> {
+    vec![
         (
             GpuEvent::SpaceMade { space: AsId(4) },
             "address space 4 made",
@@ -95,6 +94,19 @@ fn each_event_is_written_in_plain_words() {
             "submission on channel 2: 0 entries, 0 increments: queued",
         ),
         (
+            GpuEvent::ChannelDestroyed {
+                channel: ChannelId(2),
+            },
+            "channel 2 destroyed",
+        ),
+    ]
+}
+
+/// The events about updates, the back's work and completions, each with its text.
+fn work_cases() -> Vec<(GpuEvent, &'static str)> {
+    let range = PageRange::new(0x10_0000, 0x2000).unwrap();
+    vec![
+        (
             GpuEvent::Update {
                 space: AsId(4),
                 update: VmUpdate::Unmap { range },
@@ -137,12 +149,6 @@ fn each_event_is_written_in_plain_words() {
         ),
         (barrier(11), "barrier, ticket 11"),
         (
-            GpuEvent::ChannelDestroyed {
-                channel: ChannelId(2),
-            },
-            "channel 2 destroyed",
-        ),
-        (
             GpuEvent::Performed {
                 released: 2,
                 incremented: 3,
@@ -173,8 +179,12 @@ fn each_event_is_written_in_plain_words() {
             }),
             "pushed: channel 2 has queue room",
         ),
-    ];
-    for (event, text) in cases {
+    ]
+}
+
+#[test]
+fn each_event_is_written_in_plain_words() {
+    for (event, text) in call_cases().into_iter().chain(work_cases()) {
         assert_eq!(event.to_string(), text);
     }
     // A present is written as its ring entry's text.

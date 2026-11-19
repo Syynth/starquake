@@ -152,8 +152,8 @@
 //! # Presents
 //!
 //! A present names no address space ([`PresentRequest`] carries only a GPU address), so presents
-//! read through the space [`Executor::set_present_space`] names; the wiring (slice G21) sets the
-//! title's. A **guess**: one GPU address space per title. The image is a block-linear 2D image
+//! read through the space [`Executor::set_present_space`] names; the wiring (slice G21,
+//! `crate::wiring`) sets it to the first address space made. A **guess**: one GPU address space per title. The image is a block-linear 2D image
 //! of the request's size and block height, in the texture cache as any sampled texture
 //! (`present`), so a frame the GPU rendered is found as the render target it was drawn into.
 //! The frame number counts presents from 0. The command carries no fence wait (owner's

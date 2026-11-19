@@ -180,8 +180,9 @@
 //! notifier's event too (PR: "The native SDK requests this event immediately before configuring
 //! `CHANNEL_SET_ERROR_NOTIFIER`"; row 34: NVN asks for 7). Each is made the first time it is asked
 //! for and copied out with `Success`; any other id answers `BadParameter`, Eden's answer for an
-//! event the device does not have. Nothing signals them yet: channel errors are #12's
-//! (`GpuFront::channel_error`), not built here.
+//! event the device does not have. Nothing signals them yet: the GPU front reports a stopped
+//! channel's error (`GpuFront::channel_error`, `starquake_gpu::interface`), and nvsrv does not
+//! ask it yet.
 //!
 //! # Conflicts
 //!

@@ -119,7 +119,7 @@ fn full_and_queue_room_end_to_end() {
     assert_eq!(r.gpu.submit(channel, filling), Submitted::Queued);
     assert_eq!(r.gpu.submit(channel, plain(vec![one])), Submitted::Full);
     assert_eq!(r.gpu.counters().submissions_full, 1);
-    assert!(r.pushed.all().is_empty());
+    assert_eq!(r.pushed.all(), []);
     // The CPU releases the acquire; the front's poll sees it, the channel runs, and the room
     // the refused submission waits for is reported.
     r.write(SEM, &[1]);
