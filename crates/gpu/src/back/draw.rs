@@ -727,6 +727,8 @@ impl Draws {
                         })
                         .map(|r| r.stage)?,
                     HostStage::Fragment => GuestStage::Pixel,
+                    // A draw's set has no compute shader.
+                    HostStage::Compute => return None,
                 };
                 Some(SetStage { stage, index })
             })
