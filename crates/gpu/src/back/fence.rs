@@ -149,6 +149,16 @@
 //!   rather than draining the ring first. A completion is still performed no sooner than the
 //!   entry the back thread is handling when it lands has been handled
 //!   (`completed_work_is_performed_while_the_ring_stays_busy`).
+//! - **Every 32-bit word of a wide release latches.** Eden-NX2's query path latches only the
+//!   32-bit word at the release's address: it calls `OnWrite(cpu_addr,
+//!   static_cast<u32>(...value))` (or `OnWrite(cpu_addr, payload)` with the 32-bit payload) once
+//!   per release (`QueryCacheBase::CounterReport` in
+//!   `eden-nx2/src/video_core/query_cache/query_cache.h` @ 50fa86bb). Here every 32-bit word
+//!   an 8- or 16-byte release writes is latched, the timestamp's halves included, and each is
+//!   looked at for the waiter close trigger ([`WaiterTable::has_waiter`]), so a waiter on the
+//!   high word of a 64-bit semaphore is not left parked
+//!   (`a_wide_release_latches_a_waiter_on_its_high_word`,
+//!   `a_waiter_on_a_wide_releases_high_word_closes_the_open_list`).
 //! - **A failed release is reported and skipped.** Eden-NX2's QMD callbacks refuse a release to
 //!   an unmapped range when it is requested (`IsFullyMappedRange`) and its query path writes
 //!   through a host pointer; here the memory is checked when the release is performed, and a

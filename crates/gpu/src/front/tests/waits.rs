@@ -690,7 +690,10 @@ fn turn_until_parks(r: &mut Rig, parks: u64) {
         }
         r.turn();
     }
-    assert!(r.front.counters().parks >= parks, "fewer than {parks} parks");
+    assert!(
+        r.front.counters().parks >= parks,
+        "fewer than {parks} parks"
+    );
 }
 
 /// Turns the front until a turn is idle (at most a few turns); how long it may park.

@@ -56,8 +56,13 @@
 //!
 //! **The poll** is due when the clock has reached the time set when it was last scheduled; it is
 //! scheduled (and the clock read) only while a channel waits on an acquire or a fence, so an idle
-//! front reads no clock. The schedule restarts when a channel newly parks and when no channel is
-//! left waiting. While other channels keep the front busy, the poll still fires on time, since
+//! front reads no clock. The schedule restarts when a channel newly waits on an acquire or a
+//! fence (`a_channel_that_newly_parks_restarts_the_polls_schedule`), when a recheck lets a waiting
+//! channel go on (`a_channel_that_resumes_restarts_the_polls_schedule_for_the_others`), and when
+//! no channel is left waiting. A back report of a release or an increment rechecks every waiting
+//! channel at once, without waiting for the poll
+//! (`a_release_the_back_writes_rechecks_a_parked_channel_at_once`,
+//! `a_fence_wait_holds_the_submission_until_an_increment_reaches_it`). While other channels keep the front busy, the poll still fires on time, since
 //! each turn looks at the clock while anything waits (`the_poll_fires_while_other_channels_keep_the_front_busy`).
 //!
 //! # Fairness
@@ -72,9 +77,27 @@
 //! A structural error in a channel's stream ([`ChannelError`]) stops that channel for good, as
 //! hardware raises a channel error (decision 13 (c)): it is recorded for
 //! [`FrontShared::channel_error`], its waiter is removed, its unstarted entries leave its queue
-//! bound, and it no longer holds ordered updates (none of its later work will run). A failed push
-//! to the ring stops the front: every turn from then on returns [`FrontError::Ring`] with the
-//! first failure (`ring_sink`).
+//! bound, the active submission's unstarted entries included
+//! (`a_channel_stopped_inside_a_submission_releases_its_unstarted_entries`,
+//! `a_full_queue_stopped_at_its_first_entry_reports_room_once`), and it no longer holds ordered
+//! updates (none of its later work will run). A failed push to the ring stops the front: every
+//! turn from then on returns [`FrontError::Ring`] with the first failure (`ring_sink`).
+//!
+//! **GP entries are checked when they start, not at submission.** [`FrontShared::submit`] looks
+//! at nothing in a submission's entries; the 40-bit range check
+//! ([`ChannelError::EntryPastAddressSpace`]) runs when the front starts the entry
+//! (`crate::channel::Channel::start_entry`) and stops the channel
+//! (`an_entry_past_the_address_space_stops_the_channel_when_it_starts`). The reasons: Eden-NX2's
+//! `SubmitGPFIFOImpl` (`eden-nx2/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp` @ 50fa86bb)
+//! checks no entry's address and pushes the entries as given, so refusing at submission would
+//! answer an ioctl with an error no reference sends; and a bad entry is a structural error of the
+//! channel's stream, which decision 13 (c) answers by stopping the channel, as hardware raises a
+//! channel error when it fetches the entry. The alignment check
+//! ([`ChannelError::UnalignedEntry`]) cannot fire through the front at all: a submission carries
+//! raw entries, whose address is `GP_ENTRY0_GET` (bits 31:2) and `GP_ENTRY1_GET_HI`, so bits 1:0
+//! of word 0 never reach the address (`crate::fifo::GpEntry::from_raw`;
+//! `a_raw_entry_with_its_low_address_bits_set_is_not_unaligned`). Only a hand-built
+//! `GpEntry` given straight to a `Channel` can be unaligned.
 //!
 //! # Not here
 //!

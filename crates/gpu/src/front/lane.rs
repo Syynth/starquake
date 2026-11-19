@@ -18,11 +18,20 @@
 //!   quantum at a time like words, and a channel with millions of them does not hold the others
 //!   back; the time they take in all still grows with the count (an owner question: a
 //!   `Syncpoint` entry with a count would make it constant).
-//! - **`WaitForIdle` comes only with increments.** Eden-NX2 pushes the wait for idle inside its
-//!   increment command lists only (`SubmitGPFIFOImpl`, `BuildIncrementWithWfiCommandList` and
+//! - **`WaitForIdle` comes only with increments, and only when the submission asks for it.**
+//!   Eden-NX2 pushes the wait for idle inside its increment command lists only
+//!   (`SubmitGPFIFOImpl`, `BuildIncrementWithWfiCommandList` and
 //!   `BuildIncrementCountCommandList` in
 //!   `eden-nx2/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp` @ 50fa86bb), so a submission
 //!   with no increments sends none (`wait_for_idle_comes_before_the_increments_and_only_with_them`).
+//!   **A divergence, and an owner question:** Eden-NX2's NX2 path, taken when `fence_increment`
+//!   (flag bit 1) is clear and the increment count is not zero (`increment_value`, bit 8),
+//!   builds its list with `BuildIncrementCountCommandList`, which pushes `WaitForIdle`
+//!   unconditionally, whatever `suppress_wfi` (bit 4) says. Here [`Submission::wfi`] decides
+//!   alone: increments with `wfi` false (gsv: bit 4 set) get no `WaitForIdle`, pinned by the
+//!   same test (its last submission: one increment, no wait). Whether bit 4 should suppress the
+//!   wait on that path is for the owner; following Eden-NX2 would push it for every
+//!   submission with increments on the NX2 path.
 //! - **The fence to wait on** is checked with [`Syncpoints::reached`] before the submission's
 //!   first entry; an unmet fence parks the channel ([`Wait::Fence`]). It is a front wait, not a
 //!   waiter in the shared table: a syncpoint only counts up, so no value can be missed and there
@@ -51,10 +60,14 @@
 //! `SET_REFERENCE` goes to the ring as [`RingEntry::SetReference`]; an engine word for a method
 //! [`crate::macros::takes`] names goes through [`ProcessMacros::write`], and any other through
 //! the class's register file, batched: consecutive words to one method of one class go to
-//! [`RegFile::write_run`] together (at most [`MAX_RUN_WORDS`] at a time), so a run of data words
-//! to a trigger is one `Run` entry (spec, "Engine methods: the register file"). The batch is
+//! [`RegFile::write_run`] together (spec, "Engine methods: the register file"). The batch is
 //! written before anything else reaches the ring or the macro host and when the pusher returns,
-//! so entries keep stream order. `holds` is [`MacroChannel::is_waiting`].
+//! so entries keep stream order. `holds` is [`MacroChannel::is_waiting`]. Since the pusher
+//! returns at the end of every quantum, a run of data words to a trigger is one `Run` entry only
+//! within one quantum: a longer run is split where the quantum ends, and goes out as one `Run`
+//! entry per quantum it spans. The batch's own cap of [`MAX_RUN_WORDS`] (8,192) is therefore never
+//! reached, since a quantum ([`super::QUANTUM`], 4,096 words) is shorter, which a compile-time
+//! assertion below keeps true; the cap stays as a guard should the quantum grow.
 //!
 //! A channel keeps one register file per class it has sent a word to. The 3D and compute files
 //! are kept for the channel's life; files of every other class (which drop nothing and are read
@@ -81,6 +94,10 @@ use crate::syncpoint::Syncpoints;
 
 use super::FrontCounters;
 use super::ring_sink::{RingSink, Unperformed};
+
+// A pusher run reads at most a quantum, and the batch is written when it returns, so a batch
+// never reaches `MAX_RUN_WORDS` (module docs, "Routing words").
+const _: () = assert!(super::QUANTUM as usize <= MAX_RUN_WORDS);
 
 /// The most register files of classes other than 3D and compute one channel keeps: one per
 /// subchannel (a **guess** at what a real stream binds at once; module docs).

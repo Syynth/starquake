@@ -12,7 +12,9 @@
 //! [`Backoff::next_sleep`] returns how long the front may sleep before it polls again: zero for the
 //! first [`POLL_SPINS`] polls (it spins), then [`POLL_FIRST_SLEEP`], doubling at each poll up to
 //! [`POLL_LONGEST_SLEEP`], where it stays. [`Backoff::reset`] starts the schedule again; the front
-//! resets it when a channel newly parks and when no channel is left parked. The numbers other
+//! resets it when a channel newly waits on an acquire or a fence, when a recheck lets a waiting
+//! channel go on (activity that suggests the others' semaphores may move soon too), and when no
+//! channel is left waiting (`crate::front`, "One turn", names the tests). The numbers other
 //! than the 100 µs ceiling are **guesses**, to be measured (spec verification item 2).
 //!
 //! # Why the poll is far shorter than the ring's 100 ms safety net
