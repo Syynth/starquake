@@ -1820,8 +1820,9 @@ fn uploaded_constants(rig: &Rig) -> DriverConstants {
         let at = constant.offset();
         f32::from_le_bytes(block[at..at + 4].try_into().unwrap())
     };
-    let flip_y = word(DriverConstant::PositionYScale) == -1.0;
-    let reverse_depth = word(DriverConstant::PositionZScale) == -1.0;
+    let minus_one = (-1.0_f32).to_bits();
+    let flip_y = word(DriverConstant::PositionYScale).to_bits() == minus_one;
+    let reverse_depth = word(DriverConstant::PositionZScale).to_bits() == minus_one;
     let decoded = DriverConstants {
         flip_y,
         reverse_depth,
@@ -1902,8 +1903,7 @@ fn each_viewport_flip_reaches_the_flag_and_the_constants() {
             let snapshot = rig.submit();
             let last = snapshot
                 .lines()
-                .filter(|line| line.contains("emulation"))
-                .last()
+                .rfind(|line| line.contains("emulation"))
                 .unwrap()
                 .to_owned();
             assert_eq!(

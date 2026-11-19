@@ -525,7 +525,7 @@ fn the_host_viewport_is_positive_and_in_order() {
 
 /// Window y of clip-space `y_ndc` through `viewport`, for a host whose y axis has sign `s`.
 fn window_y(viewport: &Viewport, y_ndc: f32, s: f32) -> f32 {
-    viewport.y + (1.0 + s * y_ndc) / 2.0 * viewport.height
+    viewport.y + f32::midpoint(1.0, s * y_ndc) * viewport.height
 }
 
 /// Depth of clip-space `z` at `w` through `viewport`.
