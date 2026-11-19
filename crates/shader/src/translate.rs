@@ -40,7 +40,11 @@
 //! `attribute_access_checks`, `s2r_lane_id`, `s2ur_is_unsupported`,
 //! `uniform_and_constant_buffer_sources_are_rejected` and
 //! `other_instructions_are_rejected_by_mnemonic`.
+//!
+//! The instruction groups' translators (port slices 12a to 12h) are modules of their own, each
+//! appending one instruction's IR at a builder's position: [`integer`] (slice 12a).
 
+pub mod integer;
 #[cfg(test)]
 mod tests;
 
