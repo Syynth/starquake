@@ -143,8 +143,8 @@ use starquake_render::command::{
     Binding, BindingResource, BufferSlice, CopyRegion, DrawDesc, DrawParams, DynamicValues,
     IndexBufferBinding, IndexFormat, RenderTargets,
 };
-use starquake_render::pipeline::{GraphicsPipelineDesc, RasterState, Stages};
 use starquake_render::emulation::ViewportFlip;
+use starquake_render::pipeline::{GraphicsPipelineDesc, RasterState, Stages};
 use starquake_render::validate::viewport_limit;
 use starquake_render::{
     Backend, BufferDesc, BufferId, BufferUsage, Command, CommandList, DepthRange, EmulationState,

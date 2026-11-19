@@ -136,9 +136,18 @@ fn defaults() {
     // No flip: the position passes through unchanged.
     assert!(!fresh.flip_y);
     assert!(!fresh.reverse_depth);
-    assert_eq!(fresh.word(DriverConstant::PositionYScale), 1.0_f32.to_bits());
-    assert_eq!(fresh.word(DriverConstant::PositionZScale), 1.0_f32.to_bits());
-    assert_eq!(fresh.word(DriverConstant::PositionZOffset), 0.0_f32.to_bits());
+    assert_eq!(
+        fresh.word(DriverConstant::PositionYScale),
+        1.0_f32.to_bits()
+    );
+    assert_eq!(
+        fresh.word(DriverConstant::PositionZScale),
+        1.0_f32.to_bits()
+    );
+    assert_eq!(
+        fresh.word(DriverConstant::PositionZOffset),
+        0.0_f32.to_bits()
+    );
 }
 
 /// The position the lowering writes, `(x, y * ys, z * zs + w * zo, w)`, from the encoded words.
@@ -167,7 +176,10 @@ fn the_position_words_flip_and_mirror() {
         ..DriverConstants::default()
     };
     assert_eq!(shaded(&with(false, false), position), position);
-    assert_eq!(shaded(&with(true, false), position), [0.5, -0.25, 0.75, 2.0]);
+    assert_eq!(
+        shaded(&with(true, false), position),
+        [0.5, -0.25, 0.75, 2.0]
+    );
     assert_eq!(shaded(&with(false, true), position), [0.5, 0.25, 1.25, 2.0]);
     assert_eq!(shaded(&with(true, true), position), [0.5, -0.25, 1.25, 2.0]);
     // The ends of 0..w swap.

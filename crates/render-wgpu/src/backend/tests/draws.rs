@@ -18,8 +18,7 @@ use starquake_render::pipeline::{
 };
 use starquake_render::shader::{ResourceBinding, ResourceKind, SampleKind, ShaderInterface};
 use starquake_render::{
-    CompileJob, CompilePool, ComputePipelineDesc, EmulationFlags, GraphicsPipelineDesc,
-    ShaderStage,
+    CompileJob, CompilePool, ComputePipelineDesc, EmulationFlags, GraphicsPipelineDesc, ShaderStage,
 };
 
 /// The target's side, in pixels.
@@ -1401,11 +1400,7 @@ fn a_flipped_viewport_draws_the_upright_pixels() {
             });
             draws.push(up);
             draws.push(Command::Draw(draw));
-            assert_eq!(
-                s.pixels(draws),
-                image(&[(rect, MAGENTA)]),
-                "{viewport:?}"
-            );
+            assert_eq!(s.pixels(draws), image(&[(rect, MAGENTA)]), "{viewport:?}");
         }
         assert_eq!(s.gpu.host_errors(), 0);
     });

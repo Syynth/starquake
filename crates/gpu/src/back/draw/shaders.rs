@@ -430,7 +430,9 @@ pub fn emulation_key(
 /// How the first of `viewports` (those handed to the backend) flips: what `emulation()` reads.
 /// None for no viewport, which the backend refuses anyway.
 pub fn viewport_flip(viewports: &[Viewport]) -> ViewportFlip {
-    viewports.first().map_or(ViewportFlip::NONE, ViewportFlip::of)
+    viewports
+        .first()
+        .map_or(ViewportFlip::NONE, ViewportFlip::of)
 }
 
 /// The flip the driver constants carry: `flip` when `flags` has `FLIPPED_VIEWPORT`, else none.
