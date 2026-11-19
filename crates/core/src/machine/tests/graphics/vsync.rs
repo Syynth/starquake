@@ -283,6 +283,7 @@ fn the_timer_thread_ticks_the_vsync_clock_and_wakes_a_listener_s_waiter() {
         romfs: None,
         rtc: RtcAtBoot::eden_default(),
         environment: crate::EnvSource::Live,
+        until_frames: None,
     };
     let report = run_serving(
         vcpus(&mut main),

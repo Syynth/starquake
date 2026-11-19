@@ -556,8 +556,8 @@ fn modifiers_without_bits_are_refused() {
 
 #[test]
 fn every_operation_has_a_distinct_lower_case_mnemonic() {
-    // The 104 instructions of slices 6a to 6i (`op`'s module docs).
-    assert_eq!(MNEMONICS.len(), 23 + 15 + 10 + 2 + 8 + 9 + 12 + 21 + 4);
+    // The 106 instructions of slices 6a to 6i (`op`'s module docs).
+    assert_eq!(MNEMONICS.len(), 23 + 15 + 10 + 2 + 10 + 9 + 12 + 21 + 4);
     let mut sorted = MNEMONICS.to_vec();
     sorted.sort_unstable();
     sorted.dedup();

@@ -6,6 +6,7 @@
 //! crate's own, versioned by [`SUMMARY_VERSION`] and pinned by a test.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -14,7 +15,10 @@ use starquake_kernel::sched::ThreadState;
 use starquake_services::time::RtcAtBoot;
 use starquake_trace::{Dump, EnvRecord, UnixSeconds};
 
+use starquake_gpu::wiring::GpuCounters;
+
 use crate::crash::{CrashReport, Location, Module, address_text};
+use crate::frames::DumpedFrames;
 use crate::services_report::{ServicesReport, StubbedCommand};
 
 /// The process exit codes of `starquake run` (`docs/specs/observability.md`, "Headless runs").
@@ -41,7 +45,12 @@ pub mod exit_code {
 /// `unknown_services`, `host_log_lines` and `host_log_lines_dropped` are added.
 ///
 /// 3: `date` is added ([`RunDate`]).
-pub const SUMMARY_VERSION: u32 = 3;
+///
+/// 4: `frames` counts the frames presented ([`GraphicsReport::frames`]; it was always zero), the
+/// exit reason `frames_reached` is added, and `frames_dumped`, `frames_unknown`,
+/// `frames_dropped` and `gpu` (the GPU's counters, `starquake_gpu::wiring::GpuCounters`) are
+/// added.
+pub const SUMMARY_VERSION: u32 = 4;
 
 /// Bytes of guest log text a run keeps (`guest_log.txt`), and of the emulator's own warnings
 /// (`log.txt`, [`crate::host_log`]): whole lines from the first while their total fits.
@@ -72,6 +81,10 @@ pub struct RunOptions {
     /// Where the answers of the run's environment come from: the host, recorded
     /// ([`EnvSource::Live`], the default), or a recording fed back ([`EnvSource::Replay`]).
     pub environment: EnvSource,
+    /// Stop the run once this many frames have been presented (`--until frames=<n>`), as
+    /// [`ExitReason::FramesReached`]. A frame is a present the graphics server hands the GPU
+    /// ([`GraphicsReport::frames`]). `None`: the frames do not end the run.
+    pub until_frames: Option<NonZeroU64>,
 }
 
 /// Where the answers of a run's environment (its clock, random numbers, host I/O and wall
@@ -137,6 +150,8 @@ pub enum ExitReason {
     Timeout,
     /// The emulator failed; the text says how.
     EmulatorError(String),
+    /// The run presented the frames it was asked to stop at ([`RunOptions::until_frames`]).
+    FramesReached,
 }
 
 impl ExitReason {
@@ -144,7 +159,7 @@ impl ExitReason {
     #[must_use]
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::ProcessExited => exit_code::STOP_CONDITION,
+            Self::ProcessExited | Self::FramesReached => exit_code::STOP_CONDITION,
             Self::GuestCrashed(_) => exit_code::GUEST_CRASHED,
             Self::EmulatorError(_) => exit_code::EMULATOR_ERROR,
             Self::Timeout => exit_code::TIMEOUT,
@@ -159,6 +174,7 @@ impl ExitReason {
             Self::GuestCrashed(_) => "guest_crashed",
             Self::Timeout => "timeout",
             Self::EmulatorError(_) => "emulator_error",
+            Self::FramesReached => "frames_reached",
         }
     }
 }
@@ -340,6 +356,27 @@ pub struct RunReport {
     /// How many later answers are missing from [`RunReport::environment`] because the limit
     /// was reached.
     pub environment_dropped: u64,
+    /// What the graphics path left behind: the frames presented, the frame dumps, and the GPU's
+    /// counters and flight recorder.
+    pub graphics: GraphicsReport,
+}
+
+/// What a run's graphics path left behind (`docs/specs/observability.md`, the artifacts table:
+/// `summary.json`'s frames and GPU counters, `frames/` and `gpu.txt`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GraphicsReport {
+    /// Frames presented: the presents the graphics server handed the GPU front, one per frame
+    /// its vsync tick latched (`crate::hle::Graphics::frames`). The same count with the GPU and
+    /// with the null front for presents with no fence or an already-reached one; a present whose
+    /// fence the GPU reaches is latched at a tick that depends on when the host GPU completes
+    /// the work (`crate::hle::graphics`, "Frames").
+    pub frames: u64,
+    /// The frame dumps the run kept (`crate::frames`); empty for a run with no GPU.
+    pub dumps: DumpedFrames,
+    /// The GPU's counters at the end of the run; `None` for a run with no GPU (the null front).
+    pub gpu: Option<GpuCounters>,
+    /// The GPU's flight recorder (`gpu.txt`); empty for a run with no GPU.
+    pub gpu_recorder: String,
 }
 
 impl RunReport {
@@ -367,6 +404,7 @@ impl RunReport {
             date: None,
             environment: Vec::new(),
             environment_dropped: 0,
+            graphics: GraphicsReport::default(),
         }
     }
 
@@ -397,7 +435,10 @@ impl RunReport {
                 _ => None,
             },
             duration_ms: u64::try_from(self.duration.as_millis()).unwrap_or(u64::MAX),
-            frames: 0,
+            frames: self.graphics.frames,
+            frames_dumped: u64::try_from(self.graphics.dumps.files.len()).unwrap_or(u64::MAX),
+            frames_unknown: self.graphics.dumps.unknown,
+            frames_dropped: self.graphics.dumps.dropped,
             system_calls: &self.system_calls,
             service_commands: &self.services.commands,
             service_commands_uncounted: self.services.uncounted,
@@ -417,6 +458,7 @@ impl RunReport {
             patched_counter_reads: self.patched_counter_reads.len(),
             threads: &self.threads,
             date: self.date,
+            gpu: self.graphics.gpu,
         }
     }
 }
@@ -435,7 +477,7 @@ pub(crate) fn empty_dump() -> Vec<u8> {
 pub struct Summary<'a> {
     /// [`SUMMARY_VERSION`].
     pub version: u32,
-    /// `process_exited`, `guest_crashed`, `timeout` or `emulator_error`.
+    /// `process_exited`, `frames_reached`, `guest_crashed`, `timeout` or `emulator_error`.
     pub exit_reason: &'static str,
     /// The process exit code that goes with the reason.
     pub exit_code: u8,
@@ -443,8 +485,17 @@ pub struct Summary<'a> {
     pub message: Option<&'a String>,
     /// How long the run took, in milliseconds.
     pub duration_ms: u64,
-    /// Frames presented. Always zero until there is a graphics path.
+    /// Frames presented ([`GraphicsReport::frames`]).
     pub frames: u64,
+    /// Frames written to `frames/` ([`DumpedFrames::files`]).
+    pub frames_dumped: u64,
+    /// Frames dumped whose pixels the render backend could not read, so not written
+    /// ([`DumpedFrames::unknown`]).
+    pub frames_unknown: u64,
+    /// Frames read back but not written: over the run's budget for frame dumps, or refused by
+    /// the PNG encoder ([`DumpedFrames::dropped`]). Zero means every readable frame is in
+    /// `frames/`.
+    pub frames_dropped: u64,
     /// Count per system call, by name.
     pub system_calls: &'a BTreeMap<String, u64>,
     /// Requests per service command, by `<service>:<interface>::<command>`
@@ -486,6 +537,9 @@ pub struct Summary<'a> {
     /// The date the run's clocks started from and where it came from ([`RunDate`]); `null` when
     /// the run ended before it was read.
     pub date: Option<RunDate>,
+    /// The GPU's counters (`docs/specs/gpu-protocol.md`, "Observability"); `null` for a run with
+    /// no GPU.
+    pub gpu: Option<GpuCounters>,
 }
 
 #[cfg(test)]
@@ -513,6 +567,7 @@ mod tests {
             (ExitReason::GuestCrashed(crash()), 1, "guest_crashed"),
             (ExitReason::EmulatorError("x".into()), 2, "emulator_error"),
             (ExitReason::Timeout, 3, "timeout"),
+            (ExitReason::FramesReached, 0, "frames_reached"),
         ];
         for (reason, code, name) in cases {
             assert_eq!(reason.exit_code(), code, "{name}");
@@ -528,6 +583,29 @@ mod tests {
             ],
             [0, 1, 2, 3, 4]
         );
+    }
+
+    /// The graphics part of `the_summary_layout_is_pinned`'s report: every count distinct.
+    fn pinned_graphics() -> GraphicsReport {
+        let file = |frame: u64| crate::frames::FrameFile {
+            frame,
+            png: vec![1],
+        };
+        GraphicsReport {
+            frames: 13,
+            dumps: DumpedFrames {
+                files: vec![file(1), file(2)],
+                unknown: 14,
+                dropped: 15,
+            },
+            gpu: Some(GpuCounters {
+                words: 16,
+                lists_submitted: 17,
+                ..GpuCounters::default()
+            }),
+            // Not in the summary: `gpu.txt`.
+            gpu_recorder: "0 address space 1 made\n".to_owned(),
+        }
     }
 
     #[test]
@@ -571,17 +649,21 @@ mod tests {
             // Not in the summary.
             environment: vec![starquake_trace::EnvRecord::Random(3)],
             environment_dropped: 2,
+            graphics: pinned_graphics(),
         };
         let json = serde_json::to_string_pretty(&report.summary()).unwrap();
         assert_eq!(
             json,
             r#"{
-  "version": 3,
+  "version": 4,
   "exit_reason": "emulator_error",
   "exit_code": 2,
   "message": "the vCPU failed",
   "duration_ms": 1234,
-  "frames": 0,
+  "frames": 13,
+  "frames_dumped": 2,
+  "frames_unknown": 14,
+  "frames_dropped": 15,
   "system_calls": {
     "ExitProcess": 1,
     "OutputDebugString": 7
@@ -618,10 +700,36 @@ mod tests {
   "date": {
     "rtc_at_boot": 1709164811,
     "source": "host"
-  }
+  },
+  "gpu": GPU
 }"#
+            // The counters' own layout is pinned by `the_gpus_counters_json_is_pinned`
+            // (`hle/tests/graphics/gpu.rs`); here, that they are the summary's `gpu`.
+            .replace(
+                "GPU",
+                &serde_json::to_string_pretty(&report.graphics.gpu)
+                    .unwrap()
+                    .replace('\n', "\n  ")
+            )
         );
         assert_eq!(report.summary().version, SUMMARY_VERSION);
+    }
+
+    #[test]
+    fn a_run_with_no_gpu_has_null_counters_and_no_frames() {
+        let none = serde_json::to_value(
+            RunReport::emulator_error(String::new(), Duration::ZERO).summary(),
+        )
+        .unwrap();
+        assert_eq!(none["gpu"], serde_json::Value::Null);
+        for count in [
+            "frames",
+            "frames_dumped",
+            "frames_unknown",
+            "frames_dropped",
+        ] {
+            assert_eq!(none[count], 0, "{count}");
+        }
     }
 
     fn modules() -> Vec<Module> {

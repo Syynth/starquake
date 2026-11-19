@@ -20,9 +20,11 @@
 //! warp group (`op::control`), every instruction of it but `JMX` and `BPT`; slice 6g's
 //! attribute and system-value group (`op::attribute`), every instruction of it, `S2R` grown to
 //! its uniform form `S2UR`; slice 6b's 32-bit float and conversion group (`op::float`), every
-//! instruction of it in the vector datapath's forms; and slice 6a's integer group
-//! (`op::integer`), every instruction of it in the vector datapath's forms. Every other opcode
-//! is [`DecodeError::UnknownOpcode`].
+//! instruction of it in the vector datapath's forms; slice 6a's integer group
+//! (`op::integer`), every instruction of it in the vector datapath's forms; slice 6e's memory
+//! group (`op::memory`), every instruction of it in the vector datapath's forms; and slice 6f's
+//! texture and surface group (`op::texture`), every instruction of it, with PR #4588's `.UR`
+//! texture forms. Every other opcode is [`DecodeError::UnknownOpcode`].
 //!
 //! **Strict decoding** (owner's decision 4, 2026-11-12): a word with a bit set that its form
 //! does not explain is rejected, never decoded with the bit ignored. The decoder checks, in this
@@ -33,13 +35,21 @@
 //!    the lowest such bit, as PR #4588's `FirstUnknownBit` does (`frontend/ampere/isa.h`);
 //! 3. every fixed bit of the form is set (bit 91 of the uniform-register ALU forms; bits 87..89
 //!    and 91 of the uniform `BRA` and bit 91 of `BRXU`, `op::control`; bit 91 of `LDTRAM`,
-//!    `op::attribute`; the integer group's fixed predicate fields, `op::integer`), else
+//!    `op::attribute`; the integer group's fixed predicate fields, `op::integer`; bit 91 of the
+//!    bindless `LDC` and the bits PR #4588 requires set in `LDGSTS` and `ATOMS.POPC`,
+//!    `op::memory`; bit 59 of the `.B` texture forms and bit 91 of the `.UR` ones,
+//!    `op::texture`), else
 //!    [`DecodeError::MissingBit`] naming the lowest clear one;
 //! 4. the form's function reads its fields, else [`DecodeError::UnknownValue`] for a field whose
 //!    value names nothing (a vote or reduction operation past the defined ones: `op::control`;
 //!    a `MUFU` function or a comparison's combine operation past them: `op::float`; an
 //!    interpolation mode, pixel value or stage-buffer type past NAK's: `op::attribute`;
-//!    `ISETP`'s combining operation 3 and `PRMT`'s mode 7: `op::integer`);
+//!    `ISETP`'s combining operation 3 and `PRMT`'s mode 7: `op::integer`; a memory type, order,
+//!    eviction priority, atomic type or operation, cache operation or `MEMBAR` scope past the
+//!    ones the references name: `op::memory`; the exact set the texture group refuses, which
+//!    includes memory orders in the holes between NAK's values as well as past them, `TLD4`'s
+//!    offset mode 3 and `TXQ`'s query 3, is listed in `op::texture`'s module docs under "Values
+//!    the decoder refuses");
 //! 5. every set bit was read, else [`DecodeError::UnknownBit`] naming the lowest unread one. A
 //!    form explains some bits only in some of its layouts or operations: in the constant-buffer
 //!    ALU forms a bound buffer reads its index (bits 54..59) and a bindless one its uniform
@@ -70,7 +80,11 @@
 //! slots without modifiers) in `op::float`'s and pinned in `tests::float32`; the integer
 //! group's (the absolute-value and modifier bits its sources do not have, forms 2, 3 and 7 of
 //! the instructions without source 2, and the bits PR #4588's translator requires clear) in
-//! `op::integer`'s, pinned in `tests::integer`.
+//! `op::integer`'s, pinned in `tests::integer`; the memory group's (bit 91 of the forms
+//! without a uniform register, `ATOMG` `0x3a8`'s uniform-register bits, and the bits PR #4588's
+//! translator requires clear or set in `LDGSTS` and `ATOMS.POPC`) in `op::memory`'s, pinned in
+//! `tests::memory`; the texture group's (bit 89 of `TLD4.UR`, and the surface forms with a
+//! constant-buffer handle left unknown) in `op::texture`'s, pinned in `tests::texture`.
 
 mod alu;
 mod fields;
@@ -96,9 +110,27 @@ pub(crate) use op::control::{
     BRA_OPCODE, BRANCH_OFFSET, BSSY_OFFSET, BSSY_OPCODE, CALL_OPCODE, COND, COND_NOT,
     EXIT_KEEP_REF_COUNT, EXIT_NO_AT_EXIT, EXIT_OPCODE, RET_OPCODE,
 };
+// The opcodes flow analysis classifies (`crate::flow`, slice 10), named once in their groups.
+pub(crate) use op::attribute::{ALD_OPCODE, CS2R_OPCODE, IPA_OPCODE, S2R_OPCODE, S2UR_OPCODE};
+pub(crate) use op::control::{
+    BAR_OPCODE, BRA_UNIFORM_OPCODE, BREAK_OPCODE, BRX_OPCODE, BRXU_OPCODE, BSYNC_OPCODE,
+    DEPBAR_OPCODE, KILL_OPCODE, NOP_OPCODE, VOTEU_OPCODE, WARPSYNC_OPCODE,
+};
+pub(crate) use op::float::{
+    F2F_OPCODE, F2FP_OPCODE, F2I_OPCODE, FADD_OPCODE, FFMA_OPCODE, FMNMX_OPCODE, FMUL_OPCODE,
+    FRND_OPCODE, FSEL_OPCODE, FSET_OPCODE, FSETP_OPCODE, FSWZADD_OPCODE, I2F_OPCODE, I2FP_OPCODE,
+    MUFU_OPCODE,
+};
+pub(crate) use op::integer::{
+    BREV_OPCODE, FLO_OPCODE, IABS_OPCODE, IADD3_OPCODE, IMAD_HI_OPCODE, IMAD_OPCODE,
+    IMAD_WIDE_OPCODE, IMNMX_OPCODE, ISETP_OPCODE, LEA_OPCODE, LOP3_OPCODE, MOV_OPCODE, P2R_OPCODE,
+    PLOP3_OPCODE, POPC_OPCODE, PRMT_OPCODE, R2P_OPCODE, SEL_OPCODE, SGXT_OPCODE, SHF_OPCODE,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use op::texture;
 pub use op::*;
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) use op::{Named, attribute, control, float, integer, op_list};
+pub(crate) use op::{Named, attribute, control, float, integer, memory, op_list};
 pub use operand::{
     AluSrc, CBuf, CBufRef, Gpr, Pred, PredSrc, RoundMode, UniformPred, UniformPredSrc, UniformReg,
 };
