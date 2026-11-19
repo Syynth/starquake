@@ -14,8 +14,7 @@ block2:
     %3 = SetRegister r0, u32 0x2
     jump block1
 block3:
-    %8: u32 = UndefU32
-    %7: opaque = Identity %8
-    %4: opaque = Identity %8
+    %7: u32 = UndefU32
+    %4: opaque = Identity %7
     %5 = SetRegister r2, %4
     return

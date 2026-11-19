@@ -42,7 +42,18 @@
 //!   (`tests::ssa::a_self_loop_keeps_its_loop_carried_value`).
 //! - **Unreachable blocks.** Eden removes them first; this IR keeps them, so they are filled
 //!   after the reachable ones, in arena order, and a reachable block with an unreachable
-//!   predecessor is sealed then (`tests::ssa::unreachable_blocks_are_rewritten`).
+//!   predecessor is sealed then (`tests::ssa::unreachable_blocks_are_rewritten`). A read in a
+//!   block the entry cannot reach looks only in that block: it takes the block's own earlier
+//!   write, else a new `Undef` of the variable's type in the block, and never a phi or a
+//!   predecessor's value (such a block never runs). Looking through its predecessors could
+//!   give a phi whose operands are all the block's own later value: in a cycle of blocks the
+//!   entry cannot reach, a phi took that value from every back edge, was trivial, and stood
+//!   for it ahead of its definition, so the output did not verify
+//!   (`tests::ssa::an_unreachable_cycle_of_blocks_reads_undef`,
+//!   `tests::ssa::an_unreachable_self_loop_reads_undef`,
+//!   `tests::ssa::an_unreachable_two_block_cycle_reads_undef`). A reachable block's phi
+//!   takes such a predecessor's value the same way: its last write there, else an `Undef`
+//!   there.
 //! - **An entry with predecessors.** Eden's programs start with a block nothing jumps to; flow
 //!   analysis can make block 0 a loop header. A phi there would have no value on entry (the
 //!   interpreter's `PhiAtStart`), so when block 0 has predecessors its instructions and
@@ -51,7 +62,10 @@
 //!   ([`PassError::EntryPhi`]) before anything changes
 //!   (`tests::ssa::an_entry_loop_moves_to_its_own_block`, `tests::ssa::entry_phis_are_refused`).
 //! - **A trivial phi's value** is its operands' common value resolved through `Identity`
-//!   chains; Eden keeps the first operand as written, which can be an `Identity` in one
+//!   chains (by `identity`'s resolver, which follows each chain once and remembers its end,
+//!   so many phis fed from one long chain cost its length once:
+//!   `tests::linear::many_variables_fed_from_one_chain_cost_their_size`); Eden keeps the first
+//!   operand as written, which can be an `Identity` in one
 //!   predecessor of a join, where it does not dominate the join's users. The resolved value
 //!   does: it reaches the block along every edge. Eden's backend resolves identities, so the
 //!   two mean the same; the verifier here checks dominance on the operand as written
@@ -59,27 +73,54 @@
 //! - **Placement.** Phis created here come first in their block, in creation order (Eden
 //!   prepends each, so its order is the reverse), then the block's own phis; then the
 //!   `Undef`s created for trivial phis; then the trivial phis, now `Identity` operations, in
-//!   removal order (Eden reinserts each right after the phis, so newest first). None of them
-//!   names another of the same block: a block holds at most one phi per variable at a time,
-//!   and a trivial phi's resolved value is never a phi of its own variable in its own block
-//!   (that operand is skipped as a self-reference), so the order only has to put the `Undef`s
-//!   first (`tests::ssa::an_entry_phi_with_no_predecessors_is_left_alone`).
-//! - **Structured functions** are refused ([`PassError::Structured`]). Eden runs the rewrite
-//!   after structuring, on predecessors its structurizer records; in this IR a structured
-//!   block has no terminator, so its predecessors would have to come from the tree, and the
-//!   structured form's scope rule (`ir` module docs) makes the structurizer (slice 11)
-//!   responsible for values that cross a body. Which order the pipeline uses is an open
-//!   question for the owner; the rewrite runs on the control-flow graph that slice 10 builds
-//!   (`tests::ssa::structured_functions_are_refused`).
-//! - A goto variable named by a value rather than an immediate is
-//!   [`PassError::GotoIndex`] (Eden's `Arg(0).U32()` throws on one)
-//!   (`tests::ssa::goto_indices_must_be_immediates`).
+//!   removal order (Eden reinserts each right after the phis, so newest first). The order
+//!   puts the `Undef`s ahead of the removed phis that name them
+//!   (`tests::ssa::an_entry_phi_with_no_predecessors_is_left_alone`). A removed phi placed
+//!   ahead of the block's own operations is only correct when its value is not one of them.
+//!   That holds for the phis made here only because no phi is made in a block the entry cannot
+//!   reach (above): there every operand can be the block's own later value. In a reachable
+//!   block, one operand arrives along a path from the entry that does not pass through the
+//!   block. This is an argument, not a proof: the verifier run after the pass in tests and
+//!   debug builds checks it, and the equivalence proptest (`tests::equivalence`) exercises it
+//!   on generated loops and joins.
+//! - **Structured functions** are refused ([`PassError::Structured`]). This departs from the
+//!   approved spec (`docs/specs/shader-pipeline.md`) and waits on an owner ruling. The spec's
+//!   pipeline flowchart has `struct["Structurizer<br/>goto elimination"] --> ssa["SSA,
+//!   constant propagation,<br/>dead code"]`, so the rewrite runs on structured output; the
+//!   owner's decision of 2026-11-18 ("Shader and render slice plan errata") gives slice 11
+//!   "the structured IR the translators fill"; and the `ir` module docs expect the
+//!   structured form's scope rule to be checked "against the output of slices 8 (passes) and
+//!   11 (structurizer)". With this refusal the rewrite cannot run in the order the spec
+//!   draws. Eden also runs the rewrite after structuring, on predecessors its structurizer
+//!   records. Here a structured block has no terminator, so its predecessors would have to
+//!   come from the tree, and the scope rule (`ir` module docs) makes the structurizer
+//!   responsible for values that cross a body; so the rewrite runs on the control-flow graph
+//!   that slice 10 builds (`tests::ssa::structured_functions_are_refused`). Running it after
+//!   structuring, as the spec draws, needs predecessors taken from the tree.
+//! - **Refusals come before any change.** Before anything is changed, one walk over the
+//!   blocks in arena order, and each block's instructions in list order, refuses the first
+//!   instruction that is missing ([`PassError::Missing`]), names a goto variable with a value
+//!   rather than an immediate ([`PassError::GotoIndex`]; Eden's `Arg(0).U32()` throws on
+//!   one), or is an `Identity` whose chain loops or ends without a value
+//!   ([`PassError::Identity`]; the rewrite follows such chains for trivial phis, and Eden
+//!   would loop forever). An entry phi ([`PassError::EntryPhi`]) is checked after that walk
+//!   (`tests::ssa::goto_indices_must_be_immediates`,
+//!   `tests::ssa::a_missing_listed_id_is_refused_before_anything_changes`,
+//!   `tests::ssa::a_broken_identity_chain_is_refused_before_anything_changes`,
+//!   `tests::ssa::the_first_fault_in_block_order_is_refused`). Two failures can still come
+//!   after the rewrite has begun, and leave the function partly changed as
+//!   [`run`](super::run) says: an instruction or block the arena cannot hold
+//!   ([`PassError::Build`]), and [`PassError::Identity`] for a chain the rewrite itself made
+//!   (a read becomes an `Identity` of the value found), which could loop on an input that
+//!   uses a value ahead of its definition in one block (one that does not verify). Neither
+//!   has a test.
 
 use std::collections::BTreeMap;
 
 use crate::ir::{BlockId, Function, Imm, Inst, Opcode, Operand, Phi, Terminator, Type, Value};
 
-use super::{PassError, Work, arena_len, block_order, identity_of, predecessors, slot};
+use super::identity::Resolver;
+use super::{PassError, Work, block_order, identity_of, predecessors, reachable, slot};
 
 /// A variable the rewrite turns into SSA values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -237,9 +278,14 @@ struct Ssa<'f> {
     /// Each block's incomplete phis (Eden's `incomplete_phis`).
     incomplete: Vec<BTreeMap<Var, Value>>,
     sealed: Vec<bool>,
+    /// Whether the entry reaches each block.
+    reachable: Vec<bool>,
+    /// Follows `Identity` chains for trivial phis, remembering each chain's end.
+    resolver: Resolver,
     /// Each block's phis made here, in creation order.
     phis: Vec<Vec<Value>>,
-    /// Each block's `Undef`s made for trivial phis.
+    /// Each block's `Undef`s, made for trivial phis and for reads in blocks the entry cannot
+    /// reach.
     undefs: Vec<Vec<Value>>,
     /// Each block's trivial phis, now `Identity` operations, in removal order.
     removed: Vec<Vec<Value>>,
@@ -252,8 +298,11 @@ pub(super) fn run(function: &mut Function) -> Result<Work, PassError> {
         return Err(PassError::Structured);
     }
     let mut work = Work::default();
+    let mut resolver = Resolver::new(function);
+    check(function, &mut resolver, &mut work)?;
     split_entry(function, &mut work)?;
     let order = block_order(function, &mut work);
+    let reachable = reachable(function, &mut work);
     let preds = predecessors(function);
     let count = function.block_count();
     // Take each block's list: instructions made below are appended to the emptied lists,
@@ -272,6 +321,8 @@ pub(super) fn run(function: &mut Function) -> Result<Work, PassError> {
         defs: vec![BTreeMap::new(); count],
         incomplete: vec![BTreeMap::new(); count],
         sealed: vec![false; count],
+        reachable,
+        resolver,
         phis: vec![Vec::new(); count],
         undefs: vec![Vec::new(); count],
         removed: vec![Vec::new(); count],
@@ -352,6 +403,13 @@ impl Ssa<'_> {
             .unwrap_or(true)
     }
 
+    fn is_reachable(&self, block: BlockId) -> bool {
+        slot(block)
+            .and_then(|index| self.reachable.get(index))
+            .copied()
+            .unwrap_or(false)
+    }
+
     fn preds_of(&self, block: BlockId) -> &[BlockId] {
         slot(block)
             .and_then(|index| self.preds.get(index))
@@ -385,6 +443,12 @@ impl Ssa<'_> {
                 Pc::Start => {
                     if let Some(def) = self.def(var, block) {
                         top.result = def;
+                    } else if !self.is_reachable(block) {
+                        // The block never runs: its value is undefined (see the module docs).
+                        let undef = self.new_undef(var, block)?;
+                        if let Some(top) = stack.last_mut() {
+                            top.result = Operand::Value(undef);
+                        }
                     } else if !self.is_sealed(block) {
                         // An incomplete control-flow graph.
                         let phi = self.new_phi(var, block)?;
@@ -520,7 +584,9 @@ impl Ssa<'_> {
         if let Some(Inst::Phi(node)) = self.function.inst(phi) {
             for &(_, operand) in &node.incoming {
                 self.work.step();
-                let resolved = resolve(self.function, operand);
+                let resolved = self
+                    .resolver
+                    .resolve(self.function, operand, &mut self.work)?;
                 if same == Some(resolved) || operand == Operand::Value(phi) {
                     // A unique value or a self-reference.
                     continue;
@@ -535,27 +601,32 @@ impl Ssa<'_> {
         } else {
             return Ok(Operand::Value(phi));
         }
-        let index = slot(block).unwrap_or(usize::MAX);
         let same = if let Some(same) = same {
             same
         } else {
-            // The phi is unreachable or in the entry block.
-            let undef = self.function.push(
-                block,
-                Inst::Op(crate::ir::Operation::new(var.undef(), Vec::new())),
-            )?;
-            if let Some(list) = self.undefs.get_mut(index) {
-                list.push(undef);
-            }
-            Operand::Value(undef)
+            // The phi has no operand but itself, as in the entry block, which has no
+            // predecessors.
+            Operand::Value(self.new_undef(var, block)?)
         };
         if let Some(inst) = self.function.inst_mut(phi) {
             *inst = identity_of(same);
         }
-        if let Some(list) = self.removed.get_mut(index) {
+        if let Some(list) = slot(block).and_then(|index| self.removed.get_mut(index)) {
             list.push(phi);
         }
         Ok(same)
+    }
+
+    /// A new `Undef` of `var`'s type in `block`, placed ahead of the block's own operations.
+    fn new_undef(&mut self, var: Var, block: BlockId) -> Result<Value, PassError> {
+        let undef = self.function.push(
+            block,
+            Inst::Op(crate::ir::Operation::new(var.undef(), Vec::new())),
+        )?;
+        if let Some(list) = slot(block).and_then(|index| self.undefs.get_mut(index)) {
+            list.push(undef);
+        }
+        Ok(undef)
     }
 
     /// Writes each block's final list: its remaining phis, its `Undef`s, its removed phis
@@ -591,24 +662,23 @@ impl Ssa<'_> {
     }
 }
 
-/// `operand` with any chain of `Identity` operations followed to its end (Eden's
-/// `Value::Resolve`); a chain that loops or ends at a missing id stops where it is, at most
-/// once per instruction in the arena.
-pub(super) fn resolve(function: &Function, operand: Operand) -> Operand {
-    let mut current = operand;
-    for _ in 0..=arena_len(function) {
-        let Operand::Value(value) = current else {
-            return current;
-        };
-        match function.inst(value) {
-            Some(Inst::Op(op)) if op.opcode == Opcode::Identity => match op.args.first() {
-                Some(&next) => current = next,
-                None => return current,
-            },
-            _ => return current,
+/// The checks that can refuse the function, all made before anything changes (see the module
+/// docs): blocks in arena order, each block's instructions in list order, and for each
+/// instruction, that it exists ([`PassError::Missing`]), that a goto variable it names is named
+/// by an immediate ([`PassError::GotoIndex`]) and, for an `Identity`, that its chain ends at a
+/// value ([`PassError::Identity`]). The first fault met is returned.
+fn check(function: &Function, resolver: &mut Resolver, work: &mut Work) -> Result<(), PassError> {
+    for (_, block) in function.blocks() {
+        for &value in &block.insts {
+            work.step();
+            let inst = function.inst(value).ok_or(PassError::Missing(value))?;
+            access(value, inst)?;
+            if matches!(inst, Inst::Op(op) if op.opcode == Opcode::Identity) {
+                resolver.resolve(function, Operand::Value(value), work)?;
+            }
         }
     }
-    current
+    Ok(())
 }
 
 /// Moves block 0's instructions and terminator to a new last block when other blocks jump to

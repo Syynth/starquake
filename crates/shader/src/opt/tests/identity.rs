@@ -2,8 +2,11 @@
 //! `Identity` and `Void` leave their blocks; malformed chains are refused.
 
 use super::{after, after_each, error, parse, value};
-use crate::ir::{Inst, Opcode};
-use crate::opt::{Pass, PassError, run};
+use std::fmt::Write;
+
+use crate::ir::{Inst, Opcode, Operand};
+use crate::opt::identity::Resolver;
+use crate::opt::{Pass, PassError, Work, identity_of, run};
 
 /// The SSA rewrite's output for a loop of a header and a body.
 const LOOP: &str = "block0:
@@ -195,4 +198,79 @@ fn a_missing_listed_id_is_refused() {
         run(&mut function, Pass::IdentityRemoval),
         Err(PassError::Missing(value(5)))
     );
+}
+
+#[test]
+fn a_chain_as_long_as_the_arena_resolves() {
+    // The arena holds three instructions, a chain of three Identities, so the resolver's walk
+    // takes exactly as many steps as the arena has slots, the most it allows. block0's
+    // condition reads the chain before block1's links are rewired.
+    let text = "block0:
+    branch %0, block1, block1
+block1:
+    %0: opaque = Identity %1
+    %1: opaque = Identity %2
+    %2: opaque = Identity u1 true
+    return
+";
+    assert_eq!(
+        after(text, Pass::IdentityRemoval),
+        "block0:
+    branch u1 true, block1, block1
+block1:
+    return
+"
+    );
+}
+
+#[test]
+fn chain_ends_are_remembered_for_users_listed_first() {
+    // %0, then `count` users of the links from the last to the first, then the links, last
+    // first: link k is `Identity` of link k - 1, and link 1 of %0. Each user is rewired before
+    // any link is, so only the remembered ends keep the walk linear.
+    let count: u32 = 5_000;
+    let link = |k: u32| count + k;
+    let mut text = String::from("block0:\n    %0: u32 = GetCbufU32 u32 0, u32 0\n");
+    for user in 1..=count {
+        let k = count + 1 - user;
+        let _ = writeln!(text, "    %{user}: u32 = IAdd32 %{}, u32 1", link(k));
+    }
+    for k in (1..=count).rev() {
+        let previous = if k == 1 { 0 } else { link(k - 1) };
+        let _ = writeln!(text, "    %{}: opaque = Identity %{previous}", link(k));
+    }
+    text.push_str("    return\n");
+    let mut function = parse(&text);
+    let work = run(&mut function, Pass::IdentityRemoval).expect("runs");
+    let size = u64::from(2 * count + 1);
+    assert!(work.steps() <= 4 * size, "{} steps", work.steps());
+    let out = function.to_string();
+    assert!(out.contains("    %1: u32 = IAdd32 %0, u32 0x1\n"), "{out}");
+    assert!(!out.contains("Identity"), "{out}");
+}
+
+#[test]
+fn the_resolver_follows_the_arena_as_it_grows() {
+    // The SSA rewrite adds instructions after making its resolver: a chain of three added
+    // links is longer than the one-instruction arena the resolver was made for, and its ends
+    // are remembered.
+    let mut function = parse("block0:\n    %0: u32 = GetCbufU32 u32 0, u32 0\n    return\n");
+    let mut resolver = Resolver::new(&function);
+    let entry = function.entry();
+    let mut last = Operand::Value(value(0));
+    for _ in 0..3 {
+        last = Operand::Value(function.push(entry, identity_of(last)).expect("pushes"));
+    }
+    let mut first = Work::default();
+    assert_eq!(
+        resolver.resolve(&function, last, &mut first),
+        Ok(Operand::Value(value(0)))
+    );
+    // Once remembered, the chain costs one step to its remembered end and one to see it ends.
+    let mut again = Work::default();
+    assert_eq!(
+        resolver.resolve(&function, last, &mut again),
+        Ok(Operand::Value(value(0)))
+    );
+    assert_eq!(again.steps(), 2);
 }

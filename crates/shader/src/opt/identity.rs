@@ -19,6 +19,13 @@
 //!   an `Identity` without an argument or at an id with no instruction, is
 //!   [`PassError::Identity`] naming the first `Identity` of the chain met; Eden would loop
 //!   forever or read past its arguments (`tests::identity::cycles_are_refused`).
+//!
+//! The resolver ([`Resolver`]) is shared with constant propagation and the SSA rewrite (for
+//! trivial phis), and grows with the arena, since the rewrite adds phis and `Undef`s after
+//! making it; a walk may take as many steps as the arena then holds
+//! (`tests::identity::a_chain_as_long_as_the_arena_resolves`,
+//! `tests::identity::chain_ends_are_remembered_for_users_listed_first`,
+//! `tests::identity::the_resolver_follows_the_arena_as_it_grows`).
 
 use crate::ir::{Function, Inst, Opcode, Operand, Terminator, Value};
 
@@ -26,7 +33,8 @@ use super::{PassError, Work, arena_len, invalidated, tree_conditions_mut};
 
 /// Follows `Identity` chains, remembering each chain's end.
 pub(super) struct Resolver {
-    /// The end of each `Identity`'s chain, once found.
+    /// The end of each `Identity`'s chain, once found; as long as the arena, which it follows
+    /// as the arena grows.
     ends: Vec<Option<Operand>>,
     /// Scratch: the chain being followed.
     chain: Vec<Value>,
@@ -53,6 +61,12 @@ impl Resolver {
         };
         if !is_identity(function, start) {
             return Ok(operand);
+        }
+        // The arena may have grown since the last call (the SSA rewrite adds phis and
+        // `Undef`s as it goes).
+        let len = arena_len(function);
+        if self.ends.len() < len {
+            self.ends.resize(len, None);
         }
         // Walk to the end, or to a chain already resolved.
         let mut chain = std::mem::take(&mut self.chain);

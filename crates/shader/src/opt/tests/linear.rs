@@ -127,3 +127,47 @@ fn a_long_identity_chain_is_followed_once() {
     let size = u64::try_from(2 * count + 1).expect("small");
     assert!(work.steps() <= 4 * size, "{} steps", work.steps());
 }
+
+/// Goto variable 0, copied to goto variables 1 to `count` in turn in block0, then all of them
+/// read at a join of two blocks: each read's phi is trivial, and its operand is a chain of
+/// `Identity` operations as long as the variable's index.
+fn copies(count: u32) -> Function {
+    let mut t = Text {
+        text: String::new(),
+        id: 0,
+    };
+    t.raw("block0:");
+    let cond = t.line(": u1 = GetPred p0");
+    t.line(&format!(" = SetGotoVariable u32 0, %{cond}"));
+    for index in 1..=count {
+        let read = t.line(&format!(": u1 = GetGotoVariable u32 {}", index - 1));
+        t.line(&format!(" = SetGotoVariable u32 {index}, %{read}"));
+    }
+    t.raw(&format!("    branch %{cond}, block1, block2"));
+    t.raw("block1:");
+    t.raw("    jump block3");
+    t.raw("block2:");
+    t.raw("    jump block3");
+    t.raw("block3:");
+    for index in 0..=count {
+        let read = t.line(&format!(": u1 = GetGotoVariable u32 {index}"));
+        t.line(&format!(" = SetPred p1, %{read}"));
+    }
+    t.raw("    return");
+    Function::parse(&t.text).expect("parses")
+}
+
+#[test]
+fn many_variables_fed_from_one_chain_cost_their_size() {
+    // The trivial phis' operands are chains of 1 to `count` links; following each from its
+    // start would cost about count^2 / 2 steps, following each once costs about count.
+    let count = 2_000;
+    let small = run(&mut copies(count), Pass::SsaRewrite).expect("runs");
+    let large = run(&mut copies(2 * count), Pass::SsaRewrite).expect("runs");
+    assert!(
+        large.steps() <= 2 * small.steps() + SLACK,
+        "{} steps for twice the variables, {} for once",
+        large.steps(),
+        small.steps()
+    );
+}

@@ -341,19 +341,101 @@ structure:
     );
 }
 
+/// Checks that the rewrite refuses `text` with `expected` and leaves it unchanged, and that
+/// `fixed`, the same function with the fault mended, then rewrites.
+fn refused_unchanged(text: &str, expected: PassError, fixed: &str) {
+    let mut function = parse(text);
+    let unchanged = function.clone();
+    assert_eq!(run(&mut function, Pass::SsaRewrite), Err(expected));
+    assert_eq!(function, unchanged);
+    let mut function = parse(fixed);
+    run(&mut function, Pass::SsaRewrite).expect("the mended function rewrites");
+}
+
 #[test]
 fn goto_indices_must_be_immediates() {
-    for op in ["GetGotoVariable %0", "SetGotoVariable %0, u1 true"] {
-        let text =
-            format!("block0:\n    %0: u32 = GetCbufU32 u32 0, u32 0\n    %1 = {op}\n    return\n");
-        assert_eq!(
-            error(&text, Pass::SsaRewrite),
-            PassError::GotoIndex(value(1))
-        );
+    // block1 comes after a block that is filled first, so a check made while filling would
+    // leave block0 rewritten and block1 emptied.
+    for (op, fixed) in [
+        ("GetGotoVariable %0", "GetGotoVariable u32 0"),
+        (
+            "SetGotoVariable %0, u1 true",
+            "SetGotoVariable u32 0, u1 true",
+        ),
+    ] {
+        let text = |op: &str| {
+            format!(
+                "block0:\n    %0: u32 = GetCbufU32 u32 0, u32 0\n    %2 = SetRegister r0, %0\n    \
+                 jump block1\nblock1:\n    %3: u32 = GetRegister r0\n    %1 = {op}\n    return\n"
+            )
+        };
+        refused_unchanged(&text(op), PassError::GotoIndex(value(1)), &text(fixed));
     }
     assert_eq!(
         PassError::GotoIndex(value(1)).to_string(),
         "%1 names its goto variable with a value, not an immediate"
+    );
+}
+
+#[test]
+fn a_missing_listed_id_is_refused_before_anything_changes() {
+    let text = "block0:\n    %0 = SetRegister r0, u32 1\n    jump block1\nblock1:\n    %1: u32 = GetRegister r0\n    return\n";
+    let mut function = parse(text);
+    let id = function.blocks().nth(1).map(|(id, _)| id).expect("block1");
+    function.block_mut(id).expect("block1").insts.push(value(5));
+    let unchanged = function.clone();
+    assert_eq!(
+        run(&mut function, Pass::SsaRewrite),
+        Err(PassError::Missing(value(5)))
+    );
+    assert_eq!(function, unchanged);
+    let mut mended = parse(text);
+    run(&mut mended, Pass::SsaRewrite).expect("rewrites");
+}
+
+#[test]
+fn a_broken_identity_chain_is_refused_before_anything_changes() {
+    // %4 and %5 name each other; the rewrite resolves trivial phis' operands through such
+    // chains, so it refuses the input before it starts.
+    let text = |chain: &str| {
+        format!(
+            "block0:\n    %0 = SetRegister r0, u32 1\n    jump block1\nblock1:\n    \
+             %1: u32 = GetRegister r0\n{chain}    return\n"
+        )
+    };
+    refused_unchanged(
+        &text("    %4: opaque = Identity %5\n    %5: opaque = Identity %4\n"),
+        PassError::Identity(value(4)),
+        &text("    %4: opaque = Identity u32 2\n    %5: opaque = Identity %4\n"),
+    );
+}
+
+#[test]
+fn the_first_fault_in_block_order_is_refused() {
+    // Two faults, a goto index (%2) and a looping chain (%4), in either block; the one in the
+    // earlier block is reported. Both functions also have an entry phi, which is checked last.
+    let goto = "    %1: u32 = GetCbufU32 u32 0, u32 0\n    %2 = SetGotoVariable %1, u1 true\n";
+    let chain = "    %4: opaque = Identity %4\n";
+    let text = |first: &str, second: &str| {
+        format!(
+            "block0:\n    %0: u32 = Phi [block1: u32 1]\n{first}    jump block1\nblock1:\n\
+             {second}    jump block0\n"
+        )
+    };
+    for (first, second, expected) in [
+        (goto, chain, PassError::GotoIndex(value(2))),
+        (chain, goto, PassError::Identity(value(4))),
+        (goto, "", PassError::GotoIndex(value(2))),
+    ] {
+        let mut function = parse(&text(first, second));
+        let unchanged = function.clone();
+        assert_eq!(run(&mut function, Pass::SsaRewrite), Err(expected));
+        assert_eq!(function, unchanged);
+    }
+    // With neither fault, the entry phi is what is refused.
+    assert_eq!(
+        error(&text("", ""), Pass::SsaRewrite),
+        PassError::EntryPhi(value(0))
     );
 }
 
@@ -416,4 +498,137 @@ block2:
 ";
     let out = after(text, Pass::SsaRewrite);
     assert!(out.contains("%1: opaque = Identity u1 true"), "{out}");
+}
+
+/// Runs the rewrite on `text`, which must verify first, and checks that the output verifies,
+/// that the whole pipeline runs, and that the machine is the same; returns the rewritten text.
+fn rewrite_verifies(text: &str) -> String {
+    let before = parse(text);
+    before.verify().expect("the input verifies");
+    let mut piped = before.clone();
+    crate::opt::optimize(&mut piped).expect("the pipeline runs");
+    rewrite_keeps_state(text, &Machine::new())
+}
+
+#[test]
+fn an_unreachable_cycle_of_blocks_reads_undef() {
+    // block1 to block3 are a cycle the entry cannot reach. Its reads of r0 and p0 are Undefs
+    // of block1; a phi of r0 there would take block1's own %1 from both back edges and stand
+    // for it ahead of its definition.
+    let text = "block0:
+    return
+block1:
+    %0: u32 = GetRegister r0
+    %1: u32 = IAdd32 %0, u32 1
+    %2 = SetRegister r0, %1
+    %3: u1 = GetPred p0
+    branch %3, block2, block3
+block2:
+    jump block1
+block3:
+    jump block1
+";
+    assert_eq!(
+        rewrite_verifies(text),
+        "block0:
+    return
+block1:
+    %4: u32 = UndefU32
+    %5: u1 = UndefU1
+    %0: opaque = Identity %4
+    %1: u32 = IAdd32 %0, u32 0x1
+    %2 = SetRegister r0, %1
+    %3: opaque = Identity %5
+    branch %3, block2, block3
+block2:
+    jump block1
+block3:
+    jump block1
+"
+    );
+}
+
+#[test]
+fn an_unreachable_self_loop_reads_undef() {
+    // block1 is its own only predecessor and reads r0 before writing it.
+    let text = "block0:
+    %0 = SetRegister r0, u32 1
+    return
+block1:
+    %1: u32 = GetRegister r0
+    %2: u32 = IAdd32 %1, u32 1
+    %3 = SetRegister r0, %2
+    jump block1
+";
+    assert_eq!(
+        rewrite_verifies(text),
+        "block0:
+    %0 = SetRegister r0, u32 0x1
+    return
+block1:
+    %4: u32 = UndefU32
+    %1: opaque = Identity %4
+    %2: u32 = IAdd32 %1, u32 0x1
+    %3 = SetRegister r0, %2
+    jump block1
+"
+    );
+}
+
+#[test]
+fn an_unreachable_two_block_cycle_reads_undef() {
+    let text = "block0:
+    return
+block1:
+    %0: u32 = GetRegister r0
+    %1: u32 = IAdd32 %0, u32 1
+    %2 = SetRegister r0, %1
+    jump block2
+block2:
+    %3: u32 = GetRegister r0
+    %4 = SetRegister r1, %3
+    jump block1
+";
+    // Neither read looks past its own block: block2's read is undefined although its only
+    // predecessor, block1, writes r0, because block2 never runs.
+    assert_eq!(
+        rewrite_verifies(text),
+        "block0:
+    return
+block1:
+    %5: u32 = UndefU32
+    %0: opaque = Identity %5
+    %1: u32 = IAdd32 %0, u32 0x1
+    %2 = SetRegister r0, %1
+    jump block2
+block2:
+    %6: u32 = UndefU32
+    %3: opaque = Identity %6
+    %4 = SetRegister r1, %3
+    jump block1
+"
+    );
+}
+
+#[test]
+fn a_branch_with_equal_arms_is_one_predecessor() {
+    // block0 reaches block1 by both arms of one branch: block1's phi takes block0's value once.
+    let text = "block0:
+    %0 = SetRegister r0, u32 0
+    %1: u1 = GetPred p0
+    branch %1, block1, block1
+block1:
+    %2: u32 = GetRegister r0
+    %3: u32 = IAdd32 %2, u32 1
+    %4 = SetRegister r0, %3
+    %5: u1 = ULessThan %3, u32 4
+    branch %5, block1, block2
+block2:
+    return
+";
+    let start = Machine::new();
+    let out = rewrite_keeps_state(text, &start);
+    assert_eq!(ran(&parse(&out), &start).regs[0], 4);
+    assert_eq!(out.matches("[block0:").count(), 1, "{out}");
+    assert!(out.contains("Phi [block0: u32 0x0], [block1: %3]"), "{out}");
 }

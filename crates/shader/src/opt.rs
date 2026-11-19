@@ -254,6 +254,13 @@ pub(crate) fn block_order(function: &Function, work: &mut Work) -> Vec<BlockId> 
     order
 }
 
+/// Whether the entry reaches each block, by block index (the blocks [`post_order`] visits).
+pub(crate) fn reachable(function: &Function, work: &mut Work) -> Vec<bool> {
+    let mut placed = vec![false; function.block_count()];
+    post_order(function, &mut placed, work);
+    placed
+}
+
 /// The post order of the blocks the entry reaches (Eden's `PostOrder`): a depth-first walk
 /// that takes each block's first successor not yet visited, and emits a block once none is
 /// left. Marks each visited block in `placed`.
