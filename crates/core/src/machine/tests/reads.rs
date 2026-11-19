@@ -432,6 +432,7 @@ fn run_reading(test: &str, romfs: RomFs, timeout: Duration) -> (RunReport, Seen)
         romfs: Some(romfs),
         rtc: RtcAtBoot::eden_default(),
         environment: crate::EnvSource::Live,
+        until_frames: None,
     };
     let report = run(
         vcpus(&mut main),
@@ -498,6 +499,7 @@ fn session_over<'a>(memory: &'a FlatMemory, options: &'a RunOptions) -> Session<
         options,
         clock: RunClock::new(timebase()),
         recorder: Arc::new(Recorder::new()),
+        gpu_memory: None,
     }
 }
 
@@ -542,6 +544,7 @@ fn a_read_held_at_the_title_does_not_hold_up_a_card_read() {
         romfs: Some(romfs),
         rtc: RtcAtBoot::eden_default(),
         environment: crate::EnvSource::Live,
+        until_frames: None,
     };
     let memory = FlatMemory::new(RAM_BASE, RAM_SIZE);
     let session = session_over(&memory, &options);
@@ -776,6 +779,7 @@ fn run_failed(
         romfs: Some(romfs().0),
         rtc: RtcAtBoot::eden_default(),
         environment: crate::EnvSource::Live,
+        until_frames: None,
     };
     let report = run_serving(
         vcpus(&mut main),

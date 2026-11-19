@@ -1,8 +1,15 @@
 //! Writing a run's artifacts folder.
 //!
 //! Source: `docs/specs/observability.md`, "Headless runs": the folder always holds
-//! `summary.json`, `trace.txt` and `events.bin`, plus `crash.json` and `crash.txt` when the guest
-//! crashed. Frames and snapshots are not written: nothing produces them yet.
+//! `summary.json`, `trace.txt`, `events.bin`, `gpu.txt` ([`GPU_FILE`]) and the `frames/` folder
+//! ([`FRAMES_FOLDER`]), plus `crash.json` and `crash.txt` when the guest crashed. Snapshots are
+//! not written: nothing produces them yet.
+//!
+//! `gpu.txt` is the GPU's flight recorder, empty for a run with no GPU (the null front).
+//! `frames/` holds the run's frame dumps (`crate::frames`), one PNG per frame kept, named by
+//! [`frame_file_name`]; it is made even when empty. A frame file left in it by an earlier run
+//! (a file whose name [`frame_number`] reads) is removed first, so the folder holds this run's
+//! frames only; any other file in it is left alone.
 //!
 //! Two files are added to the spec's table: [`GUEST_LOG_FILE`], the text the guest wrote with
 //! `OutputDebugString` (the event stream keeps only each line's length and hash, so without it a
@@ -12,7 +19,10 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::frames::{frame_file_name, frame_number};
 use crate::report::RunReport;
+
+pub use crate::frames::FRAMES_FOLDER;
 
 /// Exit reason, duration and counts (`RunReport::summary`), as JSON.
 pub const SUMMARY_FILE: &str = "summary.json";
@@ -35,6 +45,9 @@ pub const GUEST_LOG_FILE: &str = "guest_log.txt";
 /// and ends with `[truncated: <n> later lines were not kept]`; the authority is
 /// `host_log_lines_dropped` in `summary.json`. Always written, empty when nothing was logged.
 pub const LOG_FILE: &str = "log.txt";
+/// The GPU's own flight recorder (`docs/specs/gpu-protocol.md`, "Observability"). Always
+/// written, empty for a run with no GPU.
+pub const GPU_FILE: &str = "gpu.txt";
 /// The crash report as data. Only present when the guest crashed.
 pub const CRASH_JSON_FILE: &str = "crash.json";
 /// The crash report as text. Only present when the guest crashed.
@@ -105,6 +118,8 @@ pub fn write(folder: &Path, report: &RunReport) -> Result<(), ArtifactError> {
         host_log.push_str(&truncated(report.host_log_dropped));
     }
     put(LOG_FILE, host_log.as_bytes())?;
+    put(GPU_FILE, report.graphics.gpu_recorder.as_bytes())?;
+    write_frames(&folder.join(FRAMES_FOLDER), report)?;
 
     if let Some(crash) = report.crash() {
         let data = json(CRASH_JSON_FILE, serde_json::to_string_pretty(crash))?;
@@ -120,6 +135,33 @@ pub fn write(folder: &Path, report: &RunReport) -> Result<(), ArtifactError> {
                 _ => {}
             }
         }
+    }
+    Ok(())
+}
+
+/// Makes `frames` (the artifacts folder's [`FRAMES_FOLDER`]), removes the frame files an earlier
+/// run left in it, and writes `report`'s (module docs).
+fn write_frames(frames: &Path, report: &RunReport) -> Result<(), ArtifactError> {
+    let io_error = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| ArtifactError::Io { path, source }
+    };
+    std::fs::create_dir_all(frames).map_err(io_error(frames))?;
+    for entry in std::fs::read_dir(frames).map_err(io_error(frames))? {
+        let entry = entry.map_err(io_error(frames))?;
+        let stale = entry
+            .file_name()
+            .to_str()
+            .and_then(frame_number)
+            .is_some();
+        if stale {
+            let path = entry.path();
+            std::fs::remove_file(&path).map_err(io_error(&path))?;
+        }
+    }
+    for file in &report.graphics.dumps.files {
+        let path = frames.join(frame_file_name(file.frame));
+        std::fs::write(&path, &file.png).map_err(io_error(&path))?;
     }
     Ok(())
 }

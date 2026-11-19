@@ -447,6 +447,7 @@ fn the_timer_thread_s_graphics_turn_ends_a_guest_s_wait() {
         romfs: None,
         rtc: RtcAtBoot::eden_default(),
         environment: crate::EnvSource::Live,
+        until_frames: None,
     };
     let report = run(
         vcpus(&mut main),
@@ -683,6 +684,7 @@ fn a_held_page_request_is_answered_at_the_bound_by_the_timer_thread() {
         romfs: None,
         rtc: RtcAtBoot::eden_default(),
         environment: crate::EnvSource::Live,
+        until_frames: None,
     };
     let report = run(
         vcpus(&mut main),
@@ -745,6 +747,7 @@ fn on_a_machine(check: impl FnOnce(&Machine<'_, ScriptedVcpu, FixedClock>)) {
             clock: FixedClock::new(CLOCK_STEP, CLOCK_STEP),
         }),
         recorder: Arc::new(Recorder::new()),
+        gpu_memory: None,
     };
     let env = session.environment();
     let (dispatcher, _) = boot(guest.address_space(), &guest.placed, space, &*env).unwrap();

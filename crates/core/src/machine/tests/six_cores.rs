@@ -208,6 +208,7 @@ fn stepped(
         options: &options,
         clock: RunClock::new(fixed_timebase()),
         recorder: Arc::new(Recorder::new()),
+        gpu_memory: None,
     };
     let sink = Arc::new(VecSink::new());
     session.recorder.add_sink(Arc::clone(&sink));
@@ -241,6 +242,7 @@ fn assert_exited(outcome: &Ran) {
         Ending::Failed(message) => assert_eq!(message, "", "the run failed"),
         Ending::Crashed(exception, ..) => assert_eq!(format!("{exception:?}"), "", "crashed"),
         Ending::TimedOut => assert_eq!("timed out", "", "the run timed out"),
+        Ending::FramesReached => assert_eq!("frames reached", "", "the run reached its frames"),
     }
     assert!(
         outcome.left.iter().all(|left| *left == 0),
@@ -835,6 +837,7 @@ fn a_run_whose_threads_all_wait_on_nothing_that_can_end_is_an_emulator_error() {
         romfs: None,
         rtc: RtcAtBoot::eden_default(),
         environment: crate::EnvSource::Live,
+        until_frames: None,
     };
     let report = guest.run(main, &options);
     assert_eq!(report.exit, ExitReason::EmulatorError(WAITING.to_owned()));
@@ -954,6 +957,7 @@ fn the_runs_timeout_stops_every_core() {
                 romfs: None,
                 rtc: RtcAtBoot::eden_default(),
                 environment: crate::EnvSource::Live,
+                until_frames: None,
             },
             Instant::now(),
             timebase(),
@@ -1012,6 +1016,7 @@ fn a_timed_out_run_says_where_each_thread_is_and_which_core_held_it() {
         options: &options,
         clock: RunClock::new(fixed_timebase()),
         recorder: Arc::new(Recorder::new()),
+        gpu_memory: None,
     };
     let env = session.environment();
     let (dispatcher, _) = boot(guest.address_space(), &guest.placed, &guest.memory, &*env).unwrap();
@@ -1093,6 +1098,7 @@ fn a_run_that_did_not_time_out_reads_no_threads() {
         options: &options,
         clock: RunClock::new(fixed_timebase()),
         recorder: Arc::new(Recorder::new()),
+        gpu_memory: None,
     };
     let env = session.environment();
     let (dispatcher, _) = boot(guest.address_space(), &guest.placed, &guest.memory, &*env).unwrap();

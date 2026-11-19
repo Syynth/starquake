@@ -109,6 +109,7 @@ impl Guest {
             space,
             placed: &self.placed,
             address_space: self.address_space(),
+            gpu_memory: None,
         }
     }
 
@@ -492,6 +493,7 @@ fn a_data_abort_is_a_crash_that_names_the_address_and_the_instruction() {
         romfs: None,
         rtc: RtcAtBoot::eden_default(),
         environment: crate::EnvSource::Live,
+        until_frames: None,
     };
     let report = guest.run(vcpu, &options);
 
@@ -697,6 +699,7 @@ fn a_guest_that_never_stops_is_ended_by_the_timeout() {
         romfs: None,
         rtc: RtcAtBoot::eden_default(),
         environment: crate::EnvSource::Live,
+        until_frames: None,
     };
     let vcpu = ScriptedVcpu::new().then_spin();
     let interrupters = Interrupters::default();
@@ -718,6 +721,7 @@ fn a_run_that_ends_before_its_timeout_does_not_wait_for_it() {
         romfs: None,
         rtc: RtcAtBoot::eden_default(),
         environment: crate::EnvSource::Live,
+        until_frames: None,
     };
     let vcpu = ScriptedVcpu::new().then(|_| {}, svc(SvcId::ExitProcess));
     let started = Instant::now();
@@ -875,6 +879,7 @@ fn the_environments_recording_moves_to_the_kept_recording_as_it_is_made() {
         options: &options,
         clock: RunClock::new(timebase()),
         recorder: Arc::new(Recorder::new()),
+        gpu_memory: None,
     };
     let env = session.environment();
     // The most the environment held, unmoved, each time the guest ran: after the first call,

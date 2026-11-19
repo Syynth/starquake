@@ -417,6 +417,7 @@ fn run_options(args: &RunArgs, command_line: Vec<String>, romfs: Option<RomFs>) 
         rtc: rtc_at_boot(args.date),
         environment: starquake_core::EnvSource::Live,
     }
+    until_frames: None,
 }
 
 /// Runs the program `args` names and writes its artifacts. Returns the process exit code.
