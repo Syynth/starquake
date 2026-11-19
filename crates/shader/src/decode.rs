@@ -98,7 +98,7 @@ pub(crate) use op::control::{
 };
 pub use op::*;
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) use op::{Named, attribute, control, float, integer, op_list};
+pub(crate) use op::{Named, attribute, control, float, integer, memory, op_list};
 pub use operand::{
     AluSrc, CBuf, CBufRef, Gpr, Pred, PredSrc, RoundMode, UniformPred, UniformPredSrc, UniformReg,
 };

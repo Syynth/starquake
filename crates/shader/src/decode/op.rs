@@ -11,7 +11,7 @@
 //! | `float` | 6b | `FADD`, `FMUL`, `FFMA`, `FMNMX`, `FSET`, `FSETP`, `FSEL`, `MUFU`, `FSWZADD`, `FRND`, `F2F`, `F2I`, `I2F`, `I2FP`, `F2FP` |
 //! | `half_double` | 6c | `HADD2`, `HFMA2`, `HMUL2`, `HSET2`, `HSETP2`, `HMNMX2`, `DADD`, `DMUL`, `DFMA`, `DSETP` |
 //! | `uniform` | 6d | `R2UR`, `UP2UR` |
-//! | `memory` | 6e | `LD`/`ST` (every space), `LDC`, `ATOM` (with `ATOMS`, `ATOMG`, `RED`), `CCTL`, `MEMBAR`, `LDGSTS`, `LDGDEPBAR` |
+//! | `memory` | 6e | `LD`/`ST` (every space), `LDC`, `ATOM` (with `ATOMS`, `ATOMG`, `RED`), `CCTL`, `MEMBAR`, `LDGSTS`, `LDGDEPBAR`, `ERRBAR`, `ATOMS.POPC` |
 //! | `texture` | 6f | `TEX`, `TLD`, `TLD4`, `TMML`, `TXD`, `TXQ`, `SULD`, `SUST`, `SUATOM` (with `SURED`) |
 //! | `attribute` | 6g | `ALD`, `AST`, `IPA`, `AL2P`, `S2R`, `CS2R`, `PIXLD`, `OUT`, `OUT.FINAL`, `ISBERD`, `ISBEWR`, `LDTRAM` |
 //! | `control` | 6h | `BRA`, `BRX`, `JMX`, `CALL`, `RET`, `EXIT`, `KILL`, `BSSY`, `BSYNC`, `BREAK`, `BMOV`, `WARPSYNC`, `BAR`, `VOTE`, `SHFL`, `MATCH`, `REDUX`, `NOP`, `DEPBAR`, `NANOSLEEP`, `BPT` |
@@ -26,7 +26,8 @@
 //! a destination as `RED`, `OpSuAtom` without one as `SURED`; `nvdisasm_tests.rs`, `test_ldc`,
 //! prints a uniform `OpLdc` as `uldc`). The instructions NAK has no op for get variants of their
 //! own, named in NAK's style: `BRX`, `CALL`, `RET`, `DEPBAR`, `P2R`, `R2P`, `FSEL`, `I2FP`,
-//! `LDGSTS` and `LDGDEPBAR`, which PR #4588's table has rows for (`ampere_isa_table.h`), and
+//! `LDGSTS`, `LDGDEPBAR`, `ERRBAR` and `ATOMS.POPC`, which PR #4588's table has rows for
+//! (`ampere_isa_table.h`), and
 //! `JMX`, `UP2UR` and `BPT`, which only the spec's slice list names (their slices need a source
 //! for their encodings).
 //!
@@ -61,6 +62,10 @@ pub use control::{
 };
 pub use float::{FMulScale, FSwzAddOp, FloatCmpOp, FloatType, IntType, MuFuOp, PredSetOp};
 pub use integer::{IMadMode, IntCmpOp, MovSrc, PLop3Src, PrmtMode, ShfType};
+pub use memory::{
+    AtomDst, AtomOp, AtomType, CCtlOp, GlobalAccess, LdcMode, MemAddr, MemBarScope,
+    MemEvictionPriority, MemOrder, MemScope, MemSpace, MemType, OffsetStride, UniformAddr,
+};
 
 /// An operation's mnemonic, as `nvdisasm` writes it lower-cased (for a shell, a guess).
 pub(crate) trait Named {
@@ -124,7 +129,8 @@ macro_rules! op_list {
             }
             memory {
                 Ld(OpLd), St(OpSt), Ldc(OpLdc), Atom(OpAtom), CCtl(OpCCtl), MemBar(OpMemBar),
-                LdGsts(OpLdGsts), LdgDepBar(OpLdgDepBar),
+                LdGsts(OpLdGsts), LdgDepBar(OpLdgDepBar), ErrBar(OpErrBar),
+                AtomsPopc(OpAtomsPopc),
             }
             texture {
                 Tex(OpTex), Tld(OpTld), Tld4(OpTld4), Tmml(OpTmml), Txd(OpTxd), Txq(OpTxq),
