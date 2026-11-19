@@ -21,7 +21,8 @@
 //!
 //! - [`Channel::start_entry`] gives an idle channel its next GP entry.
 //! - [`Channel::run`] reads and executes words until the entry ends, the channel parks on an
-//!   acquire, or the quantum of words is used. Engine method words go to the
+//!   acquire, the sink holds it ([`RunOutcome::Held`]: a macro call waits for a catch-up), or
+//!   the quantum of words is used. Engine method words go to the
 //!   [`ChannelSink`] as [`EngineWord`]s (the register files, slice G9, sit behind it); binds,
 //!   releases, reductions, wait for idle and memory operations go to it as
 //!   [`RingEntry`] values; dropped words and carried methods go to it as [`Note`]s.
@@ -42,7 +43,8 @@
 //! read-ahead window: when the next word to execute is not in the chunk, the channel reads
 //! from it to the end of its page or of the entry, and executes from that copy until the
 //! chunk runs out, an acquire is checked, the entry ends, or `run` returns
-//! [`RunOutcome::QuantumUsed`]; each of these drops the rest of the chunk. So no word read in
+//! [`RunOutcome::QuantumUsed`] or [`RunOutcome::Held`]; each of these drops the rest of the
+//! chunk. So no word read in
 //! one `run` call is executed by a later one, whatever the front does in between (serving
 //! other channels, changing the address table)
 //! (`words_read_ahead_are_not_kept_across_run_calls`). Within one call, a word read ahead can
@@ -549,8 +551,8 @@ struct Current {
 }
 
 /// Words read ahead from the current entry, from entry offset `start`. Emptied when the entry
-/// ends, after every acquire and when [`Channel::run`] returns [`RunOutcome::QuantumUsed`], so
-/// it never outlives the `run` call that read it.
+/// ends, after every acquire and when [`Channel::run`] returns [`RunOutcome::QuantumUsed`] or
+/// [`RunOutcome::Held`], so it never outlives the `run` call that read it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Chunk {
     start: u32,
