@@ -65,18 +65,25 @@
 //!
 //! | Instruction | Rounding | Flush-to-zero | Pinned by |
 //! |---|---|---|---|
-//! | `FADD`, `FMUL`, `FFMA` | carried (`FpControl::rounding`) | carried (`FmzMode::Ftz`) | `tests::arithmetic_carries_rounding_and_flushing` |
-//! | `FMNMX`, `FSET`, `FSETP` | none | carried | `tests::comparisons_carry_flushing` |
-//! | `FRND` (float to integral float) | emulated by the operation the mode names | carried | `tests::frnd_rounds_by_its_field` |
-//! | `F2I` (float to integer) | emulated by the operation the mode names, as the PR does | emulated: a denormal 32-bit operand is replaced by a zero of its sign before rounding; also carried on the rounding operation | `tests::f2i_flushes_denormals_before_rounding` |
-//! | `F2F` (float to half) | emulated: converted to nearest, then moved one step when the wider value of the result lies on the wrong side of the operand; also carried on the conversion | emulated: the operand and a denormal half result are flushed to zeros of their sign; also carried on the conversion | `tests::f2f_emulation_matches_the_modelled_conversion` |
-//! | `I2F`, `I2FP` (integer to float) | carried on the conversion (decision 10 lists only float-to-integer and float-to-half conversions for emulation) | none | `tests::i2f_carries_its_rounding` |
-//! | `MUFU`, `FSWZADD`, `F2FP` | none: the PR accepts only to-nearest (`F2FP`, `FSWZADD`) or has no field (`MUFU`) | none | `tests::fswzadd_refuses_its_modes`, `tests::f2fp_refuses_the_selector_and_rounding` |
+//! | `FADD`, `FMUL`, `FFMA` | carried (`FpControl::rounding`) | carried (`FmzMode::Ftz`) | `tests::arith::arithmetic_carries_rounding_and_flushing` |
+//! | `FMNMX`, `FSET`, `FSETP` | none | carried | `tests::arith::comparisons_carry_flushing` |
+//! | `FRND` (float to integral float) | emulated by the operation the mode names | carried | `tests::convert::frnd_rounds_by_its_field` |
+//! | `F2I` (float to integer) | emulated by the operation the mode names, as the PR does | emulated: a denormal 32-bit operand is replaced by a zero of its sign before rounding; also carried on the rounding operation | `tests::convert::f2i_flushes_denormals_before_rounding` |
+//! | `F2F` (float to half) | emulated: converted to nearest, then moved one step when the wider value of the result lies on the wrong side of the operand; also carried on the conversion | emulated: the operand and a denormal half result are flushed to zeros of their sign; also carried on the conversion | `tests::convert::f2f_emulation_matches_the_modelled_conversion` |
+//! | `I2F`, `I2FP` (integer to float) | carried on the conversion (decision 10 lists only float-to-integer and float-to-half conversions for emulation) | none | `tests::convert::i2f_carries_its_rounding` |
+//! | `MUFU`, `FSWZADD`, `F2FP` | none: the PR accepts only to-nearest (`F2FP`, `FSWZADD`) or has no field (`MUFU`) | none | `tests::arith::fswzadd_refuses_its_modes`, `tests::convert::f2fp_refuses_the_selector_and_rounding` |
+//!
+//! **Owner question.** `F2I.FTZ` with a 16-bit operand is not emulated: the PR leaves the
+//! denormal mode of a half operand unset (`ops_convert.cpp`, `F2I`: `denorm_cares =
+//! !half_source`), and this module follows it, where decision 10 reads as emulating
+//! flush-to-zero on every float-to-integer conversion. A half denormal rounded up gives 1 with
+//! or without `.FTZ` (`tests::convert::f2i_flushes_denormals_before_rounding`).
 //!
 //! An emulated control is carried as well, so the IR means the same whether or not a backend
 //! honours the flag: the emulation is idempotent (a correctly rounded or flushed value is left
-//! as it is), which `f2f_emulation_matches_the_modelled_conversion` checks against the
-//! interpreter's model of the flag on its own. That flushing a denormal half result is what
+//! as it is), which `tests::convert::f2f_emulation_matches_the_modelled_conversion` and the
+//! fixed-seed `tests::convert::f2f_emulation_is_exact` check against the interpreter's model of
+//! the flag on its own, with the translated function's flags honoured and ignored. That flushing a denormal half result is what
 //! `F2F.FTZ` does on the hardware is a guess from the IR's definition of `FmzMode::Ftz` (Eden's
 //! `modifiers.h`: "Flush denorms to zero"), to be confirmed by a hardware trace.
 //!
@@ -93,7 +100,11 @@
 //! with its constant, checked in the PR's order (source slots first, then the instruction's own
 //! checks, then the constant-buffer bank as the value is read). Every check runs before the
 //! first instruction is appended, so a refusal leaves the function as it was
-//! (`tests::refusals_append_nothing`). Two of the PR's checks cannot fail on a decoded
+//! (`tests::refusals_append_nothing`). The order is pinned with two faults at once by
+//! `tests::refusals_report_in_the_prs_order`,
+//! `tests::conversion_refusals_report_in_the_prs_order`,
+//! `tests::more_conversion_refusals_report_in_the_prs_order` and
+//! `tests::the_bank_is_checked_last`. Two of the PR's checks cannot fail on a decoded
 //! instruction and are not repeated: `Require(set_op <= 2)` of `FSET` and `FSETP`
 //! ([`PredSetOp`] has three variants), and `F2I`'s `Ignore(77, 1)` is not a check.
 //!
@@ -103,9 +114,9 @@
 //! |---|---|---|---|
 //! | A guard on these instructions | a select of the result (`Visitor::Run`: `guard_select` for the pure ops `classify.h` lists) | a conditional block (spec, "Instruction translation") | `tests::guarded_instructions_become_conditional_blocks` |
 //! | `@!PT` | the instruction is skipped unchecked (`guard.Never()`) | checked, and put in a block that never runs | `tests::never_guarded_instructions_are_checked` |
-//! | `MUFU.SIN`, `MUFU.COS` | `FPSin`, `FPCos` of the argument as it is | of the argument times `2 pi` (row 95) | `tests::mufu_sine_and_cosine_take_turns` |
-//! | `F2I.FTZ` with a 32-bit operand, `F2F` rounding and `.FTZ` | carried as flags only | emulated as well (decision 10) | `tests::f2i_flushes_denormals_before_rounding`, `tests::f2f_emulation_matches_the_modelled_conversion` |
-//! | `FSETP` with a `PT` destination | computes the combination, then `SetPred` discards it | computes nothing for it | `tests::fsetp_writes_both_predicates` |
+//! | `MUFU.SIN`, `MUFU.COS` | `FPSin`, `FPCos` of the argument as it is | of the argument times `2 pi` (row 95) | `tests::arith::mufu_sine_and_cosine_take_turns` |
+//! | `F2I.FTZ` with a 32-bit operand, `F2F` rounding and `.FTZ` | carried as flags only | emulated as well (decision 10) | `tests::convert::f2i_flushes_denormals_before_rounding`, `tests::convert::f2f_emulation_matches_the_modelled_conversion` |
+//! | `FSETP` with a `PT` destination | computes the combination, then `SetPred` discards it | computes nothing for it | `tests::arith::fsetp_writes_both_predicates` |
 //!
 //! Where the decoder reads more than the PR translates, this module refuses what the PR
 //! refuses, as a listed choice: `FMUL`'s scale 0 ([`FloatUnsupported::FmulScale`]), the 8-bit
@@ -113,7 +124,10 @@
 //! opcodes, which `Visitor::Run` sends to no translator ([`FloatUnsupported::WideConversion`]),
 //! `MUFU`'s immediate form `0x908`, which it sends nowhere either
 //! ([`FloatUnsupported::MufuImmediate`]), `MUFU.RCP64H`, `.RSQ64H` and `.TANH`, and the
-//! `FSWZADD` operations other than the PR's two (`tests::decoded_forms_the_pr_refuses_are_refused`).
+//! `FSWZADD` operations other than the PR's two
+//! (`tests::decoded_forms_the_pr_refuses_are_refused`,
+//! `tests::wide_conversion_opcodes_are_refused`,
+//! `tests::mufu_and_fswzadd_forms_the_pr_refuses_are_refused`).
 //! The PR's `FSWZADD` works only for those two: for an operation byte it does not accept, the
 //! complement it passes to Eden's `FSwizzleAdd` gives other arithmetic than the decoder's
 //! documented guesses (for `add`, `-b`).
@@ -126,9 +140,9 @@ use std::fmt::{self, Display, Formatter};
 use thiserror::Error;
 
 use crate::decode::{
-    AluSrc, CBuf, CBufRef, FMulScale, FSwzAddOp, FloatCmpOp, FloatType, Gpr, Instr, IntType, MuFuOp, Op,
-    OpF2F, OpF2FP, OpF2I, OpFAdd, OpFFma, OpFMnMx, OpFMul, OpFRnd, OpFSel, OpFSet, OpFSetP,
-    OpFSwzAdd, OpI2FP, OpMuFu, Pred, PredSetOp, PredSrc, RoundMode,
+    AluSrc, CBuf, CBufRef, FMulScale, FSwzAddOp, FloatCmpOp, FloatType, Gpr, Instr, IntType,
+    MuFuOp, Op, OpF2F, OpF2FP, OpF2I, OpFAdd, OpFFma, OpFMnMx, OpFMul, OpFRnd, OpFSel, OpFSet,
+    OpFSetP, OpFSwzAdd, OpI2FP, OpMuFu, Pred, PredSetOp, PredSrc, RoundMode,
 };
 use crate::flow::read_pred;
 use crate::ir::{
@@ -532,14 +546,7 @@ fn check(op: &Op) -> Result<(), FloatUnsupported> {
             swizzle_of(op.ops).map(|_| ())
         }
         Op::F2I(op) => check_f2i(op),
-        Op::I2F(op) => check_i2f(
-            op.wide,
-            op.src,
-            op.dst_type,
-            op.src_type,
-            op.select,
-            "i2f",
-        ),
+        Op::I2F(op) => check_i2f(op.wide, op.src, op.dst_type, op.src_type, op.select, "i2f"),
         Op::I2FP(op) => check_i2f(false, op.src, op.dst_type, op.src_type, 0, "i2fp"),
         Op::FRnd(op) => check_frnd(op),
         Op::F2F(op) => check_f2f(op),
@@ -855,9 +862,7 @@ impl Emit<'_, '_> {
             AluSrc::Imm(bits) => Ok(imm32(bits)),
             AluSrc::CBuf { cbuf, .. } => match cbuf.buf {
                 CBuf::Binding(bank) => self.cbuf(bank, cbuf.offset),
-                CBuf::BindlessUniform(_) => {
-                    Err(FloatUnsupported::BindlessConstantBuffer.into())
-                }
+                CBuf::BindlessUniform(_) => Err(FloatUnsupported::BindlessConstantBuffer.into()),
             },
         }
     }
@@ -1095,10 +1100,7 @@ impl Emit<'_, '_> {
         let comparison = self.compare(op.cmp, a, b, op.ftz)?;
         let accum = self.pred(op.accum)?;
         let combined = self.emit(combine_op(op.set_op), &[comparison, accum])?;
-        let value = self.emit(
-            Opcode::SelectU32,
-            &[combined, imm32(FSET_TRUE), imm32(0)],
-        )?;
+        let value = self.emit(Opcode::SelectU32, &[combined, imm32(FSET_TRUE), imm32(0)])?;
         self.set(op.dst, value)
     }
 
@@ -1350,4 +1352,3 @@ impl Emit<'_, '_> {
         self.pack_low(half, zero)
     }
 }
-
