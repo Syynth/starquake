@@ -147,7 +147,8 @@
 //! (`capture::tests::replay::a_destroy_past_every_captured_list_waits_for_one_to_reach_it`).
 //! (10) The spec calls the error for bytes left inside a record `TrailingBytes`. Here that is
 //! [`CaptureError::RecordTrailingBytes`], and [`CaptureError::TrailingBytes`] is the error for
-//! bytes after the `End` record (`capture::tests::read`).
+//! bytes after the `End` record (`capture::tests::read::a_body_shorter_than_its_length_is_refused`
+//! and `bytes_after_end_are_refused_and_sticky`).
 //!
 //! **Memory while reading.** The reader holds one record. A `Submit` takes at most its
 //! [`MAX_LIST_DECODED_BYTES`] charge (each command is charged `size_of::<Command>()` plus its

@@ -417,6 +417,63 @@ fn a_create_at_the_live_bound_waits_for_the_destroys_before_it() {
             "wait 1",
         ])
     );
+    // A second destroy of the same id while the first is pending is forwarded too (the fresh
+    // backend refuses it as the captured one did), but the resource is forgotten once. Sampler
+    // 0 is never destroyed and sampler 1 is destroyed twice; the third create waits for fence 1
+    // and finds sampler 0 still held. Its own destroy waits on list 2, so the fourth create
+    // finds two held and waits again.
+    let mut b = builder();
+    let buf = b.create_buffer(buffer_desc(4)).expect("buffer");
+    let first = b.submit(&list(vec![upload(buf, &[1])])).expect("list 1");
+    b.create_sampler(super::sampler_desc()).expect("sampler 0");
+    let twice = b.create_sampler(super::sampler_desc()).expect("sampler 1");
+    b.destroy(ResourceId::Sampler(twice), first)
+        .expect("destroy");
+    b.destroy(ResourceId::Sampler(twice), first)
+        .expect("destroy again");
+    let third = b.create_sampler(super::sampler_desc()).expect("sampler 2");
+    let second = b.submit(&list(vec![upload(buf, &[2])])).expect("list 2");
+    b.destroy(ResourceId::Sampler(third), second)
+        .expect("destroy");
+    b.create_sampler(super::sampler_desc()).expect("sampler 3");
+    let (_, log) = replay_lagging(&b.finish().expect("end"));
+    assert_eq!(
+        log,
+        words(&[
+            "sampler",
+            "sampler",
+            "destroy after 1",
+            "destroy after 1",
+            "wait 1",
+            "sampler",
+            "destroy after 2",
+            "wait 2",
+            "sampler",
+            "wait 2",
+        ])
+    );
+    // The wait forgets the destroyed ids before the create is charged: a buffer at the memory
+    // limit fits once the one destroyed before it is forgotten.
+    let mut b = builder();
+    let first = b.create_buffer(buffer_desc(4)).expect("buffer");
+    let fence = b.submit(&list(vec![upload(first, &[1])])).expect("list");
+    b.destroy(ResourceId::Buffer(first), fence)
+        .expect("destroy");
+    b.create_buffer(buffer_desc(4)).expect("buffer");
+    let bytes = b.finish().expect("end");
+    let one = super::super::CaptureLimits {
+        live_resources: 1,
+        ..super::super::CaptureLimits::SHIPPED
+    };
+    let spy = Spy::new(Knob::Lagging);
+    let len = u64::try_from(bytes.len()).expect("small");
+    let mut reader = CaptureReader::with_limits(bytes.as_slice(), len, one).expect("header");
+    let tight = ReplayOptions {
+        memory_limit: Some(4),
+        ..options()
+    };
+    let report = replay(&mut reader, &spy, &Stub, &ReplayFrames::new(), &tight).expect("replays");
+    assert_eq!((report.refused, report.differences), (0, 0));
     // A buffer create is counted apart: two pending samplers do not make it wait.
     let mut b = builder();
     let buf = b.create_buffer(buffer_desc(4)).expect("buffer");
