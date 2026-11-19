@@ -3,6 +3,7 @@
 //! so a wrong semantic cannot hide behind a shared helper.
 
 mod compare;
+mod composite;
 mod control;
 mod convert;
 mod float;

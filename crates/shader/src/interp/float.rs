@@ -1,41 +1,50 @@
 //! Floating-point semantics: the three formats, rounding with the IR's rounding modes,
 //! denormal flushing, NaN canonicalisation, and the arithmetic built on them.
 //!
-//! Every result is computed from the operands' exact values, so it does not depend on the host:
+//! Every result but the transcendentals' is computed from the operands' exact values, so it
+//! does not depend on the host:
 //!
 //! - **16- and 32-bit addition, multiplication and fused multiply-add are exact, then rounded
 //!   once** with the operation's rounding mode. A binary16 or binary32 product is exact in
 //!   binary64 (at most 48 significant bits), and Knuth's two-sum gives a sum's exact error, so
 //!   the exact result is a pair of binary64 values that [`round`] rounds to the target format in
 //!   any of the four modes.
-//! - **64-bit arithmetic** uses the host's binary64 operations, which IEEE 754 defines exactly
-//!   in round-to-nearest-even; directed rounding on a 64-bit operation is not modelled (the
-//!   caller reports it as unsupported).
+//! - **64-bit addition, multiplication and fused multiply-add** use the host's binary64
+//!   operations (`f64::mul_add` is fused on every host), which IEEE 754 defines exactly in
+//!   round-to-nearest-even; directed rounding on them is not modelled, and the caller reports
+//!   it as unsupported. Conversions to binary64 do honour every mode: an integer's exact value
+//!   is a rounded binary64 value and its exact error, and the error says which neighbour a
+//!   directed mode takes.
 //! - **Division and square root** (`FPRecip32`, `FPSqrt`) are computed in binary64 and rounded
 //!   to binary32; binary64 has more than twice binary32's precision plus two bits, so the double
 //!   rounding gives the correctly rounded result (Figueroa, "When is double rounding
 //!   innocuous?", 1995).
 //! - **Transcendentals** (`FPSin`, `FPCos`, `FPExp2`, `FPLog2`) and `FPRecipSqrt32` are the
-//!   documented exception: they call the host's binary64 `sin`, `cos`, `exp2`, `ln`-based
-//!   `log2` and `sqrt` and round the result to binary32. Hosts' binary64 `sin`, `cos`, `exp2`
-//!   and `log2` can differ in the last binary64 bit, which changes the binary32 result only when
-//!   it lies within that bit of a rounding boundary. Tests compare them at exactly
-//!   representable points (`sin 0`, `exp2 3`, `log2 8`) or within a tolerance.
+//!   documented exception: they call the host's binary64 `sin`, `cos`, `exp2`, `log2` and
+//!   `sqrt` (the reciprocal square root as `1 / sqrt(x)`, two roundings) and round the result
+//!   to binary32 once more. Hosts' binary64 `sin`, `cos`, `exp2` and `log2` come from their C
+//!   libraries and can differ in the last binary64 bit, which changes the binary32 result only
+//!   when it lies within that bit of a rounding boundary. Tests compare them at exactly
+//!   representable points (`sin 0`, `exp2 3`, `log2 8`). Hardware `MUFU` results are
+//!   approximate; the IR states no precision for these operations.
+//!
+//! The host's binary64 operations keep denormals: Rust never turns on a flush-to-zero mode.
 //!
 //! NaN results of arithmetic and conversions are the canonical NaN of their format (positive,
 //! all mantissa bits set): `0x7fff`, `0x7fff_ffff` and `0x7fff_ffff_ffff_ffff`. The binary16
 //! one is PR #4588's (`eden-pr4588/src/tests/video_core/native_shader.cpp`, the test case
 //! `Native half FMA ReLU preserves fusion values above one and canonical NaNs`: an input NaN of
-//! `0x7e01` gives `0x7fff`); the binary32 and binary64 ones are a guess by analogy, to be confirmed by a
-//! hardware trace. Sign and absolute value (`FPNeg*`, `FPAbs*`), selects, bit casts and moves
+//! `0x7e01` gives `0x7fff`); the binary32 and binary64 ones are a guess by analogy, to be
+//! confirmed by a hardware trace. Sign and absolute value (`FPNeg*`, `FPAbs*`), selects, bit casts and moves
 //! are bit operations and keep a NaN's payload (PR #4588's `ExecuteNativeWarp` computes
 //! `FPNeg16` as `a ^ 0x8000` and `FPAbs16` as `a & 0x7fff`).
 //!
 //! Denormals are kept, except that an operation whose floating-point controls say
 //! [`FmzMode::Ftz`] or [`FmzMode::Fmz`] flushes denormal operands and a denormal rounded result
 //! to a zero of the same sign, and [`FmzMode::Fmz`] also makes a product with a zero factor
-//! `+0` whatever the other factor is (Eden's `modifiers.h`: "FTZ: Flush denorms to zero, NAN is
-//! propagated", "FMZ: Flush denorms to zero, x * 0 == 0"). [`FmzMode::None`] and
+//! `+0` whatever the other factor is, a NaN included (Eden's
+//! `eden/src/shader_recompiler/frontend/ir/modifiers.h`, `FmzMode`: "FTZ, Flush denorms to
+//! zero, NAN is propagated", "FMZ, Flush denorms to zero, x * 0 == 0"). [`FmzMode::None`] and
 //! [`FmzMode::DontCare`] keep denormals. Flushing the result after rounding, and the `+0` of an
 //! FMZ product, are guesses at the hardware's order and sign. [`FpRounding::DontCare`] rounds to
 //! nearest even.
