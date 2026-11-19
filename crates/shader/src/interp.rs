@@ -120,12 +120,16 @@
 //!   is [`InterpError::LaneOutsideWarp`] for the ballot, the shuffles and the quad operations
 //!   (not for the lane masks). Results that need several active lanes are checked as golden
 //!   IR by the translators' tests. Derivatives are not supported.
+//! - **`FSwizzleAdd`**, which reads only the lane id: Eden's `EmitFSwizzleAdd`
+//!   (`emit_spirv_warp.cpp`) multiplies each operand by a constant its table picks with the
+//!   lane's two bits of the swizzle, at `(lane_id & 3) * 2`, and adds the products, the
+//!   operation's controls applying to all three steps (added for the float translator, slice
+//!   12b).
 //!
 //! An operation not listed (for example `PhiMove`, `Join`, the `Get*FromOp` pseudo-operations
 //! other than `GetInBoundsFromOp` of a shuffle, `EmitVertex`, `EndPrimitive`,
-//! `InvocationInfo`, `RenderArea`, the `SR_WScaleFactor` values, the 64-bit and float atomics,
-//! `FSwizzleAdd` and the derivatives) is
-//! [`InterpError::Unsupported`], naming the opcode; translator slices add semantics as they
+//! `InvocationInfo`, `RenderArea`, the `SR_WScaleFactor` values, the 64-bit and float atomics
+//! and the derivatives) is [`InterpError::Unsupported`], naming the opcode; translator slices add semantics as they
 //! need them.
 //!
 //! # Where the interpreter differs from its references

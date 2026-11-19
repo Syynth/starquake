@@ -6,8 +6,8 @@ use proptest::prelude::*;
 use super::*;
 use crate::asm::assemble;
 use crate::decode::{
-    CBufRef, OPCODE, OpAL2P, OpALd, OpASt, OpCS2R, OpExit, OpIpa, OpPixLd, OpS2R, PixVal, Pred,
-    RoundMode, S2RDst, UniformReg,
+    AluSrc, CBufRef, OPCODE, OpAL2P, OpALd, OpASt, OpCS2R, OpExit, OpFFma, OpIpa, OpPixLd, OpS2R,
+    PixVal, Pred, PredSrc, RoundMode, S2RDst, UniformReg,
 };
 use crate::interp::Machine;
 use crate::testing::{any_instr, config};
@@ -388,18 +388,11 @@ fn guarded_side_effects_become_conditional_blocks() {
     }
 }
 
-/// One instruction of each operation [`translate`] takes, each in a form it accepts in a vertex
+/// One instruction of each operation whose guard [`translate`] reads itself (every one it takes
+/// but the float group's, which [`float`] guards), each in a form it accepts in a vertex
 /// program, with the class PR #4588's `classify.h` gives its opcode written out: `(instr, pure,
 /// uniform)`.
 fn one_of_each_translated_op() -> Vec<(Instr, bool, bool)> {
-    let ffma = OpFFma {
-        dst: r(0),
-        srcs: [AluSrc::reg(r(1)); 3],
-        saturate: false,
-        rnd: RoundMode::NearestEven,
-        ftz: false,
-        dnz: false,
-    };
     let ipa = OpIpa {
         dst: r(0),
         addr: 0x70,
@@ -414,9 +407,8 @@ fn one_of_each_translated_op() -> Vec<(Instr, bool, bool)> {
     };
     let ur1 = UniformReg::new(1).expect("ur1");
     vec![
-        // `classify.h`: `MOV` and `FFMA` by their base, in every form.
+        // `classify.h`: `MOV` by its base, in every form.
         (mov(r(0), MovSrc::Imm(7)), true, false),
-        (Instr::new(Op::FFma(ffma)), true, false),
         // `case 0x321: // ALD`, `case 0x326: // IPA`, `case 0x805: // CS2R`, `case 0x919:
         // // S2R`.
         (Instr::new(Op::ALd(ald(r(0), 0x80, 1))), true, false),
@@ -466,15 +458,16 @@ fn encoded_opcode(instr: Instr) -> u16 {
 
 /// The translator classifies a guard by flow analysis's table, looked up by the opcode the
 /// decoder reads the operation from: for each operation it takes, its `opcode` is the one the
-/// test assembler encodes (`MOV` and `FFMA`: the same class in every operand form), the class
-/// is `classify.h`'s, and the guard becomes a select exactly for the pure ones.
+/// test assembler encodes (`MOV`: the same class in every operand form), the class is
+/// `classify.h`'s, and the guard becomes a select exactly for the pure ones. The float group,
+/// `FFMA` included, takes its own guard, so `opcode` does not name it.
 #[test]
 fn guards_classify_by_the_flow_table() {
     for (instr, pure, uniform) in one_of_each_translated_op() {
         let encoded = encoded_opcode(instr);
         let info = classify(opcode(instr.op).expect("named"));
         assert_eq!(info, classify(encoded), "{instr}");
-        if !matches!(instr.op, Op::Mov(_) | Op::FFma(_)) {
+        if !matches!(instr.op, Op::Mov(_)) {
             assert_eq!(opcode(instr.op), Some(encoded), "{instr}");
         }
         assert_eq!((info.pure, info.uniform), (pure, uniform), "{instr}");
@@ -505,8 +498,8 @@ fn guards_classify_by_the_flow_table() {
             "{instr}"
         );
     }
-    // And of `FFMA`, with an immediate, a constant buffer or a uniform register in either
-    // source that takes one.
+    // `FFMA`, in every source form, is the float group's: `opcode` does not name it, since
+    // `translate` hands it to `float` before it reads a guard.
     let ffma = |srcs| {
         Instr::new(Op::FFma(OpFFma {
             dst: r(0),
@@ -518,28 +511,10 @@ fn guards_classify_by_the_flow_table() {
         }))
     };
     let reg = AluSrc::reg(r(1));
-    let others = [
-        AluSrc::Imm(0x3f80_0000),
-        AluSrc::CBuf {
-            cbuf,
-            abs: false,
-            neg: false,
-        },
-        AluSrc::UniformReg {
-            reg: ur1,
-            abs: false,
-            neg: false,
-        },
-    ];
-    for other in others {
-        for srcs in [[reg, other, reg], [reg, reg, other]] {
-            let instr = ffma(srcs);
-            assert_eq!(
-                classify(encoded_opcode(instr)),
-                classify(opcode(instr.op).expect("named")),
-                "{instr}"
-            );
-        }
+    for other in [reg, AluSrc::Imm(0x3f80_0000)] {
+        let instr = ffma([reg, other, reg]);
+        assert!(float::in_group(&instr.op), "{instr}");
+        assert_eq!(opcode(instr.op), None, "{instr}");
     }
     // The guard rules before the class: `@!PT` never runs, whatever the operation.
     let never = PredSrc {
@@ -675,9 +650,9 @@ fn mov_lane_mask_must_be_full() {
     assert!(one(mov(r(0), MovSrc::Imm(1))).is_ok());
 }
 
-/// The decoder reads uniform-register and constant-buffer sources of `MOV` and `FFMA`; the
-/// translator rejects them, in every source position, and keeps translating register and
-/// immediate sources.
+/// The decoder reads uniform-register and constant-buffer sources of `MOV`; the translator
+/// rejects them and keeps translating register and immediate sources. (`FFMA` reads them since
+/// slice 12b: `float::tests::sources_of_every_kind`.)
 #[test]
 fn uniform_and_constant_buffer_sources_are_rejected() {
     use crate::decode::{CBuf, CBufRef, UniformReg};
@@ -689,32 +664,6 @@ fn uniform_and_constant_buffer_sources_are_rejected() {
     for src in [MovSrc::CBuf(cbuf), MovSrc::UniformReg(ureg)] {
         let instr = mov(r(0), src);
         assert_eq!(one(instr), unsupported(instr, Unsupported::Source));
-    }
-    let wide = [
-        AluSrc::CBuf {
-            cbuf,
-            abs: false,
-            neg: false,
-        },
-        AluSrc::UniformReg {
-            reg: ureg,
-            abs: false,
-            neg: false,
-        },
-    ];
-    let reg = AluSrc::reg(r(1));
-    for src in wide {
-        for srcs in [[reg, src, reg], [reg, reg, src]] {
-            let instr = Instr::new(Op::FFma(OpFFma {
-                dst: r(0),
-                srcs,
-                saturate: false,
-                rnd: RoundMode::NearestEven,
-                ftz: false,
-                dnz: false,
-            }));
-            assert_eq!(one(instr), unsupported(instr, Unsupported::Source));
-        }
     }
     let instr = mov(r(0), MovSrc::UniformReg(ureg));
     assert_eq!(
@@ -781,7 +730,10 @@ fn ffma_multiply_zero_mode_is_rejected() {
     let instr = Instr::new(Op::FFma(op));
     assert_eq!(
         one(instr),
-        unsupported(instr, Unsupported::FfmaMultiplyZero)
+        unsupported(
+            instr,
+            Unsupported::Float(float::FloatUnsupported::FfmaMultiplyZero)
+        )
     );
     assert!(one(Instr::new(Op::FFma(OpFFma { dnz: false, ..op }))).is_ok());
 }

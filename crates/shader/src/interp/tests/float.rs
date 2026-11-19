@@ -525,3 +525,52 @@ fn canonical_nan_constants_are_the_documented_bits() {
     assert_eq!(F32_NAN, 0x7fff_ffff);
     assert_eq!(F64_NAN, 0x7fff_ffff_ffff_ffff);
 }
+
+/// `FSwizzleAdd a, b, swizzle` per Eden's `EmitFSwizzleAdd`: the lane's two bits of the
+/// swizzle (at `(lane_id & 3) * 2`) pick `-a - b`, `a - b`, `-a + b` or `-b`. With `a = 3`,
+/// `b = 5`: -8, -2, 2, -5. The table's multipliers are Eden's `fswzadd_lut_a` and
+/// `fswzadd_lut_b`, written out here as literals.
+#[test]
+fn swizzled_add_follows_the_lane() {
+    use crate::interp::Machine;
+    use crate::interp::exec::SWIZZLE_ADD_FACTORS;
+    assert_eq!(
+        SWIZZLE_ADD_FACTORS,
+        [
+            (0xbf80_0000, 0xbf80_0000),
+            (0x3f80_0000, 0xbf80_0000),
+            (0xbf80_0000, 0x3f80_0000),
+            (0x0000_0000, 0xbf80_0000),
+        ]
+    );
+    let by_index = [
+        (-8.0_f32).to_bits(),
+        (-2.0_f32).to_bits(),
+        2.0_f32.to_bits(),
+        (-5.0_f32).to_bits(),
+    ];
+    // The swizzle 0b11_10_01_00 gives lane n index n; 0xa5 (`~0x5a`) gives 1, 1, 2, 2.
+    for (swizzle, indices) in [(0xe4_u32, [0_usize, 1, 2, 3]), (0xa5, [1, 1, 2, 2])] {
+        for lane in 0..8_u32 {
+            let text = format!(
+                "block0:\n    %0 = FSwizzleAdd f32 3.0, f32 5.0, u32 {swizzle:#x} {{rn, fmz_none}}\n    return\n"
+            );
+            let mut machine = Machine::new();
+            machine.system.lane_id = lane;
+            let finished = super::run(&text, &mut machine).expect("runs");
+            let slot = usize::try_from(lane % 4).expect("a lane");
+            let expected = by_index[indices[slot]];
+            assert_eq!(
+                f32_bits(finished.value(0).expect("a value")),
+                expected,
+                "lane {lane}"
+            );
+        }
+    }
+    // The controls apply: `1 - (-2^-24)` rounds up only toward positive infinity.
+    let tiny = f32_imm(0xb380_0000);
+    let up = eval(&format!("FSwizzleAdd f32 1.0, {tiny}, u32 0x1 {{rp}}"));
+    assert_eq!(f32_bits(up), ONE_UP);
+    let near = eval(&format!("FSwizzleAdd f32 1.0, {tiny}, u32 0x1 {{rn}}"));
+    assert_eq!(f32_bits(near), ONE);
+}
