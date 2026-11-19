@@ -163,4 +163,39 @@ impl WaiterTable {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Every waiter and whether it is latched, in table order: what a GPU capture records of
+    /// the table (slice G20, `crate::capture`).
+    pub fn snapshot(&self) -> Vec<(Waiter, bool)> {
+        self.lock()
+            .iter()
+            .map(|entry| (entry.waiter, entry.latched))
+            .collect()
+    }
+
+    /// Latches `channel`'s waiter, as a release that meets it would; whether it had one. For a
+    /// capture's replay, which feeds the front the latches the back made (`crate::capture`).
+    pub fn latch(&self, channel: ChannelId) -> bool {
+        let mut found = false;
+        for entry in self.lock().iter_mut() {
+            if entry.waiter.channel == channel {
+                entry.latched = true;
+                found = true;
+            }
+        }
+        found
+    }
+
+    /// Makes the table exactly `waiters`, in order, each latched or not as given. For a
+    /// capture's replay, which feeds the back the table the front left (`crate::capture`).
+    pub fn replace(&self, waiters: &[(Waiter, bool)]) {
+        let mut entries = self.lock();
+        entries.clear();
+        entries.extend(
+            waiters
+                .iter()
+                .map(|&(waiter, latched)| Entry { waiter, latched }),
+        );
+        self.count.store(entries.len(), Ordering::SeqCst);
+    }
 }

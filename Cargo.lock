@@ -1140,6 +1140,7 @@ dependencies = [
  "starquake-shader",
  "thiserror",
  "tracing",
+ "twox-hash",
 ]
 
 [[package]]
