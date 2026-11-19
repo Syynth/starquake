@@ -24,7 +24,9 @@
 //! `eden-nx2/src/video_core/engines/kepler_compute.cpp` (`ProcessNativeMethod` from line 123,
 //! `FrontApply`, `FrontCallMethod`, `FrontRunMacro`), `eden-nx2/src/video_core/macro.h`
 //! (`MacroEngine::AddCode`, `ClearCode`, `NativeMacroContext`), `eden-nx2/src/video_core/macro.cpp`
-//! (`MacroEngine::Execute`, the native path, its MME DMA reads) and
+//! (`MacroEngine::Execute`, the native path, its MME DMA reads),
+//! `eden-nx2/src/video_core/engines/maxwell_3d.cpp` (`FrontRunMacro`, `FrontDmaRead`: the 0x157
+//! and 0x158 reads) and
 //! `eden-nx2/src/video_core/control/channel_state.cpp` (`SetNativeDataRam`), Eden-NX2 @ 50fa86bb,
 //! GPL-3.0-or-later; PR #4588's `eden-pr4588/src/video_core/macro.h` @ e5fb3b97 agrees on the code
 //! store. Method numbers and fields come from the generated `clc797` and `clc7c0` tables
@@ -62,9 +64,10 @@
 //! Words to `CALL_MME_MACRO(j)` (method 0xE00 + 2j) and `CALL_MME_DATA(j)` (0xE01 + 2j), and
 //! every method above them, are a macro call's parameters, in both classes (the generated
 //! `clc7c0` table has `CALL_MME_MACRO` at byte 0x3800, the same as `clc797`). The first word of
-//! a call fixes its macro: entry `(method - 0xE00) / 2` of the start table, modulo
-//! [`START_ENTRIES`] (`CallMacroMethod`); every later word, whatever its method, is the next
-//! parameter. The call runs when the word's header owes no more ([`EngineWord::remaining`] is
+//! a call fixes its macro: entry `(method - 0xE00) / 2` of the start table ([`Engine::entry`]);
+//! every later word, whatever its method, is the next parameter. A first word at or past entry
+//! [`START_ENTRIES`] (method 0x1000 and up, past what a header can name,
+//! [`crate::channel::METHOD_MAX`]) is refused ([`HostError::PastStartTable`]). The call runs when the word's header owes no more ([`EngineWord::remaining`] is
 //! 0), even if its words came in several GP entries or submissions (the channel keeps the
 //! header's state across them, slice G8). The 3D and compute classes collect calls separately.
 //!
@@ -79,13 +82,15 @@
 //! - `state` reads the register file of the call's class, including the run's own writes so
 //!   far (0 past the file, as Eden-NX2's reads of methods past its registers);
 //! - `method` writes into the same register file as a stream word would (shadow RAM, side
-//!   effects, same-value dropping), and through the same upload and bind rules;
-//! - `barrier` performs the run's pending MME DMA reads (3D only, below).
+//!   effects, same-value dropping), and through the same upload and bind rules; a 3D
+//!   `MME_DMA_READ` write also reads into data RAM (below), which the interpreter stores
+//!   through `data_ram_load`;
+//! - `barrier` performs the run's pending MME DMA reads into the load FIFO (3D only, below).
 //!
 //! **A run's writes are committed only when it finishes.** Its register writes change the file
 //! at once, so its own `state` reads see them, but their ring entries are held, and the file
 //! words they changed are journaled. Its uploads and binds are held too, and its data RAM
-//! writes are journaled by the memo. When the run finishes, its entries go to the sink in
+//! writes, `MME_DMA_READ`'s among them, are journaled by the memo. When the run finishes, its entries go to the sink in
 //! order and its uploads and binds are applied in order; when it fails or is abandoned for a
 //! catch-up, the file and the data RAM are put back and nothing is sent or applied
 //! ([`CallResult`]). Neither the running macro's code nor its start table entry changes while it
@@ -93,7 +98,8 @@
 //!
 //! A run fails ([`CallFailure`]) on the first of: an interpreter error, a write to a method
 //! outside its class's register file (Eden-NX2's "unsupported emitted method"), a DMA read that
-//! cannot be read, DMA reads past [`DMA_RUN_MAX_WORDS`], or more than [`MAX_RUN_WRITES`] writes.
+//! cannot be read, DMA reads past [`DMA_RUN_MAX_WORDS`], an `MME_DMA_READ` past the end of data
+//! RAM, or more than [`MAX_RUN_WRITES`] writes.
 //! After the host's own failure the run is starved (no more loads; writes ignored) and ends on
 //! the interpreter's next error or its end; the host's failure is reported, as it came first.
 //! Starving only shortens the run: what it does after the failure is discarded either way.
@@ -121,7 +127,32 @@
 //!   again at the rerun ("Divergences");
 //! - otherwise the reads happen at once, in queue order, through [`GpuMemory`].
 //!
-//! The query is made only at a barrier with reads queued.
+//! The query is made only at a barrier with reads queued, or at an `MME_DMA_READ` (below).
+//!
+//! A 3D macro's write to `MME_DMA_READ` (method 0x157) reads `LENGTH` words, at most
+//! [`DMA_READ_MAX_WORDS`], from the same GPU address, into the channel's data RAM from word
+//! `SET_MME_DATA_RAM_ADDRESS` (0x156, `WORD`, 31:0) on, both as the register file holds them at
+//! that write. It reads at the write itself, as Eden-NX2's `FrontDmaRead` does, so the macro's
+//! next `DREAD` sees the words without a barrier. Checked in this order at the write:
+//!
+//! 1. a read of 0 words reads nothing (and asks nothing);
+//! 2. the words count toward the run's [`DMA_RUN_MAX_WORDS`] with the load-FIFO reads
+//!    ([`CallFailure::DmaTooLarge`]);
+//! 3. the read must end at or before data RAM's end, [`DATA_RAM_WORDS`]
+//!    ([`CallFailure::DataRamOutOfRange`]);
+//! 4. on a first run, if the back has work it has not performed, the run is abandoned for a
+//!    catch-up exactly as above (Eden-NX2's `split.Drain()` at the read), and the rerun reads
+//!    without asking;
+//! 5. the words are read through [`GpuMemory`] ([`CallFailure::DmaRead`]).
+//!
+//! The words go into data RAM through the memo's journal, so a run that fails or is abandoned
+//! later puts them back with its other data RAM writes. **The memo never remembers a call that
+//! writes `MME_DMA_READ`**, of any length and whether or not the read was made: the host
+//! answers every such write's `data_ram_load` with a load (empty when nothing was read), and
+//! the memo does not store a call that made one ([`crate::mme::NotMemoised::DataRamLoad`]). The
+//! words come from guest memory, which the memo's key and guard do not cover, and arrive without
+//! a barrier, so the barrier rule would not catch them. Eden-NX2 likewise stores no call that
+//! wrote 0x157 (`read_memory` in `MacroEngine::Execute`).
 //!
 //! # Divergences
 //!
@@ -130,26 +161,34 @@
 //! - **Writes are buffered, and a failed run commits nothing** (the spec). Eden-NX2 applies
 //!   each write as the macro makes it and keeps them when the run fails
 //!   (`a_failing_run_commits_nothing`, `a_failed_replay_commits_nothing`).
-//! - **DMA reads happen at the barrier**, from the address queued at the write. Eden-NX2 reads
-//!   at the `MME_DMA_READ_FIFOED` write itself, so a macro that loads the words without a
+//! - **Load-FIFO DMA reads happen at the barrier**, from the address queued at the write.
+//!   Eden-NX2 reads at the `MME_DMA_READ_FIFOED` write itself, so a macro that loads the words without a
 //!   barrier gets them there and underflows here (`dma_words_arrive_only_at_a_barrier`).
 //! - **A call that waits for a catch-up runs the code as it is at the rerun.** The code store
 //!   is shared by the process's channels, so another channel may upload code over the waiting
 //!   call's start before [`ProcessMacros::resume`]; the rerun then runs the new code from the
 //!   recorded start. Eden-NX2 runs the call at once, so it runs the code as it was at the call
 //!   (`a_waiting_call_reruns_the_code_as_it_is_at_the_resume`).
-//! - **A DMA read that cannot be read fails the call**; Eden-NX2's `MemoryManager::Read` gives
-//!   words without a failure result (`an_unreadable_dma_read_fails_the_call`).
+//! - **A DMA read that cannot be read fails the call**, of either kind; Eden-NX2's
+//!   `MemoryManager::Read` gives words without a failure result
+//!   (`an_unreadable_dma_read_fails_the_call`, `an_unreadable_data_ram_read_fails_the_call`).
 //! - **`SET_MME_MEM_ADDRESS_A` gives 17 bits** (`UPPER`, 16:0, the header's field; decision 10).
 //!   Eden-NX2 masks it with `0x1ffffff` (`the_dma_address_uses_the_headers_upper_field`).
 //! - **A run's DMA reads fetch at most [`DMA_RUN_MAX_WORDS`] in all**, and a run makes at most
 //!   [`MAX_RUN_WRITES`] writes; Eden-NX2 bounds neither (`dma_reads_are_bounded_per_run`,
 //!   `writes_are_bounded_per_run`). Both are **guesses** at bounds no real macro reaches, to
 //!   bound what a hostile one can make the front hold; a trace of the largest real call would
-//!   confirm them.
-//! - **`MME_DMA_READ` (0x157, into data RAM at `SET_MME_DATA_RAM_ADDRESS`) is not performed**:
-//!   it goes to the register file as any write. Row 58 names only the load-FIFO form, and the
-//!   slice covers that; Eden-NX2 performs both (`dma_read_into_data_ram_is_not_performed`).
+//!   confirm them. `MME_DMA_READ`'s words count toward the same total
+//!   (`data_ram_reads_count_toward_the_runs_dma_bound`).
+//! - **An `MME_DMA_READ` that would run past data RAM's end fails the call** and stores
+//!   nothing. Eden-NX2 (`FrontDmaRead`, `ram + i < native_data_ram.size()`) stores the words
+//!   below the end and drops the rest, and its `u32` index wraps past `u32::MAX` back to the
+//!   start of data RAM (`a_data_ram_read_past_the_end_fails_the_call`,
+//!   `a_data_ram_read_index_is_32_bits_wide`).
+//! - **Start tables hold 256 entries** ([`START_ENTRIES`], decided by the owner, a guess); Eden-NX2's
+//!   hold 0x80, so its calls `j` and `j + 0x80` share an entry and here they do not
+//!   (`call_0x80_has_its_own_entry`). A call past the table, which only a caller that is not the
+//!   pusher can make, is refused rather than wrapped (`a_call_past_the_start_table_is_refused`).
 //! - **A call that starts on a `CALL_MME_DATA` method runs the macro below it** in both
 //!   classes, as Eden-NX2's 3D front does; its compute class drops such a word
 //!   (`a_call_may_start_on_a_data_method`).
@@ -206,7 +245,8 @@ use crate::field::Field;
 use crate::interface::ChannelId;
 use crate::memory::{GpuFault, GpuMemory};
 use crate::mme::{
-    CallOutcome, DataRam, INSTRUCTION_WORDS, Instruction, MacroError, MacroHost, MacroMemo,
+    CallOutcome, DATA_RAM_WORDS, DataRam, DataRamLoad, INSTRUCTION_WORDS, Instruction, MacroError,
+    MacroHost, MacroMemo,
 };
 use crate::regs::{EntrySink, Journal, RegFile, RegsError, WORD_BYTES};
 use crate::ring::{ClassId, RingEntry};
@@ -219,11 +259,14 @@ pub const CODE_WORDS: usize = 0x3000;
 /// upload pointer (`ClearCode`: `method < 0x1000 ? method * 3 : native_code.size()`).
 pub const CODE_INSTRUCTIONS: usize = CODE_WORDS / INSTRUCTION_WORDS;
 
-/// Entries in one start table: Eden-NX2's `NativeMacroContext::positions` and
-/// `compute_positions` (`std::array<u32, 0x80>`, `eden-nx2/src/video_core/macro.h`). Mesa's
-/// `class_parser.py` gives `CALL_MME_MACRO` 256 elements, so calls `j` and `j + 0x80` share an
-/// entry, as Eden-NX2's `% positions.size()` makes them.
-pub const START_ENTRIES: usize = 0x80;
+/// Entries in one start table: the count of `CALL_MME_MACRO(j)` elements, 256 in Mesa's
+/// `mesa-nouveau/src/nouveau/headers/class_parser.py` for `clc797.h` and `clc7c0.h`, so every
+/// call method a header can name (0xE00 to [`crate::channel::METHOD_MAX`]) has its own entry
+/// (gpu-protocol "Macros"; decided by the owner, 2026-11-18). A **guess** until a trace shows a
+/// title calling past 0x80: Eden-NX2's `NativeMacroContext::positions` and `compute_positions`
+/// hold 0x80 (`std::array<u32, 0x80>`, `eden-nx2/src/video_core/macro.h`) and wrap a larger
+/// index onto them (module docs, "Divergences").
+pub const START_ENTRIES: usize = 0x100;
 
 /// The most words one `MME_DMA_READ_FIFOED` reads: Eden-NX2's `std::min<u32>(value, 0x1000)`
 /// (`MacroEngine::Execute`, `eden-nx2/src/video_core/macro.cpp`).
@@ -242,6 +285,10 @@ const MEM_ADDRESS_A: u32 = clc797::SET_MME_MEM_ADDRESS_A.method();
 const MEM_ADDRESS_B: u32 = clc797::SET_MME_MEM_ADDRESS_B.method();
 /// `MME_DMA_READ_FIFOED` (3D method 0x158): `LENGTH` (31:0) words into the load FIFO.
 const DMA_READ_FIFOED: u32 = clc797::MME_DMA_READ_FIFOED.method();
+/// `SET_MME_DATA_RAM_ADDRESS` (3D method 0x156): `WORD` (31:0), where `MME_DMA_READ` stores.
+const DATA_RAM_ADDRESS: u32 = clc797::SET_MME_DATA_RAM_ADDRESS.method();
+/// `MME_DMA_READ` (3D method 0x157): `LENGTH` (31:0) words into data RAM.
+const DMA_READ: u32 = clc797::MME_DMA_READ.method();
 /// Where `SET_MME_MEM_ADDRESS_A`'s bits go in the address.
 const MEM_ADDRESS_UPPER_SHIFT: u32 = u32::BITS;
 
@@ -334,12 +381,13 @@ impl Engine {
         }
     }
 
-    /// The start table entry a call that starts on `method` uses (`CallMacroMethod`); `None`
-    /// below the macro methods.
+    /// The start table entry a call that starts on `method` uses: call `j`'s entry is `j`.
+    /// `None` below the macro methods, and for a call at or past [`START_ENTRIES`], which no
+    /// method a header can name reaches (module docs, "Calls").
     pub fn entry(self, method: u32) -> Option<usize> {
         let offset = method.checked_sub(self.first_macro_method())?;
         let call = usize::try_from(offset / self.call_stride()).ok()?;
-        Some(call % START_ENTRIES)
+        (call < START_ENTRIES).then_some(call)
     }
 }
 
@@ -420,6 +468,17 @@ pub enum CallFailure {
     /// The run made more than [`MAX_RUN_WRITES`] writes.
     #[error("the macro made more than {limit} method writes", limit = MAX_RUN_WRITES)]
     TooManyWrites,
+    /// An `MME_DMA_READ` would store words past the end of data RAM.
+    #[error(
+        "the macro's DMA read of length {words} into data RAM at word {index:#x} runs past the end of data RAM ({limit:#x} words)",
+        limit = DATA_RAM_WORDS
+    )]
+    DataRamOutOfRange {
+        /// The data RAM word the read starts at (`SET_MME_DATA_RAM_ADDRESS`).
+        index: u32,
+        /// The words to read, after the cut to [`DMA_READ_MAX_WORDS`].
+        words: u32,
+    },
 }
 
 /// What became of a call.
@@ -493,6 +552,16 @@ pub enum HostError {
     /// The register file refused the word.
     #[error("{0}")]
     Regs(RegsError),
+    /// The word would start a call at or past [`START_ENTRIES`], which has no start table
+    /// entry (no method a header can name does).
+    #[error(
+        "method {method:#x} would call a macro past the start table's {limit} entries",
+        limit = START_ENTRIES
+    )]
+    PastStartTable {
+        /// The method.
+        method: u16,
+    },
 }
 
 /// One code store: its words, decoded, the upload offset, its start table and its memo.
@@ -618,6 +687,8 @@ struct RunScratch {
     fifo: Vec<u32>,
     /// A DMA read's bytes.
     bytes: Vec<u8>,
+    /// The words the last `MME_DMA_READ` read, for the interpreter to store in data RAM.
+    ram_words: Vec<u32>,
 }
 
 impl RunScratch {
@@ -627,6 +698,7 @@ impl RunScratch {
         self.ops.clear();
         self.reads.clear();
         self.fifo.clear();
+        self.ram_words.clear();
     }
 }
 
@@ -772,10 +844,14 @@ struct RunHost<'a, M: ?Sized, B: ?Sized> {
     caught_up: bool,
     status: RunStatus,
     writes: usize,
-    /// DMA words queued so far, performed or not.
+    /// DMA words charged so far, of both kinds, queued or read.
     dma_words: u32,
     /// The next FIFO word to load.
     next: usize,
+    /// The last write was an `MME_DMA_READ`: the data RAM word its words (in
+    /// `scratch.ram_words`, empty if it read none) go to, until the interpreter takes them
+    /// ([`MacroHost::data_ram_load`]).
+    ram_load: Option<u32>,
 }
 
 impl<M: GpuMemory + ?Sized, B: BackWork + ?Sized> RunHost<'_, M, B> {
@@ -785,21 +861,58 @@ impl<M: GpuMemory + ?Sized, B: BackWork + ?Sized> RunHost<'_, M, B> {
         }
     }
 
-    fn queue_dma(&mut self, length: u32) {
-        let words = DMA_READ_FIFOED_LENGTH.get(length).min(DMA_READ_MAX_WORDS);
-        if words == 0 {
-            return;
-        }
+    /// The GPU address `SET_MME_MEM_ADDRESS_A` and `_B` give, as the file holds them now.
+    fn dma_address(&self) -> u64 {
+        let upper = MEM_ADDRESS_A_UPPER.get(self.file.get(MEM_ADDRESS_A).unwrap_or(0));
+        let lower = MEM_ADDRESS_B_LOWER.get(self.file.get(MEM_ADDRESS_B).unwrap_or(0));
+        (u64::from(upper) << MEM_ADDRESS_UPPER_SHIFT) | u64::from(lower)
+    }
+
+    /// Charges `words` DMA words to the run; `false`, with the run failed, if that takes it
+    /// past [`DMA_RUN_MAX_WORDS`] in all.
+    fn charge_dma(&mut self, words: u32) -> bool {
         let total = self.dma_words.saturating_add(words);
         if total > DMA_RUN_MAX_WORDS {
             self.fail(CallFailure::DmaTooLarge { words: total });
-            return;
+            return false;
         }
         self.dma_words = total;
-        let upper = MEM_ADDRESS_A_UPPER.get(self.file.get(MEM_ADDRESS_A).unwrap_or(0));
-        let lower = MEM_ADDRESS_B_LOWER.get(self.file.get(MEM_ADDRESS_B).unwrap_or(0));
-        let address = (u64::from(upper) << MEM_ADDRESS_UPPER_SHIFT) | u64::from(lower);
+        true
+    }
+
+    fn queue_dma(&mut self, length: u32) {
+        let words = DMA_READ_FIFOED_LENGTH.get(length).min(DMA_READ_MAX_WORDS);
+        if words == 0 || !self.charge_dma(words) {
+            return;
+        }
+        let address = self.dma_address();
         self.scratch.reads.push(DmaRead { address, words });
+    }
+
+    /// Reads `read` from guest memory and appends its words to the load FIFO, or to
+    /// `scratch.ram_words` for a read into data RAM; `false`, with the run failed, if it cannot
+    /// be read.
+    fn read_words(&mut self, read: DmaRead, into_fifo: bool) -> bool {
+        // At most `DMA_READ_MAX_WORDS` words: the product fits.
+        let bytes = usize::try_from(u64::from(read.words) * u64::from(WORD_BYTES)).unwrap_or(0);
+        self.scratch.bytes.clear();
+        self.scratch.bytes.resize(bytes, 0);
+        if let Err(fault) = self.memory.read(read.address, &mut self.scratch.bytes) {
+            self.fail(CallFailure::DmaRead {
+                address: read.address,
+                words: read.words,
+                fault,
+            });
+            return false;
+        }
+        let (words, _) = self.scratch.bytes.as_chunks::<4>();
+        let out = if into_fifo {
+            &mut self.scratch.fifo
+        } else {
+            &mut self.scratch.ram_words
+        };
+        out.extend(words.iter().map(|&bytes| u32::from_le_bytes(bytes)));
+        true
     }
 
     fn perform_reads(&mut self) {
@@ -807,24 +920,40 @@ impl<M: GpuMemory + ?Sized, B: BackWork + ?Sized> RunHost<'_, M, B> {
             let Some(read) = self.scratch.reads.get(index).copied() else {
                 break;
             };
-            // At most `DMA_READ_MAX_WORDS` words: the product fits.
-            let bytes = usize::try_from(u64::from(read.words) * u64::from(WORD_BYTES)).unwrap_or(0);
-            self.scratch.bytes.clear();
-            self.scratch.bytes.resize(bytes, 0);
-            if let Err(fault) = self.memory.read(read.address, &mut self.scratch.bytes) {
-                self.fail(CallFailure::DmaRead {
-                    address: read.address,
-                    words: read.words,
-                    fault,
-                });
+            if !self.read_words(read, true) {
                 return;
             }
-            let (words, _) = self.scratch.bytes.as_chunks::<4>();
-            self.scratch
-                .fifo
-                .extend(words.iter().map(|&bytes| u32::from_le_bytes(bytes)));
         }
         self.scratch.reads.clear();
+    }
+
+    /// `MME_DMA_READ` of `length` words (module docs, "MME DMA reads"). Checked in this order:
+    /// a read of 0 words reads nothing; past the run's [`DMA_RUN_MAX_WORDS`] it fails the run
+    /// ([`CallFailure::DmaTooLarge`]); past the end of data RAM it fails the run
+    /// ([`CallFailure::DataRamOutOfRange`]); on a first run with back work unperformed it
+    /// abandons the run for a catch-up; then it reads, or fails the run
+    /// ([`CallFailure::DmaRead`]). The words read wait in `scratch.ram_words` for the
+    /// interpreter.
+    fn read_into_data_ram(&mut self, length: u32) {
+        let words = DMA_READ_LENGTH.get(length).min(DMA_READ_MAX_WORDS);
+        if words == 0 || !self.charge_dma(words) {
+            return;
+        }
+        let index = DATA_RAM_ADDRESS_WORD.get(self.file.get(DATA_RAM_ADDRESS).unwrap_or(0));
+        let fits = u64::from(index)
+            .checked_add(u64::from(words))
+            .and_then(|end| usize::try_from(end).ok())
+            .is_some_and(|end| end <= DATA_RAM_WORDS);
+        if !fits {
+            self.fail(CallFailure::DataRamOutOfRange { index, words });
+            return;
+        }
+        if !self.caught_up && self.back.has_unperformed_work() {
+            self.status = RunStatus::Abandoned;
+            return;
+        }
+        let address = self.dma_address();
+        self.read_words(DmaRead { address, words }, false);
     }
 }
 
@@ -834,6 +963,10 @@ const MEM_ADDRESS_A_UPPER: Field = clc797::SET_MME_MEM_ADDRESS_A_UPPER;
 const MEM_ADDRESS_B_LOWER: Field = clc797::SET_MME_MEM_ADDRESS_B_LOWER;
 /// `MME_DMA_READ_FIFOED_LENGTH` (31:0).
 const DMA_READ_FIFOED_LENGTH: Field = clc797::MME_DMA_READ_FIFOED_LENGTH;
+/// `MME_DMA_READ_LENGTH` (31:0).
+const DMA_READ_LENGTH: Field = clc797::MME_DMA_READ_LENGTH;
+/// `SET_MME_DATA_RAM_ADDRESS_WORD` (31:0).
+const DATA_RAM_ADDRESS_WORD: Field = clc797::SET_MME_DATA_RAM_ADDRESS_WORD;
 
 impl<M: GpuMemory + ?Sized, B: BackWork + ?Sized> MacroHost for RunHost<'_, M, B> {
     fn load(&mut self) -> Option<u32> {
@@ -850,6 +983,13 @@ impl<M: GpuMemory + ?Sized, B: BackWork + ?Sized> MacroHost for RunHost<'_, M, B
     }
 
     fn method(&mut self, method: u16, value: u32) {
+        let number = u32::from(method);
+        let loads_data_ram = self.engine == Engine::ThreeD && number == DMA_READ;
+        // Every `MME_DMA_READ` write is reported as a load, in every state, so the memo never
+        // remembers a call that makes one (`MacroHost::data_ram_load`).
+        self.scratch.ram_words.clear();
+        self.ram_load = loads_data_ram
+            .then(|| DATA_RAM_ADDRESS_WORD.get(self.file.get(DATA_RAM_ADDRESS).unwrap_or(0)));
         if self.status != RunStatus::Running {
             return;
         }
@@ -858,7 +998,6 @@ impl<M: GpuMemory + ?Sized, B: BackWork + ?Sized> MacroHost for RunHost<'_, M, B
             return;
         }
         self.writes = self.writes.saturating_add(1);
-        let number = u32::from(method);
         let start_pointer = self
             .file
             .get(self.engine.methods().start_pointer)
@@ -878,6 +1017,9 @@ impl<M: GpuMemory + ?Sized, B: BackWork + ?Sized> MacroHost for RunHost<'_, M, B
         if self.engine == Engine::ThreeD && number == DMA_READ_FIFOED {
             self.queue_dma(value);
         }
+        if loads_data_ram {
+            self.read_into_data_ram(value);
+        }
     }
 
     fn barrier(&mut self) {
@@ -889,6 +1031,16 @@ impl<M: GpuMemory + ?Sized, B: BackWork + ?Sized> MacroHost for RunHost<'_, M, B
             return;
         }
         self.perform_reads();
+    }
+
+    fn data_ram_load(&mut self) -> Option<DataRamLoad<'_>> {
+        let index = self.ram_load.take()?;
+        let words: &[u32] = if self.status == RunStatus::Running {
+            &self.scratch.ram_words
+        } else {
+            &[]
+        };
+        Some(DataRamLoad { index, words })
     }
 }
 
@@ -930,8 +1082,9 @@ impl ProcessMacros {
     /// # Errors
     ///
     /// Checked in this order, each changing nothing: [`HostError::Waiting`] while a call waits
-    /// for a catch-up; [`HostError::WrongFile`]; [`HostError::Regs`] if the register file
-    /// refuses the word.
+    /// for a catch-up; [`HostError::WrongFile`]; then [`HostError::PastStartTable`] for the
+    /// first word of a call at or past [`START_ENTRIES`], or [`HostError::Regs`] if the
+    /// register file refuses a word to another method.
     pub fn write<M, B, S>(
         &mut self,
         channel: &mut MacroChannel,
@@ -955,6 +1108,11 @@ impl ProcessMacros {
             && method >= engine.first_macro_method()
         {
             let call = channel.collecting_mut(engine);
+            if call.method.is_none() && engine.entry(method).is_none() {
+                return Err(HostError::PastStartTable {
+                    method: word.method,
+                });
+            }
             call.method.get_or_insert(word.method);
             call.parameters.push(word.value);
             if word.remaining > 0 {
@@ -1178,6 +1336,7 @@ impl ProcessMacros {
             writes: 0,
             dma_words: 0,
             next: 0,
+            ram_load: None,
         };
         let outcome = store.memo.call(
             program,

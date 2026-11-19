@@ -388,7 +388,8 @@ fn constants_match_the_references() {
     // Written out from the cited sources, so a wrong shipping constant fails here.
     assert_eq!(CODE_WORDS, 0x3000); // eden-nx2 macro.h: std::array<u32, 0x3000> native_code
     assert_eq!(CODE_INSTRUCTIONS, 0x1000); // ClearCode: method < 0x1000 ? method * 3
-    assert_eq!(START_ENTRIES, 0x80); // NativeMacroContext: std::array<u32, 0x80> positions
+    // class_parser.py: 'CALL_MME_MACRO': 256 (owner's ruling, 2026-11-18; Eden-NX2 has 0x80).
+    assert_eq!(START_ENTRIES, 256);
     assert_eq!(DMA_READ_MAX_WORDS, 0x1000); // macro.cpp: std::min<u32>(value, 0x1000)
     for engine in Engine::ALL {
         let methods = engine.methods();
@@ -400,10 +401,23 @@ fn constants_match_the_references() {
         assert_eq!(engine.first_macro_method(), 0x3800 / 4);
         assert_eq!(engine.call_stride(), 8 / 4);
     }
-    // clc797.h: SET_MME_MEM_ADDRESS_A 0x0550 (UPPER 16:0), _B 0x0554, MME_DMA_READ_FIFOED 0x0560.
+    // An independent derivation: every call method a header can name has its own entry.
+    for engine in Engine::ALL {
+        let calls = (crate::channel::METHOD_MAX + 1 - engine.first_macro_method())
+            / engine.call_stride();
+        assert_eq!(usize::try_from(calls).unwrap(), START_ENTRIES);
+    }
+    // clc797.h: SET_MME_MEM_ADDRESS_A 0x0550 (UPPER 16:0), _B 0x0554, SET_MME_DATA_RAM_ADDRESS
+    // 0x0558 (WORD 31:0), MME_DMA_READ 0x055c (LENGTH 31:0), MME_DMA_READ_FIFOED 0x0560.
     assert_eq!(MEM_ADDRESS_A, 0x550 / 4);
     assert_eq!(MEM_ADDRESS_B, 0x554 / 4);
+    assert_eq!(DATA_RAM_ADDRESS, 0x558 / 4);
+    assert_eq!(DMA_READ, 0x55c / 4);
     assert_eq!(DMA_READ_FIFOED, 0x560 / 4);
+    assert_eq!(DATA_RAM_ADDRESS_WORD, Field::new(31, 0));
+    assert_eq!(DMA_READ_LENGTH, Field::new(31, 0));
+    // mme_tu104.h: MME_TU104_DRAM_COUNT; eden-nx2 maxwell_3d.h: std::array<u32, 0xc00>.
+    assert_eq!(DATA_RAM_WORDS, 0xc00);
     assert_eq!(MEM_ADDRESS_A_UPPER, Field::new(16, 0));
     assert_eq!(MEM_ADDRESS_B_LOWER, Field::new(31, 0));
     assert_eq!(DMA_READ_FIFOED_LENGTH, Field::new(31, 0));
@@ -423,10 +437,18 @@ fn entries_map_calls_to_the_start_table() {
         assert_eq!(engine.entry(first + 1), Some(0));
         assert_eq!(engine.entry(first + 2), Some(1));
         assert_eq!(engine.entry(first + 2 * 0x7f + 1), Some(0x7f));
-        // Calls j and j + START_ENTRIES share an entry.
-        let wrap = u32::try_from(START_ENTRIES).unwrap();
-        assert_eq!(engine.entry(first + 2 * wrap), Some(0));
-        assert_eq!(engine.entry(first + 2 * (wrap + 3)), Some(3));
+        // Call 0x80 has its own entry (Eden-NX2 wraps it onto entry 0).
+        assert_eq!(engine.entry(first + 2 * 0x80), Some(0x80));
+        // The last entry, from both its methods, and none past it.
+        let entries = u32::try_from(START_ENTRIES).unwrap();
+        assert_eq!(engine.entry(first + 2 * (entries - 1)), Some(START_ENTRIES - 1));
+        assert_eq!(
+            engine.entry(first + 2 * (entries - 1) + 1),
+            Some(START_ENTRIES - 1)
+        );
+        assert_eq!(engine.entry(first + 2 * entries), None);
+        assert_eq!(engine.entry(first + 2 * (entries + 3)), None);
+        assert_eq!(engine.entry(u32::MAX), None);
     }
 }
 
@@ -589,14 +611,112 @@ fn every_word_of_a_header_is_a_parameter_of_the_first_words_macro() {
 }
 
 #[test]
-fn calls_j_and_j_plus_the_table_size_share_an_entry() {
+fn call_0x80_has_its_own_entry() {
+    // Divergence: Eden-NX2's 0x80-entry tables run call 0x80 from entry 0.
     let mut rig = make_rig();
     let mut chan = Chan::new(A);
-    rig.upload(&mut chan, Engine::ThreeD, 0x10, &echo(1), 3);
+    rig.upload(&mut chan, Engine::ThreeD, 0x10, &echo(1), 0);
+    rig.upload(&mut chan, Engine::ThreeD, 0x20, &echo(2), 0x80);
     rig.take();
-    let j = 3 + u32::try_from(START_ENTRIES).unwrap();
-    let report = rig.call(&mut chan, Engine::ThreeD, j, &[8]);
-    assert_eq!((report.entry, report.start), (3, 0x10));
+    let report = rig.call(&mut chan, Engine::ThreeD, 0x80, &[8, 9]);
+    assert_eq!((report.entry, report.start), (0x80, 0x20));
+    assert_eq!(
+        rig.take(),
+        [
+            write_entry(A, Engine::ThreeD, out_method(0), 8),
+            write_entry(A, Engine::ThreeD, out_method(1), 9),
+        ]
+    );
+    let report = rig.call(&mut chan, Engine::ThreeD, 0, &[7]);
+    assert_eq!((report.entry, report.start), (0, 0x10));
+    assert_eq!(rig.process.starts(Engine::ThreeD)[0x80], 0x20);
+    assert_eq!(rig.process.starts(Engine::ThreeD)[0], 0x10);
+}
+
+#[test]
+fn a_call_past_the_start_table_is_refused() {
+    for engine in Engine::ALL {
+        let mut rig = make_rig();
+        let mut chan = Chan::new(A);
+        let last = u32::try_from(START_ENTRIES - 1).unwrap();
+        rig.upload(&mut chan, engine, 0x10, &echo(1), last);
+        rig.take();
+        // The last entry runs.
+        let report = rig.call(&mut chan, engine, last, &[0x31]);
+        assert_eq!(
+            (report.entry, report.start, report.result),
+            (
+                START_ENTRIES - 1,
+                0x10,
+                CallResult::Committed(CallOutcome::Stored)
+            )
+        );
+        rig.take();
+        // The first method past it is refused and changes nothing.
+        let past = call_method(engine, last + 1);
+        let file = match engine {
+            Engine::ThreeD => snapshot(&chan.three_d),
+            Engine::Compute => snapshot(&chan.compute),
+        };
+        assert_eq!(
+            rig.word(&mut chan, engine, past, 0x32, 1),
+            Err(HostError::PastStartTable { method: past })
+        );
+        assert_eq!(chan.macros.collected(engine), []);
+        assert_eq!(rig.take(), []);
+        let after = match engine {
+            Engine::ThreeD => snapshot(&chan.three_d),
+            Engine::Compute => snapshot(&chan.compute),
+        };
+        assert_eq!(after, file);
+        // A later parameter word on that method belongs to the call begun before it.
+        assert_eq!(
+            rig.word(&mut chan, engine, call_method(engine, last), 0x41, 1),
+            Ok(WordOutcome::Parameter)
+        );
+        let outcome = rig.word(&mut chan, engine, past, 0x42, 0).unwrap();
+        assert!(matches!(
+            outcome,
+            WordOutcome::Call(CallReport { entry, .. }) if entry == START_ENTRIES - 1
+        ));
+    }
+}
+
+#[test]
+fn a_call_past_the_start_table_is_checked_after_the_waiting_and_file_checks() {
+    let mut rig = make_rig();
+    let mut chan = Chan::new(A);
+    let past = call_method(Engine::ThreeD, u32::try_from(START_ENTRIES).unwrap());
+    // The wrong file and a call past the table: the wrong file is reported.
+    let env = MacroEnv {
+        memory: &rig.mem,
+        back: &rig.back,
+    };
+    let error = rig.process.write(
+        &mut chan.macros,
+        &mut chan.compute,
+        word(Engine::ThreeD, past, 1, 0),
+        &env,
+        &mut rig.out,
+    );
+    assert_eq!(
+        error,
+        Err(HostError::WrongFile {
+            file_channel: A.0,
+            file_class: clc7c0::CLASS,
+            channel: A.0,
+            class: clc797::CLASS,
+        })
+    );
+    // Waiting and a call past the table: waiting is reported.
+    rig.upload(&mut chan, Engine::ThreeD, 0, &dma_macro(), 0);
+    rig.back.busy.set(true);
+    let report = rig.call(&mut chan, Engine::ThreeD, 0, &source_parameters(SOURCE, 2));
+    assert_eq!(report.result, CallResult::CatchUp);
+    assert_eq!(
+        rig.word(&mut chan, Engine::ThreeD, past, 1, 0),
+        Err(HostError::Waiting)
+    );
 }
 
 #[test]
@@ -1253,6 +1373,20 @@ fn failure_messages_are_plain_words() {
             CallFailure::TooManyWrites,
             "the macro made more than 262144 method writes",
         ),
+        (
+            CallFailure::DataRamOutOfRange {
+                index: 0xbff,
+                words: 2,
+            },
+            "the macro's DMA read of length 2 into data RAM at word 0xbff runs past the end of data RAM (0xc00 words)",
+        ),
+        (
+            CallFailure::DataRamOutOfRange {
+                index: 0xc00,
+                words: 1,
+            },
+            "the macro's DMA read of length 1 into data RAM at word 0xc00 runs past the end of data RAM (0xc00 words)",
+        ),
     ];
     for (failure, text) in cases {
         assert_eq!(failure.to_string(), text);
@@ -1274,6 +1408,10 @@ fn failure_messages_are_plain_words() {
                 class: 0xc797,
             },
             "the register file of class 0xc7c0 on channel 9 does not belong to class 0xc797 on channel 7",
+        ),
+        (
+            HostError::PastStartTable { method: 0x1000 },
+            "method 0x1000 would call a macro past the start table's 256 entries",
         ),
     ];
     for (error, text) in cases {
@@ -1950,39 +2088,6 @@ fn a_dma_read_is_cut_to_its_maximum() {
 }
 
 #[test]
-fn dma_read_into_data_ram_is_not_performed() {
-    // Divergence: MME_DMA_READ (0x157) is a register write only.
-    let mut rig = make_rig();
-    let mut chan = Chan::new(A);
-    let dma_read = m16(clc797::MME_DMA_READ.method());
-    let ram_address = m16(clc797::SET_MME_DATA_RAM_ADDRESS.method());
-    let program = finish(vec![
-        mov(1, 0x5a),
-        store(6, 1),
-        emit_param(m16(MEM_ADDRESS_A)),
-        emit_param(m16(MEM_ADDRESS_B)),
-        emit_imm(ram_address, 6),
-        emit_imm(dma_read, 1),
-        barrier(),
-        dread_to(0, 6),
-        emit_reg(out_method(0), 0),
-    ]);
-    rig.upload(&mut chan, Engine::ThreeD, 0, &program, 0);
-    rig.take();
-    rig.write_memory(SOURCE, &[0x77]);
-    rig.back.busy.set(true);
-    let [upper, lower, _] = source_parameters(SOURCE, 0);
-    let report = rig.call(&mut chan, Engine::ThreeD, 0, &[upper, lower]);
-    assert!(matches!(report.result, CallResult::Committed(_)));
-    assert_eq!(rig.back.queries.get(), 0);
-    assert_eq!(chan.macros.data_ram().get(6), Some(0x5a));
-    assert_eq!(
-        rig.take().last(),
-        Some(&write_entry(A, Engine::ThreeD, out_method(0), 0x5a))
-    );
-}
-
-#[test]
 fn a_waiting_call_holds_its_channel_at_the_word_after_it() {
     // Through the real pusher: the call, then a write. The pusher stops after the call; the
     // write is read again after the catch-up, so a word rewritten meanwhile is seen.
@@ -2345,4 +2450,510 @@ fn the_3d_and_compute_classes_collect_calls_separately() {
             write_entry(A, Engine::ThreeD, out_method(1), 0x32),
         ]
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// MME_DMA_READ into data RAM
+// ---------------------------------------------------------------------------------------------
+
+/// A data RAM word the read macros write before their read, away from the words they read.
+const SCRATCH_WORD: u16 = 0x10;
+/// Where the read macros read to in most tests.
+const RAM_AT: u32 = 0x20;
+
+/// `R<dst>` = data RAM `[R<index>]`.
+fn dread_reg(dst: u8, index: u8) -> Instruction {
+    inst0(AluOp::Dread, r(dst), r(index), Reg::Zero)
+}
+
+/// The data RAM read macro: parameters `[upper, lower, ram index, length]` go to
+/// `SET_MME_MEM_ADDRESS_A/B`, `SET_MME_DATA_RAM_ADDRESS` and `MME_DMA_READ`, after a data RAM
+/// write to `SCRATCH_WORD` and a write to scratch 9 (to show they are not committed by a run
+/// that is not). With `read_back`, the word at the read's index is then read with `DREAD`, with
+/// no barrier, and emitted to scratch 0.
+fn ram_read_macro(read_back: bool) -> Vec<Instruction> {
+    let mut program = vec![
+        emit_param(m16(MEM_ADDRESS_A)),
+        emit_param(m16(MEM_ADDRESS_B)),
+        mov_reg(2, Reg::Load0),
+        emit_reg(m16(DATA_RAM_ADDRESS), 2),
+        mov(3, 0x55),
+        store(SCRATCH_WORD, 3),
+        emit_imm(out_method(9), 0x99),
+        emit_param(m16(DMA_READ)),
+    ];
+    if read_back {
+        program.extend([dread_reg(0, 2), emit_reg(out_method(0), 0)]);
+    }
+    finish(program)
+}
+
+fn ram_parameters(address: u64, index: u32, words: u32) -> [u32; 4] {
+    let [upper, lower, _] = source_parameters(address, 0);
+    [upper, lower, index, words]
+}
+
+/// Words that differ in every byte, so a swapped or narrowed read shows.
+const WORDS: [u32; 3] = [0xa1b2_c3d4, 0x5566_7788, 0x0bad_f00d];
+
+/// The data RAM words from `from` for `count` words.
+fn ram_words(chan: &Chan, from: u32, count: u32) -> Vec<u32> {
+    (from..from + count)
+        .map(|index| chan.macros.data_ram().get(index).unwrap())
+        .collect()
+}
+
+/// Remembered calls in `store`'s memo.
+fn memo_len(rig: &Rig, store: Engine) -> usize {
+    rig.process.store(store).memo.len()
+}
+
+#[test]
+fn a_data_ram_read_with_nothing_pending_lands_at_once() {
+    let mut rig = make_rig();
+    let mut chan = Chan::new(A);
+    rig.upload(&mut chan, Engine::ThreeD, 0, &ram_read_macro(true), 0);
+    rig.take();
+    rig.write_memory(SOURCE, &WORDS);
+    let report = rig.call(&mut chan, Engine::ThreeD, 0, &ram_parameters(SOURCE, RAM_AT, 3));
+    assert_eq!(
+        report.result,
+        CallResult::Committed(CallOutcome::NotStored(NotMemoised::DataRamLoad))
+    );
+    assert_eq!(rig.back.queries.get(), 1);
+    // The exact words at the exact place, and nothing on either side.
+    assert_eq!(ram_words(&chan, RAM_AT - 1, 5), [0, WORDS[0], WORDS[1], WORDS[2], 0]);
+    assert_eq!(chan.macros.data_ram().get(u32::from(SCRATCH_WORD)), Some(0x55));
+    // The macro's DREAD right after the write saw the first word, without a barrier.
+    let sent = rig.take();
+    assert_eq!(
+        sent.last(),
+        Some(&write_entry(A, Engine::ThreeD, out_method(0), WORDS[0]))
+    );
+    // The read method goes to the ring as any write.
+    assert!(sent.contains(&write_entry(A, Engine::ThreeD, m16(DMA_READ), 3)));
+    assert!(!chan.macros.is_waiting());
+    assert_eq!(memo_len(&rig, Engine::ThreeD), 0);
+}
+
+#[test]
+fn a_data_ram_read_with_pending_back_work_commits_nothing_and_reruns_after_the_catch_up() {
+    let mut rig = make_rig();
+    let mut chan = Chan::new(A);
+    rig.upload(&mut chan, Engine::ThreeD, 0x30, &ram_read_macro(true), 4);
+    rig.take();
+    rig.write_memory(SOURCE, &[1, 2, 3]);
+    let before = snapshot(&chan.three_d);
+    let ram_before = chan.macros.data_ram().clone();
+    rig.back.busy.set(true);
+    let parameters = ram_parameters(SOURCE, RAM_AT, 3);
+    let report = rig.call(&mut chan, Engine::ThreeD, 4, &parameters);
+    assert_eq!(report.result, CallResult::CatchUp);
+    assert_eq!((report.entry, report.start), (4, 0x30));
+    assert_eq!(rig.back.queries.get(), 1);
+    // Nothing committed: no entries, the file and data RAM (the scratch word too) as before.
+    assert_eq!(rig.take(), []);
+    assert_eq!(snapshot(&chan.three_d), before);
+    assert_eq!(chan.macros.data_ram(), &ram_before);
+    assert!(chan.macros.is_waiting());
+    // The abandoned run was not remembered either.
+    assert_eq!(memo_len(&rig, Engine::ThreeD), 0);
+
+    // The back performs its work, which writes the words the macro reads.
+    rig.write_memory(SOURCE, &WORDS);
+    let report = rig.resume(&mut chan, Engine::ThreeD).unwrap();
+    assert_eq!(
+        report.result,
+        CallResult::Committed(CallOutcome::NotStored(NotMemoised::DataRamLoad))
+    );
+    // The rerun read without asking the back again, although it still says it is busy.
+    assert_eq!(rig.back.queries.get(), 1);
+    assert_eq!(ram_words(&chan, RAM_AT, 3), WORDS);
+    assert_eq!(chan.macros.data_ram().get(u32::from(SCRATCH_WORD)), Some(0x55));
+    let sent = rig.take();
+    assert_eq!(
+        sent.last(),
+        Some(&write_entry(A, Engine::ThreeD, out_method(0), WORDS[0]))
+    );
+    assert!(sent.contains(&write_entry(A, Engine::ThreeD, out_method(9), 0x99)));
+    assert!(!chan.macros.is_waiting());
+}
+
+#[test]
+fn a_call_that_reads_into_data_ram_is_never_replayed() {
+    let mut rig = make_rig();
+    let mut chan = Chan::new(A);
+    rig.upload(&mut chan, Engine::ThreeD, 0, &ram_read_macro(true), 0);
+    rig.take();
+    let parameters = ram_parameters(SOURCE, RAM_AT, 1);
+    for (round, word) in WORDS.into_iter().enumerate() {
+        // The same call, with the same data RAM as the round before left it, but new memory: a
+        // replay would leave the round before's word.
+        rig.write_memory(SOURCE, &[word]);
+        let report = rig.call(&mut chan, Engine::ThreeD, 0, &parameters);
+        assert_eq!(
+            report.result,
+            CallResult::Committed(CallOutcome::NotStored(NotMemoised::DataRamLoad)),
+            "round {round}"
+        );
+        assert_eq!(chan.macros.data_ram().get(RAM_AT), Some(word));
+        assert_eq!(
+            rig.take().last(),
+            Some(&write_entry(A, Engine::ThreeD, out_method(0), word))
+        );
+        assert_eq!(memo_len(&rig, Engine::ThreeD), 0);
+    }
+}
+
+#[test]
+fn an_empty_data_ram_read_reads_nothing_asks_nothing_and_is_not_remembered() {
+    // As Eden-NX2's `read_memory`, any MME_DMA_READ write keeps the call out of the memo; a read
+    // of 0 words is not checked against data RAM's end, so the index may be anything.
+    let mut rig = make_rig();
+    let mut chan = Chan::new(A);
+    rig.upload(&mut chan, Engine::ThreeD, 0, &ram_read_macro(false), 0);
+    rig.take();
+    rig.back.busy.set(true);
+    for index in [RAM_AT, u32::MAX] {
+        let unmapped = GPU_BASE + PAGES * PAGE_SIZE;
+        let report = rig.call(&mut chan, Engine::ThreeD, 0, &ram_parameters(unmapped, index, 0));
+        assert_eq!(
+            report.result,
+            CallResult::Committed(CallOutcome::NotStored(NotMemoised::DataRamLoad))
+        );
+        assert_eq!(rig.back.queries.get(), 0);
+        assert_eq!(chan.macros.data_ram().get(RAM_AT), Some(0));
+        assert_eq!(memo_len(&rig, Engine::ThreeD), 0);
+    }
+}
+
+#[test]
+fn a_failed_run_that_writes_the_read_method_is_not_remembered() {
+    // The run fails at a write outside the file, then writes MME_DMA_READ while starved: the
+    // read is not made, and the memo still does not remember the call (its replay would make
+    // the read without storing its words).
+    let mut rig = make_rig();
+    let mut chan = Chan::new(A);
+    let program = finish(vec![
+        emit_param(m16(MEM_ADDRESS_A)),
+        emit_param(m16(MEM_ADDRESS_B)),
+        emit_imm(call_method(Engine::ThreeD, 1), 2),
+        emit_imm(m16(DATA_RAM_ADDRESS), 0x20),
+        emit_imm(m16(DMA_READ), 1),
+    ]);
+    rig.upload(&mut chan, Engine::ThreeD, 0, &program, 0);
+    rig.take();
+    rig.write_memory(SOURCE, &WORDS);
+    let [upper, lower, _] = source_parameters(SOURCE, 0);
+    let report = rig.call(&mut chan, Engine::ThreeD, 0, &[upper, lower]);
+    assert_eq!(
+        report.result,
+        CallResult::Failed {
+            error: CallFailure::MethodOutOfRange {
+                method: call_method(Engine::ThreeD, 1),
+            },
+            first_for_macro: true,
+        }
+    );
+    assert_eq!(memo_len(&rig, Engine::ThreeD), 0);
+    assert_eq!(rig.back.queries.get(), 0);
+    assert_eq!(chan.macros.data_ram().get(0x20), Some(0));
+}
+
+/// One data RAM read of `words` at `index` on a fresh rig, from a source with `WORDS` at its
+/// start; returns the result and the channel.
+fn ram_read(index: u32, words: u32) -> (CallResult, Chan, Vec<RingEntry<'static>>) {
+    let mut rig = make_rig();
+    let mut chan = Chan::new(A);
+    rig.upload(&mut chan, Engine::ThreeD, 0, &ram_read_macro(false), 0);
+    rig.take();
+    rig.write_memory(GPU_BASE, &WORDS);
+    let report = rig.call(&mut chan, Engine::ThreeD, 0, &ram_parameters(GPU_BASE, index, words));
+    (report.result, chan, rig.take())
+}
+
+fn out_of_range(index: u32, words: u32) -> CallResult {
+    CallResult::Failed {
+        error: CallFailure::DataRamOutOfRange { index, words },
+        first_for_macro: true,
+    }
+}
+
+#[test]
+fn a_data_ram_read_past_the_end_fails_the_call() {
+    // Divergence: Eden-NX2 stores the words below the end and drops the rest.
+    let end = u32::try_from(DATA_RAM_WORDS).unwrap();
+    let loaded = CallResult::Committed(CallOutcome::NotStored(NotMemoised::DataRamLoad));
+    // Ending exactly at the end: stored, the last word in data RAM's last word.
+    let (result, chan, _) = ram_read(end - 3, 3);
+    assert_eq!(result, loaded);
+    assert_eq!(ram_words(&chan, end - 4, 4), [0, WORDS[0], WORDS[1], WORDS[2]]);
+    // One word more: refused, and nothing stored or sent, the scratch word included.
+    let (result, chan, sent) = ram_read(end - 3, 4);
+    assert_eq!(result, out_of_range(end - 3, 4));
+    assert_eq!(ram_words(&chan, end - 4, 4), [0; 4]);
+    assert_eq!(chan.macros.data_ram().get(u32::from(SCRATCH_WORD)), Some(0));
+    assert_eq!(sent, []);
+    assert_eq!(chan.three_d.get(u32::from(out_method(9))), Some(0));
+    assert_eq!(chan.three_d.get(DATA_RAM_ADDRESS), Some(0));
+    // The index at the edge: the last word is accepted, the end refused.
+    let (result, chan, _) = ram_read(end - 1, 1);
+    assert_eq!(result, loaded);
+    assert_eq!(chan.macros.data_ram().get(end - 1), Some(WORDS[0]));
+    assert_eq!(ram_read(end, 1).0, out_of_range(end, 1));
+    // A length with a high byte, at the edge on both sides.
+    let length = 0x102;
+    assert_eq!(ram_read(end - length, length).0, loaded);
+    assert_eq!(ram_read(end - length + 1, length).0, out_of_range(end - length + 1, length));
+    // The length is cut to DMA_READ_MAX_WORDS before the check, as for a load-FIFO read.
+    assert_eq!(ram_read(0, u32::MAX).0, out_of_range(0, DMA_READ_MAX_WORDS));
+}
+
+#[test]
+fn a_data_ram_read_index_is_32_bits_wide() {
+    // `SET_MME_DATA_RAM_ADDRESS_WORD` is 31:0: an index differing only above its low byte
+    // lands elsewhere, and one at or above 2^31 or near u32::MAX is past the end (Eden-NX2's
+    // `ram + i` would wrap that last one onto data RAM's start).
+    let (_, chan, _) = ram_read(0xb20, 1);
+    assert_eq!(chan.macros.data_ram().get(0xb20), Some(WORDS[0]));
+    assert_eq!(chan.macros.data_ram().get(0x20), Some(0));
+    assert_eq!(ram_read(1 << 31, 1).0, out_of_range(1 << 31, 1));
+    assert_eq!(ram_read(u32::MAX, 2).0, out_of_range(u32::MAX, 2));
+}
+
+#[test]
+fn an_unreadable_data_ram_read_fails_the_call() {
+    // Divergence: Eden-NX2's reads have no failure result.
+    let mut rig = make_rig();
+    let mut chan = Chan::new(A);
+    rig.upload(&mut chan, Engine::ThreeD, 0, &ram_read_macro(true), 0);
+    rig.take();
+    let before = snapshot(&chan.three_d);
+    let end = GPU_BASE + PAGES * PAGE_SIZE;
+    let report = rig.call(&mut chan, Engine::ThreeD, 0, &ram_parameters(end - 4, RAM_AT, 2));
+    assert_eq!(
+        report.result,
+        CallResult::Failed {
+            error: CallFailure::DmaRead {
+                address: end - 4,
+                words: 2,
+                fault: GpuFault::Unmapped { va: end },
+            },
+            first_for_macro: true,
+        }
+    );
+    assert_eq!(rig.take(), []);
+    assert_eq!(snapshot(&chan.three_d), before);
+    assert_eq!(ram_words(&chan, RAM_AT, 2), [0, 0]);
+    assert_eq!(chan.macros.data_ram().get(u32::from(SCRATCH_WORD)), Some(0));
+    assert_eq!(memo_len(&rig, Engine::ThreeD), 0);
+    // Ending exactly at the mapping's end reads.
+    rig.write_memory(end - 8, &[0x81, 0x82]);
+    let report = rig.call(&mut chan, Engine::ThreeD, 0, &ram_parameters(end - 8, RAM_AT, 2));
+    assert!(matches!(report.result, CallResult::Committed(_)));
+    assert_eq!(ram_words(&chan, RAM_AT, 2), [0x81, 0x82]);
+}
+
+/// A load-FIFO read of `fifo` words (queued, never performed: no barrier), then a data RAM read
+/// of `words` at `index`.
+fn fifo_then_ram_macro() -> Vec<Instruction> {
+    finish(vec![
+        emit_param(m16(MEM_ADDRESS_A)),
+        emit_param(m16(MEM_ADDRESS_B)),
+        emit_param(m16(DMA_READ_FIFOED)),
+        mov_reg(2, Reg::Load0),
+        emit_reg(m16(DATA_RAM_ADDRESS), 2),
+        emit_param(m16(DMA_READ)),
+    ])
+}
+
+fn fifo_then_ram(rig: &mut Rig, address: u64, fifo: u32, index: u32, words: u32) -> CallResult {
+    let mut chan = Chan::new(A);
+    rig.upload(&mut chan, Engine::ThreeD, 0, &fifo_then_ram_macro(), 0);
+    rig.take();
+    let [upper, lower, _] = source_parameters(address, 0);
+    rig.call(&mut chan, Engine::ThreeD, 0, &[upper, lower, fifo, index, words])
+        .result
+}
+
+#[test]
+fn data_ram_reads_count_toward_the_runs_dma_bound() {
+    let loaded = CallResult::Committed(CallOutcome::NotStored(NotMemoised::DataRamLoad));
+    let ram = 0x10;
+    let fifo = DMA_RUN_MAX_WORDS - ram;
+    assert_eq!(fifo_then_ram(&mut make_rig(), GPU_BASE, fifo, 0, ram), loaded);
+    assert_eq!(
+        fifo_then_ram(&mut make_rig(), GPU_BASE, fifo, 0, ram + 1),
+        CallResult::Failed {
+            error: CallFailure::DmaTooLarge {
+                words: DMA_RUN_MAX_WORDS + 1,
+            },
+            first_for_macro: true,
+        }
+    );
+    // A data RAM read first, then a load-FIFO read: the same total.
+    let program = finish(vec![
+        emit_param(m16(MEM_ADDRESS_A)),
+        emit_param(m16(MEM_ADDRESS_B)),
+        emit_param(m16(DMA_READ)),
+        emit_param(m16(DMA_READ_FIFOED)),
+    ]);
+    let run = |fifo: u32| {
+        let mut rig = make_rig();
+        let mut chan = Chan::new(A);
+        rig.upload(&mut chan, Engine::ThreeD, 0, &program, 0);
+        let [upper, lower, _] = source_parameters(GPU_BASE, 0);
+        rig.call(&mut chan, Engine::ThreeD, 0, &[upper, lower, ram, fifo])
+            .result
+    };
+    assert_eq!(run(DMA_RUN_MAX_WORDS - ram), loaded);
+    assert_eq!(
+        run(DMA_RUN_MAX_WORDS - ram + 1),
+        CallResult::Failed {
+            error: CallFailure::DmaTooLarge {
+                words: DMA_RUN_MAX_WORDS + 1,
+            },
+            first_for_macro: true,
+        }
+    );
+}
+
+#[test]
+fn data_ram_read_checks_come_in_their_documented_order() {
+    let end = u32::try_from(DATA_RAM_WORDS).unwrap();
+    // The run's bound before data RAM's end: both faults at once.
+    let mut rig = make_rig();
+    assert_eq!(
+        fifo_then_ram(&mut rig, GPU_BASE, DMA_RUN_MAX_WORDS - 1, end - 1, 2),
+        CallResult::Failed {
+            error: CallFailure::DmaTooLarge {
+                words: DMA_RUN_MAX_WORDS + 1,
+            },
+            first_for_macro: true,
+        }
+    );
+    // Data RAM's end before the catch-up: the back is not asked.
+    let mut rig = make_rig();
+    rig.back.busy.set(true);
+    assert_eq!(
+        fifo_then_ram(&mut rig, GPU_BASE, 0, end - 1, 2),
+        out_of_range(end - 1, 2)
+    );
+    assert_eq!(rig.back.queries.get(), 0);
+    // The catch-up before the read: an unmapped read waits, then fails at the rerun.
+    let mut rig = make_rig();
+    let mut chan = Chan::new(A);
+    rig.upload(&mut chan, Engine::ThreeD, 0, &ram_read_macro(false), 0);
+    rig.take();
+    rig.back.busy.set(true);
+    let unmapped = GPU_BASE + PAGES * PAGE_SIZE;
+    let report = rig.call(&mut chan, Engine::ThreeD, 0, &ram_parameters(unmapped, 0, 1));
+    assert_eq!(report.result, CallResult::CatchUp);
+    assert_eq!(rig.back.queries.get(), 1);
+    let report = rig.resume(&mut chan, Engine::ThreeD).unwrap();
+    assert_eq!(
+        report.result,
+        CallResult::Failed {
+            error: CallFailure::DmaRead {
+                address: unmapped,
+                words: 1,
+                fault: GpuFault::Unmapped { va: unmapped },
+            },
+            first_for_macro: true,
+        }
+    );
+}
+
+#[test]
+fn the_data_ram_read_uses_the_registers_held_at_its_write() {
+    // The registers come from stream words before the call; the macro rewrites them after its
+    // read, which changes nothing.
+    let mut rig = make_rig();
+    let mut chan = Chan::new(A);
+    let program = finish(vec![
+        emit_param(m16(DMA_READ)),
+        emit_imm(m16(MEM_ADDRESS_B), 0),
+        emit_imm(m16(DATA_RAM_ADDRESS), 0x7),
+    ]);
+    rig.upload(&mut chan, Engine::ThreeD, 0, &program, 0);
+    let [upper, lower, _] = source_parameters(SOURCE, 0);
+    rig.stream(&mut chan, Engine::ThreeD, MEM_ADDRESS_A, &[upper]);
+    rig.stream(&mut chan, Engine::ThreeD, MEM_ADDRESS_B, &[lower]);
+    rig.stream(&mut chan, Engine::ThreeD, DATA_RAM_ADDRESS, &[RAM_AT]);
+    rig.take();
+    rig.write_memory(SOURCE, &WORDS);
+    let report = rig.call(&mut chan, Engine::ThreeD, 0, &[2]);
+    assert!(matches!(report.result, CallResult::Committed(_)));
+    assert_eq!(ram_words(&chan, RAM_AT, 3), [WORDS[0], WORDS[1], 0]);
+    assert_eq!(chan.macros.data_ram().get(0x7), Some(0));
+}
+
+#[test]
+fn data_ram_reads_are_3d_only_and_land_in_the_data_ram_compute_shares() {
+    // Eden-NX2's compute front reads no MME memory; `clc7c0.h` has the method, and a compute
+    // write to it is a register write only here, and is remembered.
+    let mut rig = make_rig();
+    let mut chan = Chan::new(A);
+    let program = finish(vec![
+        emit_param(m16(MEM_ADDRESS_A)),
+        emit_param(m16(MEM_ADDRESS_B)),
+        emit_imm(m16(DATA_RAM_ADDRESS), 0x30),
+        emit_imm(m16(DMA_READ), 1),
+    ]);
+    rig.upload(&mut chan, Engine::Compute, 0, &program, 0);
+    rig.take();
+    rig.write_memory(SOURCE, &WORDS);
+    rig.back.busy.set(true);
+    let [upper, lower, _] = source_parameters(SOURCE, 0);
+    let report = rig.call(&mut chan, Engine::Compute, 0, &[upper, lower]);
+    assert_eq!(report.result, CallResult::Committed(CallOutcome::Stored));
+    assert_eq!(rig.back.queries.get(), 0);
+    assert_eq!(chan.macros.data_ram().get(0x30), Some(0));
+    assert_eq!(
+        rig.take().last(),
+        Some(&write_entry(A, Engine::Compute, m16(DMA_READ), 1))
+    );
+
+    // A 3D read lands where a compute macro reads it.
+    rig.back.busy.set(false);
+    rig.upload(&mut chan, Engine::ThreeD, 0, &ram_read_macro(false), 0);
+    rig.upload(
+        &mut chan,
+        Engine::Compute,
+        0x10,
+        &finish(vec![dread_to(0, 0x31), emit_reg(out_method(0), 0)]),
+        1,
+    );
+    rig.take();
+    rig.call(&mut chan, Engine::ThreeD, 0, &ram_parameters(SOURCE, 0x30, 2));
+    let report = rig.call(&mut chan, Engine::Compute, 1, &[0]);
+    assert!(matches!(report.result, CallResult::Committed(_)));
+    assert_eq!(
+        rig.take().last(),
+        Some(&write_entry(A, Engine::Compute, out_method(0), WORDS[1]))
+    );
+}
+
+#[test]
+fn a_data_ram_read_stored_over_by_a_later_dwrite_keeps_the_dwrite() {
+    // The words land at the write, in order with the macro's own data RAM writes.
+    let mut rig = make_rig();
+    let mut chan = Chan::new(A);
+    let program = finish(vec![
+        emit_param(m16(MEM_ADDRESS_A)),
+        emit_param(m16(MEM_ADDRESS_B)),
+        mov(3, 0x66),
+        store(0x21, 3),
+        emit_imm(m16(DATA_RAM_ADDRESS), 0x20),
+        emit_imm(m16(DMA_READ), 3),
+        mov(4, 0x77),
+        store(0x22, 4),
+    ]);
+    rig.upload(&mut chan, Engine::ThreeD, 0, &program, 0);
+    rig.take();
+    rig.write_memory(SOURCE, &WORDS);
+    let [upper, lower, _] = source_parameters(SOURCE, 0);
+    let report = rig.call(&mut chan, Engine::ThreeD, 0, &[upper, lower]);
+    assert!(matches!(report.result, CallResult::Committed(_)));
+    assert_eq!(ram_words(&chan, 0x20, 3), [WORDS[0], WORDS[1], 0x77]);
 }

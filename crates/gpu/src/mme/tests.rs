@@ -12,11 +12,11 @@ use proptest::prelude::*;
 use proptest::test_runner::{Config, RngSeed};
 
 use super::testing::{
-    DMA_FIFOED_METHOD, Host, add_imm, alu, branch, finish, inst0, inst01, jal, loop_, merge, mov,
+    DMA_FIFOED_METHOD, DMA_RAM_METHOD, Host, add_imm, alu, branch, finish, inst0, inst01, jal, loop_, merge, mov,
     mov_reg, op3, r, run_program, store, with_imm, with_out,
 };
 use super::{
-    Alu, AluOp, DATA_RAM_WORDS, DataRam, DecodeError, EncodeError, GPR_COUNT, INSTRUCTION_WORDS,
+    Alu, AluOp, DATA_RAM_WORDS, DataRam, DataRamLoad, MacroHost, DecodeError, EncodeError, GPR_COUNT, INSTRUCTION_WORDS,
     Instruction, LOAD_BARRIER, METHOD_MASK, MacroError, Out, OutOp, Pred, Reg, StepLimit,
     decode_program, encode_program, inst, run,
 };
@@ -1028,6 +1028,142 @@ fn the_load_barrier_lets_the_host_refill_the_load_fifo() {
     run(&finish(program), &mut ram, &mut host, StepLimit::DEFAULT).unwrap();
     assert_eq!((word(&ram, 0), word(&ram, 1)), (1000, 1001));
     assert_eq!(host.barriers, 1);
+}
+
+/// Emits immediate 0 to method immediate 1.
+fn emit_imm(method: u16, value: u16) -> Instruction {
+    with_imm(
+        with_out(Instruction::default(), 0, OutOp::Imm1, OutOp::Imm0),
+        value,
+        method,
+    )
+}
+
+/// `R<dst>` = data RAM `[index]`.
+fn dread(dst: u8, index: u16) -> Instruction {
+    with_imm(inst0(AluOp::Dread, r(dst), Reg::Imm, Reg::Zero), index, 0)
+}
+
+#[test]
+fn a_data_ram_load_is_stored_right_after_its_write() {
+    // The load's words land before the macro goes on: its next DREAD sees them, a DWRITE after
+    // it overwrites one, and the interpreter asks after every emitted method.
+    let words = [0xa1b2_c3d4, 0x5566_7788, 0x0bad_f00d];
+    let program = finish(vec![
+        emit_imm(0x20, 1),
+        emit_imm(DMA_RAM_METHOD, 4),
+        dread(0, 5),
+        mov(1, 0x77),
+        store(4, 1),
+        inst0(AluOp::Add, Reg::Zero, Reg::Zero, Reg::Zero),
+    ]);
+    let mut host = Host {
+        memory: words.to_vec(),
+        ..Host::default()
+    };
+    let mut ram = DataRam::new();
+    run(&program, &mut ram, &mut host, StepLimit::DEFAULT).unwrap();
+    let stored: Vec<u32> = (3..8).map(|index| word(&ram, index)).collect();
+    assert_eq!(stored, [0, 0x77, words[1], words[2], 0]);
+    assert_eq!(host.ram_load_queries, 2);
+    assert_eq!(host.ram_load, None);
+    // R0 held the loaded word: write it out to check.
+    let program = finish(vec![
+        emit_imm(DMA_RAM_METHOD, 4),
+        dread(0, 5),
+        with_imm(
+            with_out(
+                inst0(AluOp::Add, Reg::Zero, r(0), Reg::Zero),
+                0,
+                OutOp::Imm1,
+                OutOp::Alu0,
+            ),
+            0,
+            0x21,
+        ),
+    ]);
+    let mut host = Host {
+        memory: words.to_vec(),
+        ..Host::default()
+    };
+    run(&program, &mut DataRam::new(), &mut host, StepLimit::DEFAULT).unwrap();
+    assert_eq!(host.calls, [(DMA_RAM_METHOD, 4), (0x21, words[1])]);
+}
+
+#[test]
+fn a_data_ram_load_past_the_end_fails_with_the_words_before_it_stored() {
+    let end = u32::try_from(DATA_RAM_WORDS).unwrap();
+    let words = vec![0x11, 0x22];
+    // Ending exactly at the end: stored.
+    let at = u16::try_from(end - 2).unwrap();
+    let mut host = Host {
+        memory: words.clone(),
+        ..Host::default()
+    };
+    let mut ram = DataRam::new();
+    run(
+        &finish(vec![emit_imm(DMA_RAM_METHOD, at)]),
+        &mut ram,
+        &mut host,
+        StepLimit::DEFAULT,
+    )
+    .unwrap();
+    assert_eq!((word(&ram, end - 2), word(&ram, end - 1)), (0x11, 0x22));
+    // One word later: the first word is stored and the second fails, as a DWRITE there would.
+    let at = u16::try_from(end - 1).unwrap();
+    let mut host = Host {
+        memory: words,
+        ..Host::default()
+    };
+    let mut ram = DataRam::new();
+    let result = run(
+        &finish(vec![mov(0, 1), emit_imm(DMA_RAM_METHOD, at)]),
+        &mut ram,
+        &mut host,
+        StepLimit::DEFAULT,
+    );
+    assert_eq!(
+        result,
+        Err(MacroError::DataRamOutOfBounds { pc: 1, index: end })
+    );
+    assert_eq!(word(&ram, end - 1), 0x11);
+}
+
+#[test]
+fn an_empty_data_ram_load_and_the_default_hook_store_nothing() {
+    let mut host = Host::default();
+    let mut ram = DataRam::new();
+    run(
+        &finish(vec![emit_imm(DMA_RAM_METHOD, 4)]),
+        &mut ram,
+        &mut host,
+        StepLimit::DEFAULT,
+    )
+    .unwrap();
+    assert_eq!(ram, DataRam::new());
+    assert_eq!(host.ram_load_queries, 1);
+
+    /// A host that keeps the default `data_ram_load`.
+    struct Plain;
+    impl MacroHost for Plain {
+        fn load(&mut self) -> Option<u32> {
+            None
+        }
+        fn state(&mut self, _: u16) -> u32 {
+            0
+        }
+        fn method(&mut self, _: u16, _: u32) {}
+    }
+    assert_eq!(Plain.data_ram_load(), None::<DataRamLoad<'_>>);
+    let mut ram = DataRam::new();
+    run(
+        &finish(vec![emit_imm(DMA_RAM_METHOD, 4)]),
+        &mut ram,
+        &mut Plain,
+        StepLimit::DEFAULT,
+    )
+    .unwrap();
+    assert_eq!(ram, DataRam::new());
 }
 
 #[test]

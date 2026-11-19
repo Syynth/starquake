@@ -7,11 +7,18 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use super::{Alu, AluOp, DataRam, Instruction, MacroError, MacroHost, Out, OutOp, Reg, StepLimit};
+use super::{
+    Alu, AluOp, DataRam, DataRamLoad, Instruction, MacroError, MacroHost, Out, OutOp, Reg,
+    StepLimit,
+};
 
 /// Arbitrary method id the test host treats as "start a DMA read of `value` words into the load
 /// FIFO at the next barrier" (the real method numbers belong to the 3D engine, not to MME).
 pub const DMA_FIFOED_METHOD: u16 = 0x100;
+
+/// Arbitrary method id the test host treats as "load all of `memory` into data RAM from word
+/// `value`" ([`MacroHost::data_ram_load`]; the real method is the 3D engine's `MME_DMA_READ`).
+pub const DMA_RAM_METHOD: u16 = 0x101;
 
 /// Hand-derived lane masks for each predicate mode, in encoding order: `(predicate non-zero,
 /// predicate zero)`, bit 0 = ALU 0, bit 1 = ALU 1, bit 2 = output 0, bit 3 = output 1.
@@ -55,6 +62,11 @@ pub struct Host {
     /// Memory the DMA-read hook reads from.
     pub memory: Vec<u32>,
     pub dma_words: usize,
+    /// The data RAM word the last write to [`DMA_RAM_METHOD`] loads `memory` to, until the
+    /// interpreter takes it.
+    pub ram_load: Option<u32>,
+    /// How many times the interpreter asked for a data RAM load.
+    pub ram_load_queries: u32,
 }
 
 impl Host {
@@ -90,6 +102,18 @@ impl MacroHost for Host {
         if method == DMA_FIFOED_METHOD {
             self.dma_words = usize::try_from(value).unwrap_or(0);
         }
+        if method == DMA_RAM_METHOD {
+            self.ram_load = Some(value);
+        }
+    }
+
+    fn data_ram_load(&mut self) -> Option<DataRamLoad<'_>> {
+        self.ram_load_queries += 1;
+        let index = self.ram_load.take()?;
+        Some(DataRamLoad {
+            index,
+            words: &self.memory,
+        })
     }
 
     fn barrier(&mut self) {
