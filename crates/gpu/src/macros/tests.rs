@@ -2947,7 +2947,8 @@ fn the_data_ram_read_uses_the_registers_held_at_its_write() {
 #[test]
 fn data_ram_reads_are_3d_only_and_land_in_the_data_ram_compute_shares() {
     // Eden-NX2's compute front reads no MME memory; `clc7c0.h` has the method, and a compute
-    // write to it is a register write only here, and is remembered.
+    // write to it is a register write only here. The call is not remembered (divergence:
+    // Eden-NX2 stores it), as the 3D call it could stand for would read.
     let mut rig = make_rig();
     let mut chan = Chan::new(A);
     let program = finish(vec![
@@ -2962,7 +2963,11 @@ fn data_ram_reads_are_3d_only_and_land_in_the_data_ram_compute_shares() {
     rig.back.busy.set(true);
     let [upper, lower, _] = source_parameters(SOURCE, 0);
     let report = rig.call(&mut chan, Engine::Compute, 0, &[upper, lower]);
-    assert_eq!(report.result, CallResult::Committed(CallOutcome::Stored));
+    assert_eq!(
+        report.result,
+        CallResult::Committed(CallOutcome::NotStored(NotMemoised::DataRamLoad))
+    );
+    assert_eq!(memo_len(&rig, Engine::Compute), 0);
     assert_eq!(rig.back.queries.get(), 0);
     assert_eq!(chan.macros.data_ram().get(0x30), Some(0));
     assert_eq!(
@@ -2992,6 +2997,34 @@ fn data_ram_reads_are_3d_only_and_land_in_the_data_ram_compute_shares() {
     assert_eq!(
         rig.take().last(),
         Some(&write_entry(A, Engine::Compute, out_method(0), WORDS[1]))
+    );
+}
+
+#[test]
+fn a_compute_call_on_the_3d_store_is_not_replayed_for_a_3d_data_ram_read() {
+    // Until a channel uploads compute code, its compute calls run from the 3D store and memo,
+    // whose key (start, parameters) does not name the engine. A compute call that writes
+    // `MME_DMA_READ` reads nothing, but it is not remembered either, so a 3D call with the
+    // same entry and parameters runs and reads rather than replaying the compute call.
+    let mut rig = make_rig();
+    let mut chan = Chan::new(A);
+    rig.upload(&mut chan, Engine::ThreeD, 0, &ram_read_macro(false), 0);
+    rig.take();
+    rig.write_memory(SOURCE, &WORDS);
+    let parameters = ram_parameters(SOURCE, RAM_AT, 3);
+    let loaded = CallResult::Committed(CallOutcome::NotStored(NotMemoised::DataRamLoad));
+
+    let report = rig.call(&mut chan, Engine::Compute, 0, &parameters);
+    assert_eq!(report.result, loaded);
+    assert_eq!(memo_len(&rig, Engine::ThreeD), 0);
+    assert_eq!(ram_words(&chan, RAM_AT, 3), [0, 0, 0]);
+
+    let report = rig.call(&mut chan, Engine::ThreeD, 0, &parameters);
+    assert_eq!(report.result, loaded);
+    assert_eq!(rig.back.queries.get(), 1);
+    assert_eq!(
+        ram_words(&chan, RAM_AT - 1, 5),
+        [0, WORDS[0], WORDS[1], WORDS[2], 0]
     );
 }
 

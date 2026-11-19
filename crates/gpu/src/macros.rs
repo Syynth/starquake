@@ -67,9 +67,10 @@
 //! a call fixes its macro: entry `(method - 0xE00) / 2` of the start table ([`Engine::entry`]);
 //! every later word, whatever its method, is the next parameter. A first word at or past entry
 //! [`START_ENTRIES`] (method 0x1000 and up, past what a header can name,
-//! [`crate::channel::METHOD_MAX`]) is refused ([`HostError::PastStartTable`]). The call runs when the word's header owes no more ([`EngineWord::remaining`] is
-//! 0), even if its words came in several GP entries or submissions (the channel keeps the
-//! header's state across them, slice G8). The 3D and compute classes collect calls separately.
+//! [`crate::channel::METHOD_MAX`]) is refused ([`HostError::PastStartTable`]). The call runs
+//! when the word's header owes no more ([`EngineWord::remaining`] is 0), even if its words came
+//! in several GP entries or submissions (the channel keeps the header's state across them,
+//! slice G8). The 3D and compute classes collect calls separately.
 //!
 //! # A run
 //!
@@ -146,18 +147,20 @@
 //! 5. the words are read through [`GpuMemory`] ([`CallFailure::DmaRead`]).
 //!
 //! The words go into data RAM through the memo's journal, so a run that fails or is abandoned
-//! later puts them back with its other data RAM writes. **The memo never remembers a call that
-//! writes `MME_DMA_READ`**, of any length and whether or not the read was made: the host
-//! answers every such write's `data_ram_load` with a load (empty when nothing was read), and
-//! the memo does not store a call that made one ([`crate::mme::NotMemoised::DataRamLoad`]). The
-//! words come from guest memory, which the memo's key and guard do not cover, and arrive without
-//! a barrier, so the barrier rule would not catch them. Eden-NX2 likewise stores no call that
-//! wrote 0x157 (`read_memory` in `MacroEngine::Execute`).
+//! later puts them back with its other data RAM writes. **The memo remembers no call that
+//! writes method 0x157 (`MME_DMA_READ`), in either class**, of any length and whether or not a
+//! read was made: the host answers every such write's `data_ram_load` with a load (empty when
+//! nothing was read, as for every compute write), and the memo does not store a call that made
+//! one ([`crate::mme::NotMemoised::DataRamLoad`]). The words come from guest memory, which the
+//! memo's key and guard do not cover, and arrive without a barrier, so the barrier rule would
+//! not catch them. Eden-NX2 likewise stores no 3D call that wrote 0x157 (`read_memory` in
+//! `MacroEngine::Execute`).
 //!
 //! `clc7c0.h` gives the compute class the same `MME_DMA_READ` and `_FIFOED` methods; a compute
-//! macro's write to them is a register write only, as Eden-NX2's compute front makes no MME
-//! memory reads (`kepler_compute.cpp`), and such a call may be remembered
-//! (`dma_reads_are_3d_only`, `data_ram_reads_are_3d_only_and_land_in_the_data_ram_compute_shares`).
+//! macro's write to them reads nothing and is a register write only, as Eden-NX2's compute
+//! front makes no MME memory reads (`kepler_compute.cpp`) (`dma_reads_are_3d_only`,
+//! `data_ram_reads_are_3d_only_and_land_in_the_data_ram_compute_shares`). A compute call that
+//! writes 0x157 is still not remembered ("Divergences").
 //!
 //! # Divergences
 //!
@@ -194,6 +197,14 @@
 //!   hold 0x80, so its calls `j` and `j + 0x80` share an entry and here they do not
 //!   (`call_0x80_has_its_own_entry`). A call past the table, which only a caller that is not the
 //!   pusher can make, is refused rather than wrapped (`a_call_past_the_start_table_is_refused`).
+//! - **A compute call that writes `MME_DMA_READ` is not remembered.** Eden-NX2's
+//!   `kepler_compute.cpp` stores such a call in the `native_memo` it shares with 3D. Here,
+//!   until a channel uploads compute code, its compute calls run from the 3D store and memo,
+//!   whose key (start, parameters) does not name the engine, so a remembered compute call would
+//!   be replayed for a 3D call with the same entry and parameters, and that call's read would
+//!   be dropped without an error
+//!   (`a_compute_call_on_the_3d_store_is_not_replayed_for_a_3d_data_ram_read`,
+//!   `data_ram_reads_are_3d_only_and_land_in_the_data_ram_compute_shares`).
 //! - **A call that starts on a `CALL_MME_DATA` method runs the macro below it** in both
 //!   classes, as Eden-NX2's 3D front does; its compute class drops such a word
 //!   (`a_call_may_start_on_a_data_method`).
@@ -989,11 +1000,14 @@ impl<M: GpuMemory + ?Sized, B: BackWork + ?Sized> MacroHost for RunHost<'_, M, B
 
     fn method(&mut self, method: u16, value: u32) {
         let number = u32::from(method);
-        let loads_data_ram = self.engine == Engine::ThreeD && number == DMA_READ;
-        // Every `MME_DMA_READ` write is reported as a load, in every state, so the memo never
-        // remembers a call that makes one (`MacroHost::data_ram_load`).
+        let writes_dma_read = number == DMA_READ;
+        // Only a 3D write reads; a compute write is a register write only.
+        let loads_data_ram = self.engine == Engine::ThreeD && writes_dma_read;
+        // Every `MME_DMA_READ` write, of either engine, is reported as a load, in every state,
+        // so the memo remembers no call that makes one (`MacroHost::data_ram_load`): a compute
+        // call on the 3D store shares the 3D memo, whose key does not name the engine.
         self.scratch.ram_words.clear();
-        self.ram_load = loads_data_ram
+        self.ram_load = writes_dma_read
             .then(|| DATA_RAM_ADDRESS_WORD.get(self.file.get(DATA_RAM_ADDRESS).unwrap_or(0)));
         if self.status != RunStatus::Running {
             return;

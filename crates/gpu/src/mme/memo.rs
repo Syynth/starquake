@@ -17,8 +17,8 @@
 //! - read a register ([`MacroHost::state`]): [`NotMemoised::RegisterRead`];
 //! - ran a load barrier ([`MacroHost::barrier`]): [`NotMemoised::Barrier`];
 //! - made a method write that the host says loaded data RAM ([`MacroHost::data_ram_load`]
-//!   returned `Some`, with or without words; the front macro host does so for every 3D
-//!   `MME_DMA_READ` write, `crate::macros`): [`NotMemoised::DataRamLoad`]. Such a write changes
+//!   returned `Some`, with or without words; the front macro host does so for every
+//!   `MME_DMA_READ` write, 3D or compute, `crate::macros`): [`NotMemoised::DataRamLoad`]. Such a write changes
 //!   data RAM from guest memory, which neither the key nor the guard covers, and without a
 //!   barrier, so the barrier rule does not catch it;
 //! - asked the host for a word after its parameters were used up (words a DMA read appended):
