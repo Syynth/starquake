@@ -1056,3 +1056,71 @@ pub fn replay(capture: &Capture, options: ReplayOptions) -> Result<ReplayOutput,
         stopped_early,
     })
 }
+
+/// The seams alone, over one log each, for the seams' tests (`super::tests::seams`).
+#[cfg(test)]
+pub(crate) mod seams {
+    use super::{
+        Arc, BackRecord, Blobs, Cursor, FrontRecord, Mutex, ReplayError, ReplayFenceClock,
+        ReplayFrontClock, ReplayMemory, ReplayShaders, ReplayedWrite, Shared, Thread, check, lock,
+    };
+    use crate::back::draw::shaders::ShaderLookup;
+    use crate::back::fence::FenceClock;
+    use crate::front::FrontClock;
+    use crate::interface::AsId;
+
+    /// A front log being fed back: its memory for `space`, its clock, and its failure.
+    pub(crate) struct Front {
+        cursor: Shared<FrontRecord>,
+        blobs: Arc<Blobs>,
+    }
+
+    impl Front {
+        pub(crate) fn new(records: Vec<FrontRecord>, blobs: Blobs) -> Self {
+            Self {
+                cursor: Arc::new(Mutex::new(Cursor::new(Thread::Front, records))),
+                blobs: Arc::new(blobs),
+            }
+        }
+        pub(crate) fn memory(&self, space: AsId) -> ReplayMemory<FrontRecord> {
+            ReplayMemory::new(&self.cursor, &self.blobs, space)
+        }
+        pub(crate) fn clock(&self) -> impl FrontClock {
+            ReplayFrontClock(Arc::clone(&self.cursor))
+        }
+        pub(crate) fn check(&self) -> Result<(), ReplayError> {
+            check(&self.cursor)
+        }
+        pub(crate) fn next(&self) -> usize {
+            lock(&self.cursor).next
+        }
+        pub(crate) fn writes(&self) -> Vec<ReplayedWrite> {
+            lock(&self.cursor).writes.clone()
+        }
+    }
+
+    /// A back log being fed back: its clock and shader cache, and its failure.
+    pub(crate) struct Back {
+        cursor: Shared<BackRecord>,
+    }
+
+    impl Back {
+        pub(crate) fn new(records: Vec<BackRecord>) -> Self {
+            Self {
+                cursor: Arc::new(Mutex::new(Cursor::new(Thread::Back, records))),
+            }
+        }
+        pub(crate) fn clock(&self) -> impl FenceClock {
+            ReplayFenceClock(Arc::clone(&self.cursor))
+        }
+        pub(crate) fn shaders(&self) -> impl ShaderLookup {
+            ReplayShaders(Arc::clone(&self.cursor))
+        }
+        pub(crate) fn check(&self) -> Result<(), ReplayError> {
+            check(&self.cursor)
+        }
+        pub(crate) fn next(&self) -> usize {
+            lock(&self.cursor).next
+        }
+    }
+}

@@ -290,3 +290,79 @@ fn an_extra_back_step_diverges_at_the_end_of_the_ring() {
         })
     );
 }
+
+#[test]
+fn a_release_that_latches_a_parked_acquire_reaches_the_front_as_a_latch() {
+    let mut builder = builder();
+    let waiting = channel(&mut builder);
+    let releasing = channel(&mut builder);
+    let gated = submission_at(&builder, CMD, &acquires_then_releases(SEM, 1, SEM2, 9));
+    builder.submit(waiting, gated).unwrap();
+    builder.run().unwrap();
+    let release = submission_at(&builder, CMD2, &releases(SEM, 1));
+    builder.submit(releasing, release).unwrap();
+    builder.run().unwrap();
+    let mut word = [0; 4];
+    builder.cpu_read(SPACE, SEM2, &mut word).unwrap();
+    assert_eq!(u32::from_le_bytes(word), 9, "the parked channel ran on");
+    let capture = builder.finish().unwrap();
+    assert!(capture.front.contains(&FrontRecord::Latch { channel: waiting }));
+    assert!(
+        capture
+            .back
+            .iter()
+            .any(|record| matches!(record, BackRecord::Waiters { waiters } if !waiters.is_empty()))
+    );
+    let output = replay(&capture, ReplayOptions::default()).unwrap();
+    assert_eq!(
+        writes_text(&output.writes),
+        format!(
+            "back space {space} wrote 4 bytes at {SEM:#x}: 01 00 00 00\n\
+             back space {space} wrote 4 bytes at {SEM2:#x}: 09 00 00 00\n",
+            space = SPACE.0
+        )
+    );
+
+    // Without the latch, the front does what it did not do when the capture was made.
+    let mut unlatched = capture;
+    unlatched
+        .front
+        .retain(|record| !matches!(record, FrontRecord::Latch { .. }));
+    assert!(matches!(
+        replay(&unlatched, ReplayOptions::default()).unwrap_err(),
+        ReplayError::Diverged(Divergence {
+            thread: Thread::Front,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn a_fence_wait_reads_the_syncpoint_value_the_back_left() {
+    let mut builder = builder();
+    let first = channel(&mut builder);
+    let second = channel(&mut builder);
+    let mut increments = submission_at(&builder, CMD, &releases(SEM, 1));
+    increments.increments = 1;
+    builder.submit(first, increments).unwrap();
+    let mut waits = submission_at(&builder, CMD2, &releases(SEM2, 2));
+    waits.wait = Some(crate::interface::Fence {
+        id: syncpoint(),
+        value: 1,
+    });
+    builder.submit(second, waits).unwrap();
+    builder.run().unwrap();
+    let capture = builder.finish().unwrap();
+    assert!(capture.front.contains(&FrontRecord::Syncpoint {
+        id: syncpoint(),
+        value: 1
+    }));
+    let output = replay(&capture, ReplayOptions::default()).unwrap();
+    assert_eq!(output.writes.len(), 2);
+
+    let mut unset = capture;
+    unset
+        .front
+        .retain(|record| !matches!(record, FrontRecord::Syncpoint { .. }));
+    assert!(replay(&unset, ReplayOptions::default()).is_err());
+}
