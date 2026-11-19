@@ -177,6 +177,16 @@
 //! (`a_graphics_server_with_a_busy_gpu_is_not_idle` pins only that a busy GPU makes the server
 //! busy).
 //!
+//! The core loop asks [`Graphics::idleness`], which is [`Graphics::is_idle`] with the busy
+//! answer split in two: [`Idleness::GpuBusy`] when everything but the GPU is idle and the GPU
+//! answered busy, [`Idleness::Busy`] when anything else is busy. The rest is asked whatever the
+//! GPU answered, so that a run stalled but for the GPU's answer can be asked again at the GPU's
+//! next quiet signal (`crate::machine`'s `cores` module, "Telling a stalled run"; gpu-protocol,
+//! "Idleness"). The null front never answers `GpuBusy`
+//! (`idleness_is_gpu_busy_only_when_the_gpu_alone_is_busy`, `the_null_front_is_never_gpu_busy`,
+//! and, with the GPU, `a_graphics_server_with_a_busy_gpu_is_not_idle` and
+//! `a_graphics_server_over_an_idle_gpu_is_idle_or_busy_never_gpu_busy`).
+//!
 //! # Replay
 //!
 //! The spec's replay: "a fake `GpuFront` takes submissions, and the recorded notes are fed back

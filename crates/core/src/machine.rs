@@ -33,7 +33,9 @@
 //! variable). Stopping the run interrupts and wakes every core. A run whose cores have all
 //! parked while nothing could ever end a wait (the graphics server idle,
 //! `crate::hle::Graphics::is_idle`, and then [`Dispatcher::is_stalled`]) ends as an emulator
-//! error ([`WAITING`]).
+//! error ([`WAITING`]). When only the GPU answered busy, the last core to park asks again at the
+//! GPU's next quiet signal, a bounded number of times (`machine/cores.rs`, "Telling a stalled
+//! run").
 //!
 //! It is generic over [`Vcpu`], so everything here runs on any host against scripted vCPUs; the
 //! hypervisor only enters in [`crate::system`]. Core 0 runs on the calling thread with the vCPU
