@@ -63,8 +63,12 @@ pub use control::{
 pub use float::{FMulScale, FSwzAddOp, FloatCmpOp, FloatType, IntType, MuFuOp, PredSetOp};
 pub use integer::{IMadMode, IntCmpOp, MovSrc, PLop3Src, PrmtMode, ShfType};
 pub use memory::{
-    AtomDst, AtomOp, AtomType, CCtlOp, GlobalAccess, LdcMode, MemAddr, MemBarScope,
+    AtomCmpSrc, AtomDst, AtomOp, AtomType, CCtlOp, GlobalAccess, LdcMode, MemAddr, MemBarScope,
     MemEvictionPriority, MemOrder, MemScope, MemSpace, MemType, OffsetStride, UniformAddr,
+};
+pub use texture::{
+    ChannelMask, ImageAccess, ImageDim, TexCBufRef, TexChannel, TexDim, TexLodMode, TexOffsetMode,
+    TexQuery, TexRef,
 };
 
 /// An operation's mnemonic, as `nvdisasm` writes it lower-cased (for a shell, a guess).

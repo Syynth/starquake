@@ -1099,6 +1099,7 @@ name = "starquake-core"
 version = "0.0.0"
 dependencies = [
  "insta",
+ "png",
  "serde",
  "serde_json",
  "starquake-cpu",
@@ -1106,6 +1107,7 @@ dependencies = [
  "starquake-gsv",
  "starquake-ipc",
  "starquake-kernel",
+ "starquake-layout",
  "starquake-loader",
  "starquake-memory",
  "starquake-render",

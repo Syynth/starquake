@@ -1140,7 +1140,7 @@ fn atomic_and_barrier_field_values_match_the_references() {
         );
     }
     assert_eq!(AtomOp::ENCODED, atom_ops.map(|(value, _)| value));
-    assert_eq!(AtomOp::CmpExch { cmpr: r(1) }.bits(), None);
+    assert_eq!(AtomOp::CmpExch(AtomCmpSrc::Separate { cmpr: r(1) }).bits(), None);
     let cctl_ops = [
         (CCtlOp::Pf1, 0, false),
         (CCtlOp::Pf2, 1, false),
@@ -1682,10 +1682,26 @@ fn unencodable_ldc_and_atomics_are_errors() {
         ),
         (
             OpAtom {
-                op: AtomOp::CmpExch { cmpr: r(4) },
+                op: AtomOp::CmpExch(AtomCmpSrc::Separate { cmpr: r(4) }),
                 ..atom
             },
             "atom has no bits for a uniform address register".into(),
+        ),
+        // The surface atomics' packed compare source has no memory-atomic form; without the
+        // refusal it would encode as an `ADD` (the operation field left clear).
+        (
+            OpAtom {
+                op: AtomOp::CmpExch(AtomCmpSrc::Packed),
+                ..atom
+            },
+            "atom has no bits for a packed compare source".into(),
+        ),
+        (
+            OpAtom {
+                op: AtomOp::CmpExch(AtomCmpSrc::Packed),
+                ..shared
+            },
+            "atom has no bits for a packed compare source".into(),
         ),
     ];
     for (op, message) in atom_cases {

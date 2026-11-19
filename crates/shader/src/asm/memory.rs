@@ -22,7 +22,7 @@ use crate::decode::memory::{
     STG_UNIFORM_OPCODE, STL_OPCODE, STL_UNIFORM_OPCODE, STS_OPCODE, STS_UNIFORM_OPCODE,
 };
 use crate::decode::{
-    AtomDst, AtomOp, CBUF_INDEX, CBUF_OFFSET, CBuf, DST, LdcMode, MemAddr, MemSpace, Named, OpAtom,
+    AtomCmpSrc, AtomDst, AtomOp, CBUF_INDEX, CBUF_OFFSET, CBuf, DST, LdcMode, MemAddr, MemSpace, Named, OpAtom,
     OpAtomsPopc, OpCCtl, OpErrBar, OpLd, OpLdGsts, OpLdc, OpLdgDepBar, OpMemBar, OpSt, Pred,
     PredSrc,
 };
@@ -199,7 +199,10 @@ impl Encode for OpAtom {
         let mnemonic = Self::MNEMONIC;
         let uniform = self.addr.uniform.is_some();
         let cmpr = match self.op {
-            AtomOp::CmpExch { cmpr } => Some(cmpr),
+            AtomOp::CmpExch(AtomCmpSrc::Separate { cmpr }) => Some(cmpr),
+            AtomOp::CmpExch(AtomCmpSrc::Packed) => {
+                return absent(mnemonic, false, "a packed compare source");
+            }
             _ => None,
         };
         let (opcode, layout, op_field) = match (self.space, self.dst, cmpr, uniform) {

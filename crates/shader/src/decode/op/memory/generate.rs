@@ -201,7 +201,9 @@ fn ldc() -> BoxedStrategy<Op> {
 /// Any operation of the four-bit operation field, or a compare-and-swap when `cas`.
 fn any_atom_op(cas: bool) -> BoxedStrategy<AtomOp> {
     if cas {
-        any_gpr().prop_map(|cmpr| AtomOp::CmpExch { cmpr }).boxed()
+        any_gpr()
+            .prop_map(|cmpr| AtomOp::CmpExch(AtomCmpSrc::Separate { cmpr }))
+            .boxed()
     } else {
         select(&AtomOp::ENCODED[..]).boxed()
     }

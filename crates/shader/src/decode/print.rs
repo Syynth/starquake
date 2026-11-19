@@ -30,7 +30,11 @@
 //! `stg`, `lds`, `sts`, `ldl`, `stl`, `atomg`, `red` and `atoms` for 32-bit accesses with `.ef`
 //! and `.strong.sm`, every atomic operation and type (in shared memory the 32-bit integer ones),
 //! and addresses with `.64`, `.x8`, a uniform register and a positive or negative offset
-//! (`+-0x1`).
+//! (`+-0x1`). Of the texture group (`op::texture`), `test_texture` pins the bindless `tex`,
+//! `tld`, `tld4`, `tmml`, `txd` and `txq` with `.scr`, `.b`, every level-of-detail mode,
+//! `tld4`'s `.g` and offset modes, `.ef` and `.nodep`, in that order, the operands
+//! `p0, r2, r0, r1, r3, 2d, 0x7`, and the three `txq` queries; that module's docs list what of
+//! its text is a guess.
 //! **Everything else is a guess** in `nvdisasm`'s usual style that a developer with
 //! `nvdisasm` should check (spec, "`nvdisasm` cross-check"): `urz` and `upt`, the `.rm`/`.rp`
 //! rounding names (taken from NAK's own `FRndMode` printer), `.fmz` for the `dnz` bit, float

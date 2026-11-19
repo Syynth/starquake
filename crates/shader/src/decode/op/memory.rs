@@ -18,6 +18,13 @@
 //! [`REFERENCE_ROWS`]), and PR #4588's translator (`ops_memory.cpp`, `ops_misc.cpp`, `LDC`, and
 //! `visitor.cpp`, `Visitor::Run`) says how it reads them.
 //!
+//! The field value types [`MemType`], [`MemOrder`], [`MemScope`], [`MemEvictionPriority`],
+//! [`AtomType`], [`AtomOp`] and [`AtomCmpSrc`], their printed text and the fields
+//! [`MEM_TYPE`], [`MEM_ORDER`], [`MEM_EVICTION`], [`ATOM_TYPE`], [`ATOM_OP`] and [`RED_OP`] are
+//! defined here once and shared with slice 6f's surface instructions (`op::texture`), as NAK
+//! shares them. [`AtomCmpSrc::Packed`] is the surface atomics' compare source; the memory
+//! atomics' forms do not encode it, and the test assembler refuses it.
+//!
 //! **From PR #4588 alone**, each needing an `nvdisasm` check (spec, verification E2): `LDGSTS`
 //! (`0xfae`, `Visitor::LDGSTS`), `LDGDEPBAR` (`0x9af`), `ERRBAR` (`0x9ab`) and `ATOMS.POPC`
 //! (`0xf8c`, `Visitor::ATOMS_POPC`). NAK has no op for them. So does the meaning of bit 76 of
@@ -1057,12 +1064,27 @@ pub enum AtomOp {
     Xor,
     /// 8: exchange.
     Exch,
-    /// Compare and swap: the data replaces the value where it equals `cmpr` (NAK's
-    /// `CmpExch(AtomCmpSrc::Separate)`).
-    CmpExch {
+    /// Compare and swap: the data replaces the value where it equals the compared value (NAK's
+    /// `CmpExch`). It has opcodes of its own, not a value of the operation field.
+    CmpExch(AtomCmpSrc),
+}
+
+/// Where a compare-and-swap finds the value it compares with (NAK's `AtomCmpSrc`, with the
+/// separate source's register carried here rather than in the op, so that only a
+/// compare-and-swap has one). Shared by the memory atomics and the surface atomics
+/// (`op::texture`'s `SUATOM.CAS`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AtomCmpSrc {
+    /// A register of its own (`ATOMG.CAS`, `ATOMS.CAS`: [`CAS_CMPR`]); not encodable for
+    /// surfaces.
+    Separate {
         /// The comparison value.
         cmpr: Gpr,
     },
+    /// Packed with the data, the compared value first: the only source `SUATOM.CAS` takes
+    /// (NAK: `assert!(cmp_src == AtomCmpSrc::Packed)`), and one the memory atomics' forms do
+    /// not encode.
+    Packed,
 }
 
 impl AtomOp {
@@ -1092,7 +1114,7 @@ impl AtomOp {
             Self::Or => Some(6),
             Self::Xor => Some(7),
             Self::Exch => Some(8),
-            Self::CmpExch { .. } => None,
+            Self::CmpExch(_) => None,
         }
     }
 
@@ -1152,7 +1174,8 @@ impl Named for OpAtom {
 
 impl Display for AtomOp {
     /// NAK's `AtomOp` printer, which `test_ld_st_atom` confirms but for `.cas` (a guess for the
-    /// compare-and-swap, which NAK prints `.cmpexch`).
+    /// compare-and-swap with either compare source, which NAK prints `.cmpexch` and
+    /// `.cmpexch.packed`).
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Add => ".add",
@@ -1164,7 +1187,7 @@ impl Display for AtomOp {
             Self::Or => ".or",
             Self::Xor => ".xor",
             Self::Exch => ".exch",
-            Self::CmpExch { .. } => ".cas",
+            Self::CmpExch(_) => ".cas",
         })
     }
 }
@@ -1212,7 +1235,7 @@ impl Display for OpAtom {
             }
         }
         write!(f, "{}, ", self.addr.text(self.space))?;
-        if let AtomOp::CmpExch { cmpr } = self.op {
+        if let AtomOp::CmpExch(AtomCmpSrc::Separate { cmpr }) = self.op {
             write!(f, "{cmpr}, ")?;
         }
         write!(f, "{}", self.data)
@@ -1261,7 +1284,7 @@ fn decode_atom(reader: &mut Reader, form: AtomForm, layout: AddrLayout) -> Resul
         MemSpace::Shared(stride(reader))
     };
     let op = match (cmpr, form) {
-        (Some(cmpr), _) => AtomOp::CmpExch { cmpr },
+        (Some(cmpr), _) => AtomOp::CmpExch(AtomCmpSrc::Separate { cmpr }),
         // Cannot fail: every three-bit value names an operation.
         (None, AtomForm::Red) => AtomOp::from_bits(reader.field(RED_OP)).unwrap_or(AtomOp::Add),
         (None, _) => read_coded(reader, ATOM_OP, AtomOp::from_bits)?,
