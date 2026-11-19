@@ -31,7 +31,7 @@ fn attr(writer: &mut Writer, offset: Gpr, addr: u16, comps: u8) -> Result<(), En
 /// Writes a byte address into [`ATTR_WORD`] (`set_field(64..72, addr >> 2)` after
 /// `assert!(self.addr % 4 == 0)`).
 fn attr_word(writer: &mut Writer, addr: u16) -> Result<(), EncodeError> {
-    if addr % ATTR_WORD_BYTES != 0 {
+    if !addr.is_multiple_of(ATTR_WORD_BYTES) {
         return Err(EncodeError::AttrAlign {
             addr,
             align: ATTR_WORD_BYTES,

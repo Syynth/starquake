@@ -235,7 +235,10 @@ fn s2ur_is_unsupported() {
             dst: S2RDst::Uniform(ur1),
             sr,
         }));
-        assert_eq!(one(s2ur), unsupported(s2ur, Unsupported::Instruction("s2ur")));
+        assert_eq!(
+            one(s2ur),
+            unsupported(s2ur, Unsupported::Instruction("s2ur"))
+        );
     }
 }
 

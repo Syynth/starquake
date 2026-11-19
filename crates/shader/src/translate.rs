@@ -44,8 +44,8 @@ use std::fmt::{self, Display, Formatter};
 use thiserror::Error;
 
 use crate::decode::{
-    AluSrc, Gpr, Instr, MovSrc, Op, OpALd, OpASt, OpExit, OpFFma, OpMov, OpS2R, RoundMode,
-    S2RDst, SpecialReg,
+    AluSrc, Gpr, Instr, MovSrc, Op, OpALd, OpASt, OpExit, OpFFma, OpMov, OpS2R, RoundMode, S2RDst,
+    SpecialReg,
 };
 use crate::ir::{
     Attribute, BuildError, Builder, Flags, FmzMode, FpControl, FpRounding, Function, Imm, Opcode,

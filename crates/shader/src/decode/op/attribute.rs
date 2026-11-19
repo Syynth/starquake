@@ -1335,7 +1335,11 @@ pub(crate) const FORMS: &[Form] = &[
         |reader| Ok(decode_ldtram(reader)),
     )
     .with_fixed(LDTRAM_FIXED.mask()),
-    Form::new(PIXLD_OPCODE, mask_of(&[DST, PIXLD_VAL, PRED_DST]), decode_pixld),
+    Form::new(
+        PIXLD_OPCODE,
+        mask_of(&[DST, PIXLD_VAL, PRED_DST]),
+        decode_pixld,
+    ),
     out(SOURCE_1_FORMS[0]),
     out(SOURCE_1_FORMS[1]),
     out(SOURCE_1_FORMS[2]),

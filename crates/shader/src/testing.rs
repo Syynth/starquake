@@ -6,8 +6,8 @@ use proptest::strategy::Union;
 use proptest::test_runner::{Config, RngSeed};
 
 use crate::decode::{
-    AluSrc, CBuf, CBufRef, Form, GROUP_HOOKS, GROUPS, Gpr, Instr, Instruction, OPCODE, Pred, PredSrc,
-    UniformReg,
+    AluSrc, CBuf, CBufRef, Form, GROUP_HOOKS, GROUPS, Gpr, Instr, Instruction, OPCODE, Pred,
+    PredSrc, UniformReg,
 };
 
 /// A fixed seed keeps every property test deterministic.

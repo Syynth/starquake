@@ -11,6 +11,11 @@ use super::super::op::attribute::{self, *};
 use super::*;
 use crate::asm::{EncodeError, assemble};
 
+/// A hand-built word's opcode and fields, and its expected text.
+type Case = (u128, &'static [(u32, u128)], &'static str);
+/// [`Case`] with fields built at run time.
+type BuiltCase = (u128, Vec<(u32, u128)>, &'static str);
+
 /// NAK's `test_isberd`, ported as a fixture table (`nvdisasm_tests.rs` @ 52238762): `r1` from
 /// `[r2]` and `[r2+0x42]`, with every output, access type, skew and memory type, and the text
 /// NAK checks against `nvdisasm` (SM86 has every case: the loops skip only SM below 75 and 86).
@@ -49,8 +54,9 @@ fn isberd_text_matches_nak_nvdisasm_cases() {
                         } else {
                             format!("[r2+0x{imm_offset:x}]")
                         };
-                        let expected =
-                            format!("isberd{output_str}{access_str}{skew_str}{mem_str} r1, {addr};");
+                        let expected = format!(
+                            "isberd{output_str}{access_str}{skew_str}{mem_str} r1, {addr};"
+                        );
                         assert_eq!(round_text(instr), expected);
                         checked += 1;
                     }
@@ -134,7 +140,10 @@ fn hand_built_words_of_each_form_decode() {
         // S2UR ur6, SR_CTAID.Z: uniform dst 6 at bit 16, index 39.
         (word(0x9c3, &[(16, 6), (72, 39)]), "s2ur ur6, sr_ctaid.z;"),
         // CS2R r8, SR_CLOCKLO (the pair): dst 8, index 80, .64 at bit 80.
-        (word(0x805, &[(16, 8), (72, 80), (80, 1)]), "cs2r r8, sr_clocklo;"),
+        (
+            word(0x805, &[(16, 8), (72, 80), (80, 1)]),
+            "cs2r r8, sr_clocklo;",
+        ),
         // AL2P.o.64 r1, a[0x84+r3]: dst 1, offset 3, addr 0x84, comps - 1 = 1, output 79.
         (
             word(0x920, &[(16, 1), (24, 3), (40, 0x84), (74, 1), (79, 1)]),
@@ -206,10 +215,7 @@ fn hand_built_words_of_each_form_decode() {
         ),
     ];
     // One case per form of the group, in form order.
-    let opcodes: Vec<u64> = cases
-        .iter()
-        .map(|(word, _)| word.field(OPCODE))
-        .collect();
+    let opcodes: Vec<u64> = cases.iter().map(|(word, _)| word.field(OPCODE)).collect();
     let forms: Vec<u64> = attribute::FORMS
         .iter()
         .map(|form| u64::from(form.opcode))
@@ -248,7 +254,7 @@ fn hand_built_words_pin_each_modifier_bit() {
     let with = |base: &[(u32, u128)], extra: &[(u32, u128)]| -> Vec<(u32, u128)> {
         base.iter().chain(extra).copied().collect()
     };
-    let cases: Vec<(u128, Vec<(u32, u128)>, &str)> = vec![
+    let cases: Vec<BuiltCase> = vec![
         (0x321, with(&ald, &[]), "ald r1, a[0x80];"),
         (0x321, with(&ald, &[(79, 1)]), "ald.o r1, a[0x80];"),
         (0x321, with(&ald, &[(76, 1)]), "ald.p r1, a[0x80];"),
@@ -264,7 +270,11 @@ fn hand_built_words_pin_each_modifier_bit() {
         (0x920, with(&al2p, &[(79, 1)]), "al2p.o r1, a[0x80];"),
         (0x920, with(&al2p, &[(74, 3)]), "al2p.128 r1, a[0x80];"),
         (0x326, with(&ipa, &[]), "ipa.pass r1, a[0x80];"),
-        (0x326, with(&ipa, &[(76, 1)]), "ipa.pass.centroid r1, a[0x80];"),
+        (
+            0x326,
+            with(&ipa, &[(76, 1)]),
+            "ipa.pass.centroid r1, a[0x80];",
+        ),
         (0x326, with(&ipa, &[(78, 1)]), "ipa.constant r1, a[0x80];"),
         (0x3ad, with(&ldtram, &[]), "ldtram.ab r1, a[0x80];"),
         (0x3ad, with(&ldtram, &[(72, 1)]), "ldtram.c r1, a[0x80];"),
@@ -294,7 +304,11 @@ fn hand_built_words_pin_each_modifier_bit() {
         (0x927, with(&isbewr, &[(75, 1)]), "isbewr.32 [r2], r1;"),
     ];
     for (opcode, fields, expected) in cases {
-        assert_eq!(text(word(opcode, &fields)), expected, "{opcode:#x} {fields:?}");
+        assert_eq!(
+            text(word(opcode, &fields)),
+            expected,
+            "{opcode:#x} {fields:?}"
+        );
     }
 }
 
@@ -303,7 +317,7 @@ fn hand_built_words_pin_each_modifier_bit() {
 /// register field at a value no other field has.
 #[test]
 fn hand_built_words_pin_each_register_field() {
-    let cases: [(u128, &[(u32, u128)], &str); 12] = [
+    let cases: [Case; 12] = [
         // ALD: vertex 7, offset 9, destination 4.
         (
             0x321,
@@ -360,7 +374,11 @@ fn hand_built_words_pin_each_register_field() {
         (0x927, &[(24, 7), (32, 0xff)], "isbewr [r7], rz;"),
     ];
     for (opcode, fields, expected) in cases {
-        assert_eq!(text(word(opcode, fields)), expected, "{opcode:#x} {fields:?}");
+        assert_eq!(
+            text(word(opcode, fields)),
+            expected,
+            "{opcode:#x} {fields:?}"
+        );
     }
 }
 
@@ -397,14 +415,18 @@ fn every_ipa_mode_decodes() {
                 text(word),
                 format!("ipa{freq_str}{loc_str} r1, a[0x80]{offset};")
             );
-            let Ok(Instr {
-                op: Op::Ipa(ipa), ..
-            }) = decode(word)
-            else {
-                panic!("an ipa");
-            };
-            assert_eq!((ipa.loc, ipa.freq), (loc, freq));
-            assert_eq!((ipa.loc.bits(), ipa.freq.bits()), (loc_bits, freq_bits));
+            assert_eq!(
+                decode(word).map(|instr| instr.op),
+                Ok(Op::Ipa(OpIpa {
+                    dst: r(1),
+                    addr: 0x80,
+                    freq,
+                    loc,
+                    offset: Gpr::RZ,
+                    pred: Pred::PT,
+                }))
+            );
+            assert_eq!((loc.bits(), freq.bits()), (loc_bits, freq_bits));
             checked += 1;
         }
     }
@@ -553,24 +575,36 @@ fn every_special_register_prints_its_name() {
 /// The attribute offsets at both edges of their fields, in hand-built words: the ten-bit byte
 /// address of `ALD`, `AST` and `AL2P` (0 and `0x3ff`), the eight-bit word address of `IPA` and
 /// `LDTRAM` (bytes 0 and `0x3fc`) and the sixteen-bit immediate of `ISBERD` and `ISBEWR` (0 and
-/// `0xffff`); and the encoder at and one past each edge.
+/// `0xffff`).
 #[test]
 fn attribute_offsets_at_both_edges() {
-    let cases: [(u128, &[(u32, u128)], &str); 12] = [
-        (0x321, &[(16, 1), (24, 0xff), (32, 0xff), (40, 0)], "ald r1, a[0x0];"),
+    let cases: [Case; 12] = [
+        (
+            0x321,
+            &[(16, 1), (24, 0xff), (32, 0xff), (40, 0)],
+            "ald r1, a[0x0];",
+        ),
         (
             0x321,
             &[(16, 1), (24, 0xff), (32, 0xff), (40, 0x3ff)],
             "ald r1, a[0x3ff];",
         ),
-        (0x322, &[(24, 0xff), (32, 1), (40, 0), (64, 0xff)], "ast a[0x0], r1;"),
+        (
+            0x322,
+            &[(24, 0xff), (32, 1), (40, 0), (64, 0xff)],
+            "ast a[0x0], r1;",
+        ),
         (
             0x322,
             &[(24, 0xff), (32, 1), (40, 0x3ff), (64, 0xff)],
             "ast a[0x3ff], r1;",
         ),
         (0x920, &[(16, 1), (24, 0xff), (40, 0)], "al2p r1, a[0x0];"),
-        (0x920, &[(16, 1), (24, 0xff), (40, 0x3ff)], "al2p r1, a[0x3ff];"),
+        (
+            0x920,
+            &[(16, 1), (24, 0xff), (40, 0x3ff)],
+            "al2p r1, a[0x3ff];",
+        ),
         (
             0x326,
             &[(16, 1), (32, 0xff), (64, 0), (81, 7)],
@@ -581,7 +615,11 @@ fn attribute_offsets_at_both_edges() {
             &[(16, 1), (32, 0xff), (64, 0xff), (81, 7)],
             "ipa.pass r1, a[0x3fc];",
         ),
-        (0x3ad, &[(16, 1), (24, 63), (64, 0), (91, 1)], "ldtram.ab r1, a[0x0];"),
+        (
+            0x3ad,
+            &[(16, 1), (24, 63), (64, 0), (91, 1)],
+            "ldtram.ab r1, a[0x0];",
+        ),
         (
             0x3ad,
             &[(16, 1), (24, 63), (64, 0xff), (91, 1)],
@@ -601,6 +639,11 @@ fn attribute_offsets_at_both_edges() {
     for (opcode, fields, expected) in cases {
         assert_eq!(text(word(opcode, fields)), expected, "{opcode:#x}");
     }
+}
+
+/// The encoder at and one past the edge of each attribute offset field.
+#[test]
+fn encoder_refuses_offsets_past_their_fields() {
     // The fields' last values, from the shipping constants.
     let last_addr = (1_u16 << ATTR_ADDR.width) - 1;
     let last_word = ((1_u16 << ATTR_WORD.width) - 1) * ATTR_WORD_BYTES;
@@ -687,7 +730,12 @@ fn values_the_group_refuses() {
         width,
         value,
     };
-    let ipa = |loc, freq| word(0x326, &[(16, 1), (32, 0xff), (76, loc), (78, freq), (81, 7)]);
+    let ipa = |loc, freq| {
+        word(
+            0x326,
+            &[(16, 1), (32, 0xff), (76, loc), (78, freq), (81, 7)],
+        )
+    };
     assert_eq!(decode(ipa(3, 0)), Err(unknown(0x326, 76, 2, 3)));
     assert_eq!(decode(ipa(2, 3)), Err(unknown(0x326, 78, 2, 3)));
     assert_eq!(decode(ipa(3, 3)), Err(unknown(0x326, 76, 2, 3)));
@@ -857,18 +905,18 @@ fn out_type_zero_is_out_final() {
 /// `S2UR` is `S2R` with a uniform destination: one operation, two forms, two printed names.
 #[test]
 fn s2ur_is_s2r_with_a_uniform_destination() {
-    let s2ur = decode(word(0x9c3, &[(16, 5), (72, 33)])).expect("decodes");
+    let uniform = decode(word(0x9c3, &[(16, 5), (72, 33)])).expect("decodes");
     assert_eq!(
-        s2ur.op,
+        uniform.op,
         Op::S2R(OpS2R {
             dst: S2RDst::Uniform(ur(5)),
             sr: SpecialReg::TID_X,
         })
     );
-    assert_eq!(s2ur.op.mnemonic(), "s2r");
-    let s2r = decode(word(0x919, &[(16, 5), (72, 33)])).expect("decodes");
+    assert_eq!(uniform.op.mnemonic(), "s2r");
+    let per_thread = decode(word(0x919, &[(16, 5), (72, 33)])).expect("decodes");
     assert_eq!(
-        s2r.op,
+        per_thread.op,
         Op::S2R(OpS2R {
             dst: S2RDst::Reg(r(5)),
             sr: SpecialReg::TID_X,
@@ -977,10 +1025,7 @@ fn unencodable_attribute_instructions_are_errors() {
     };
     assert!(isbewr(IsbeAccess::Map).is_ok());
     assert!(isbewr(IsbeAccess::Attribute).is_ok());
-    assert_eq!(
-        isbewr(IsbeAccess::Patch),
-        Err(EncodeError::IsbewrAccess(1))
-    );
+    assert_eq!(isbewr(IsbeAccess::Patch), Err(EncodeError::IsbewrAccess(1)));
     assert_eq!(
         isbewr(IsbeAccess::Primitive).map_err(|error| error.to_string()),
         Err("isbewr cannot write access type 2".into())

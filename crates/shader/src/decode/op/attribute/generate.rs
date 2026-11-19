@@ -25,6 +25,17 @@ fn any_attr_word() -> impl Strategy<Value = u16> {
 
 /// Every operation of the group.
 pub(super) fn all() -> Vec<BoxedStrategy<Op>> {
+    [
+        attribute_loads(),
+        interpolation(),
+        system_values(),
+        outputs(),
+    ]
+    .concat()
+}
+
+/// `ALD`, `AST` and `AL2P`.
+fn attribute_loads() -> Vec<BoxedStrategy<Op>> {
     let ald = (
         (any_gpr(), any_gpr(), any_gpr()),
         any_attr_addr(),
@@ -76,23 +87,11 @@ pub(super) fn all() -> Vec<BoxedStrategy<Op>> {
                 output,
             })
         });
-    let s2r_dst = prop_oneof![
-        any_gpr().prop_map(S2RDst::Reg),
-        any_uniform_reg().prop_map(S2RDst::Uniform),
-    ];
-    let s2r = (s2r_dst, any::<u8>()).prop_map(|(dst, sr)| {
-        Op::S2R(OpS2R {
-            dst,
-            sr: SpecialReg(sr),
-        })
-    });
-    let cs2r = (any_gpr(), any::<u8>(), any::<bool>()).prop_map(|(dst, sr, wide)| {
-        Op::CS2R(OpCS2R {
-            dst,
-            sr: SpecialReg(sr),
-            wide,
-        })
-    });
+    vec![ald.boxed(), ast.boxed(), al2p.boxed()]
+}
+
+/// `IPA` and `LDTRAM`.
+fn interpolation() -> Vec<BoxedStrategy<Op>> {
     let ipa = (
         (any_gpr(), any_gpr()),
         any_attr_word(),
@@ -120,8 +119,35 @@ pub(super) fn all() -> Vec<BoxedStrategy<Op>> {
             })
         },
     );
+    vec![ipa.boxed(), ldtram.boxed()]
+}
+
+/// `S2R` (both forms), `CS2R` and `PIXLD`.
+fn system_values() -> Vec<BoxedStrategy<Op>> {
+    let s2r_dst = prop_oneof![
+        any_gpr().prop_map(S2RDst::Reg),
+        any_uniform_reg().prop_map(S2RDst::Uniform),
+    ];
+    let s2r = (s2r_dst, any::<u8>()).prop_map(|(dst, sr)| {
+        Op::S2R(OpS2R {
+            dst,
+            sr: SpecialReg(sr),
+        })
+    });
+    let cs2r = (any_gpr(), any::<u8>(), any::<bool>()).prop_map(|(dst, sr, wide)| {
+        Op::CS2R(OpCS2R {
+            dst,
+            sr: SpecialReg(sr),
+            wide,
+        })
+    });
     let pixld = (any_gpr(), select(&PixVal::ALL[..]), any_pred())
         .prop_map(|(dst, val, pred)| Op::PixLd(OpPixLd { dst, val, pred }));
+    vec![s2r.boxed(), cs2r.boxed(), pixld.boxed()]
+}
+
+/// `OUT`, `OUT.FINAL`, `ISBERD` and `ISBEWR`.
+fn outputs() -> Vec<BoxedStrategy<Op>> {
     let out = (
         any_gpr(),
         any_gpr(),
@@ -136,13 +162,14 @@ pub(super) fn all() -> Vec<BoxedStrategy<Op>> {
                 out_type,
             })
         });
-    let out_final = (any_gpr(), any_gpr(), any_unmodified_src()).prop_map(|(dst, handle, stream)| {
-        Op::OutFinal(OpOutFinal {
-            dst,
-            handle,
-            stream,
-        })
-    });
+    let out_final =
+        (any_gpr(), any_gpr(), any_unmodified_src()).prop_map(|(dst, handle, stream)| {
+            Op::OutFinal(OpOutFinal {
+                dst,
+                handle,
+                stream,
+            })
+        });
     let isberd = (
         (any_gpr(), any_gpr()),
         any::<u16>(),
@@ -150,17 +177,19 @@ pub(super) fn all() -> Vec<BoxedStrategy<Op>> {
         select(&IsbeAccess::ALL[..]),
         any::<[bool; 2]>(),
     )
-        .prop_map(|((dst, offset), imm_offset, mem_type, access, [output, skew])| {
-            Op::Isberd(OpIsberd {
-                dst,
-                offset,
-                imm_offset,
-                mem_type,
-                access,
-                output,
-                skew,
-            })
-        });
+        .prop_map(
+            |((dst, offset), imm_offset, mem_type, access, [output, skew])| {
+                Op::Isberd(OpIsberd {
+                    dst,
+                    offset,
+                    imm_offset,
+                    mem_type,
+                    access,
+                    output,
+                    skew,
+                })
+            },
+        );
     let writable: Vec<IsbeAccess> = IsbeAccess::ALL
         .into_iter()
         .filter(|access| access.writable())
@@ -172,26 +201,20 @@ pub(super) fn all() -> Vec<BoxedStrategy<Op>> {
         select(writable),
         any::<[bool; 2]>(),
     )
-        .prop_map(|((offset, data), imm_offset, mem_type, access, [output, skew])| {
-            Op::Isbewr(OpIsbewr {
-                offset,
-                data,
-                imm_offset,
-                mem_type,
-                access,
-                output,
-                skew,
-            })
-        });
+        .prop_map(
+            |((offset, data), imm_offset, mem_type, access, [output, skew])| {
+                Op::Isbewr(OpIsbewr {
+                    offset,
+                    data,
+                    imm_offset,
+                    mem_type,
+                    access,
+                    output,
+                    skew,
+                })
+            },
+        );
     vec![
-        ald.boxed(),
-        ast.boxed(),
-        al2p.boxed(),
-        s2r.boxed(),
-        cs2r.boxed(),
-        ipa.boxed(),
-        ldtram.boxed(),
-        pixld.boxed(),
         out.boxed(),
         out_final.boxed(),
         isberd.boxed(),
