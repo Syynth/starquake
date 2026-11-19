@@ -55,7 +55,9 @@
 //!    (`SET_ALPHA_REF`'s bits as a float, as Eden's `bit_cast`), the viewport flip (Eden's
 //!    `y_negate`: the window origin is the lower left, `fixed_pipeline_state.cpp`), the render
 //!    area (the surface clip, or colour target 0's size when the clip is not set, as Eden-NX2's
-//!    `vk_graphics_pipeline.cpp`), and the draw's base vertex and instance.
+//!    `vk_graphics_pipeline.cpp`), the draw's base vertex and instance, and the first
+//!    viewport's y flip and depth reversal while the pipeline has `FLIPPED_VIEWPORT`
+//!    ([`shaders::constants_flip`]; the backend then sets that viewport positive).
 //! 8. **The draw**: a [`Command::SetRenderTargets`] when the targets' views changed since the
 //!    last one, then the [`Command::Draw`], with the first `min(Caps::limits.max_viewports, 16)`
 //!    viewports and scissors, as Eden sends `min(device.GetMaxViewports(), NumViewports)`
@@ -142,6 +144,7 @@ use starquake_render::command::{
     IndexBufferBinding, IndexFormat, RenderTargets,
 };
 use starquake_render::pipeline::{GraphicsPipelineDesc, RasterState, Stages};
+use starquake_render::emulation::ViewportFlip;
 use starquake_render::validate::viewport_limit;
 use starquake_render::{
     Backend, BufferDesc, BufferId, BufferUsage, Command, CommandList, DepthRange, EmulationState,
@@ -771,6 +774,7 @@ impl Draws {
         let used = usize::try_from(viewport_limit(self.backend.caps())).unwrap_or(usize::MAX);
         viewports.truncate(used);
         scissors.truncate(used);
+        let viewport_flip = shaders::viewport_flip(&viewports);
         let alpha_on = mirror
             .reg(&clc797::SET_ALPHA_TEST, &[])?
             .field(clc797::SET_ALPHA_TEST_ENABLE)?
@@ -808,6 +812,7 @@ impl Draws {
                 vertex_attributes: u32::try_from(vertex.layout.attributes.len())
                     .unwrap_or(u32::MAX),
                 color_targets: targets.formats.colors,
+                viewport: viewport_flip,
             },
         );
         let emulation_key = shaders::emulation_key(flags, alpha_func);
@@ -1032,7 +1037,8 @@ impl Draws {
         };
         // Step 7.
         if binds_constants {
-            let constants = driver_constants(mirror, alpha_ref, call)?;
+            let flip = shaders::constants_flip(flags, viewport_flip);
+            let constants = driver_constants(mirror, alpha_ref, call, flip)?;
             upload_constants(
                 ctx,
                 &self.roots,
@@ -1338,6 +1344,7 @@ fn driver_constants(
     mirror: &Mirror,
     alpha_reference: f32,
     call: &DrawCall,
+    flip: ViewportFlip,
 ) -> Result<DriverConstants, DrawError> {
     let three_d = mirror.three_d()?;
     let select = three_d.ct_select();
@@ -1361,5 +1368,7 @@ fn driver_constants(
         render_area_height: height as f32,
         base_vertex: call.base_vertex,
         base_instance: call.base_instance,
+        flip_y: flip.flip_y,
+        reverse_depth: flip.reverse_depth,
     })
 }

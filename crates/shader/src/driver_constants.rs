@@ -14,10 +14,13 @@
 //! | 12 | render-area height | `f32` | same |
 //! | 16 | base vertex | `u32` | Eden reads `BaseVertex` as an unsigned word (`emit_spirv_context_get_set.cpp`) |
 //! | 20 | base instance | `u32` | Eden reads `BaseInstance` as an unsigned word (same file) |
-//! | 24 | padding, zero | | |
+//! | 24 | position y scale: -1.0 when the guest viewport flips y, else 1.0 | `f32` | starquake's own (below) |
+//! | 28 | position z scale: -1.0 when the guest viewport's depth range is reversed, else 1.0 | `f32` | starquake's own (below) |
+//! | 32 | position z offset, in units of w: 1.0 when the depth range is reversed, else 0.0 | `f32` | starquake's own (below) |
+//! | 36 | padding, zero | | |
 //!
 //! Every value is a 32-bit little-endian word at a 4-byte-aligned offset, and the block is
-//! [`DRIVER_CONSTANTS_SIZE`] bytes. That the block is padded to a multiple of 16 bytes, so it
+//! [`DRIVER_CONSTANTS_SIZE`] bytes. Version 2 added the three position words. That the block is padded to a multiple of 16 bytes, so it
 //! can be bound as a uniform buffer on every host, is a **guess**, settled when slice 17 lowers
 //! reads of it and wgpu accepts the module. The order of the values is starquake's own; changing
 //! it, or any value's type, means bumping [`DRIVER_CONSTANTS_VERSION`]. Pinned by
@@ -41,16 +44,32 @@
 //!   Here it is [`DriverConstant::ViewportFlip`], at its offset in the block. Pinned by
 //!   `tests::golden_bytes`.
 //!
+//! # The flipped viewport
+//!
+//! wgpu cannot set a viewport with a negative height or a reversed depth range, so under the
+//! render backend's `FLIPPED_VIEWPORT` emulation flag (mirrored as
+//! [`crate::variant::EmulationKey::flipped_viewport`]) the backend sets the host viewport
+//! positive and the vertex shader flips instead (render-backend, "Fixed-function state the host
+//! lacks"; owner's ruling 28 of 2026-11-19; the render crate's `emulation` module docs give the
+//! arithmetic). Slice 17 lowers it: on the last stage before rasterisation, with the flag set,
+//! the written position `(x, y, z, w)` becomes
+//! `(x, y * PositionYScale, z * PositionZScale + w * PositionZOffset, w)`, after the -1..1
+//! depth-range rewrite where that flag is set too. The GPU crate fills the three words from the
+//! draw's first viewport: [`DriverConstants::flip_y`] and [`DriverConstants::reverse_depth`].
+//! The words are a scale and an offset rather than two switches so a later remap (a depth range
+//! outside 0..1, should a host take one) needs no layout change; that is a guess at what such a
+//! remap needs. No reference does this: Eden hands the flipped viewport to Vulkan as it is.
+//!
 //! Where the GPU crate takes each value from (the render area from the surface clip or colour
 //! target 0, as Eden-NX2's `vk_graphics_pipeline.cpp` does, and the base vertex and instance from
 //! the draw) is G18's to decide and cite; this module only says where each goes.
 
 /// The version of the layout below.
-pub const DRIVER_CONSTANTS_VERSION: u32 = 1;
+pub const DRIVER_CONSTANTS_VERSION: u32 = 2;
 
-/// The size of the block in bytes: six words, padded to a multiple of 16 (a guess; see the
+/// The size of the block in bytes: nine words, padded to a multiple of 16 (a guess; see the
 /// module docs).
-pub const DRIVER_CONSTANTS_SIZE: usize = 32;
+pub const DRIVER_CONSTANTS_SIZE: usize = 48;
 
 /// The size of one value.
 const WORD: usize = 4;
@@ -70,6 +89,12 @@ pub enum DriverConstant {
     BaseVertex,
     /// The base instance.
     BaseInstance,
+    /// The scale applied to the position's y: -1.0 or 1.0.
+    PositionYScale,
+    /// The scale applied to the position's z: -1.0 or 1.0.
+    PositionZScale,
+    /// The offset added to the position's z, in units of its w: 1.0 or 0.0.
+    PositionZOffset,
 }
 
 /// The type a driver constant is read as.
@@ -83,13 +108,16 @@ pub enum ConstantType {
 
 impl DriverConstant {
     /// Every value, in layout order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 9] = [
         Self::AlphaReference,
         Self::ViewportFlip,
         Self::RenderAreaWidth,
         Self::RenderAreaHeight,
         Self::BaseVertex,
         Self::BaseInstance,
+        Self::PositionYScale,
+        Self::PositionZScale,
+        Self::PositionZOffset,
     ];
 
     /// The value's byte offset in the block.
@@ -101,6 +129,9 @@ impl DriverConstant {
             Self::RenderAreaHeight => 3,
             Self::BaseVertex => 4,
             Self::BaseInstance => 5,
+            Self::PositionYScale => 6,
+            Self::PositionZScale => 7,
+            Self::PositionZOffset => 8,
         };
         index * WORD
     }
@@ -111,7 +142,10 @@ impl DriverConstant {
             Self::AlphaReference
             | Self::ViewportFlip
             | Self::RenderAreaWidth
-            | Self::RenderAreaHeight => ConstantType::F32,
+            | Self::RenderAreaHeight
+            | Self::PositionYScale
+            | Self::PositionZScale
+            | Self::PositionZOffset => ConstantType::F32,
             Self::BaseVertex | Self::BaseInstance => ConstantType::U32,
         }
     }
@@ -158,6 +192,13 @@ pub struct DriverConstants {
     pub base_vertex: u32,
     /// The base instance.
     pub base_instance: u32,
+    /// Whether the vertex shader negates the position's y (the guest viewport's height is
+    /// negative); written as a y scale of -1.0, else 1.0 (module docs, "The flipped viewport").
+    pub flip_y: bool,
+    /// Whether the vertex shader mirrors the position's z within 0..w (the guest viewport's
+    /// depth range is reversed); written as a z scale of -1.0 and offset of 1.0, else 1.0 and
+    /// 0.0.
+    pub reverse_depth: bool,
 }
 
 impl DriverConstants {
@@ -172,6 +213,11 @@ impl DriverConstants {
             DriverConstant::RenderAreaHeight => self.render_area_height.to_bits(),
             DriverConstant::BaseVertex => self.base_vertex,
             DriverConstant::BaseInstance => self.base_instance,
+            DriverConstant::PositionYScale => sign(self.flip_y).to_bits(),
+            DriverConstant::PositionZScale => sign(self.reverse_depth).to_bits(),
+            DriverConstant::PositionZOffset => {
+                if self.reverse_depth { 1.0_f32 } else { 0.0_f32 }.to_bits()
+            }
         }
     }
 
@@ -186,6 +232,11 @@ impl DriverConstants {
         }
         out
     }
+}
+
+/// -1.0 when `negate`, else 1.0.
+const fn sign(negate: bool) -> f32 {
+    if negate { -1.0 } else { 1.0 }
 }
 
 /// Every value lies inside the block.

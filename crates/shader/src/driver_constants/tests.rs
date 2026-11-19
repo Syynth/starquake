@@ -10,6 +10,8 @@ const VALUES: DriverConstants = DriverConstants {
     render_area_height: 720.0,
     base_vertex: 0x8000_0003,
     base_instance: 0x0102_0304,
+    flip_y: true,
+    reverse_depth: true,
 };
 
 #[test]
@@ -23,7 +25,11 @@ fn golden_bytes() {
             0x00, 0x00, 0x34, 0x44, // render-area height 720.0
             0x03, 0x00, 0x00, 0x80, // base vertex 0x8000_0003
             0x04, 0x03, 0x02, 0x01, // base instance 0x0102_0304
+            0x00, 0x00, 0x80, 0xbf, // position y scale -1.0
+            0x00, 0x00, 0x80, 0xbf, // position z scale -1.0
+            0x00, 0x00, 0x80, 0x3f, // position z offset 1.0
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // padding
+            0x00, 0x00, 0x00, 0x00,
         ]
     );
     let unflipped = DriverConstants {
@@ -31,6 +37,21 @@ fn golden_bytes() {
         ..VALUES
     };
     assert_eq!(unflipped.encode()[4..8], [0x00, 0x00, 0x80, 0x3f]);
+    // Each viewport switch changes only its own words.
+    let upright = DriverConstants {
+        flip_y: false,
+        ..VALUES
+    };
+    let mut expected = VALUES.encode();
+    expected[24..28].copy_from_slice(&[0x00, 0x00, 0x80, 0x3f]);
+    assert_eq!(upright.encode(), expected);
+    let forward = DriverConstants {
+        reverse_depth: false,
+        ..VALUES
+    };
+    let mut expected = VALUES.encode();
+    expected[28..36].copy_from_slice(&[0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x00]);
+    assert_eq!(forward.encode(), expected);
 }
 
 #[test]
@@ -48,12 +69,15 @@ fn offsets_are_the_tables() {
             (DriverConstant::RenderAreaHeight, 12, ConstantType::F32),
             (DriverConstant::BaseVertex, 16, ConstantType::U32),
             (DriverConstant::BaseInstance, 20, ConstantType::U32),
+            (DriverConstant::PositionYScale, 24, ConstantType::F32),
+            (DriverConstant::PositionZScale, 28, ConstantType::F32),
+            (DriverConstant::PositionZOffset, 32, ConstantType::F32),
         ]
     );
-    assert_eq!(DRIVER_CONSTANTS_SIZE, 32);
-    assert_eq!(DRIVER_CONSTANTS_VERSION, 1);
-    assert_eq!(DriverConstantsLayout::CURRENT.version(), 1);
-    assert_eq!(DriverConstantsLayout::CURRENT.size(), 32);
+    assert_eq!(DRIVER_CONSTANTS_SIZE, 48);
+    assert_eq!(DRIVER_CONSTANTS_VERSION, 2);
+    assert_eq!(DriverConstantsLayout::CURRENT.version(), 2);
+    assert_eq!(DriverConstantsLayout::CURRENT.size(), 48);
 }
 
 #[test]
@@ -71,6 +95,9 @@ fn each_word_is_its_field() {
             720.0_f32.to_bits(),
             0x8000_0003,
             0x0102_0304,
+            (-1.0_f32).to_bits(),
+            (-1.0_f32).to_bits(),
+            1.0_f32.to_bits(),
         ]
     );
     // Each word sits at its offset in the encoding.
@@ -106,4 +133,44 @@ fn defaults() {
     assert_eq!(fresh.render_area_height.to_bits(), 0);
     assert_eq!(fresh.base_vertex, 0);
     assert_eq!(fresh.base_instance, 0);
+    // No flip: the position passes through unchanged.
+    assert!(!fresh.flip_y);
+    assert!(!fresh.reverse_depth);
+    assert_eq!(fresh.word(DriverConstant::PositionYScale), 1.0_f32.to_bits());
+    assert_eq!(fresh.word(DriverConstant::PositionZScale), 1.0_f32.to_bits());
+    assert_eq!(fresh.word(DriverConstant::PositionZOffset), 0.0_f32.to_bits());
+}
+
+/// The position the lowering writes, `(x, y * ys, z * zs + w * zo, w)`, from the encoded words.
+fn shaded(constants: &DriverConstants, [x, y, z, w]: [f32; 4]) -> [f32; 4] {
+    let bytes = constants.encode();
+    let read = |constant: DriverConstant| {
+        let at = constant.offset();
+        f32::from_le_bytes(bytes[at..at + 4].try_into().expect("a word"))
+    };
+    [
+        x,
+        y * read(DriverConstant::PositionYScale),
+        z * read(DriverConstant::PositionZScale) + w * read(DriverConstant::PositionZOffset),
+        w,
+    ]
+}
+
+/// What each switch does to a position through the module docs' formula: y negated, z mirrored
+/// within 0..w, and nothing at all with both off.
+#[test]
+fn the_position_words_flip_and_mirror() {
+    let position = [0.5, 0.25, 0.75, 2.0];
+    let with = |flip_y, reverse_depth| DriverConstants {
+        flip_y,
+        reverse_depth,
+        ..DriverConstants::default()
+    };
+    assert_eq!(shaded(&with(false, false), position), position);
+    assert_eq!(shaded(&with(true, false), position), [0.5, -0.25, 0.75, 2.0]);
+    assert_eq!(shaded(&with(false, true), position), [0.5, 0.25, 1.25, 2.0]);
+    assert_eq!(shaded(&with(true, true), position), [0.5, -0.25, 1.25, 2.0]);
+    // The ends of 0..w swap.
+    assert_eq!(shaded(&with(false, true), [0.0, 0.0, 0.0, 2.0])[2], 2.0);
+    assert_eq!(shaded(&with(false, true), [0.0, 0.0, 2.0, 2.0])[2], 0.0);
 }

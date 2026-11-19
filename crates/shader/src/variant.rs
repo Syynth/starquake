@@ -91,7 +91,7 @@
 //! | 12 | workgroup size x, y, z, 32 bits each |
 //! | 4 | shared-memory size, 32 bits |
 //! | 1 | alpha test: 0 for none, else 1 plus the [`CompareFunction`] code |
-//! | 4 | depth-range rewrite, primitive-restart rewrite, attribute fetch, typed outputs: 0 or 1 each |
+//! | 5 | depth-range rewrite, primitive-restart rewrite, attribute fetch, typed outputs, flipped viewport: 0 or 1 each |
 //! | 1 | texture swizzle count, at most [`MAX_TEXTURE_SWIZZLES`] |
 //! | 4 per swizzle | the [`SwizzleSource`] codes of x, y, z, w |
 //!
@@ -111,7 +111,8 @@ use thiserror::Error;
 use crate::translate::{ATTRIBUTE_SPACE_END, COLOR_TARGETS};
 
 /// The version of the byte encoding [`VariantKey::encode`] writes.
-pub const VARIANT_KEY_VERSION: u8 = 1;
+/// Version 2 added the flipped-viewport switch (owner's ruling 28 of 2026-11-19).
+pub const VARIANT_KEY_VERSION: u8 = 2;
 
 /// How many vertex attributes the guest has (`Maxwell::NumVertexAttributes` = 32,
 /// `eden/src/video_core/engines/maxwell_3d.h` @ cf654052; `RuntimeInfo::generic_input_types`
@@ -147,7 +148,7 @@ pub const VARIANT_KEY_FIXED_SIZE: usize = 1 // version
     + 3 * 4 // workgroup size
     + 4 // shared-memory size
     + 1 // alpha test
-    + 4 // the four emulation switches
+    + 5 // the five emulation switches
     + 1; // swizzle count
 
 /// The size of the longest encoded key.
@@ -387,6 +388,10 @@ pub struct EmulationKey {
     pub attribute_fetch: bool,
     /// `TYPED_OUTPUTS`: the fragment shader's outputs are typed to match integer targets.
     pub typed_outputs: bool,
+    /// `FLIPPED_VIEWPORT`: the vertex shader flips y and remaps depth from the driver
+    /// constants ([`crate::driver_constants`]), because the host cannot set the guest's
+    /// viewport (owner's ruling 28 of 2026-11-19; slice 17 lowers it).
+    pub flipped_viewport: bool,
 }
 
 /// Reads whether one mirrored flag is set in a key.
@@ -403,6 +408,7 @@ impl EmulationKey {
         }),
         ("ATTRIBUTE_FETCH", |key| key.attribute_fetch),
         ("TYPED_OUTPUTS", |key| key.typed_outputs),
+        ("FLIPPED_VIEWPORT", |key| key.flipped_viewport),
     ];
 }
 
@@ -461,6 +467,8 @@ pub enum KeyField {
     AttributeFetch,
     /// The typed outputs switch.
     TypedOutputs,
+    /// The flipped-viewport switch.
+    FlippedViewport,
     /// The texture swizzle count.
     SwizzleCount,
     /// A component of a texture swizzle (0 is x).
@@ -487,6 +495,7 @@ impl Display for KeyField {
             Self::PrimitiveRestartRewrite => f.write_str("the primitive-restart rewrite switch"),
             Self::AttributeFetch => f.write_str("the attribute fetch switch"),
             Self::TypedOutputs => f.write_str("the typed outputs switch"),
+            Self::FlippedViewport => f.write_str("the flipped-viewport switch"),
             Self::SwizzleCount => f.write_str("the texture swizzle count"),
             Self::Swizzle { binding, component } => {
                 write!(f, "component {component} of texture swizzle {binding}")
@@ -624,6 +633,7 @@ impl VariantKey {
         out.push(u8::from(emulation.primitive_restart_rewrite));
         out.push(u8::from(emulation.attribute_fetch));
         out.push(u8::from(emulation.typed_outputs));
+        out.push(u8::from(emulation.flipped_viewport));
         // `TextureSwizzles` holds at most `MAX_TEXTURE_SWIZZLES`, which fits a byte (asserted
         // above), so this never saturates.
         out.push(u8::try_from(swizzles.len()).unwrap_or(u8::MAX));
@@ -669,6 +679,7 @@ impl VariantKey {
             reader.switch(KeyField::PrimitiveRestartRewrite)?;
         key.emulation.attribute_fetch = reader.switch(KeyField::AttributeFetch)?;
         key.emulation.typed_outputs = reader.switch(KeyField::TypedOutputs)?;
+        key.emulation.flipped_viewport = reader.switch(KeyField::FlippedViewport)?;
         let count = usize::from(reader.byte(KeyField::SwizzleCount)?);
         if count > MAX_TEXTURE_SWIZZLES {
             return Err(KeyError::TooManySwizzles { count });

@@ -19,6 +19,7 @@
 //! | [`EmulationFlags::PRIMITIVE_RESTART_REWRITE`] | primitive restart is off and the device lacks [`Features::PRIMITIVE_RESTART_OFF`] | Eden: `video_core/renderer_vulkan/vk_graphics_pipeline.cpp`, "MoltenVK/Metal always has primitive restart enabled and cannot disable it"; wgpu restarts every indexed strip (the spec's decision 1 table) |
 //! | [`EmulationFlags::ATTRIBUTE_FETCH`] | the guest uses more vertex attributes than [`Limits::max_vertex_attributes`] | Eden: `video_core/vulkan_common/vulkan_device.cpp` caps MoltenVK at 16 ("MVK driver breaks when using more than 16 vertex attributes/bindings"); the guest has 32 |
 //! | [`EmulationFlags::TYPED_OUTPUTS`] | a colour target has an integer format and the device lacks [`Features::UNTYPED_FRAGMENT_OUTPUTS`] | Eden: `vk_pipeline_cache.cpp` fills `color_output_types` from the target formats on MoltenVK only |
+//! | [`EmulationFlags::FLIPPED_VIEWPORT`] | the draw's first viewport flips y or reverses depth ([`ViewportFlip`]) and the device lacks [`Features::FLIPPED_VIEWPORT`] | Not from Eden, which hands Vulkan the flipped viewport as it is (`GetViewportState`, `video_core/renderer_vulkan/vk_rasterizer.cpp`); wgpu-core 30.0.2's `set_viewport` refuses it, so the vertex shader flips instead (render-backend's table; decided by the owner, 2026-11-19) |
 //!
 //! Rows of the spec's table that are not flags, and so not decided here: quads and line loops
 //! (the backend rewrites indices), logic operations and geometry shaders (the draw is skipped or
@@ -40,6 +41,35 @@
 //!   shader has without the flag, so only an integer target sets it.
 //!   `each_flag_follows_its_rows` (the output rows), `an_integer_target_in_any_slot_is_seen`.
 //!
+//! # The flipped viewport
+//!
+//! A guest viewport whose height is negative, or whose depth range is reversed (the near
+//! plane's depth above the far plane's), is one wgpu refuses. With
+//! [`EmulationFlags::FLIPPED_VIEWPORT`] the pipeline's vertex shader and the backend share the
+//! work so the draw covers the same pixels at the same depths:
+//!
+//! - **The backend** sets [`host_viewport`]: a negative height `h` at `y` becomes `-h` at
+//!   `y + h` (the same rows), and a reversed range is swapped.
+//! - **The vertex shader** (shader-pipeline slice 17 lowers it) negates clip-space y when
+//!   [`ViewportFlip::flip_y`] is set, and replaces clip-space z with `w - z` when
+//!   [`ViewportFlip::reverse_depth`] is set, after the -1..1 depth-range rewrite where that
+//!   applies (the rewrite yields a 0..1 z, which the reversal then mirrors). The GPU crate
+//!   carries both in the driver constants.
+//!
+//! Window y is affine in clip-space y, `y + (1 + s * y_ndc) / 2 * h` for the host's sign `s`,
+//! so `y + h` and `-h` with `y_ndc` negated give the same value; depth is
+//! `near + z / w * (far - near)`, and `far + (w - z) / w * (near - far)` is the same value,
+//! while `0 <= w - z <= w` clips exactly where `0 <= z <= w` does. Pinned by
+//! `tests::a_flipped_viewport_lands_on_the_guests_pixels_and_depths`.
+//!
+//! Only the first viewport is read: a wgpu render pass has one, and the driver constants carry
+//! one flip. A host with several viewports and without [`Features::FLIPPED_VIEWPORT`] would
+//! need a flip per viewport; no such backend exists. A negative width (a negative x scale) is not
+//! flipped: Eden hands one to Vulkan as it is, which allows only the height to be negative, and
+//! the backend still refuses it. A depth outside 0..=1 does not reach the backend from the GPU crate,
+//! which clamps both depths as Eden does without `VK_EXT_depth_range_unrestricted`
+//! (`GetViewportState`); a backend still refuses one from elsewhere.
+//!
 //! # What the primitive restart flag does not look at
 //!
 //! Whether a draw can meet the restart value at all (only an indexed draw can, and under wgpu
@@ -50,6 +80,7 @@
 //! [`Limits::max_vertex_attributes`]: crate::caps::Limits::max_vertex_attributes
 
 use crate::caps::{Caps, Features, GUEST_COLOR_TARGETS};
+use crate::command::Viewport;
 use crate::format::PixelFormat;
 use crate::pipeline::EmulationFlags;
 use crate::resource::CompareFunction;
@@ -78,6 +109,59 @@ pub struct EmulationState {
     pub vertex_attributes: u32,
     /// The colour targets' formats, by the guest's target index.
     pub color_targets: [Option<PixelFormat>; GUEST_COLOR_TARGETS],
+    /// How the draw's first viewport flips (module docs, "The flipped viewport").
+    pub viewport: ViewportFlip,
+}
+
+/// How a guest viewport departs from one every host can set (module docs, "The flipped
+/// viewport").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ViewportFlip {
+    /// The height is negative.
+    pub flip_y: bool,
+    /// The depth range is reversed: the near plane's depth is above the far plane's.
+    pub reverse_depth: bool,
+}
+
+impl ViewportFlip {
+    /// No flip: what [`Default`] gives.
+    pub const NONE: Self = Self {
+        flip_y: false,
+        reverse_depth: false,
+    };
+
+    /// How `viewport` flips. A height of `-0.0` or NaN, and depths that are equal or NaN, are
+    /// not flips.
+    pub fn of(viewport: &Viewport) -> Self {
+        Self {
+            flip_y: viewport.height < 0.0,
+            reverse_depth: viewport.min_depth > viewport.max_depth,
+        }
+    }
+
+    /// Whether anything is flipped.
+    pub const fn any(self) -> bool {
+        self.flip_y || self.reverse_depth
+    }
+}
+
+/// The viewport a backend sets for `guest` when the pipeline has
+/// [`EmulationFlags::FLIPPED_VIEWPORT`]: a negative height made positive over the same rows, and
+/// a reversed depth range swapped; every other field as it is (module docs, "The flipped
+/// viewport"). The arithmetic is `f32`'s, so a result past the host's range (a `y + height`
+/// that overflows to infinity) is left for the backend's own viewport check to refuse.
+pub fn host_viewport(guest: &Viewport) -> Viewport {
+    let flip = ViewportFlip::of(guest);
+    let mut host = *guest;
+    if flip.flip_y {
+        host.y = guest.y + guest.height;
+        host.height = -guest.height;
+    }
+    if flip.reverse_depth {
+        host.min_depth = guest.max_depth;
+        host.max_depth = guest.min_depth;
+    }
+    host
 }
 
 /// What the shaders (and, for primitive restart, the indices) must emulate for `state` on a
@@ -98,6 +182,7 @@ pub fn emulation(caps: &Caps, state: &EmulationState) -> EmulationFlags {
         .flatten()
         .any(|format| format.is_integer())
         && lacks(Features::UNTYPED_FRAGMENT_OUTPUTS);
+    let flipped_viewport = state.viewport.any() && lacks(Features::FLIPPED_VIEWPORT);
 
     [
         (alpha_test, EmulationFlags::ALPHA_TEST),
@@ -108,6 +193,7 @@ pub fn emulation(caps: &Caps, state: &EmulationState) -> EmulationFlags {
         ),
         (attribute_fetch, EmulationFlags::ATTRIBUTE_FETCH),
         (typed_outputs, EmulationFlags::TYPED_OUTPUTS),
+        (flipped_viewport, EmulationFlags::FLIPPED_VIEWPORT),
     ]
     .into_iter()
     .filter(|(needed, _)| *needed)
