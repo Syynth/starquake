@@ -404,6 +404,21 @@ fn check_point(from: R, to: R) {
 
 #[test]
 fn point_sampling_scales_down_and_up() {
+    // 4 to 6: destination 3 sits exactly on source 2, which a step rounded down would miss.
+    check_point(
+        R {
+            x: 1,
+            y: 1,
+            w: 4,
+            h: 4,
+        },
+        R {
+            x: 0,
+            y: 0,
+            w: 6,
+            h: 6,
+        },
+    );
     check_point(
         R {
             x: 2,
@@ -826,6 +841,21 @@ fn rectangle_filter_and_size_refusals_are_exact() {
     // A non-empty destination from an empty source.
     assert_eq!(
         run_with(&base, &|r| {
+            r.set(d::SET_PIXELS_FROM_MEMORY_DU_DX_INT, 0)
+                .set(d::SET_PIXELS_FROM_MEMORY_DU_DX_FRAC, 0);
+        }),
+        Err(CopyError::BlitRect {
+            side: CopySide::Source
+        })
+    );
+    // The empty source is reported before the filter.
+    let rf32_bilinear = Blit {
+        format: d::SET_SRC_FORMAT_V_RF32,
+        bilinear: true,
+        ..base
+    };
+    assert_eq!(
+        run_with(&rf32_bilinear, &|r| {
             r.set(d::SET_PIXELS_FROM_MEMORY_DU_DX_INT, 0)
                 .set(d::SET_PIXELS_FROM_MEMORY_DU_DX_FRAC, 0);
         }),

@@ -31,8 +31,16 @@ const LOW_BASE: u64 = 0x45_0000_0000;
 
 type Memory = TestGpuMemory<FlatMemory>;
 
-/// A memory with `PAGES` pages mapped at `GPU_BASE`, and again at `LOW_BASE`, filled with a
-/// pattern whose every byte differs from its neighbours.
+/// Fills the guest memory with a pattern whose every byte differs from its neighbours.
+fn fill(mem: &Memory) {
+    let pattern: Vec<u8> = (0..PAGES * PAGE_SIZE)
+        .map(|o| (o.wrapping_mul(7).wrapping_add(o / 251) & 0xff) as u8)
+        .collect();
+    mem.guest().write(CPU_BASE, &pattern).unwrap();
+}
+
+/// A memory with `PAGES` pages mapped at `GPU_BASE`, and again at `LOW_BASE`, filled with the
+/// pattern.
 fn memory() -> Memory {
     let size = usize::try_from(PAGES * PAGE_SIZE).unwrap();
     let mem = TestGpuMemory::new(FlatMemory::new(CPU_BASE, size));
@@ -46,15 +54,12 @@ fn memory() -> Memory {
         CPU_BASE,
     )
     .unwrap();
-    let pattern: Vec<u8> = (0..PAGES * PAGE_SIZE)
-        .map(|o| (o.wrapping_mul(7).wrapping_add(o / 251) & 0xff) as u8)
-        .collect();
-    mem.guest().write(CPU_BASE, &pattern).unwrap();
+    fill(&mem);
     mem
 }
 
 /// A memory whose GPU mapping is `PAGES` pages at `GPU_BASE` except page `hole`, which is
-/// unmapped.
+/// unmapped, filled with the pattern.
 fn memory_with_hole(hole: u64) -> Memory {
     let size = usize::try_from(PAGES * PAGE_SIZE).unwrap();
     let mem = TestGpuMemory::new(FlatMemory::new(CPU_BASE, size));
@@ -71,6 +76,7 @@ fn memory_with_hole(hole: u64) -> Memory {
         CPU_BASE + after,
     )
     .unwrap();
+    fill(&mem);
     mem
 }
 
