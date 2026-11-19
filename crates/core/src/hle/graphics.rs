@@ -173,7 +173,9 @@
 //! a poll run after the question began that found it still parked, which it waits for at most
 //! `starquake_gpu::wiring::IDLE_POLL_WAIT`), asked before gsv's queue, so
 //! that a completion the GPU pushes while the question is asked is either seen as work in flight
-//! or found queued (`a_graphics_server_with_a_busy_gpu_is_not_idle`).
+//! or found queued. That order is by construction: no test can force the race, so none pins it
+//! (`a_graphics_server_with_a_busy_gpu_is_not_idle` pins only that a busy GPU makes the server
+//! busy).
 //!
 //! # Replay
 //!
