@@ -27,5 +27,6 @@ starquake-shader = { workspace = true, features = ["test-support"] }
 # naga's MSL writer, for experiment E1's mesh case only: final code is not written outside tests
 # until a direct backend asks for it (spec, slice 22).
 naga = { workspace = true, features = ["msl-out"] }
+insta.workspace = true
 proptest.workspace = true
 wgpu.workspace = true

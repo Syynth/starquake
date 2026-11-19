@@ -65,6 +65,7 @@ pub mod interp;
 pub mod ir;
 pub mod lookup;
 pub mod lower;
+pub mod opt;
 pub mod program;
 pub mod sph;
 #[cfg(test)]

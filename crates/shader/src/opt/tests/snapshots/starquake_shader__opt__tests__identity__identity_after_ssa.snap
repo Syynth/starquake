@@ -1,0 +1,22 @@
+---
+source: crates/shader/src/opt/tests/identity.rs
+expression: text
+---
+block0:
+    %0 = SetRegister r0, u32 0x3
+    %1 = SetRegister r1, u32 0x0
+    jump block1
+block1:
+    %11: u32 = Phi [block0: u32 0x3], [block2: %7]
+    %12: u32 = Phi [block0: u32 0x0], [block2: %5]
+    %3: u1 = INotEqual %11, u32 0x0
+    branch %3, block2, block3
+block2:
+    %5: u32 = IAdd32 %12, %11
+    %6 = SetRegister r1, %5
+    %7: u32 = ISub32 %11, u32 0x1
+    %8 = SetRegister r0, %7
+    jump block1
+block3:
+    %10 = SetRegister r2, %12
+    return
