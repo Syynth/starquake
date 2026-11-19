@@ -199,10 +199,11 @@ mod tests;
 pub use waiters::{Waiter, WaiterTable};
 
 use std::collections::VecDeque;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
-use starquake_render::{Backend, Command, CommandList, FenceValue, RenderError};
+use starquake_render::{Backend, Command, CommandList, FenceValue, RenderError, WaitOutcome};
 use thiserror::Error;
 
 use crate::interface::{AsId, Completions, GpuCompletion, SyncpointId, Ticket, VmUpdate};
@@ -249,6 +250,9 @@ pub struct OrderedUpdate {
 /// One update of one address table.
 #[derive(Clone)]
 pub struct VmChange {
+    /// The address space whose table it is: the executor (slice G19) drops the update's range
+    /// from that space's caches once it is applied ([`Fences::take_applied`]).
+    pub space: AsId,
     /// The address table the update applies to.
     pub vm: Arc<GpuVm>,
     /// The update.
@@ -296,6 +300,10 @@ pub enum CloseReason {
     /// `SignalReference`; decided by the owner on 2026-11-18). The executor (slice G19) calls
     /// [`Fences::close`] with it.
     SetReference,
+    /// The executor must see the host GPU finish the open list before it goes on: a write-back
+    /// whose readbacks the list holds, or a conditional-render catch-up whose release the list
+    /// holds ([`Fences::settle`]).
+    CatchUp,
 }
 
 /// When fenced actions are performed.
@@ -364,6 +372,25 @@ pub enum FenceError {
     /// The ring failed.
     #[error(transparent)]
     Ring(#[from] PopError),
+    /// The render backend's wait for a catch-up failed ([`Fences::settle`]).
+    #[error("the render backend's wait for a catch-up failed: {0}")]
+    Wait(RenderError),
+    /// The host GPU did not reach the fence a catch-up waited for in time ([`Fences::settle`]).
+    #[error("the host GPU did not finish command list {fence} in time for a catch-up")]
+    CatchUpTimedOut {
+        /// The fence value waited for.
+        fence: u64,
+    },
+}
+
+/// What [`Fences::settle`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Settled {
+    /// No release of the range was pending: nothing was closed, waited for or performed.
+    Nothing,
+    /// The list holding the newest such release completed, and completion processing performed
+    /// this.
+    Performed(Report),
 }
 
 /// What [`Fences::wait`] ended with.
@@ -392,6 +419,8 @@ pub struct ClosedCounts {
     pub elapsed: u64,
     /// [`CloseReason::SetReference`].
     pub set_reference: u64,
+    /// [`CloseReason::CatchUp`].
+    pub catch_up: u64,
 }
 
 impl ClosedCounts {
@@ -403,6 +432,7 @@ impl ClosedCounts {
             CloseReason::Waiter => &mut self.waiter,
             CloseReason::Elapsed => &mut self.elapsed,
             CloseReason::SetReference => &mut self.set_reference,
+            CloseReason::CatchUp => &mut self.catch_up,
         };
         *slot = slot.saturating_add(1);
     }
@@ -459,6 +489,16 @@ pub struct Fences {
     /// `completed()` as the last completion check read it.
     seen: FenceValue,
     counters: FenceCounters,
+    /// The newest fence submitted since [`Fences::take_submitted`] last looked.
+    submitted: Option<FenceValue>,
+    /// Updates applied since [`Fences::take_applied`] last looked, in the order applied.
+    applied: Vec<(AsId, VmUpdate)>,
+}
+
+/// Whether `release` writes a byte of `range`.
+fn overlaps(release: &Release, range: &Range<u64>) -> bool {
+    let end = release.address.saturating_add(release.form.bytes());
+    release.address < range.end && range.start < end
 }
 
 /// The low 32 bits of `value`: what a 32-bit acquire reads from a release of it.
@@ -544,6 +584,30 @@ fn write_release(
     Ok(Written { bytes, len })
 }
 
+/// The words a release's waiters are latched with: what `memory` holds at `address` after the
+/// write, read back (module docs, "Completion"), or, when that read faults, the bytes written,
+/// logged at warning level.
+fn read_back(memory: &dyn GpuMemory, address: u64, written: Written) -> Written {
+    let mut bytes = [0; LARGEST_RELEASE_BYTES];
+    let Some(out) = bytes.get_mut(..written.len) else {
+        return written;
+    };
+    match memory.read(address, out) {
+        Ok(()) => Written {
+            bytes,
+            len: written.len,
+        },
+        Err(fault) => {
+            tracing::warn!(
+                address,
+                %fault,
+                "a release could not be read back; its waiters are latched with the bytes written"
+            );
+            written
+        }
+    }
+}
+
 /// The largest form a release writes: the 16-byte structure with a timestamp.
 const LARGEST_RELEASE: ReleaseForm = ReleaseForm {
     size: PayloadSize::Eight,
@@ -583,6 +647,96 @@ impl Fences {
             in_flight: VecDeque::new(),
             seen,
             counters: FenceCounters::default(),
+            submitted: None,
+            applied: Vec::new(),
+        }
+    }
+
+    /// The newest fence value a list was submitted with since the last call, if any, and forgets
+    /// it: the executor (slice G19) reports it to the caches and draw paths
+    /// ([`crate::back::buffer::BufferCache::submitted`]), since lists are closed here for
+    /// reasons of the fence path's own (a waiter, the elapsed time, an empty ring).
+    pub fn take_submitted(&mut self) -> Option<FenceValue> {
+        self.submitted.take()
+    }
+
+    /// The ordered updates applied since the last call, with their address spaces, in the order
+    /// they were applied, and forgets them: the executor drops their ranges from that space's
+    /// caches and the shader cache (gpu-protocol, "Ordered address-table updates and barriers",
+    /// step 4).
+    pub fn take_applied(&mut self) -> Vec<(AsId, VmUpdate)> {
+        std::mem::take(&mut self.applied)
+    }
+
+    /// Records every command of `commands` on the open list, in order, emptying it, and then
+    /// closes the list if it has recorded for [`CLOSE_AFTER`]: the commands of one draw,
+    /// dispatch or copy stay in one list (a draw's `SetRenderTargets` and its `Draw`, say).
+    /// Nothing is recorded, and nothing closed, when `commands` is empty.
+    ///
+    /// # Errors
+    ///
+    /// [`FenceError::Submit`] as for [`Fences::record`].
+    pub fn record_list(&mut self, commands: &mut CommandList) -> Result<(), FenceError> {
+        if commands.commands.is_empty() {
+            return Ok(());
+        }
+        let now = self.env.clock.elapsed();
+        if self.open.commands.is_empty() {
+            self.opened_at = now;
+        }
+        self.open.commands.append(&mut commands.commands);
+        if now.saturating_sub(self.opened_at) >= CLOSE_AFTER {
+            self.close(CloseReason::Elapsed)?;
+        }
+        Ok(())
+    }
+
+    /// Makes every fenced release of address space `space` that writes a byte of `range` and is
+    /// not yet performed visible, waiting at most `timeout` for the host GPU (the conditional
+    /// render catch-up of gpu-protocol, "3D: from state to a draw": "after a catch-up when that
+    /// value is still pending"). When the open list holds such a release it is closed
+    /// ([`CloseReason::CatchUp`]); then, if a list in flight holds one, the newest such list's
+    /// fence is waited for ([`Backend::wait`]), and completion runs ([`Fences::complete`]).
+    /// Returns [`Settled::Nothing`] when no such release was pending, and nothing is closed,
+    /// waited for or performed.
+    ///
+    /// # Errors
+    ///
+    /// [`FenceError::Submit`] when closing failed; [`FenceError::Wait`] when the backend's wait
+    /// failed or `timeout` passed first. Completion runs in every case once anything was waited
+    /// for, so what did complete is performed.
+    pub fn settle(
+        &mut self,
+        space: AsId,
+        range: Range<u64>,
+        timeout: Duration,
+    ) -> Result<Settled, FenceError> {
+        let writes = |action: &FencedAction| match action {
+            FencedAction::Release {
+                space: s, release, ..
+            } => *s == space && overlaps(release, &range),
+            FencedAction::Increment(_) | FencedAction::Marker { .. } => false,
+        };
+        if self.open_actions.iter().any(writes) {
+            self.close(CloseReason::CatchUp)?;
+        }
+        let Some(fence) = self
+            .in_flight
+            .iter()
+            .rev()
+            .find(|list| list.actions.iter().any(writes))
+            .map(|list| list.fence)
+        else {
+            return Ok(Settled::Nothing);
+        };
+        let waited = self.backend.wait(fence, timeout);
+        let report = self.complete();
+        match waited {
+            Ok(WaitOutcome::Reached) => Ok(Settled::Performed(report)),
+            Ok(WaitOutcome::TimedOut) => Err(FenceError::CatchUpTimedOut {
+                fence: fence.get(),
+            }),
+            Err(error) => Err(FenceError::Wait(error)),
         }
     }
 
@@ -659,6 +813,7 @@ impl Fences {
         let actions = std::mem::take(&mut self.open_actions);
         match self.backend.submit(list) {
             Ok(fence) => {
+                self.submitted = Some(self.submitted.map_or(fence, |seen| seen.max(fence)));
                 self.counters.closed.count(reason);
                 tracing::trace!(?reason, fence = fence.get(), "command list submitted");
                 self.in_flight.push_back(InFlight { fence, actions });
@@ -772,6 +927,7 @@ impl Fences {
             } => match write_release(&*memory, &release, &*self.env.clock) {
                 Ok(written) => {
                     report.released = report.released.saturating_add(1);
+                    let written = read_back(&*memory, release.address, written);
                     for (address, word) in written.words(release.address) {
                         if self.env.waiters.on_write(space, address, word) {
                             report.latched = true;
@@ -796,6 +952,7 @@ impl Fences {
                 if let Some(ordered) = ordered {
                     if let Some(change) = ordered.change {
                         change.vm.apply(&change.update);
+                        self.applied.push((change.space, change.update));
                     }
                     if let Some(ticket) = ordered.ticket {
                         self.env

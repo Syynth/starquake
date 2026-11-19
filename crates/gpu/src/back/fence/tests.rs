@@ -3,6 +3,7 @@
 //! completion queue and the front's wake-up. Every wait is bounded.
 
 mod production;
+mod seams;
 mod waiters;
 
 use std::collections::VecDeque;
@@ -466,6 +467,7 @@ fn a_new_fence_path_has_nothing_recorded_in_flight_or_counted() {
                 waiter: 0,
                 elapsed: 0,
                 set_reference: 0,
+                catch_up: 0,
             },
             lost_wakes: 0,
             failed_releases: 0,
@@ -555,6 +557,7 @@ fn nothing_is_visible_before_its_list_completes() {
         token: MarkerToken(7),
         ordered: Some(OrderedUpdate {
             change: Some(VmChange {
+                space: SPACE,
                 vm: Arc::clone(&vm),
                 update: VmUpdate::Unmap {
                     range: PageRange::new(vm_base, PAGE_SIZE).unwrap(),
@@ -754,6 +757,7 @@ fn each_close_reason_is_counted_on_its_own() {
         CloseReason::Waiter,
         CloseReason::Elapsed,
         CloseReason::SetReference,
+        CloseReason::CatchUp,
     ];
     for reason in reasons {
         let mut r = rig();
@@ -767,6 +771,7 @@ fn each_close_reason_is_counted_on_its_own() {
             CloseReason::Waiter => expected.waiter = 1,
             CloseReason::Elapsed => expected.elapsed = 1,
             CloseReason::SetReference => expected.set_reference = 1,
+            CloseReason::CatchUp => expected.catch_up = 1,
         }
         assert_eq!(r.fences.counters().closed, expected, "{reason:?}");
     }
@@ -1393,6 +1398,7 @@ fn an_ordered_update_is_applied_before_its_report() {
         token: MarkerToken(1),
         ordered: Some(OrderedUpdate {
             change: Some(VmChange {
+                space: SPACE,
                 vm: Arc::clone(&vm),
                 update: VmUpdate::DestroyMemory {
                     range: PageRange::new(GPU_BASE, PAGE_SIZE).unwrap(),
@@ -1440,6 +1446,7 @@ fn markers_report_their_token_and_only_what_they_carry() {
             MarkerToken(3),
             Some(OrderedUpdate {
                 change: Some(VmChange {
+                    space: SPACE,
                     vm: Arc::clone(&vm),
                     update: unmap,
                 }),
