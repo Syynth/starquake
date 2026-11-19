@@ -399,6 +399,17 @@ fn ipa_follows_edens_generic_range() {
             assert!(without.is_ok(), "word {word}: {without:?}");
         }
     }
+    // The position's W itself (31), just below the generics, reads once, needs no header and is
+    // not multiplied (here the attribute and W are the same word, so it is checked by its IR).
+    let ir = one(Op::Ipa(ipa(r(1), addr(POSITION_W)))).expect("translates");
+    assert_eq!(
+        ir.to_string(),
+        "block0:\n\
+         \x20   %0: f32 = GetAttribute a0x7c, u32 0x0\n\
+         \x20   %1: u32 = BitCastU32F32 %0\n\
+         \x20   %2 = SetRegister r1, %1\n\
+         \x20   return\n"
+    );
 }
 
 /// The frequency (`.PASS`, `.CONSTANT`) and the centroid location change nothing: the IR is the
