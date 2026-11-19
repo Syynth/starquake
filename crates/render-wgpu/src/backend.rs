@@ -123,8 +123,10 @@ use thiserror::Error;
 /// the enum is non-exhaustive (a later exported-image kind would reach it).
 const UNKNOWN_TARGET: &str = "the wgpu backend presents to a window or offscreen only";
 
-/// How long [`WgpuBackend::new`] waits for wgpu to find an adapter or open a device. Native
-/// wgpu answers at once; the bound only keeps a broken driver from hanging the caller.
+/// How long [`WgpuBackend::new`] waits for wgpu to find an adapter or open a device, and how
+/// long a pipeline build on the compile pool waits for each of its wgpu error scopes to report
+/// (`crate::pipeline`, which names its own error, [`crate::pipeline::SCOPE_TIMEOUT`]). Native
+/// wgpu answers both at once; the bound only keeps a broken driver from hanging the caller.
 pub const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Why the backend could not be made.
@@ -144,7 +146,10 @@ pub enum NewError {
     Thread(String),
 }
 
-/// Runs a wgpu future to its end on this thread, up to [`OPEN_TIMEOUT`].
+/// Runs a wgpu future to its end on this thread, up to [`OPEN_TIMEOUT`]. [`WgpuBackend::new`]
+/// uses it for the adapter and the device, and a pipeline build for its error scopes
+/// (`crate::pipeline`), which reports the timeout in its own words rather than as
+/// [`NewError::Timeout`].
 pub(crate) fn block_on<F: Future>(future: F) -> Result<F::Output, NewError> {
     let mut future = pin!(future);
     let mut context = Context::from_waker(Waker::noop());

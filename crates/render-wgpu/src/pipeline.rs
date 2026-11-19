@@ -87,7 +87,7 @@ pub mod layout;
 mod scan;
 pub mod state;
 
-use crate::backend::block_on;
+use crate::backend::{NewError, block_on};
 use layout::{LayoutPlan, Stage};
 use scan::ModuleFacts;
 use starquake_render::shader::ShaderInterface;
@@ -118,6 +118,10 @@ pub const NO_COMPILE_POOL: &str =
 pub const DROPPED: &str = "the compile pool dropped the pipeline's build without running it";
 /// A build panicked.
 pub const PANICKED: &str = "the pipeline's build panicked";
+/// A wgpu error scope did not report within [`crate::OPEN_TIMEOUT`]. Native wgpu reports a
+/// popped scope at once (each pop's future is ready when it is made), so no host reaches this
+/// today; the branch is driven by `tests::a_scope_that_does_not_report_fails_the_build`.
+pub const SCOPE_TIMEOUT: &str = "wgpu did not report the pipeline build's errors in time";
 
 /// The guest's warp width, which a shader using subgroups relies on (shader-pipeline, "What
 /// naga 30.0.1 can express": subgroup operations need "a subgroup size of 32").
@@ -338,13 +342,20 @@ fn scoped<T>(device: &wgpu::Device, f: impl FnOnce() -> T) -> Result<T, String> 
     // Popped innermost first, as wgpu requires; each pop takes effect at once.
     let pops = [internal.pop(), memory.pop(), validation.pop()];
     for pop in pops {
-        match block_on(pop) {
-            Ok(None) => {}
-            Ok(Some(error)) => return Err(error.to_string()),
-            Err(error) => return Err(error.to_string()),
-        }
+        scope_outcome(block_on(pop))?;
     }
     Ok(value)
+}
+
+/// What one popped error scope means for a build: nothing caught, the error it caught, or
+/// [`SCOPE_TIMEOUT`] when it did not report in time.
+fn scope_outcome(popped: Result<Option<wgpu::Error>, NewError>) -> Result<(), String> {
+    match popped {
+        Ok(None) => Ok(()),
+        Ok(Some(error)) => Err(error.to_string()),
+        // `block_on` fails only by timing out ([`NewError::Timeout`]).
+        Err(_) => Err(SCOPE_TIMEOUT.to_owned()),
+    }
 }
 
 /// Where a build stands.

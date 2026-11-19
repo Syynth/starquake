@@ -110,6 +110,20 @@ fn the_first_outcome_stands() {
 }
 
 #[test]
+fn a_scope_that_does_not_report_fails_the_build() {
+    assert_eq!(scope_outcome(Ok(None)), Ok(()));
+    assert_eq!(
+        scope_outcome(Err(NewError::Timeout)),
+        Err(SCOPE_TIMEOUT.to_owned())
+    );
+    let caught = wgpu::Error::OutOfMemory {
+        source: Box::new(std::io::Error::other("caught")),
+    };
+    let message = caught.to_string();
+    assert_eq!(scope_outcome(Ok(Some(caught))), Err(message));
+}
+
+#[test]
 fn a_failed_pipeline_skips_every_draw_and_counts_once() {
     for setting in [WhileCompiling::Wait, WhileCompiling::Skip] {
         let counters = Counters::default();
@@ -612,6 +626,33 @@ fn depth_and_stencil_state_wgpu_refuses_as_given_builds() {
             assert_eq!(settled(&gpu, id), PipelineStatus::Ready, "{what}");
         }
         assert_eq!(gpu.host_errors(), 0);
+    });
+}
+
+/// A cell settled with a real pipeline keeps it when a failure follows, and one settled failed
+/// stays failed when a pipeline follows: the first outcome stands either way.
+#[test]
+fn the_first_outcome_stands_with_a_real_pipeline() {
+    bounded(|| {
+        let Some(gpu) = gpu("first outcome", Arc::new(ThreadPool), WhileCompiling::Wait) else {
+            return;
+        };
+        let vs = vertex(&gpu);
+        let fs = textured(&gpu);
+        let id = gpu
+            .create_graphics_pipeline(graphics_desc(vs, Some(fs)))
+            .expect("accepted");
+        let host = ready(gpu.draw_pipeline(id)).0;
+
+        let ready_first = PipelineCell::new();
+        ready_first.settle(Ok(host.clone()));
+        ready_first.settle(Err("second".into()));
+        assert_eq!(ready_first.status(), PipelineStatus::Ready);
+
+        let failed_first = PipelineCell::new();
+        failed_first.settle(Err("first".into()));
+        failed_first.settle(Ok(host));
+        assert_eq!(failed_first.status(), PipelineStatus::Failed);
     });
 }
 
