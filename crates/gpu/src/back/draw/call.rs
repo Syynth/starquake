@@ -51,7 +51,8 @@
 //!   counter and never defer. `an_instanced_form_does_not_defer_a_begin_end_draw`.
 //! - **Topology override legacy values are refused.** Eden's `UpdateTopology` casts a legacy
 //!   `SET_PRIMITIVE_TOPOLOGY` value (`LEGACY_*`, 0x1001 and up) to a topology that does not
-//!   exist; here the draw reports [`super::DrawError::Topology`]. That is in `fixed`.
+//!   exist; here the draw reports [`super::DrawError::Topology`] (in `fixed`).
+//!   `the_topology_override_maps_its_own_values_and_refuses_legacy_ones`.
 
 use crate::back::state::{Mirror, StateError};
 use crate::classes::{Method, clc797};

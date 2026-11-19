@@ -37,8 +37,8 @@
 //!
 //! - a stage reads the bind group of Eden's `stage_index` (vertex, both forms, 0; tessellation
 //!   init 1; tessellation 2; geometry 3; pixel 4); `SET_PIPELINE_BINDING`'s group is not read,
-//!   as Eden reads none (decision 10, "the one a title ran on"; `tests::a_stage_reads_the_bind_
-//!   group_of_its_slot_not_the_pipeline_binding`);
+//!   as Eden reads none (decision 10, "the one a title ran on";
+//!   `tests::a_stage_reads_the_bind_group_of_its_slot_not_the_pipeline_binding`);
 //! - banks 24 to 31 come from the root tables (PR #4588's `ReadCbufValue`,
 //!   `eden-pr4588/src/video_core/shader_environment.cpp`);
 //! - a texture handle is a header index in bits 19:0 and a sampler index in 31:20, or the whole
@@ -61,7 +61,9 @@
 //! each colour output's type (Eden's `color_output_types`: integer formats signed or unsigned,
 //! the rest float), dual-source blending, and the [`EmulationKey`] copied field by field from the
 //! backend's [`EmulationFlags`], with the alpha function present exactly when `ALPHA_TEST` is
-//! set (`tests::every_emulation_flag_reaches_the_key`). The compute fields are zero for a draw.
+//! set (`tests::every_emulation_flag_reaches_the_key_field_it_mirrors`, and through a whole
+//! draw `tests::every_emulation_flag_reaches_the_key_through_a_draw`). The compute fields are
+//! zero for a draw.
 //! [`VariantKey::next_stage_reads`] stays empty: slice 9 leaves it to the side that has
 //! translated the fragment program (an owner question in `starquake_shader::variant`).
 //!
@@ -69,8 +71,10 @@
 //! which only a set's translation knows (slice 9's owner question). This slice therefore looks
 //! a set up first with the swizzles of the textures the previous answer for the same requests
 //! bound (none for a set never seen), and, if the set it gets binds textures whose swizzles
-//! differ, once more with those (`tests::swizzles_reach_the_key_in_binding_order`). A
-//! **provisional** answer to that question, raised with the owner.
+//! differ, once more with those
+//! (`tests::swizzles_reach_the_key_in_binding_order_only_without_view_swizzle`). A
+//! **provisional** answer to that question, raised with the owner. The binding order is each
+//! shader's texture uses in set order, then in resource-table order.
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -39,8 +39,20 @@
 //!   enable of the topology's class is on (Eden's `POLYGON_OFFSET_ENABLE_LUT`).
 //! - Depth and stencil: Eden's `FixedPipelineState::DynamicState` fields, with the back face
 //!   taking the front face's state when `SET_TWO_SIDED_STENCIL_TEST` is off.
-//! - Vertex input: one buffer per enabled stream and one attribute per active attribute, its
-//!   location the attribute's index (Eden's `VertexAttribute` loop in `vk_graphics_pipeline.cpp`).
+//! - Vertex input: one attribute per active attribute, its location the attribute's index, and
+//!   one buffer per stream an attribute reads (Eden's `VertexAttribute` loop in
+//!   `vk_graphics_pipeline.cpp`; the [`vertex`] docs say which attributes are active).
+//!
+//! # Divergences from Eden
+//!
+//! - **A field is read only where it matters.** Eden reads every register as a number; here an
+//!   enum getter refuses a value the header does not name, and a register never written holds
+//!   0, which several of these fields do not name. So the depth function is read only while the
+//!   depth test is on, the stencil functions and operations only while the stencil test is on,
+//!   the cull face only while culling is on, the logic operation only while it is on, and a
+//!   target's equations only while its blend is on. Dual-source blending therefore looks at
+//!   target 0 only while its blend is on, where Eden's `uses_dual_source` looks at its factors
+//!   whatever its enable (`tests::dual_source_blending_reaches_the_key`).
 //!
 //! # Not read
 //!

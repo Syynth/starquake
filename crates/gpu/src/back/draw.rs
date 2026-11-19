@@ -70,7 +70,11 @@
 //! The inline index draws, `DRAW_ZERO_INDEX` and `DRAW_AUTO` ([`Skip::Unhandled`]), indirect
 //! draws (they reach the 3D class through macros), storage buffers and images (the seam's
 //! resource table has no such kind yet), the catch-up before reading a conditional-render value
-//! that a pending release will write, and vertex streams 16 to 31's sizes beyond what G10 reads.
+//! that a pending release will write, tessellation and geometry shaders in the pipeline (the
+//! shader crate's `HostStage` has vertex and fragment only), and the storage-buffer fetch of
+//! attributes past the host's limit: with `ATTRIBUTE_FETCH` set every attribute is still in the
+//! vertex layout, which the backend refuses, so such a draw is skipped as a failed pipeline
+//! (`tests::every_emulation_flag_reaches_the_key_through_a_draw`).
 
 pub mod call;
 pub mod conditional;
