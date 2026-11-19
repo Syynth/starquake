@@ -113,8 +113,12 @@
 //!   ([`MacroChannel::is_waiting`]; the channel's sink holds the pusher at the word after the
 //!   call, [`crate::channel::ChannelSink::holds`]), and the front (slice G14) calls
 //!   [`ProcessMacros::resume`] once the back reports that it has performed everything sent
-//!   before it. The rerun reads at once, without asking the back again: the channel has sent
-//!   nothing since, and the abandoned run's writes were never sent;
+//!   before it. The rerun reads at once, without asking the back again: this channel has sent
+//!   nothing since, and the abandoned run's writes were never sent. The rerun runs from the
+//!   code store and start the abandoned run used, recorded when the call began to wait, so a
+//!   bind of the call's entry by another channel in between does not change which macro runs
+//!   (`a_waiting_call_reruns_the_start_it_was_called_with`); the code at that start is read
+//!   again at the rerun ("Divergences");
 //! - otherwise the reads happen at once, in queue order, through [`GpuMemory`].
 //!
 //! The query is made only at a barrier with reads queued.
@@ -129,6 +133,11 @@
 //! - **DMA reads happen at the barrier**, from the address queued at the write. Eden-NX2 reads
 //!   at the `MME_DMA_READ_FIFOED` write itself, so a macro that loads the words without a
 //!   barrier gets them there and underflows here (`dma_words_arrive_only_at_a_barrier`).
+//! - **A call that waits for a catch-up runs the code as it is at the rerun.** The code store
+//!   is shared by the process's channels, so another channel may upload code over the waiting
+//!   call's start before [`ProcessMacros::resume`]; the rerun then runs the new code from the
+//!   recorded start. Eden-NX2 runs the call at once, so it runs the code as it was at the call
+//!   (`a_waiting_call_reruns_the_code_as_it_is_at_the_resume`).
 //! - **A DMA read that cannot be read fails the call**; Eden-NX2's `MemoryManager::Read` gives
 //!   words without a failure result (`an_unreadable_dma_read_fails_the_call`).
 //! - **`SET_MME_MEM_ADDRESS_A` gives 17 bits** (`UPPER`, 16:0, the header's field; decision 10).
@@ -651,8 +660,25 @@ pub struct MacroChannel {
     compute_uploaded: bool,
     /// Per engine, the call collecting parameters (and its buffer, kept for its capacity).
     collecting: [Call; 2],
-    /// The call waiting for a catch-up, and its engine.
-    waiting: Option<(Engine, Call)>,
+    /// The call waiting for a catch-up.
+    waiting: Option<Waiting>,
+}
+
+/// A call waiting for a catch-up, with the code store and start its abandoned run used: the
+/// rerun runs from the same start, even if a channel binds the call's entry in between
+/// (module docs, "MME DMA reads").
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Waiting {
+    engine: Engine,
+    pin: Pin,
+    call: Call,
+}
+
+/// The code store and first instruction a call's first run used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Pin {
+    store: Engine,
+    start: u32,
 }
 
 impl MacroChannel {
@@ -925,7 +951,7 @@ impl ProcessMacros {
             }
             let call = std::mem::take(call);
             return Ok(WordOutcome::Call(
-                self.run_call(channel, file, engine, call, env, out, false),
+                self.run_call(channel, file, engine, call, env, out, None),
             ));
         }
         let start_pointer = engine.map_or(0, |engine| {
@@ -961,14 +987,14 @@ impl ProcessMacros {
         B: BackWork + ?Sized,
         S: EntrySink + ?Sized,
     {
-        let Some((engine, _)) = channel.waiting else {
+        let Some(engine) = channel.waiting.as_ref().map(|waiting| waiting.engine) else {
             return Err(HostError::NotWaiting);
         };
         check_file(file, channel.id, engine.class())?;
-        let Some((engine, call)) = channel.waiting.take() else {
+        let Some(Waiting { engine, pin, call }) = channel.waiting.take() else {
             return Err(HostError::NotWaiting);
         };
-        Ok(self.run_call(channel, file, engine, call, env, out, true))
+        Ok(self.run_call(channel, file, engine, call, env, out, Some(pin)))
     }
 
     /// Words of `store`'s code; `None` past [`CODE_WORDS`].
@@ -1092,7 +1118,9 @@ impl ProcessMacros {
         }
     }
 
-    /// Runs `call` of `engine` on `channel` and commits or discards its effects.
+    /// Runs `call` of `engine` on `channel` and commits or discards its effects. `pin` is the
+    /// store and start of a rerun after a catch-up (its DMA reads happen without asking the
+    /// back); a first run looks them up.
     #[expect(
         clippy::too_many_arguments,
         reason = "one call's full context; a struct would only rename the same fields"
@@ -1105,21 +1133,23 @@ impl ProcessMacros {
         call: Call,
         env: &MacroEnv<'_, M, B>,
         out: &mut S,
-        caught_up: bool,
+        pin: Option<Pin>,
     ) -> CallReport
     where
         M: GpuMemory + ?Sized,
         B: BackWork + ?Sized,
         S: EntrySink + ?Sized,
     {
-        let store_engine = channel.store_for(engine);
         let entry = call
             .method
             .and_then(|method| engine.entry(u32::from(method)))
             .unwrap_or(0);
+        let Pin {
+            store: store_engine,
+            start,
+        } = pin.unwrap_or_else(|| self.pin(channel, engine, entry));
         let Self { stores, run, .. } = self;
         let store = store_mut(stores, store_engine);
-        let start = store.starts.get(entry).copied().unwrap_or(0);
         store.memo.synchronize(store.generation);
         let program = usize::try_from(start)
             .ok()
@@ -1132,7 +1162,7 @@ impl ProcessMacros {
             scratch: run,
             memory: env.memory,
             back: env.back,
-            caught_up,
+            caught_up: pin.is_some(),
             status: RunStatus::Running,
             writes: 0,
             dma_words: 0,
@@ -1178,23 +1208,18 @@ impl ProcessMacros {
         run.clear();
         let result = match failure {
             None => {
-                channel.waiting = Some((engine, call));
+                channel.waiting = Some(Waiting {
+                    engine,
+                    pin: Pin {
+                        store: store_engine,
+                        start,
+                    },
+                    call,
+                });
                 CallResult::CatchUp
             }
             Some(error) => {
-                let past_code = u32::try_from(CODE_INSTRUCTIONS).unwrap_or(u32::MAX);
-                let key = (store_engine, start.min(past_code));
-                let first_for_macro = self.failures_logged.insert(key);
-                if first_for_macro {
-                    tracing::warn!(
-                        engine = engine.name(),
-                        store = store_engine.name(),
-                        start,
-                        %error,
-                        parameters = %Words(&call.parameters),
-                        "macro call failed and committed nothing; later failures of this macro are not logged"
-                    );
-                }
+                let first_for_macro = self.log_failure(engine, store_engine, start, error, &call);
                 Self::recycle(channel, engine, call);
                 CallResult::Failed {
                     error,
@@ -1209,6 +1234,38 @@ impl ProcessMacros {
             start,
             result,
         }
+    }
+
+    /// The code store and start a first run of `engine`'s call on table entry `entry` uses.
+    fn pin(&self, channel: &MacroChannel, engine: Engine, entry: usize) -> Pin {
+        let store = channel.store_for(engine);
+        let start = self.store(store).starts.get(entry).copied().unwrap_or(0);
+        Pin { store, start }
+    }
+
+    /// Records a failed call of the macro at `start` of `store`, logging it if it is the first
+    /// failure of that macro in the process (module docs, "A run"); returns whether it was.
+    fn log_failure(
+        &mut self,
+        engine: Engine,
+        store: Engine,
+        start: u32,
+        error: CallFailure,
+        call: &Call,
+    ) -> bool {
+        let past_code = u32::try_from(CODE_INSTRUCTIONS).unwrap_or(u32::MAX);
+        let first_for_macro = self.failures_logged.insert((store, start.min(past_code)));
+        if first_for_macro {
+            tracing::warn!(
+                engine = engine.name(),
+                store = store.name(),
+                start,
+                %error,
+                parameters = %Words(&call.parameters),
+                "macro call failed and committed nothing; later failures of this macro are not logged"
+            );
+        }
+        first_for_macro
     }
 
     /// Gives a finished call's parameter buffer back to its channel, for its capacity.

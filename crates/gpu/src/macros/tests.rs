@@ -1042,6 +1042,86 @@ fn uploads_are_recorded_per_channel() {
     assert_eq!(rig.process.uploads(A, Engine::ThreeD).code_words, 5);
 }
 
+#[test]
+fn a_channel_rebinding_its_own_start_is_not_a_rewrite() {
+    let mut rig = make_rig();
+    let mut a = Chan::new(A);
+    let mut b = Chan::new(B);
+    let start_pointer = THREE_D_METHODS.start_pointer;
+    let start = THREE_D_METHODS.start;
+    rig.stream(&mut a, Engine::ThreeD, start_pointer, &[4]);
+    rig.stream(&mut a, Engine::ThreeD, start, &[0x50]);
+    // A binds its own entry again with a new value: not a rewrite, nothing logged.
+    let ((), events) = captured(|| {
+        rig.stream(&mut a, Engine::ThreeD, start_pointer, &[4]);
+        rig.stream(&mut a, Engine::ThreeD, start, &[0x60]);
+    });
+    assert_eq!(events, []);
+    assert_eq!(rig.process.cross_channel_rewrites(), 0);
+    assert_eq!(rig.process.starts(Engine::ThreeD)[4], 0x60);
+    // B binding A's entry with another value is one.
+    rig.stream(&mut b, Engine::ThreeD, start_pointer, &[4]);
+    rig.stream(&mut b, Engine::ThreeD, start, &[0x70]);
+    assert_eq!(rig.process.cross_channel_rewrites(), 1);
+    assert_eq!(rig.process.starts(Engine::ThreeD)[4], 0x70);
+}
+
+#[test]
+fn forgetting_a_channel_clears_its_record_in_both_stores() {
+    let mut rig = make_rig();
+    let mut a = Chan::new(A);
+    let mut b = Chan::new(B);
+    for chan in [&mut a, &mut b] {
+        // Into the 3D store, then, after its own pointer write, into the compute store.
+        rig.stream(
+            chan,
+            Engine::ThreeD,
+            THREE_D_METHODS.instruction_pointer,
+            &[0],
+        );
+        rig.stream(chan, Engine::ThreeD, THREE_D_METHODS.instruction, &[1, 2]);
+        rig.stream(
+            chan,
+            Engine::Compute,
+            COMPUTE_METHODS.instruction_pointer,
+            &[0],
+        );
+        rig.stream(
+            chan,
+            Engine::Compute,
+            COMPUTE_METHODS.instruction,
+            &[3, 4, 5],
+        );
+        rig.stream(chan, Engine::Compute, COMPUTE_METHODS.start_pointer, &[1]);
+        rig.stream(chan, Engine::Compute, COMPUTE_METHODS.start, &[0]);
+        assert!(chan.macros.compute_uploaded());
+    }
+    let three_d = ChannelUploads {
+        code_words: 2,
+        start_entries: 0,
+    };
+    let compute = ChannelUploads {
+        code_words: 3,
+        start_entries: 1,
+    };
+    for channel in [A, B] {
+        assert_eq!(rig.process.uploads(channel, Engine::ThreeD), three_d);
+        assert_eq!(rig.process.uploads(channel, Engine::Compute), compute);
+    }
+    rig.process.forget_channel(B);
+    assert_eq!(
+        rig.process.uploads(B, Engine::ThreeD),
+        ChannelUploads::default()
+    );
+    assert_eq!(
+        rig.process.uploads(B, Engine::Compute),
+        ChannelUploads::default()
+    );
+    // A's record stays.
+    assert_eq!(rig.process.uploads(A, Engine::ThreeD), three_d);
+    assert_eq!(rig.process.uploads(A, Engine::Compute), compute);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Runs: state reads, buffered writes, failures
 // ---------------------------------------------------------------------------------------------
@@ -1543,6 +1623,95 @@ fn a_dma_read_with_pending_back_work_commits_nothing_and_reruns_after_the_catch_
     assert_eq!(
         rig.resume(&mut chan, Engine::ThreeD),
         Err(HostError::NotWaiting)
+    );
+}
+
+#[test]
+fn a_waiting_call_reruns_the_start_it_was_called_with() {
+    let mut rig = make_rig();
+    let mut a = Chan::new(A);
+    let mut b = Chan::new(B);
+    rig.upload(&mut a, Engine::ThreeD, 0x30, &dma_macro(), 4);
+    // Another macro, uploaded before A's call; B binds it to entry 5 for now.
+    rig.upload(&mut b, Engine::ThreeD, 0x80, &echo(3), 5);
+    rig.take();
+    let generation = rig.process.code_generation(Engine::ThreeD);
+    rig.write_memory(SOURCE, &[1, 2]);
+    rig.back.busy.set(true);
+    let parameters = source_parameters(SOURCE, 2);
+    let report = rig.call(&mut a, Engine::ThreeD, 4, &parameters);
+    assert_eq!(report.result, CallResult::CatchUp);
+    assert_eq!((report.entry, report.start), (4, 0x30));
+
+    // While A waits, B binds entry 4 to its own macro (no code word is uploaded).
+    rig.stream(&mut b, Engine::ThreeD, THREE_D_METHODS.start_pointer, &[4]);
+    rig.stream(&mut b, Engine::ThreeD, THREE_D_METHODS.start, &[0x80]);
+    assert_eq!(rig.process.starts(Engine::ThreeD)[4], 0x80);
+    assert_eq!(rig.process.code_generation(Engine::ThreeD), generation);
+    rig.take();
+
+    // The rerun runs the macro A called, at the start its first run used.
+    rig.write_memory(SOURCE, &[0x1111, 0x2222]);
+    let report = rig.resume(&mut a, Engine::ThreeD).unwrap();
+    assert_eq!(
+        (report.store, report.entry, report.start, report.result),
+        (
+            Engine::ThreeD,
+            4,
+            0x30,
+            CallResult::Committed(CallOutcome::NotStored(NotMemoised::Barrier)),
+        )
+    );
+    let sent = rig.take();
+    assert_eq!(
+        sent[sent.len() - 2..],
+        [
+            write_entry(A, Engine::ThreeD, out_method(0), 0x1111),
+            write_entry(A, Engine::ThreeD, out_method(1), 0x2222),
+        ]
+    );
+    // B's bind stays: A's next call on entry 4 runs B's macro.
+    rig.back.busy.set(false);
+    let report = rig.call(&mut a, Engine::ThreeD, 4, &[0xa, 0xb, 0xc]);
+    assert_eq!((report.entry, report.start), (4, 0x80));
+    assert_eq!(
+        rig.take(),
+        [
+            write_entry(A, Engine::ThreeD, out_method(0), 0xa),
+            write_entry(A, Engine::ThreeD, out_method(1), 0xb),
+            write_entry(A, Engine::ThreeD, out_method(2), 0xc),
+        ]
+    );
+}
+
+#[test]
+fn a_waiting_call_reruns_the_code_as_it_is_at_the_resume() {
+    let mut rig = make_rig();
+    let mut a = Chan::new(A);
+    let mut b = Chan::new(B);
+    rig.upload(&mut a, Engine::ThreeD, 0x30, &dma_macro(), 4);
+    rig.take();
+    rig.back.busy.set(true);
+    let parameters = source_parameters(SOURCE, 2);
+    let report = rig.call(&mut a, Engine::ThreeD, 4, &parameters);
+    assert_eq!(report.result, CallResult::CatchUp);
+
+    // While A waits, B uploads other code over A's macro, bound to another entry.
+    rig.upload(&mut b, Engine::ThreeD, 0x30, &echo(3), 5);
+    assert_eq!(rig.process.starts(Engine::ThreeD)[4], 0x30);
+    rig.take();
+
+    // The rerun runs the code now at A's start (divergence: Eden-NX2 ran the call at once).
+    let report = rig.resume(&mut a, Engine::ThreeD).unwrap();
+    assert_eq!((report.entry, report.start), (4, 0x30));
+    assert_eq!(report.result, CallResult::Committed(CallOutcome::Stored));
+    assert_eq!(
+        rig.take(),
+        [
+            write_entry(A, Engine::ThreeD, out_method(0), parameters[0]),
+            write_entry(A, Engine::ThreeD, out_method(1), parameters[1]),
+            write_entry(A, Engine::ThreeD, out_method(2), parameters[2]),
+        ]
     );
 }
 
