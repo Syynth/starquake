@@ -518,3 +518,214 @@ fn two_threads_see_every_entry_in_push_order_through_a_small_ring() {
         assert_eq!(of(&received), of(&entries));
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Waking the consumer without an entry (slice G15)
+// ---------------------------------------------------------------------------------------------
+
+/// Long enough that only a wake can end a `pop_or_wake` before [`PATIENCE`].
+const FOREVER: Duration = Duration::from_secs(1000);
+
+#[test]
+fn a_wake_before_the_call_is_returned_at_once_and_several_are_one() {
+    let (_producer, mut consumer) = ring(8).unwrap();
+    let wake = consumer.waker();
+    wake.wake();
+    wake.clone().wake();
+    assert_eq!(consumer.pop_or_wake(FOREVER, || true), Ok(Popped::Woken));
+    // Both wakes came before the consumer looked: they were one.
+    assert_eq!(
+        consumer.pop_or_wake(Duration::ZERO, || true),
+        Ok(Popped::TimedOut)
+    );
+    assert_eq!(format!("{wake:?}"), "ConsumerWake");
+}
+
+#[test]
+fn an_entry_comes_before_a_wake_and_a_wake_before_idle() {
+    let (mut producer, mut consumer) = ring(8).unwrap();
+    producer.try_push(&write(1, 2)).unwrap();
+    producer.publish();
+    consumer.waker().wake();
+    assert_eq!(
+        consumer.pop_or_wake(FOREVER, || false),
+        Ok(Popped::Entry(write(1, 2)))
+    );
+    // The wake is still owed, and comes before `idle` is asked.
+    let mut asked = 0;
+    assert_eq!(
+        consumer.pop_or_wake(FOREVER, || {
+            asked += 1;
+            true
+        }),
+        Ok(Popped::Woken)
+    );
+    assert_eq!(asked, 0);
+}
+
+#[test]
+fn a_caller_with_work_is_woken_at_once() {
+    let (_producer, mut consumer) = ring(8).unwrap();
+    assert_eq!(consumer.pop_or_wake(FOREVER, || false), Ok(Popped::Woken));
+}
+
+#[test]
+fn work_found_at_the_last_look_wakes_without_a_sleep() {
+    // `idle` says there is work only on its second call, the one made after the consumer marks
+    // itself waiting: the consumer must not sleep.
+    let (_producer, mut consumer) = ring(8).unwrap();
+    let popped = within(move || {
+        let mut calls = 0;
+        let popped = consumer.pop_or_wake(FOREVER, || {
+            calls += 1;
+            calls < 2
+        });
+        (popped, calls)
+    });
+    assert_eq!(popped, (Ok(Popped::Woken), 2));
+}
+
+#[test]
+fn a_wake_between_the_last_look_and_the_lock_is_not_lost() {
+    // The wake lands after the consumer's last call to `idle` and before it takes the lock. It
+    // sees the consumer marked waiting and rings a condvar nobody waits on yet, so only the
+    // consumer's look at the flag under the lock saves it.
+    let (_producer, mut consumer) = ring(8).unwrap();
+    let mut wake = Some(consumer.waker());
+    consumer.after_last_look = Some(Box::new(move || {
+        if let Some(wake) = wake.take() {
+            wake.wake();
+        }
+    }));
+    let popped = within(move || consumer.pop_or_wake(FOREVER, || true));
+    assert_eq!(popped, Ok(Popped::Woken));
+}
+
+#[test]
+fn a_wake_between_the_lock_and_the_wait_is_not_lost() {
+    // The wake lands while the consumer holds the lock after its last look: it has stored its
+    // flag and must ring the condvar once the consumer waits.
+    let (_producer, mut consumer) = ring(8).unwrap();
+    let shared = Arc::clone(&consumer.shared);
+    let mut wake = Some(consumer.waker());
+    consumer.before_wait = Some(Box::new(move || {
+        if let Some(wake) = wake.take() {
+            thread::spawn(move || wake.wake());
+            // Until the waker has stored its flag; it then waits for the lock this thread holds.
+            until_set(|| shared.woken.load(Ordering::SeqCst));
+        }
+    }));
+    let popped = within(move || consumer.pop_or_wake(FOREVER, || true));
+    assert_eq!(popped, Ok(Popped::Woken));
+}
+
+#[test]
+fn a_sleeping_consumer_wakes_on_a_wake_from_another_thread() {
+    let (_producer, mut consumer) = ring(8).unwrap();
+    let shared = Arc::clone(&consumer.shared);
+    let wake = consumer.waker();
+    let (popped, results) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let _ = popped.send(consumer.pop_or_wake(FOREVER, || true));
+    });
+    until_set(|| shared.consumer_waiting.load(Ordering::SeqCst));
+    wake.wake();
+    assert_eq!(results.recv_timeout(PATIENCE), Ok(Ok(Popped::Woken)));
+    within(move || reader.join().is_ok());
+}
+
+#[test]
+fn the_completion_wake_wakes_the_consumer() {
+    let (_producer, mut consumer) = ring(8).unwrap();
+    consumer.waker().completion_wake().wake();
+    assert_eq!(consumer.pop_or_wake(FOREVER, || true), Ok(Popped::Woken));
+}
+
+#[test]
+fn idle_is_asked_with_no_lock_held() {
+    // An `idle` that wakes the consumer itself: made under the ring's lock, its wake would wait
+    // for that lock forever (the consumer is marked waiting by its last call).
+    let (_producer, mut consumer) = ring(8).unwrap();
+    let wake = consumer.waker();
+    let popped = within(move || {
+        let mut calls = 0;
+        consumer.pop_or_wake(FOREVER, move || {
+            calls += 1;
+            if calls == 2 {
+                wake.wake();
+            }
+            true
+        })
+    });
+    assert_eq!(popped, Ok(Popped::Woken));
+}
+
+#[test]
+fn a_sleep_that_reaches_the_safety_net_returns_recheck() {
+    let (_producer, mut consumer) = ring(8).unwrap();
+    consumer.set_longest_sleep(Duration::from_millis(5));
+    let popped = within(move || consumer.pop_or_wake(PATIENCE * 100, || true));
+    assert_eq!(popped, Ok(Popped::Recheck));
+}
+
+#[test]
+fn the_callers_timeout_is_a_timeout_not_a_recheck() {
+    let (_producer, mut consumer) = ring(8).unwrap();
+    // The safety net is the test default (far beyond PATIENCE); the caller's deadline is short.
+    let popped = within(move || consumer.pop_or_wake(Duration::from_millis(5), || true));
+    assert_eq!(popped, Ok(Popped::TimedOut));
+}
+
+#[test]
+fn pop_timeout_leaves_a_wake_for_pop_or_wake() {
+    let (_producer, mut consumer) = ring(8).unwrap();
+    consumer.waker().wake();
+    assert_eq!(consumer.pop_timeout(Duration::from_millis(5)), Ok(None));
+    assert_eq!(consumer.pop_or_wake(FOREVER, || true), Ok(Popped::Woken));
+}
+
+#[test]
+fn a_gone_producer_comes_before_a_wake() {
+    let (producer, mut consumer) = ring(8).unwrap();
+    consumer.waker().wake();
+    drop(producer);
+    assert_eq!(
+        consumer.pop_or_wake(FOREVER, || true),
+        Err(PopError::Disconnected)
+    );
+}
+
+#[test]
+fn a_producer_that_goes_while_the_consumer_sleeps_disconnects_it() {
+    let (producer, mut consumer) = ring(8).unwrap();
+    let shared = Arc::clone(&consumer.shared);
+    let (popped, results) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let _ = popped.send(consumer.pop_or_wake(FOREVER, || true));
+    });
+    until_set(|| shared.consumer_waiting.load(Ordering::SeqCst));
+    drop(producer);
+    assert_eq!(
+        results.recv_timeout(PATIENCE),
+        Ok(Err(PopError::Disconnected))
+    );
+    within(move || reader.join().is_ok());
+}
+
+#[test]
+fn an_entry_published_while_the_consumer_sleeps_ends_the_sleep() {
+    let (mut producer, mut consumer) = ring(8).unwrap();
+    let shared = Arc::clone(&consumer.shared);
+    let (popped, results) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let _ = popped.send(consumer.pop_or_wake(FOREVER, || true));
+    });
+    until_set(|| shared.consumer_waiting.load(Ordering::SeqCst));
+    producer.try_push(&write(1, 9)).unwrap();
+    producer.publish();
+    assert_eq!(
+        results.recv_timeout(PATIENCE),
+        Ok(Ok(Popped::Entry(write(1, 9))))
+    );
+    within(move || reader.join().is_ok());
+}

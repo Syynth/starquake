@@ -37,6 +37,33 @@
 //! emitted them). The other guarantees (releases after host completion, markers, presents, the
 //! order of `GpuFront` calls) are kept by the front and back on top of it (slices G14 and G15).
 //!
+//! # Waking the consumer without an entry
+//!
+//! The back thread also sleeps here while host GPU work is in flight, and must wake when a list
+//! completes, with no entry to show for it (gpu-protocol, "Releases and completion", "How the
+//! back thread sleeps"; decided by the owner on 2026-11-18). [`Consumer::waker`] hands out a
+//! [`ConsumerWake`], which `core` turns into the render backend's
+//! [`CompletionWake`](starquake_render::wake::CompletionWake) ([`ConsumerWake::completion_wake`]).
+//! [`Consumer::pop_or_wake`] waits for an entry *or* a wake, and takes a closure, `idle`, with
+//! which the caller looks at its own state (the back thread: whether `completed()` has passed a
+//! list in flight).
+//!
+//! A wake is never lost between the consumer's last look and its sleep. A wake stores a flag
+//! and then, if the consumer is marked waiting, rings the condition variable under the ring's
+//! lock. Before it sleeps the consumer marks itself waiting, calls `idle` (with no lock held),
+//! then takes the lock and looks at the flag and the ring once more before it waits, which
+//! releases the lock atomically. The flag and the waiting mark are sequentially consistent
+//! atomics, so a wake that lands after the call to `idle` either sees the mark and rings (it
+//! blocks on the lock until the consumer waits) or is seen by the look under the lock. Pinned
+//! by `a_wake_between_the_last_look_and_the_lock_is_not_lost` and
+//! `a_wake_between_the_lock_and_the_wait_is_not_lost` in `spsc/tests.rs`.
+//!
+//! When a sleep reaches the safety-net bound with no entry and no wake, [`Consumer::pop_or_wake`]
+//! returns [`Popped::Recheck`] instead of sleeping again, so the caller can look at what a
+//! wake would have told it, and count a lost wake if it finds it moved. [`Consumer::pop`] and
+//! [`Consumer::pop_timeout`] wait for entries only: a wake makes them look again and sleep on,
+//! and its flag waits for the next [`Consumer::pop_or_wake`].
+//!
 //! # Back-pressure
 //!
 //! [`Producer::push`] waits for space when the ring is full, and only the front, which owns the
@@ -52,6 +79,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
+
+use starquake_render::wake::CompletionWake;
 
 use super::encode::{DecodeError, EncodeError, decode, encode, entry_words};
 use super::entry::RingEntry;
@@ -142,6 +171,9 @@ struct Shared {
     consumer_waiting: AtomicBool,
     /// The producer is about to sleep, or sleeping, on `space`.
     producer_waiting: AtomicBool,
+    /// A [`ConsumerWake`] rang since [`Consumer::pop_or_wake`] last returned
+    /// [`Popped::Woken`].
+    woken: AtomicBool,
     lock: Mutex<()>,
     data: Condvar,
     space: Condvar,
@@ -194,6 +226,7 @@ pub fn ring(capacity: usize) -> Result<(Producer, Consumer), CapacityError> {
         consumer_gone: AtomicBool::new(false),
         consumer_waiting: AtomicBool::new(false),
         producer_waiting: AtomicBool::new(false),
+        woken: AtomicBool::new(false),
         lock: Mutex::new(()),
         data: Condvar::new(),
         space: Condvar::new(),
@@ -210,8 +243,13 @@ pub fn ring(capacity: usize) -> Result<(Producer, Consumer), CapacityError> {
         read: 0,
         available: 0,
         scratch: Vec::new(),
+        longest_sleep: LONGEST_SLEEP,
         #[cfg(test)]
         between_looks: None,
+        #[cfg(test)]
+        after_last_look: None,
+        #[cfg(test)]
+        before_wait: None,
     };
     Ok((producer, consumer))
 }
@@ -357,6 +395,50 @@ impl Drop for Producer {
     }
 }
 
+/// A handle that wakes the ring's consumer without an entry (module docs, "Waking the consumer
+/// without an entry"). Cloneable, `Send` and `Sync`; it never blocks for longer than the
+/// consumer holds the ring's lock to look at the ring.
+#[derive(Clone)]
+pub struct ConsumerWake {
+    shared: Arc<Shared>,
+}
+
+impl ConsumerWake {
+    /// Wakes the consumer: its current or next [`Consumer::pop_or_wake`] returns
+    /// [`Popped::Woken`] unless an entry comes first. Several wakes before it looks are one.
+    pub fn wake(&self) {
+        self.shared.woken.store(true, Ordering::SeqCst);
+        self.shared.wake_consumer();
+    }
+
+    /// This wake as the render backend's completion wake, which `core` hands the backend at
+    /// construction (render-backend, "The completion wake").
+    pub fn completion_wake(&self) -> CompletionWake {
+        let wake = self.clone();
+        CompletionWake::new(move || wake.wake())
+    }
+}
+
+impl std::fmt::Debug for ConsumerWake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ConsumerWake")
+    }
+}
+
+/// What [`Consumer::pop_or_wake`] ended with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Popped {
+    /// An entry.
+    Entry(RingEntry<'static>),
+    /// No entry: a [`ConsumerWake`] rang, or the caller's `idle` said it has work.
+    Woken,
+    /// No entry and no wake for the safety-net bound (100 ms): the caller should look at what a
+    /// wake would have told it.
+    Recheck,
+    /// The timeout passed with no entry and no wake.
+    TimedOut,
+}
+
 /// The back's end of the ring.
 pub struct Consumer {
     shared: Arc<Shared>,
@@ -365,13 +447,46 @@ pub struct Consumer {
     /// The published position as last read.
     available: u64,
     scratch: Vec<u64>,
+    /// The longest one sleep lasts before it looks again ([`LONGEST_SLEEP`]; a test may
+    /// shorten it to see [`Popped::Recheck`]).
+    longest_sleep: Duration,
     /// Runs in [`Consumer::try_pop`] between its first look for an entry and its look at whether
     /// the producer is gone, so a test can drop the producer exactly there.
     #[cfg(test)]
     between_looks: Option<Box<dyn FnMut() + Send>>,
+    /// Runs in [`Consumer::pop_or_wake`] after its last call to `idle` and before it takes the
+    /// ring's lock, so a test can land a wake there.
+    #[cfg(test)]
+    after_last_look: Option<Box<dyn FnMut() + Send>>,
+    /// Runs in [`Consumer::pop_or_wake`] with the ring's lock held, after its last look and
+    /// just before it waits. A hook must not wake the consumer on its own thread here (the
+    /// wake would wait for the lock this thread holds).
+    #[cfg(test)]
+    before_wait: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl Consumer {
+    /// A handle that wakes this consumer without an entry.
+    pub fn waker(&self) -> ConsumerWake {
+        ConsumerWake {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
+    /// Makes one sleep last at most `longest`, so a test sees [`Popped::Recheck`] without
+    /// waiting the production bound.
+    #[cfg(test)]
+    pub(crate) fn set_longest_sleep(&mut self, longest: Duration) {
+        self.longest_sleep = longest;
+    }
+
+    /// Runs `hook` in every later [`Consumer::pop_or_wake`] after its last call to `idle` and
+    /// before it takes the ring's lock (module docs, "Waking the consumer without an entry").
+    #[cfg(test)]
+    pub(crate) fn set_after_last_look(&mut self, hook: Box<dyn FnMut() + Send>) {
+        self.after_last_look = Some(hook);
+    }
+
     /// Whether an entry is visible, reading the published position again if needed.
     fn has_entry(&mut self) -> bool {
         if self.available == self.read {
@@ -473,10 +588,94 @@ impl Consumer {
             if !self.has_entry() && !shared.producer_gone.load(Ordering::SeqCst) {
                 let _guard = shared
                     .data
-                    .wait_timeout(guard, wait.min(LONGEST_SLEEP))
+                    .wait_timeout(guard, wait.min(self.longest_sleep))
                     .unwrap_or_else(PoisonError::into_inner);
             }
             shared.consumer_waiting.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// The next entry, or a wake, waiting at most `timeout` for either (module docs, "Waking
+    /// the consumer without an entry").
+    ///
+    /// `idle` is the caller's look at its own state: it returns `false` when the caller has
+    /// work a wake would have told it about, and this returns [`Popped::Woken`] at once. It is
+    /// called with no lock held: when the call starts, and once more after the consumer marks
+    /// itself waiting and before it sleeps. An entry comes before a wake, and a wake before
+    /// `idle`'s answer.
+    ///
+    /// # Errors
+    ///
+    /// As [`Consumer::try_pop`]: [`PopError::Disconnected`] once the ring is empty and the
+    /// producer is gone, and [`PopError::Corrupt`] for a bad entry.
+    pub fn pop_or_wake(
+        &mut self,
+        timeout: Duration,
+        mut idle: impl FnMut() -> bool,
+    ) -> Result<Popped, PopError> {
+        let deadline = Instant::now().checked_add(timeout);
+        let mut spins = 0;
+        loop {
+            if let Some(entry) = self.try_pop()? {
+                return Ok(Popped::Entry(entry));
+            }
+            if self.shared.woken.swap(false, Ordering::SeqCst) {
+                return Ok(Popped::Woken);
+            }
+            if spins == 0 && !idle() {
+                return Ok(Popped::Woken);
+            }
+            if spins < SPINS_BEFORE_SLEEP {
+                spins += 1;
+                std::hint::spin_loop();
+                continue;
+            }
+            let now = Instant::now();
+            let wait = match deadline {
+                Some(deadline) if deadline <= now => return Ok(Popped::TimedOut),
+                Some(deadline) => deadline.saturating_duration_since(now),
+                None => Duration::MAX,
+            };
+            let shared = Arc::clone(&self.shared);
+            // Marked before the last look, so a wake that lands after it rings the condvar.
+            shared.consumer_waiting.store(true, Ordering::SeqCst);
+            if !idle() {
+                shared.consumer_waiting.store(false, Ordering::SeqCst);
+                return Ok(Popped::Woken);
+            }
+            #[cfg(test)]
+            if let Some(hook) = self.after_last_look.as_mut() {
+                hook();
+            }
+            let guard = shared.lock();
+            if self.has_entry() || shared.producer_gone.load(Ordering::SeqCst) {
+                drop(guard);
+                shared.consumer_waiting.store(false, Ordering::SeqCst);
+                continue;
+            }
+            if shared.woken.swap(false, Ordering::SeqCst) {
+                drop(guard);
+                shared.consumer_waiting.store(false, Ordering::SeqCst);
+                return Ok(Popped::Woken);
+            }
+            #[cfg(test)]
+            if let Some(hook) = self.before_wait.as_mut() {
+                hook();
+            }
+            let sleep = wait.min(self.longest_sleep);
+            let (guard, result) = shared
+                .data
+                .wait_timeout(guard, sleep)
+                .unwrap_or_else(PoisonError::into_inner);
+            drop(guard);
+            shared.consumer_waiting.store(false, Ordering::SeqCst);
+            if shared.woken.swap(false, Ordering::SeqCst) {
+                return Ok(Popped::Woken);
+            }
+            // The safety net ran out (not the caller's deadline) with nothing to show.
+            if result.timed_out() && sleep < wait && !self.has_entry() {
+                return Ok(Popped::Recheck);
+            }
         }
     }
 }
