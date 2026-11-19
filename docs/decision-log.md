@@ -554,3 +554,57 @@ Entry format:
 - **SCOPE:** moderate (spec amendment)
 - **WHAT:** The render capture v2 design is approved, with its five choices as recommended. (15) A capture stores each shader's inputs as slice 20's record and retranslates on replay; SPIR-V or MSL a backend received is stored as it is, and a module with no origin is recorded as missing. This reads the 2026-11-16 entry's "serialisable shader description" as the inputs, not a serialised naga module. (16) Replay maps the capture's ids and fence values to the fresh backend's, and refuses a list naming an id it does not hold. (17) `starquake run --capture render` writes `render.sqrc` into the artifacts folder for the whole run, with `--capture-limit` (default 4 GiB, a guess). (18) Version 1 files are refused with the exact version error. (19) A capture from another translator version is refused by default; `--retranslate` replays with the new translator and reports every shader whose entry or interface changed. R11's second part splits into R11b (the render crate) and R11c (the wiring, after R12, shader slice 20 and G18); R5 and R6 need no new code, only the constraints the design lists.
 - **WHY:** Storing inputs keeps the one shader capture format, survives naga upgrades, feeds nothing from a file to naga or wgpu unchecked, and replays on a later direct backend; a serialised naga module cannot trust its `ModuleInfo` and can overflow the stack on a crafted file, WGSL text is lossy, and wgpu never hands back final code. Mapping ids avoids a shared allocator that does not exist. Refusing old or mismatched captures by default keeps a replay from silently comparing different things.
+
+## Owner rulings on the wave 39 to 43 questions: the lead's recommendations, taken as a batch
+- **WHEN:** 2026-11-19
+- **PROJECT:** starquake
+- **SYSTEM:** graphics (gpu-protocol, render-backend, shader-pipeline, observability)
+- **SCOPE:** moderate to architectural (spec amendment)
+- **WHAT:** The owner took the lead's recommendation on each of the 46 "awaiting the owner" rows of `docs/proposals.md` under "From wave 39" to "From wave 43". Rows with no recommendation of their own are accepted as built, provisional where the code marks a guess. The rulings, in row order:
+  1. G14's guesses and departures (#325) are accepted and listed in gpu-protocol as choices.
+  2. `Syncpoint` ring entries carry a count (#325).
+  3. GPU-modified images stay until the budget refuses new ones; revisited with write-back eviction in M4 (#328).
+  4. `ShaderStamp` is a digest of the shader cache's entry key, defined with shader slice 21; 128 bits stays a guess (#334).
+  5. Viewport, scissor, blend constant and stencil reference are always dynamic (#334).
+  6. `MAX_PIPELINES` = 65,536 as a guess; a key is recorded when the backend accepts the pipeline (#334).
+  7. The `TextureKind` question gains a usage field (#348).
+  8. A stage is specialised on what the previous stage stores (Eden's `MakeRuntimeInfo`), not on what the next reads (#348).
+  9. New slice G24 (`CLEAR_SURFACE`) after G18 (#329).
+  10. Slice 19's rejection names the failing program; "once per program" stays (#329).
+  11. Slice 19 adapts to G18's `ShaderLookup`/`SetLookup` seam; the spec names the ticket wait (#329).
+  12. Swizzles are bound by two lookups, the second only when they differ (#329).
+  13. `GpuMemory::generation` comes from the VM's `Translate::generation` (#333).
+  14. `MME_DMA_READ` (0x157) is performed at the write and the memo stores no call that writes it; the compute class's MME DMA methods are register writes only, until a trace says otherwise (#393).
+  15. Eden's local-memory formula stays until verification E3 (#349).
+  16. Sampler LOD bias moves into the shader (slice 17, for R7); guest 1D arrays become 2D textures of height 1; the stencil aspect of `D32_FLOAT_S8_UINT` comes with the D24S8 conversion; the anisotropy and negative-LOD-clamp rules stand (#382).
+  17. render-backend errata from R5: wgpu pin 30.0.2; wgpu refuses depth clears outside 0..=1 and clears of compressed formats (#382).
+  18. The wgpu backend treats the Apple GPU family as meeting "subgroup size 32" (#383).
+  19. No driver pipeline cache under wgpu for now; revisited with a direct Vulkan backend (#383).
+  20. `ShaderInterface` carries the shader's requirements and binding-array counts (#383).
+  21. Deferred instances are drawn at G19's boundaries, with no macro-end ring entry, as built (#330).
+  22. Presents read through the space `set_present_space` names, as built; the format mapping and the ignored pitch stay guesses (#330).
+  23. New slice G25 (`LOAD_CONSTANT_BUFFER` data written to guest memory) after G19 (#330).
+  24. R8's choices as built: `WindowSize` in `WindowHandles`; the rotation corners, `FRAME_LATENCY` = 2 and the letterbox aspect stay guesses (#385).
+  25. render-backend errata from R8 and R11b: verification 11 settled with no `unsafe`; the surface is made in `set_present_target` on the main thread on macOS; "Render capture v2" is approved, not a draft (#385, #388).
+  26. R11b's bounds and departures as built, guesses still marked (#388).
+  27. The program content hash is seeded with the header length, 0 or 128 (#350).
+  28. Guest y-flips and depth remaps: an `EmulationFlags` field and a driver constant handle them in the vertex shader (slice 17); the backend keeps the host viewport positive (#384).
+  29. The release timestamp is guest time from the kernel's clock, through the `Gpu`'s config (#332).
+  30. `is_idle` waits up to `IDLE_POLL_WAIT` for a poll, as built (#332).
+  31. No `destroy_address_space`, and presents read through the first space made, as built and provisional (#332).
+  32. A restored run uses the null front until a front snapshot exists, as built (#332).
+  33. The decoder framework gains known bits (with their own divergence accounting) and a per-form canonical word, in a small slice before 6c and 6d (#351, #352).
+  34. NAK's integer encodings stay until the `nvdisasm` check, E2 (#351).
+  35. `OUT.FINAL` and `ISBEWR` as built (#357).
+  36. render-backend errata from R7: typed outputs are required by wgpu; every non-draw command is outside a pass under wgpu; R7 sets the strip index format (#384).
+  37. When the GPU answers busy, the parked core asks again when the GPU next reports quiet, up to a named retry count (PR #422 review).
+  38. The macOS gate stays on pushes to `main`; the lead checks `main`'s last macOS run after every wave (PR #422, #423).
+  39. PR #423's timer thread sleeps in pieces sized by measured lateness (no `unsafe`); the held-page test times the timer thread's recorded note; the vsync bound is not tightened now (#423).
+  40. render-backend names the recording backend's no-call-log mode that runs use (#386).
+  41. Frames as built: a fenced present counts as a frame by host timing, stated as such; the dump flag's path is `ExecConfig::dumps` in `GpuConfig::exec`; observability states which frames a run keeps (#386).
+  42. G20's choices as built (#331).
+  43. The surface forms with a constant-buffer handle (`SULD` 0xb97, `SUST` 0xb9b, `SUATOM` 0x593) are decoded from PR #4588, marked for the `nvdisasm` check (#356).
+  44. The memory decoder's choices as built (#355).
+  45. Flow analysis bounds and choices as built; the bounds stay guesses (#362).
+  46. The interpreter's choices as built; guesses stay marked and `interp` stays public (#360).
+- **WHY:** The owner's batch ruling ("Take all", 2026-11-19) on the lead's recommendations, for the reasons each row gives. In brief: a count bounds a guest-chosen increment run (2); write-back eviction belongs with M4 (3); wgpu, Vulkan and Metal all set the four states per draw (5); builds finish asynchronously, so acceptance is the only point a key can be recorded (6); without a usage field, a shader that only samples is retranslated on a format change (7); the GPU crate cannot build the next stage's reads from engine state (8); a first present needs clears and constant-buffer data in memory, and no slice owned them (9, 23); naming the program keeps the spec's per-program log (10); G18's seam already carries what the draw path needs (11); generation needs one source (13); performing 0x157 at the write matches Eden-NX2 (14); a trace or verification settles the guessed encodings and formulas (15, 34, 43); wgpu has no sampler LOD bias, no 1D arrays and no aspect on copies (16); Apple GPUs run 32-wide SIMD groups while wgpu reports 4..64 (18); wgpu's cache API is `unsafe` and Vulkan-only, so the Mac gains nothing (19); the backend should not dig layouts out of the naga module (20); seeding by header length keeps compute and graphics entries apart (27); wgpu refuses negative viewports and reversed or out-of-range depth ranges, and guest y-flips are likely common (28); host nanoseconds break replay (29); a busy answer must not hide a stall until the timeout (37); macOS minutes cost ten times Linux's, so a check after every wave replaces running it on PRs (38); one precise wait would need `unsafe` outside `cpu` (39); a run's recording backend must not grow with each present (40); building on a decoder framework that can represent both references keeps divergences counted (33). Behaviour already built and reviewed is written into the specs rather than left as an unlisted departure, and its guesses stay marked so a trace can confirm them (1, 4, 12, 17, 21, 22, 24 to 26, 30 to 32, 35, 36, 41, 42, 44 to 46).
