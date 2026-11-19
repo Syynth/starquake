@@ -5,8 +5,9 @@
 //!
 //! - [`GpuMemory`] is the GPU's access trait. Its production implementation is [`VmMemory`]
 //!   (slice G22): it translates through an address space's [`crate::vm::GpuVm`] and resolves
-//!   each `Target` (guest memory, the GPU-only store, the syncpoint shim). The capture-replay
-//!   implementation (slice G20) comes later; with the `test-support` feature this module exports
+//!   each `Target` (guest memory, the GPU-only store, the syncpoint shim). The capture's
+//!   recording and replay implementations are [`crate::capture::RecordingMemory`] and
+//!   [`crate::capture::ReplayMemory`] (slice G20); with the `test-support` feature this module exports
 //!   [`TestGpuMemory`], which maps page ranges of a GPU address space onto a
 //!   [`starquake_memory::GuestMemory`].
 //! - [`GpuOnlyStore`] holds the host pages behind `GpuOnly` targets: allocated on the first

@@ -24,6 +24,8 @@ postcard.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# The content hash of a GPU capture's blobs and ring entries (slice G20, `capture`).
+twox-hash.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

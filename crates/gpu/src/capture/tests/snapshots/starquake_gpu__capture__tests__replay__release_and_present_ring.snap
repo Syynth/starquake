@@ -1,0 +1,6 @@
+---
+source: crates/gpu/src/capture/tests/replay.rs
+expression: write_text(&output.ring)
+---
+release channel=0 address=0x1234030010 payload=0x1 size=4 timestamp=no op=write
+present address=0x1234020000 width=8 height=8 pitch=1 block-height=0 format=1 shown=0,0,8,8 layer=1 display=2
