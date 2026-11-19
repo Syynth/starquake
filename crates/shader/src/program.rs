@@ -7,6 +7,7 @@
 use thiserror::Error;
 
 use crate::decode::{DecodeError, Instr, Instruction, LengthError, decode};
+use crate::exchange::ExchangeError;
 use crate::host::HostShader;
 use crate::ir::Function;
 use crate::lower::{LowerError, lower};
@@ -32,6 +33,10 @@ pub enum Rejection {
     /// The IR does not lower.
     #[error(transparent)]
     Lower(#[from] LowerError),
+    /// The program's questions about engine state were not settled (spec, "Translation
+    /// inputs: questions and answers").
+    #[error(transparent)]
+    Questions(#[from] ExchangeError),
 }
 
 /// Splits `code` into instructions and decodes each one.
