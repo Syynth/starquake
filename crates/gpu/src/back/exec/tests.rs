@@ -2067,6 +2067,7 @@ fn starts_draw_is_exactly_the_draw_path_tables() {
         let listed = DRAW_METHODS
             .iter()
             .chain(UNHANDLED_METHODS.iter())
+            .chain(CLEAR_METHODS.iter())
             .any(|m| m.method() == method);
         assert_eq!(starts_draw(method), listed, "{method:#x}");
     }
@@ -2077,6 +2078,7 @@ fn starts_draw_is_exactly_the_draw_path_tables() {
         &clc797::DRAW_VERTEX_ARRAY_BEGIN_END_B,
         &clc797::DRAW_INLINE_INDEX,
         &clc797::DRAW_AUTO,
+        &clc797::CLEAR_SURFACE,
     ] {
         assert!(starts_draw(method.method()), "{}", method.name);
     }
@@ -2390,3 +2392,6 @@ fn a_present_with_no_space_and_a_bad_format_is_no_present_space() {
     let entry = parse_text(&bad).unwrap();
     assert_eq!(rig.exec.apply(&entry[0]), Err(ExecError::NoPresentSpace));
 }
+
+// Clears through the executor (slice G24).
+mod clear;

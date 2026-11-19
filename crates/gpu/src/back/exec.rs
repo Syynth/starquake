@@ -215,9 +215,10 @@ use crate::back::copy::{
     dma_method,
 };
 use crate::back::draw::call::{DRAW_METHODS, UNHANDLED_METHODS};
+use crate::back::draw::clear::CLEAR_METHODS;
 use crate::back::draw::conditional;
 use crate::back::draw::shaders::{HostShaders, ShaderLookup};
-use crate::back::draw::{DrawContext, DrawError, Draws, Outcome, WaitWhileCompiling};
+use crate::back::draw::{DrawContext, DrawError, Draws, WaitWhileCompiling};
 use crate::back::fence::{CloseReason, FenceError, FencedAction, Fences, Settled};
 use crate::back::pipeline::PipelineCache;
 use crate::back::qmd::{LAST_INLINE_QMD_METHOD, QMD_BYTES, QmdError, QmdTable, inline_qmd_address};
@@ -1352,7 +1353,7 @@ impl Executor {
             }
             DrawStep::Flush => draws.flush(&mut ctx, &mut engine.mirror),
         };
-        if matches!(outcome, Ok(Some(Outcome::Drawn))) {
+        if matches!(&outcome, Ok(Some(o)) if o.drew()) {
             *last_drawer = Some((channel, class));
         }
         // Cache uploads made before a failure stay in the list (`back::draw`, "Errors and what
@@ -1507,8 +1508,8 @@ enum DrawStep {
     Flush,
 }
 
-/// The 3D methods a word to which may start a draw (module docs).
-const DRAW_STARTER_TABLES: [&[&Method]; 2] = [&DRAW_METHODS, &UNHANDLED_METHODS];
+/// The 3D methods a word to which may start a draw or a clear (module docs).
+const DRAW_STARTER_TABLES: [&[&Method]; 3] = [&DRAW_METHODS, &UNHANDLED_METHODS, &CLEAR_METHODS];
 
 /// The bits in one word of [`DRAW_STARTERS`].
 const STARTER_WORD_BITS: usize = u64::BITS as usize;

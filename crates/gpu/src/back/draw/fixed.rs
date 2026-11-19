@@ -629,7 +629,6 @@ fn viewports(mirror: &Mirror, three_d: ThreeD<'_>) -> Result<Vec<Viewport>, Draw
 /// Every scissor (module docs, "Sources"): a disabled one is the whole target, the largest
 /// `i32` in each extent as Eden has it.
 fn scissors(mirror: &Mirror, three_d: ThreeD<'_>) -> Result<Vec<Rect>, DrawError> {
-    const WHOLE: u32 = i32::MAX.unsigned_abs();
     let lower_left = lower_left(three_d)?;
     if !scale_offset(mirror)? {
         // Eden's `UpdateScissorsState` without `viewport_scale_offset_enabled`: the surface clip,
@@ -655,33 +654,53 @@ fn scissors(mirror: &Mirror, three_d: ThreeD<'_>) -> Result<Vec<Rect>, DrawError
     }
     let clip = i64::from(clip_height(three_d)?);
     (0..SCISSORS)
-        .map(|index| {
-            let s = three_d.scissor(index)?;
-            if !on(s.enable()?) {
-                return Ok(Rect {
-                    x: 0,
-                    y: 0,
-                    width: WHOLE,
-                    height: WHOLE,
-                });
-            }
-            let (min_x, max_x) = (i64::from(s.xmin()?), i64::from(s.xmax()?));
-            let (min_y, max_y) = (i64::from(s.ymin()?), i64::from(s.ymax()?));
-            let (min_y, max_y) = if lower_left {
-                (clip - max_y, clip - min_y)
-            } else {
-                (min_y, max_y)
-            };
-            let (min_y, max_y) = (min_y.max(0), max_y.max(0));
-            let extent = |span: i64| u32::try_from(span.max(0)).unwrap_or(0);
-            Ok(Rect {
-                x: extent(min_x),
-                y: extent(min_y),
-                width: extent(max_x - min_x),
-                height: extent(max_y - min_y),
-            })
-        })
+        .map(|index| scissor_at(three_d, index, clip, lower_left))
         .collect()
+}
+
+/// Scissor `index` as Eden's `GetScissorState` computes it at resolution scale 1, whatever
+/// `SET_VIEWPORT_SCALE_OFFSET` says: the clear path reads scissor 0 this way
+/// (`eden-nx2/src/video_core/renderer_vulkan/vk_rasterizer.cpp` @ 50fa86bb, `Clear`), and
+/// [`scissors`] each scissor while the scale and offset are on.
+pub(crate) fn guest_scissor(three_d: ThreeD<'_>, index: u32) -> Result<Rect, DrawError> {
+    let clip = i64::from(clip_height(three_d)?);
+    scissor_at(three_d, index, clip, lower_left(three_d)?)
+}
+
+/// Scissor `index` (module docs, "Sources"): a disabled one is the whole target, the largest
+/// `i32` in each extent as Eden has it; a lower-left origin flips y by `clip`, the surface clip
+/// height; a span whose end is below its start is empty.
+fn scissor_at(
+    three_d: ThreeD<'_>,
+    index: u32,
+    clip: i64,
+    lower_left: bool,
+) -> Result<Rect, DrawError> {
+    const WHOLE: u32 = i32::MAX.unsigned_abs();
+    let s = three_d.scissor(index)?;
+    if !on(s.enable()?) {
+        return Ok(Rect {
+            x: 0,
+            y: 0,
+            width: WHOLE,
+            height: WHOLE,
+        });
+    }
+    let (min_x, max_x) = (i64::from(s.xmin()?), i64::from(s.xmax()?));
+    let (min_y, max_y) = (i64::from(s.ymin()?), i64::from(s.ymax()?));
+    let (min_y, max_y) = if lower_left {
+        (clip - max_y, clip - min_y)
+    } else {
+        (min_y, max_y)
+    };
+    let (min_y, max_y) = (min_y.max(0), max_y.max(0));
+    let extent = |span: i64| u32::try_from(span.max(0)).unwrap_or(0);
+    Ok(Rect {
+        x: extent(min_x),
+        y: extent(min_y),
+        width: extent(max_x - min_x),
+        height: extent(max_y - min_y),
+    })
 }
 
 /// One target's equations from the shared or per-target fields.

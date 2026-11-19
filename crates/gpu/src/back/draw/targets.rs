@@ -202,7 +202,7 @@ pub fn targets(mirror: &Mirror) -> Result<Targets, DrawError> {
 }
 
 /// Colour target `index`'s image, or `None` when its format is `DISABLED`.
-fn color_target(
+pub(crate) fn color_target(
     three_d: ThreeD<'_>,
     index: u32,
     samples: SampleLayout,
@@ -249,7 +249,7 @@ fn color_target(
 }
 
 /// The depth target's image.
-fn depth_target(three_d: ThreeD<'_>, samples: SampleLayout) -> Result<ImageInfo, DrawError> {
+pub(crate) fn depth_target(three_d: ThreeD<'_>, samples: SampleLayout) -> Result<ImageInfo, DrawError> {
     let zt = three_d.zt();
     let format = depth_format(zt.format()?.value)?;
     let width = zt.width()?;
