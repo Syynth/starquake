@@ -28,14 +28,22 @@ impl AdapterReport {
             ("adapter", info.name.clone()),
             ("backend", format!("{:?}", info.backend)),
             ("device type", format!("{:?}", info.device_type)),
-            ("driver", format!("{} {}", info.driver, info.driver_info).trim().to_owned()),
+            (
+                "driver",
+                format!("{} {}", info.driver, info.driver_info)
+                    .trim()
+                    .to_owned(),
+            ),
             ("ASTC (LDR)", has(F::TEXTURE_COMPRESSION_ASTC)),
             ("ASTC (HDR)", has(F::TEXTURE_COMPRESSION_ASTC_HDR)),
             ("ASTC (3D)", has(F::TEXTURE_COMPRESSION_ASTC_SLICED_3D)),
             ("BC", has(F::TEXTURE_COMPRESSION_BC)),
             ("ETC2 and EAC", has(F::TEXTURE_COMPRESSION_ETC2)),
             ("D32 float + S8", has(F::DEPTH32FLOAT_STENCIL8)),
-            ("16-bit normalised formats", has(F::TEXTURE_FORMAT_16BIT_NORM)),
+            (
+                "16-bit normalised formats",
+                has(F::TEXTURE_FORMAT_16BIT_NORM),
+            ),
             ("clip distances", has(F::CLIP_DISTANCES)),
             ("dual-source blending", has(F::DUAL_SOURCE_BLENDING)),
             ("subgroups", has(F::SUBGROUP)),
@@ -47,19 +55,40 @@ impl AdapterReport {
                 "non-uniform indexing of binding arrays",
                 has(F::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING),
             ),
-            ("mesh shaders (experimental)", has(F::EXPERIMENTAL_MESH_SHADER)),
+            (
+                "mesh shaders (experimental)",
+                has(F::EXPERIMENTAL_MESH_SHADER),
+            ),
             ("depth clip control", has(F::DEPTH_CLIP_CONTROL)),
             ("clamp-to-border", has(F::ADDRESS_MODE_CLAMP_TO_BORDER)),
             ("polygon mode line", has(F::POLYGON_MODE_LINE)),
             ("polygon mode point", has(F::POLYGON_MODE_POINT)),
             ("pipeline cache", has(F::PIPELINE_CACHE)),
-            ("max vertex attributes", limits.max_vertex_attributes.to_string()),
+            (
+                "max vertex attributes",
+                limits.max_vertex_attributes.to_string(),
+            ),
             ("max vertex buffers", limits.max_vertex_buffers.to_string()),
-            ("max colour attachments", limits.max_color_attachments.to_string()),
-            ("max texture size 1D", limits.max_texture_dimension_1d.to_string()),
-            ("max texture size 2D", limits.max_texture_dimension_2d.to_string()),
-            ("max texture size 3D", limits.max_texture_dimension_3d.to_string()),
-            ("max texture layers", limits.max_texture_array_layers.to_string()),
+            (
+                "max colour attachments",
+                limits.max_color_attachments.to_string(),
+            ),
+            (
+                "max texture size 1D",
+                limits.max_texture_dimension_1d.to_string(),
+            ),
+            (
+                "max texture size 2D",
+                limits.max_texture_dimension_2d.to_string(),
+            ),
+            (
+                "max texture size 3D",
+                limits.max_texture_dimension_3d.to_string(),
+            ),
+            (
+                "max texture layers",
+                limits.max_texture_array_layers.to_string(),
+            ),
             ("max buffer size", limits.max_buffer_size.to_string()),
             ("max bind groups", limits.max_bind_groups.to_string()),
             (
@@ -78,7 +107,10 @@ impl AdapterReport {
                 "max storage textures per stage",
                 limits.max_storage_textures_per_shader_stage.to_string(),
             ),
-            ("max samplers per stage", limits.max_samplers_per_shader_stage.to_string()),
+            (
+                "max samplers per stage",
+                limits.max_samplers_per_shader_stage.to_string(),
+            ),
         ];
         Self { lines }
     }

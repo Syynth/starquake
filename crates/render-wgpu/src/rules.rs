@@ -78,7 +78,8 @@ pub const MULTISAMPLED_LAYERS: &str = "a multisampled texture has one layer unde
 /// A multisampled texture without the render-target usage.
 pub const MULTISAMPLED_TARGET: &str = "a multisampled texture must be a render target under wgpu";
 /// A multisampled storage texture.
-pub const MULTISAMPLED_STORAGE: &str = "a multisampled texture cannot be a storage image under wgpu";
+pub const MULTISAMPLED_STORAGE: &str =
+    "a multisampled texture cannot be a storage image under wgpu";
 /// A compressed texture whose size, rounded up to whole blocks, is past the device's limit.
 pub const PADDED_SIZE: &str = "a compressed texture rounded up to whole blocks is too large";
 /// A 1D array view.
@@ -151,7 +152,10 @@ pub fn check_texture(
             return Err(unsupported(ONE_D_TARGET));
         }
     }
-    let flat = matches!(desc.dimension, TextureDimension::D2 | TextureDimension::Cube);
+    let flat = matches!(
+        desc.dimension,
+        TextureDimension::D2 | TextureDimension::Cube
+    );
     if !color && !flat {
         return Err(unsupported(DEPTH_DIMENSION));
     }
@@ -181,11 +185,18 @@ pub fn check_texture(
         }
     }
     let (dimension, limit) = match desc.dimension {
-        TextureDimension::D1 => (wgpu::TextureDimension::D1, caps.limits.max_texture_dimension_1d),
-        TextureDimension::D2 | TextureDimension::Cube => {
-            (wgpu::TextureDimension::D2, caps.limits.max_texture_dimension_2d)
-        }
-        TextureDimension::D3 => (wgpu::TextureDimension::D3, caps.limits.max_texture_dimension_3d),
+        TextureDimension::D1 => (
+            wgpu::TextureDimension::D1,
+            caps.limits.max_texture_dimension_1d,
+        ),
+        TextureDimension::D2 | TextureDimension::Cube => (
+            wgpu::TextureDimension::D2,
+            caps.limits.max_texture_dimension_2d,
+        ),
+        TextureDimension::D3 => (
+            wgpu::TextureDimension::D3,
+            caps.limits.max_texture_dimension_3d,
+        ),
     };
     let pad = |len: u32, block: u32| -> Result<u32, RenderError> {
         len.checked_next_multiple_of(block)
@@ -262,10 +273,7 @@ fn whole_level(desc: &TextureDesc, region: &TextureRegion) -> bool {
     let Some(level) = desc.mip_extent(region.mip) else {
         return false;
     };
-    region.origin.x == 0
-        && region.origin.y == 0
-        && region.origin.z == 0
-        && region.extent == level
+    region.origin.x == 0 && region.origin.y == 0 && region.origin.z == 0 && region.extent == level
 }
 
 /// Checks a texture-to-texture copy that has passed `validate_copy`.

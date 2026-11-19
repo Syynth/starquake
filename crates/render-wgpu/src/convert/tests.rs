@@ -102,7 +102,11 @@ fn texture_specs_list_the_srgb_counterpart() {
         Some(vec![wgpu::TextureFormat::Bgra8Unorm])
     );
     let spec = TextureSpec::new(&srgb, host, wgpu::TextureUsages::empty(), false);
-    assert_eq!(spec.map(|s| s.view_formats), Some(vec![]), "cannot reinterpret");
+    assert_eq!(
+        spec.map(|s| s.view_formats),
+        Some(vec![]),
+        "cannot reinterpret"
+    );
     let plain = TextureDesc {
         format: PixelFormat::R8Unorm,
         ..desc
@@ -113,7 +117,10 @@ fn texture_specs_list_the_srgb_counterpart() {
         format: PixelFormat::R5G6B5Unorm,
         ..desc
     };
-    assert_eq!(TextureSpec::new(&packed, host, wgpu::TextureUsages::empty(), true), None);
+    assert_eq!(
+        TextureSpec::new(&packed, host, wgpu::TextureUsages::empty(), true),
+        None
+    );
 }
 
 #[test]
@@ -129,7 +136,12 @@ fn view_descriptors_carry_every_field() {
     assert_eq!(d.format, Some(wgpu::TextureFormat::Rgba8UnormSrgb));
     assert_eq!(d.dimension, Some(wgpu::TextureViewDimension::D2Array));
     assert_eq!(
-        (d.base_mip_level, d.mip_level_count, d.base_array_layer, d.array_layer_count),
+        (
+            d.base_mip_level,
+            d.mip_level_count,
+            d.base_array_layer,
+            d.array_layer_count
+        ),
         (2, Some(3), 4, Some(5))
     );
     assert_eq!(d.aspect, wgpu::TextureAspect::All);
@@ -139,11 +151,18 @@ fn view_descriptors_carry_every_field() {
         (ViewDimension::D1Array, None),
         (ViewDimension::D2, Some(wgpu::TextureViewDimension::D2)),
         (ViewDimension::Cube, Some(wgpu::TextureViewDimension::Cube)),
-        (ViewDimension::CubeArray, Some(wgpu::TextureViewDimension::CubeArray)),
+        (
+            ViewDimension::CubeArray,
+            Some(wgpu::TextureViewDimension::CubeArray),
+        ),
         (ViewDimension::D3, Some(wgpu::TextureViewDimension::D3)),
     ] {
         let v = view(PixelFormat::R8Unorm, ours);
-        assert_eq!(view_descriptor(&v).and_then(|d| d.dimension), theirs, "{ours:?}");
+        assert_eq!(
+            view_descriptor(&v).and_then(|d| d.dimension),
+            theirs,
+            "{ours:?}"
+        );
     }
     assert!(view_descriptor(&view(PixelFormat::R5G6B5Unorm, ViewDimension::D2)).is_none());
 }
@@ -184,14 +203,26 @@ fn sampler_descriptors_follow_the_module_rules() {
             wgpu::MipmapFilterMode::Linear
         )
     );
-    assert_eq!((d.lod_min_clamp, d.lod_max_clamp), (0.0, 7.0), "raised to zero");
+    assert_eq!(
+        (d.lod_min_clamp, d.lod_max_clamp),
+        (0.0, 7.0),
+        "raised to zero"
+    );
     assert_eq!(d.anisotropy_clamp, 1, "a nearest filter drops anisotropy");
     assert_eq!(d.compare, Some(wgpu::CompareFunction::GreaterEqual));
     assert_eq!(d.border_color, Some(wgpu::SamplerBorderColor::OpaqueWhite));
     s.min_filter = FilterMode::Linear;
-    assert_eq!(sampler_descriptor(&s).anisotropy_clamp, 8, "all linear keeps it");
+    assert_eq!(
+        sampler_descriptor(&s).anisotropy_clamp,
+        8,
+        "all linear keeps it"
+    );
     s.mip_filter = FilterMode::Nearest;
-    assert_eq!(sampler_descriptor(&s).anisotropy_clamp, 1, "the mip filter counts too");
+    assert_eq!(
+        sampler_descriptor(&s).anisotropy_clamp,
+        1,
+        "the mip filter counts too"
+    );
     s.address = [AddressMode::ClampToEdge; 3];
     assert_eq!(sampler_descriptor(&s).border_color, None, "no border read");
     s.max_lod = -1.0;
@@ -203,7 +234,10 @@ fn sampler_descriptors_follow_the_module_rules() {
         (CompareFunction::LessEqual, wgpu::CompareFunction::LessEqual),
         (CompareFunction::Greater, wgpu::CompareFunction::Greater),
         (CompareFunction::NotEqual, wgpu::CompareFunction::NotEqual),
-        (CompareFunction::GreaterEqual, wgpu::CompareFunction::GreaterEqual),
+        (
+            CompareFunction::GreaterEqual,
+            wgpu::CompareFunction::GreaterEqual,
+        ),
         (CompareFunction::Always, wgpu::CompareFunction::Always),
     ] {
         s.compare = Some(ours);

@@ -26,9 +26,7 @@
 
 use crate::format::texture_format;
 use crate::rules::{HostTexture, border_color};
-use starquake_render::resource::{
-    AddressMode, CompareFunction, FilterMode, ViewDimension,
-};
+use starquake_render::resource::{AddressMode, CompareFunction, FilterMode, ViewDimension};
 use starquake_render::{BufferUsage, SamplerDesc, TextureDesc, TextureUsage, ViewDesc};
 
 /// wgpu's usages for a buffer.
@@ -57,7 +55,10 @@ pub fn texture_usages(usage: TextureUsage, allowed: wgpu::TextureUsages) -> wgpu
     for (ours, theirs) in [
         (TextureUsage::SAMPLED, wgpu::TextureUsages::TEXTURE_BINDING),
         (TextureUsage::STORAGE, wgpu::TextureUsages::STORAGE_BINDING),
-        (TextureUsage::RENDER_TARGET, wgpu::TextureUsages::RENDER_ATTACHMENT),
+        (
+            TextureUsage::RENDER_TARGET,
+            wgpu::TextureUsages::RENDER_ATTACHMENT,
+        ),
         (TextureUsage::COPY_SRC, wgpu::TextureUsages::COPY_SRC),
         (TextureUsage::COPY_DST, wgpu::TextureUsages::COPY_DST),
     ] {
@@ -155,9 +156,7 @@ const fn address(mode: AddressMode) -> wgpu::AddressMode {
         AddressMode::MirrorRepeat => wgpu::AddressMode::MirrorRepeat,
         // The device never reports mirror-clamp-to-edge (`crate::caps`), so the shared checks
         // refuse it before this; clamping to the edge is the nearest wgpu has.
-        AddressMode::ClampToEdge | AddressMode::MirrorClampToEdge => {
-            wgpu::AddressMode::ClampToEdge
-        }
+        AddressMode::ClampToEdge | AddressMode::MirrorClampToEdge => wgpu::AddressMode::ClampToEdge,
         AddressMode::ClampToBorder => wgpu::AddressMode::ClampToBorder,
     }
 }

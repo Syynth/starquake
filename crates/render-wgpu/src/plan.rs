@@ -32,8 +32,8 @@ use starquake_render::format::FormatAspect;
 use starquake_render::resource::{Extent3d, Origin3d, TextureDimension};
 use starquake_render::validate::{self, Resolved, ResolvedView};
 use starquake_render::{
-    BufferDesc, BufferId, Caps, Command, CommandList, PixelFormat, ReadbackId, RenderError,
-    Slots, StagingSlice, TextureDesc, TextureId, TextureUsage, ViewDesc, ViewId,
+    BufferDesc, BufferId, Caps, Command, CommandList, PixelFormat, ReadbackId, RenderError, Slots,
+    StagingSlice, TextureDesc, TextureId, TextureUsage, ViewDesc, ViewId,
 };
 use std::collections::BTreeSet;
 
@@ -364,11 +364,7 @@ pub fn check(
 }
 
 /// The step for an upload of `from` into `to`.
-fn upload_step(
-    tables: &Tables,
-    from: StagingSlice,
-    to: &CopyRegion,
-) -> Result<Step, RenderError> {
+fn upload_step(tables: &Tables, from: StagingSlice, to: &CopyRegion) -> Result<Step, RenderError> {
     let len = u64::try_from(from.len()).unwrap_or(u64::MAX);
     let resolved = resolve(tables, to)?;
     validate::validate_upload(len, resolved)?;
@@ -404,7 +400,13 @@ fn clear_step(tables: &Tables, clear: &ClearDesc) -> Result<Step, RenderError> {
     validate::validate_clear(target, clear)?;
     let extent = target.base_extent()?;
     let (width, height) = (extent.width, extent.height);
-    rules::check_clear_area(&tex.desc, view.desc.format, clear.rect.as_ref(), width, height)?;
+    rules::check_clear_area(
+        &tex.desc,
+        view.desc.format,
+        clear.rect.as_ref(),
+        width,
+        height,
+    )?;
     let layers = if tex.desc.dimension == TextureDimension::D3 {
         Layers::Slices {
             count: extent.depth_or_layers,
@@ -487,7 +489,10 @@ fn resolve<'t>(tables: &'t Tables, region: &'t CopyRegion) -> Result<Resolved<'t
 }
 
 /// A validated region of a texture of `format` as whole blocks, and the rows it packs into.
-pub fn texel_box(format: PixelFormat, region: &TextureRegion) -> Result<(TexelBox, Rows), RenderError> {
+pub fn texel_box(
+    format: PixelFormat,
+    region: &TextureRegion,
+) -> Result<(TexelBox, Rows), RenderError> {
     let (bw, bh) = (format.block_width(), format.block_height());
     let wide = region.extent.width.div_ceil(bw);
     let high = region.extent.height.div_ceil(bh);
@@ -496,9 +501,7 @@ pub fn texel_box(format: PixelFormat, region: &TextureRegion) -> Result<(TexelBo
     };
     let width = wide.checked_mul(bw).ok_or(overflow.clone())?;
     let height = high.checked_mul(bh).ok_or(overflow.clone())?;
-    let row_bytes = wide
-        .checked_mul(format.bytes_per_block())
-        .ok_or(overflow)?;
+    let row_bytes = wide.checked_mul(format.bytes_per_block()).ok_or(overflow)?;
     Ok((
         TexelBox {
             texture: region.texture,
@@ -603,7 +606,11 @@ pub fn clear_ops(value: ClearValue) -> ClearOps {
 
 /// Checks a `SetRenderTargets` (module docs, rule 4). The wgpu backend opens no pass until
 /// draws exist (slice R7), so the command changes nothing.
-fn render_targets(tables: &Tables, caps: &Caps, targets: &RenderTargets) -> Result<(), RenderError> {
+fn render_targets(
+    tables: &Tables,
+    caps: &Caps,
+    targets: &RenderTargets,
+) -> Result<(), RenderError> {
     validate::validate_render_targets(caps, targets)?;
     let colors = targets.colors.iter().flatten().map(|v| (*v, true));
     for (id, color) in colors.chain(targets.depth_stencil.map(|v| (v, false))) {

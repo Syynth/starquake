@@ -57,9 +57,15 @@ mod tests {
         assert!(!queue_full(d - 1, 0, depth), "one below");
         assert!(queue_full(d, 0, depth), "at the depth");
         assert!(queue_full(d + 1, 0, depth), "one above");
-        assert!(!queue_full(10 + d - 1, 10, depth), "measured from completed");
+        assert!(
+            !queue_full(10 + d - 1, 10, depth),
+            "measured from completed"
+        );
         assert!(queue_full(10 + d, 10, depth));
-        assert!(!queue_full(5, 9, depth), "completed past submitted reads as empty");
+        assert!(
+            !queue_full(5, 9, depth),
+            "completed past submitted reads as empty"
+        );
         assert!(!queue_full(0, 0, NonZeroU64::MIN));
         assert!(queue_full(1, 0, NonZeroU64::MIN));
         assert!(queue_full(u64::MAX, 0, NonZeroU64::MAX));

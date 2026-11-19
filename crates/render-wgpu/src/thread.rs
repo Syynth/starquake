@@ -394,14 +394,16 @@ impl Render {
             ResourceId::Shader(_) | ResourceId::Pipeline(_) => false,
         };
         if !released {
-            self.shared.host_error(&"a freed resource had no host object");
+            self.shared
+                .host_error(&"a freed resource had no host object");
         }
     }
 
     fn buffer(&self, id: BufferId) -> Option<&wgpu::Buffer> {
         let found = self.buffers.get(id.index(), id.generation());
         if found.is_none() {
-            self.shared.host_error(&"a checked buffer had no host object");
+            self.shared
+                .host_error(&"a checked buffer had no host object");
         }
         found
     }
@@ -409,7 +411,8 @@ impl Render {
     fn texture(&self, id: TextureId) -> Option<&wgpu::Texture> {
         let found = self.textures.get(id.index(), id.generation());
         if found.is_none() {
-            self.shared.host_error(&"a checked texture had no host object");
+            self.shared
+                .host_error(&"a checked texture had no host object");
         }
         found
     }
@@ -638,7 +641,13 @@ impl Render {
         let Some(rect) = step.rect else {
             for z in first..end {
                 let (layer, slice) = if sliced { (0, Some(z)) } else { (z, None) };
-                clear_pass(encoder, &view(texture, layer, step.mip), slice, step.ops, step.format);
+                clear_pass(
+                    encoder,
+                    &view(texture, layer, step.mip),
+                    slice,
+                    step.ops,
+                    step.format,
+                );
             }
             return;
         };
@@ -684,12 +693,8 @@ impl Render {
 
     /// Settles the lists wgpu has finished, oldest first (module docs).
     fn settle(&mut self) {
-        let finished = std::mem::take(
-            &mut *self
-                .finished
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner),
-        );
+        let finished =
+            std::mem::take(&mut *self.finished.lock().unwrap_or_else(PoisonError::into_inner));
         for fence in finished {
             if let Some(entry) = self.in_flight.iter_mut().find(|f| f.fence == fence) {
                 entry.done = true;
@@ -704,7 +709,8 @@ impl Render {
             let Some(entry) = self.in_flight.pop_front() else {
                 break;
             };
-            let bytes: Vec<Option<Vec<u8>>> = entry.reads.iter().map(|r| self.read_out(r)).collect();
+            let bytes: Vec<Option<Vec<u8>>> =
+                entry.reads.iter().map(|r| self.read_out(r)).collect();
             for (read, bytes) in entry.reads.iter().zip(&bytes) {
                 if let ReadTarget::Readback(id) = read.target {
                     readbacks.push((id, bytes.clone().map_or(Readback::Unknown, Readback::Bytes)));

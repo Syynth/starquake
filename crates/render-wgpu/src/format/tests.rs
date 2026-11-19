@@ -96,10 +96,16 @@ fn hand_checked_entries() {
         (PixelFormat::A2B10G10R10Uint, TextureFormat::Rgb10a2Uint), // A2B10G10R10_UINT_PACK32
         (PixelFormat::B10G11R11Float, TextureFormat::Rg11b10Ufloat), // B10G11R11_UFLOAT_PACK32
         (PixelFormat::E5B9G9R9Float, TextureFormat::Rgb9e5Ufloat), // E5B9G9R9_UFLOAT_PACK32
-        (PixelFormat::Bc6hSfloat, TextureFormat::Bc6hRgbFloat),   // BC6H_SFLOAT_BLOCK
-        (PixelFormat::Etc2RgbPtaSrgb, TextureFormat::Etc2Rgb8A1UnormSrgb), // ETC2_R8G8B8A1_SRGB
+        (PixelFormat::Bc6hSfloat, TextureFormat::Bc6hRgbFloat),  // BC6H_SFLOAT_BLOCK
+        (
+            PixelFormat::Etc2RgbPtaSrgb,
+            TextureFormat::Etc2Rgb8A1UnormSrgb,
+        ), // ETC2_R8G8B8A1_SRGB
         (PixelFormat::EacR11G11Snorm, TextureFormat::EacRg11Snorm), // EAC_R11G11_SNORM_BLOCK
-        (PixelFormat::D32FloatS8Uint, TextureFormat::Depth32FloatStencil8), // D32_SFLOAT_S8_UINT
+        (
+            PixelFormat::D32FloatS8Uint,
+            TextureFormat::Depth32FloatStencil8,
+        ), // D32_SFLOAT_S8_UINT
         (
             PixelFormat::Astc2d10x6Srgb,
             TextureFormat::Astc {

@@ -30,7 +30,10 @@ fn aligned_rows_are_one_copy() {
     assert_eq!(copies.len(), 1);
     let (layout, part) = copies[0];
     assert_eq!(layout.offset, 12);
-    assert_eq!(layout.bytes_per_row, Some(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
+    assert_eq!(
+        layout.bytes_per_row,
+        Some(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+    );
     assert_eq!(layout.rows_per_image, Some(3));
     assert_eq!(part, at(64, 3, 2));
 }
@@ -57,7 +60,10 @@ fn one_unaligned_row_is_one_copy_with_a_padded_stride() {
         ..rows
     };
     let (layout, _) = row_copies(at(65, 1, 1), 0, wide, 1)[0];
-    assert_eq!(layout.bytes_per_row, Some(2 * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
+    assert_eq!(
+        layout.bytes_per_row,
+        Some(2 * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+    );
 }
 
 #[test]
@@ -80,7 +86,15 @@ fn unaligned_rows_are_one_copy_per_row_in_packed_order() {
         );
         let row = u32::try_from(row).expect("small");
         let image = u32::try_from(image).expect("small");
-        assert_eq!(part.origin, Origin3d { x: 4, y: 8 + 4 * row, z: 1 + image }, "copy {i}");
+        assert_eq!(
+            part.origin,
+            Origin3d {
+                x: 4,
+                y: 8 + 4 * row,
+                z: 1 + image
+            },
+            "copy {i}"
+        );
         assert_eq!(
             part.extent,
             Extent3d {

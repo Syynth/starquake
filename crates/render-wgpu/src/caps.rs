@@ -41,7 +41,9 @@
 
 use crate::format::texture_format;
 use starquake_render::caps::{DynamicState, StageSupport};
-use starquake_render::{Caps, Features, FormatFeatures, FormatTable, Limits, PixelFormat, SampleCounts};
+use starquake_render::{
+    Caps, Features, FormatFeatures, FormatTable, Limits, PixelFormat, SampleCounts,
+};
 use wgpu::{TextureFormatFeatureFlags, TextureUsages};
 
 /// wgpu's alignment for buffer copies and buffer writes, in bytes (`wgpu::COPY_BUFFER_ALIGNMENT`).
@@ -92,11 +94,26 @@ pub fn format_features(features: &wgpu::TextureFormatFeatures) -> FormatFeatures
     let flags = features.flags;
     let mut out = FormatFeatures::EMPTY;
     for (has, feature) in [
-        (usages.contains(TextureUsages::TEXTURE_BINDING), FormatFeatures::SAMPLE),
-        (flags.contains(TextureFormatFeatureFlags::FILTERABLE), FormatFeatures::FILTER),
-        (usages.contains(TextureUsages::RENDER_ATTACHMENT), FormatFeatures::RENDER),
-        (flags.contains(TextureFormatFeatureFlags::BLENDABLE), FormatFeatures::BLEND),
-        (usages.contains(TextureUsages::STORAGE_BINDING), FormatFeatures::STORAGE),
+        (
+            usages.contains(TextureUsages::TEXTURE_BINDING),
+            FormatFeatures::SAMPLE,
+        ),
+        (
+            flags.contains(TextureFormatFeatureFlags::FILTERABLE),
+            FormatFeatures::FILTER,
+        ),
+        (
+            usages.contains(TextureUsages::RENDER_ATTACHMENT),
+            FormatFeatures::RENDER,
+        ),
+        (
+            flags.contains(TextureFormatFeatureFlags::BLENDABLE),
+            FormatFeatures::BLEND,
+        ),
+        (
+            usages.contains(TextureUsages::STORAGE_BINDING),
+            FormatFeatures::STORAGE,
+        ),
         (
             usages.contains(TextureUsages::COPY_SRC | TextureUsages::COPY_DST),
             FormatFeatures::COPY,
@@ -116,7 +133,10 @@ pub fn sample_counts(flags: TextureFormatFeatureFlags) -> SampleCounts {
         (TextureFormatFeatureFlags::MULTISAMPLE_X2, SampleCounts::X2),
         (TextureFormatFeatureFlags::MULTISAMPLE_X4, SampleCounts::X4),
         (TextureFormatFeatureFlags::MULTISAMPLE_X8, SampleCounts::X8),
-        (TextureFormatFeatureFlags::MULTISAMPLE_X16, SampleCounts::X16),
+        (
+            TextureFormatFeatureFlags::MULTISAMPLE_X16,
+            SampleCounts::X16,
+        ),
     ] {
         if flags.contains(flag) {
             counts = counts.union(count);

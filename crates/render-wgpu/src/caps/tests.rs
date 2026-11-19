@@ -54,7 +54,10 @@ fn every_limit_comes_from_its_wgpu_limit() {
         ROOMY,
     );
     let l = c.limits;
-    assert_eq!(l.max_buffer_size, 1_000_000, "rounded down to the copy alignment");
+    assert_eq!(
+        l.max_buffer_size, 1_000_000,
+        "rounded down to the copy alignment"
+    );
     assert_eq!(l.max_staging_size, 1_000_000, "capped at the buffer size");
     assert_eq!(
         [
@@ -200,7 +203,10 @@ fn the_device_gets_only_wanted_features_the_adapter_has() {
         device_features(wgpu::Features::SHADER_F64 | wgpu::Features::TEXTURE_COMPRESSION_BC),
         wgpu::Features::TEXTURE_COMPRESSION_BC
     );
-    assert_eq!(device_features(wgpu::Features::empty()), wgpu::Features::empty());
+    assert_eq!(
+        device_features(wgpu::Features::empty()),
+        wgpu::Features::empty()
+    );
 }
 
 #[test]
@@ -273,10 +279,8 @@ fn sample_counts_match_a_model_for_every_combination() {
 
 #[test]
 fn formats_follow_the_device_features_and_the_map() {
-    let all_usages = Usages::TEXTURE_BINDING
-        | Usages::RENDER_ATTACHMENT
-        | Usages::COPY_SRC
-        | Usages::COPY_DST;
+    let all_usages =
+        Usages::TEXTURE_BINDING | Usages::RENDER_ATTACHMENT | Usages::COPY_SRC | Usages::COPY_DST;
     let describe = |format: wgpu::TextureFormat| TextureFormatFeatures {
         allowed_usages: all_usages,
         flags: if format == wgpu::TextureFormat::Rgba8Unorm {
@@ -291,11 +295,17 @@ fn formats_follow_the_device_features_and_the_map() {
     // Without the BC feature, a BC format can do nothing; with it, what wgpu says.
     let without = FormatSupport::new(wgpu::Features::empty(), describe);
     let with = FormatSupport::new(wgpu::Features::TEXTURE_COMPRESSION_BC, describe);
-    assert_eq!(without.table.get(PixelFormat::Bc1RgbaUnorm), FormatFeatures::EMPTY);
+    assert_eq!(
+        without.table.get(PixelFormat::Bc1RgbaUnorm),
+        FormatFeatures::EMPTY
+    );
     assert_eq!(with.table.get(PixelFormat::Bc1RgbaUnorm), full);
     // A format that needs no feature, and one with no wgpu form.
     assert_eq!(without.table.get(PixelFormat::R8Unorm), full);
-    assert_eq!(with.table.get(PixelFormat::R5G6B5Unorm), FormatFeatures::EMPTY);
+    assert_eq!(
+        with.table.get(PixelFormat::R5G6B5Unorm),
+        FormatFeatures::EMPTY
+    );
     // Sample counts per format, and `Caps` takes RGBA8's.
     assert_eq!(
         with.samples(PixelFormat::A8B8G8R8Unorm),

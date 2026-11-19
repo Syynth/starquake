@@ -33,7 +33,12 @@ pub(crate) fn test_caps() -> Caps {
 }
 
 /// A one-level, one-sample 2D texture of `format`, `width` by `height`.
-pub(crate) fn texture(format: PixelFormat, width: u32, height: u32, usage: TextureUsage) -> TextureDesc {
+pub(crate) fn texture(
+    format: PixelFormat,
+    width: u32,
+    height: u32,
+    usage: TextureUsage,
+) -> TextureDesc {
     TextureDesc {
         dimension: TextureDimension::D2,
         format,

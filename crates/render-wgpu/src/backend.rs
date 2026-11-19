@@ -158,14 +158,26 @@ impl State {
     /// Frees `id` now: its slot moves on and its host object's release is queued.
     fn free(&mut self, id: ResourceId) {
         let freed = match id {
-            ResourceId::Buffer(i) => self.tables.buffers.remove(i.index(), i.generation()).is_some(),
-            ResourceId::Texture(i) => {
-                self.tables.textures.remove(i.index(), i.generation()).is_some()
-            }
-            ResourceId::View(i) => self.tables.views.remove(i.index(), i.generation()).is_some(),
-            ResourceId::Sampler(i) => {
-                self.tables.samplers.remove(i.index(), i.generation()).is_some()
-            }
+            ResourceId::Buffer(i) => self
+                .tables
+                .buffers
+                .remove(i.index(), i.generation())
+                .is_some(),
+            ResourceId::Texture(i) => self
+                .tables
+                .textures
+                .remove(i.index(), i.generation())
+                .is_some(),
+            ResourceId::View(i) => self
+                .tables
+                .views
+                .remove(i.index(), i.generation())
+                .is_some(),
+            ResourceId::Sampler(i) => self
+                .tables
+                .samplers
+                .remove(i.index(), i.generation())
+                .is_some(),
             ResourceId::Shader(_) | ResourceId::Pipeline(_) => false,
         };
         if freed {

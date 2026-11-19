@@ -41,7 +41,10 @@ fn add_texture(tables: &mut Tables, desc: TextureDesc) -> TextureId {
 }
 
 fn add_view(tables: &mut Tables, texture: TextureId, desc: ViewDesc) -> ViewId {
-    let (i, g) = tables.views.insert(ViewRec { texture, desc }).expect("room");
+    let (i, g) = tables
+        .views
+        .insert(ViewRec { texture, desc })
+        .expect("room");
     ViewId::new(i, g)
 }
 
@@ -66,11 +69,22 @@ fn world() -> World {
     let other = BufferId::new(i, g);
     let all = TextureUsage::ALL.difference(TextureUsage::STORAGE);
     let rgba = add_texture(&mut tables, texture(PixelFormat::A8B8G8R8Unorm, 8, 4, all));
-    let rgba_view = add_view(&mut tables, rgba, view(PixelFormat::A8B8G8R8Unorm, ViewDimension::D2));
-    let srgb_view = add_view(&mut tables, rgba, view(PixelFormat::A8B8G8R8Srgb, ViewDimension::D2));
+    let rgba_view = add_view(
+        &mut tables,
+        rgba,
+        view(PixelFormat::A8B8G8R8Unorm, ViewDimension::D2),
+    );
+    let srgb_view = add_view(
+        &mut tables,
+        rgba,
+        view(PixelFormat::A8B8G8R8Srgb, ViewDimension::D2),
+    );
     let srgb = add_texture(&mut tables, texture(PixelFormat::A8B8G8R8Srgb, 8, 4, all));
     let copies = TextureUsage::COPY_SRC.union(TextureUsage::COPY_DST);
-    let bc = add_texture(&mut tables, texture(PixelFormat::Bc1RgbaUnorm, 6, 6, copies));
+    let bc = add_texture(
+        &mut tables,
+        texture(PixelFormat::Bc1RgbaUnorm, 6, 6, copies),
+    );
     let deep = add_texture(
         &mut tables,
         TextureDesc {
@@ -83,9 +97,17 @@ fn world() -> World {
             ..texture(PixelFormat::A8B8G8R8Unorm, 4, 4, all)
         },
     );
-    let deep_view = add_view(&mut tables, deep, view(PixelFormat::A8B8G8R8Unorm, ViewDimension::D3));
+    let deep_view = add_view(
+        &mut tables,
+        deep,
+        view(PixelFormat::A8B8G8R8Unorm, ViewDimension::D3),
+    );
     let depth = add_texture(&mut tables, texture(PixelFormat::D32Float, 8, 4, all));
-    let depth_view = add_view(&mut tables, depth, view(PixelFormat::D32Float, ViewDimension::D2));
+    let depth_view = add_view(
+        &mut tables,
+        depth,
+        view(PixelFormat::D32Float, ViewDimension::D2),
+    );
     let array = add_texture(
         &mut tables,
         TextureDesc {
@@ -140,7 +162,12 @@ fn as_present(step: &Step) -> (PixelFormat, Option<(TexelBox, Rows)>) {
 }
 
 fn run(w: &World, commands: Vec<Command>) -> Result<Checked, RenderError> {
-    check(&w.tables, &test_caps(), &BTreeSet::new(), CommandList { commands })
+    check(
+        &w.tables,
+        &test_caps(),
+        &BTreeSet::new(),
+        CommandList { commands },
+    )
 }
 
 fn steps(w: &World, commands: Vec<Command>) -> Vec<Step> {
@@ -170,7 +197,11 @@ fn region(texture: TextureId, x: u32, y: u32, w: u32, h: u32) -> CopyRegion {
 
 fn upload(bytes: usize, to: CopyRegion) -> Command {
     Command::Upload {
-        from: StagingSlice::from_bytes((0..bytes).map(|i| u8::try_from(i % 251).expect("small")).collect()),
+        from: StagingSlice::from_bytes(
+            (0..bytes)
+                .map(|i| u8::try_from(i % 251).expect("small"))
+                .collect(),
+        ),
         to,
     }
 }
@@ -236,10 +267,13 @@ fn uploads_check_shared_rules_before_wgpu_rules() {
 }
 
 #[test]
-fn copies_become_their_kind_of_step() {
+fn buffer_copies_become_copy_steps() {
     let w = world();
     let copy = |src, dst| Command::Copy(CopyDesc { src, dst });
-    let s = steps(&w, vec![copy(slice(w.buffer, 0, 64), slice(w.other, 64, 64))]);
+    let s = steps(
+        &w,
+        vec![copy(slice(w.buffer, 0, 64), slice(w.other, 64, 64))],
+    );
     assert_eq!(
         s[0],
         Step::CopyBuffer {
@@ -251,9 +285,19 @@ fn copies_become_their_kind_of_step() {
         }
     );
     assert_eq!(
-        run(&w, vec![copy(slice(w.buffer, 0, 64), slice(w.buffer, 64, 64))]).err(),
+        run(
+            &w,
+            vec![copy(slice(w.buffer, 0, 64), slice(w.buffer, 64, 64))]
+        )
+        .err(),
         Some(RenderError::Unsupported(rules::SAME_BUFFER))
     );
+}
+
+#[test]
+fn texture_copies_become_their_kind_of_step() {
+    let w = world();
+    let copy = |src, dst| Command::Copy(CopyDesc { src, dst });
     let rows = Rows {
         row_bytes: 16,
         rows: 2,
@@ -269,7 +313,10 @@ fn copies_become_their_kind_of_step() {
             depth_or_layers: 1,
         },
     };
-    let s = steps(&w, vec![copy(slice(w.buffer, 128, 32), region(w.rgba, 4, 2, 4, 2))]);
+    let s = steps(
+        &w,
+        vec![copy(slice(w.buffer, 128, 32), region(w.rgba, 4, 2, 4, 2))],
+    );
     assert_eq!(
         s[0],
         Step::BufferToTexture {
@@ -279,7 +326,10 @@ fn copies_become_their_kind_of_step() {
             at
         }
     );
-    let s = steps(&w, vec![copy(region(w.rgba, 4, 2, 4, 2), slice(w.buffer, 128, 32))]);
+    let s = steps(
+        &w,
+        vec![copy(region(w.rgba, 4, 2, 4, 2), slice(w.buffer, 128, 32))],
+    );
     assert_eq!(
         s[0],
         Step::TextureToBuffer {
@@ -289,7 +339,10 @@ fn copies_become_their_kind_of_step() {
             rows
         }
     );
-    let s = steps(&w, vec![copy(region(w.srgb, 0, 0, 4, 2), region(w.rgba, 4, 2, 4, 2))]);
+    let s = steps(
+        &w,
+        vec![copy(region(w.srgb, 0, 0, 4, 2), region(w.rgba, 4, 2, 4, 2))],
+    );
     assert_eq!(
         s[0],
         Step::TextureToTexture {
@@ -302,11 +355,19 @@ fn copies_become_their_kind_of_step() {
         }
     );
     assert_eq!(
-        run(&w, vec![copy(region(w.rgba, 0, 0, 4, 2), region(w.rgba, 4, 2, 4, 2))]).err(),
+        run(
+            &w,
+            vec![copy(region(w.rgba, 0, 0, 4, 2), region(w.rgba, 4, 2, 4, 2))]
+        )
+        .err(),
         Some(RenderError::Unsupported(rules::SAME_LEVEL))
     );
     assert_eq!(
-        run(&w, vec![copy(slice(w.buffer, 130, 32), region(w.rgba, 4, 2, 4, 2))]).err(),
+        run(
+            &w,
+            vec![copy(slice(w.buffer, 130, 32), region(w.rgba, 4, 2, 4, 2))]
+        )
+        .err(),
         Some(RenderError::Unsupported(rules::BLOCK_OFFSET))
     );
     assert_eq!(
@@ -319,7 +380,11 @@ fn copies_become_their_kind_of_step() {
         "the destination side is checked too"
     );
     assert_eq!(
-        run(&w, vec![copy(slice(w.buffer, 0, 6), slice(w.buffer, 64, 6))]).err(),
+        run(
+            &w,
+            vec![copy(slice(w.buffer, 0, 6), slice(w.buffer, 64, 6))]
+        )
+        .err(),
         Some(RenderError::Unsupported(rules::BUFFER_ALIGNMENT)),
         "alignment before the same-buffer rule"
     );
@@ -335,13 +400,19 @@ fn blits_draws_and_dispatches_wait_for_their_slices() {
         dst_rect: Rect::default(),
         filter: FilterMode::Nearest,
     });
-    assert_eq!(run(&w, vec![blit]).err(), Some(RenderError::Unsupported(BLITS_NOT_YET)));
+    assert_eq!(
+        run(&w, vec![blit]).err(),
+        Some(RenderError::Unsupported(BLITS_NOT_YET))
+    );
     let dispatch = Command::Dispatch(DispatchDesc {
         pipeline: PipelineId::new(0, 0),
         bindings: Vec::new(),
         params: DispatchParams::Direct { x: 1, y: 1, z: 1 },
     });
-    assert_eq!(run(&w, vec![dispatch]).err(), Some(RenderError::Unsupported(DRAWS_NOT_YET)));
+    assert_eq!(
+        run(&w, vec![dispatch]).err(),
+        Some(RenderError::Unsupported(DRAWS_NOT_YET))
+    );
     // A good command before a refused one changes nothing: the whole list is refused.
     let marker = Command::Marker(Marker { submit: 1, draw: 2 });
     let blit = Command::Blit(BlitDesc {
@@ -357,7 +428,13 @@ fn blits_draws_and_dispatches_wait_for_their_slices() {
 #[test]
 fn clears_name_their_layers_area_and_value() {
     let w = world();
-    let clear = |target, rect, value| Command::Clear(ClearDesc { target, value, rect });
+    let clear = |target, rect, value| {
+        Command::Clear(ClearDesc {
+            target,
+            value,
+            rect,
+        })
+    };
     let red = ClearValue::Float([1.0, 0.0, 0.0, 1.0]);
     let full = Rect {
         x: 0,
@@ -376,8 +453,15 @@ fn clears_name_their_layers_area_and_value() {
         ],
     );
     let whole = as_clear(&s[0]);
-    assert_eq!(whole.rect, None, "a rectangle covering the level is a whole clear");
-    assert_eq!(whole.format, wgpu::TextureFormat::Rgba8UnormSrgb, "the view's format");
+    assert_eq!(
+        whole.rect, None,
+        "a rectangle covering the level is a whole clear"
+    );
+    assert_eq!(
+        whole.format,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        "the view's format"
+    );
     assert_eq!(whole.layers, Layers::Array { first: 0, count: 1 });
     assert_eq!(whole.texture, w.rgba);
     let partial = as_clear(&s[1]);
@@ -387,8 +471,15 @@ fn clears_name_their_layers_area_and_value() {
     let array = as_clear(&s[3]);
     assert_eq!(array.layers, Layers::Array { first: 1, count: 3 });
     assert_eq!(
-        run(&w, vec![clear(w.depth_view, Some(Rect { width: 7, ..full }), ClearValue::Depth(0.5))])
-            .err(),
+        run(
+            &w,
+            vec![clear(
+                w.depth_view,
+                Some(Rect { width: 7, ..full }),
+                ClearValue::Depth(0.5)
+            )]
+        )
+        .err(),
         Some(RenderError::Unsupported(rules::WHOLE_CLEAR))
     );
     let depth = as_clear(&steps(&w, vec![clear(w.depth_view, None, ClearValue::Depth(0.5))])[0]);
@@ -443,7 +534,10 @@ fn readback_ids_are_used_once() {
         id: ReadbackId::new(n, 0),
     };
     let checked = run(&w, vec![read(1), read(2)]).expect("two ids");
-    assert_eq!(checked.readbacks, vec![ReadbackId::new(1, 0), ReadbackId::new(2, 0)]);
+    assert_eq!(
+        checked.readbacks,
+        vec![ReadbackId::new(1, 0), ReadbackId::new(2, 0)]
+    );
     assert_eq!(
         checked.steps[0],
         Step::Readback {
@@ -510,7 +604,11 @@ fn presents_read_dumped_frames_from_the_base_layer() {
     );
     assert_eq!(as_present(&s[0]), (PixelFormat::A8B8G8R8Unorm, None));
     let (at, rows) = as_present(&s[1]).1.expect("dumped");
-    assert_eq!(at.origin, Origin3d { x: 1, y: 1, z: 1 }, "the view's base layer");
+    assert_eq!(
+        at.origin,
+        Origin3d { x: 1, y: 1, z: 1 },
+        "the view's base layer"
+    );
     assert_eq!(
         rows,
         Rows {
@@ -549,7 +647,11 @@ fn render_targets_are_checked_and_change_nothing() {
         &mut w.tables,
         texture(PixelFormat::A8B8G8R8Unorm, 4, 4, TextureUsage::SAMPLED),
     );
-    let sampled_view = add_view(&mut w.tables, sampled, view(PixelFormat::A8B8G8R8Unorm, ViewDimension::D2));
+    let sampled_view = add_view(
+        &mut w.tables,
+        sampled,
+        view(PixelFormat::A8B8G8R8Unorm, ViewDimension::D2),
+    );
     let mut wrong = RenderTargets::default();
     wrong.colors[1] = Some(sampled_view);
     assert_eq!(
@@ -559,7 +661,10 @@ fn render_targets_are_checked_and_change_nothing() {
             usage: "render target"
         })
     );
-    assert_eq!(steps(&w, vec![Command::Marker(Marker { submit: 1, draw: 1 })]), []);
+    assert_eq!(
+        steps(&w, vec![Command::Marker(Marker { submit: 1, draw: 1 })]),
+        []
+    );
 }
 
 #[test]
@@ -575,12 +680,18 @@ fn a_view_whose_texture_is_gone_is_stale() {
         value: ClearValue::Float([0.0; 4]),
         rect: None,
     });
-    assert_eq!(run(&w, vec![clear]).err(), Some(RenderError::Invalid(NO_TEXTURE)));
+    assert_eq!(
+        run(&w, vec![clear]).err(),
+        Some(RenderError::Invalid(NO_TEXTURE))
+    );
     let stale = ViewId::new(w.rgba_view.index(), w.rgba_view.generation() + 1);
     let clear = Command::Clear(ClearDesc {
         target: stale,
         value: ClearValue::Float([0.0; 4]),
         rect: None,
     });
-    assert_eq!(run(&w, vec![clear]).err(), Some(RenderError::Invalid(NO_VIEW)));
+    assert_eq!(
+        run(&w, vec![clear]).err(),
+        Some(RenderError::Invalid(NO_VIEW))
+    );
 }
