@@ -136,6 +136,11 @@ pub const GROUPS_3D: &[GroupEntry] = &[
     one(&clc797::SET_BLEND_CONST_BLUE, Blend),
     one(&clc797::SET_BLEND_CONST_ALPHA, Blend),
     one(&clc797::SET_SINGLE_CT_WRITE_CONTROL, Blend),
+    one(&clc797::SET_GLOBAL_COLOR_KEY, Blend),
+    one(&clc797::SET_SINGLE_ROP_CONTROL, Blend),
+    one(&clc797::SET_ANTI_ALIAS_ALPHA_CONTROL, Blend),
+    one(&clc797::SET_LOGIC_OP, Blend),
+    one(&clc797::SET_LOGIC_OP_FUNC, Blend),
     // Blend per target.
     each(&clc797::SET_BLEND, BLEND_TARGETS, BlendPerTarget, 0),
     each(&clc797::SET_CT_WRITE, BLEND_TARGETS, BlendPerTarget, 0),
@@ -249,7 +254,8 @@ pub const GROUPS_3D: &[GroupEntry] = &[
     one(&clc797::SET_ZT_SELECT, Zt),
     one(&clc797::SET_ZT_SPARSE, Zt),
     one(&clc797::SET_ZT_READ_ONLY, Zt),
-    // Vertex streams: the A half is streams 0 to 15, the B half 16 to 31.
+    // Vertex streams: the A half is streams 0 to 15, the B half 16 to 31; the sizes are one
+    // array of 32 (Eden-NX2's, decision 10; `VERTEX_STREAM_SIZES`).
     each(
         &clc797::SET_VERTEX_STREAM_A_FORMAT,
         VERTEX_STREAMS_PER_HALF,
@@ -340,6 +346,7 @@ pub const GROUPS_3D: &[GroupEntry] = &[
     one(&clc797::SET_INDEX_BUFFER_F, IndexBuffer),
     one(&clc797::SET_INDEX_BUFFER_SIZE_A, IndexBuffer),
     one(&clc797::SET_INDEX_BUFFER_SIZE_B, IndexBuffer),
+    one(&clc797::DRAW_INDEX_BUFFER, IndexBuffer),
     // Constant buffer bindings, per bind group.
     each(
         &clc797::BIND_GROUP_CONSTANT_BUFFER,
@@ -399,6 +406,10 @@ pub const GROUPS_3D: &[GroupEntry] = &[
     one(&clc797::SET_LINE_STIPPLE, Rasterizer),
     one(&clc797::SET_POINT_SIZE, Rasterizer),
     one(&clc797::SET_PROVOKING_VERTEX, Rasterizer),
+    one(&clc797::SET_LINE_STIPPLE_PARAMETERS, Rasterizer),
+    one(&clc797::SET_ANTI_ALIASED_LINE, Rasterizer),
+    one(&clc797::SET_CONSERVATIVE_RASTER, Rasterizer),
+    one(&clc797::SET_DA_PRIMITIVE_RESTART, Rasterizer),
     // Depth and stencil state.
     one(&clc797::SET_DEPTH_TEST, DepthStencil),
     one(&clc797::SET_DEPTH_WRITE, DepthStencil),

@@ -31,12 +31,17 @@ pub const VERTEX_STREAMS_PER_HALF: u32 = 16;
 /// `eden-nx2/src/video_core/engines/maxwell_3d.h`).
 pub const VERTEX_STREAMS: u32 = 2 * VERTEX_STREAMS_PER_HALF;
 
-/// Vertex stream sizes (`SET_VERTEX_STREAM_SIZE_A` and `_B`): Mesa's length for
-/// `SET_VERTEX_STREAM_*`, which covers them. Streams from 16 up have no size register here:
-/// **guess**, since the header's gap after `SET_VERTEX_STREAM_SIZE_B(15)` (bytes 0x680 to 0x6FF)
-/// would hold sixteen more, and Eden-NX2 keeps its 32 limits at byte 0x1F00, a method this header
-/// does not define. A trace of a title binding a seventeenth vertex buffer would settle it.
-pub const VERTEX_STREAM_SIZES: u32 = 16;
+/// Vertex stream sizes (`SET_VERTEX_STREAM_SIZE_A` and `_B`): one per stream, Eden-NX2's 32 where
+/// Mesa's `SET_VERTEX_STREAM_*` length gives 16. In native mode Eden-NX2 reads stream `index`'s
+/// size at method `0x600 / 4 + index * 2` (`ADDRESS_UPPER & 0xff`, then the lower word) for
+/// every one of its `NumVertexArrays` = 32 streams (`NativeVertexStreamSize` in
+/// `eden-nx2/src/video_core/engines/maxwell_3d.h`, called from `buffer_cache.h`'s
+/// `UpdateVertexBuffer` and `maxwell_3d.cpp`), and marks each pair dirty
+/// (`FillBlock(tables, 0x600 / sizeof(u32) + i * 2, 2, VertexBuffer0 + i, ...)` for `i` below 32
+/// in `eden-nx2/src/video_core/dirty_flags.cpp` @ 50fa86bb; `eden-pr4588` has the same). The
+/// owner's rule for references that disagree (gpu-protocol decision 10: where one answer contains
+/// the other, the larger) keeps 32. A listed divergence in the `state` module docs.
+pub const VERTEX_STREAM_SIZES: u32 = VERTEX_STREAMS;
 
 /// Vertex attributes in each half, `SET_VERTEX_ATTRIBUTE_A` and `_B`: Mesa's length for
 /// `SET_VERTEX_ATTRIBUTE_*`.
@@ -69,8 +74,10 @@ pub enum GroupKind {
     Viewport,
     /// Every scissor: `SET_SCISSOR_*`. One group, as Eden's `Scissors`.
     Scissor,
-    /// The blend state shared by every target: `SET_BLEND_*` without `PER_TARGET`, and
-    /// `SET_SINGLE_CT_WRITE_CONTROL`.
+    /// The blend state shared by every target: `SET_BLEND_*` without `PER_TARGET`,
+    /// `SET_SINGLE_CT_WRITE_CONTROL`, `SET_GLOBAL_COLOR_KEY` and `SET_SINGLE_ROP_CONTROL` (in
+    /// Eden's `blend` block), the alpha-to-coverage and alpha-to-one control
+    /// (`SET_ANTI_ALIAS_ALPHA_CONTROL`) and the logic op (`SET_LOGIC_OP`, `SET_LOGIC_OP_FUNC`).
     Blend,
     /// Blend target `j`: `SET_BLEND(j)`, `SET_BLEND_PER_TARGET_*(j)` and `SET_CT_WRITE(j)`.
     BlendPerTarget,
@@ -85,7 +92,8 @@ pub enum GroupKind {
     /// Every vertex attribute: `SET_VERTEX_ATTRIBUTE_A` and `_B`. One group, as Eden's
     /// `VertexInput`.
     VertexAttribute,
-    /// The index buffer: `SET_INDEX_BUFFER_*`.
+    /// The index buffer: `SET_INDEX_BUFFER_*`, and `DRAW_INDEX_BUFFER` (Eden's
+    /// `index_buffer.count`, which Eden marks with the rest of the block).
     IndexBuffer,
     /// Bind group `j`'s constant buffers: `BIND_GROUP_CONSTANT_BUFFER(j)`.
     BindGroup,
@@ -94,7 +102,9 @@ pub enum GroupKind {
     /// Pipeline `j` (its program address and stage): `SET_PIPELINE_*(j)`.
     Pipeline,
     /// Rasterizer state: polygon modes, culling, front face, raster enable, polygon offset and
-    /// depth bias, line and point sizes.
+    /// depth bias, line and point sizes, line stipple (`SET_LINE_STIPPLE` and
+    /// `SET_LINE_STIPPLE_PARAMETERS`), anti-aliased lines, conservative raster and primitive
+    /// restart (`SET_DA_PRIMITIVE_RESTART`).
     Rasterizer,
     /// Depth and stencil state: `SET_DEPTH_TEST`, `_WRITE`, `_FUNC`, the depth bounds and every
     /// `SET_STENCIL_*` and `SET_BACK_STENCIL_*`.

@@ -30,6 +30,18 @@
 //! address from the method's strides, the bits from the field, and the valid values of a named
 //! field from its generated list. No bit position, stride or enum value is written by hand here.
 //!
+//! **A departure from the approved spec, for the owner** (`docs/specs/gpu-protocol.md`, "Mirrors
+//! and dirty flags"). The spec says "A generated table maps each method to its groups" and that
+//! the typed accessors "are generated from the same tables (decision 6)". Here neither is
+//! generated: the group table is written by hand (keyed on the generated method constants), and
+//! the getters are hand-listed macro lines that name generated `Method` and `Field` constants.
+//! Nothing `cargo xtask gen-classes` emits says which methods form a group or which fields a
+//! getter returns. Owner question: accept a hand-written table and getter list keyed on the
+//! generated constants, or extend `cargo xtask gen-classes` to emit both. Until then the tests
+//! stand in for generation: `every_register_a_view_reads_marks_that_views_group` checks every
+//! register a getter reads against the group table, and `eden_tracked_registers_mark_a_group`
+//! checks the table against Eden's.
+//!
 //! # A write
 //!
 //! [`Mirror::run`] (and [`Mirror::write`], one word) stores each word in the register, so the
@@ -72,8 +84,9 @@
 //! - Methods, fields and values: the generated tables of `classes/clc797.h` and `clc7c0.h`
 //!   (`mesa-nouveau/src/nouveau/headers/nvidia/classes/` @ 52238762, Copyright (c) 2020, NVIDIA
 //!   CORPORATION, MIT).
-//! - The bind and the halves of the vertex stream and attribute arrays:
-//!   `eden-nx2/src/video_core/engines/maxwell_3d.{h,cpp}` @ 50fa86bb (GPL-3.0-or-later).
+//! - The bind, the halves of the vertex stream and attribute arrays and the native vertex
+//!   stream sizes: `eden-nx2/src/video_core/engines/maxwell_3d.{h,cpp}` and
+//!   `eden-nx2/src/video_core/dirty_flags.cpp` @ 50fa86bb (GPL-3.0-or-later).
 //!
 //! # Divergences and guesses
 //!
@@ -88,16 +101,40 @@
 //!   (`MaxConstBuffers`) and drops a bind to a slot above them ("slot field is 5 bits; the state
 //!   array holds 18"); here every value of the 5-bit `SHADER_SLOT` field has a slot, by the same
 //!   rule. `a_bind_records_the_selected_buffer_in_its_group_and_slot` (slot 31).
-//! - **Vertex stream sizes for streams 0 to 15 only (guess).** The header's
-//!   `SET_VERTEX_STREAM_SIZE_A` and `_B` have Mesa's sixteen elements, while the streams have 32
-//!   (the `_A` and `_B` halves); Eden-NX2 keeps 32 limits at byte 0x1F00, which `clc797.h` does
-//!   not define. [`VertexStream::size`] is [`StateError::Index`] from stream 16 up.
-//!   `stream_attribute_and_binding_accessors_are_bounded_at_their_exact_edge`.
+//! - **Thirty-two vertex stream sizes, not sixteen.** Mesa gives `SET_VERTEX_STREAM_SIZE_A` and
+//!   `_B` sixteen elements; Eden-NX2 in native mode reads a size for each of its 32 streams at
+//!   method `0x600 / 4 + index * 2` (`NativeVertexStreamSize` in `maxwell_3d.h`, used by
+//!   `buffer_cache.h`'s `UpdateVertexBuffer` and by `maxwell_3d.cpp`) and marks each pair dirty
+//!   (`FillBlock(tables, 0x600 / sizeof(u32) + i * 2, 2, VertexBuffer0 + i, ...)` for `i` below
+//!   32 in `eden-nx2/src/video_core/dirty_flags.cpp`; `eden-pr4588` has the same). By decision
+//!   10's "the larger" rule the sizes are one array of 32 ([`VERTEX_STREAM_SIZES`]), and
+//!   [`VertexStream::size`] reads element `j` for stream `j`. The front's `STATE_3D` still gives
+//!   these methods Mesa's 16, which only makes writes to sizes 16 to 31 always-sent triggers
+//!   there. `groups_by_method_number_from_the_header_text` (methods `0x1a0` and `0x1bf`),
+//!   `every_vertex_stream_method_marks_the_stream_of_its_half` and
+//!   `stream_attribute_and_binding_accessors_are_bounded_at_their_exact_edge` (streams 31 and 32).
+//! - **The bind masks the selector to the header's fields.** Eden-NX2's `ProcessCBBind` takes
+//!   the whole `const_buffer.size` word and the whole `address_high` word
+//!   (`ConstantBuffer::Address` in `maxwell_3d.h`); here the size is the selector's `SIZE` field
+//!   (16:0) and the upper address its `ADDRESS_UPPER` field (7:0), as `clc797.h` defines them,
+//!   so bits above those fields are dropped. Decision 10 lets the header win.
+//!   `a_bind_records_the_selected_buffer_in_its_group_and_slot`.
 //! - **Groups are coarser than Eden's Vulkan tracker** in places: one [`GroupKind::Rasterizer`]
 //!   and one [`GroupKind::DepthStencil`] where Eden keeps a flag per dynamic state (cull mode,
 //!   depth compare, stencil reference, ...), and per-target blend groups where Eden has one
-//!   `Blending` flag. Marking more than Eden costs a re-derivation, never a missed change.
-//!   `groups_by_method_number_from_the_header_text`.
+//!   `Blending` flag. Marking more than Eden costs a re-derivation. No change is missed for
+//!   exactly these registers: every register Eden's dirty-flag tables mark that `clc797.h`
+//!   defines (`eden_tracked_registers_mark_a_group`), and every register a typed view's getter
+//!   reads (`every_register_a_view_reads_marks_that_views_group`). A register in neither set
+//!   marks nothing and is counted ([`Mirror::ungrouped_words`]), so a later getter for one needs
+//!   a table line too. `groups_by_method_number_from_the_header_text`.
+//! - **Eden marks two blocks `clc797.h` does not define**, and they mark nothing here: the
+//!   legacy vertex stream limits (`vertex_stream_limits`, byte 0x1F00, two words per stream) and
+//!   the index buffer's limit address (`index_buffer.limit_addr_high` and `_low`, bytes 0x17D0
+//!   and 0x17D4). Ampere takes sizes instead (`SET_VERTEX_STREAM_SIZE_A/B`,
+//!   `SET_INDEX_BUFFER_SIZE_A/B`). Eden's padding words inside a block (the fourth word of each
+//!   scissor, words 10 to 15 of each render target, ...) are no method here either.
+//!   `eden_registers_clc797_does_not_define_mark_nothing`.
 //! - **The spec's `SET_PROGRAM_REGION` is not in `clc797.h`**: Ampere's pipelines take a 64-bit
 //!   program address each (`SET_PIPELINE_PROGRAM_ADDRESS_A` and `_B`), which
 //!   [`Pipeline::program_address`] reads. `index_buffer_pools_and_pipeline_getters`.

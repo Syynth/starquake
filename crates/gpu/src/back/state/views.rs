@@ -41,8 +41,6 @@ pub mod arrays {
     pub const CT_SELECT_TARGET: &str = "colour target select entry";
     /// [`super::ThreeD::vertex_stream`].
     pub const VERTEX_STREAM: &str = "vertex stream";
-    /// [`super::VertexStream::size`].
-    pub const VERTEX_STREAM_SIZE: &str = "vertex stream size";
     /// [`super::ThreeD::vertex_attribute`].
     pub const VERTEX_ATTRIBUTE: &str = "vertex attribute";
     /// [`super::ThreeD::bind_group`].
@@ -405,6 +403,18 @@ getters!(Blend {
     const_alpha: float clc797::SET_BLEND_CONST_ALPHA;
     /// `SET_SINGLE_CT_WRITE_CONTROL_ENABLE`.
     single_ct_write_control: named clc797::SET_SINGLE_CT_WRITE_CONTROL, clc797::SET_SINGLE_CT_WRITE_CONTROL_ENABLE;
+    /// `SET_GLOBAL_COLOR_KEY_ENABLE` (Eden's `blend.enable_global_color_key`).
+    global_color_key: named clc797::SET_GLOBAL_COLOR_KEY, clc797::SET_GLOBAL_COLOR_KEY_ENABLE;
+    /// `SET_SINGLE_ROP_CONTROL_ENABLE` (Eden's `blend.single_rop_control_enable`).
+    single_rop_control: named clc797::SET_SINGLE_ROP_CONTROL, clc797::SET_SINGLE_ROP_CONTROL_ENABLE;
+    /// `SET_ANTI_ALIAS_ALPHA_CONTROL_ALPHA_TO_COVERAGE` (Eden's `AlphaToCoverageEnable`).
+    alpha_to_coverage: named clc797::SET_ANTI_ALIAS_ALPHA_CONTROL, clc797::SET_ANTI_ALIAS_ALPHA_CONTROL_ALPHA_TO_COVERAGE;
+    /// `SET_ANTI_ALIAS_ALPHA_CONTROL_ALPHA_TO_ONE` (Eden's `AlphaToOneEnable`).
+    alpha_to_one: named clc797::SET_ANTI_ALIAS_ALPHA_CONTROL, clc797::SET_ANTI_ALIAS_ALPHA_CONTROL_ALPHA_TO_ONE;
+    /// `SET_LOGIC_OP_ENABLE` (Eden's `LogicOpEnable`).
+    logic_op_enable: named clc797::SET_LOGIC_OP, clc797::SET_LOGIC_OP_ENABLE;
+    /// `SET_LOGIC_OP_FUNC_V` (Eden's `LogicOp`).
+    logic_op_func: named clc797::SET_LOGIC_OP_FUNC, clc797::SET_LOGIC_OP_FUNC_V;
 });
 
 element_view! {
@@ -491,6 +501,9 @@ const CT_SELECT_TARGETS: [Field; 8] = [
 
 // One select entry per colour target, so the entries' bound is [`COLOR_TARGETS`].
 const _: () = assert!(CT_SELECT_TARGETS.len() == COLOR_TARGETS as usize);
+
+// A size for every stream, so `VertexStream::size` needs no bound beyond the stream's own.
+const _: () = assert!(VERTEX_STREAM_SIZES == VERTEX_STREAMS);
 
 getters!(CtSelect {
     /// `SET_CT_SELECT_TARGET_COUNT`.
@@ -678,16 +691,16 @@ impl VertexStream<'_> {
         reg.named(field)
     }
 
-    /// `SET_VERTEX_STREAM_SIZE_A_UPPER` above `SET_VERTEX_STREAM_SIZE_B_LOWER`: only for streams
-    /// below [`VERTEX_STREAM_SIZES`] (a **guess**; see that constant).
+    /// `SET_VERTEX_STREAM_SIZE_A_UPPER` above `SET_VERTEX_STREAM_SIZE_B_LOWER`, element `j` for
+    /// stream `j`: one array of [`VERTEX_STREAM_SIZES`], a size for every stream (Eden-NX2's
+    /// `NativeVertexStreamSize`; see that constant).
     pub fn size(&self) -> Result<u64, StateError> {
-        let index = bounded(arrays::VERTEX_STREAM_SIZE, self.index, VERTEX_STREAM_SIZES)?;
         address(
             self.mirror
-                .reg(&clc797::SET_VERTEX_STREAM_SIZE_A, &[index])?,
+                .reg(&clc797::SET_VERTEX_STREAM_SIZE_A, &[self.index])?,
             clc797::SET_VERTEX_STREAM_SIZE_A_UPPER,
             self.mirror
-                .reg(&clc797::SET_VERTEX_STREAM_SIZE_B, &[index])?,
+                .reg(&clc797::SET_VERTEX_STREAM_SIZE_B, &[self.index])?,
             clc797::SET_VERTEX_STREAM_SIZE_B_LOWER,
         )
     }
@@ -982,6 +995,16 @@ getters!(Rasterizer {
     point_size: float clc797::SET_POINT_SIZE;
     /// `SET_PROVOKING_VERTEX_V`.
     provoking_vertex: named clc797::SET_PROVOKING_VERTEX, clc797::SET_PROVOKING_VERTEX_V;
+    /// `SET_DA_PRIMITIVE_RESTART_ENABLE` (Eden's `PrimitiveRestartEnable`).
+    primitive_restart: named clc797::SET_DA_PRIMITIVE_RESTART, clc797::SET_DA_PRIMITIVE_RESTART_ENABLE;
+    /// `SET_CONSERVATIVE_RASTER_ENABLE` (Eden's `ConservativeRasterizationMode`).
+    conservative_raster: named clc797::SET_CONSERVATIVE_RASTER, clc797::SET_CONSERVATIVE_RASTER_ENABLE;
+    /// `SET_ANTI_ALIASED_LINE_ENABLE` (Eden's `LineRasterizationMode`).
+    anti_aliased_line: named clc797::SET_ANTI_ALIASED_LINE, clc797::SET_ANTI_ALIASED_LINE_ENABLE;
+    /// `SET_LINE_STIPPLE_PARAMETERS_FACTOR` (Eden's `LineStippleParams`).
+    line_stipple_factor: field clc797::SET_LINE_STIPPLE_PARAMETERS, clc797::SET_LINE_STIPPLE_PARAMETERS_FACTOR;
+    /// `SET_LINE_STIPPLE_PARAMETERS_PATTERN` (Eden's `LineStippleParams`).
+    line_stipple_pattern: field clc797::SET_LINE_STIPPLE_PARAMETERS, clc797::SET_LINE_STIPPLE_PARAMETERS_PATTERN;
 });
 
 single_view! {

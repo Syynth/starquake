@@ -72,7 +72,9 @@ fn array_lengths_are_the_cited_values() {
     assert_eq!(COLOR_TARGETS, 8);
     assert_eq!(VERTEX_STREAMS_PER_HALF, 16);
     assert_eq!(VERTEX_STREAMS, 32);
-    assert_eq!(VERTEX_STREAM_SIZES, 16);
+    // Eden-NX2's `NumVertexArrays` (`eden-nx2/src/video_core/engines/maxwell_3d.h` @ 50fa86bb),
+    // larger than Mesa's 16 for `SET_VERTEX_STREAM_SIZE_*` (decision 10).
+    assert_eq!(VERTEX_STREAM_SIZES, 32);
     assert_eq!(VERTEX_ATTRIBUTES_PER_HALF, 16);
     assert_eq!(VERTEX_ATTRIBUTES, 32);
     assert_eq!(BIND_GROUPS, 16);
@@ -87,6 +89,17 @@ fn array_lengths_agree_with_the_front_state_table() {
     let mut checked = 0;
     for entry in GROUPS_3D {
         let method = entry.span.method();
+        // The vertex stream sizes take Eden-NX2's 32 here (decision 10), while the front's
+        // `STATE_3D` still says Mesa's 16. That only makes writes to sizes 16 to 31 always-sent
+        // triggers at the front; the mirror stores and groups them all the same.
+        if [
+            clc797::SET_VERTEX_STREAM_SIZE_A.name,
+            clc797::SET_VERTEX_STREAM_SIZE_B.name,
+        ]
+        .contains(&method.name)
+        {
+            continue;
+        }
         for span in STATE_3D.iter().filter(|span| span.method() == method) {
             assert_eq!(span.count(), entry.span.count(), "{}", method.name);
             checked += 1;
@@ -145,6 +158,24 @@ fn set_operations() {
     // Neighbouring indices of one kind are distinct groups.
     assert!(!ab.contains(group(GroupKind::ColorTarget, 2)));
     assert!(!ab.contains(group(GroupKind::ColorTarget, 4)));
+}
+
+#[test]
+fn clearing_a_clean_group_leaves_it_clean() {
+    // Clearing only removes: a group that is not dirty stays clean, alone or next to one that is.
+    let mut mirror = clean(THREE_D);
+    mirror.clear(set(&[one(GroupKind::Zt)]));
+    assert_eq!(mirror.dirty(), GroupSet::EMPTY);
+    put(&mut mirror, &clc797::SET_DEPTH_FUNC, &[], 1);
+    assert_eq!(mirror.dirty(), set(&[one(GroupKind::DepthStencil)]));
+    mirror.clear(set(&[one(GroupKind::DepthStencil), one(GroupKind::Zt)]));
+    assert_eq!(mirror.dirty(), GroupSet::EMPTY);
+    // A difference whose operand is not a subset leaves out the extra groups.
+    let a = one(GroupKind::Viewport);
+    let b = group(GroupKind::ColorTarget, 3);
+    let c = one(GroupKind::Zt);
+    assert_eq!(set(&[a, b]).difference(set(&[b, c])), set(&[a]));
+    assert_eq!(GroupSet::EMPTY.difference(set(&[c])), GroupSet::EMPTY);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -254,6 +285,14 @@ fn groups_by_method_number_from_the_header_text() {
         (THREE_D, 0x631, &[group(VertexStream, 17)]),
         // SET_VERTEX_STREAM_SIZE_B(15): 0x0604 + 15 * 8.
         (THREE_D, 0x19f, &[group(VertexStream, 15)]),
+        // SET_VERTEX_STREAM_SIZE_A(16): 0x0600 + 16 * 8, past Mesa's 16 (decision 10).
+        (THREE_D, 0x1a0, &[group(VertexStream, 16)]),
+        // SET_VERTEX_STREAM_SIZE_B(31): 0x0604 + 31 * 8, Eden-NX2's last.
+        (THREE_D, 0x1bf, &[group(VertexStream, 31)]),
+        // SET_VERTEX_STREAM_INSTANCE_A(3): 0x1880 + 3 * 4, stream 3.
+        (THREE_D, 0x623, &[group(VertexStream, 3)]),
+        // SET_VERTEX_STREAM_B_LOCATION_A(5): 0x1d04 + 5 * 16, stream 21.
+        (THREE_D, 0x755, &[group(VertexStream, 21)]),
         // SET_VERTEX_ATTRIBUTE_B(15): 0x11a0 + 15 * 4.
         (THREE_D, 0x477, &[one(VertexAttribute)]),
         // SET_INDEX_BUFFER_F: 0x17dc.
@@ -272,6 +311,8 @@ fn groups_by_method_number_from_the_header_text() {
         (THREE_D, 0x487, &[one(CtSelect)]),
         // SET_SURFACE_CLIP_HORIZONTAL: 0x0ff4, two groups.
         (THREE_D, 0x3fd, &[one(Viewport), one(CtSelect)]),
+        // SET_SURFACE_CLIP_VERTICAL: 0x0ff8, two groups.
+        (THREE_D, 0x3fe, &[one(Viewport), one(CtSelect)]),
         // SET_WINDOW_ORIGIN: 0x13ac, two groups.
         (THREE_D, 0x4eb, &[one(Viewport), one(Rasterizer)]),
         // SET_DEPTH_BIAS_CLAMP: 0x187c.
@@ -280,6 +321,26 @@ fn groups_by_method_number_from_the_header_text() {
         (THREE_D, 0x4c3, &[one(DepthStencil)]),
         // SET_BLEND_CONST_ALPHA: 0x1328.
         (THREE_D, 0x4ca, &[one(Blend)]),
+        // SET_GLOBAL_COLOR_KEY: 0x1354 (Eden: `blend.enable_global_color_key`).
+        (THREE_D, 0x4d5, &[one(Blend)]),
+        // SET_SINGLE_ROP_CONTROL: 0x135c (Eden: `blend.single_rop_control_enable`).
+        (THREE_D, 0x4d7, &[one(Blend)]),
+        // SET_ANTI_ALIAS_ALPHA_CONTROL: 0x153c (Eden: `AlphaToCoverage`, `AlphaToOne`).
+        (THREE_D, 0x54f, &[one(Blend)]),
+        // SET_LOGIC_OP: 0x19c4 (Eden: `LogicOpEnable`).
+        (THREE_D, 0x671, &[one(Blend)]),
+        // SET_LOGIC_OP_FUNC: 0x19c8 (Eden: `LogicOp`).
+        (THREE_D, 0x672, &[one(Blend)]),
+        // SET_CONSERVATIVE_RASTER: 0x1148 (Eden: `ConservativeRasterizationMode`).
+        (THREE_D, 0x452, &[one(Rasterizer)]),
+        // SET_ANTI_ALIASED_LINE: 0x1570 (Eden: `LineRasterizationMode`).
+        (THREE_D, 0x55c, &[one(Rasterizer)]),
+        // SET_DA_PRIMITIVE_RESTART: 0x1644 (Eden: `PrimitiveRestartEnable`).
+        (THREE_D, 0x591, &[one(Rasterizer)]),
+        // SET_LINE_STIPPLE_PARAMETERS: 0x1680 (Eden: `LineStippleParams`).
+        (THREE_D, 0x5a0, &[one(Rasterizer)]),
+        // DRAW_INDEX_BUFFER: 0x17e0 (Eden: `index_buffer.count`, `IndexBuffer`).
+        (THREE_D, 0x5f8, &[one(IndexBuffer)]),
         // SET_CONSTANT_BUFFER_SELECTOR_A: 0x2380, no group.
         (THREE_D, 0x8e0, &[]),
         // SET_TEX_HEADER_POOL_A of compute: 0x1574.
@@ -306,6 +367,488 @@ fn the_named_constants_have_the_header_addresses_used_above() {
     assert_eq!(clc797::SET_DEPTH_BIAS_CLAMP.byte_address, 0x187c);
     assert_eq!(clc797::SET_BLEND_CONST_ALPHA.byte_address, 0x1328);
     assert_eq!(clc7c0::SEND_PCAS_A.byte_address, 0x02b4);
+    assert_eq!(clc797::SET_VERTEX_STREAM_SIZE_A.byte_address, 0x0600);
+    assert_eq!(clc797::SET_VERTEX_STREAM_SIZE_B.byte_address, 0x0604);
+    assert_eq!(clc797::SET_SURFACE_CLIP_VERTICAL.byte_address, 0x0ff8);
+    assert_eq!(clc797::SET_GLOBAL_COLOR_KEY.byte_address, 0x1354);
+    assert_eq!(clc797::SET_SINGLE_ROP_CONTROL.byte_address, 0x135c);
+    assert_eq!(clc797::SET_ANTI_ALIAS_ALPHA_CONTROL.byte_address, 0x153c);
+    assert_eq!(clc797::SET_LOGIC_OP.byte_address, 0x19c4);
+    assert_eq!(clc797::SET_LOGIC_OP_FUNC.byte_address, 0x19c8);
+    assert_eq!(clc797::SET_CONSERVATIVE_RASTER.byte_address, 0x1148);
+    assert_eq!(clc797::SET_ANTI_ALIASED_LINE.byte_address, 0x1570);
+    assert_eq!(clc797::SET_DA_PRIMITIVE_RESTART.byte_address, 0x1644);
+    assert_eq!(clc797::SET_LINE_STIPPLE_PARAMETERS.byte_address, 0x1680);
+    assert_eq!(clc797::DRAW_INDEX_BUFFER.byte_address, 0x17e0);
+}
+
+#[test]
+fn every_vertex_stream_method_marks_the_stream_of_its_half() {
+    // Not derived from the table: element `k` of every `_A` method is stream `k`, of every `_B`
+    // method stream `16 + k`, and element `k` of the size pair stream `k` for all 32.
+    use clc797::*;
+    let a_half: [&Method; 5] = [
+        &SET_VERTEX_STREAM_A_FORMAT,
+        &SET_VERTEX_STREAM_A_LOCATION_A,
+        &SET_VERTEX_STREAM_A_LOCATION_B,
+        &SET_VERTEX_STREAM_A_FREQUENCY,
+        &SET_VERTEX_STREAM_INSTANCE_A,
+    ];
+    let b_half: [&Method; 5] = [
+        &SET_VERTEX_STREAM_B_FORMAT,
+        &SET_VERTEX_STREAM_B_LOCATION_A,
+        &SET_VERTEX_STREAM_B_LOCATION_B,
+        &SET_VERTEX_STREAM_B_FREQUENCY,
+        &SET_VERTEX_STREAM_INSTANCE_B,
+    ];
+    let marks = |method: &Method, element: u32| {
+        let mut mirror = clean(THREE_D);
+        put(&mut mirror, method, &[element], 1);
+        mirror.dirty()
+    };
+    for k in 0..VERTEX_STREAMS_PER_HALF {
+        for method in a_half {
+            let expected = set(&[group(GroupKind::VertexStream, k)]);
+            assert_eq!(marks(method, k), expected, "{} element {k}", method.name);
+        }
+        for method in b_half {
+            let stream = VERTEX_STREAMS_PER_HALF + k;
+            let expected = set(&[group(GroupKind::VertexStream, stream)]);
+            assert_eq!(marks(method, k), expected, "{} element {k}", method.name);
+        }
+    }
+    for k in 0..VERTEX_STREAM_SIZES {
+        for method in [&SET_VERTEX_STREAM_SIZE_A, &SET_VERTEX_STREAM_SIZE_B] {
+            let expected = set(&[group(GroupKind::VertexStream, k)]);
+            assert_eq!(marks(method, k), expected, "{} element {k}", method.name);
+        }
+    }
+}
+
+/// Each getter result's `Debug` form, joined.
+macro_rules! probe {
+    ($($read:expr),* $(,)?) => {
+        [$(format!("{:?}", $read)),*].join(" ")
+    };
+}
+
+/// Every getter of the view that reads group `group`, as text (each result's `Debug` form).
+fn read_group(view: ThreeD<'_>, group: Group) -> String {
+    let index = group.index();
+    match group.kind() {
+        GroupKind::Viewport => read_viewport(view, index),
+        GroupKind::Scissor => read_scissor(view, index),
+        GroupKind::Blend => read_blend(view, index),
+        GroupKind::BlendPerTarget => read_blend_per_target(view, index),
+        GroupKind::ColorTarget => read_color_target(view, index),
+        GroupKind::CtSelect => read_ct_select(view, index),
+        GroupKind::Zt => read_zt(view, index),
+        GroupKind::VertexStream => read_vertex_stream(view, index),
+        GroupKind::VertexAttribute => read_vertex_attribute(view, index),
+        GroupKind::IndexBuffer => read_index_buffer(view, index),
+        GroupKind::BindGroup => read_bind_group(view, index),
+        GroupKind::TexPool => read_tex_pool(view, index),
+        GroupKind::Pipeline => read_pipeline(view, index),
+        GroupKind::Rasterizer => read_rasterizer(view, index),
+        GroupKind::DepthStencil => read_depth_stencil(view, index),
+    }
+}
+
+fn read_viewport(view: ThreeD<'_>, _index: u32) -> String {
+    (0..VIEWPORTS)
+        .map(|i| {
+            let v = view.viewport(i).unwrap();
+            probe!(
+                v.scale_x(),
+                v.scale_y(),
+                v.scale_z(),
+                v.offset_x(),
+                v.offset_y(),
+                v.offset_z(),
+                v.swizzle_x(),
+                v.swizzle_y(),
+                v.swizzle_z(),
+                v.swizzle_w(),
+                v.clip_x0(),
+                v.clip_width(),
+                v.clip_y0(),
+                v.clip_height(),
+                v.clip_min_z(),
+                v.clip_max_z(),
+            )
+        })
+        .collect()
+}
+
+fn read_scissor(view: ThreeD<'_>, _index: u32) -> String {
+    (0..SCISSORS)
+        .map(|i| {
+            let s = view.scissor(i).unwrap();
+            probe!(s.enable(), s.xmin(), s.xmax(), s.ymin(), s.ymax())
+        })
+        .collect()
+}
+
+fn read_blend(view: ThreeD<'_>, _index: u32) -> String {
+    let b = view.blend();
+    probe!(
+        b.state_per_target(),
+        b.separate_for_alpha(),
+        b.color_op(),
+        b.color_source_coeff(),
+        b.color_dest_coeff(),
+        b.alpha_op(),
+        b.alpha_source_coeff(),
+        b.alpha_dest_coeff(),
+        b.const_red(),
+        b.const_green(),
+        b.const_blue(),
+        b.const_alpha(),
+        b.single_ct_write_control(),
+        b.global_color_key(),
+        b.single_rop_control(),
+        b.alpha_to_coverage(),
+        b.alpha_to_one(),
+        b.logic_op_enable(),
+        b.logic_op_func(),
+    )
+}
+
+fn read_blend_per_target(view: ThreeD<'_>, index: u32) -> String {
+    let b = view.blend_per_target(index).unwrap();
+    probe!(
+        b.enable(),
+        b.write_red(),
+        b.write_green(),
+        b.write_blue(),
+        b.write_alpha(),
+        b.separate_for_alpha(),
+        b.color_op(),
+        b.color_source_coeff(),
+        b.color_dest_coeff(),
+        b.alpha_op(),
+        b.alpha_source_coeff(),
+        b.alpha_dest_coeff(),
+    )
+}
+
+fn read_color_target(view: ThreeD<'_>, index: u32) -> String {
+    let c = view.color_target(index).unwrap();
+    probe!(
+        c.address(),
+        c.width(),
+        c.height(),
+        c.format(),
+        c.block_width(),
+        c.block_height(),
+        c.block_depth(),
+        c.layout(),
+        c.third_dimension_control(),
+        c.third_dimension(),
+        c.array_pitch(),
+        c.layer(),
+    )
+}
+
+fn read_ct_select(view: ThreeD<'_>, _index: u32) -> String {
+    let c = view.ct_select();
+    let targets: Vec<_> = (0..COLOR_TARGETS).map(|entry| c.target(entry)).collect();
+    probe!(
+        c.target_count(),
+        c.surface_clip_x(),
+        c.surface_clip_width(),
+        c.surface_clip_y(),
+        c.surface_clip_height(),
+        targets,
+    )
+}
+
+fn read_zt(view: ThreeD<'_>, _index: u32) -> String {
+    let z = view.zt();
+    probe!(
+        z.address(),
+        z.format(),
+        z.block_width(),
+        z.block_height(),
+        z.block_depth(),
+        z.array_pitch(),
+        z.width(),
+        z.height(),
+        z.third_dimension(),
+        z.size_control(),
+        z.layer(),
+        z.target_count(),
+    )
+}
+
+fn read_vertex_stream(view: ThreeD<'_>, index: u32) -> String {
+    let s = view.vertex_stream(index).unwrap();
+    probe!(
+        s.enable(),
+        s.stride(),
+        s.address(),
+        s.frequency(),
+        s.instanced(),
+        s.size(),
+    )
+}
+
+fn read_vertex_attribute(view: ThreeD<'_>, _index: u32) -> String {
+    (0..VERTEX_ATTRIBUTES)
+        .map(|i| {
+            let a = view.vertex_attribute(i).unwrap();
+            probe!(
+                a.stream(),
+                a.source(),
+                a.offset(),
+                a.component_bit_widths(),
+                a.numerical_type(),
+                a.swap_r_and_b(),
+            )
+        })
+        .collect()
+}
+
+fn read_index_buffer(view: ThreeD<'_>, _index: u32) -> String {
+    let i = view.index_buffer();
+    probe!(i.address(), i.size(), i.index_size(), i.first())
+}
+
+fn read_bind_group(view: ThreeD<'_>, index: u32) -> String {
+    let g = view.bind_group(index).unwrap();
+    let slots: Vec<_> = (0..CONSTANT_BUFFER_SLOTS)
+        .map(|slot| g.constant_buffer(slot))
+        .collect();
+    probe!(slots)
+}
+
+fn read_tex_pool(view: ThreeD<'_>, _index: u32) -> String {
+    let t = view.tex_pools();
+    probe!(
+        t.header_address(),
+        t.header_maximum_index(),
+        t.sampler_address(),
+        t.sampler_maximum_index(),
+    )
+}
+
+fn read_pipeline(view: ThreeD<'_>, index: u32) -> String {
+    let p = view.pipeline(index).unwrap();
+    probe!(
+        p.enable(),
+        p.shader_type(),
+        p.program_address(),
+        p.register_count(),
+        p.binding_group(),
+    )
+}
+
+fn read_rasterizer(view: ThreeD<'_>, _index: u32) -> String {
+    let r = view.rasterizer();
+    probe!(
+        r.front_polygon_mode(),
+        r.back_polygon_mode(),
+        r.cull_enable(),
+        r.cull_face(),
+        r.front_face(),
+        r.window_origin_mode(),
+        r.window_origin_flip_y(),
+        r.raster_enable(),
+        r.poly_offset_point(),
+        r.poly_offset_line(),
+        r.poly_offset_fill(),
+        r.depth_bias(),
+        r.slope_scale_depth_bias(),
+        r.depth_bias_clamp(),
+        r.line_width(),
+        r.aliased_line_width(),
+        r.point_size(),
+        r.provoking_vertex(),
+        r.primitive_restart(),
+        r.conservative_raster(),
+        r.anti_aliased_line(),
+        r.line_stipple_factor(),
+        r.line_stipple_pattern(),
+    )
+}
+
+fn read_depth_stencil(view: ThreeD<'_>, _index: u32) -> String {
+    let d = view.depth_stencil();
+    probe!(
+        d.depth_test(),
+        d.depth_write(),
+        d.depth_func(),
+        d.depth_bounds_test(),
+        d.depth_bounds_min(),
+        d.depth_bounds_max(),
+        d.stencil_test(),
+        d.stencil_op_fail(),
+        d.stencil_op_zfail(),
+        d.stencil_op_zpass(),
+        d.stencil_func(),
+        d.stencil_func_ref(),
+        d.stencil_func_mask(),
+        d.stencil_mask(),
+        d.two_sided_stencil_test(),
+        d.back_stencil_op_fail(),
+        d.back_stencil_op_zfail(),
+        d.back_stencil_op_zpass(),
+        d.back_stencil_func(),
+        d.back_stencil_func_ref(),
+        d.back_stencil_func_mask(),
+        d.back_stencil_mask(),
+    )
+}
+/// Every 3D group, in bit order.
+fn every_group() -> Vec<Group> {
+    GroupKind::ALL
+        .iter()
+        .flat_map(|&kind| (0..kind.count()).map(move |index| group(kind, index)))
+        .collect()
+}
+
+#[test]
+fn every_register_a_view_reads_marks_that_views_group() {
+    // Found by probing, not from a list: for every register of the 3D file, a write of all ones
+    // to a clean mirror must mark every group whose view then reads differently. A getter whose
+    // method the table leaves out (`DepthStencil::stencil_mask` without `SET_STENCIL_MASK`,
+    // `Pipeline::enable` without `SET_PIPELINE_SHADER`, `CtSelect::surface_clip_y` without
+    // `SET_SURFACE_CLIP_VERTICAL`) fails here.
+    let groups = every_group();
+    let fresh = clean(THREE_D);
+    let before: Vec<String> = {
+        let view = fresh.three_d().unwrap();
+        groups.iter().map(|&g| read_group(view, g)).collect()
+    };
+    let registers = ClassRules::for_class(THREE_D).registers();
+    let mut seen = GroupSet::EMPTY;
+    for method in 0..registers {
+        let mut mirror = clean(THREE_D);
+        mirror.write(method, u32::MAX).unwrap();
+        let view = mirror.three_d().unwrap();
+        for (&g, old) in groups.iter().zip(&before) {
+            if read_group(view, g) != *old {
+                seen = seen.with(g);
+                assert!(
+                    mirror.is_dirty(g),
+                    "method {method:#x} changes what {g:?} reads but does not mark it"
+                );
+            }
+        }
+    }
+    // Every group's view reads at least one register, so none of the checks above is vacuous.
+    assert_eq!(seen.len(), GROUP_COUNT);
+}
+
+#[test]
+fn eden_tracked_registers_mark_a_group() {
+    // The registers Eden's dirty-flag tables mark (`eden/src/video_core/dirty_flags.cpp` and
+    // `eden/src/video_core/renderer_vulkan/vk_state_tracker.cpp` @ cf654052, offsets from
+    // `eden/src/video_core/engines/maxwell_3d.h`), and the native vertex stream sizes Eden-NX2
+    // adds (`eden-nx2/src/video_core/dirty_flags.cpp` @ 50fa86bb), as method numbers: (Eden's
+    // field, first method, elements, methods between elements, words per element). A word
+    // Eden's block covers that `clc797.h` defines no method for is left out and named in the
+    // comment (Eden's padding); the two blocks Eden marks that `clc797.h` does not define at
+    // all are `eden_registers_clc797_does_not_define_mark_nothing`.
+    let tracked: &[(&str, u32, u32, u32, u32)] = &[
+        ("viewport_transform", 0x280, 16, 8, 8),
+        ("viewports", 0x300, 16, 4, 4),
+        ("surface_clip", 0x3fd, 1, 0, 2),
+        ("viewport_scale_offset_enabled", 0x64b, 1, 0, 1),
+        ("window_origin", 0x4eb, 1, 0, 1),
+        // Word 3 of each scissor is Eden's padding.
+        ("scissor_test", 0x380, 16, 4, 3),
+        ("depth_bias", 0x56f, 1, 0, 1),
+        ("depth_bias_clamp", 0x61f, 1, 0, 1),
+        ("slope_scale_depth_bias", 0x55b, 1, 0, 1),
+        ("blend_color", 0x4c7, 1, 0, 4),
+        ("depth_bounds", 0x3e7, 1, 0, 2),
+        ("stencil_two_side_enable", 0x565, 1, 0, 1),
+        ("stencil_front_ref, _func_mask, _mask", 0x4e5, 1, 0, 3),
+        ("stencil_back_ref, _mask, _func_mask", 0x3d5, 1, 0, 3),
+        ("line_width_smooth, _aliased", 0x4ec, 1, 0, 2),
+        (
+            "gl_cull_test_enabled, gl_front_face, gl_cull_face",
+            0x646,
+            1,
+            0,
+            3,
+        ),
+        ("depth_bounds_enable", 0x66f, 1, 0, 1),
+        ("depth_test_enable", 0x4b3, 1, 0, 1),
+        ("depth_write_enabled", 0x4ba, 1, 0, 1),
+        ("stencil_enable", 0x4e0, 1, 0, 1),
+        ("primitive_restart.enabled", 0x591, 1, 0, 1),
+        ("rasterize_enable", 0xdf, 1, 0, 1),
+        ("polygon_offset_point/line/fill_enable", 0x370, 1, 0, 3),
+        ("logic_op.enable", 0x671, 1, 0, 1),
+        ("logic_op.op", 0x672, 1, 0, 1),
+        ("viewport_clip_control", 0x64f, 1, 0, 1),
+        ("line_stipple_enable", 0x59b, 1, 0, 1),
+        ("anti_alias_alpha_control", 0x54f, 1, 0, 1),
+        ("depth_test_func", 0x4c3, 1, 0, 1),
+        ("stencil_front_op", 0x4e1, 1, 0, 4),
+        ("stencil_back_op", 0x566, 1, 0, 4),
+        ("color_mask_common", 0x3e4, 1, 0, 1),
+        ("blend_per_target_enabled", 0x4b9, 1, 0, 1),
+        ("color_mask", 0x680, 8, 1, 1),
+        ("blend", 0x4cf, 1, 0, 17),
+        // Word 7 of each target is Eden's padding.
+        ("blend_per_target", 0x780, 8, 8, 7),
+        ("vertex_attrib_format", 0x458, 32, 1, 1),
+        ("vertex_stream_instances", 0x620, 32, 1, 1),
+        ("vertex_streams", 0x700, 32, 4, 4),
+        ("eden-nx2 native vertex stream sizes", 0x180, 32, 2, 2),
+        ("line_stipple_params", 0x5a0, 1, 0, 1),
+        ("conservative_raster_enable", 0x452, 1, 0, 1),
+        ("line_anti_alias_enable", 0x55c, 1, 0, 1),
+        ("index_buffer.start_addr", 0x5f2, 1, 0, 2),
+        ("index_buffer.format, .first, .count", 0x5f6, 1, 0, 3),
+        ("tex_header", 0x55d, 1, 0, 3),
+        ("tex_sampler", 0x557, 1, 0, 3),
+        // Words 10 to 15 of each render target are Eden's padding.
+        ("rt", 0x200, 8, 16, 10),
+        ("rt_control", 0x487, 1, 0, 1),
+        ("zeta_enable", 0x54e, 1, 0, 1),
+        ("zeta_size", 0x48a, 1, 0, 2),
+        ("zeta", 0x3f8, 1, 0, 5),
+        // Words 9 to 15 of each pipeline are Eden's padding.
+        ("pipelines", 0x800, 6, 16, 9),
+    ];
+    let mut checked = 0;
+    for &(field, first, elements, stride, words) in tracked {
+        for element in 0..elements {
+            for word in 0..words {
+                let method = first + element * stride + word;
+                let mut mirror = clean(THREE_D);
+                mirror.write(method, 1).unwrap();
+                assert!(
+                    !mirror.dirty().is_empty(),
+                    "Eden's {field}: method {method:#x} marks no group"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, 784);
+}
+
+#[test]
+fn eden_registers_clc797_does_not_define_mark_nothing() {
+    // A listed divergence: Eden marks its legacy vertex stream limits (`vertex_stream_limits`,
+    // byte 0x1F00, two words per stream) and the index buffer's limit address
+    // (`index_buffer.limit_addr_high` and `_low`, bytes 0x17D0 and 0x17D4), and `clc797.h`
+    // defines no method at either place: Ampere takes vertex stream and index buffer sizes
+    // instead (`SET_VERTEX_STREAM_SIZE_A/B`, Eden-NX2's `NativeVertexStreamSize`, and
+    // `SET_INDEX_BUFFER_SIZE_A/B`). A write there marks nothing and is counted.
+    let mut methods: Vec<u32> = (0x7c0..0x800).collect();
+    methods.extend([0x5f4, 0x5f5]);
+    for method in methods {
+        let mut mirror = clean(THREE_D);
+        mirror.write(method, 1).unwrap();
+        assert_eq!(mirror.dirty(), GroupSet::EMPTY, "method {method:#x}");
+        assert_eq!(mirror.ungrouped_words(), 1, "method {method:#x}");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -936,7 +1479,9 @@ fn stream_attribute_and_binding_accessors_are_bounded_at_their_exact_edge() {
                 &[VERTEX_STREAMS_PER_HALF - 1],
                 33,
             ),
+            (&SET_VERTEX_STREAM_SIZE_A, &[VERTEX_STREAM_SIZES - 1], 0x31),
             (&SET_VERTEX_STREAM_SIZE_B, &[VERTEX_STREAM_SIZES - 1], 0x44),
+            (&SET_VERTEX_STREAM_SIZE_B, &[VERTEX_STREAMS_PER_HALF], 0x16),
             (
                 &SET_VERTEX_ATTRIBUTE_B,
                 &[VERTEX_ATTRIBUTES_PER_HALF - 1],
@@ -961,18 +1506,25 @@ fn stream_attribute_and_binding_accessors_are_bounded_at_their_exact_edge() {
     );
     let error = index_error(arrays::VERTEX_STREAM, VERTEX_STREAMS, VERTEX_STREAMS);
     assert_eq!(view.vertex_stream(VERTEX_STREAMS).unwrap_err(), error);
-    // The size array is shorter than the streams: stream 16 exists but has no size.
+    // Every stream has a size (Eden-NX2's 32, decision 10): the last stream reads its own
+    // pair, stream 16 (past Mesa's 16) its own, and stream 32 does not exist.
+    assert_eq!(VERTEX_STREAM_SIZES, VERTEX_STREAMS);
     assert_eq!(
         view.vertex_stream(VERTEX_STREAM_SIZES - 1).unwrap().size(),
-        Ok(0x44)
+        Ok(0x31_0000_0044)
     );
-    let stream = view.vertex_stream(VERTEX_STREAM_SIZES).unwrap();
-    let error = index_error(
-        arrays::VERTEX_STREAM_SIZE,
-        VERTEX_STREAM_SIZES,
-        VERTEX_STREAM_SIZES,
+    assert_eq!(
+        view.vertex_stream(VERTEX_STREAMS_PER_HALF).unwrap().size(),
+        Ok(0x16)
     );
-    assert_eq!(stream.size().unwrap_err(), error);
+    assert_eq!(
+        view.vertex_stream(VERTEX_STREAMS_PER_HALF - 1)
+            .unwrap()
+            .size(),
+        Ok(0)
+    );
+    let error = index_error(arrays::VERTEX_STREAM, VERTEX_STREAMS, VERTEX_STREAMS);
+    assert_eq!(view.vertex_stream(VERTEX_STREAM_SIZES).unwrap_err(), error);
     let attribute = view.vertex_attribute(VERTEX_ATTRIBUTES - 1).unwrap();
     assert_eq!(attribute.stream(), Ok(0x1f));
     let error = index_error(
@@ -1483,6 +2035,53 @@ fn blend_getters() {
         blend.const_alpha(),
     ];
     assert_eq!(constants.map(Result::unwrap), [0.25, 0.5, 0.75, 1.0]);
+}
+
+#[test]
+fn blend_logic_op_and_alpha_control_getters() {
+    use clc797::*;
+    let mut mirror = three_d();
+    put_all(
+        &mut mirror,
+        &[
+            (&SET_GLOBAL_COLOR_KEY, &[], SET_GLOBAL_COLOR_KEY_ENABLE_TRUE),
+            (
+                &SET_SINGLE_ROP_CONTROL,
+                &[],
+                SET_SINGLE_ROP_CONTROL_ENABLE_FALSE,
+            ),
+            (&SET_LOGIC_OP, &[], SET_LOGIC_OP_ENABLE_TRUE),
+            (&SET_LOGIC_OP_FUNC, &[], SET_LOGIC_OP_FUNC_V_NAND),
+        ],
+    );
+    // Alpha to coverage on, alpha to one off: the two fields of one word read apart.
+    put_fields(
+        &mut mirror,
+        &SET_ANTI_ALIAS_ALPHA_CONTROL,
+        &[],
+        &[
+            (
+                SET_ANTI_ALIAS_ALPHA_CONTROL_ALPHA_TO_COVERAGE,
+                SET_ANTI_ALIAS_ALPHA_CONTROL_ALPHA_TO_COVERAGE_ENABLE,
+            ),
+            (
+                SET_ANTI_ALIAS_ALPHA_CONTROL_ALPHA_TO_ONE,
+                SET_ANTI_ALIAS_ALPHA_CONTROL_ALPHA_TO_ONE_DISABLE,
+            ),
+        ],
+    );
+    let view = mirror.three_d().unwrap();
+    let blend = view.blend();
+    let added = [
+        blend.global_color_key(),
+        blend.single_rop_control(),
+        blend.alpha_to_coverage(),
+        blend.alpha_to_one(),
+        blend.logic_op_enable(),
+        blend.logic_op_func(),
+    ];
+    let expected = ["TRUE", "FALSE", "ENABLE", "DISABLE", "TRUE", "NAND"];
+    assert_eq!(added.map(name), expected);
 }
 
 #[test]
@@ -2013,6 +2612,53 @@ fn rasterizer_getters() {
         raster.point_size(),
     ];
     assert_eq!(floats.map(Result::unwrap), [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+}
+
+#[test]
+fn rasterizer_restart_raster_and_line_getters() {
+    use clc797::*;
+    let mut mirror = three_d();
+    put_all(
+        &mut mirror,
+        &[
+            (
+                &SET_DA_PRIMITIVE_RESTART,
+                &[],
+                SET_DA_PRIMITIVE_RESTART_ENABLE_TRUE,
+            ),
+            (
+                &SET_CONSERVATIVE_RASTER,
+                &[],
+                SET_CONSERVATIVE_RASTER_ENABLE_FALSE,
+            ),
+            (
+                &SET_ANTI_ALIASED_LINE,
+                &[],
+                SET_ANTI_ALIASED_LINE_ENABLE_TRUE,
+            ),
+        ],
+    );
+    put_fields(
+        &mut mirror,
+        &SET_LINE_STIPPLE_PARAMETERS,
+        &[],
+        &[
+            (SET_LINE_STIPPLE_PARAMETERS_FACTOR, 0x5c),
+            (SET_LINE_STIPPLE_PARAMETERS_PATTERN, 0xa3f1),
+        ],
+    );
+    let view = mirror.three_d().unwrap();
+    let raster = view.rasterizer();
+    let added = [
+        raster.primitive_restart(),
+        raster.conservative_raster(),
+        raster.anti_aliased_line(),
+    ];
+    assert_eq!(added.map(name), ["TRUE", "FALSE", "TRUE"]);
+    assert_eq!(
+        (raster.line_stipple_factor(), raster.line_stipple_pattern()),
+        (Ok(0x5c), Ok(0xa3f1))
+    );
 }
 
 /// A 3D mirror with distinct depth and stencil state.
