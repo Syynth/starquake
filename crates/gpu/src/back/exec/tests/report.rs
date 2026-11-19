@@ -42,6 +42,12 @@ fn one_word(semaphore: u64, payload: u32) -> String {
 
 const BIND: &str = "bind channel=3 subchannel=0 class=0xc797\n";
 
+/// `text`, the ring text of a report, split before its last line: the address and the payload,
+/// then the query word that triggers the release.
+fn split_trigger(text: &str) -> (&str, &str) {
+    text.split_at(text.trim_end().rfind('\n').unwrap() + 1)
+}
+
 #[test]
 fn a_one_word_payload_report_writes_four_bytes() {
     let mut rig = Rig::new();
@@ -256,7 +262,7 @@ fn deferred_instances_are_drawn_before_a_report_semaphore_release() {
     assert!(rig.exec.draws(CHANNEL).unwrap().has_deferred());
     // The address and the payload leave the instances waiting; the query word draws them.
     let report = one_word(SEM, PAYLOAD);
-    let (state, trigger) = report.split_at(report.trim_end().rfind('\n').unwrap() + 1);
+    let (state, trigger) = split_trigger(&report);
     rig.run(state);
     assert!(rig.exec.draws(CHANNEL).unwrap().has_deferred());
     rig.run(trigger);
@@ -285,3 +291,97 @@ fn deferred_instances_are_drawn_before_a_report_semaphore_release() {
     rig.exec.complete();
     assert_eq!(rig.word(SEM), PAYLOAD);
 }
+
+#[test]
+fn deferred_instances_are_drawn_before_a_release_that_finds_the_open_list_empty() {
+    // The list holding the first draw is closed before the report arrives, so the open list is
+    // empty when it does. The deferred instances are drawn into a new list first, and the
+    // release waits for that list; attached before them, it would ride the list in flight.
+    let mut rig = Rig::late();
+    rig.run(&(draw_state() + &instanced(clc797::BEGIN_OP_TRIANGLES)));
+    rig.exec.close(CloseReason::RingEmpty).unwrap();
+    assert!(rig.exec.draws(CHANNEL).unwrap().has_deferred());
+    let late = rig.late.clone().unwrap();
+    assert_eq!(late.submitted(), vec![FenceValue::new(1)]);
+    rig.run(&one_word(SEM, PAYLOAD));
+    assert!(!rig.exec.draws(CHANNEL).unwrap().has_deferred());
+    rig.exec.close(CloseReason::RingEmpty).unwrap();
+    assert_eq!(
+        late.submitted(),
+        vec![FenceValue::new(1), FenceValue::new(2)]
+    );
+    late.finish(FenceValue::new(1));
+    rig.exec.complete();
+    assert_eq!(rig.word(SEM), 0, "the release rode the list in flight");
+    late.finish(FenceValue::new(2));
+    rig.exec.complete();
+    assert_eq!(rig.word(SEM), PAYLOAD);
+}
+
+#[test]
+fn a_failed_deferred_draw_before_a_report_still_releases_and_returns_the_draws_error() {
+    // The deferred instances have a topology the draw path refuses only when it draws them.
+    // The query word still attaches its release, which is written, and returns the draw's
+    // error (exec module docs, "Deferred instanced draws").
+    let mut rig = Rig::new();
+    rig.run(&(draw_state() + &instanced(UNDEFINED_OP)));
+    assert!(rig.exec.draws(CHANNEL).unwrap().has_deferred());
+    let report = one_word(SEM, PAYLOAD);
+    let (state, trigger) = split_trigger(&report);
+    rig.run(state);
+    let fenced = rig.exec.fences().counters().fenced;
+    let trigger = parse_text(trigger).unwrap();
+    assert_eq!(
+        rig.exec.apply(&trigger[0]),
+        Err(ExecError::Draw(DrawError::Topology {
+            value: UNDEFINED_OP
+        }))
+    );
+    assert!(!rig.exec.draws(CHANNEL).unwrap().has_deferred());
+    assert_eq!(rig.exec.fences().counters().fenced - fenced, 1);
+    rig.submit();
+    rig.exec.complete();
+    assert_eq!(rig.word(SEM), PAYLOAD);
+}
+
+#[test]
+fn a_catch_up_finds_a_report_release_in_its_channels_address_space() {
+    // Channel 5 lives in a second space. Its report release waits in the open list behind
+    // channel 3's draw; channel 5's conditional render reads that report, so it must find the
+    // release pending in the second space and catch up with it. A release filed under another
+    // space is not found: no catch-up, and the report is read before it is written.
+    let mut rig = Rig::new();
+    let second = AsId(SPACE.0 + 1);
+    let other_mem = memory();
+    rig.exec
+        .add_space(
+            second,
+            Arc::<Memory>::clone(&other_mem),
+            Arc::new(WriteWatch::new()),
+        )
+        .unwrap();
+    let channel = ChannelId(5);
+    rig.exec.add_channel(channel, second).unwrap();
+    rig.run(&(draw_state() + &draw()));
+    let word = query(
+        clc797::SET_REPORT_SEMAPHORE_D_REPORT_NONE,
+        clc797::SET_REPORT_SEMAPHORE_D_STRUCTURE_SIZE_ONE_WORD,
+    );
+    let sequence = REPORT + 16;
+    rig.run(
+        &(String::from("bind channel=5 subchannel=0 class=0xc797\n")
+            + &report_on(channel, sequence, 5, word)),
+    );
+    let read = |address: u64| {
+        let mut bytes = [0; 4];
+        other_mem.read(address, &mut bytes).unwrap();
+        u32::from_le_bytes(bytes)
+    };
+    assert_eq!((read(sequence), rig.exec.counters().catch_ups), (0, 0));
+    rig.run(
+        &conditional(clc797::SET_RENDER_ENABLE_C_MODE_RENDER_IF_EQUAL)
+            .replace("channel=3 ", "channel=5 "),
+    );
+    assert_eq!((read(sequence), rig.exec.counters().catch_ups), (5, 1));
+}
+
