@@ -1059,12 +1059,17 @@ fn a_conflicting_use_starts_a_new_pass() {
             &Feed::Direct,
             MAGENTA,
         );
-        let Some(Command::Draw(draw)) = second.last_mut() else {
+        let Some(Command::Draw(mut draw)) = second.pop() else {
             unreachable!("the last command is the draw");
         };
         draw.vertex_buffers = vec![at(shared)];
-        draws.extend(second);
-        assert_eq!(s.pixels(draws), image(&[(OTHER, GREEN), (RECT, MAGENTA)]));
+        // Every upload first, so nothing but the conflict separates the two draws.
+        let first = draws.split_off(draws.len() - 1);
+        let mut list = second;
+        list.extend(draws);
+        list.extend(first);
+        list.push(Command::Draw(draw));
+        assert_eq!(s.pixels(list), image(&[(OTHER, GREEN), (RECT, MAGENTA)]));
         assert_eq!(s.gpu.host_errors(), 0);
     });
 }

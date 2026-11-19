@@ -397,6 +397,8 @@ struct World {
     compute: PipelineId,
     /// [`World::graphics`] whose layout has a binding array of textures at (0, 4) as well.
     arrays: PipelineId,
+    /// [`World::graphics`] made for four samples a pixel.
+    multisampled: PipelineId,
 }
 
 const RGBA: PixelFormat = PixelFormat::A8B8G8R8Unorm;
@@ -493,8 +495,9 @@ fn add_pipeline(pipelines: &mut Registry, info: PipelineInfo) -> PipelineId {
     PipelineId::new(i, g)
 }
 
-/// The world's pipelines (graphics, quads, strips, writer, compute, arrays; [`World`]'s docs).
-fn pipelines() -> (Registry, [PipelineId; 6]) {
+/// The world's pipelines (graphics, quads, strips, writer, compute, arrays, multisampled;
+/// [`World`]'s docs).
+fn pipelines() -> (Registry, [PipelineId; 7]) {
     let mut pipelines = Registry::default();
     let eight = vec![VertexStep {
         stride: 8,
@@ -517,7 +520,15 @@ fn pipelines() -> (Registry, [PipelineId; 6]) {
         PipelineInfo::Compute(LayoutInfo {
             groups: vec![vec![entry(0, STORAGE_ENTRY, 4)]],
         }),
-        graphics_info(Topology::Triangles, eight, &[array]),
+        graphics_info(Topology::Triangles, eight.clone(), &[array]),
+        {
+            let PipelineInfo::Graphics(mut info) = graphics_info(Topology::Triangles, eight, &[])
+            else {
+                unreachable!("a graphics pipeline");
+            };
+            info.samples = 4;
+            PipelineInfo::Graphics(info)
+        },
     ];
     let ids = infos.map(|info| add_pipeline(&mut pipelines, info));
     (pipelines, ids)
@@ -566,7 +577,18 @@ fn world() -> World {
         })
         .expect("room");
     let shadow = SamplerId::new(i, g);
-    let (pipelines, [graphics, quads, strips, writer, compute, arrays]) = pipelines();
+    let (
+        pipelines,
+        [
+            graphics,
+            quads,
+            strips,
+            writer,
+            compute,
+            arrays,
+            multisampled,
+        ],
+    ) = pipelines();
     let integers = add_view(
         &mut tables,
         texture(PixelFormat::R32Uint, 4, 4, TextureUsage::SAMPLED),
@@ -600,6 +622,7 @@ fn world() -> World {
         writer,
         compute,
         arrays,
+        multisampled,
     }
 }
 
@@ -858,6 +881,11 @@ fn every_draw_refusal_names_its_rule() {
                     .push(binding(7, BindingResource::Sampler(w.linear)));
             },
             RenderError::Invalid(EXTRA_BINDING),
+        ),
+        (
+            "a pipeline made for another sample count",
+            |w, _, d| d.pipeline = w.multisampled,
+            RenderError::Invalid(TARGET_MISMATCH),
         ),
         (
             "a binding left out",
