@@ -626,8 +626,7 @@ fn each_submit_wakes_once_after_the_new_value_is_stored() {
         let first = backend.submit(CommandList::new()).expect("empty list");
         let second = backend.submit(CommandList::new()).expect("empty list");
         assert_eq!((first, second), (FenceValue::new(1), FenceValue::new(2)));
-        let seen = seen.lock().unwrap().clone();
-        seen
+        seen.lock().unwrap().clone()
     });
     // One wake per completed list, each seeing its own list's value already stored.
     assert_eq!(seen, vec![FenceValue::new(1), FenceValue::new(2)]);
@@ -648,13 +647,14 @@ fn a_refused_list_wakes_nothing() {
         });
         assert_eq!(
             backend.submit(list),
-            Err(crate::error::RenderError::Invalid("no live buffer has this id"))
+            Err(crate::error::RenderError::Invalid(
+                "no live buffer has this id"
+            ))
         );
         assert_eq!(backend.completed(), FenceValue::ZERO);
         // The next good list wakes as usual.
         assert_eq!(backend.submit(CommandList::new()), Ok(FenceValue::new(1)));
-        let seen = seen.lock().unwrap().clone();
-        seen
+        seen.lock().unwrap().clone()
     });
     assert_eq!(seen, vec![FenceValue::new(1)]);
 }

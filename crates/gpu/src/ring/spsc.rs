@@ -51,12 +51,15 @@
 //! A wake is never lost between the consumer's last look and its sleep. A wake stores a flag
 //! and then, if the consumer is marked waiting, rings the condition variable under the ring's
 //! lock. Before it sleeps the consumer marks itself waiting, calls `idle` (with no lock held),
-//! then takes the lock and looks at the flag and the ring once more before it waits, which
-//! releases the lock atomically. The flag and the waiting mark are sequentially consistent
-//! atomics, so a wake that lands after the call to `idle` either sees the mark and rings (it
-//! blocks on the lock until the consumer waits) or is seen by the look under the lock. Pinned
-//! by `a_wake_between_the_last_look_and_the_lock_is_not_lost` and
-//! `a_wake_between_the_lock_and_the_wait_is_not_lost` in `spsc/tests.rs`.
+//! then takes the lock, looks at the flag and the ring once more, and waits, which releases the
+//! lock atomically. The flag and the waiting mark are sequentially consistent atomics, so a
+//! wake whose flag store comes before that look under the lock is seen by it, and one whose
+//! store comes after it sees the mark and rings (blocking on the lock until the consumer
+//! waits). A backend stores its new completed value before it wakes, so a completion that
+//! lands after `idle`'s look is caught by the flag. Pinned by
+//! `a_wake_between_the_last_look_and_the_lock_is_not_lost` and
+//! `a_wake_between_the_lock_and_the_wait_is_not_lost` in `spsc/tests.rs`, and through the back
+//! thread's fence path by `back::fence::tests::a_completion_in_the_window_before_the_sleep_is_not_lost`.
 //!
 //! When a sleep reaches the safety-net bound with no entry and no wake, [`Consumer::pop_or_wake`]
 //! returns [`Popped::Recheck`] instead of sleeping again, so the caller can look at what a
@@ -637,7 +640,7 @@ impl Consumer {
                 None => Duration::MAX,
             };
             let shared = Arc::clone(&self.shared);
-            // Marked before the last look, so a wake that lands after it rings the condvar.
+            // Marked before the look under the lock, so a wake that comes after it rings.
             shared.consumer_waiting.store(true, Ordering::SeqCst);
             if !idle() {
                 shared.consumer_waiting.store(false, Ordering::SeqCst);

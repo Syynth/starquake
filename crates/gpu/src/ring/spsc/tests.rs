@@ -566,7 +566,13 @@ fn an_entry_comes_before_a_wake_and_a_wake_before_idle() {
 #[test]
 fn a_caller_with_work_is_woken_at_once() {
     let (_producer, mut consumer) = ring(8).unwrap();
-    assert_eq!(consumer.pop_or_wake(FOREVER, || false), Ok(Popped::Woken));
+    let mut calls = 0;
+    let popped = consumer.pop_or_wake(FOREVER, || {
+        calls += 1;
+        false
+    });
+    // At its first look, before any spinning.
+    assert_eq!((popped, calls), (Ok(Popped::Woken), 1));
 }
 
 #[test]
