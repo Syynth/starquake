@@ -42,8 +42,8 @@
 //! Colour comes before depth and stencil in the list, as in Eden.
 //!
 //! The clear of one target and layer is [`Command::Clear`] of a view of that layer
-//! ([`TextureCache::render_target_layer`]): the target's own view when it has one layer, so
-//! clears and draws share it. The rectangle is `None` when the clamped area covers the target.
+//! ([`crate::back::texture::TextureCache::render_target_layer`]): the target's own view when
+//! it has one layer, so clears and draws share it. The rectangle is `None` when the clamped area covers the target.
 //! Resolving a target marks it GPU-modified and uploads it first if guest memory is newer, as
 //! for a draw (`back::texture`, "Uses and uploads").
 //!
@@ -657,7 +657,7 @@ impl Entry {
 }
 
 /// The host objects of the draw-based clear (module docs), made on first use.
-pub struct Clears {
+pub(crate) struct Clears {
     backend: Arc<dyn Backend>,
     shaders: [Option<ShaderId>; Entry::COUNT],
     /// Made in this order, destroyed in this order.

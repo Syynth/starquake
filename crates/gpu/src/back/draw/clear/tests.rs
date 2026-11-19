@@ -969,7 +969,7 @@ fn each_clear_surface_bit_asks_for_its_part() {
     rig.clear_stencil(0, FULL_STENCIL_MASK, 0);
     // No bit: nothing.
     assert_eq!(rig.clear_word(0), Ok(Cleared::NOTHING));
-    assert!(rig.clears().is_empty());
+    assert_eq!(rig.clears(), []);
     // Each colour bit alone: a masked colour clear through that channel.
     for (field, bit) in CHANNELS {
         let before = rig.draws_of().len();
@@ -1112,7 +1112,7 @@ fn a_reversed_scissor_clears_nothing() {
                 depth_stencil: None,
             }
         );
-        assert!(rig.commands().is_empty());
+        assert_eq!(rig.commands().len(), 0);
     }
 }
 
@@ -1382,7 +1382,7 @@ fn only_the_aspects_the_format_has_are_cleared() {
                     Some(Part::Skipped(skip)),
                     "{format:#x}"
                 );
-                assert!(rig.commands().is_empty());
+                assert_eq!(rig.commands().len(), 0);
             }
             Ok(value) => {
                 assert_eq!(cleared, ONLY_DEPTH_STENCIL, "{format:#x}");
@@ -1480,22 +1480,19 @@ fn a_depth_value_outside_zero_to_one_is_clamped_and_nan_is_skipped() {
         rig.clear_depth(value);
         rig.clear_stencil(3, FULL_STENCIL_MASK, 0);
         let cleared = rig.clear(depth_stencil(true, true));
-        match expect {
-            Some(depth) => {
-                assert_eq!(cleared, ONLY_DEPTH_STENCIL, "{value}");
-                assert_eq!(
-                    rig.clears()[0].value,
-                    ClearValue::DepthStencil { depth, stencil: 3 },
-                    "{value}"
-                );
-            }
-            None => {
-                assert_eq!(
-                    cleared.depth_stencil,
-                    Some(Part::Skipped(ClearSkip::DepthNotANumber))
-                );
-                assert!(rig.commands().is_empty());
-            }
+        if let Some(depth) = expect {
+            assert_eq!(cleared, ONLY_DEPTH_STENCIL, "{value}");
+            assert_eq!(
+                rig.clears()[0].value,
+                ClearValue::DepthStencil { depth, stencil: 3 },
+                "{value}"
+            );
+        } else {
+            assert_eq!(
+                cleared.depth_stencil,
+                Some(Part::Skipped(ClearSkip::DepthNotANumber))
+            );
+            assert_eq!(rig.commands().len(), 0);
         }
     }
     // A NaN depth value is not read when only stencil is asked.
@@ -1705,7 +1702,7 @@ fn a_stencil_only_target_draws_with_no_fragment_stage_and_binds_nothing() {
         Some(Part::Drawn)
     );
     let draw = rig.draws_of().pop().unwrap();
-    assert!(draw.bindings.is_empty());
+    assert_eq!(draw.bindings, []);
     let snapshot = rig.submit();
     let line = pipeline_line(&snapshot, draw.pipeline);
     assert!(!line.contains("fragment"), "{line}");
@@ -1807,8 +1804,8 @@ fn a_failed_part_appends_no_part_of_the_clear() {
         rig.clear_word(word),
         Err(DrawError::ClearPipelinesFull { limit: 0 })
     );
-    assert!(rig.clears().is_empty());
-    assert!(rig.kinds().is_empty(), "{:?}", rig.kinds());
+    assert_eq!(rig.clears(), []);
+    assert_eq!(rig.kinds(), Vec::<&str>::new());
     // The next attempt, with room, does both.
     rig.draws.clears.pipeline_limit = 1;
     assert_eq!(
@@ -1898,7 +1895,7 @@ fn render_disabled_comes_before_every_other_check() {
             depth_stencil: disabled,
         }
     );
-    assert!(rig.commands().is_empty());
+    assert_eq!(rig.commands().len(), 0);
     // Turned back on: the empty area is next.
     rig.set(
         &clc797::SET_RENDER_ENABLE_C,
