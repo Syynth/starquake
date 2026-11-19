@@ -234,7 +234,7 @@ impl Mirror {
         let Some(&last) = words.last() else {
             return Ok(());
         };
-        if self.class.0 == clc797::CLASS
+        if !self.bindings.is_empty()
             && let Some(group) = BIND_SPAN.numbers().position(|number| number == method)
         {
             for &word in words {

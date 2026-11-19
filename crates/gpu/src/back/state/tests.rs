@@ -582,6 +582,14 @@ fn run_positions_without_a_rule_stay_put() {
         .unwrap();
     let positions: Vec<u32> = mirror.run_positions(past, offset(), 2).unwrap().collect();
     assert_eq!(positions, [0x40; 2]);
+    // A constant buffer load's rule changes the offset, not another register.
+    let selector = clc797::SET_ROOT_TABLE_SELECTOR.method();
+    mirror.write(selector, 0x10_00).unwrap();
+    let positions: Vec<u32> = mirror
+        .run_positions(constant_buffer(0), selector, 2)
+        .unwrap()
+        .collect();
+    assert_eq!(positions, [0x10_00; 2]);
 }
 
 #[test]
