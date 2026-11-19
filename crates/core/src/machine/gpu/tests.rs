@@ -3,6 +3,7 @@
 
 use starquake_gpu::wiring::BackError;
 use starquake_memory::FlatMemory;
+use starquake_trace::SystemClock;
 
 use super::*;
 
@@ -40,8 +41,14 @@ fn each_combination_gets_its_front() {
         (&replay, Some(&memory), false),
         (&replay, None, false),
     ] {
-        let (graphics, keeper) = super::graphics(environment, memory, None, Arc::new(NoWake))
-            .unwrap_or_else(|error| unreachable!("{error}"));
+        let (graphics, keeper) = super::graphics(
+            environment,
+            memory,
+            None,
+            Arc::new(NoWake),
+            SystemClock::new(),
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
         assert_eq!(graphics.gpu().is_some(), gpu, "{environment:?}");
         assert_eq!(graphics.null_front().is_some(), !gpu, "{environment:?}");
         assert_eq!(keeper.is_some(), gpu, "{environment:?}");
@@ -57,12 +64,24 @@ fn the_frame_limit_reaches_either_front() {
     let memory: Arc<dyn GuestMemory> = Arc::new(FlatMemory::new(0x8000_0000, 0x1000));
     let limit = NonZeroU64::new(1);
     for memory in [Some(&memory), None] {
-        let (graphics, _) = super::graphics(&EnvSource::Live, memory, limit, Arc::new(NoWake))
-            .unwrap_or_else(|error| unreachable!("{error}"));
+        let (graphics, _) = super::graphics(
+            &EnvSource::Live,
+            memory,
+            limit,
+            Arc::new(NoWake),
+            SystemClock::new(),
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
         // Nothing handed yet: the limit of one is not reached; with no limit it never is.
         assert!(!graphics.frame_limit_reached());
-        let (unlimited, _) = super::graphics(&EnvSource::Live, memory, None, Arc::new(NoWake))
-            .unwrap_or_else(|error| unreachable!("{error}"));
+        let (unlimited, _) = super::graphics(
+            &EnvSource::Live,
+            memory,
+            None,
+            Arc::new(NoWake),
+            SystemClock::new(),
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
         assert!(!unlimited.frame_limit_reached());
         for built in [&graphics, &unlimited] {
             if let Some(gpu) = built.gpu() {
@@ -170,8 +189,14 @@ fn a_dead_gpus_words_are_plain_and_carry_its_error() {
 #[test]
 fn a_stopped_gpu_ends_the_run_and_a_running_one_does_not() {
     let memory: Arc<dyn GuestMemory> = Arc::new(FlatMemory::new(0x8000_0000, 0x1000));
-    let (graphics, _) = super::graphics(&EnvSource::Live, Some(&memory), None, Arc::new(NoWake))
-        .unwrap_or_else(|error| unreachable!("{error}"));
+    let (graphics, _) = super::graphics(
+        &EnvSource::Live,
+        Some(&memory),
+        None,
+        Arc::new(NoWake),
+        SystemClock::new(),
+    )
+    .unwrap_or_else(|error| unreachable!("{error}"));
     assert!(check_running(&graphics).is_ok());
     graphics.gpu().unwrap().stop().unwrap();
     match check_running(&graphics) {
@@ -186,9 +211,14 @@ fn a_stopped_gpu_ends_the_run_and_a_running_one_does_not() {
 #[test]
 fn finishing_reads_the_gpu_and_keeps_a_clean_ending() {
     let memory: Arc<dyn GuestMemory> = Arc::new(FlatMemory::new(0x8000_0000, 0x1000));
-    let (graphics, keeper) =
-        super::graphics(&EnvSource::Live, Some(&memory), None, Arc::new(NoWake))
-            .unwrap_or_else(|error| unreachable!("{error}"));
+    let (graphics, keeper) = super::graphics(
+        &EnvSource::Live,
+        Some(&memory),
+        None,
+        Arc::new(NoWake),
+        SystemClock::new(),
+    )
+    .unwrap_or_else(|error| unreachable!("{error}"));
     graphics
         .front()
         .barrier(starquake_gpu::interface::Ticket(7));
@@ -257,4 +287,179 @@ fn a_failed_gpu_thread_replaces_only_an_ending_that_reached_the_stop_condition()
             assert_eq!(after, before);
         }
     }
+}
+
+/// A run's clock held at one reading, counting how often it is read (by every copy).
+#[derive(Clone)]
+struct HeldClock {
+    now: starquake_trace::HostNanos,
+    reads: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl HeldClock {
+    fn at(nanos: u64) -> Self {
+        Self {
+            now: starquake_trace::HostNanos(nanos),
+            reads: Arc::default(),
+        }
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl HostClock for HeldClock {
+    fn now(&mut self) -> starquake_trace::HostNanos {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.now
+    }
+}
+
+/// The run's clock in the GPU tests below: 1,000,000,007 ns, which is 614,400,004 ticks of the
+/// guest GPU's timer (614.4 MHz; `starquake_kernel::time`'s
+/// `the_gpu_timer_shares_guest_time_s_zero_and_rounds_down_at_a_tick` works the same reading
+/// by hand), 31,250,000 Switch 2 counter ticks and 19,200,000 Switch 1 ones: every unit gives a
+/// different number.
+const RUN_NOW: u64 = 1_000_000_007;
+const RUN_NOW_GPU_TICKS: u64 = 614_400_004;
+
+#[test]
+fn the_back_s_timestamp_is_the_kernel_s_gpu_timer_reading_of_the_run_s_clock() {
+    let run = HeldClock::at(RUN_NOW);
+    let clock = GuestTimeClock::new(run.clone());
+    assert_eq!(clock.gpu_timestamp(), RUN_NOW_GPU_TICKS);
+    assert_eq!(
+        clock.gpu_timestamp(),
+        gpu_ticks_at(starquake_trace::HostNanos(RUN_NOW)).0
+    );
+    for other_unit in [
+        RUN_NOW,
+        starquake_kernel::time::CounterRate::SWITCH_2
+            .ticks_at(starquake_trace::HostNanos(RUN_NOW))
+            .0,
+        starquake_kernel::time::CounterRate::SWITCH_1
+            .ticks_at(starquake_trace::HostNanos(RUN_NOW))
+            .0,
+    ] {
+        assert_ne!(clock.gpu_timestamp(), other_unit);
+    }
+    // Each timestamp is one reading of the run's clock; the time a list has been open is the
+    // host's and reads it not at all.
+    let reads = run.reads();
+    let _ = clock.elapsed();
+    assert_eq!(run.reads(), reads);
+    let _ = clock.gpu_timestamp();
+    assert_eq!(run.reads(), reads + 1);
+}
+
+/// The production wiring end to end (issue #435, "Tests"): a run's GPU, built by [`graphics`]
+/// over a run's clock held still, performs a 16-byte semaphore release whose timestamp is the
+/// guest GPU timer's reading of that clock.
+#[test]
+fn a_run_s_gpu_writes_guest_time_after_a_release_s_payload() {
+    use starquake_gpu::classes::clc76f;
+    use starquake_gpu::fifo::{GpEntry, MethodMode, PushBuffer, Sync};
+    use starquake_gpu::interface::{
+        AsId, ChannelConfig, GpfifoEntry, Kind, Submission, Submitted, SyncpointId, Target,
+    };
+    use starquake_gpu::sema::ReleaseForm;
+    use starquake_gpu::sema::{self, HostSemaphore, PayloadSize, RELEASE_TIMESTAMP_OFFSET};
+    use starquake_gpu::vm::GpuVm;
+    use starquake_memory::PAGE_SIZE;
+
+    const CPU_BASE: u64 = 0x8000_0000;
+    const PAGES: u64 = 4;
+    // Not equal to the CPU address, so a missed translation writes elsewhere.
+    const GPU_BASE: u64 = 0x12_3400_0000;
+    const SEM_OFFSET: u64 = PAGE_SIZE + 0x10;
+    const PAYLOAD: u32 = 0x5a5a_0001;
+    const SPACE: AsId = AsId(0x21);
+    const PATIENCE: Duration = Duration::from_secs(20);
+
+    let flat = Arc::new(FlatMemory::new(
+        CPU_BASE,
+        usize::try_from(PAGES * PAGE_SIZE).unwrap(),
+    ));
+    let memory: Arc<dyn GuestMemory> = Arc::<FlatMemory>::clone(&flat);
+    let run = HeldClock::at(RUN_NOW);
+    let (graphics, _) = super::graphics(
+        &EnvSource::Live,
+        Some(&memory),
+        None,
+        Arc::new(NoWake),
+        run.clone(),
+    )
+    .unwrap_or_else(|error| unreachable!("{error}"));
+    let vm = Arc::new(GpuVm::new());
+    vm.map(
+        PageRange::new(GPU_BASE, PAGES * PAGE_SIZE).unwrap(),
+        Target::Guest { cpu_va: CPU_BASE },
+        Kind(0),
+    )
+    .unwrap();
+    let front = graphics.front();
+    front.create_address_space(SPACE, vm);
+    let channel = front
+        .create_channel(ChannelConfig {
+            space: SPACE,
+            syncpoint: SyncpointId::new(5).unwrap(),
+        })
+        .unwrap();
+
+    let form = ReleaseForm {
+        size: PayloadSize::Four,
+        timestamp: true,
+    };
+    let operation = sema::encode_semaphored(&HostSemaphore::Release { form, wfi: false }).unwrap();
+    let semaphore = GPU_BASE + SEM_OFFSET;
+    let mut pb = PushBuffer::new();
+    pb.methods(
+        MethodMode::Incrementing,
+        0,
+        u16::try_from(clc76f::SEMAPHOREA.method()).unwrap(),
+        &[
+            u32::try_from(semaphore >> 32).unwrap(),
+            u32::try_from(semaphore & 0xffff_ffff).unwrap(),
+            PAYLOAD,
+            operation,
+        ],
+    )
+    .unwrap();
+    let words = pb.into_words();
+    let stream: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    flat.write(CPU_BASE, &stream).unwrap();
+    let entry = GpEntry {
+        address: GPU_BASE,
+        length: u32::try_from(words.len()).unwrap(),
+        sync: Sync::Proceed,
+        ..GpEntry::default()
+    };
+    let submitted = front.submit(
+        channel,
+        Submission {
+            entries: vec![GpfifoEntry(entry.to_raw().unwrap())],
+            wait: None,
+            increments: 0,
+            wfi: false,
+        },
+    );
+    assert_eq!(submitted, Submitted::Queued);
+
+    let written = usize::try_from(form.bytes()).unwrap();
+    let mut bytes = vec![0; written];
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        flat.read(CPU_BASE + SEM_OFFSET, &mut bytes).unwrap();
+        if bytes[..4] == PAYLOAD.to_le_bytes() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the release was never written");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let at = usize::try_from(RELEASE_TIMESTAMP_OFFSET).unwrap();
+    assert_eq!(bytes[..at], u64::from(PAYLOAD).to_le_bytes());
+    assert_eq!(bytes[at..], RUN_NOW_GPU_TICKS.to_le_bytes());
+    assert!(run.reads() >= 1);
+    graphics.gpu().unwrap().stop().unwrap();
 }

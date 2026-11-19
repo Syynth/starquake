@@ -25,6 +25,8 @@ use starquake_gsv::vi2::{
 
 use std::num::NonZeroU64;
 
+use starquake_trace::SystemClock;
+
 use super::*;
 use crate::hle::graphics::{ReplayError, frames_to_hand};
 use crate::hle::tests::Scratch;
@@ -563,8 +565,14 @@ fn a_presented_image_is_dumped_as_a_png_of_its_pixels() {
 
     let linear = linear_image();
     let shared: Arc<dyn GuestMemory> = image_memory(&linear);
-    let (graphics, keeper) = gpu::graphics(&EnvSource::Live, Some(&shared), None, Arc::new(NoWake))
-        .unwrap_or_else(|error| unreachable!("{error}"));
+    let (graphics, keeper) = gpu::graphics(
+        &EnvSource::Live,
+        Some(&shared),
+        None,
+        Arc::new(NoWake),
+        SystemClock::new(),
+    )
+    .unwrap_or_else(|error| unreachable!("{error}"));
     let keeper = keeper.unwrap();
     map_the_image(&graphics);
 
@@ -613,9 +621,14 @@ fn backend_held_after(count: u32) -> (usize, usize, usize, u64) {
     use starquake_render::Backend;
 
     let shared: Arc<dyn GuestMemory> = image_memory(&linear_image());
-    let (graphics, built) =
-        gpu::graphics_and_backend(&EnvSource::Live, Some(&shared), None, Arc::new(NoWake))
-            .unwrap_or_else(|error| unreachable!("{error}"));
+    let (graphics, built) = gpu::graphics_and_backend(
+        &EnvSource::Live,
+        Some(&shared),
+        None,
+        Arc::new(NoWake),
+        SystemClock::new(),
+    )
+    .unwrap_or_else(|error| unreachable!("{error}"));
     let (_keeper, backend) = built.unwrap();
     map_the_image(&graphics);
     let rig = rig_with(&graphics);
@@ -677,9 +690,14 @@ fn a_gpu_thread_that_failed_turns_a_clean_ending_into_an_emulator_error() {
 
     for clean in [Ending::Exited, Ending::FramesReached] {
         let shared: Arc<dyn GuestMemory> = Arc::new(PanickingMemory(image_memory(&linear_image())));
-        let (graphics, keeper) =
-            gpu::graphics(&EnvSource::Live, Some(&shared), None, Arc::new(NoWake))
-                .unwrap_or_else(|error| unreachable!("{error}"));
+        let (graphics, keeper) = gpu::graphics(
+            &EnvSource::Live,
+            Some(&shared),
+            None,
+            Arc::new(NoWake),
+            SystemClock::new(),
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
         map_the_image(&graphics);
         let rig = rig_with(&graphics);
         assert_eq!(present_and_latch(&rig, &graphics, 1), [1]);

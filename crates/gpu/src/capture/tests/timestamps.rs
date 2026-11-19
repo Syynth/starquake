@@ -5,8 +5,8 @@
 
 use super::*;
 use crate::capture::{
-    Access, BackRecord, Capture, ContentHash, Divergence, ReplayError, ReplayOptions,
-    ReplayOutput, Thread, replay,
+    Access, BackRecord, Capture, ContentHash, Divergence, ReplayError, ReplayOptions, ReplayOutput,
+    Thread, replay,
 };
 use crate::sema::RELEASE_TIMESTAMP_OFFSET;
 
@@ -61,7 +61,10 @@ fn two_timestamped_releases() -> Capture {
 /// then the timestamp at [`RELEASE_TIMESTAMP_OFFSET`].
 fn structure(payload: u32, timestamp: u64) -> Vec<u8> {
     let mut bytes = u64::from(payload).to_le_bytes().to_vec();
-    assert_eq!(u64::try_from(bytes.len()).unwrap(), RELEASE_TIMESTAMP_OFFSET);
+    assert_eq!(
+        u64::try_from(bytes.len()).unwrap(),
+        RELEASE_TIMESTAMP_OFFSET
+    );
     bytes.extend_from_slice(&timestamp.to_le_bytes());
     assert_eq!(u64::try_from(bytes.len()).unwrap(), FORM.bytes());
     bytes

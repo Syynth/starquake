@@ -42,8 +42,29 @@
 //!   each use, which is safe (`starquake_memory::WriteWatch`'s module docs). Each request the
 //!   caches make waits in the watch for the rest of the run: the watch grows by one request per
 //!   cache entry the GPU makes, which the kernel half bounds once it takes them.
-//! - The GPU's clocks are the host's (`Graphics::with_gpu`), and its other settings
-//!   `GpuConfig`'s defaults.
+//! - **The GPU's clocks** ([`GuestTimeClock`], issue #435). The timestamp a 16-byte semaphore
+//!   release writes is guest time from the kernel's clock (gpu-protocol, "Fenced completion";
+//!   the owner's ruling of 2026-11-19, row 29): the back thread's clock reads a copy of the
+//!   run's clock, the one whose other copy the environment wraps for the kernel
+//!   (`crate::clock::Timebase`; a copy shares the zero, so the timestamp counts from guest time's
+//!   zero), and converts the reading with the kernel's
+//!   [`starquake_kernel::time::gpu_ticks_at`], into the guest GPU timer's ticks (614.4 MHz, a
+//!   guess for Switch 2 listed there). Nothing in `core` converts: the kernel owns the
+//!   conversion. How long a list has been open, which only decides when the back closes it, is
+//!   the host's monotonic time, as is the front thread's clock (the acquire poll's back-off).
+//!   The reading is not recorded in the environment's recording: the GPU's threads read it in an
+//!   order the kernel's readings do not fix, and no replay builds the GPU ("Which front"). A
+//!   GPU capture records each one (`starquake_gpu::capture`, the `timestamp` record), and its
+//!   replay writes the recorded value. With a clock that counts its own readings (`--clock
+//!   fixed`), the GPU's copy counts its own: the `n`th timestamp is the clock's `n`th reading,
+//!   not the time the kernel last read.
+//! - The GPU's other settings are `GpuConfig`'s defaults ([`gpu_config`]).
+//!
+//! **Departure: the clock is not in `GpuConfig`.** gpu-protocol says the timestamp is guest time
+//! "which `core` passes through the `Gpu`'s config". `GpuConfig` is a plain settings value
+//! (`Copy`, compared whole by `a_run_asks_the_gpu_to_dump_every_present`), so the clock goes
+//! where the GPU already takes its clocks: [`GpuParts::fence_clock`], into `GpuDeps::fence_clock`,
+//! beside the config. **Owner question**: whether the config should carry the clock instead.
 //!
 //! # During the run
 //!
@@ -82,20 +103,23 @@
 //! [`GPU_DRAIN_WAIT`] without a backend that never completes, which the run does not build.
 
 use std::num::NonZeroU64;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use starquake_gpu::back::buffer::InvalidationSink;
 use starquake_gpu::back::draw::shaders::{SetLookup, ShaderLookup};
 use starquake_gpu::back::exec::{ExecConfig, FrameDumps};
+use starquake_gpu::back::fence::FenceClock;
 use starquake_gpu::wiring::{Gpu, GpuConfig, GpuRing, IDLE_POLL_WAIT, WiringError};
 use starquake_gsv::completion::Wake;
+use starquake_kernel::time::gpu_ticks_at;
 use starquake_memory::{GuestMemory, PageRange, WriteWatch};
 use starquake_render::caps::{DynamicState, StageSupport};
 use starquake_render::{
     Caps, Features, FormatFeatures, FormatTable, Limits, RecordingBackend, SampleCounts,
 };
 use starquake_shader::lookup::{EngineState, ProgramMemory, ProgramRequest, Ticket, VariantKey};
+use starquake_trace::HostClock;
 
 use super::Ending;
 use crate::frames::FrameKeeper;
@@ -204,6 +228,42 @@ impl InvalidationSink for NoShaders {
     fn invalidate(&mut self, _range: PageRange) {}
 }
 
+/// The GPU back thread's clock in a run (module docs, "The GPU's clocks"): its timestamp is guest
+/// time, the kernel's conversion of a reading of the run's clock; its elapsed time is the host's.
+pub(crate) struct GuestTimeClock<C> {
+    /// A copy of the run's clock: the same zero as the environment's copy.
+    guest: Mutex<C>,
+    /// The host's monotonic clock, for how long a list has been open.
+    host: starquake_gpu::front::HostClock,
+}
+
+impl<C> GuestTimeClock<C> {
+    /// The back thread's clock over `guest`, a copy of the run's clock.
+    pub(crate) fn new(guest: C) -> Self {
+        Self {
+            guest: Mutex::new(guest),
+            host: starquake_gpu::front::HostClock::new(),
+        }
+    }
+}
+
+impl<C: HostClock> FenceClock for GuestTimeClock<C> {
+    /// The host's monotonic time since this clock was made.
+    fn elapsed(&self) -> Duration {
+        FenceClock::elapsed(&self.host)
+    }
+
+    /// The guest GPU timer now: [`gpu_ticks_at`] of a reading of the run's clock.
+    fn gpu_timestamp(&self) -> u64 {
+        let now = self
+            .guest
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .now();
+        gpu_ticks_at(now).0
+    }
+}
+
 /// The GPU's settings in a run: `GpuConfig`'s defaults, with every present dumped (module docs,
 /// "The GPU's parts").
 #[must_use]
@@ -219,14 +279,17 @@ pub(crate) fn gpu_config() -> GpuConfig {
 
 /// A run's graphics server (module docs, "Which front"), rung through `wake`, handing its front
 /// no more than `frame_limit` frames, and the frame keeper its GPU dumps into when it has one.
-/// The error is the words the run ends with when the GPU's threads cannot be started.
-pub(crate) fn graphics(
+/// A GPU's release timestamps read `clock`, a copy of the run's clock, as guest time (module
+/// docs, "The GPU's clocks"). The error is the words the run ends with when the GPU's threads
+/// cannot be started.
+pub(crate) fn graphics<C: HostClock + 'static>(
     environment: &EnvSource,
     memory: Option<&Arc<dyn GuestMemory>>,
     frame_limit: Option<NonZeroU64>,
     wake: Arc<dyn Wake>,
+    clock: C,
 ) -> Result<(Graphics, Option<Arc<FrameKeeper>>), String> {
-    let (graphics, gpu) = graphics_and_backend(environment, memory, frame_limit, wake)?;
+    let (graphics, gpu) = graphics_and_backend(environment, memory, frame_limit, wake, clock)?;
     Ok((graphics, gpu.map(|(keeper, _)| keeper)))
 }
 
@@ -235,11 +298,12 @@ pub(crate) type KeeperAndBackend = (Arc<FrameKeeper>, Arc<RecordingBackend>);
 
 /// [`graphics`], with the render backend the GPU was built over when it has one, so that a test
 /// can look at what the backend holds (module docs, "The GPU's parts").
-pub(crate) fn graphics_and_backend(
+pub(crate) fn graphics_and_backend<C: HostClock + 'static>(
     environment: &EnvSource,
     memory: Option<&Arc<dyn GuestMemory>>,
     frame_limit: Option<NonZeroU64>,
     wake: Arc<dyn Wake>,
+    clock: C,
 ) -> Result<(Graphics, Option<KeeperAndBackend>), String> {
     let shared = if builds_gpu(environment, memory.is_some()) {
         memory
@@ -265,6 +329,7 @@ pub(crate) fn graphics_and_backend(
         guest: Arc::clone(memory),
         watch: Arc::new(WriteWatch::new()),
         config: gpu_config(),
+        fence_clock: Arc::new(GuestTimeClock::new(clock)),
     };
     let graphics = Graphics::with_gpu(Some(wake), parts)
         .map_err(|error| format!("the GPU could not be started: {error}"))?
