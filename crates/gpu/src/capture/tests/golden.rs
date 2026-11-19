@@ -578,7 +578,8 @@ fn shader_records() {
             address: 0x9000 + index,
         })
         .collect();
-    let mut body = vec![vec![0x27], u32le(7)];
+    // The cache's accesses, then the request count: distinct values, so swapped reads fail.
+    let mut body = vec![vec![0x27], u32le(0x0b0c_0d0e), u32le(7)];
     for (index, (_, byte)) in (0u64..).zip(stages) {
         body.extend([vec![byte], u64le(0x9000 + index)]);
     }
@@ -595,6 +596,7 @@ fn shader_records() {
         expected.push(answer_bytes.clone());
         back(
             &BackRecord::ShaderLookup {
+                cache_accesses: 0x0b0c_0d0e,
                 requests: requests.clone(),
                 answer,
             },

@@ -258,6 +258,111 @@ fn a_file_past_the_limit_is_refused_without_being_read_whole() {
     );
 }
 
+/// The file's length at the bound is read (and then refused by the reader for what it holds,
+/// not its length); one byte past it is refused from the length alone.
+#[test]
+fn the_read_bound_is_exact_on_both_sides() {
+    let scratch = Scratch::new("bound");
+    let path = scratch.file("eight.sqgc", b"SQGCSQGC");
+    assert!(matches!(
+        read_bounded(&path, 8).unwrap(),
+        Read::Bytes(bytes) if bytes == b"SQGCSQGC"
+    ));
+    assert!(matches!(read_bounded(&path, 7).unwrap(), Read::TooLarge(8)));
+
+    // At the real bound, a sparse file of zeros is read and is not a capture.
+    let at = scratch.0.join("at.sqgc");
+    let file = fs::File::create(&at).unwrap();
+    file.set_len(u64::try_from(MAX_CAPTURE_BYTES).unwrap())
+        .unwrap();
+    drop(file);
+    let error = gpu_replay(&args(at.clone(), None, None)).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "the capture {} is malformed: the file is not a GPU capture: it starts with 00 00 00 \
+             00, not SQGC",
+            at.display()
+        )
+    );
+    fs::remove_file(&at).unwrap();
+    // One byte past it: refused from the length.
+    let past = scratch.0.join("past.sqgc");
+    let file = fs::File::create(&past).unwrap();
+    file.set_len(u64::try_from(MAX_CAPTURE_BYTES).unwrap() + 1)
+        .unwrap();
+    drop(file);
+    assert!(matches!(
+        read_bounded(&past, MAX_CAPTURE_BYTES).unwrap(),
+        Read::TooLarge(len) if len == MAX_CAPTURE_BYTES + 1
+    ));
+    assert_eq!(
+        gpu_replay(&args(past.clone(), None, None))
+            .unwrap_err()
+            .to_string(),
+        format!(
+            "the capture {} is malformed: the capture is {} bytes; at most {MAX_CAPTURE_BYTES} \
+             bytes are read",
+            past.display(),
+            MAX_CAPTURE_BYTES + 1
+        )
+    );
+}
+
+/// The summary of a whole replay that applied exactly the presents `--until` asked for says
+/// nothing more; one present short, it says the capture ended first.
+#[test]
+fn the_summary_says_the_capture_ended_only_when_presents_were_missing() {
+    let output = ReplayOutput {
+        ring: vec![],
+        render: String::new(),
+        writes: vec![],
+        presents: 1,
+        stopped_early: false,
+        blobs: std::sync::Arc::new(starquake_gpu::capture::Blobs::new()),
+    };
+    let whole = "replayed the whole capture: 0 ring entries, 1 presents; the ring and the render \
+                 stream match the capture\n";
+    let path = PathBuf::from("unused.sqgc");
+    assert_eq!(
+        render_output(&output, &args(path.clone(), Some(1), None)),
+        whole
+    );
+    assert_eq!(
+        render_output(&output, &args(path.clone(), None, None)),
+        whole
+    );
+    assert_eq!(
+        render_output(&output, &args(path, Some(2), None)),
+        format!("{whole}the capture ended before present 2\n")
+    );
+}
+
+/// A capture without a render stream is malformed: a replay that succeeds always compared one.
+#[test]
+fn a_capture_without_a_render_stream_is_malformed() {
+    let scratch = Scratch::new("no-render");
+    let capture = capture(1);
+    let mut file = capture.to_bytes().unwrap();
+    // The outputs end the file: drop the render record (a tag and a hash) and lower the count.
+    let outputs = capture.outputs.len();
+    let count_at = file.len() - outputs * 17 - 4;
+    file.truncate(file.len() - 17);
+    let lower = u32::try_from(outputs - 1).unwrap();
+    file[count_at..count_at + 4].copy_from_slice(&lower.to_le_bytes());
+    let path = scratch.file("no-render.sqgc", &file);
+    let error = gpu_replay(&args(path.clone(), None, None)).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "the capture {} is malformed: the capture's outputs hold 0 render command streams; \
+             a capture holds exactly one",
+            path.display()
+        )
+    );
+    assert_eq!(error.exit_code(), exit_code::EMULATOR_ERROR);
+}
+
 #[test]
 fn dump_names_are_the_three_the_contract_lists() {
     assert_eq!(Dump::from_name("ring"), Some(Dump::Ring));

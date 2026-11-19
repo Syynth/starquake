@@ -56,7 +56,7 @@
 //! | `24` | timestamp | `u64` |
 //! | `25` | waiters | `u32` count; each `u32` channel, `u32` space, `u64` address, `u8` operation (0 equal, 1 greater or equal, 2 circular greater or equal, 3 and, 4 nor), `u32` payload, `u8` latched |
 //! | `26` | drain | `u32` space, `u32` count of (`u64` start, `u64` size) |
-//! | `27` | shader lookup | `u32` count of (`u8` stage, 0–6 in `GuestStage` order, `u64` address); answer |
+//! | `27` | shader lookup | `u32` accesses the cache made while answering; `u32` count of (`u8` stage, 0–6 in `GuestStage` order, `u64` address); answer |
 //! | `28` | shader wait | `u64` ticket; answer |
 //! | `30` | read | `u32` space, `u64` address, `u64` length; `u8` 0 then the bytes' hash, or 1 then a fault |
 //! | `31` | write | `u32` space, `u64` address, the bytes' hash; `u8` 0, or 1 then a fault |
@@ -69,15 +69,33 @@
 //! `u64` length; 2 guest, `u64` GPU address and `u64` guest address; 3 shim write, `u64`
 //! address. A shader answer is `u8` 0 ready, 1 pending then `u64` ticket, or 2 rejected.
 //!
-//! The reader checks the magic, then the version, before anything else; then every field's
-//! range (a syncpoint below 192, whole pages, flags 0 or 1, known kinds), the header's lists
-//! (spaces distinct, channel ids distinct, each channel's space listed), the blob table's order
-//! and each blob's hash, that every blob a record names is in the table, and that a read's
-//! length is its blob's. Golden bytes for every record are pinned in `tests::golden`.
+//! The reader refuses a file longer than [`MAX_CAPTURE_BYTES`] unread, then checks the magic,
+//! then the version, before anything else; then, in file order, every field's range (a
+//! syncpoint below 192, whole pages, flags 0 or 1, known kinds), the header's lists (each at
+//! most [`MAX_SPACES`] or [`MAX_CHANNELS`] long, refused from its count; spaces distinct,
+//! channel ids distinct, each channel's space listed, a channel's repeat before its space), the
+//! memory budget (below), the blob table's order and each blob's hash; then, once the file is
+//! read, in this order: each `waiters` record lists a header channel at most once and in that
+//! channel's space, the outputs hold exactly one render stream, every blob a record names is
+//! in the table, and a read's length is its blob's. The writer ([`Capture::to_bytes`]) makes
+//! the same checks of what it writes (the header's, then the last ones, then the budget and the
+//! file's length), so every file it writes reads back. Golden bytes for every record are pinned
+//! in `tests::golden`.
 //!
-//! **Bounds.** [`Capture::parse`] reads at most [`MAX_CAPTURE_BYTES`]; every list it reads is
-//! read item by item (no allocation from a count), so what it holds is at most a small multiple
-//! of the file's length. A replay's ring is held by a collector bounded at
+//! **Bounds.** [`Capture::parse`] reads at most [`MAX_CAPTURE_BYTES`], and charges what it
+//! keeps against [`MAX_CAPTURE_MEMORY`] before taking the memory: each list at the capacity it
+//! grows to (doubling from four items, so its spare room is counted too), each record its size
+//! in memory (a one-byte `turn` record costs a whole [`FrontRecord`]), the build id and each
+//! blob's bytes and handle. Past the budget it stops ([`CaptureError::OverBudget`]). Not
+//! counted: the blob table's tree nodes; the sets the header's checks use (at most
+//! [`MAX_SPACES`] plus [`MAX_CHANNELS`] ids); the input bytes themselves; and, while a list
+//! grows, its old buffer, held alongside the new one for the copy (so the peak is up to half
+//! as much again as the list's charge). Every record and list item takes at least as many
+//! bytes in memory as in the file (`tests::parse::each_item_takes_at_least_its_file_bytes_in_memory`),
+//! so [`MAX_CAPTURE_BYTES`] is the budget itself: a longer file could not fit it. Every list is
+//! read item by item (no allocation from a count). [`replay()`] takes the capture by value and
+//! copies neither its logs nor its blobs; the writes it reports name their blobs
+//! ([`ReplayedWrite`]). A replay's ring is held by a collector bounded at
 //! [`MAX_COLLECTED_WORDS`]; past it the replay stops ([`CollectError::Overflow`]).
 //!
 //! # What the logs hold
@@ -99,16 +117,20 @@
 //!
 //! # Replay
 //!
-//! [`replay()`] restores the starting state and builds a fresh front with a [`ReplayMemory`]
+//! [`replay()`] first makes the reader's checks of the capture (a capture made in memory is
+//! checked as a file is: [`ReplayError::Malformed`]), then restores the starting state and
+//! builds a fresh front with a [`ReplayMemory`]
 //! per address space answering from the front log, runs one turn per `turn` record after
 //! queueing the requests and reports recorded before it, then stops it: the ring it pushed is
 //! compared with the capture's ring hashes, first difference first
 //! ([`ReplayError::RingDiffers`], then [`ReplayError::RingLength`]). Then a fresh back (the
 //! recording backend with the capture's `Caps`, the executor, the fence path) takes its steps
 //! from the back log: each `apply` applies the next entry the front pushed. When the back ran
-//! the whole log, the recording backend's snapshot text is compared with the capture's render
-//! stream ([`ReplayError::RenderDiffers`]). `--until present=N` stops the back once it has
-//! applied `N` presents.
+//! the whole log, the recording backend's snapshot text is compared with the capture's one
+//! render stream ([`ReplayError::RenderDiffers`]; a capture holds exactly one, so a whole
+//! replay always compares it). `--until present=N` stops the back once it has applied `N`
+//! presents; when that is the end of the back log, the replay is a whole one and compares the
+//! render stream (`tests::replay::until_present_at_the_back_logs_end_is_a_whole_replay`).
 //!
 //! A call that is not the log's next record, a top-level record the driver did not expect, or
 //! a `complete` whose fence the backend has not reached, stops the replay with the thread and
@@ -128,8 +150,11 @@
 //!   key, the questions answered or the shaders: those go in the shader capture format of
 //!   shader-pipeline slice 20, which is not built. A replay feeds back a pending answer; a ready
 //!   or rejected one stops it ([`ReplayError::Unsupported`]). The live cache's reads while it
-//!   answered are in the back log before the lookup record, and a replayed lookup steps past
-//!   them.
+//!   answered are in the back log just before the lookup record, which counts them; a replayed
+//!   lookup steps past exactly that many, each a read or a query, and diverges at its cursor
+//!   when the records before the lookup record are not exactly those (a read of the back's own
+//!   that the replay did not make,
+//!   `tests::seams::a_back_read_the_replay_skipped_before_a_lookup_diverges_at_its_index`).
 //! - **Write-tracking drains.** Only the builder records captures, and its watches are never
 //!   armed, so no capture has a `drain` record; a replay refuses one
 //!   ([`ReplayError::Unsupported`]).
@@ -169,7 +194,11 @@
 //! # Checks, in order, and the tests that pin them
 //!
 //! - Header: magic, then version (`tests::parse::the_magic_is_checked_before_the_version`,
-//!   `the_version_is_checked_before_the_body`).
+//!   `the_version_is_checked_before_the_body`); a channel's repeated id before its unlisted
+//!   space (`tests::parse::the_header_lists_are_checked`).
+//! - After the file is read: the `waiters` records, then the render stream, then the named
+//!   blobs; the header's checks before all three when written
+//!   (`tests::parse::the_last_checks_run_in_order`).
 //! - Replay: the starting state, then the front log, then the ring (a differing entry before a
 //!   different length, `tests::replay::a_ring_hash_the_capture_lacks_is_a_length_difference`),
 //!   then the back log, then the render stream
@@ -191,8 +220,8 @@ mod tests;
 pub use drive::{CollectError, MAX_COLLECTED_WORDS, entry_hash};
 pub use format::{
     Access, BackRecord, Blobs, Capture, CaptureError, CapturedChannel, ContentHash,
-    EngineStateKind, FrontRecord, Header, MAGIC, MAX_BUILD_ID, MAX_CAPTURE_BYTES, Output,
-    ShaderAnswer, StateRecord, TAGS, VERSION,
+    EngineStateKind, FrontRecord, Header, MAGIC, MAX_BUILD_ID, MAX_CAPTURE_BYTES,
+    MAX_CAPTURE_MEMORY, MAX_CHANNELS, MAX_SPACES, Output, ShaderAnswer, StateRecord, TAGS, VERSION,
 };
 pub use record::{
     RecordError, Recorded, Recorder, RecordingFenceClock, RecordingFrontClock, RecordingMemory,

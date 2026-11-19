@@ -311,8 +311,9 @@ pub(crate) fn answer_of(answer: &SetLookup) -> ShaderAnswer {
 }
 
 /// A shader cache that records every lookup and wait of the cache it wraps, after the cache
-/// answered: the reads the cache made while answering are in the back log before the record
-/// (through the back's [`RecordingMemory`]).
+/// answered: the reads the cache made while answering are in the back log just before the
+/// record (through the back's [`RecordingMemory`]), and the lookup record counts them (the back
+/// log's growth while the cache answered), so a replay steps past exactly those.
 pub struct RecordingShaders {
     inner: Box<dyn ShaderCache>,
     recorder: Arc<Recorder>,
@@ -333,8 +334,11 @@ impl ShaderLookup for RecordingShaders {
         memory: &dyn ProgramMemory,
         state: &dyn EngineState,
     ) -> SetLookup {
+        let before = self.recorder.back_len();
         let answer = self.inner.lookup(requests, variant, memory, state);
+        let made = self.recorder.back_len().saturating_sub(before);
         self.recorder.back(BackRecord::ShaderLookup {
+            cache_accesses: u32::try_from(made).unwrap_or(u32::MAX),
             requests: requests.to_vec(),
             answer: answer_of(&answer),
         });

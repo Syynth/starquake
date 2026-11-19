@@ -2,6 +2,7 @@
 //! their logs ([`ReplayMemory`] and the clocks and shader cache here), and [`replay`], which runs
 //! the real front on its log, then the real back on the ring the front made and its own log.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -14,8 +15,8 @@ use thiserror::Error;
 
 use super::drive::{CollectError, Collector, Discard, MAX_COLLECTED_WORDS, Retired, entry_hash};
 use super::format::{
-    Access, BackRecord, Blobs, Capture, ContentHash, EngineStateKind, FrontRecord, Output,
-    ShaderAnswer, StateRecord,
+    Access, BackRecord, Blobs, Capture, CaptureError, ContentHash, EngineStateKind, FrontRecord,
+    Header, Output, ShaderAnswer, StateRecord,
 };
 use super::record::Thread;
 use crate::back::buffer::InvalidationSink;
@@ -52,6 +53,10 @@ pub struct Divergence {
 /// Why a replay stopped before its end, or could not start.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum ReplayError {
+    /// The capture fails a check the reader makes ([`Capture::parse`]): a capture made in
+    /// memory is checked as a file is.
+    #[error("the capture is malformed: {0}")]
+    Malformed(#[from] CaptureError),
     /// The replay diverged.
     #[error(transparent)]
     Diverged(#[from] Divergence),
@@ -141,8 +146,11 @@ pub struct ReplayOptions {
     pub until_present: Option<u64>,
 }
 
-/// A write a replayed thread made, as the capture recorded it and the replay matched it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A write a replayed thread made, as the capture recorded it and the replay matched it. The
+/// bytes are not copied: they are the blob `data` names, in [`ReplayOutput::blobs`] (a matched
+/// write's bytes hash to a blob the capture's checks found in the table), so a stream that
+/// writes one large blob many times holds it once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReplayedWrite {
     /// The thread.
     pub thread: Thread,
@@ -150,8 +158,10 @@ pub struct ReplayedWrite {
     pub space: AsId,
     /// The GPU address.
     pub va: u64,
-    /// The bytes.
-    pub data: Vec<u8>,
+    /// The bytes' blob.
+    pub data: ContentHash,
+    /// The bytes' length.
+    pub len: u64,
     /// The outcome the capture recorded.
     pub result: Result<(), GpuFault>,
 }
@@ -169,6 +179,8 @@ pub struct ReplayOutput {
     pub presents: u64,
     /// Whether the replay stopped at `--until present=N`, before the capture's end.
     pub stopped_early: bool,
+    /// The capture's blob table, which the writes name.
+    pub blobs: Arc<Blobs>,
 }
 
 /// One log being fed back, shared by the seams that answer from it.
@@ -406,7 +418,8 @@ impl<R: Logged + Send> GpuMemory for ReplayMemory<R> {
                     thread,
                     space,
                     va,
-                    data: data.to_vec(),
+                    data: hash,
+                    len: u64::try_from(data.len()).unwrap_or(u64::MAX),
                     result,
                 });
                 result
@@ -497,8 +510,11 @@ impl FenceClock for ReplayFenceClock {
 /// The shader cache in replay: answers each lookup and wait from the back log.
 ///
 /// The live cache's reads while it answered precede its record in the log (module docs,
-/// "Shader lookups"); a lookup here steps past them (reads and queries, not writes) to the
-/// lookup record. A pending answer is given back as it was. A ready or rejected answer stops the
+/// "Shader lookups"), and the record counts them. A lookup here steps past exactly that many
+/// records, each of which must be a read or a query (not a write), to the lookup record: when
+/// the records from the cursor to the next lookup record are not exactly the ones it counts
+/// (the back skipped a read of its own before the lookup, say), the lookup diverges at the
+/// cursor. A pending answer is given back as it was. A ready or rejected answer stops the
 /// replay ([`ReplayError::Unsupported`]): its shaders or reason are not in the capture.
 struct ReplayShaders(Shared<BackRecord>);
 
@@ -532,23 +548,38 @@ impl ShaderLookup for ReplayShaders {
         _state: &dyn EngineState,
     ) -> SetLookup {
         let mut cursor = lock(&self.0);
+        if cursor.failure.is_some() {
+            return SetLookup::Pending(Ticket::new(0));
+        }
+        // The next record that is not a read or a query: each lookup either consumes the
+        // records it walks or stops the replay, so the walks are linear in the log.
+        let start = cursor.next;
+        let mut at = start;
         while let Some(BackRecord::Access(
             Access::Read { .. } | Access::GpuOnly { .. } | Access::Generation { .. },
-        )) = cursor.records.get(cursor.next)
+        )) = cursor.records.get(at)
         {
-            cursor.next += 1;
+            at += 1;
         }
-        let made = || format!("the back looked up {} programs", requests.len());
-        let answer = cursor.take(made, |record| match record {
-            BackRecord::ShaderLookup {
+        let walked = at - start;
+        let answer = match cursor.records.get(at) {
+            Some(BackRecord::ShaderLookup {
+                cache_accesses,
                 requests: logged,
                 answer,
-            } if logged.as_slice() == requests => Some(*answer),
+            }) if logged.as_slice() == requests
+                && usize::try_from(*cache_accesses).ok() == Some(walked) =>
+            {
+                Some(*answer)
+            }
             _ => None,
-        });
-        match answer {
-            Some(answer) => Self::answer(&mut cursor, answer),
-            None => SetLookup::Pending(Ticket::new(0)),
+        };
+        if let Some(answer) = answer {
+            cursor.next = at + 1;
+            Self::answer(&mut cursor, answer)
+        } else {
+            cursor.diverge(format!("the back looked up {} programs", requests.len()));
+            SetLookup::Pending(Ticket::new(0))
         }
     }
 
@@ -594,20 +625,19 @@ struct Restored {
 }
 
 fn restore_state(capture: &Capture) -> Result<Restored, ReplayError> {
-    let mut saved: Vec<(AsId, Arc<GpuVm>)> = Vec::new();
+    let listed: BTreeSet<AsId> = capture.header.spaces.iter().copied().collect();
+    let mut saved: BTreeMap<AsId, Arc<GpuVm>> = BTreeMap::new();
     let mut syncpoints = None;
     for record in &capture.state {
         match *record {
             StateRecord::AddressTable { space, blob } => {
-                if !capture.header.spaces.contains(&space)
-                    || saved.iter().any(|(known, _)| *known == space)
-                {
+                if !listed.contains(&space) || saved.contains_key(&space) {
                     return Err(ReplayError::StateSpace { space });
                 }
                 let bytes = capture.blobs.get(blob).unwrap_or_default();
                 let vm = GpuVm::restore(bytes)
                     .map_err(|error| ReplayError::AddressTable { space, error })?;
-                saved.push((space, Arc::new(vm)));
+                saved.insert(space, Arc::new(vm));
             }
             StateRecord::Syncpoints { blob } => {
                 if syncpoints.is_some() {
@@ -626,9 +656,8 @@ fn restore_state(capture: &Capture) -> Result<Restored, ReplayError> {
         .iter()
         .map(|&space| {
             let vm = saved
-                .iter()
-                .find(|(known, _)| *known == space)
-                .map_or_else(|| Arc::new(GpuVm::new()), |(_, vm)| Arc::clone(vm));
+                .get(&space)
+                .map_or_else(|| Arc::new(GpuVm::new()), Arc::clone);
             (space, vm)
         })
         .collect();
@@ -679,14 +708,12 @@ struct FrontRun {
 impl FrontReplay {
     /// A fresh front over the restored state, with the header's spaces and channels made.
     fn new(
-        capture: &Capture,
+        header: &Header,
+        log: Vec<FrontRecord>,
         restored: &Restored,
         blobs: &Arc<Blobs>,
     ) -> Result<Self, ReplayError> {
-        let cursor: Shared<FrontRecord> = Arc::new(Mutex::new(Cursor::new(
-            Thread::Front,
-            capture.front.clone(),
-        )));
+        let cursor: Shared<FrontRecord> = Arc::new(Mutex::new(Cursor::new(Thread::Front, log)));
         let (producer, consumer) =
             ring(RING_WORDS).map_err(|error| ReplayError::Ring(error.to_string()))?;
         let collector = Collector::start(consumer, MAX_COLLECTED_WORDS)
@@ -710,7 +737,7 @@ impl FrontReplay {
             let memory: Arc<dyn GpuMemory> = Arc::new(ReplayMemory::new(&cursor, blobs, *space));
             shared.create_address_space(*space, Arc::clone(vm), memory);
         }
-        for channel in &capture.header.channels {
+        for channel in &header.channels {
             let made =
                 shared
                     .create_channel(channel.config)
@@ -846,9 +873,8 @@ fn back(error: &ExecError) -> ReplayError {
 }
 
 /// Compares the entries the front pushed with the capture's ring hashes, first difference first.
-fn compare_ring(capture: &Capture, entries: &[RingEntry<'static>]) -> Result<(), ReplayError> {
-    let captured: Vec<ContentHash> = capture
-        .outputs
+fn compare_ring(outputs: &[Output], entries: &[RingEntry<'static>]) -> Result<(), ReplayError> {
+    let captured: Vec<ContentHash> = outputs
         .iter()
         .filter_map(|output| match *output {
             Output::Ring { hash } => Some(hash),
@@ -883,21 +909,20 @@ struct BackReplay {
 impl BackReplay {
     /// A fresh back over the restored state, with the header's spaces and channels added.
     fn new(
-        capture: &Capture,
+        header: &Header,
+        log: Vec<BackRecord>,
         restored: &Restored,
         blobs: &Arc<Blobs>,
         front: FrontRun,
     ) -> Result<Self, ReplayError> {
-        let caps: Caps = capture
-            .blobs
-            .get(capture.header.caps)
+        let caps: Caps = blobs
+            .get(header.caps)
             .ok_or_else(|| ReplayError::Caps("the blob is missing".to_owned()))
             .and_then(|bytes| {
                 postcard::from_bytes(bytes).map_err(|error| ReplayError::Caps(error.to_string()))
             })?;
-        let cursor: Shared<BackRecord> =
-            Arc::new(Mutex::new(Cursor::new(Thread::Back, capture.back.clone())));
-        let backend = Arc::new(RecordingBackend::new(caps, capture.header.memory_allowed));
+        let cursor: Shared<BackRecord> = Arc::new(Mutex::new(Cursor::new(Thread::Back, log)));
+        let backend = Arc::new(RecordingBackend::new(caps, header.memory_allowed));
         let waiters = Arc::new(WaiterTable::new());
         let fences = Fences::new(
             Arc::<RecordingBackend>::clone(&backend),
@@ -908,7 +933,7 @@ impl BackReplay {
                 clock: Arc::new(ReplayFenceClock(Arc::clone(&cursor))),
                 front: Arc::new(NoWake),
             },
-            capture.header.mode,
+            header.mode,
         );
         let mut executor = Executor::new(
             Arc::<RecordingBackend>::clone(&backend),
@@ -916,22 +941,22 @@ impl BackReplay {
             Box::new(ReplayShaders(Arc::clone(&cursor))),
             Arc::clone(&front.ordered),
             ExecConfig {
-                setting: capture.header.setting,
+                setting: header.setting,
                 ..ExecConfig::default()
             },
         );
-        for &space in &capture.header.spaces {
+        for &space in &header.spaces {
             let memory: Arc<dyn GpuMemory> = Arc::new(ReplayMemory::new(&cursor, blobs, space));
             executor
                 .add_space(space, memory, Arc::new(WriteWatch::new()))
                 .map_err(|error| back(&error))?;
         }
-        for channel in &capture.header.channels {
+        for channel in &header.channels {
             executor
                 .add_channel(channel.id, channel.config.space)
                 .map_err(|error| back(&error))?;
         }
-        if let Some(&first) = capture.header.spaces.first() {
+        if let Some(&first) = header.spaces.first() {
             executor
                 .set_present_space(first)
                 .map_err(|error| back(&error))?;
@@ -1024,23 +1049,37 @@ impl BackReplay {
     }
 }
 
-/// Replays `capture` (module docs, "Replay"): the front on its log, the ring against the
-/// capture's hashes, then the back on that ring and its log, and, when the back ran to the end,
-/// the render command stream against the capture's.
+/// Replays `capture` (module docs, "Replay"): its checks ([`Capture::parse`]'s, for a capture
+/// made in memory), then the front on its log, the ring against the capture's hashes, then the
+/// back on that ring and its log, and, when the back ran to the end of its log, the render
+/// command stream against the capture's one render stream. The capture is taken whole: its logs
+/// become the replay's cursors and its blob table [`ReplayOutput::blobs`], with nothing copied.
 ///
 /// # Errors
 ///
 /// [`ReplayError`]: the first failure, in that order.
-pub fn replay(capture: &Capture, options: ReplayOptions) -> Result<ReplayOutput, ReplayError> {
-    let restored = restore_state(capture)?;
-    let blobs = Arc::new(capture.blobs.clone());
-    let front = FrontReplay::new(capture, &restored, &blobs)?.run()?;
-    compare_ring(capture, &front.entries)?;
-    let mut back = BackReplay::new(capture, &restored, &blobs, front)?;
+pub fn replay(capture: Capture, options: ReplayOptions) -> Result<ReplayOutput, ReplayError> {
+    capture.validate()?;
+    let restored = restore_state(&capture)?;
+    let captured_render = capture.render_stream();
+    let Capture {
+        header,
+        front,
+        back,
+        blobs,
+        outputs,
+        ..
+    } = capture;
+    let blobs = Arc::new(blobs);
+    let back_len = back.len();
+    let front = FrontReplay::new(&header, front, &restored, &blobs)?.run()?;
+    compare_ring(&outputs, &front.entries)?;
+    drop(outputs);
+    let mut back = BackReplay::new(&header, back, &restored, &blobs, front)?;
     let mut stopped_early = false;
     loop {
         if options.until_present.is_some_and(|n| back.presents >= n) {
-            stopped_early = lock(&back.cursor).next < capture.back.len();
+            stopped_early = lock(&back.cursor).next < back_len;
             break;
         }
         let Some(record) = back.next()? else {
@@ -1051,11 +1090,9 @@ pub fn replay(capture: &Capture, options: ReplayOptions) -> Result<ReplayOutput,
     check(&back.cursor)?;
     let render = back.backend.snapshot();
     if !stopped_early {
-        let captured = capture.outputs.iter().find_map(|output| match *output {
-            Output::Render { text } => capture.blobs.get(text),
-            Output::Ring { .. } => None,
-        });
-        if captured.is_some_and(|text| text != render.as_bytes()) {
+        // `validate` found exactly one render stream, and its blob in the table.
+        let captured = captured_render.and_then(|text| blobs.get(text));
+        if captured != Some(render.as_bytes()) {
             return Err(ReplayError::RenderDiffers);
         }
     }
@@ -1067,6 +1104,7 @@ pub fn replay(capture: &Capture, options: ReplayOptions) -> Result<ReplayOutput,
         writes,
         presents: back.presents,
         stopped_early,
+        blobs,
     })
 }
 
@@ -1112,16 +1150,24 @@ pub(crate) mod seams {
         }
     }
 
-    /// A back log being fed back: its clock and shader cache, and its failure.
+    /// A back log being fed back: its memory, clock and shader cache, and its failure.
     pub(crate) struct Back {
         cursor: Shared<BackRecord>,
+        blobs: Arc<Blobs>,
     }
 
     impl Back {
         pub(crate) fn new(records: Vec<BackRecord>) -> Self {
+            Self::with_blobs(records, Blobs::new())
+        }
+        pub(crate) fn with_blobs(records: Vec<BackRecord>, blobs: Blobs) -> Self {
             Self {
                 cursor: Arc::new(Mutex::new(Cursor::new(Thread::Back, records))),
+                blobs: Arc::new(blobs),
             }
+        }
+        pub(crate) fn memory(&self, space: AsId) -> ReplayMemory<BackRecord> {
+            ReplayMemory::new(&self.cursor, &self.blobs, space)
         }
         pub(crate) fn clock(&self) -> impl FenceClock {
             ReplayFenceClock(Arc::clone(&self.cursor))

@@ -16,7 +16,12 @@
 //!
 //! The table holds at most one waiter per channel ([`WaiterTable::register`] replaces), so its
 //! size is bounded by the channels gsv has created; the front removes a channel's waiter when the
-//! channel resumes or is destroyed (G14).
+//! channel resumes or is destroyed (G14). The capture's crate-only mutators keep that bound:
+//! [`WaiterTable::latch`] adds nothing, and [`WaiterTable::replace`] is fed only by a replay,
+//! from `waiters` records the capture's checks have found to list each channel at most once,
+//! each a channel of the capture's header (at most `crate::capture::MAX_CHANNELS`) in that
+//! channel's address space (`crate::capture::format`, `CaptureError::WaiterRepeated`,
+//! `WaiterChannel` and `WaiterSpace`).
 //!
 //! # Divergences from Eden-NX2
 //!
@@ -165,8 +170,9 @@ impl WaiterTable {
     }
 
     /// Every waiter and whether it is latched, in table order: what a GPU capture records of
-    /// the table (slice G20, `crate::capture`).
-    pub fn snapshot(&self) -> Vec<(Waiter, bool)> {
+    /// the table (slice G20, `crate::capture`). Only the capture builder records captures.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn snapshot(&self) -> Vec<(Waiter, bool)> {
         self.lock()
             .iter()
             .map(|entry| (entry.waiter, entry.latched))
@@ -175,7 +181,7 @@ impl WaiterTable {
 
     /// Latches `channel`'s waiter, as a release that meets it would; whether it had one. For a
     /// capture's replay, which feeds the front the latches the back made (`crate::capture`).
-    pub fn latch(&self, channel: ChannelId) -> bool {
+    pub(crate) fn latch(&self, channel: ChannelId) -> bool {
         let mut found = false;
         for entry in self.lock().iter_mut() {
             if entry.waiter.channel == channel {
@@ -187,8 +193,10 @@ impl WaiterTable {
     }
 
     /// Makes the table exactly `waiters`, in order, each latched or not as given. For a
-    /// capture's replay, which feeds the back the table the front left (`crate::capture`).
-    pub fn replace(&self, waiters: &[(Waiter, bool)]) {
+    /// capture's replay, which feeds the back the table the front left (`crate::capture`); the
+    /// caller keeps the one-waiter-per-channel bound (module docs): the replay passes only
+    /// `waiters` records the capture's checks accepted.
+    pub(crate) fn replace(&self, waiters: &[(Waiter, bool)]) {
         let mut entries = self.lock();
         entries.clear();
         entries.extend(

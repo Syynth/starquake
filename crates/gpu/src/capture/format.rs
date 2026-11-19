@@ -5,7 +5,7 @@
 //! it. Every number is little-endian. The parent module's docs give the byte layout of each
 //! record; [`TAGS`] lists every record tag.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Display, Formatter};
 use std::time::Duration;
 
@@ -36,10 +36,77 @@ pub const VERSION: u32 = 1;
 /// The longest build id a header holds, in bytes.
 pub const MAX_BUILD_ID: usize = 256;
 
-/// The largest capture [`Capture::parse`] reads: the bound on what a file can make the reader
-/// hold, since every record and blob it keeps is at most as large as its bytes (module docs,
-/// "Bounds"). A **guess** at a size no synthetic capture reaches.
-pub const MAX_CAPTURE_BYTES: usize = 1 << 30;
+/// The most memory a capture may need once read, in bytes: what [`Capture::parse`] charges each
+/// record, list and blob it keeps (its size in memory, the lists' capacity included; module
+/// docs, "Bounds") and what [`Capture::to_bytes`] refuses past. A **guess** at a size no
+/// synthetic capture reaches; the first captures of running titles would show whether it must
+/// grow (a version bump is not needed for that: the layout does not change).
+pub const MAX_CAPTURE_MEMORY: usize = 256 << 20;
+
+/// The largest capture file [`Capture::parse`] reads and [`Capture::to_bytes`] writes. Derived
+/// from [`MAX_CAPTURE_MEMORY`]: every record, list and blob takes at least as many bytes in
+/// memory as in the file, so a longer file cannot fit the budget
+/// (`tests::parse::generated_captures_read_back_as_written` checks the charge against the
+/// file's length).
+pub const MAX_CAPTURE_BYTES: usize = MAX_CAPTURE_MEMORY;
+
+/// The most address spaces a header lists. A **guess**, well above what gsv holds at once
+/// (eight address spaces, `starquake_gsv`'s `MAX_ADDRESS_SPACES`), so a capture that spans
+/// spaces made and destroyed still fits; it bounds the header's checks and the replay's setup.
+pub const MAX_SPACES: usize = 1024;
+
+/// The most channels a header lists. A **guess**, as [`MAX_SPACES`]: it bounds the header's
+/// checks, the replay's setup, and (through the `waiters` record's checks) the acquire waiter
+/// table a replay installs.
+pub const MAX_CHANNELS: usize = 4096;
+
+/// What one blob costs in memory besides its bytes: its name and its byte vector's handle, as
+/// the blob table keeps them. The table's tree nodes are not counted (module docs, "Bounds").
+const BLOB_ENTRY: usize = size_of::<ContentHash>() + size_of::<Vec<u8>>();
+
+/// The fewest items a list read from a file is given room for when it first grows.
+const MIN_CAPACITY: usize = 4;
+
+/// The capacity the reader gives a list of `len` items: none for an empty list, else
+/// [`MIN_CAPACITY`] or the next power of two, whichever is larger. The reader grows each list to
+/// exactly this (doubling), so [`Capture::memory_charge`] can count what reading a capture
+/// takes without reading it.
+const fn list_capacity(len: usize) -> usize {
+    if len == 0 {
+        0
+    } else if len <= MIN_CAPACITY {
+        MIN_CAPACITY
+    } else {
+        match len.checked_next_power_of_two() {
+            Some(capacity) => capacity,
+            None => usize::MAX,
+        }
+    }
+}
+
+/// What a list of `len` items of `T` costs in memory once read: its capacity in items, each its
+/// size.
+fn list_charge<T>(len: usize) -> usize {
+    list_capacity(len).saturating_mul(size_of::<T>())
+}
+
+/// The bounds a capture is read and written within: [`Limits::DEFAULT`] in [`Capture::parse`]
+/// and [`Capture::to_bytes`], smaller ones in tests that put a bound's edge in reach.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Limits {
+    /// The longest file, in bytes.
+    pub(crate) bytes: usize,
+    /// The most memory the capture may need once read, in bytes.
+    pub(crate) memory: usize,
+}
+
+impl Limits {
+    /// [`MAX_CAPTURE_BYTES`] and [`MAX_CAPTURE_MEMORY`].
+    pub(crate) const DEFAULT: Self = Self {
+        bytes: MAX_CAPTURE_BYTES,
+        memory: MAX_CAPTURE_MEMORY,
+    };
+}
 
 /// A 128-bit content hash: XXH3's 128-bit variant with seed 0 (`twox-hash`'s `XxHash3_128`, as
 /// the shader crate's program hash uses), defined byte for byte by the xxHash specification, so
@@ -400,8 +467,12 @@ pub enum BackRecord {
         /// The dirty ranges.
         ranges: Vec<PageRange>,
     },
-    /// A shader lookup: the requests, and the answer's kind.
+    /// A shader lookup: the accesses the cache made while answering, the requests, and the
+    /// answer's kind.
     ShaderLookup {
+        /// How many records the cache's own memory accesses take just before this one in the
+        /// back log: a replay steps past exactly that many, and they must be reads or queries.
+        cache_accesses: u32,
         /// The programs asked for.
         requests: Vec<ProgramRequest>,
         /// The answer.
@@ -479,11 +550,33 @@ pub enum CaptureError {
         /// The version in the file.
         found: u32,
     },
-    /// The file is larger than [`MAX_CAPTURE_BYTES`].
-    #[error("the capture is {len} bytes; at most {MAX_CAPTURE_BYTES} bytes are read")]
+    /// The file is larger than its bound ([`MAX_CAPTURE_BYTES`] outside tests), read or
+    /// written.
+    #[error("the capture is {len} bytes; at most {limit} bytes are read")]
     TooLarge {
         /// The file's length.
         len: usize,
+        /// The bound.
+        limit: usize,
+    },
+    /// The capture needs more memory once read than its budget ([`MAX_CAPTURE_MEMORY`] outside
+    /// tests): the reader stops at the first list growth or blob that passes it.
+    #[error("the capture needs more than {limit} bytes of memory once read")]
+    OverBudget {
+        /// The budget.
+        limit: usize,
+    },
+    /// The header lists more address spaces than [`MAX_SPACES`].
+    #[error("the header lists {count} address spaces; at most {MAX_SPACES} are allowed")]
+    TooManySpaces {
+        /// How many it lists.
+        count: usize,
+    },
+    /// The header lists more channels than [`MAX_CHANNELS`].
+    #[error("the header lists {count} channels; at most {MAX_CHANNELS} are allowed")]
+    TooManyChannels {
+        /// How many it lists.
+        count: usize,
     },
     /// The file ends inside something.
     #[error("the capture ends at byte {offset}, inside {what}")]
@@ -572,6 +665,45 @@ pub enum CaptureError {
         channel: ChannelId,
         /// Its space.
         space: AsId,
+    },
+    /// A `waiters` record lists a channel twice: the table holds one waiter per channel.
+    #[error("back log record {record} lists channel {} in the waiter table twice", .channel.0)]
+    WaiterRepeated {
+        /// The record's index in the back log.
+        record: usize,
+        /// The channel.
+        channel: ChannelId,
+    },
+    /// A `waiters` record lists a channel the header does not.
+    #[error("back log record {record} lists a waiter of channel {}, which the header does not list", .channel.0)]
+    WaiterChannel {
+        /// The record's index in the back log.
+        record: usize,
+        /// The channel.
+        channel: ChannelId,
+    },
+    /// A `waiters` record puts a channel's waiter in an address space other than the channel's.
+    #[error(
+        "back log record {record} puts channel {}'s waiter in address space {}; the channel is in address space {}",
+        .channel.0, .space.0, .expected.0
+    )]
+    WaiterSpace {
+        /// The record's index in the back log.
+        record: usize,
+        /// The channel.
+        channel: ChannelId,
+        /// The waiter's space.
+        space: AsId,
+        /// The channel's space, as the header lists it.
+        expected: AsId,
+    },
+    /// The outputs do not hold exactly one render command stream.
+    #[error(
+        "the capture's outputs hold {count} render command streams; a capture holds exactly one"
+    )]
+    RenderOutputs {
+        /// How many they hold.
+        count: usize,
     },
     /// A list has more items than its 32-bit count can say (writing only).
     #[error("{what} has more than 4294967295 items")]
@@ -1063,8 +1195,13 @@ impl Out {
                     self.range(*range);
                 }
             }
-            BackRecord::ShaderLookup { requests, answer } => {
+            BackRecord::ShaderLookup {
+                cache_accesses,
+                requests,
+                answer,
+            } => {
                 self.u8(tag::SHADER_LOOKUP);
+                self.u32(*cache_accesses);
                 self.count(requests.len(), "a shader lookup")?;
                 for request in requests {
                     self.u8(stage_value(request.stage));
@@ -1103,13 +1240,121 @@ fn bad(at: usize, what: &'static str) -> CaptureError {
     CaptureError::BadValue { offset: at, what }
 }
 
-/// The bytes being read, and where.
+/// The header's list checks, shared by the reader, the writer and the replay: each list's
+/// length within its cap (checked from the count, before any item is read), the spaces pairwise
+/// distinct, the channel ids pairwise distinct, and each channel's space listed. Kept in sets,
+/// so a list of `n` costs `O(n log n)` (and `n` is capped).
+#[derive(Default)]
+struct HeaderLists {
+    spaces: BTreeSet<AsId>,
+    channels: BTreeSet<ChannelId>,
+}
+
+impl HeaderLists {
+    /// Refuses an address space list of `count` past [`MAX_SPACES`].
+    fn space_count(count: usize) -> Result<(), CaptureError> {
+        if count > MAX_SPACES {
+            return Err(CaptureError::TooManySpaces { count });
+        }
+        Ok(())
+    }
+
+    /// Refuses a channel list of `count` past [`MAX_CHANNELS`].
+    fn channel_count(count: usize) -> Result<(), CaptureError> {
+        if count > MAX_CHANNELS {
+            return Err(CaptureError::TooManyChannels { count });
+        }
+        Ok(())
+    }
+
+    /// The next address space of the list.
+    fn space(&mut self, space: AsId) -> Result<(), CaptureError> {
+        if !self.spaces.insert(space) {
+            return Err(CaptureError::DuplicateSpace { space });
+        }
+        Ok(())
+    }
+
+    /// The next channel of the list: its id not listed before, then its space listed.
+    fn channel(&mut self, id: ChannelId, space: AsId) -> Result<(), CaptureError> {
+        if !self.channels.insert(id) {
+            return Err(CaptureError::DuplicateChannel { channel: id });
+        }
+        if !self.spaces.contains(&space) {
+            return Err(CaptureError::UnknownSpace { channel: id, space });
+        }
+        Ok(())
+    }
+
+    /// A whole header, in the reader's order: the build id's length, the space list, the
+    /// channel list.
+    fn check(header: &Header) -> Result<(), CaptureError> {
+        let id = header.build_id.len();
+        if id > MAX_BUILD_ID {
+            return Err(CaptureError::BuildIdTooLong { len: id });
+        }
+        let mut lists = Self::default();
+        Self::space_count(header.spaces.len())?;
+        for &space in &header.spaces {
+            lists.space(space)?;
+        }
+        Self::channel_count(header.channels.len())?;
+        for channel in &header.channels {
+            lists.channel(channel.id, channel.config.space)?;
+        }
+        Ok(())
+    }
+}
+
+/// A 32-bit count as a length.
+fn len_of(count: u32) -> usize {
+    usize::try_from(count).unwrap_or(usize::MAX)
+}
+
+/// The bytes being read, where, and the memory what was read takes (module docs, "Bounds").
 struct In<'a> {
     bytes: &'a [u8],
     at: usize,
+    /// The most memory the capture may take.
+    budget: usize,
+    /// The memory charged so far.
+    charged: usize,
 }
 
 impl<'a> In<'a> {
+    fn new(bytes: &'a [u8], budget: usize) -> Self {
+        Self {
+            bytes,
+            at: 0,
+            budget,
+            charged: 0,
+        }
+    }
+
+    /// Charges `bytes` of memory against the budget, refusing past it.
+    fn charge(&mut self, bytes: usize) -> Result<(), CaptureError> {
+        let total = self
+            .charged
+            .checked_add(bytes)
+            .filter(|&total| total <= self.budget)
+            .ok_or(CaptureError::OverBudget { limit: self.budget })?;
+        self.charged = total;
+        Ok(())
+    }
+
+    /// Appends `item` to `list`, first growing a full list to [`list_capacity`] of one more
+    /// item and charging the room it adds, so the budget is charged before the memory is taken.
+    fn push<T>(&mut self, list: &mut Vec<T>, item: T) -> Result<(), CaptureError> {
+        if list.len() == list.capacity() {
+            let capacity = list_capacity(list.len().saturating_add(1));
+            let grow = capacity.saturating_sub(list.capacity());
+            self.charge(grow.saturating_mul(size_of::<T>()))?;
+            list.reserve_exact(grow);
+        }
+        list.push(item);
+        Ok(())
+    }
+
     fn take(&mut self, len: usize, what: &'static str) -> Result<&'a [u8], CaptureError> {
         let end = self
             .at
@@ -1222,14 +1467,14 @@ impl<'a> In<'a> {
             return Err(CaptureError::UnsupportedVersion { found: version });
         }
         let at = self.at;
-        let len = usize::try_from(self.count("the build id")?).unwrap_or(usize::MAX);
+        let len = len_of(self.count("the build id")?);
         if len > MAX_BUILD_ID {
             return Err(CaptureError::BuildIdTooLong { len });
         }
         let id = self.take(len, "the build id")?;
-        let build_id = std::str::from_utf8(id)
-            .map_err(|_| bad(at, "the build id is not UTF-8"))?
-            .to_owned();
+        let build_id = std::str::from_utf8(id).map_err(|_| bad(at, "the build id is not UTF-8"))?;
+        self.charge(build_id.len())?;
+        let build_id = build_id.to_owned();
         let caps = self.hash("the header")?;
         let memory_allowed = self.u64("the header")?;
         let at = self.at;
@@ -1244,29 +1489,28 @@ impl<'a> In<'a> {
             sub::AT_RECORD => Mode::AtRecord,
             _ => return Err(bad(at, "the fence mode is unknown")),
         };
+        let mut lists = HeaderLists::default();
+        let count = self.count("the address space list")?;
+        HeaderLists::space_count(len_of(count))?;
         let mut spaces = Vec::new();
-        for _ in 0..self.count("the address space list")? {
+        for _ in 0..count {
             let space = self.space()?;
-            if spaces.contains(&space) {
-                return Err(CaptureError::DuplicateSpace { space });
-            }
-            spaces.push(space);
+            lists.space(space)?;
+            self.push(&mut spaces, space)?;
         }
+        let count = self.count("the channel list")?;
+        HeaderLists::channel_count(len_of(count))?;
         let mut channels: Vec<CapturedChannel> = Vec::new();
-        for _ in 0..self.count("the channel list")? {
+        for _ in 0..count {
             let id = ChannelId(self.u32("a channel")?);
             let space = self.space()?;
             let syncpoint = self.syncpoint()?;
-            if channels.iter().any(|known| known.id == id) {
-                return Err(CaptureError::DuplicateChannel { channel: id });
-            }
-            if !spaces.contains(&space) {
-                return Err(CaptureError::UnknownSpace { channel: id, space });
-            }
-            channels.push(CapturedChannel {
+            lists.channel(id, space)?;
+            let channel = CapturedChannel {
                 id,
                 config: ChannelConfig { space, syncpoint },
-            });
+            };
+            self.push(&mut channels, channel)?;
         }
         Ok(Header {
             build_id,
@@ -1383,7 +1627,8 @@ impl<'a> In<'a> {
         let wfi = self.bool(SECTION)?;
         let mut entries = Vec::new();
         for _ in 0..self.count(SECTION)? {
-            entries.push(GpfifoEntry(self.u64(SECTION)?));
+            let entry = GpfifoEntry(self.u64(SECTION)?);
+            self.push(&mut entries, entry)?;
         }
         Ok(FrontRecord::Submit {
             channel,
@@ -1473,7 +1718,8 @@ impl<'a> In<'a> {
                 let incremented = self.bool(SECTION)?;
                 let mut markers = Vec::new();
                 for _ in 0..self.count(SECTION)? {
-                    markers.push(MarkerToken(self.u64("a report")?));
+                    let marker = MarkerToken(self.u64("a report")?);
+                    self.push(&mut markers, marker)?;
                 }
                 FrontRecord::Report {
                     markers,
@@ -1530,16 +1776,14 @@ impl<'a> In<'a> {
                         .ok_or_else(|| bad(op_at, "an acquire operation is unknown"))?;
                     let payload = self.u32("a waiter")?;
                     let latched = self.bool("a waiter")?;
-                    waiters.push((
-                        Waiter {
-                            channel,
-                            space,
-                            address,
-                            op,
-                            payload,
-                        },
-                        latched,
-                    ));
+                    let waiter = Waiter {
+                        channel,
+                        space,
+                        address,
+                        op,
+                        payload,
+                    };
+                    self.push(&mut waiters, (waiter, latched))?;
                 }
                 BackRecord::Waiters { waiters }
             }
@@ -1547,22 +1791,26 @@ impl<'a> In<'a> {
                 let space = self.space()?;
                 let mut ranges = Vec::new();
                 for _ in 0..self.count(SECTION)? {
-                    ranges.push(self.range()?);
+                    let range = self.range()?;
+                    self.push(&mut ranges, range)?;
                 }
                 BackRecord::Drain { space, ranges }
             }
             tag::SHADER_LOOKUP => {
+                let cache_accesses = self.u32(SECTION)?;
                 let mut requests = Vec::new();
                 for _ in 0..self.count(SECTION)? {
                     let stage_at = self.at;
                     let stage = stage_from(self.u8("a shader request")?)
                         .ok_or_else(|| bad(stage_at, "a shader stage is unknown"))?;
-                    requests.push(ProgramRequest {
+                    let request = ProgramRequest {
                         stage,
                         address: self.u64("a shader request")?,
-                    });
+                    };
+                    self.push(&mut requests, request)?;
                 }
                 BackRecord::ShaderLookup {
+                    cache_accesses,
                     requests,
                     answer: self.answer()?,
                 }
@@ -1616,6 +1864,7 @@ impl<'a> In<'a> {
             last = Some(hash);
             let len = usize::try_from(self.u64("a blob")?).unwrap_or(usize::MAX);
             let bytes = self.take(len, "a blob")?;
+            self.charge(bytes.len().saturating_add(BLOB_ENTRY))?;
             if ContentHash::of(bytes) != hash {
                 return Err(CaptureError::CorruptBlob { hash });
             }
@@ -1626,16 +1875,28 @@ impl<'a> In<'a> {
 }
 
 impl Capture {
-    /// The capture as a file.
+    /// The capture as a file, after the checks [`Capture::parse`] makes of what it reads, so
+    /// that every file written reads back.
     ///
     /// # Errors
     ///
-    /// [`CaptureError::BuildIdTooLong`], [`CaptureError::TooMany`] for a list past a 32-bit
-    /// count, and [`CaptureError::MissingBlob`] (then [`CaptureError::ReadLength`]) when a
-    /// record names a blob the table does not hold (or a blob the wrong length), so that every
-    /// file written reads back.
+    /// In this order: the header's ([`CaptureError::BuildIdTooLong`], then the lists' errors
+    /// in the reader's order), the body's (as [`Capture::parse`]'s last checks: the `waiters`
+    /// records, the render output, the named blobs), [`CaptureError::OverBudget`] past
+    /// [`MAX_CAPTURE_MEMORY`], [`CaptureError::TooMany`] for a list past a 32-bit count, and
+    /// [`CaptureError::TooLarge`] for a file past [`MAX_CAPTURE_BYTES`].
     pub fn to_bytes(&self) -> Result<Vec<u8>, CaptureError> {
-        self.check_blobs()?;
+        self.to_bytes_within(Limits::DEFAULT)
+    }
+
+    /// [`Capture::to_bytes`] within `limits`.
+    pub(crate) fn to_bytes_within(&self, limits: Limits) -> Result<Vec<u8>, CaptureError> {
+        self.validate()?;
+        if self.memory_charge() > limits.memory {
+            return Err(CaptureError::OverBudget {
+                limit: limits.memory,
+            });
+        }
         let mut out = Out(Vec::new());
         out.header(&self.header)?;
         out.count(self.state.len(), "the starting state")?;
@@ -1660,39 +1921,66 @@ impl Capture {
         for output in &self.outputs {
             out.output(output);
         }
+        if out.0.len() > limits.bytes {
+            return Err(CaptureError::TooLarge {
+                len: out.0.len(),
+                limit: limits.bytes,
+            });
+        }
         Ok(out.0)
     }
 
-    /// Reads a capture: the header first (magic, then version), then the starting state, the
-    /// front log, the back log, the blob table and the outputs, each a 32-bit count of records,
-    /// with no bytes after them. Then every blob a record names must be in the table, and every
-    /// read's length must be its blob's.
+    /// Reads a capture: the header first (magic, then version, then the build id and the
+    /// lists), then the starting state, the front log, the back log, the blob table and the
+    /// outputs, each a 32-bit count of records, with no bytes after them. Every record, list
+    /// and blob kept is charged its memory against [`MAX_CAPTURE_MEMORY`] as it is read. Then,
+    /// in this order: every `waiters` record's channels are distinct, listed in the header and
+    /// in their listed space; the outputs hold exactly one render stream; every blob a record
+    /// names is in the table, and every read's length is its blob's.
     ///
     /// # Errors
     ///
-    /// [`CaptureError`]: the first problem in file order (the header's in the order above).
+    /// [`CaptureError`]: [`CaptureError::TooLarge`] past [`MAX_CAPTURE_BYTES`] before
+    /// anything is read, then the first problem in file order, then the last checks in the
+    /// order above.
     pub fn parse(bytes: &[u8]) -> Result<Self, CaptureError> {
-        if bytes.len() > MAX_CAPTURE_BYTES {
-            return Err(CaptureError::TooLarge { len: bytes.len() });
+        Self::parse_within(bytes, Limits::DEFAULT).map(|(capture, _)| capture)
+    }
+
+    /// [`Capture::parse`] within `limits`, with the memory it charged.
+    pub(crate) fn parse_within(
+        bytes: &[u8],
+        limits: Limits,
+    ) -> Result<(Self, usize), CaptureError> {
+        if bytes.len() > limits.bytes {
+            return Err(CaptureError::TooLarge {
+                len: bytes.len(),
+                limit: limits.bytes,
+            });
         }
-        let mut input = In { bytes, at: 0 };
+        let mut input = In::new(bytes, limits.memory);
         let header = input.header()?;
+        input.charge(size_of::<Self>())?;
         let mut state = Vec::new();
         for _ in 0..input.count("the starting state")? {
-            state.push(input.state()?);
+            let record = input.state()?;
+            input.push(&mut state, record)?;
         }
         let mut front = Vec::new();
         for _ in 0..input.count("the front log")? {
-            front.push(input.front()?);
+            let record = input.front()?;
+            input.push(&mut front, record)?;
         }
         let mut back = Vec::new();
         for _ in 0..input.count("the back log")? {
-            back.push(input.back()?);
+            let record = input.back()?;
+            input.push(&mut back, record)?;
         }
         let blobs = input.blobs()?;
         let mut outputs = Vec::new();
         for _ in 0..input.count("the outputs")? {
-            outputs.push(input.output()?);
+            let output = input.output()?;
+            input.push(&mut outputs, output)?;
         }
         if input.at < bytes.len() {
             return Err(CaptureError::TrailingBytes {
@@ -1708,8 +1996,125 @@ impl Capture {
             blobs,
             outputs,
         };
-        capture.check_blobs()?;
-        Ok(capture)
+        capture.check_body()?;
+        Ok((capture, input.charged))
+    }
+
+    /// What reading this capture's file charges against the memory budget: the capture
+    /// itself, the build id, each list at the capacity the reader gives it ([`list_capacity`]),
+    /// and each blob's bytes and [`BLOB_ENTRY`]. Equal to what [`Capture::parse_within`]
+    /// reports (`tests::parse::generated_captures_read_back_as_written`).
+    pub(crate) fn memory_charge(&self) -> usize {
+        let header = &self.header;
+        let front = self.front.iter().map(|record| match record {
+            FrontRecord::Submit { submission, .. } => {
+                list_charge::<GpfifoEntry>(submission.entries.len())
+            }
+            FrontRecord::Report { markers, .. } => list_charge::<MarkerToken>(markers.len()),
+            _ => 0,
+        });
+        let back = self.back.iter().map(|record| match record {
+            BackRecord::Waiters { waiters } => list_charge::<(Waiter, bool)>(waiters.len()),
+            BackRecord::Drain { ranges, .. } => list_charge::<PageRange>(ranges.len()),
+            BackRecord::ShaderLookup { requests, .. } => {
+                list_charge::<ProgramRequest>(requests.len())
+            }
+            _ => 0,
+        });
+        let blobs = self
+            .blobs
+            .by_hash
+            .values()
+            .map(|bytes| bytes.len().saturating_add(BLOB_ENTRY));
+        [
+            size_of::<Self>(),
+            header.build_id.len(),
+            list_charge::<AsId>(header.spaces.len()),
+            list_charge::<CapturedChannel>(header.channels.len()),
+            list_charge::<StateRecord>(self.state.len()),
+            list_charge::<FrontRecord>(self.front.len()),
+            list_charge::<BackRecord>(self.back.len()),
+            list_charge::<Output>(self.outputs.len()),
+        ]
+        .into_iter()
+        .chain(front)
+        .chain(back)
+        .chain(blobs)
+        .fold(0, usize::saturating_add)
+    }
+
+    /// Every check the reader makes of a capture's contents, for a capture made in memory: the
+    /// header's ([`HeaderLists::check`]), then the body's ([`Capture::check_body`]). The writer
+    /// and the replay run it.
+    pub(crate) fn validate(&self) -> Result<(), CaptureError> {
+        HeaderLists::check(&self.header)?;
+        self.check_body()
+    }
+
+    /// The checks made once the whole file is read: the `waiters` records, the render output,
+    /// the named blobs, in that order.
+    fn check_body(&self) -> Result<(), CaptureError> {
+        self.check_waiters()?;
+        self.check_render()?;
+        self.check_blobs()
+    }
+
+    /// Each `waiters` record, in log order, waiter by waiter: its channel not listed before in
+    /// that record, listed in the header, and in the space the header gives it. So a record that
+    /// passes holds at most one waiter per header channel, as the live table does
+    /// (`crate::back::fence::WaiterTable`).
+    fn check_waiters(&self) -> Result<(), CaptureError> {
+        let channels: BTreeMap<ChannelId, AsId> = self
+            .header
+            .channels
+            .iter()
+            .map(|channel| (channel.id, channel.config.space))
+            .collect();
+        for (record, logged) in self.back.iter().enumerate() {
+            let BackRecord::Waiters { waiters } = logged else {
+                continue;
+            };
+            let mut seen = BTreeSet::new();
+            for (waiter, _) in waiters {
+                let channel = waiter.channel;
+                if !seen.insert(channel) {
+                    return Err(CaptureError::WaiterRepeated { record, channel });
+                }
+                let Some(&expected) = channels.get(&channel) else {
+                    return Err(CaptureError::WaiterChannel { record, channel });
+                };
+                if waiter.space != expected {
+                    return Err(CaptureError::WaiterSpace {
+                        record,
+                        channel,
+                        space: waiter.space,
+                        expected,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The outputs hold exactly one render stream, so a whole replay always has one to compare.
+    fn check_render(&self) -> Result<(), CaptureError> {
+        let count = self
+            .outputs
+            .iter()
+            .filter(|output| matches!(output, Output::Render { .. }))
+            .count();
+        if count != 1 {
+            return Err(CaptureError::RenderOutputs { count });
+        }
+        Ok(())
+    }
+
+    /// The capture's one render stream: the text's blob.
+    pub(crate) fn render_stream(&self) -> Option<ContentHash> {
+        self.outputs.iter().find_map(|output| match *output {
+            Output::Render { text } => Some(text),
+            Output::Ring { .. } => None,
+        })
     }
 
     /// Every blob a record names, with the length a read gives it, in file order.
@@ -1807,7 +2212,7 @@ pub(crate) mod one {
         bytes: &'a [u8],
         read: impl FnOnce(&mut In<'a>) -> Result<T, CaptureError>,
     ) -> Result<T, CaptureError> {
-        let mut input = In { bytes, at: 0 };
+        let mut input = In::new(bytes, usize::MAX);
         let value = read(&mut input)?;
         if input.at != bytes.len() {
             return Err(CaptureError::TrailingBytes {

@@ -136,7 +136,7 @@ pub fn render_output(output: &ReplayOutput, args: &GpuReplayArgs) -> String {
     match args.dump {
         Some(Dump::Ring) => text.push_str(&write_text(&output.ring)),
         Some(Dump::Render) => text.push_str(&output.render),
-        Some(Dump::Writes) => text.push_str(&writes_text(&output.writes)),
+        Some(Dump::Writes) => text.push_str(&writes_text(&output.writes, &output.blobs)),
         None => {}
     }
     text
@@ -159,11 +159,16 @@ pub fn gpu_replay(args: &GpuReplayArgs) -> Result<String, GpuReplayError> {
         })?;
     let bytes = match read {
         Read::Bytes(bytes) => bytes,
-        Read::TooLarge(len) => return Err(malformed(CaptureError::TooLarge { len })),
+        Read::TooLarge(len) => {
+            return Err(malformed(CaptureError::TooLarge {
+                len,
+                limit: MAX_CAPTURE_BYTES,
+            }));
+        }
     };
     let capture = Capture::parse(&bytes).map_err(malformed)?;
     let output = replay(
-        &capture,
+        capture,
         ReplayOptions {
             until_present: args.until_present,
         },

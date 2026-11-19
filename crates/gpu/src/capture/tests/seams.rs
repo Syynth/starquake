@@ -292,6 +292,107 @@ fn replay_memory_diverges_on_each_difference() {
     );
 }
 
+/// A GPU-only query, a generation query and a write each diverge on every field they match:
+/// the address space, the address and (a query's) length, each the only difference.
+#[test]
+fn queries_and_writes_diverge_on_each_difference() {
+    let gpu_only = FrontRecord::Access(Access::GpuOnly {
+        space: SPACE,
+        va: 0x5000,
+        len: 0x10,
+        answer: true,
+    });
+    let found = format!(
+        "a GPU-only query of 16 bytes at 0x5000 in address space {}",
+        SPACE.0
+    );
+    for (space, va, len) in [
+        (AsId(0x22), 0x5000, 0x10),
+        (SPACE, 0x5004, 0x10),
+        (SPACE, 0x5000, 0x11),
+    ] {
+        let log = seams::Front::new(vec![gpu_only.clone()], Blobs::new());
+        assert!(!log.memory(space).is_gpu_only(va, len));
+        assert_eq!(
+            log.check().unwrap_err(),
+            ReplayError::Diverged(Divergence {
+                thread: Thread::Front,
+                record: 0,
+                found: found.clone(),
+                made: format!(
+                    "the GPU asked whether {len} bytes at {va:#x} in address space {} are GPU-only",
+                    space.0
+                ),
+            })
+        );
+    }
+    // A generation query of another space.
+    let log = seams::Front::new(
+        vec![FrontRecord::Access(Access::Generation {
+            space: SPACE,
+            value: 0x55,
+        })],
+        Blobs::new(),
+    );
+    assert_eq!(log.memory(AsId(0x22)).generation(), 0);
+    assert_eq!(
+        log.check().unwrap_err(),
+        ReplayError::Diverged(Divergence {
+            thread: Thread::Front,
+            record: 0,
+            found: format!("a generation query of address space {}", SPACE.0),
+            made: "the GPU asked address space 34 for its generation".to_owned(),
+        })
+    );
+    // A write of the logged bytes at another address, and in another space.
+    let hash = ContentHash::of(&[1]);
+    let write = FrontRecord::Access(Access::Write {
+        space: SPACE,
+        va: 0x1000,
+        data: hash,
+        result: Ok(()),
+    });
+    let found = format!(
+        "a write of blob {hash} at 0x1000 in address space {}",
+        SPACE.0
+    );
+    for (space, va) in [(SPACE, 0x1004), (AsId(0x22), 0x1000)] {
+        let log = seams::Front::new(vec![write.clone()], blobs(&[&[1]]));
+        assert_eq!(
+            log.memory(space).write(va, &[1]),
+            Err(GpuFault::Unmapped { va })
+        );
+        assert_eq!(
+            log.check().unwrap_err(),
+            ReplayError::Diverged(Divergence {
+                thread: Thread::Front,
+                record: 0,
+                found: found.clone(),
+                made: format!(
+                    "the GPU wrote blob {hash} at {va:#x} in address space {}",
+                    space.0
+                ),
+            })
+        );
+        assert_eq!(log.writes(), []);
+    }
+    // The same write matches, and is kept by its blob and length.
+    let log = seams::Front::new(vec![write], blobs(&[&[1]]));
+    log.memory(SPACE).write(0x1000, &[1]).unwrap();
+    log.check().unwrap();
+    assert_eq!(
+        log.writes(),
+        [crate::capture::ReplayedWrite {
+            thread: Thread::Front,
+            space: SPACE,
+            va: 0x1000,
+            data: hash,
+            len: 1,
+            result: Ok(()),
+        }]
+    );
+}
+
 #[test]
 fn the_first_divergence_is_kept_and_every_later_call_fails() {
     let log = seams::Front::new(
@@ -404,6 +505,7 @@ fn a_pending_answer_is_fed_back_past_the_reads_the_cache_made() {
             value: 1,
         }),
         BackRecord::ShaderLookup {
+            cache_accesses: 2,
             requests: vec![request()],
             answer: ShaderAnswer::Pending { ticket: 0x31 },
         },
@@ -424,6 +526,7 @@ fn a_pending_answer_is_fed_back_past_the_reads_the_cache_made() {
 #[test]
 fn a_lookup_of_other_programs_diverges_and_a_write_is_not_skipped() {
     let back = seams::Back::new(vec![BackRecord::ShaderLookup {
+        cache_accesses: 0,
         requests: vec![ProgramRequest {
             stage: GuestStage::Vertex,
             address: 0x4000,
@@ -448,6 +551,7 @@ fn a_lookup_of_other_programs_diverges_and_a_write_is_not_skipped() {
             result: Ok(()),
         }),
         BackRecord::ShaderLookup {
+            cache_accesses: 0,
             requests: vec![request()],
             answer: ShaderAnswer::Pending { ticket: 1 },
         },
@@ -459,6 +563,153 @@ fn a_lookup_of_other_programs_diverges_and_a_write_is_not_skipped() {
     ));
 }
 
+/// A read of the back's own, then the cache's one read, then the lookup that counts one.
+fn back_read_then_lookup() -> Vec<BackRecord> {
+    let read = |va: u64| {
+        BackRecord::Access(Access::Read {
+            space: SPACE,
+            va,
+            len: 4,
+            result: Err(GpuFault::Unmapped { va }),
+        })
+    };
+    vec![
+        read(0x1000),
+        read(0x4000),
+        BackRecord::ShaderLookup {
+            cache_accesses: 1,
+            requests: vec![request()],
+            answer: ShaderAnswer::Pending { ticket: 7 },
+        },
+    ]
+}
+
+/// The lookup steps past exactly the accesses its record counts: a read of the back's own that
+/// the replayed back did not make, just before a lookup, is a divergence at that read's index.
+#[test]
+fn a_back_read_the_replay_skipped_before_a_lookup_diverges_at_its_index() {
+    // The back makes its read, then looks up: the cache's one read is stepped past.
+    let back = seams::Back::new(back_read_then_lookup());
+    let mut buf = [0; 4];
+    let reads = back.memory(SPACE);
+    assert_eq!(
+        reads.read(0x1000, &mut buf),
+        Err(GpuFault::Unmapped { va: 0x1000 })
+    );
+    assert!(matches!(lookup(&mut back.shaders()), SetLookup::Pending(t) if t == Ticket::new(7)));
+    back.check().unwrap();
+    assert_eq!(back.next(), 3);
+
+    // The back skips its read and looks up at once.
+    let back = seams::Back::new(back_read_then_lookup());
+    assert!(matches!(
+        lookup(&mut back.shaders()),
+        SetLookup::Pending(t) if t == Ticket::new(0)
+    ));
+    assert_eq!(
+        back.check().unwrap_err(),
+        ReplayError::Diverged(Divergence {
+            thread: Thread::Back,
+            record: 0,
+            found: format!("a read of 4 bytes at 0x1000 in address space {}", SPACE.0),
+            made: "the back looked up 1 programs".to_owned(),
+        })
+    );
+    assert_eq!(back.next(), 0);
+
+    // A lookup that counts more accesses than precede it diverges at the cursor too.
+    let mut records = back_read_then_lookup();
+    records.drain(..2);
+    let back = seams::Back::new(records);
+    lookup(&mut back.shaders());
+    assert_eq!(
+        back.check().unwrap_err(),
+        ReplayError::Diverged(Divergence {
+            thread: Thread::Back,
+            record: 0,
+            found: "a shader lookup of 1 programs".to_owned(),
+            made: "the back looked up 1 programs".to_owned(),
+        })
+    );
+}
+
+/// A shader cache that reads through a recording memory while it answers, as a live cache reads
+/// its programs through the back's memory.
+struct ReadingShaders {
+    memory: RecordingMemory,
+    reads: usize,
+}
+
+impl ShaderLookup for ReadingShaders {
+    fn lookup(
+        &mut self,
+        _requests: &[ProgramRequest],
+        _variant: &VariantKey,
+        _memory: &dyn ProgramMemory,
+        _state: &dyn EngineState,
+    ) -> SetLookup {
+        let mut buf = [0; 4];
+        for n in 0..self.reads {
+            let va = GPU_BASE + 4 * u64::try_from(n).unwrap();
+            self.memory.read(va, &mut buf).unwrap();
+        }
+        SetLookup::Pending(Ticket::new(3))
+    }
+
+    fn wait(&mut self, ticket: Ticket) -> SetLookup {
+        SetLookup::Pending(ticket)
+    }
+}
+
+impl crate::back::buffer::InvalidationSink for ReadingShaders {
+    fn invalidate(&mut self, _range: PageRange) {}
+}
+
+#[test]
+fn recording_shaders_count_the_reads_the_cache_made_while_answering() {
+    let recorder = Arc::new(Recorder::new(1 << 10));
+    let back_memory = RecordingMemory::new(memory(), Arc::clone(&recorder), Thread::Back, SPACE);
+    // A read of the back's own before the lookup is not the cache's.
+    let mut buf = [0; 4];
+    back_memory.read(GPU_BASE + 0x100, &mut buf).unwrap();
+    let inner = ReadingShaders {
+        memory: RecordingMemory::new(memory(), Arc::clone(&recorder), Thread::Back, SPACE),
+        reads: 3,
+    };
+    let mut shaders = RecordingShaders::new(Box::new(inner), Arc::clone(&recorder));
+    lookup(&mut shaders);
+    let back = recorder.take().unwrap().back;
+    assert_eq!(back.len(), 5);
+    assert_eq!(
+        back[4],
+        BackRecord::ShaderLookup {
+            cache_accesses: 3,
+            requests: vec![request()],
+            answer: ShaderAnswer::Pending { ticket: 3 },
+        }
+    );
+    // The recorded log replays: the back's read, then the lookup past the cache's three.
+    let blobs = {
+        let mut table = Blobs::new();
+        let guest = memory();
+        for va in [GPU_BASE + 0x100, GPU_BASE, GPU_BASE + 4, GPU_BASE + 8] {
+            guest.read(va, &mut buf).unwrap();
+            table.insert(&buf);
+        }
+        table
+    };
+    let replayed = seams::Back::with_blobs(back, blobs);
+    replayed
+        .memory(SPACE)
+        .read(GPU_BASE + 0x100, &mut buf)
+        .unwrap();
+    assert!(
+        matches!(lookup(&mut replayed.shaders()), SetLookup::Pending(t) if t == Ticket::new(3))
+    );
+    replayed.check().unwrap();
+    assert_eq!(replayed.next(), 5);
+}
+
 #[test]
 fn a_ready_or_rejected_answer_stops_the_replay() {
     for (answer, what) in [
@@ -466,6 +717,7 @@ fn a_ready_or_rejected_answer_stops_the_replay() {
         (ShaderAnswer::Rejected, "a rejected shader answer"),
     ] {
         let back = seams::Back::new(vec![BackRecord::ShaderLookup {
+            cache_accesses: 0,
             requests: vec![request()],
             answer,
         }]);
@@ -499,6 +751,7 @@ fn recording_shaders_keep_each_lookup_and_wait_with_its_answer() {
         recorder.take().unwrap().back,
         [
             BackRecord::ShaderLookup {
+                cache_accesses: 0,
                 requests: vec![request()],
                 answer: ShaderAnswer::Pending { ticket: 0 },
             },
@@ -559,7 +812,7 @@ fn starting_state_the_replay_cannot_restore_is_refused_by_kind() {
             owner: 1,
             blob,
         });
-        let error = replay(&capture, ReplayOptions::default()).unwrap_err();
+        let error = replay(capture.clone(), ReplayOptions::default()).unwrap_err();
         assert_eq!(error, ReplayError::UnsupportedState { kind });
         assert_eq!(
             error.to_string(),
@@ -583,7 +836,7 @@ fn the_starting_state_is_checked() {
         blob,
     });
     assert_eq!(
-        replay(&capture, ReplayOptions::default()).unwrap_err(),
+        replay(capture.clone(), ReplayOptions::default()).unwrap_err(),
         ReplayError::StateSpace { space: AsId(0x99) }
     );
     // The same space's table twice.
@@ -591,7 +844,7 @@ fn the_starting_state_is_checked() {
     let table = capture.state[0];
     capture.state.push(table);
     assert_eq!(
-        replay(&capture, ReplayOptions::default()).unwrap_err(),
+        replay(capture.clone(), ReplayOptions::default()).unwrap_err(),
         ReplayError::StateSpace { space: SPACE }
     );
     // The syncpoints twice.
@@ -599,7 +852,7 @@ fn the_starting_state_is_checked() {
     let syncpoints = capture.state[1];
     capture.state.push(syncpoints);
     assert_eq!(
-        replay(&capture, ReplayOptions::default()).unwrap_err(),
+        replay(capture.clone(), ReplayOptions::default()).unwrap_err(),
         ReplayError::StateSyncpoints
     );
     // A table that does not restore.
@@ -610,21 +863,23 @@ fn the_starting_state_is_checked() {
         blob: junk,
     };
     assert!(matches!(
-        replay(&capture, ReplayOptions::default()).unwrap_err(),
+        replay(capture.clone(), ReplayOptions::default()).unwrap_err(),
         ReplayError::AddressTable { space, .. } if space == SPACE
     ));
     // Syncpoints that do not restore.
     let mut capture = built();
+    let junk = capture.blobs.insert(b"junk");
     capture.state[1] = StateRecord::Syncpoints { blob: junk };
     assert!(matches!(
-        replay(&capture, ReplayOptions::default()).unwrap_err(),
+        replay(capture.clone(), ReplayOptions::default()).unwrap_err(),
         ReplayError::Syncpoints(_)
     ));
     // Capabilities that do not decode.
     let mut capture = built();
+    let junk = capture.blobs.insert(b"junk");
     capture.header.caps = junk;
     assert!(matches!(
-        replay(&capture, ReplayOptions::default()).unwrap_err(),
+        replay(capture.clone(), ReplayOptions::default()).unwrap_err(),
         ReplayError::Caps(_)
     ));
 }
@@ -633,7 +888,7 @@ fn the_starting_state_is_checked() {
 fn a_channel_a_fresh_gpu_would_number_differently_is_refused() {
     let mut capture = built();
     capture.header.channels[0].id = ChannelId(5);
-    let error = replay(&capture, ReplayOptions::default()).unwrap_err();
+    let error = replay(capture.clone(), ReplayOptions::default()).unwrap_err();
     assert_eq!(
         error,
         ReplayError::ChannelId {
@@ -657,7 +912,7 @@ fn a_drain_record_is_refused_where_the_back_meets_it() {
             ranges: vec![],
         },
     );
-    let error = replay(&capture, ReplayOptions::default()).unwrap_err();
+    let error = replay(capture.clone(), ReplayOptions::default()).unwrap_err();
     assert_eq!(
         error,
         ReplayError::Unsupported {
@@ -678,7 +933,7 @@ fn a_record_only_a_turn_reads_diverges_between_turns() {
         },
     );
     assert_eq!(
-        replay(&capture, ReplayOptions::default()).unwrap_err(),
+        replay(capture.clone(), ReplayOptions::default()).unwrap_err(),
         ReplayError::Diverged(Divergence {
             thread: Thread::Front,
             record: 0,
@@ -689,7 +944,7 @@ fn a_record_only_a_turn_reads_diverges_between_turns() {
     let mut capture = built();
     capture.back.insert(0, BackRecord::Timestamp { value: 1 });
     assert_eq!(
-        replay(&capture, ReplayOptions::default()).unwrap_err(),
+        replay(capture.clone(), ReplayOptions::default()).unwrap_err(),
         ReplayError::Diverged(Divergence {
             thread: Thread::Back,
             record: 0,
@@ -717,7 +972,7 @@ fn a_completion_whose_fence_the_backend_has_not_reached_diverges() {
     let reached = *completed;
     *completed += 1;
     assert_eq!(
-        replay(&capture, ReplayOptions::default()).unwrap_err(),
+        replay(capture.clone(), ReplayOptions::default()).unwrap_err(),
         ReplayError::Diverged(Divergence {
             thread: Thread::Back,
             record: index,
@@ -725,4 +980,25 @@ fn a_completion_whose_fence_the_backend_has_not_reached_diverges() {
             made: format!("the backend had completed fence {reached}"),
         })
     );
+    // A completion below the fence the backend reached diverges too: the value must be equal.
+    let BackRecord::Complete { completed } = &mut capture.back[index] else {
+        unreachable!()
+    };
+    assert!(reached > 0, "the present's list completed a fence");
+    *completed = reached - 1;
+    assert_eq!(
+        replay(capture.clone(), ReplayOptions::default()).unwrap_err(),
+        ReplayError::Diverged(Divergence {
+            thread: Thread::Back,
+            record: index,
+            found: format!("completion processing at fence {}", reached - 1),
+            made: format!("the backend had completed fence {reached}"),
+        })
+    );
+    // At the fence reached, it replays.
+    let BackRecord::Complete { completed } = &mut capture.back[index] else {
+        unreachable!()
+    };
+    *completed = reached;
+    replay(capture, ReplayOptions::default()).unwrap();
 }
