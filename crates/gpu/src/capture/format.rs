@@ -1625,78 +1625,6 @@ impl<'a> In<'a> {
     }
 }
 
-/// One record's bytes and back, for the golden tests (`super::tests::golden`).
-#[cfg(test)]
-pub(crate) mod one {
-    use super::{BackRecord, CaptureError, FrontRecord, Header, In, Out, Output, StateRecord};
-
-    pub(crate) fn header(header: &Header) -> Result<Vec<u8>, CaptureError> {
-        let mut out = Out(Vec::new());
-        out.header(header)?;
-        Ok(out.0)
-    }
-
-    pub(crate) fn state(record: &StateRecord) -> Vec<u8> {
-        let mut out = Out(Vec::new());
-        out.state(record);
-        out.0
-    }
-
-    pub(crate) fn front(record: &FrontRecord) -> Result<Vec<u8>, CaptureError> {
-        let mut out = Out(Vec::new());
-        out.front(record)?;
-        Ok(out.0)
-    }
-
-    pub(crate) fn back(record: &BackRecord) -> Result<Vec<u8>, CaptureError> {
-        let mut out = Out(Vec::new());
-        out.back(record)?;
-        Ok(out.0)
-    }
-
-    pub(crate) fn output(output: &Output) -> Vec<u8> {
-        let mut out = Out(Vec::new());
-        out.output(output);
-        out.0
-    }
-
-    /// Reads one record of each kind with `read`, which must take every byte.
-    fn whole<T>(
-        bytes: &[u8],
-        read: impl FnOnce(&mut In<'_>) -> Result<T, CaptureError>,
-    ) -> Result<T, CaptureError> {
-        let mut input = In { bytes, at: 0 };
-        let value = read(&mut input)?;
-        if input.at != bytes.len() {
-            return Err(CaptureError::TrailingBytes {
-                offset: input.at,
-                count: bytes.len() - input.at,
-            });
-        }
-        Ok(value)
-    }
-
-    pub(crate) fn read_header(bytes: &[u8]) -> Result<Header, CaptureError> {
-        whole(bytes, |input| input.header())
-    }
-
-    pub(crate) fn read_state(bytes: &[u8]) -> Result<StateRecord, CaptureError> {
-        whole(bytes, |input| input.state())
-    }
-
-    pub(crate) fn read_front(bytes: &[u8]) -> Result<FrontRecord, CaptureError> {
-        whole(bytes, |input| input.front())
-    }
-
-    pub(crate) fn read_back(bytes: &[u8]) -> Result<BackRecord, CaptureError> {
-        whole(bytes, |input| input.back())
-    }
-
-    pub(crate) fn read_output(bytes: &[u8]) -> Result<Output, CaptureError> {
-        whole(bytes, |input| input.output())
-    }
-}
-
 impl Capture {
     /// The capture as a file.
     ///
@@ -1836,5 +1764,77 @@ impl Capture {
             }
         }
         Ok(())
+    }
+}
+
+/// One record's bytes and back, for the golden tests (`super::tests::golden`).
+#[cfg(test)]
+pub(crate) mod one {
+    use super::{BackRecord, CaptureError, FrontRecord, Header, In, Out, Output, StateRecord};
+
+    pub(crate) fn header(header: &Header) -> Result<Vec<u8>, CaptureError> {
+        let mut out = Out(Vec::new());
+        out.header(header)?;
+        Ok(out.0)
+    }
+
+    pub(crate) fn state(record: &StateRecord) -> Vec<u8> {
+        let mut out = Out(Vec::new());
+        out.state(record);
+        out.0
+    }
+
+    pub(crate) fn front(record: &FrontRecord) -> Result<Vec<u8>, CaptureError> {
+        let mut out = Out(Vec::new());
+        out.front(record)?;
+        Ok(out.0)
+    }
+
+    pub(crate) fn back(record: &BackRecord) -> Result<Vec<u8>, CaptureError> {
+        let mut out = Out(Vec::new());
+        out.back(record)?;
+        Ok(out.0)
+    }
+
+    pub(crate) fn output(output: &Output) -> Vec<u8> {
+        let mut out = Out(Vec::new());
+        out.output(output);
+        out.0
+    }
+
+    /// Reads one record of each kind with `read`, which must take every byte.
+    fn whole<'a, T>(
+        bytes: &'a [u8],
+        read: impl FnOnce(&mut In<'a>) -> Result<T, CaptureError>,
+    ) -> Result<T, CaptureError> {
+        let mut input = In { bytes, at: 0 };
+        let value = read(&mut input)?;
+        if input.at != bytes.len() {
+            return Err(CaptureError::TrailingBytes {
+                offset: input.at,
+                count: bytes.len() - input.at,
+            });
+        }
+        Ok(value)
+    }
+
+    pub(crate) fn read_header(bytes: &[u8]) -> Result<Header, CaptureError> {
+        whole(bytes, In::header)
+    }
+
+    pub(crate) fn read_state(bytes: &[u8]) -> Result<StateRecord, CaptureError> {
+        whole(bytes, In::state)
+    }
+
+    pub(crate) fn read_front(bytes: &[u8]) -> Result<FrontRecord, CaptureError> {
+        whole(bytes, In::front)
+    }
+
+    pub(crate) fn read_back(bytes: &[u8]) -> Result<BackRecord, CaptureError> {
+        whole(bytes, In::back)
+    }
+
+    pub(crate) fn read_output(bytes: &[u8]) -> Result<Output, CaptureError> {
+        whole(bytes, In::output)
     }
 }

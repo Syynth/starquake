@@ -44,16 +44,16 @@ fn range(start: u64, size: u64) -> PageRange {
     PageRange::new(start, size).unwrap()
 }
 
-fn front(record: FrontRecord, expected: &[Vec<u8>]) {
+fn front(record: &FrontRecord, expected: &[Vec<u8>]) {
     let expected = expected.concat();
-    assert_eq!(one::front(&record).unwrap(), expected, "{record:?}");
-    assert_eq!(one::read_front(&expected).unwrap(), record);
+    assert_eq!(one::front(record).unwrap(), expected, "{record:?}");
+    assert_eq!(&one::read_front(&expected).unwrap(), record);
 }
 
-fn back(record: BackRecord, expected: &[Vec<u8>]) {
+fn back(record: &BackRecord, expected: &[Vec<u8>]) {
     let expected = expected.concat();
-    assert_eq!(one::back(&record).unwrap(), expected, "{record:?}");
-    assert_eq!(one::read_back(&expected).unwrap(), record);
+    assert_eq!(one::back(record).unwrap(), expected, "{record:?}");
+    assert_eq!(&one::read_back(&expected).unwrap(), record);
 }
 
 fn state(record: StateRecord, expected: &[Vec<u8>]) {
@@ -148,9 +148,9 @@ fn starting_state_records() {
 
 #[test]
 fn front_records_of_the_driver() {
-    front(FrontRecord::Turn, &[vec![0x10]]);
+    front(&FrontRecord::Turn, &[vec![0x10]]);
     front(
-        FrontRecord::Submit {
+        &FrontRecord::Submit {
             channel: ChannelId(0x51),
             submission: Submission {
                 entries: vec![
@@ -178,7 +178,7 @@ fn front_records_of_the_driver() {
         ],
     );
     front(
-        FrontRecord::Submit {
+        &FrontRecord::Submit {
             channel: ChannelId(0x52),
             submission: Submission {
                 entries: vec![],
@@ -196,10 +196,14 @@ fn front_records_of_the_driver() {
             u32le(0),
         ],
     );
+}
+
+#[test]
+fn front_update_records() {
     let r = range(0x1000, 0x3000);
     let rb = [u64le(0x1000), u64le(0x3000)].concat();
     front(
-        FrontRecord::Update {
+        &FrontRecord::Update {
             space: AsId(0x23),
             update: VmUpdate::Unmap { range: r },
             ticket: Some(Ticket(0xa1)),
@@ -214,7 +218,7 @@ fn front_records_of_the_driver() {
         ],
     );
     front(
-        FrontRecord::Update {
+        &FrontRecord::Update {
             space: AsId(0x24),
             update: VmUpdate::ModifyKind {
                 range: r,
@@ -225,7 +229,7 @@ fn front_records_of_the_driver() {
         &[vec![0x12], u32le(0x24), vec![1], rb.clone(), vec![0x5b, 0]],
     );
     front(
-        FrontRecord::Update {
+        &FrontRecord::Update {
             space: AsId(0x25),
             update: VmUpdate::DestroyMemory { range: r },
             ticket: Some(Ticket(0xa2)),
@@ -240,7 +244,7 @@ fn front_records_of_the_driver() {
         ],
     );
     front(
-        FrontRecord::Update {
+        &FrontRecord::Update {
             space: AsId(0x26),
             update: VmUpdate::DestroySparseRegion {
                 range: r,
@@ -258,14 +262,18 @@ fn front_records_of_the_driver() {
             u64le(0xa3),
         ],
     );
+}
+
+#[test]
+fn front_records_of_gsv() {
     front(
-        FrontRecord::Barrier {
+        &FrontRecord::Barrier {
             ticket: Ticket(0xd1d2),
         },
         &[vec![0x13], u64le(0xd1d2)],
     );
     front(
-        FrontRecord::Present {
+        &FrontRecord::Present {
             request: PresentRequest {
                 image: ImageDesc {
                     address: 0x1_0203_0405,
@@ -302,7 +310,7 @@ fn front_records_of_the_driver() {
         ],
     );
     front(
-        FrontRecord::Destroy {
+        &FrontRecord::Destroy {
             channel: ChannelId(0xe1),
         },
         &[vec![0x15], u32le(0xe1)],
@@ -312,7 +320,7 @@ fn front_records_of_the_driver() {
 #[test]
 fn front_records_from_the_back_and_the_clock() {
     front(
-        FrontRecord::Report {
+        &FrontRecord::Report {
             markers: vec![MarkerToken(0x11), MarkerToken(0x22)],
             released: true,
             incremented: false,
@@ -320,7 +328,7 @@ fn front_records_from_the_back_and_the_clock() {
         &[vec![0x16, 1, 0], u32le(2), u64le(0x11), u64le(0x22)],
     );
     front(
-        FrontRecord::Report {
+        &FrontRecord::Report {
             markers: vec![],
             released: false,
             incremented: true,
@@ -328,28 +336,28 @@ fn front_records_from_the_back_and_the_clock() {
         &[vec![0x16, 0, 1], u32le(0)],
     );
     front(
-        FrontRecord::Syncpoint {
+        &FrontRecord::Syncpoint {
             id: SyncpointId::new(0x0b).unwrap(),
             value: 0x1234_5678,
         },
         &[vec![0x17, 0x0b], u32le(0x1234_5678)],
     );
     front(
-        FrontRecord::Latch {
+        &FrontRecord::Latch {
             channel: ChannelId(0x13),
         },
         &[vec![0x18], u32le(0x13)],
     );
     front(
-        FrontRecord::Clock {
+        &FrontRecord::Clock {
             now: Duration::from_nanos(0x01_0203_0405),
         },
         &[vec![0x19], u64le(0x01_0203_0405)],
     );
 }
 
-/// Every access, with the bytes after its tag, in both logs.
-fn accesses() -> Vec<(Access, Vec<u8>)> {
+/// Every read, with the bytes after its tag.
+fn reads() -> Vec<(Access, Vec<u8>)> {
     let head = |tag: u8, space: u32, va: u64| [vec![tag], u32le(space), u64le(va)].concat();
     vec![
         (
@@ -420,6 +428,13 @@ fn accesses() -> Vec<(Access, Vec<u8>)> {
             ]
             .concat(),
         ),
+    ]
+}
+
+/// Every write and query, with the bytes after its tag.
+fn other_accesses() -> Vec<(Access, Vec<u8>)> {
+    let head = |tag: u8, space: u32, va: u64| [vec![tag], u32le(space), u64le(va)].concat();
+    vec![
         (
             Access::Write {
                 space: AsId(0x65),
@@ -465,30 +480,34 @@ fn accesses() -> Vec<(Access, Vec<u8>)> {
 
 #[test]
 fn accesses_in_either_log() {
-    for (access, bytes) in accesses() {
-        front(FrontRecord::Access(access), &[bytes.clone()]);
-        back(BackRecord::Access(access), &[bytes]);
+    for (access, bytes) in reads().into_iter().chain(other_accesses()) {
+        front(&FrontRecord::Access(access), std::slice::from_ref(&bytes));
+        back(&BackRecord::Access(access), &[bytes]);
     }
 }
 
 #[test]
 fn back_records() {
-    back(BackRecord::Apply, &[vec![0x20]]);
-    back(BackRecord::Close, &[vec![0x21]]);
+    back(&BackRecord::Apply, &[vec![0x20]]);
+    back(&BackRecord::Close, &[vec![0x21]]);
     back(
-        BackRecord::Complete { completed: 0x77 },
+        &BackRecord::Complete { completed: 0x77 },
         &[vec![0x22], u64le(0x77)],
     );
     back(
-        BackRecord::Elapsed {
+        &BackRecord::Elapsed {
             elapsed: Duration::from_nanos(0x0203_0405),
         },
         &[vec![0x23], u64le(0x0203_0405)],
     );
     back(
-        BackRecord::Timestamp { value: 0x0304_0506 },
+        &BackRecord::Timestamp { value: 0x0304_0506 },
         &[vec![0x24], u64le(0x0304_0506)],
     );
+}
+
+#[test]
+fn the_waiter_record() {
     let ops = [
         (AcquireOp::Equal, 0),
         (AcquireOp::GreaterOrEqual, 1),
@@ -519,9 +538,13 @@ fn back_records() {
             vec![u8::from(latched)],
         ]);
     }
-    back(BackRecord::Waiters { waiters }, &expected);
+    back(&BackRecord::Waiters { waiters }, &expected);
+}
+
+#[test]
+fn the_drain_record() {
     back(
-        BackRecord::Drain {
+        &BackRecord::Drain {
             space: AsId(0x27),
             ranges: vec![range(0x1000, 0x2000), range(0x5000, 0x1000)],
         },
@@ -571,14 +594,14 @@ fn shader_records() {
         let mut expected = body.clone();
         expected.push(answer_bytes.clone());
         back(
-            BackRecord::ShaderLookup {
+            &BackRecord::ShaderLookup {
                 requests: requests.clone(),
                 answer,
             },
             &expected,
         );
         back(
-            BackRecord::ShaderWait {
+            &BackRecord::ShaderWait {
                 ticket: 0xbeef,
                 answer,
             },

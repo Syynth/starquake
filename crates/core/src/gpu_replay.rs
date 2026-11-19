@@ -12,6 +12,7 @@
 //! A capture with fewer presents than `--until present=N` asks for replays to its end, and the
 //! summary line says so: the end of the capture is the replay's other stop condition.
 
+use std::fmt::Write as _;
 use std::fs::File;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -130,7 +131,7 @@ pub fn render_output(output: &ReplayOutput, args: &GpuReplayArgs) -> String {
         && !output.stopped_early
         && output.presents < until
     {
-        text.push_str(&format!("the capture ended before present {until}\n"));
+        let _ = writeln!(text, "the capture ended before present {until}");
     }
     match args.dump {
         Some(Dump::Ring) => text.push_str(&write_text(&output.ring)),

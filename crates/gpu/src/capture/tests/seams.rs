@@ -52,9 +52,9 @@ fn recording_memory_records_each_call_with_its_answer_in_its_threads_log() {
     back.write(GPU_BASE + 8, &[9, 8]).unwrap();
     assert_eq!(back.generation(), 1);
     assert!(!back.is_gpu_only(GPU_BASE, 16));
-    let recorded = recorder.take().unwrap();
+    let taken = recorder.take().unwrap();
     assert_eq!(
-        recorded.front,
+        taken.front,
         [
             FrontRecord::Access(Access::Read {
                 space: SPACE,
@@ -73,7 +73,7 @@ fn recording_memory_records_each_call_with_its_answer_in_its_threads_log() {
         ]
     );
     assert_eq!(
-        recorded.back,
+        taken.back,
         [
             BackRecord::Access(Access::Write {
                 space: AsId(0x22),
@@ -94,14 +94,11 @@ fn recording_memory_records_each_call_with_its_answer_in_its_threads_log() {
         ]
     );
     assert_eq!(
-        recorded.blobs.get(ContentHash::of(&[2, 3, 4])),
+        taken.blobs.get(ContentHash::of(&[2, 3, 4])),
         Some(&[2, 3, 4][..])
     );
-    assert_eq!(
-        recorded.blobs.get(ContentHash::of(&[9, 8])),
-        Some(&[9, 8][..])
-    );
-    assert_eq!(recorded.blobs.len(), 2);
+    assert_eq!(taken.blobs.get(ContentHash::of(&[9, 8])), Some(&[9, 8][..]));
+    assert_eq!(taken.blobs.len(), 2);
 }
 
 #[test]
@@ -111,9 +108,9 @@ fn the_recorder_keeps_blobs_up_to_its_limit_and_counts_a_repeated_blob_once() {
     recorder.blob(&[1; 5]);
     recorder.blob(&[2; 3]);
     recorder.front(FrontRecord::Turn);
-    let recorded = recorder.take().unwrap();
-    assert_eq!((recorded.blobs.len(), recorded.blobs.bytes()), (2, 8));
-    assert_eq!(recorded.front, [FrontRecord::Turn]);
+    let taken = recorder.take().unwrap();
+    assert_eq!((taken.blobs.len(), taken.blobs.bytes()), (2, 8));
+    assert_eq!(taken.front, [FrontRecord::Turn]);
 
     let recorder = Recorder::new(8);
     recorder.blob(&[1; 5]);
@@ -280,7 +277,7 @@ fn replay_memory_diverges_on_each_difference() {
             SPACE.0
         )
     );
-    assert!(log.writes().is_empty());
+    assert_eq!(log.writes(), []);
     // A query past the log's end.
     let log = seams::Front::new(vec![], Blobs::new());
     assert_eq!(log.memory(SPACE).generation(), 0);
@@ -312,7 +309,7 @@ fn the_first_divergence_is_kept_and_every_later_call_fails() {
     );
     assert!(!memory.is_gpu_only(0, 1));
     let ReplayError::Diverged(divergence) = log.check().unwrap_err() else {
-        panic!("not a divergence")
+        unreachable!("not a divergence")
     };
     assert_eq!(divergence.record, 0);
     assert!(divergence.made.contains("0x1001"));
@@ -579,7 +576,7 @@ fn the_starting_state_is_checked() {
     // A table for a space the header does not list.
     let mut capture = built();
     let StateRecord::AddressTable { blob, .. } = capture.state[0] else {
-        panic!("the builder saves the table first")
+        unreachable!("the builder saves the table first")
     };
     capture.state.push(StateRecord::AddressTable {
         space: AsId(0x99),
