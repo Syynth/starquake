@@ -174,46 +174,55 @@ pub(super) struct Back {
 impl Back {
     /// The loop (module docs).
     pub(super) fn run(mut self) -> Result<(), BackError> {
-        loop {
-            self.apply_controls();
-            if self.inbox.is_stopping() {
-                self.publish();
-                return Ok(());
-            }
-            match self.exec.wait(&mut self.ring, BACK_WAIT) {
-                Ok(Woke::Entry(entry)) => {
-                    // The entry is the `taken`-th: what was posted before it was pushed is due.
-                    self.apply_controls();
-                    // A refused entry is logged and counted by the executor.
-                    if self.exec.apply(&entry).is_err() {
-                        tracing::trace!("the back refused an entry; counted");
-                    }
-                    self.taken = self.taken.saturating_add(1);
-                }
-                Ok(Woke::Completed(_) | Woke::TimedOut) => {}
-                Err(FenceError::Ring(PopError::Disconnected)) => {
-                    self.apply_controls();
-                    self.publish();
-                    return Ok(());
-                }
-                Err(FenceError::Ring(error)) => {
-                    tracing::error!(%error, "the GPU back thread's ring is corrupt; it stops");
-                    self.publish();
-                    return Err(BackError::Ring(error));
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "the GPU back thread's wait failed");
-                    self.wait_failures = self.wait_failures.saturating_add(1);
-                }
-            }
+        while self.step(BACK_WAIT)? {}
+        Ok(())
+    }
+
+    /// One pass of the loop, waiting at most `wait`: whether the loop goes on.
+    ///
+    /// # Errors
+    ///
+    /// [`BackError::Ring`] for a corrupt ring.
+    pub(super) fn step(&mut self, wait: Duration) -> Result<bool, BackError> {
+        self.apply_controls();
+        if self.inbox.is_stopping() {
             self.publish();
+            return Ok(false);
         }
+        match self.exec.wait(&mut self.ring, wait) {
+            Ok(Woke::Entry(entry)) => {
+                // The entry is the `taken`-th: what was posted before it was pushed is due.
+                self.apply_controls();
+                // A refused entry is logged and counted by the executor.
+                if self.exec.apply(&entry).is_err() {
+                    tracing::trace!("the back refused an entry; counted");
+                }
+                self.taken = self.taken.saturating_add(1);
+            }
+            Ok(Woke::Completed(_) | Woke::TimedOut) => {}
+            Err(FenceError::Ring(PopError::Disconnected)) => {
+                self.apply_controls();
+                self.publish();
+                return Ok(false);
+            }
+            Err(FenceError::Ring(error)) => {
+                tracing::error!(%error, "the GPU back thread's ring is corrupt; it stops");
+                self.publish();
+                return Err(BackError::Ring(error));
+            }
+            Err(error) => {
+                tracing::warn!(%error, "the GPU back thread's wait failed");
+                self.wait_failures = self.wait_failures.saturating_add(1);
+            }
+        }
+        self.publish();
+        Ok(true)
     }
 
     /// Applies every control that is due, in the order posted (module docs). Each is taken off
     /// the inbox under its lock and applied with the lock released, so a post never waits for
     /// the executor.
-    fn apply_controls(&mut self) {
+    pub(super) fn apply_controls(&mut self) {
         while let Some(control) = self.next_due() {
             self.apply_control(control);
         }
