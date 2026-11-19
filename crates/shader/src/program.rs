@@ -6,6 +6,8 @@
 
 use thiserror::Error;
 
+use crate::cache::CacheRefusal;
+use crate::capture::CaptureError;
 use crate::decode::{DecodeError, Instr, Instruction, LengthError, decode};
 use crate::exchange::ExchangeError;
 use crate::host::HostShader;
@@ -37,6 +39,13 @@ pub enum Rejection {
     /// inputs: questions and answers").
     #[error(transparent)]
     Questions(#[from] ExchangeError),
+    /// The program could not be captured from guest memory (slice 3, as the shader cache reads
+    /// it; slice 19).
+    #[error(transparent)]
+    Capture(#[from] CaptureError),
+    /// The shader cache refused the shader itself (slice 19).
+    #[error(transparent)]
+    Cache(#[from] CacheRefusal),
 }
 
 /// Splits `code` into instructions and decodes each one.
