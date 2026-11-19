@@ -7,6 +7,10 @@
 //! constant and turns into an [`Unsupported`] rejection naming the same thing, except the
 //! colour-register bound of `EXIT`, which cannot fail here (see `Translator::exit`).
 //!
+//! The instruction groups' translators (port slices 12a to 12h) each have a module here that
+//! translates one instruction of a flow block (slice 10) at a time: [`control`] for the
+//! control and warp group. [`translate`] keeps refusing those groups' instructions.
+//!
 //! Slice 1 handles linear flow only (spec, port slice 1). Where starquake is stricter than the
 //! PR, because the PR resolves the case in a part not built yet:
 //!
@@ -41,6 +45,7 @@
 //! `uniform_and_constant_buffer_sources_are_rejected` and
 //! `other_instructions_are_rejected_by_mnemonic`.
 
+pub mod control;
 #[cfg(test)]
 mod tests;
 
@@ -130,9 +135,13 @@ pub enum Unsupported {
     /// The stage is not handled yet.
     #[error("{0} programs are not supported yet")]
     Stage(GuestStage),
-    /// An instruction the translator does not handle yet: every one but the six of slice 1.
+    /// An instruction no translator handles yet: in [`translate`], every one but the six of
+    /// slice 1; in [`control::translate_control`], `BMOV`, `NANOSLEEP`, `JMX` and `BPT`.
     #[error("{0}")]
     Instruction(&'static str),
+    /// A control or warp form [`control::translate_control`] does not handle.
+    #[error("{0}")]
+    Control(#[from] control::ControlUnsupported),
     /// A uniform-register or constant-buffer source of `MOV` or `FFMA` (PR #4588 reads both:
     /// `visitor.cpp`, `Visitor::Value`).
     #[error("a uniform-register or constant-buffer source")]
