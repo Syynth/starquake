@@ -41,6 +41,10 @@
 //! (`TMML`, per-texel gather offsets, the fault predicate of `.SPARSE` results, the
 //! minimum-LOD clamp).
 //!
+//! Slice 7 is the IR interpreter ([`interp`]), the semantic test oracle (decision 15 of the
+//! spec): it runs one invocation of an IR function on plain machine state, so translator and
+//! IR-pass tests can compare the IR's results with values derived from documented behaviour.
+//!
 //! Slice 10 rebuilds a captured program's control flow ([`flow`]): it finds and resolves the
 //! jump tables of `BRX`, walks the program under both convergence-barrier models, splits it
 //! into blocks, inlines every call, and builds the IR's basic blocks from the flow graph.
@@ -57,6 +61,7 @@ pub mod flow;
 #[cfg(test)]
 mod gpu_harness;
 pub mod host;
+pub mod interp;
 pub mod ir;
 pub mod lookup;
 pub mod lower;
