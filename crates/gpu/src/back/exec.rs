@@ -111,12 +111,17 @@
 //! `eden-nx2/src/video_core/engines/maxwell_3d.cpp` @ 50fa86bb), which its ring carries. The
 //! spec's ring has no entry for the end of a macro. Here a channel's deferred instances are
 //! drawn ([`Draws::flush`]) before any entry of that channel that is not a `Write` or `Run` of
-//! its 3D class, and every channel's before a `Syncpoint`, `Marker` or `Present`, so the work
-//! after them in the stream comes after the draw. A **divergence**, and an owner question: a
-//! ring entry for the end of a macro would let the back draw them where Eden-NX2 does.
-//! Pinned by `tests::deferred_instances_are_drawn_before_the_channels_next_release` and, for a
-//! marker, a syncpoint, a DMA word and an inline-to-memory word, by
-//! `tests::deferred_instances_are_drawn_before_each_boundary`.
+//! its 3D class, before a word of its 3D class that releases a report semaphore (a
+//! `SET_REPORT_SEMAPHORE_D` word that [`report::decide`] answers with a release; below,
+//! "Report semaphores"), and every channel's before a `Syncpoint`, `Marker` or `Present`, so
+//! the work after them in the stream comes after the draw. A **divergence**, and an owner
+//! question: a ring entry for the end of a macro would let the back draw them where Eden-NX2
+//! does. Pinned by `tests::deferred_instances_are_drawn_before_the_channels_next_release`; for
+//! a marker, a syncpoint, a DMA word and an inline-to-memory word, by
+//! `tests::deferred_instances_are_drawn_before_each_boundary`; for a report semaphore, by
+//! `tests::report::deferred_instances_are_drawn_before_a_report_semaphore_release` and, with
+//! the open list empty when the report arrives,
+//! `tests::report::deferred_instances_are_drawn_before_a_release_that_finds_the_open_list_empty`.
 //!
 //! A deferred draw that fails (a topology only checked when it is drawn, a non-finite
 //! viewport) does not stop the entry that drew it: the release, increment or marker is still
@@ -124,7 +129,8 @@
 //! engine, since one channel's bad draw must not drop another channel's fence or ordered
 //! update. The entry's own error is returned first; the deferred draw's is returned when the
 //! entry's own work succeeded, and logged and counted otherwise
-//! (`tests::a_failed_deferred_draw_does_not_stop_the_entry_after_it`).
+//! (`tests::a_failed_deferred_draw_does_not_stop_the_entry_after_it`; for a report semaphore,
+//! `tests::report::a_failed_deferred_draw_before_a_report_still_releases_and_returns_the_draws_error`).
 //!
 //! # Report semaphores
 //!

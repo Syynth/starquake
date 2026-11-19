@@ -9,7 +9,9 @@
 //! `SET_REPORT_SEMAPHORE_A/B`, as a fenced release like every other ([`FencedAction::Release`],
 //! `back::fence`). The native SDK ends a queue's work with one and waits for the word to
 //! change, so without it a title stops after its first submissions. Counter reports (occlusion
-//! counts, primitive counts, timestamps) are the second half and are still deferred.
+//! counts, primitive counts, timestamps) are the second half and are still deferred. The
+//! compute class's report semaphore (`clc7c0.h`'s `SET_REPORT_SEMAPHORE_A`–`D`) is not handled
+//! here: it is issue #458.
 //!
 //! Method numbers and fields are `clc797.h`'s (`mesa-nouveau/src/nouveau/headers/nvidia/classes/`
 //! @ 52238762, MIT), read through the generated [`clc797`]. The behaviour is that of Eden-NX2's
@@ -30,18 +32,21 @@
 //! | `ACQUIRE` (1) or `TRAP` (3) | any | [`ReportAction::Nothing`] |
 //!
 //! `ProcessQueryGet` calls `rasterizer->Query` for `Operation::Release` and
-//! `Operation::ReportOnly` alike and does nothing for the other two (`UNIMPLEMENTED_MSG`), and
-//! its `report` value 0 is `QueryType::Payload`.
+//! `Operation::ReportOnly` and does nothing for the other two (`UNIMPLEMENTED_MSG`), and its
+//! `report` value 0 is `QueryType::Payload`. The two calls differ in one flag: only a
+//! `Release` with `short_query` set is marked `IsAFence` (below, "Divergences").
 //!
 //! The release:
 //!
 //! - **address**: `SET_REPORT_SEMAPHORE_A`'s `OFFSET_UPPER` (7:0) as bits 39:32 over
-//!   `SET_REPORT_SEMAPHORE_B`'s `OFFSET_LOWER` (Eden's `report_semaphore.Address()`);
+//!   `SET_REPORT_SEMAPHORE_B`'s `OFFSET_LOWER` (a 40-bit address; Eden's
+//!   `report_semaphore.Address()` keeps more, below, "Divergences");
 //! - **payload**: `SET_REPORT_SEMAPHORE_C`'s `PAYLOAD`, 32 bits;
 //! - **form**: with `STRUCTURE_SIZE` (28) `ONE_WORD` (Eden's `short_query`), the 4 payload
 //!   bytes; with `FOUR_WORDS`, the 16-byte structure, the payload widened to 64 bits and then
 //!   the timestamp ([`crate::sema::ReleaseForm`]; row 52). `CounterReport` writes the same two
-//!   shapes (`HasTimeout` is set when `short_query` is 0).
+//!   shapes (`HasTimeout` is set when `short_query` is 0). The timestamp is the fence path's
+//!   ([`crate::back::fence::FenceClock::gpu_timestamp`]; below, "Divergences").
 //!
 //! The executor (`back::exec`) attaches it for the channel's address space, after drawing the
 //! channel's deferred instances, as it does for a `Release` entry.
@@ -49,11 +54,26 @@
 //! # Divergences from Eden-NX2
 //!
 //! - **Every payload release is fenced** (owner's decision 2, "Releases happen after the work
-//!   they follow"). Eden-NX2 fences the one-word form (`IsAFence`, `SignalFence`) and, unless
-//!   its GPU accuracy is High, writes the four-word form at the write itself
-//!   (`!Settings::IsGPULevelHigh() && counter_type == QueryType::Payload`). Here both wait for
-//!   the host work before them, and both are written at once when there is none
-//!   (`back::exec::tests::a_report_semaphore_release_waits_for_the_work_before_it`).
+//!   they follow"). Eden-NX2 fences only a one-word `RELEASE`: `ProcessQueryGet` sets
+//!   `IsAFence` for `Operation::Release` when `short_query` is set, and never for
+//!   `Operation::ReportOnly`, and `CounterReport` then calls `SignalFence`. A four-word
+//!   `RELEASE` and every `REPORT_ONLY`, unless its GPU accuracy is High, are written at the
+//!   write itself (`!Settings::IsGPULevelHigh() && counter_type == QueryType::Payload`). Here
+//!   every form of both operations waits for the host work before it
+//!   (`back::exec::tests::a_report_semaphore_release_waits_for_the_work_before_it`), and is
+//!   written at once when there is none
+//!   (`back::exec::tests::a_one_word_payload_report_writes_four_bytes`).
+//! - **The address keeps 8 bits of `OFFSET_UPPER`.** `clc797.h` gives the field bits 7:0, so a
+//!   value above them is dropped and the address has 40 bits. Eden-NX2 reads `address_high` as
+//!   a whole `u32` and shifts all 32 bits up (`Address()`,
+//!   `eden-nx2/src/video_core/engines/maxwell_3d.h` @ 50fa86bb).
+//!   `tests::the_address_takes_eight_upper_bits_and_all_lower_ones`.
+//! - **The four-word form's timestamp is the host's monotonic clock**, in nanoseconds, as for
+//!   every 16-byte release (the production [`crate::back::fence::FenceClock`], `crate::wiring`).
+//!   The owner's ruling of 2026-11-19 (`docs/decision-log.md`, ruling 29) makes it guest time
+//!   from the kernel's clock; issue #435 changes it for every release, this one included.
+//!   Eden-NX2 writes `gpu.GetTicks()`. Not pinned here: the executor's tests use the fence
+//!   path's fake clock (`back::exec::tests::a_four_word_payload_report_writes_the_payload_and_the_timestamp`).
 //! - **A counter report writes nothing.** Eden-NX2 answers the kinds its backend counts from
 //!   host queries, and every other kind as a payload of 1 (`streamer == nullptr`:
 //!   `counter_type = QueryType::Payload; payload = 1U`). Which of those this project wants is
@@ -74,8 +94,9 @@
 //!   `REDUCTION_ENABLE` on a payload report; a trace of one that does would say whether the
 //!   release should be a reduction ([`crate::sema::Reduction`]).
 //! - `RELEASE` (4), `ACQUIRE` (8), `PIPELINE_LOCATION`, `COMPARISON`, `AWAKEN_ENABLE`,
-//!   `SUB_REPORT`, `REPORT_DWORD_NUMBER` and `FLUSH_DISABLE` are ignored, as in Eden-NX2 for a
-//!   payload (`sub_report` only selects among counters).
+//!   `SUB_REPORT`, `REPORT_DWORD_NUMBER`, `FLUSH_DISABLE` and `CONDITIONAL_TRAP` (19) are
+//!   ignored, as in Eden-NX2 for a payload (`sub_report` only selects among counters; Eden-NX2's
+//!   `query` union has no field at bit 19).
 //! - `REPORT_SEMAPHORE_EXECUTE` and the 64-bit `SET_REPORT_SEMAPHORE_PAYLOAD_LOWER/UPPER` and
 //!   `_ADDRESS_LOWER/UPPER` registers `clc797.h` adds are not acted on: neither reference acts
 //!   on them, and no title has been seen to write them.
