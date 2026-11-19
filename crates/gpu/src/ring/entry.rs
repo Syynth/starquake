@@ -189,6 +189,15 @@ pub enum RingEntry<'a> {
         /// The channel.
         channel: ChannelId,
     },
+    /// `SET_REFERENCE` (host method 0x14) with its count: the back closes its open command list
+    /// with no fenced action attached, as Eden-NX2's back does (`puller.cpp`, `RefCnt` →
+    /// `SignalReference`; gpu-protocol "Host methods", decided by the owner on 2026-11-18).
+    SetReference {
+        /// The channel.
+        channel: ChannelId,
+        /// The count written.
+        value: u32,
+    },
     /// A host memory operation.
     Invalidate {
         /// The channel.
@@ -245,6 +254,7 @@ impl RingEntry<'_> {
             Self::Release(release) => RingEntry::Release(release),
             Self::Syncpoint { id } => RingEntry::Syncpoint { id },
             Self::WaitForIdle { channel } => RingEntry::WaitForIdle { channel },
+            Self::SetReference { channel, value } => RingEntry::SetReference { channel, value },
             Self::Invalidate { channel, what } => RingEntry::Invalidate { channel, what },
             Self::Marker { token } => RingEntry::Marker { token },
             Self::Present(present) => RingEntry::Present(present),
@@ -259,6 +269,7 @@ impl RingEntry<'_> {
             | Self::Write { channel, .. }
             | Self::Run { channel, .. }
             | Self::WaitForIdle { channel }
+            | Self::SetReference { channel, .. }
             | Self::Invalidate { channel, .. } => Some(*channel),
             Self::Release(_)
             | Self::Syncpoint { .. }

@@ -8,11 +8,14 @@
 //! This module holds the ones that exist so far: [`ChannelId`], [`SyncpointId`] and
 //! [`SYNCPOINT_COUNT`], the present's [`PresentRequest`] with its [`ImageDesc`], [`LayerId`]
 //! and [`DisplayId`], graphics-server slice 2's [`Fence`], [`Ticket`], [`GpuCompletion`] and
-//! [`Completions`], and slice 6's [`Target`], [`RegionId`], [`Kind`] and [`VmUpdate`]. The
+//! [`Completions`], slice 6's [`Target`], [`RegionId`], [`Kind`] and [`VmUpdate`], and the front
+//! loop's (G14) [`AsId`], [`GpfifoEntry`], [`Submission`], [`Submitted`], [`ChannelConfig`] and
+//! [`CHANNEL_QUEUE_ENTRIES`], which gsv defined until the front existed and now re-exports. The
 //! block's `Syncpoints` and `GpuVm` have behaviour, not only a shape, so they live in
-//! [`crate::syncpoint`] and [`crate::vm`]. The rest of the block (`Submission`, `GpuFront`, ...)
-//! belongs here too when its slice lands.
+//! [`crate::syncpoint`] and [`crate::vm`]. The rest of the block (`GpuFront`, `GpuError`) belongs
+//! here too when its slice (the wiring, G21) lands.
 
+use serde::{Deserialize, Serialize};
 use starquake_memory::PageRange;
 /// The area of an image a present shows ([`PresentRequest::shown`]): the render backend's
 /// rectangle, named here so that gsv, which builds a [`PresentRequest`] and does not depend on
@@ -187,6 +190,56 @@ impl VmUpdate {
             | Self::DestroySparseRegion { range, .. } => range,
         }
     }
+}
+
+/// A GPU address space, as gsv numbers it (gpu 33): graphics-server's `AsId`, the address space a
+/// channel's addresses resolve in ([`ChannelConfig::space`]). Not a protocol fact: gsv hands the
+/// numbers out and the GPU only compares them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct AsId(pub u32);
+
+/// The most GP entries a channel's submission queue holds (decided by the owner, graphics-server
+/// decision 12; gpu-protocol, "Back-pressure", where the figure is a **guess** at a size no title
+/// reaches in normal pacing). The front enforces it ([`Submitted::Full`],
+/// `crate::front`); gsv refuses a single submission larger than it, which could never be queued.
+pub const CHANNEL_QUEUE_ENTRIES: usize = 65_536;
+
+/// One GP entry as the guest wrote it: 8 bytes, little-endian (graphics-server's `GpfifoEntry`;
+/// [`crate::fifo::GpEntry::from_raw`] decodes it). Kept raw so that a submission is saved and
+/// handed on exactly as sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GpfifoEntry(pub u64);
+
+/// What gsv hands the GPU front for one `SubmitGPFIFO` (graphics-server's `Submission`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Submission {
+    /// The entries, in order.
+    pub entries: Vec<GpfifoEntry>,
+    /// The fence to wait on first (flag bit 0).
+    pub wait: Option<Fence>,
+    /// How many increments of the channel's syncpoint to perform after the entries.
+    pub increments: u32,
+    /// Whether to wait for idle before the increments (flag bit 4 clear).
+    pub wfi: bool,
+}
+
+/// What the front's `submit` answers (graphics-server's `Submitted`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Submitted {
+    /// The submission is in the channel's queue.
+    Queued,
+    /// The channel's queue cannot take it; nothing was queued, and
+    /// [`GpuCompletion::GpuQueueRoom`] follows once there is room.
+    Full,
+}
+
+/// What a GPU channel is made with (graphics-server's `ChannelConfig`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChannelConfig {
+    /// The address space its addresses resolve in.
+    pub space: AsId,
+    /// The syncpoint its increments go to.
+    pub syncpoint: SyncpointId,
 }
 
 /// A vi2 layer. A **guess** at the width: `nn::vi` layer ids are 64-bit; graphics-server names

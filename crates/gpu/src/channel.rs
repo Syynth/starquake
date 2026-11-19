@@ -208,9 +208,9 @@
 //!
 //! # Not here yet
 //!
-//! - `SET_REFERENCE` has no [`RingEntry`] kind (the spec's "Host methods" lists it among the
-//!   ring entries, its ring sketch does not), so it reaches the sink through
-//!   [`ChannelSink::set_reference`] until the ring has one.
+//! - `SET_REFERENCE` reaches the sink through [`ChannelSink::set_reference`], and the front
+//!   loop's sink (slice G14, `crate::front`) turns it into [`RingEntry::SetReference`] (decided
+//!   by the owner on 2026-11-18: it stays a ring entry).
 //! - A release or acquire on the syncpoint shim page (spec, "Semaphore acquires") is resolved
 //!   by the production [`GpuMemory`] (slice G22), not here.
 
@@ -337,7 +337,8 @@ pub trait ChannelSink {
     fn entry(&mut self, entry: RingEntry<'static>);
     /// A data word for an engine method.
     fn method(&mut self, word: EngineWord);
-    /// `SET_REFERENCE` with its count (no ring entry kind carries it yet; module docs).
+    /// `SET_REFERENCE` with its count; the front loop sends it on as
+    /// [`RingEntry::SetReference`] (module docs).
     fn set_reference(&mut self, value: u32);
     /// A dropped word or a carried method.
     fn note(&mut self, note: Note);
@@ -601,6 +602,8 @@ pub struct Channel {
     parked: Option<Acquire>,
     stopped: Option<ChannelError>,
     dropped: [u64; DroppedKind::ALL.len()],
+    /// Command words read and executed by [`Channel::run`] so far.
+    words: u64,
     scratch: Vec<u8>,
 }
 
@@ -622,6 +625,7 @@ impl Channel {
             parked: None,
             stopped: None,
             dropped: [0; DroppedKind::ALL.len()],
+            words: 0,
             scratch: Vec::new(),
         }
     }
@@ -655,6 +659,13 @@ impl Channel {
     /// The last `SET_REFERENCE` count (0 on a fresh channel).
     pub const fn reference(&self) -> u32 {
         self.regs.reference
+    }
+
+    /// How many command words [`Channel::run`] has read and executed on this channel, over its
+    /// life (0 on a fresh channel): what the front loop (slice G14) counts against a channel's
+    /// quantum. A word read ahead but not executed is not counted.
+    pub const fn words_read(&self) -> u64 {
+        self.words
     }
 
     /// How many words of `kind` this channel has dropped.
@@ -754,6 +765,7 @@ impl Channel {
                 Err(error) => return Err(self.stop(error)),
             };
             used = used.saturating_add(1);
+            self.words = self.words.saturating_add(1);
             if let Some(current) = self.current.as_mut() {
                 current.offset = current.offset.saturating_add(1);
             }
