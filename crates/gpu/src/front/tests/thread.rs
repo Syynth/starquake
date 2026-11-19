@@ -102,6 +102,7 @@ fn the_front_thread_runs_a_submission_and_wakes_for_a_back_report() {
     }
     assert!(submitted_b);
     assert!(!thread.is_finished());
+    assert!(Arc::ptr_eq(thread.shared(), &r.shared));
     assert_eq!(within(move || thread.stop()), Ok(()));
 }
 

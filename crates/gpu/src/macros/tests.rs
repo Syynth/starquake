@@ -1591,6 +1591,7 @@ fn a_dma_read_with_pending_back_work_commits_nothing_and_reruns_after_the_catch_
     assert_eq!(snapshot(&chan.three_d), before);
     assert_eq!(chan.macros.data_ram().get(5), Some(0));
     assert!(chan.macros.is_waiting());
+    assert_eq!(chan.macros.waiting_engine(), Some(Engine::ThreeD));
 
     // The channel takes no word while the call waits.
     assert_eq!(
@@ -1609,6 +1610,7 @@ fn a_dma_read_with_pending_back_work_commits_nothing_and_reruns_after_the_catch_
     // The rerun did not ask the back again, even though it still says it is busy.
     assert_eq!(rig.back.queries.get(), 1);
     assert!(!chan.macros.is_waiting());
+    assert_eq!(chan.macros.waiting_engine(), None);
     let sent = rig.take();
     assert_eq!(
         sent[sent.len() - 2..],

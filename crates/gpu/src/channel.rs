@@ -204,7 +204,8 @@
 //!
 //! Also not used: `ACQUIRE_SWITCH` and `ACQUIRE_SWITCH_TSG` (a scheduling hint), `WFI_SCOPE`,
 //! the `SET_OBJECT` `ENGINE` field, and a GP entry's level (row 73), fetch and sync flags; the
-//! sync flag is the front loop's (slice G14) to honour before it starts the entry.
+//! sync flag is honoured by the front loop (slice G14, `crate::front`) before it starts the
+//! entry.
 //!
 //! # Not here yet
 //!

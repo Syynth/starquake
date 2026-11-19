@@ -365,9 +365,16 @@ fn a_fence_wait_holds_the_submission_until_an_increment_reaches_it() {
     r.settle();
     assert_eq!(r.syncpoints.read(syncpoint(9)), 1);
     assert!(!has(&r.take(), &scratch_text(a, 0, 0xa1)));
-    // The second, reported by the back, reaches it.
+    // The second reaches it. Past the poll's spins with the clock stopped, and with B's
+    // submission looked at before its increment is performed, only the back's report of the
+    // increment can make the front look again.
+    for _ in 0..POLL_SPINS {
+        r.turn();
+    }
+    let polls = r.front.counters().polls;
     r.shared.submit(b, one);
     r.settle();
+    assert_eq!(r.front.counters().polls, polls);
     assert_eq!(r.syncpoints.read(syncpoint(9)), 2);
     assert!(has(&r.take(), &scratch_text(a, 0, 0xa1)));
 }
@@ -630,8 +637,8 @@ fn a_macro_dma_read_with_unperformed_work_waits_for_the_back_and_runs_again() {
 
 #[test]
 fn a_failing_macro_call_is_counted_and_the_stream_goes_on() {
-    // A call to an entry whose code is all zeros reads no parameter and ends, so its one
-    // parameter is left over: the interpreter reports the unused parameter as a failure.
+    // A macro that loads two parameters, called with one: the run fails on the missing
+    // parameter, commits nothing, and the words after the call still run.
     let mut r = rig();
     let a = r.channel(5);
     let mut pb = PushBuffer::new();

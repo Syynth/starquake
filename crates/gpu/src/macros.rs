@@ -183,12 +183,13 @@
 //!
 //! # Not here
 //!
-//! The front loop (slice G14) owns the register files, the channels and the ring: it routes a
-//! channel's words for the methods [`takes`] names through [`ProcessMacros::write`] (and may
-//! batch the others straight into [`RegFile::write_run`]), implements
-//! [`crate::channel::ChannelSink::holds`] with [`MacroChannel::is_waiting`], answers
-//! [`BackWork`] from the ring, and calls [`ProcessMacros::resume`] after the back's report (a
-//! `Marker`). It also calls [`ProcessMacros::forget_channel`] when a channel is destroyed. A
+//! The front loop (slice G14, [`crate::front`]) owns the register files, the channels and the
+//! ring: it routes a channel's words for the methods [`takes`] names through
+//! [`ProcessMacros::write`] (and batches the others straight into [`RegFile::write_run`]),
+//! implements [`crate::channel::ChannelSink::holds`] with [`MacroChannel::is_waiting`], answers
+//! [`BackWork`] from what it pushed and the markers the back reported, and calls
+//! [`ProcessMacros::resume`] after the back's report of the `Marker` it pushed for the
+//! catch-up. It also calls [`ProcessMacros::forget_channel`] when a channel is destroyed. A
 //! macro JIT, the older Fermi macro processor, and counters for the run summary come later.
 
 #[cfg(test)]
