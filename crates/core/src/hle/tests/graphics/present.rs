@@ -211,7 +211,7 @@ fn a_present_reaches_the_latch_on_a_vsync_tick() {
     let before = rig.all_events().len();
     rig.turn_at(&graphics, HostNanos(deadline.0 - 1));
     assert_eq!(notes(&rig.all_events()[before..]), []);
-    assert_eq!(graphics.front().presented(), 0);
+    assert_eq!(graphics.null_front().unwrap().presented(), 0);
     rig.turn_at(&graphics, deadline);
     let latched = Note::FrameLatched {
         client: CLIENT,
@@ -223,7 +223,7 @@ fn a_present_reaches_the_latch_on_a_vsync_tick() {
         [Note::VsyncTick { tick: 1 }, latched]
     );
     assert!(rig.all_events()[before..].contains(&(TIMER.0, TIMER.1, latched.event(GSV_ROOT))));
-    assert_eq!(graphics.front().presented(), 1);
+    assert_eq!(graphics.null_front().unwrap().presented(), 1);
     assert_eq!(poll(&rig, notification), KernelError::TimedOut.code());
 
     // The second present's tick releases slot 0: the guest's event is signalled and 212 shows
@@ -249,7 +249,7 @@ fn a_present_reaches_the_latch_on_a_vsync_tick() {
             },
         ]
     );
-    assert_eq!(graphics.front().presented(), 2);
+    assert_eq!(graphics.null_front().unwrap().presented(), 2);
     assert_eq!(poll(&rig, notification), ResultCode::SUCCESS);
     let freed = rig.tipc(vi2, &availability);
     assert_eq!((freed.result, mask(&freed.data)), (0, ALL_SLOTS & !0b10));
@@ -345,7 +345,7 @@ fn an_already_reached_fence_replays_to_the_same_latch() {
             ],
         ]
     );
-    assert_eq!(run.front().presented(), 2);
+    assert_eq!(run.null_front().unwrap().presented(), 2);
 
     let replay = Graphics::new(FrontMode::Replay, None);
     let replayed = rig_with(&replay);
@@ -366,5 +366,5 @@ fn an_already_reached_fence_replays_to_the_same_latch() {
     });
     assert_eq!(replayed.all_events(), recorded.all_events());
     assert_eq!(state_of(&replayed, &replay), state_of(&recorded, &run));
-    assert_eq!(replay.front().presented(), 2);
+    assert_eq!(replay.null_front().unwrap().presented(), 2);
 }

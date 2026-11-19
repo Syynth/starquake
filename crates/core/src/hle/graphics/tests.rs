@@ -60,7 +60,7 @@ fn unmap() -> VmUpdate {
 #[test]
 fn ordered_updates_and_barriers_are_done_at_once_in_a_run() {
     let live = graphics(FrontMode::Live);
-    let front = live.front();
+    let front = live.null_front().unwrap();
     front.update_vm(AsId(1), unmap(), Some(Ticket(0x31)));
     front.update_vm(AsId(1), unmap(), None);
     front.barrier(Ticket(0x32));
@@ -86,9 +86,9 @@ fn ordered_updates_and_barriers_are_done_at_once_in_a_run() {
 
     let replay = graphics(FrontMode::Replay);
     replay
-        .front()
+        .null_front().unwrap()
         .update_vm(AsId(1), unmap(), Some(Ticket(0x31)));
-    replay.front().barrier(Ticket(0x32));
+    replay.null_front().unwrap().barrier(Ticket(0x32));
     assert_eq!(queued(&replay), []);
 }
 
@@ -99,7 +99,7 @@ fn ordered_updates_and_barriers_are_done_at_once_in_a_run() {
 fn a_submission_s_increments_are_performed_at_once() {
     for mode in [FrontMode::Live, FrontMode::Replay] {
         let graphics = graphics(mode);
-        let front = graphics.front();
+        let front = graphics.null_front().unwrap();
         let syncpoints = graphics.shared().syncpoints();
         let channel = front.create_channel(config(SP)).unwrap();
         syncpoints.watch(id(SP));
@@ -134,7 +134,7 @@ fn a_submission_s_increments_are_performed_at_once() {
 #[test]
 fn a_submission_s_wait_fence_is_not_waited_for() {
     let graphics = graphics(FrontMode::Live);
-    let front = graphics.front();
+    let front = graphics.null_front().unwrap();
     let syncpoints = graphics.shared().syncpoints();
     let channel = front.create_channel(config(SP)).unwrap();
     let fence = Fence {
@@ -154,7 +154,7 @@ fn a_submission_s_wait_fence_is_not_waited_for() {
 #[test]
 fn a_submission_on_an_unknown_channel_does_nothing() {
     let graphics = graphics(FrontMode::Live);
-    let front = graphics.front();
+    let front = graphics.null_front().unwrap();
     let syncpoints = graphics.shared().syncpoints();
     let made = front.create_channel(config(SP)).unwrap();
     let never = ChannelId(made.0 + 1);
@@ -172,7 +172,7 @@ fn a_submission_on_an_unknown_channel_does_nothing() {
 fn channels_count_up_from_the_first_and_go_when_destroyed() {
     for mode in [FrontMode::Live, FrontMode::Replay] {
         let graphics = graphics(mode);
-        let front = graphics.front();
+        let front = graphics.null_front().unwrap();
         let first = front.create_channel(config(SP)).unwrap();
         let second = front.create_channel(config(NEIGHBOUR)).unwrap();
         assert_eq!(
@@ -195,7 +195,7 @@ fn channels_count_up_from_the_first_and_go_when_destroyed() {
         );
     }
     let graphics = graphics(FrontMode::Live);
-    let front = graphics.front();
+    let front = graphics.null_front().unwrap();
     front.channels.lock().unwrap().next = u32::MAX - 1;
     assert_eq!(
         front.create_channel(config(SP)),
@@ -321,7 +321,7 @@ fn the_notes_are_recorded_for_the_root() {
         }
     }
     let graphics = graphics(FrontMode::Live);
-    graphics.front().barrier(Ticket(0x71));
+    graphics.null_front().unwrap().barrier(Ticket(0x71));
     let mut host = Notes(Vec::new());
     let taken = graphics.turn(&mut host, HostNanos(0));
     assert_eq!(
@@ -356,7 +356,7 @@ fn the_graphics_server_is_idle_only_with_nothing_queued() {
     }
     let graphics = graphics(FrontMode::Live);
     assert!(graphics.is_idle());
-    graphics.front().barrier(Ticket(0x81));
+    graphics.null_front().unwrap().barrier(Ticket(0x81));
     assert!(!graphics.is_idle());
     graphics.turn(&mut Quiet, HostNanos(0));
     assert!(graphics.is_idle());
