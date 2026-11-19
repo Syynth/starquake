@@ -65,9 +65,9 @@
 //!
 //! | Rows | What this decoder does | Pinned by |
 //! |---|---|---|
-//! | `WARPSYNC` and `NANOSLEEP` forms 2, 3 and 7 (`0x548`, `0x748`, `0xf48`, `0x55d`, `0x75d`, `0xf5d`) | Unknown opcodes: NAK's `encode_alu(.., None, None, Some(src), None)` puts the one source in source 1, which only forms 1, 4, 5 and 6 hold, as for `MOV` | `tests::framework` `control_alu_forms_2_3_and_7_are_unknown` (`decode::tests::control`) |
+//! | `WARPSYNC` and `NANOSLEEP` forms 2, 3 and 7 (`0x548`, `0x748`, `0xf48`, `0x55d`, `0x75d`, `0xf5d`) | Unknown opcodes: NAK's `encode_alu(.., None, None, Some(src), None)` puts the one source in source 1, which only forms 1, 4, 5 and 6 hold, as for `MOV` | `decode::tests::control::control_rows_left_undecoded_are_unknown_opcodes` |
 //! | Bits 62 and 63 of `WARPSYNC` and `NANOSLEEP` forms 1, 5 and 6 (`0x348`, `0xb48`, `0xd48`, `0x35d`, `0xb5d`, `0xd5d`) | Rejected: NAK never modifies these sources (a `u32` mask; `OpNanosleep::time` is unmodified), as for `MOV` | `control_sources_reject_modifier_bits` |
-//! | `BAR` form `0x31d` | Unknown opcode: NAK's encoding of it is commented out and PR #4588's translator accepts only `0xb1d` (`visitor.cpp`, case `0xb1d`) | `control_alu_forms_2_3_and_7_are_unknown` |
+//! | `BAR` form `0x31d` | Unknown opcode: NAK's encoding of it is commented out and PR #4588's translator accepts only `0xb1d` (`visitor.cpp`, case `0xb1d`) | `control_rows_left_undecoded_are_unknown_opcodes` |
 //! | Bits 87..90 and 91 of the uniform `BRA`, bit 91 of `BRXU` | Required set (see above); the table marks them known only | `control_fixed_bits_are_required` |
 //!
 //! Every other control form's mask is its row's exactly (`decode::tests::masks_match_the_reference_table`).

@@ -357,8 +357,8 @@ fn predicates_at_the_edges_of_their_encoding() {
     assert!(Pred::PT.is_true());
 }
 
-/// Uniform predicates have no decoded form yet (slice 6d), so their reader and writer are
-/// checked directly.
+/// The reader and writer of uniform predicates, checked directly at each edge (the uniform
+/// `BRA`, `op::control`, reads one in its own tests).
 #[test]
 fn uniform_predicates_at_the_edges_of_their_encoding() {
     let reg_field = Field::new(87, UniformPred::BITS);
@@ -435,8 +435,8 @@ fn immediates_at_the_edges_of_their_encoding() {
     }
 }
 
-/// Two's-complement fields have no decoded form yet (slices 6e and 6h), so the reader and
-/// writer are checked directly at each end of the range and one past it.
+/// The reader and writer of two's-complement fields at widths no decoded form has (the
+/// branch offsets of `op::control` are 48 and 30 bits), at each end of the range and one past it.
 #[test]
 fn signed_fields_at_the_edges_of_their_range() {
     for width in [1, 24, 63, 64] {

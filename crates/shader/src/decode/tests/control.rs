@@ -222,6 +222,8 @@ fn barrier_words() -> Vec<(Instruction, &'static str)> {
         (word(0x945, &[(16, 2), (87, 7), (34, 8)]), "bssy b2, +0x20;"),
         // BSYNC 0x941: b15.
         (word(0x941, &[(16, 15), (87, 7)]), "bsync b15;"),
+        // The condition !PT (never) is printed; only plain PT is left out.
+        (word(0x941, &[(87, 7), (90, 1)]), "bsync !pt, b0;"),
         // BREAK 0x942: b1 under p0.
         (word(0x942, &[(16, 1), (87, 0)]), "break p0, b1;"),
         // BMOV 0x356: b4 at 24, r9 at 32; bit 84 (.CLEAR) alone.
@@ -720,7 +722,7 @@ fn control_sources_reject_modifier_bits() {
 /// The forms PR #4588's table has rows for that this decoder leaves unknown: `WARPSYNC` and
 /// `NANOSLEEP` forms 2, 3 and 7, and `BAR`'s `0x31d`; and opcodes next to the group's.
 #[test]
-fn control_alu_forms_2_3_and_7_are_unknown() {
+fn control_rows_left_undecoded_are_unknown_opcodes() {
     let unknown = [
         AluForm::ImmSrc2.opcode(WARPSYNC_OPCODE),
         AluForm::CBufSrc2.opcode(WARPSYNC_OPCODE),

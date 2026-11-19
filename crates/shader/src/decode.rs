@@ -49,7 +49,10 @@
 //! requires it set, `Visitor::WideSlot`: "native uniform source flag"); `MOV`'s forms 2, 3 and
 //! 7, which the table has rows for, are unknown opcodes here (see `op::integer`). Pinned by
 //! `tests::mov_rejects_source_modifier_bits`, `tests::framework::uniform_forms_require_bit_91`,
-//! `tests::unknown_opcodes_name_the_opcode` and `tests::masks_match_the_reference_table`.
+//! `tests::unknown_opcodes_name_the_opcode` and `tests::masks_match_the_reference_table`. The
+//! control group's divergences (the same two for `WARPSYNC` and `NANOSLEEP`, `BAR`'s form
+//! `0x31d`, and the fixed bits of the uniform `BRA` and of `BRXU`) are listed in `op::control`'s
+//! module docs and pinned in `tests::control`.
 
 mod alu;
 mod fields;
