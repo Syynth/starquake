@@ -264,13 +264,19 @@ impl DrawCalls {
     ///
     /// As [`DrawCalls::method`].
     pub fn flush(&mut self, mirror: &Mirror) -> Result<Option<DrawCall>, StateError> {
-        if self.mode != Mode::Instance || self.instance_count == 0 {
+        if !self.has_deferred() {
             return Ok(None);
         }
         let count = self.instance_count.saturating_add(1);
         let call = self.end(mirror, count, true)?;
         self.instance_count = 0;
         Ok(call)
+    }
+
+    /// Whether [`DrawCalls::flush`] has instances to draw: the machine is in its instance mode
+    /// with instances counted.
+    pub fn has_deferred(&self) -> bool {
+        self.mode == Mode::Instance && self.instance_count != 0
     }
 
     /// `BEGIN` (Eden's `DrawBegin`); returns the deferred draw a `FIRST` flushes.

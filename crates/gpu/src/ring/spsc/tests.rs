@@ -39,15 +39,18 @@ fn write(channel: u32, value: u32) -> RingEntry<'static> {
 }
 
 fn release(payload: u64) -> RingEntry<'static> {
-    RingEntry::Release(Release {
-        address: 0x1000,
-        payload,
-        form: ReleaseForm {
-            size: PayloadSize::Four,
-            timestamp: false,
+    RingEntry::Release {
+        channel: ChannelId(1),
+        release: Release {
+            address: 0x1000,
+            payload,
+            form: ReleaseForm {
+                size: PayloadSize::Four,
+                timestamp: false,
+            },
+            op: ReleaseOp::Write,
         },
-        op: ReleaseOp::Write,
-    })
+    }
 }
 
 fn run(channel: u32, words: usize) -> RingEntry<'static> {

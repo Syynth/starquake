@@ -5,8 +5,8 @@
 //! bind channel=1 subchannel=2 class=0xc797
 //! write channel=1 class=0xc797 method=0x45 value=0x1
 //! run channel=1 class=0xc797 method=0x8e3 words=0x1,0x2
-//! release address=0x1000 payload=0x5 size=4 timestamp=no op=write
-//! release address=0x1000 payload=0x1 size=8 timestamp=yes op=add.unsigned
+//! release channel=1 address=0x1000 payload=0x5 size=4 timestamp=no op=write
+//! release channel=1 address=0x1000 payload=0x1 size=8 timestamp=yes op=add.unsigned
 //! syncpoint id=5
 //! wait-for-idle channel=1
 //! invalidate channel=1 what=l2-flush-dirty
@@ -207,13 +207,13 @@ impl fmt::Display for RingEntry<'_> {
                 }
                 Ok(())
             }
-            Self::Release(release) => {
+            Self::Release { channel, release } => {
                 let size = release.form.size.bytes();
                 let timestamp = if release.form.timestamp { "yes" } else { "no" };
                 write!(
                     f,
-                    " address={:#x} payload={:#x} size={size} timestamp={timestamp} op=",
-                    release.address, release.payload
+                    " channel={} address={:#x} payload={:#x} size={size} timestamp={timestamp} op=",
+                    channel.0, release.address, release.payload
                 )?;
                 match release.op {
                     ReleaseOp::Write => f.write_str("write"),
@@ -385,6 +385,7 @@ fn release_op(text: &str) -> Result<ReleaseOp, ParseError> {
 
 /// The fields of a release.
 fn release(fields: &mut Fields<'_>) -> Result<RingEntry<'static>, ParseError> {
+    let channel = ChannelId(fields.number("channel")?);
     let address = fields.number("address")?;
     let payload = fields.number("payload")?;
     let size = match fields.number::<u64>("size")? {
@@ -394,12 +395,15 @@ fn release(fields: &mut Fields<'_>) -> Result<RingEntry<'static>, ParseError> {
     };
     let timestamp = fields.named("timestamp", &[(true, "yes"), (false, "no")])?;
     let op = release_op(fields.text("op")?)?;
-    Ok(RingEntry::Release(Release {
-        address,
-        payload,
-        form: ReleaseForm { size, timestamp },
-        op,
-    }))
+    Ok(RingEntry::Release {
+        channel,
+        release: Release {
+            address,
+            payload,
+            form: ReleaseForm { size, timestamp },
+            op,
+        },
+    })
 }
 
 /// The fields of a present.

@@ -177,8 +177,15 @@ pub enum RingEntry<'a> {
         /// The words, at most [`super::MAX_RUN_WORDS`].
         words: Cow<'a, [u32]>,
     },
-    /// A semaphore release or reduction.
-    Release(Release),
+    /// A semaphore release or reduction, with the channel that issued it, so the back resolves
+    /// which address space's memory it writes (decided by the owner, 2026-11-18, "gpu-protocol
+    /// errata from waves 37 and 38" item 10).
+    Release {
+        /// The channel that issued it.
+        channel: ChannelId,
+        /// What to write.
+        release: Release,
+    },
     /// A syncpoint increment.
     Syncpoint {
         /// The syncpoint.
@@ -251,7 +258,7 @@ impl RingEntry<'_> {
                 method,
                 words: Cow::Owned(words.into_owned()),
             },
-            Self::Release(release) => RingEntry::Release(release),
+            Self::Release { channel, release } => RingEntry::Release { channel, release },
             Self::Syncpoint { id } => RingEntry::Syncpoint { id },
             Self::WaitForIdle { channel } => RingEntry::WaitForIdle { channel },
             Self::SetReference { channel, value } => RingEntry::SetReference { channel, value },
@@ -268,11 +275,11 @@ impl RingEntry<'_> {
             Self::Bind { channel, .. }
             | Self::Write { channel, .. }
             | Self::Run { channel, .. }
+            | Self::Release { channel, .. }
             | Self::WaitForIdle { channel }
             | Self::SetReference { channel, .. }
             | Self::Invalidate { channel, .. } => Some(*channel),
-            Self::Release(_)
-            | Self::Syncpoint { .. }
+            Self::Syncpoint { .. }
             | Self::Marker { .. }
             | Self::Present(_)
             | Self::CaptureControl(_) => None,
