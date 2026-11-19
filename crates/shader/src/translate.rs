@@ -4,7 +4,7 @@
 //! (`eden-pr4588/src/shader_recompiler/frontend/ampere/` @ e5fb3b97, GPL-3.0-or-later):
 //! `ops_move.cpp` (`MOV`), `ops_alu.cpp` (`FFMA`) and `ops_attr.cpp` (`EXIT`) here, and one
 //! module per instruction group beside this one (spec, "Instruction translation"), joined by
-//! [`GROUPS`]: `attribute` (slice 12g: `ALD`, `AST`, `IPA`, `AL2P`, `S2R`, `CS2R`, `PIXLD`, and
+//! `GROUPS`: `attribute` (slice 12g: `ALD`, `AST`, `IPA`, `AL2P`, `S2R`, `CS2R`, `PIXLD`, and
 //! the deferred `OUT`, `ISBERD` and `ISBEWR`). Each of the PR's `Require` checks on these forms
 //! is kept with its constant and turns into an [`Unsupported`] rejection naming the same thing,
 //! except the colour-register bound of `EXIT`, which cannot fail here (see `Translator::exit`).
@@ -137,7 +137,7 @@ pub enum Unsupported {
     #[error("{0} programs are not supported yet")]
     Stage(GuestStage),
     /// An instruction no translator handles yet: neither `MOV`, `FFMA` and `EXIT` here nor a
-    /// group of [`GROUPS`].
+    /// group of `GROUPS`.
     #[error("{0}")]
     Instruction(&'static str),
     /// A uniform-register or constant-buffer source of `MOV` or `FFMA` (PR #4588 reads both:
