@@ -11,25 +11,20 @@
 //! | [`VariantKey::vertex_attributes`] | the component type of each vertex attribute | Eden `RuntimeInfo::generic_input_types` (`eden/src/shader_recompiler/runtime_info.h` @ cf654052), 32 entries (`Maxwell::NumVertexAttributes`, `eden/src/video_core/engines/maxwell_3d.h`) |
 //! | [`VariantKey::color_targets`] | the component type of each colour target | Eden `RuntimeInfo::color_output_types`, filled with `Float`, `SignedInt` or `UnsignedInt` only (`eden/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp`) |
 //! | [`VariantKey::dual_source_blend`] | whether dual-source blending is on | Eden `RuntimeInfo::dual_source_blend` |
-//! | [`VariantKey::next_stage_reads`] | which attribute words the fragment program reads, for the last stage before rasterisation | spec, "interface matching"; see "Which stage the mask describes, and who fills it" |
+//! | [`VariantKey::previous_stage_stores`] | for each stage that follows another, the attribute words the stage before it stores | Eden `RuntimeInfo::previous_stage_stores`, filled by `MakeRuntimeInfo` (`eden/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp` @ cf654052); spec, "Pipeline-state specialisation"; see "The previous stage's stores" |
 //! | [`VariantKey::workgroup_size`], [`VariantKey::shared_memory_size`] | a compute program's workgroup and shared-memory size | spec, "Compute shaders"; Eden `Environment::WorkgroupSize`, `SharedMemorySize` (`environment.h`) |
 //! | [`VariantKey::emulation`] | the render backend's `EmulationFlags`, field by field | spec, "Pipeline-state specialisation"; review guide, M13 |
 //! | [`VariantKey::texture_swizzles`] | each texture binding's swizzle, when the host has no view swizzle | spec, the exception to decision 16; review guide, M11 |
 //!
 //! # Where this differs from Eden
 //!
-//! - Eden specialises a stage on what the stage before it stores
-//!   (`RuntimeInfo::previous_stage_stores`, a mask over `IR::Attribute`). The spec specialises a
-//!   stage on what the stage after it reads ("which outputs the next stage reads"), so the key
-//!   holds [`VariantKey::next_stage_reads`]. Both are masks over the guest's attribute words;
-//!   this one covers the 256 words of the attribute space below
-//!   [`crate::translate::ATTRIBUTE_SPACE_END`], which hold every guest attribute
-//!   (`IR::Attribute::FrontFace` is word 255 in `eden/src/shader_recompiler/frontend/ir/attribute.h`);
-//!   Eden's 512-bit mask also has room for host-only values past them. Eden builds its mask per
-//!   stage, from the previous program's translation info, not from registers
-//!   (`eden/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp` @ cf654052, `MakeRuntimeInfo`:
-//!   `info.previous_stage_stores = previous_program->info.stores`); "Which stage the mask
-//!   describes, and who fills it" below says what that means for this key.
+//! - Eden's `previous_stage_stores` is a 512-bit mask over `IR::Attribute`
+//!   (`VaryingState`, `eden/src/shader_recompiler/varying_state.h`). An [`AttributeMask`] covers
+//!   the 256 words of the attribute space below [`crate::translate::ATTRIBUTE_SPACE_END`], which
+//!   hold every guest attribute (`IR::Attribute::FrontFace` is word 255 in
+//!   `eden/src/shader_recompiler/frontend/ir/attribute.h`); Eden's mask also has room for
+//!   host-only values past them. "The previous stage's stores" below lists the other
+//!   differences.
 //! - Eden keeps the alpha-test function in `RuntimeInfo::alpha_test_func` and its reference
 //!   value beside it. The key holds the function as [`EmulationKey::alpha_test`], present
 //!   exactly when the render backend's `ALPHA_TEST` flag is set; the reference value is a
@@ -40,36 +35,41 @@
 //!   ([`KeyError::TooManySwizzles`]) where Eden's fixed-capacity vector has no room. Pinned by
 //!   `tests::the_swizzle_cap_at_its_edge`.
 //!
-//! # Which stage the mask describes, and who fills it
+//! # The previous stage's stores
 //!
-//! A key covers a whole set of stages: a lookup takes every [`crate::lookup::ProgramRequest`]
-//! of the set and one key. So [`VariantKey::next_stage_reads`], one mask, can describe the
-//! consumer of only one stage. As defined here, provisionally and pending the owner's answer
-//! below:
+//! A stage is specialised on what the stage before it stores, as Eden specialises
+//! (`MakeRuntimeInfo`: `info.previous_stage_stores = previous_program->info.stores`), not on
+//! what the stage after it reads, which the GPU crate cannot build from engine state (spec,
+//! "Pipeline-state specialisation"; decided by the owner, 2026-11-19, ruling 8). A key covers a
+//! whole set of stages (a lookup takes every [`crate::lookup::ProgramRequest`] of the set and
+//! one key), so [`VariantKey::previous_stage_stores`] holds one [`AttributeMask`] per stage
+//! that can follow another ([`FollowingStage`]: tessellation init, tessellation, geometry and
+//! pixel). The GPU crate's draw path (slice G18) fills each from the stores of the stage before
+//! it in the set, which it learns from that stage's translated shader; a stage not in the set
+//! has the empty mask.
 //!
-//! - **Which stage**: the mask is the set of attribute words the fragment program reads, and it
-//!   specialises only the last stage before rasterisation (the one whose outputs the fragment
-//!   stage reads). Any other stage of the set that feeds another (a vertex stage feeding
-//!   tessellation or geometry) is not specialised on its consumer.
-//! - **Who fills it**: what a stage reads is a fact of that program's translation, not of any
-//!   register, so the GPU crate cannot build it from engine state, although the spec says the
-//!   back thread "builds the `VariantKey` from 3D engine state". Only the side that has
-//!   translated (or at least scanned) the fragment program can fill it: the shader cache
-//!   (slice 19), the way Eden's `MakeRuntimeInfo` fills `previous_stage_stores` from the
-//!   previous program's info.
+//! Where this differs from Eden:
 //!
-//! [`VariantKey::texture_swizzles`] has the same kind of gap. It is keyed by **binding order**:
+//! - **The vertex stage has no mask.** Eden sets every bit for a program with no previous
+//!   program (`info.previous_stage_stores.mask.set()`), which is always the vertex program:
+//!   Eden's loop over the programs starts at `VertexB` when `VertexA` is present (merged into it
+//!   by `MergeDualVertexPrograms`), and refuses a lone `VertexA` (`UNIMPLEMENTED_IF(index ==
+//!   0)`). Every bit set specialises on nothing, so the key holds no mask for it.
+//! - **A passthrough geometry program's mask is not added.** Eden ORs
+//!   `previous_program->info.passthrough.mask` into the stores when the previous program is a
+//!   passthrough geometry program; the passthrough mask is not an input here (`GpPassthroughMask`
+//!   is not covered, [`crate::exchange`]).
+//! - **No legacy stores mapping.** Eden also copies `previous_stage_legacy_stores_mapping`; the
+//!   key has no field for it.
+//!
+//! # The texture swizzles' binding order
+//!
+//! [`VariantKey::texture_swizzles`] is keyed by **binding order**:
 //! the order of the set's texture bindings as slice 17's lowering numbers them. That order is
 //! assigned during translation, so the GPU crate cannot know it before a set's first lookup.
 //!
 //! ## For the owner
 //!
-//! - **Which stage `next_stage_reads` describes, and who fills it.** With more than one stage
-//!   feeding another in a set, one mask cannot describe every consumer, and the GPU crate cannot
-//!   build it from engine state, which departs from the spec sentence quoted above. Choices
-//!   include a mask per feeding stage filled by the shader cache from the next program's
-//!   translation, or following Eden's previous-stage stores instead (the departure listed under
-//!   "Where this differs from Eden"). This slice adds no field.
 //! - **What the swizzle binding order is keyed by.** Binding order is known only after
 //!   translation, so the key cannot carry the swizzles on a set's first lookup. Keying each
 //!   swizzle by something the GPU crate knows beforehand (a stage and texture handle) would
@@ -87,7 +87,7 @@
 //! | 32 | one [`AttributeType`] code per vertex attribute |
 //! | 8 | one [`ColorType`] code per colour target |
 //! | 1 | dual-source blending, 0 or 1 |
-//! | 32 | next stage's reads: four 64-bit lanes, lane 0 (attribute words 0 to 63) first |
+//! | 128 | previous stages' stores: one mask per [`FollowingStage`] in [`FollowingStage::ALL`] order, each four 64-bit lanes, lane 0 (attribute words 0 to 63) first |
 //! | 12 | workgroup size x, y, z, 32 bits each |
 //! | 4 | shared-memory size, 32 bits |
 //! | 1 | alpha test: 0 for none, else 1 plus the [`CompareFunction`] code |
@@ -108,10 +108,13 @@ use std::fmt::{self, Display, Formatter};
 
 use thiserror::Error;
 
-use crate::translate::{ATTRIBUTE_SPACE_END, COLOR_TARGETS};
+use crate::translate::{ATTRIBUTE_SPACE_END, COLOR_TARGETS, GuestStage};
 
 /// The version of the byte encoding [`VariantKey::encode`] writes.
-pub const VARIANT_KEY_VERSION: u8 = 1;
+///
+/// Version 2 replaced version 1's one mask of what the next stage reads with a mask per
+/// [`FollowingStage`] of what the previous stage stores (owner's ruling of 2026-11-19).
+pub const VARIANT_KEY_VERSION: u8 = 2;
 
 /// How many vertex attributes the guest has (`Maxwell::NumVertexAttributes` = 32,
 /// `eden/src/video_core/engines/maxwell_3d.h` @ cf654052; `RuntimeInfo::generic_input_types`
@@ -143,7 +146,7 @@ pub const VARIANT_KEY_FIXED_SIZE: usize = 1 // version
     + VERTEX_ATTRIBUTES
     + COLOR_TARGETS
     + 1 // dual-source blending
-    + ATTRIBUTE_MASK_LANES * 8
+    + FOLLOWING_STAGES * ATTRIBUTE_MASK_LANES * 8
     + 3 * 4 // workgroup size
     + 4 // shared-memory size
     + 1 // alpha test
@@ -365,6 +368,100 @@ impl AttributeMask {
     }
 }
 
+/// A graphics stage that can follow another, and so is specialised on what the stage before it
+/// stores (module docs, "The previous stage's stores"). Every [`GuestStage`] of a graphics set
+/// except the two vertex stages, in pipeline order, which is the order of the key's encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum FollowingStage {
+    /// The tessellation init (control) stage.
+    TessellationInit,
+    /// The tessellation (evaluation) stage.
+    Tessellation,
+    /// The geometry stage.
+    Geometry,
+    /// The pixel stage.
+    Pixel,
+}
+
+/// How many stages can follow another: the length of [`FollowingStage::ALL`].
+pub const FOLLOWING_STAGES: usize = 4;
+
+impl FollowingStage {
+    /// Every following stage, in pipeline order.
+    pub const ALL: [Self; FOLLOWING_STAGES] = [
+        Self::TessellationInit,
+        Self::Tessellation,
+        Self::Geometry,
+        Self::Pixel,
+    ];
+
+    /// The following stage `stage` is, or `None` for a stage that never follows another (the
+    /// two vertex stages) or is not a graphics stage (compute).
+    pub const fn of(stage: GuestStage) -> Option<Self> {
+        match stage {
+            GuestStage::TessellationInit => Some(Self::TessellationInit),
+            GuestStage::Tessellation => Some(Self::Tessellation),
+            GuestStage::Geometry => Some(Self::Geometry),
+            GuestStage::Pixel => Some(Self::Pixel),
+            GuestStage::VertexCullBeforeFetch | GuestStage::Vertex | GuestStage::Compute => None,
+        }
+    }
+
+    /// The guest stage this is.
+    pub const fn stage(self) -> GuestStage {
+        match self {
+            Self::TessellationInit => GuestStage::TessellationInit,
+            Self::Tessellation => GuestStage::Tessellation,
+            Self::Geometry => GuestStage::Geometry,
+            Self::Pixel => GuestStage::Pixel,
+        }
+    }
+
+    /// Its index in [`FollowingStage::ALL`].
+    const fn index(self) -> usize {
+        match self {
+            Self::TessellationInit => 0,
+            Self::Tessellation => 1,
+            Self::Geometry => 2,
+            Self::Pixel => 3,
+        }
+    }
+}
+
+impl Display for FollowingStage {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::TessellationInit => "tessellation init",
+            Self::Tessellation => "tessellation",
+            Self::Geometry => "geometry",
+            Self::Pixel => "pixel",
+        })
+    }
+}
+
+/// For each [`FollowingStage`], the attribute words the stage before it stores (module docs,
+/// "The previous stage's stores").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct PreviousStores([AttributeMask; FOLLOWING_STAGES]);
+
+impl PreviousStores {
+    /// No stores for any stage.
+    pub const EMPTY: Self = Self([AttributeMask::EMPTY; FOLLOWING_STAGES]);
+
+    /// What the stage before `stage` stores.
+    pub const fn get(self, stage: FollowingStage) -> AttributeMask {
+        self.0[stage.index()]
+    }
+
+    /// These stores with `stage`'s set to `mask`.
+    #[must_use]
+    pub const fn with(self, stage: FollowingStage, mask: AttributeMask) -> Self {
+        let mut masks = self.0;
+        masks[stage.index()] = mask;
+        Self(masks)
+    }
+}
+
 /// The render backend's `EmulationFlags` (render-backend, "Fixed-function state the host
 /// lacks"), mirrored field by field because the shader crate cannot see the render crate's
 /// types. The GPU crate copies each flag in (slice G18), and [`EmulationKey::MIRRORED`] names
@@ -418,11 +515,9 @@ pub struct VariantKey {
     pub color_targets: [ColorType; COLOR_TARGETS],
     /// Whether dual-source blending is on.
     pub dual_source_blend: bool,
-    /// The attribute words the fragment program reads, specialising the last stage before
-    /// rasterisation; filled by the side that has translated the fragment program, not from
-    /// engine state (provisional; see the module docs, "Which stage the mask describes, and who
-    /// fills it").
-    pub next_stage_reads: AttributeMask,
+    /// For each stage that follows another, what the stage before it stores (module docs, "The
+    /// previous stage's stores").
+    pub previous_stage_stores: PreviousStores,
     /// A compute program's workgroup size, x, y and z.
     pub workgroup_size: [u32; 3],
     /// A compute program's shared-memory size in bytes.
@@ -445,8 +540,8 @@ pub enum KeyField {
     ColorTarget(u8),
     /// The dual-source blending switch.
     DualSourceBlend,
-    /// The mask of attribute words the next stage reads.
-    NextStageReads,
+    /// The mask of what the stage before a following stage stores.
+    PreviousStageStores(FollowingStage),
     /// The workgroup size along an axis (0 is x).
     WorkgroupSize(u8),
     /// The shared-memory size.
@@ -479,7 +574,12 @@ impl Display for KeyField {
             Self::VertexAttribute(index) => write!(f, "the type of vertex attribute {index}"),
             Self::ColorTarget(index) => write!(f, "the type of colour target {index}"),
             Self::DualSourceBlend => f.write_str("the dual-source blending switch"),
-            Self::NextStageReads => f.write_str("the attributes the next stage reads"),
+            Self::PreviousStageStores(stage) => {
+                write!(
+                    f,
+                    "the attributes the stage before the {stage} stage stores"
+                )
+            }
             Self::WorkgroupSize(axis) => write!(f, "the workgroup size along axis {axis}"),
             Self::SharedMemorySize => f.write_str("the shared-memory size"),
             Self::AlphaTest => f.write_str("the alpha test"),
@@ -607,8 +707,10 @@ impl VariantKey {
         out.extend(self.vertex_attributes.iter().map(|ty| ty.code()));
         out.extend(self.color_targets.iter().map(|ty| ty.code()));
         out.push(u8::from(self.dual_source_blend));
-        for lane in self.next_stage_reads.lanes() {
-            out.extend_from_slice(&lane.to_le_bytes());
+        for stage in FollowingStage::ALL {
+            for lane in self.previous_stage_stores.get(stage).lanes() {
+                out.extend_from_slice(&lane.to_le_bytes());
+            }
         }
         for size in self.workgroup_size {
             out.extend_from_slice(&size.to_le_bytes());
@@ -651,11 +753,15 @@ impl VariantKey {
             *ty = reader.coded(KeyField::ColorTarget(index_u8(index)), ColorType::from_code)?;
         }
         key.dual_source_blend = reader.switch(KeyField::DualSourceBlend)?;
-        let mut lanes = [0; ATTRIBUTE_MASK_LANES];
-        for lane in &mut lanes {
-            *lane = reader.u64(KeyField::NextStageReads)?;
+        for stage in FollowingStage::ALL {
+            let mut lanes = [0; ATTRIBUTE_MASK_LANES];
+            for lane in &mut lanes {
+                *lane = reader.u64(KeyField::PreviousStageStores(stage))?;
+            }
+            key.previous_stage_stores = key
+                .previous_stage_stores
+                .with(stage, AttributeMask::from_lanes(lanes));
         }
-        key.next_stage_reads = AttributeMask::from_lanes(lanes);
         for (axis, size) in key.workgroup_size.iter_mut().enumerate() {
             *size = reader.u32(KeyField::WorkgroupSize(index_u8(axis)))?;
         }

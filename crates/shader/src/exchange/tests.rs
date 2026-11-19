@@ -11,7 +11,7 @@ use super::*;
 /// chain of questions that follows the answers moves forward and a wrong stage changes the
 /// value; bank [`UNBOUND_BANK`] and handle [`INVALID_HANDLE`] have no answer.
 struct FakeState {
-    calls: RefCell<Vec<(GuestStage, Question)>>,
+    calls: RefCell<Vec<(GuestStage, Call)>>,
     /// Added to every word, so two states give different answers to the same question.
     bias: u32,
 }
@@ -37,6 +37,27 @@ fn stage_index(stage: GuestStage) -> u32 {
     }
 }
 
+/// One call the engine state saw: the engine is asked about a handle, not about its usage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Call {
+    Cbuf { bank: u8, offset: u32 },
+    Texture(u32),
+}
+
+/// The calls `asked` make of the engine state.
+fn asked(asked: Vec<(GuestStage, Question)>) -> Vec<(GuestStage, Call)> {
+    asked
+        .into_iter()
+        .map(|(stage, question)| {
+            let call = match question {
+                Question::CbufWord { bank, offset } => Call::Cbuf { bank, offset },
+                Question::TextureKind { handle, .. } => Call::Texture(handle),
+            };
+            (stage, call)
+        })
+        .collect()
+}
+
 fn kind_for(handle: u32) -> TextureKind {
     TextureKind {
         sampled: SampledType::SignedInt,
@@ -55,7 +76,7 @@ impl FakeState {
         }
     }
 
-    fn calls(&self) -> Vec<(GuestStage, Question)> {
+    fn calls(&self) -> Vec<(GuestStage, Call)> {
         self.calls.borrow().clone()
     }
 }
@@ -64,14 +85,12 @@ impl EngineState for FakeState {
     fn cbuf_word(&self, stage: GuestStage, bank: u8, offset: u32) -> Option<u32> {
         self.calls
             .borrow_mut()
-            .push((stage, Question::CbufWord { bank, offset }));
+            .push((stage, Call::Cbuf { bank, offset }));
         (bank != UNBOUND_BANK).then(|| offset + STEP + stage_index(stage) * STAGE_SALT + self.bias)
     }
 
     fn texture_kind(&self, stage: GuestStage, handle: u32) -> Option<TextureKind> {
-        self.calls
-            .borrow_mut()
-            .push((stage, Question::TextureKind { handle }));
+        self.calls.borrow_mut().push((stage, Call::Texture(handle)));
         (handle != INVALID_HANDLE).then(|| kind_for(handle))
     }
 }
@@ -124,8 +143,20 @@ fn cbuf(bank: u8, offset: u32) -> Question {
     Question::CbufWord { bank, offset }
 }
 
+/// A question about `handle` used as an image, whose answer keeps the whole kind.
 fn texture(handle: u32) -> Question {
-    Question::TextureKind { handle }
+    Question::TextureKind {
+        handle,
+        usage: TextureUsage::Image,
+    }
+}
+
+/// A question about `handle` only sampled.
+fn sampled(handle: u32) -> Question {
+    Question::TextureKind {
+        handle,
+        usage: TextureUsage::Sampled,
+    }
 }
 
 #[test]
@@ -179,11 +210,11 @@ fn each_question_follows_the_answer_before_it() {
     let third = second + STEP + salt;
     assert_eq!(
         state.calls(),
-        vec![
+        asked(vec![
             (STAGE, cbuf(CHAIN_BANK, CHAIN_START)),
             (STAGE, cbuf(CHAIN_BANK, second)),
             (STAGE, cbuf(CHAIN_BANK, third)),
-        ]
+        ])
     );
     assert_eq!(
         done.answers.cbuf_word(CHAIN_BANK, third),
@@ -218,11 +249,11 @@ fn repeated_questions_are_answered_once() {
     assert_eq!(done.rounds, 2);
     assert_eq!(
         state.calls(),
-        vec![
+        asked(vec![
             (STAGE, cbuf(1, 8)),
             (STAGE, texture(6)),
             (STAGE, cbuf(2, 0x20)),
-        ]
+        ])
     );
 }
 
@@ -233,7 +264,7 @@ fn a_round_that_repeats_only_old_questions_ends_the_exchange() {
     let script = Script::new(vec![vec![cbuf(1, 8)], vec![cbuf(1, 8)]]);
     let done = exchange(STAGE, &script, &state).expect("within the cap");
     assert_eq!(done.rounds, 1);
-    assert_eq!(state.calls(), vec![(STAGE, cbuf(1, 8))]);
+    assert_eq!(state.calls(), asked(vec![(STAGE, cbuf(1, 8))]));
 }
 
 #[test]
@@ -243,11 +274,11 @@ fn questions_are_asked_in_first_ask_order_and_recorded_by_question() {
     let done = exchange(STAGE, &script, &state).expect("within the cap");
     assert_eq!(
         state.calls(),
-        vec![
+        asked(vec![
             (STAGE, texture(9)),
             (STAGE, cbuf(2, 8)),
             (STAGE, cbuf(1, 0x10)),
-        ]
+        ])
     );
     let salt = stage_index(STAGE) * STAGE_SALT;
     assert_eq!(
@@ -270,7 +301,7 @@ fn the_stage_reaches_the_engine_state() {
         let done = exchange(stage, &script, &state).expect("within the cap");
         assert_eq!(
             state.calls(),
-            vec![(stage, cbuf(1, 0)), (stage, texture(1))]
+            asked(vec![(stage, cbuf(1, 0)), (stage, texture(1))])
         );
         assert_eq!(
             done.answers.cbuf_word(1, 0),
@@ -289,10 +320,18 @@ fn missing_answers_are_recorded_as_missing() {
         Some(Answer::CbufWord(None))
     );
     assert_eq!(done.answers.cbuf_word(UNBOUND_BANK, 4), Some(None));
-    assert_eq!(done.answers.texture_kind(INVALID_HANDLE), Some(None));
+    assert_eq!(
+        done.answers
+            .texture_kind(INVALID_HANDLE, TextureUsage::Image),
+        Some(None)
+    );
     // Not asked: no answer at all.
     assert_eq!(done.answers.cbuf_word(UNBOUND_BANK, 8), None);
-    assert_eq!(done.answers.texture_kind(INVALID_HANDLE + 1), None);
+    assert_eq!(
+        done.answers
+            .texture_kind(INVALID_HANDLE + 1, TextureUsage::Image),
+        None
+    );
     assert_eq!(done.answers.get(texture(1)), None);
 }
 
@@ -303,7 +342,10 @@ fn accessors_read_their_own_kind() {
     let state = FakeState::new(0);
     let script = Script::new(vec![vec![cbuf(0, 7), texture(7)]]);
     let done = exchange(STAGE, &script, &state).expect("within the cap");
-    assert_eq!(done.answers.texture_kind(7), Some(Some(kind_for(7))));
+    assert_eq!(
+        done.answers.texture_kind(7, TextureUsage::Image),
+        Some(Some(kind_for(7)))
+    );
     assert_eq!(
         done.answers.cbuf_word(0, 7),
         Some(Some(7 + STEP + stage_index(STAGE) * STAGE_SALT))
@@ -326,11 +368,11 @@ fn reanswer_asks_the_same_questions_in_question_order() {
     let again = done.answers.reanswer(GuestStage::Geometry, &changed);
     assert_eq!(
         changed.calls(),
-        vec![
+        asked(vec![
             (GuestStage::Geometry, cbuf(2, 0x10)),
             (GuestStage::Geometry, cbuf(4, 0x30)),
             (GuestStage::Geometry, texture(5)),
-        ]
+        ])
     );
     assert_ne!(again, done.answers);
     assert_eq!(
@@ -357,4 +399,151 @@ fn the_texture_format_keeps_the_format_bits_only() {
         TextureFormat::from_texhead_word0(0x1234_5678).bits(),
         0x1234_5678 & 0x0007_ffff
     );
+}
+
+/// Engine state whose only texture header, [`HANDLE`], has the kind `kind_for(HANDLE)` and the
+/// format bits `format`: two of these differ only in the format.
+struct OneHeader {
+    format: u32,
+}
+
+const HANDLE: u32 = 6;
+
+impl EngineState for OneHeader {
+    fn cbuf_word(&self, _stage: GuestStage, _bank: u8, _offset: u32) -> Option<u32> {
+        None
+    }
+
+    fn texture_kind(&self, _stage: GuestStage, handle: u32) -> Option<TextureKind> {
+        (handle == HANDLE).then(|| TextureKind {
+            format: TextureFormat::from_texhead_word0(self.format),
+            ..kind_for(HANDLE)
+        })
+    }
+}
+
+/// Two format words with distinct non-zero bits in every format field (the components and the
+/// four data types), so a field that is dropped still differs.
+const FORMAT_A: u32 = 0x0004_6888;
+const FORMAT_B: u32 = 0x0001_fa91;
+
+#[test]
+fn a_format_change_keeps_a_sampled_answer() {
+    let script = || Script::new(vec![vec![sampled(HANDLE)]]);
+    let a = exchange(STAGE, &script(), &OneHeader { format: FORMAT_A }).expect("one round");
+    let b = exchange(STAGE, &script(), &OneHeader { format: FORMAT_B }).expect("one round");
+    // The recorded answers, and so the shader entry's key, are equal.
+    assert_eq!(a.answers, b.answers);
+    assert_eq!(
+        a.answers.texture_kind(HANDLE, TextureUsage::Sampled),
+        Some(Some(TextureKind {
+            format: TextureFormat::UNREAD,
+            ..kind_for(HANDLE)
+        }))
+    );
+    // Re-answered from the other format on a later draw: the same answers, so no
+    // retranslation.
+    assert_eq!(
+        a.answers.reanswer(STAGE, &OneHeader { format: FORMAT_B }),
+        a.answers
+    );
+    // The kind still counts: a header of another kind is a new answer.
+    let other = TextureKind {
+        depth: !kind_for(HANDLE).depth,
+        ..kind_for(HANDLE)
+    };
+    struct OtherKind(TextureKind);
+    impl EngineState for OtherKind {
+        fn cbuf_word(&self, _: GuestStage, _: u8, _: u32) -> Option<u32> {
+            None
+        }
+        fn texture_kind(&self, _: GuestStage, _: u32) -> Option<TextureKind> {
+            Some(self.0)
+        }
+    }
+    assert_ne!(a.answers.reanswer(STAGE, &OtherKind(other)), a.answers);
+}
+
+#[test]
+fn a_format_change_changes_an_image_answer() {
+    let script = || Script::new(vec![vec![texture(HANDLE)]]);
+    let a = exchange(STAGE, &script(), &OneHeader { format: FORMAT_A }).expect("one round");
+    let b = exchange(STAGE, &script(), &OneHeader { format: FORMAT_B }).expect("one round");
+    assert_ne!(a.answers, b.answers);
+    assert_eq!(
+        a.answers.texture_kind(HANDLE, TextureUsage::Image),
+        Some(Some(TextureKind {
+            format: TextureFormat::from_texhead_word0(FORMAT_A),
+            ..kind_for(HANDLE)
+        }))
+    );
+    assert_ne!(
+        a.answers.reanswer(STAGE, &OneHeader { format: FORMAT_B }),
+        a.answers
+    );
+    assert_eq!(
+        a.answers.reanswer(STAGE, &OneHeader { format: FORMAT_A }),
+        a.answers
+    );
+}
+
+#[test]
+fn the_two_usages_of_one_handle_are_two_questions() {
+    let state = FakeState::new(0);
+    let script = Script::new(vec![vec![
+        sampled(HANDLE),
+        texture(HANDLE),
+        sampled(HANDLE),
+    ]]);
+    let done = exchange(STAGE, &script, &state).expect("one round");
+    // Each usage is answered once, from one engine call each.
+    assert_eq!(
+        state.calls(),
+        asked(vec![(STAGE, sampled(HANDLE)), (STAGE, texture(HANDLE))])
+    );
+    // Recorded in question order: sampled before image (the usages' declaration order).
+    assert_eq!(
+        done.answers
+            .iter()
+            .map(|(question, _)| question)
+            .collect::<Vec<_>>(),
+        vec![sampled(HANDLE), texture(HANDLE)]
+    );
+    assert_eq!(
+        done.answers.texture_kind(HANDLE, TextureUsage::Sampled),
+        Some(Some(kind_for(HANDLE).for_usage(TextureUsage::Sampled)))
+    );
+    assert_eq!(
+        done.answers.texture_kind(HANDLE, TextureUsage::Image),
+        Some(Some(kind_for(HANDLE)))
+    );
+    // A handle asked about with one usage has no answer for the other.
+    let only_sampled =
+        exchange(STAGE, &Script::new(vec![vec![sampled(HANDLE)]]), &state).expect("one round");
+    assert_eq!(
+        only_sampled
+            .answers
+            .texture_kind(HANDLE, TextureUsage::Image),
+        None
+    );
+}
+
+#[test]
+fn for_usage_drops_the_format_only_for_sampling() {
+    let kind = TextureKind {
+        format: TextureFormat::from_texhead_word0(FORMAT_A),
+        ..kind_for(7)
+    };
+    assert_eq!(kind.for_usage(TextureUsage::Image), kind);
+    assert_eq!(
+        kind.for_usage(TextureUsage::Sampled),
+        TextureKind {
+            sampled: kind.sampled,
+            depth: kind.depth,
+            multisampled: kind.multisampled,
+            buffer: kind.buffer,
+            format: TextureFormat::UNREAD,
+        }
+    );
+    assert_eq!(TextureFormat::UNREAD.bits(), 0);
 }

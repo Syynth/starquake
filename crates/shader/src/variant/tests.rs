@@ -21,6 +21,42 @@ const GOLDEN_SWIZZLES: [Swizzle; 2] = [
     },
 ];
 
+/// Stores with distinct non-zero lanes for every following stage.
+fn golden_stores() -> PreviousStores {
+    let lanes = [
+        [
+            0x0102_0304_0506_0708,
+            0x1112_1314_1516_1718,
+            0x2122_2324_2526_2728,
+            0x3132_3334_3536_3738,
+        ],
+        [
+            0x4142_4344_4546_4748,
+            0x5152_5354_5556_5758,
+            0x6162_6364_6566_6768,
+            0x7172_7374_7576_7778,
+        ],
+        [
+            0x8182_8384_8586_8788,
+            0x9192_9394_9596_9798,
+            0xa1a2_a3a4_a5a6_a7a8,
+            0xb1b2_b3b4_b5b6_b7b8,
+        ],
+        [
+            0xc1c2_c3c4_c5c6_c7c8,
+            0xd1d2_d3d4_d5d6_d7d8,
+            0xe1e2_e3e4_e5e6_e7e8,
+            0xf1f2_f3f4_f5f6_f7f8,
+        ],
+    ];
+    FollowingStage::ALL
+        .into_iter()
+        .zip(lanes)
+        .fold(PreviousStores::EMPTY, |stores, (stage, lanes)| {
+            stores.with(stage, AttributeMask::from_lanes(lanes))
+        })
+}
+
 /// A key with distinct non-zero values in every field (as distinct as each field's codes
 /// allow: neighbouring entries of an array always differ).
 fn golden_key() -> VariantKey {
@@ -32,12 +68,7 @@ fn golden_key() -> VariantKey {
         *ty = [ColorType::SignedInt, ColorType::UnsignedInt][index % 2];
     }
     key.dual_source_blend = true;
-    key.next_stage_reads = AttributeMask::from_lanes([
-        0x0102_0304_0506_0708,
-        0x1112_1314_1516_1718,
-        0x2122_2324_2526_2728,
-        0x3132_3334_3536_3738,
-    ]);
+    key.previous_stage_stores = golden_stores();
     key.workgroup_size = [0x4142_4344, 0x5152_5354, 0x6162_6364];
     key.shared_memory_size = 0x7172_7374;
     key.emulation = EmulationKey {
@@ -52,19 +83,34 @@ fn golden_key() -> VariantKey {
 }
 
 #[rustfmt::skip]
-const GOLDEN_BYTES: [u8; 104] = [
-    0x01, // version
+const GOLDEN_BYTES: [u8; 200] = [
+    0x02, // version
     // vertex attribute types
     1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1,
     2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2,
     // colour target types
     1, 2, 1, 2, 1, 2, 1, 2,
     0x01, // dual-source blending
-    // next stage's reads, lanes 0 to 3
+    // the stage before the tessellation init stage, lanes 0 to 3
     0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
     0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,
     0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21,
     0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31,
+    // the stage before the tessellation stage, lanes 0 to 3
+    0x48, 0x47, 0x46, 0x45, 0x44, 0x43, 0x42, 0x41,
+    0x58, 0x57, 0x56, 0x55, 0x54, 0x53, 0x52, 0x51,
+    0x68, 0x67, 0x66, 0x65, 0x64, 0x63, 0x62, 0x61,
+    0x78, 0x77, 0x76, 0x75, 0x74, 0x73, 0x72, 0x71,
+    // the stage before the geometry stage, lanes 0 to 3
+    0x88, 0x87, 0x86, 0x85, 0x84, 0x83, 0x82, 0x81,
+    0x98, 0x97, 0x96, 0x95, 0x94, 0x93, 0x92, 0x91,
+    0xa8, 0xa7, 0xa6, 0xa5, 0xa4, 0xa3, 0xa2, 0xa1,
+    0xb8, 0xb7, 0xb6, 0xb5, 0xb4, 0xb3, 0xb2, 0xb1,
+    // the stage before the pixel stage, lanes 0 to 3
+    0xc8, 0xc7, 0xc6, 0xc5, 0xc4, 0xc3, 0xc2, 0xc1,
+    0xd8, 0xd7, 0xd6, 0xd5, 0xd4, 0xd3, 0xd2, 0xd1,
+    0xe8, 0xe7, 0xe6, 0xe5, 0xe4, 0xe3, 0xe2, 0xe1,
+    0xf8, 0xf7, 0xf6, 0xf5, 0xf4, 0xf3, 0xf2, 0xf1,
     // workgroup size x, y, z
     0x44, 0x43, 0x42, 0x41, 0x54, 0x53, 0x52, 0x51, 0x64, 0x63, 0x62, 0x61,
     0x74, 0x73, 0x72, 0x71, // shared-memory size
@@ -77,14 +123,16 @@ const GOLDEN_BYTES: [u8; 104] = [
 
 #[test]
 fn layout_constants() {
-    assert_eq!(VARIANT_KEY_VERSION, 1);
+    assert_eq!(VARIANT_KEY_VERSION, 2);
     assert_eq!(VERTEX_ATTRIBUTES, 32);
     assert_eq!(MAX_TEXTURE_SWIZZLES, 192);
     assert_eq!(ATTRIBUTE_WORDS, 256);
     assert_eq!(ATTRIBUTE_MASK_LANES, 4);
+    assert_eq!(FOLLOWING_STAGES, 4);
+    assert_eq!(FollowingStage::ALL.len(), FOLLOWING_STAGES);
     assert_eq!(SWIZZLE_SIZE, 4);
-    assert_eq!(VARIANT_KEY_FIXED_SIZE, 96);
-    assert_eq!(VARIANT_KEY_MAX_SIZE, 96 + 192 * 4);
+    assert_eq!(VARIANT_KEY_FIXED_SIZE, 192);
+    assert_eq!(VARIANT_KEY_MAX_SIZE, 192 + 192 * 4);
 }
 
 #[test]
@@ -97,7 +145,7 @@ fn golden_bytes() {
 fn the_default_key_decodes_from_zeros() {
     // Hand-built: the version, then every field zero and no swizzles.
     let mut bytes = vec![0; VARIANT_KEY_FIXED_SIZE];
-    bytes[0] = 1;
+    bytes[0] = 2;
     assert_eq!(VariantKey::decode(&bytes), Ok(VariantKey::default()));
     assert_eq!(VariantKey::default().encode(), bytes);
 }
@@ -110,7 +158,10 @@ fn defaults() {
     assert_eq!(fresh.vertex_attributes, [AttributeType::Float; 32]);
     assert_eq!(fresh.color_targets, [ColorType::Float; 8]);
     assert!(!fresh.dual_source_blend);
-    assert_eq!(fresh.next_stage_reads, AttributeMask::EMPTY);
+    assert_eq!(fresh.previous_stage_stores, PreviousStores::EMPTY);
+    for stage in FollowingStage::ALL {
+        assert_eq!(fresh.previous_stage_stores.get(stage), AttributeMask::EMPTY);
+    }
     assert_eq!(fresh.workgroup_size, [0, 0, 0]);
     assert_eq!(fresh.shared_memory_size, 0);
     assert_eq!(
@@ -160,7 +211,7 @@ fn any_key() -> impl Strategy<Value = VariantKey> {
         prop::array::uniform32(any_coded(AttributeType::ALL)),
         prop::array::uniform8(any_coded(ColorType::ALL)),
         any::<bool>(),
-        prop::array::uniform4(any::<u64>()),
+        prop::array::uniform4(prop::array::uniform4(any::<u64>())),
         prop::array::uniform3(any::<u32>()),
         any::<u32>(),
         emulation,
@@ -172,7 +223,12 @@ fn any_key() -> impl Strategy<Value = VariantKey> {
                     vertex_attributes: attributes,
                     color_targets: colors,
                     dual_source_blend: dual,
-                    next_stage_reads: AttributeMask::from_lanes(lanes),
+                    previous_stage_stores: FollowingStage::ALL.into_iter().zip(lanes).fold(
+                        PreviousStores::EMPTY,
+                        |stores, (stage, lanes)| {
+                            stores.with(stage, AttributeMask::from_lanes(lanes))
+                        },
+                    ),
                     workgroup_size: workgroup,
                     shared_memory_size: shared,
                     emulation,
@@ -219,7 +275,7 @@ fn the_version_is_checked_first() {
         })
     );
     // Another version with a truncated body: the version is reported.
-    for found in [0, 2, u8::MAX] {
+    for found in [0, 1, 3, u8::MAX] {
         assert_eq!(
             VariantKey::decode(&[found]),
             Err(KeyError::Version { found })
@@ -227,15 +283,15 @@ fn the_version_is_checked_first() {
     }
     // Another version in front of an otherwise valid key.
     let mut other = GOLDEN_BYTES;
-    other[0] = 2;
+    other[0] = 1;
     assert_eq!(
         VariantKey::decode(&other),
-        Err(KeyError::Version { found: 2 })
+        Err(KeyError::Version { found: 1 })
     );
     assert_eq!(
-        KeyError::Version { found: 2 }.to_string(),
+        KeyError::Version { found: 1 }.to_string(),
         format!(
-            "variant key version 2 is not supported; this build reads version {VARIANT_KEY_VERSION}"
+            "variant key version 1 is not supported; this build reads version {VARIANT_KEY_VERSION}"
         )
     );
     // The right version with nothing after it.
@@ -265,44 +321,62 @@ fn every_prefix_is_truncated_in_the_right_field() {
         (33, KeyField::ColorTarget(0)),
         (40, KeyField::ColorTarget(7)),
         (41, KeyField::DualSourceBlend),
-        (42, KeyField::NextStageReads),
-        (73, KeyField::NextStageReads),
-        (74, KeyField::WorkgroupSize(0)),
-        (77, KeyField::WorkgroupSize(0)),
-        (78, KeyField::WorkgroupSize(1)),
-        (82, KeyField::WorkgroupSize(2)),
-        (85, KeyField::WorkgroupSize(2)),
-        (86, KeyField::SharedMemorySize),
-        (89, KeyField::SharedMemorySize),
-        (90, KeyField::AlphaTest),
-        (91, KeyField::DepthRangeRewrite),
-        (92, KeyField::PrimitiveRestartRewrite),
-        (93, KeyField::AttributeFetch),
-        (94, KeyField::TypedOutputs),
-        (95, KeyField::SwizzleCount),
         (
-            96,
+            42,
+            KeyField::PreviousStageStores(FollowingStage::TessellationInit),
+        ),
+        (
+            73,
+            KeyField::PreviousStageStores(FollowingStage::TessellationInit),
+        ),
+        (
+            74,
+            KeyField::PreviousStageStores(FollowingStage::Tessellation),
+        ),
+        (
+            105,
+            KeyField::PreviousStageStores(FollowingStage::Tessellation),
+        ),
+        (106, KeyField::PreviousStageStores(FollowingStage::Geometry)),
+        (137, KeyField::PreviousStageStores(FollowingStage::Geometry)),
+        (138, KeyField::PreviousStageStores(FollowingStage::Pixel)),
+        (169, KeyField::PreviousStageStores(FollowingStage::Pixel)),
+        (170, KeyField::WorkgroupSize(0)),
+        (173, KeyField::WorkgroupSize(0)),
+        (174, KeyField::WorkgroupSize(1)),
+        (178, KeyField::WorkgroupSize(2)),
+        (181, KeyField::WorkgroupSize(2)),
+        (182, KeyField::SharedMemorySize),
+        (185, KeyField::SharedMemorySize),
+        (186, KeyField::AlphaTest),
+        (187, KeyField::DepthRangeRewrite),
+        (188, KeyField::PrimitiveRestartRewrite),
+        (189, KeyField::AttributeFetch),
+        (190, KeyField::TypedOutputs),
+        (191, KeyField::SwizzleCount),
+        (
+            192,
             KeyField::Swizzle {
                 binding: 0,
                 component: 0,
             },
         ),
         (
-            99,
+            195,
             KeyField::Swizzle {
                 binding: 0,
                 component: 3,
             },
         ),
         (
-            100,
+            196,
             KeyField::Swizzle {
                 binding: 1,
                 component: 0,
             },
         ),
         (
-            103,
+            199,
             KeyField::Swizzle {
                 binding: 1,
                 component: 3,
@@ -350,13 +424,13 @@ fn each_coded_field_accepts_its_last_code_and_refuses_the_next() {
         (33, KeyField::ColorTarget(0), 2, 3),
         (40, KeyField::ColorTarget(7), 2, 3),
         (41, KeyField::DualSourceBlend, 1, 2),
-        (90, KeyField::AlphaTest, 8, 9),
-        (91, KeyField::DepthRangeRewrite, 1, 2),
-        (92, KeyField::PrimitiveRestartRewrite, 1, 2),
-        (93, KeyField::AttributeFetch, 1, 2),
-        (94, KeyField::TypedOutputs, 1, 2),
+        (186, KeyField::AlphaTest, 8, 9),
+        (187, KeyField::DepthRangeRewrite, 1, 2),
+        (188, KeyField::PrimitiveRestartRewrite, 1, 2),
+        (189, KeyField::AttributeFetch, 1, 2),
+        (190, KeyField::TypedOutputs, 1, 2),
         (
-            96,
+            192,
             KeyField::Swizzle {
                 binding: 0,
                 component: 0,
@@ -365,7 +439,7 @@ fn each_coded_field_accepts_its_last_code_and_refuses_the_next() {
             8,
         ),
         (
-            103,
+            199,
             KeyField::Swizzle {
                 binding: 1,
                 component: 3,
@@ -410,20 +484,20 @@ fn the_codes_inside_each_set() {
         Ok(ColorType::Float)
     );
     assert_eq!(zero(41).map(|key| key.dual_source_blend), Ok(false));
-    assert_eq!(zero(90).map(|key| key.emulation.alpha_test), Ok(None));
+    assert_eq!(zero(186).map(|key| key.emulation.alpha_test), Ok(None));
     assert_eq!(
-        VariantKey::decode(&patched(90, 1)).map(|key| key.emulation.alpha_test),
+        VariantKey::decode(&patched(186, 1)).map(|key| key.emulation.alpha_test),
         Ok(Some(CompareFunction::Never))
     );
     assert_eq!(
-        VariantKey::decode(&patched(90, 8)).map(|key| key.emulation.alpha_test),
+        VariantKey::decode(&patched(186, 8)).map(|key| key.emulation.alpha_test),
         Ok(Some(CompareFunction::Always))
     );
     let switches: [(usize, Read); 4] = [
-        (91, |key| key.emulation.depth_range_rewrite),
-        (92, |key| key.emulation.primitive_restart_rewrite),
-        (93, |key| key.emulation.attribute_fetch),
-        (94, |key| key.emulation.typed_outputs),
+        (187, |key| key.emulation.depth_range_rewrite),
+        (188, |key| key.emulation.primitive_restart_rewrite),
+        (189, |key| key.emulation.attribute_fetch),
+        (190, |key| key.emulation.typed_outputs),
     ];
     for (offset, read) in switches {
         assert_eq!(
@@ -437,7 +511,7 @@ fn the_codes_inside_each_set() {
         );
     }
     assert_eq!(
-        zero(96).map(|key| key.texture_swizzles.as_slice()[0].x),
+        zero(192).map(|key| key.texture_swizzles.as_slice()[0].x),
         Ok(SwizzleSource::Zero)
     );
     let field = KeyField::Swizzle {
@@ -445,7 +519,7 @@ fn the_codes_inside_each_set() {
         component: 0,
     };
     assert_eq!(
-        VariantKey::decode(&patched(96, 1)),
+        VariantKey::decode(&patched(192, 1)),
         Err(KeyError::InvalidValue { field, value: 1 })
     );
     assert_eq!(
@@ -457,8 +531,8 @@ fn the_codes_inside_each_set() {
 #[test]
 fn the_first_invalid_field_is_reported() {
     let mut bytes = patched(33, 3);
-    bytes[91] = 2;
-    bytes[103] = 1;
+    bytes[187] = 2;
+    bytes[199] = 1;
     assert_eq!(
         VariantKey::decode(&bytes),
         Err(KeyError::InvalidValue {
@@ -524,7 +598,7 @@ fn the_swizzle_cap_at_its_edge() {
 fn the_swizzle_count_is_checked_before_the_swizzles() {
     // A count past the cap and too few bytes for it: the count is reported.
     let count = u8::try_from(MAX_TEXTURE_SWIZZLES + 1).expect("fits");
-    let bytes = patched(95, count);
+    let bytes = patched(191, count);
     assert_eq!(
         VariantKey::decode(&bytes),
         Err(KeyError::TooManySwizzles {
@@ -533,7 +607,7 @@ fn the_swizzle_count_is_checked_before_the_swizzles() {
     );
     // A count within the cap and too few bytes: the swizzle it ends in.
     assert_eq!(
-        VariantKey::decode(&patched(95, 3)),
+        VariantKey::decode(&patched(191, 3)),
         Err(KeyError::Truncated {
             field: KeyField::Swizzle {
                 binding: 2,
@@ -544,7 +618,7 @@ fn the_swizzle_count_is_checked_before_the_swizzles() {
     );
     // A count below what follows: the rest is trailing.
     assert_eq!(
-        VariantKey::decode(&patched(95, 1)),
+        VariantKey::decode(&patched(191, 1)),
         Err(KeyError::TrailingBytes {
             end: GOLDEN_BYTES.len() - SWIZZLE_SIZE,
             len: GOLDEN_BYTES.len()
@@ -564,8 +638,8 @@ fn trailing_bytes_are_refused() {
         })
     );
     assert_eq!(
-        KeyError::TrailingBytes { end: 104, len: 105 }.to_string(),
-        "the variant key ends at byte 104, but 105 bytes were given"
+        KeyError::TrailingBytes { end: 200, len: 201 }.to_string(),
+        "the variant key ends at byte 200, but 201 bytes were given"
     );
 }
 
@@ -749,8 +823,20 @@ fn key_field_names_are_plain_words() {
         (KeyField::ColorTarget(7), "the type of colour target 7"),
         (KeyField::DualSourceBlend, "the dual-source blending switch"),
         (
-            KeyField::NextStageReads,
-            "the attributes the next stage reads",
+            KeyField::PreviousStageStores(FollowingStage::TessellationInit),
+            "the attributes the stage before the tessellation init stage stores",
+        ),
+        (
+            KeyField::PreviousStageStores(FollowingStage::Tessellation),
+            "the attributes the stage before the tessellation stage stores",
+        ),
+        (
+            KeyField::PreviousStageStores(FollowingStage::Geometry),
+            "the attributes the stage before the geometry stage stores",
+        ),
+        (
+            KeyField::PreviousStageStores(FollowingStage::Pixel),
+            "the attributes the stage before the pixel stage stores",
         ),
         (
             KeyField::WorkgroupSize(2),
@@ -780,4 +866,144 @@ fn key_field_names_are_plain_words() {
     for (field, text) in cases {
         assert_eq!(field.to_string(), text);
     }
+}
+
+#[test]
+fn following_stages_are_every_graphics_stage_but_the_vertex_ones() {
+    // Written out: Eden's `MakeRuntimeInfo` sets `previous_stage_stores` from a previous program
+    // for every stage after `VertexB`; the vertex stages are first, and compute has no stages.
+    let cases = [
+        (GuestStage::VertexCullBeforeFetch, None),
+        (GuestStage::Vertex, None),
+        (
+            GuestStage::TessellationInit,
+            Some(FollowingStage::TessellationInit),
+        ),
+        (GuestStage::Tessellation, Some(FollowingStage::Tessellation)),
+        (GuestStage::Geometry, Some(FollowingStage::Geometry)),
+        (GuestStage::Pixel, Some(FollowingStage::Pixel)),
+        (GuestStage::Compute, None),
+    ];
+    for (stage, following) in cases {
+        assert_eq!(FollowingStage::of(stage), following, "{stage:?}");
+        if let Some(following) = following {
+            assert_eq!(following.stage(), stage);
+        }
+    }
+    // Pipeline order, which is the encoding's order.
+    assert_eq!(
+        FollowingStage::ALL,
+        [
+            FollowingStage::TessellationInit,
+            FollowingStage::Tessellation,
+            FollowingStage::Geometry,
+            FollowingStage::Pixel,
+        ]
+    );
+    let names: Vec<String> = FollowingStage::ALL
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(
+        names,
+        ["tessellation init", "tessellation", "geometry", "pixel"]
+    );
+}
+
+#[test]
+fn previous_stores_keep_each_stage_apart() {
+    let mask = AttributeMask::EMPTY.with(32).with(200);
+    for stage in FollowingStage::ALL {
+        let stores = PreviousStores::EMPTY.with(stage, mask);
+        for other in FollowingStage::ALL {
+            let expected = if other == stage {
+                mask
+            } else {
+                AttributeMask::EMPTY
+            };
+            assert_eq!(stores.get(other), expected, "{stage} then {other}");
+        }
+        // Setting a stage again replaces its mask, and back to empty gives the empty stores.
+        let replaced = stores.with(stage, AttributeMask::EMPTY.with(1));
+        assert_eq!(replaced.get(stage), AttributeMask::EMPTY.with(1));
+        assert_eq!(
+            stores.with(stage, AttributeMask::EMPTY),
+            PreviousStores::EMPTY
+        );
+    }
+    assert_eq!(PreviousStores::default(), PreviousStores::EMPTY);
+}
+
+/// Where the mask of `stage` starts in an encoded key: after the version, the vertex attribute
+/// types, the colour target types and the dual-source switch, then 32 bytes per earlier stage.
+fn stores_offset(stage: FollowingStage) -> usize {
+    let index = FollowingStage::ALL
+        .iter()
+        .position(|&s| s == stage)
+        .expect("listed");
+    1 + VERTEX_ATTRIBUTES + COLOR_TARGETS + 1 + index * ATTRIBUTE_MASK_LANES * 8
+}
+
+#[test]
+fn each_stages_stores_land_in_its_own_bytes() {
+    // Word 37 (generic 1's y) and word 200: lane 0 bit 37 and lane 3 bit 8.
+    let mask = AttributeMask::EMPTY.with(37).with(200);
+    let empty = VariantKey::default().encode();
+    for stage in FollowingStage::ALL {
+        let key = VariantKey {
+            previous_stage_stores: PreviousStores::EMPTY.with(stage, mask),
+            ..VariantKey::default()
+        };
+        let bytes = key.encode();
+        // Golden: exactly two bytes differ from the empty key's, at the stage's offset.
+        let at = stores_offset(stage);
+        let mut expected = empty.clone();
+        expected[at + 4] = 1 << 5; // word 37: lane 0, byte 4, bit 5
+        expected[at + 3 * 8 + 1] = 1; // word 200: lane 3, byte 1, bit 0
+        assert_eq!(bytes, expected, "{stage}");
+        assert_eq!(VariantKey::decode(&bytes), Ok(key));
+    }
+    // The four offsets, written out.
+    assert_eq!(FollowingStage::ALL.map(stores_offset), [42, 74, 106, 138]);
+}
+
+#[test]
+fn the_key_changes_with_the_stores_and_not_otherwise() {
+    let base = VariantKey {
+        previous_stage_stores: PreviousStores::EMPTY.with(
+            FollowingStage::Pixel,
+            AttributeMask::EMPTY.with(28).with(32),
+        ),
+        ..golden_key()
+    };
+    // Equal stores, built in another order: the same key and bytes.
+    let same = VariantKey {
+        previous_stage_stores: PreviousStores::EMPTY.with(
+            FollowingStage::Pixel,
+            AttributeMask::EMPTY.with(32).with(28),
+        ),
+        ..golden_key()
+    };
+    assert_eq!(same, base);
+    assert_eq!(same.encode(), base.encode());
+    // One more word stored: a different key.
+    let more = VariantKey {
+        previous_stage_stores: base.previous_stage_stores.with(
+            FollowingStage::Pixel,
+            AttributeMask::EMPTY.with(28).with(32).with(33),
+        ),
+        ..golden_key()
+    };
+    assert_ne!(more, base);
+    assert_ne!(more.encode(), base.encode());
+    // The same mask under another stage: a different key.
+    let moved = VariantKey {
+        previous_stage_stores: PreviousStores::EMPTY.with(
+            FollowingStage::Geometry,
+            AttributeMask::EMPTY.with(28).with(32),
+        ),
+        ..golden_key()
+    };
+    assert_ne!(moved, base);
+    assert_ne!(moved.encode(), base.encode());
 }

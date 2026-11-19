@@ -52,7 +52,7 @@
 //! | `ReadInstruction` | the program's bytes, read through [`crate::lookup::ProgramMemory`] from [`crate::lookup::ProgramRequest::address`] | yes |
 //! | `ReadCbufValue` | [`Question::CbufWord`] | yes |
 //! | `ReadTextureType` | only whether the type is `Buffer`: [`TextureKind::buffer`] | **partly**; see below |
-//! | `ReadTexturePixelFormat` | [`TextureKind::format`], the header's format bits rather than Eden's converted `TexturePixelFormat` | yes |
+//! | `ReadTexturePixelFormat` | [`TextureKind::format`] of a [`TextureUsage::Image`] question, the header's format bits rather than Eden's converted `TexturePixelFormat` | **partly**; see below |
 //! | `IsTexturePixelFormatInteger` | [`TextureKind::sampled`] (which also tells signed from unsigned) | yes |
 //! | `ReadViewportTransformState` | nothing | **no** |
 //! | `TextureBoundBuffer` | nothing | **no** |
@@ -67,6 +67,31 @@
 //! | `StartAddress` | [`crate::lookup::ProgramRequest::address`] (an absolute address, where Eden's is an offset from the program base) | yes |
 //! | `IsProprietaryDriver` | nothing (Eden derives it from `TextureBoundBuffer`, `texture_bound == 2`) | **no** |
 //! | `cbuf_word_cache`, `handle_cache`, `track_cache` | nothing: Eden's caches, not translation inputs | not an input |
+//!
+//! # Usage, and which answers carry the format
+//!
+//! [`Question::TextureKind`] says how the program uses the handle ([`TextureUsage`]), so a
+//! shader is specialised on the header's format bits only where its translation depends on
+//! them (spec, "Translation inputs: questions and answers"; decided by the owner, 2026-11-19,
+//! ruling 7). [`EngineState::texture_kind`] keeps the sketch's signature and reports the whole
+//! [`TextureKind`] whatever the usage; the exchange records it through [`TextureKind::for_usage`]:
+//!
+//! - [`TextureUsage::Sampled`]: the format is replaced by [`TextureFormat::UNREAD`], so two
+//!   headers that differ only in their format bits, with the same kind, give equal answers and
+//!   the shader is not retranslated (pinned by `tests::a_format_change_keeps_a_sampled_answer`);
+//! - [`TextureUsage::Image`]: the format is kept, so a format change is a new answer (pinned by
+//!   `tests::a_format_change_changes_an_image_answer`).
+//!
+//! Both [`exchange`] and [`Answers::reanswer`] record through it, so a later draw's answers
+//! compare equal exactly when the first draw's would have.
+//!
+//! The two usages are the issue's ("sampled only, or read or written as an image"). Eden reads
+//! the format in one more place: an `ImageFetch` from a buffer texture on a host that cannot
+//! render to SNORM buffers is patched by format (`PatchTexelFetch` behind
+//! `ReadTexturePixelFormatCached`, `eden/src/shader_recompiler/ir_opt/texture_pass.cpp` @
+//! cf654052). Which usage such a fetch asks with is left to the texture pass (slice 13); asking
+//! with [`TextureUsage::Image`] gets the format. An **owner question** whether it needs a usage
+//! of its own.
 //!
 //! No driver constant stands in for an `Environment` member: the driver constants hold values
 //! Eden takes from `RuntimeInfo` and the draw, not from `Environment`. [`TextureKind::depth`] and
@@ -140,7 +165,25 @@ pub enum Question {
     TextureKind {
         /// The handle, as the program reads it.
         handle: u32,
+        /// How the program uses it, which decides whether the answer carries the format (see
+        /// the module docs, "Usage, and which answers carry the format").
+        usage: TextureUsage,
     },
+}
+
+/// How a program uses a texture handle (spec, "Translation inputs": "The usage says how the
+/// shader uses the texture"; decided by the owner, 2026-11-19, ruling 7).
+///
+/// A handle used both ways is asked about once per usage: two questions, each answered once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum TextureUsage {
+    /// Only sampled, fetched or queried through a texture instruction: the translation depends
+    /// on the kind (component type, depth, multisampled, buffer), not on the format bits, so
+    /// the answer carries [`TextureFormat::UNREAD`].
+    Sampled,
+    /// Read or written as an image by a surface instruction, whose host storage image must
+    /// declare its format (rows 83 and 86): the answer carries the header's format bits.
+    Image,
 }
 
 /// The component type a texture's samples have (spec: "sampled component type (float, signed,
@@ -165,6 +208,11 @@ pub enum SampledType {
 pub struct TextureFormat(u32);
 
 impl TextureFormat {
+    /// The format recorded in the answer to a [`TextureUsage::Sampled`] question: no bits,
+    /// whatever the header holds, because that usage does not read them. It is told apart from
+    /// a header whose format bits are all zero by the question's usage, not by its value.
+    pub const UNREAD: Self = Self(0);
+
     /// The format of a texture header whose first word is `word`; the bits outside
     /// [`TEXHEAD_FORMAT_MASK`] (the swizzle sources) are dropped.
     pub const fn from_texhead_word0(word: u32) -> Self {
@@ -189,11 +237,27 @@ pub struct TextureKind {
     pub multisampled: bool,
     /// Whether it is a buffer texture.
     pub buffer: bool,
-    /// Its format, for a formatted surface load or store. The back thread fills it for every
-    /// handle, because the question does not say how the program uses the handle; so two
-    /// formats with the same kind give different answers, and a shader that only samples the
-    /// texture is retranslated when the format changes.
+    /// Its format, for a formatted surface load or store. [`EngineState::texture_kind`] fills
+    /// it for every handle; the answer recorded for a [`TextureUsage::Sampled`] question holds
+    /// [`TextureFormat::UNREAD`] instead ([`TextureKind::for_usage`]), so a shader that only
+    /// samples the texture is not retranslated when the format changes but the kind does not.
     pub format: TextureFormat,
+}
+
+impl TextureKind {
+    /// The kind as the answer to a question of `usage` records it: unchanged for
+    /// [`TextureUsage::Image`], with the format replaced by [`TextureFormat::UNREAD`] for
+    /// [`TextureUsage::Sampled`] (module docs, "Usage, and which answers carry the format").
+    #[must_use]
+    pub const fn for_usage(self, usage: TextureUsage) -> Self {
+        match usage {
+            TextureUsage::Sampled => Self {
+                format: TextureFormat::UNREAD,
+                ..self
+            },
+            TextureUsage::Image => self,
+        }
+    }
 }
 
 /// The answer to one [`Question`], as [`EngineState`] gave it.
@@ -215,6 +279,8 @@ pub trait EngineState {
     /// is none.
     fn cbuf_word(&self, stage: GuestStage, bank: u8, offset: u32) -> Option<u32>;
     /// What `handle` points to for `stage`, or `None` if it points to no valid texture header.
+    /// Reports the format whatever the usage; the exchange drops it where the usage does not
+    /// read it ([`TextureKind::for_usage`]).
     fn texture_kind(&self, stage: GuestStage, handle: u32) -> Option<TextureKind>;
 }
 
@@ -254,10 +320,10 @@ impl Answers {
         }
     }
 
-    /// The answer to [`Question::TextureKind`] for `handle`: `None` if it was not asked,
-    /// `Some(None)` if the handle points to no valid texture header.
-    pub fn texture_kind(&self, handle: u32) -> Option<Option<TextureKind>> {
-        match self.get(Question::TextureKind { handle }) {
+    /// The answer to [`Question::TextureKind`] for `handle` and `usage`: `None` if it was not
+    /// asked, `Some(None)` if the handle points to no valid texture header.
+    pub fn texture_kind(&self, handle: u32, usage: TextureUsage) -> Option<Option<TextureKind>> {
+        match self.get(Question::TextureKind { handle, usage }) {
             Some(Answer::TextureKind(kind)) => Some(kind),
             Some(Answer::CbufWord(_)) | None => None,
         }
@@ -293,13 +359,18 @@ impl Answers {
     }
 }
 
-/// Answers one question from `engine`.
+/// Answers one question from `engine`; a texture kind is recorded for the question's usage
+/// ([`TextureKind::for_usage`]).
 fn answer(stage: GuestStage, question: Question, engine: &dyn EngineState) -> Answer {
     match question {
         Question::CbufWord { bank, offset } => {
             Answer::CbufWord(engine.cbuf_word(stage, bank, offset))
         }
-        Question::TextureKind { handle } => Answer::TextureKind(engine.texture_kind(stage, handle)),
+        Question::TextureKind { handle, usage } => Answer::TextureKind(
+            engine
+                .texture_kind(stage, handle)
+                .map(|kind| kind.for_usage(usage)),
+        ),
     }
 }
 
