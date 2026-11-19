@@ -55,7 +55,11 @@ use crate::hle::graphics::Idleness;
 /// docs, "Telling a stalled run"). Starquake's own number, a **guess** (gpu-protocol asks only
 /// for "a named retry count"): an idle GPU reads busy for a few microseconds in each 100 ms
 /// safety-net turn, so a stalled run whose questions land in eight turns in a row is very
-/// unlikely, while a GPU that stays busy is asked no more than nine times per park.
+/// unlikely, while a GPU that stays busy is asked no more than nine times per park. What would
+/// confirm or change it: a measurement of how often consecutive questions land in GPU turns (a
+/// scratch run with `IDLE_PARK` cut to 1 µs, as issue #436's reproduction does), or a trace of a
+/// long back list that no guest waits on, showing how many quiet signals pass before the GPU
+/// answers idle.
 pub(super) const GPU_QUIET_RETRIES: u32 = 8;
 
 /// What the last core to park was told (module docs, "Telling a stalled run").
@@ -70,8 +74,11 @@ pub(super) enum Stall {
 }
 
 /// The core loop's question, from the graphics server's `graphics` answer and the kernel's
-/// (`kernel_stalled`, asked only when the graphics server is idle or busy only because of the
-/// GPU, as before the GPU's answer could be told apart).
+/// (`kernel_stalled`, asked when the graphics server is idle or busy only because of the GPU,
+/// and not when anything else is busy). The kernel, and with it the kernel lock, is now also
+/// asked when the answer is [`Idleness::GpuBusy`]: before the GPU's answer was told apart, a
+/// busy GPU made the question "not stalled" without asking the kernel.
+#[must_use]
 pub(super) fn stall(graphics: Idleness, kernel_stalled: impl FnOnce() -> bool) -> Stall {
     let stalled = match graphics {
         Idleness::Busy => return Stall::NotStalled,
@@ -262,6 +269,19 @@ impl<I: Interrupter> Cores<I> {
     #[cfg(test)]
     pub(super) fn busy_turns_left(&self) -> u32 {
         self.parks.busy_turns.load(Ordering::SeqCst)
+    }
+
+    /// How many cores are parked, read under the idle count's lock: once it is every core, the
+    /// last one's question has been asked, since a park asks with that lock held.
+    #[cfg(test)]
+    pub(super) fn parked(&self) -> usize {
+        *lock(&self.idle)
+    }
+
+    /// The core armed for the GPU's next quiet signal, by index, if one is.
+    #[cfg(test)]
+    pub(super) fn armed(&self) -> Option<usize> {
+        *lock(&self.parks.armed)
     }
 
     /// Stops every core: each is interrupted and woken, and parks no more.

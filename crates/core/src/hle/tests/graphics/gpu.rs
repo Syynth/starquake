@@ -192,10 +192,12 @@ fn a_graphics_server_with_a_busy_gpu_is_not_idle() {
     assert!(!graphics.is_idle());
 }
 
-/// A running GPU that is idle leaves the server idle, not `GpuBusy`; with something queued it
-/// is busy for more than the GPU. Waited for, since a safety-net turn reads busy while it runs.
+/// A running GPU that is idle leaves the server idle once its turn ends; with a completion
+/// queued the server reads busy, not `GpuBusy`, whatever the GPU answers. An idle GPU does read
+/// busy while a safety-net turn runs, so the server can read `GpuBusy` meanwhile: idle is
+/// waited for, not asserted once.
 #[test]
-fn a_graphics_server_over_an_idle_gpu_is_idle_or_busy_never_gpu_busy() {
+fn a_graphics_server_over_an_idle_gpu_becomes_idle_and_a_queued_completion_reads_busy() {
     let graphics = with_gpu();
     wait_until("the server over a new GPU is idle", || {
         graphics.idleness() == Idleness::Idle

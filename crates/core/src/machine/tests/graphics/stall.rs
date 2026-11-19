@@ -7,8 +7,12 @@
 //! `Cores::read_gpu_busy`: questions that come to "stalled" read busy only because of the GPU
 //! until a given number of the GPU front thread's own quiet signals have reached an armed core,
 //! as if the GPU stayed in a turn until each of them. Without the retry no core is ever armed,
-//! so such a run never ends on its own (each test here failed that way with the retry removed,
-//! at the test's bound). There is no timer thread: nothing here has a deadline.
+//! so such a run never ends on its own: the three tests that use `Cores::read_gpu_busy` failed
+//! that way with the retry removed, at the test's bound. `a_stalled_run_with_the_gpu_ends_waiting`
+//! forces nothing and passes without the retry too, unless a question happens to land in one of
+//! the GPU's own turns. `a_stalled_run_whose_gpu_answers_busy_arms_the_last_core_for_the_quiet_signal`
+//! forces nothing either: it stops the GPU, so the GPU's real busy answer goes through the core
+//! loop's production question. There is no timer thread: nothing here has a deadline.
 
 use std::sync::atomic::Ordering;
 
@@ -132,6 +136,39 @@ fn a_stalled_run_whose_questions_land_in_gpu_turns_up_to_the_bound_ends_waiting(
         |_| {},
     );
     assert_eq!(failed_with(&ending), WAITING);
+}
+
+/// The production path from the GPU's answer to the stall question, with nothing forced: a
+/// stopped GPU answers busy for good (`Gpu::is_idle`), so the graphics server's idleness is
+/// `GpuBusy` ([`crate::hle::Graphics::idleness`]), the core loop's question comes to
+/// `OnlyTheGpu` once the kernel says the run is stalled, and the last core to park stays armed
+/// for a quiet signal a stopped GPU never tells. A question that only knew "idle or busy" would
+/// read the stopped GPU as busy, come to "not stalled" and arm no core.
+#[test]
+fn a_stalled_run_whose_gpu_answers_busy_arms_the_last_core_for_the_quiet_signal() {
+    let ending = stalled_gpu_run(
+        |machine| machine.graphics.gpu().unwrap().stop().unwrap(),
+        |machine| {
+            let cores = usize::from(machine.cores.count());
+            let deadline = Instant::now() + PATIENCE;
+            while machine.cores.parked() != cores {
+                assert!(Instant::now() < deadline, "the cores never all parked");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // Every core parked: the last one's question has been asked, and a stopped GPU
+            // tells no quiet signal that could disarm it.
+            assert!(
+                machine.cores.armed().is_some(),
+                "no core was armed for the GPU's quiet signal"
+            );
+            assert!(
+                !machine.stopped.load(Ordering::SeqCst),
+                "the run ended though the GPU answered busy"
+            );
+            machine.stop(Ending::Failed(STOPPED_BY_THE_TEST.to_owned()));
+        },
+    );
+    assert_eq!(failed_with(&ending), STOPPED_BY_THE_TEST);
 }
 
 /// One past the bound: the GPU reads busy until one more quiet signal than a park waits for.

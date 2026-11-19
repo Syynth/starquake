@@ -182,10 +182,12 @@
 //! answered busy, [`Idleness::Busy`] when anything else is busy. The rest is asked whatever the
 //! GPU answered, so that a run stalled but for the GPU's answer can be asked again at the GPU's
 //! next quiet signal (`crate::machine`'s `cores` module, "Telling a stalled run"; gpu-protocol,
-//! "Idleness"). The null front never answers `GpuBusy`
-//! (`idleness_is_gpu_busy_only_when_the_gpu_alone_is_busy`, `the_null_front_is_never_gpu_busy`,
-//! and, with the GPU, `a_graphics_server_with_a_busy_gpu_is_not_idle` and
-//! `a_graphics_server_over_an_idle_gpu_is_idle_or_busy_never_gpu_busy`).
+//! "Idleness"). The null front never answers `GpuBusy` (`the_null_front_is_never_gpu_busy`);
+//! the split itself is pinned by `idleness_is_gpu_busy_only_when_the_gpu_alone_is_busy`, and,
+//! with the GPU, by `a_graphics_server_with_a_busy_gpu_is_not_idle` (a stopped GPU alone reads
+//! `GpuBusy`) and `a_graphics_server_over_an_idle_gpu_becomes_idle_and_a_queued_completion_reads_busy`
+//! (an idle GPU's server becomes `Idle`, and a queued completion reads `Busy` whatever the GPU
+//! answers).
 //!
 //! # Replay
 //!
@@ -741,7 +743,9 @@ impl Graphics {
     /// call first (module docs, "Telling a stalled run"): nothing queued, no request held by the
     /// shared page, no guest signal of the page waiting for its turn, and no vsync tick to come
     /// (in a run the clock stopped, in a replay no tick fed back). It takes gsv's shared lock,
-    /// so it waits for a drain in progress, whose signals are then made.
+    /// so it waits for a drain in progress, whose signals are then made. It does so even when
+    /// the GPU answered busy ([`Graphics::idleness`]): before the GPU's answer was told apart, a
+    /// busy GPU returned at once, without the lock.
     #[must_use]
     pub fn is_idle(&self) -> bool {
         self.idleness() == Idleness::Idle
@@ -749,7 +753,8 @@ impl Graphics {
 
     /// [`Graphics::is_idle`], saying whether a busy answer came from the GPU alone (module docs,
     /// "Telling a stalled run"): the GPU is asked first, then the rest is asked whatever the
-    /// GPU answered.
+    /// GPU answered. So gsv's shared lock is taken, and a drain in progress waited for, even
+    /// when the GPU answered busy.
     #[must_use]
     pub fn idleness(&self) -> Idleness {
         // The GPU first: a completion it pushes while this asks is then seen as work in flight
