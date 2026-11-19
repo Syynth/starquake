@@ -8,6 +8,7 @@
 //! recorder's text.
 
 mod back;
+mod counters;
 mod recorder;
 mod threads;
 
