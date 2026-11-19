@@ -60,7 +60,7 @@ pub use control::{
     ShflSrc, VoteDst, VoteOp,
 };
 pub use float::{FMulScale, FSwzAddOp, FloatCmpOp, FloatType, IntType, MuFuOp, PredSetOp};
-pub use integer::MovSrc;
+pub use integer::{IMadMode, IntCmpOp, MovSrc, PLop3Src, PrmtMode, ShfType};
 
 /// An operation's mnemonic, as `nvdisasm` writes it lower-cased (for a shell, a guess).
 pub(crate) trait Named {

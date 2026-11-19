@@ -5,15 +5,23 @@ mod attribute;
 mod control;
 mod float32;
 mod framework;
+mod integer;
 
 use proptest::prelude::*;
 
+use super::fields::ALU_FORM;
 use super::print::FloatOperand;
 use super::*;
 use crate::asm::{EncodeError, assemble};
 use crate::decode::control::EXIT_OPCODE;
 use crate::decode::integer::MOV_OPCODE;
 use crate::testing::{any_form_word, any_instr, any_word_of, config, forms};
+
+/// The 9-bit opcode below the operand form of a 12-bit ALU `opcode` (its low [`ALU_FORM`]`.start`
+/// bits: `encode_alu_base`'s `set_field(0..9, opcode)`).
+fn base_of(opcode: u16) -> u16 {
+    opcode & ((1 << ALU_FORM.start) - 1)
+}
 
 fn r(index: u8) -> Gpr {
     Gpr::new(index)
@@ -565,7 +573,10 @@ fn mov_rejects_source_modifier_bits() {
         .iter()
         .map(|(form, _)| form.opcode(MOV_OPCODE))
         .collect();
-    for row in integer::REFERENCE_ROWS {
+    let mov_rows = super::integer::REFERENCE_ROWS
+        .iter()
+        .filter(|row| base_of(row.opcode) == MOV_OPCODE);
+    for row in mov_rows {
         let expected = if forms.contains(&row.opcode) {
             SLOT_ABS.mask() | SLOT_NEG.mask()
         } else {

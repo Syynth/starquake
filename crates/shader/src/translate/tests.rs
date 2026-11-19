@@ -351,8 +351,12 @@ fn uniform_and_constant_buffer_sources_are_rejected() {
 /// Every operation but the six of slice 1 is rejected by its mnemonic.
 #[test]
 fn other_instructions_are_rejected_by_mnemonic() {
-    use crate::decode::{OpIAdd3, OpNop, OpTex};
-    for op in [Op::IAdd3(OpIAdd3 {}), Op::Nop(OpNop {}), Op::Tex(OpTex {})] {
+    use crate::decode::{OpIAbs, OpNop, OpTex};
+    let iabs = Op::IAbs(OpIAbs {
+        dst: r(0),
+        src: AluSrc::reg(r(1)),
+    });
+    for op in [iabs, Op::Nop(OpNop {}), Op::Tex(OpTex {})] {
         let instr = Instr::new(op);
         assert_eq!(
             one(instr),
