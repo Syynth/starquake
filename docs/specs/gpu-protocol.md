@@ -90,7 +90,7 @@ states exactly what this spec assumes of each and what it offers them.
 | 3D macros are called at methods 0xE00 and up (`CALL_MME_MACRO(j)` at byte 0x3800 + 8j); a call runs when its last data word arrives | `classes/clc797.h`; `eden-nx2/src/video_core/engines/maxwell_3d.cpp` (`ProcessMacro`) |
 | The compute class also runs macros at 0xE00 and up (`CALL_MME_MACRO(j)` at byte 0x3800 + 8j), sharing its channel's data RAM with the 3D class | `classes/clc7c0.h` (`NVC7C0_CALL_MME_MACRO`; decided by the owner, 2026-11-18); `eden-nx2/src/video_core/engines/kepler_compute.cpp` (line 133), `control/channel_state.cpp` (`SetNativeDataRam`) |
 | Macro data RAM is per channel | Row 84 |
-| MME DMA reads: 3D methods 0x154/0x155 (`SET_MME_MEM_ADDRESS_A/B`, byte 0x550/0x554) and 0x158 (`MME_DMA_READ_FIFOED`, byte 0x560) feed the load FIFO after a load barrier | Row 58; `classes/clc797.h` |
+| MME DMA reads: 3D methods 0x154/0x155 (`SET_MME_MEM_ADDRESS_A/B`, byte 0x550/0x554) and 0x158 (`MME_DMA_READ_FIFOED`, byte 0x560) feed the load FIFO after a load barrier; 0x157 (`MME_DMA_READ`, byte 0x55C) reads into the macro data RAM | Row 58; `classes/clc797.h`; `eden-nx2/src/video_core/engines/maxwell_3d.cpp` (0x157 and 0x158 handled together) |
 | `SET_MME_SHADOW_RAM_CONTROL` is method 0x49 (byte 0x124), modes track, track with filter, passthrough, replay | `classes/clc797.h`; row 144 |
 | About 60% of 3D register writes repeat the register's value | Row 135 |
 | Compute dispatches use QMD 3.0 (word 18 bits 7:0 = 0x30), scheduled with `SEND_PCAS_A` (method 0xAD, QMD address >> 8) and `SEND_SIGNALING_PCAS2_B` (0xB0: action bits 3:0, count minus one bits 23:14) | `classes/clc7c0.h`, `classes/clc7c0qmd.h`; `eden-nx2/src/video_core/native_qmd.h` |
@@ -153,9 +153,11 @@ reach; this crate only performs them.
   submission's first entry, the front checks `Syncpoints::reached(wait)`, and if it is not met
   registers a waiter and parks the channel. The back's report of an increment rechecks it.
 - **The increments** (row 32: NVN2 sets bit 8 and expects them though its commands contain
-  none) are appended by the front after the submission's last entry, as `Syncpoint` ring entries
-  for the channel's syncpoint, so the back performs them after the host GPU has finished the
-  submission's work.
+  none) are appended by the front after the submission's last entry, as a `Syncpoint` ring entry
+  for the channel's syncpoint that carries the count, so the back performs them after the host
+  GPU has finished the submission's work. gsv passes a guest-chosen count (up to `u32::MAX`);
+  one entry with a count keeps the front's cost the same whatever the count, where one entry per
+  increment would cost time linear in it (decided by the owner, 2026-11-19).
 - **A full queue.** A channel's queue holds at most 65,536 GP entries (decided by the owner,
   graphics-server decision 12; "Back-pressure" below). When a submission does not fit, `submit`
   returns `Submitted::Full` and queues nothing; gsv defers the guest's reply, and the front
@@ -180,6 +182,29 @@ loop
 
 The quantum is 4,096 words (**guess**; tuned by measurement, it only affects fairness, never
 correctness, since channels order themselves through semaphores).
+
+**Front-loop choices** (built in G14, `crates/gpu/src/front.rs`; decided by the owner,
+2026-11-19):
+
+- The "process" across which ordered updates wait for channels and macro code stores are
+  shared is the address space (`AsId`).
+- A GP entry with `SYNC_WAIT` (`NVC76F_GP_ENTRY1_SYNC`, bit 31 of word 1) makes the channel wait,
+  before it starts that entry, until the back has performed everything pushed before it, as the
+  field's names (`SYNC_PROCEED`, `SYNC_WAIT`) in `clc76f.h` read. Eden-NX2 waits after the entry,
+  and only behind its `sync_memory_operations` setting (`DmaPusher::Step` in `dma_pusher.cpp`).
+  A **guess** and a listed divergence.
+- A submission to an unknown or destroyed channel is dropped and answered `Queued`.
+- An ordered update queued after a barrier can be reported done before that barrier when the
+  barrier waits on a channel of another address space.
+- The macro host's question whether the back has work it has not performed (`BackWork`) is
+  answered from the markers the back has reported, so the first MME DMA read after any pushed
+  work costs a catch-up.
+- A submission with no entries is charged one place in its channel's queue, so empty
+  submissions cannot pile up behind a parked channel without bound.
+- `WaitForIdle` is pushed only with a submission's increments, and only when the submission asks
+  for it (`Submission::wfi` decides alone). Eden-NX2's NX2 path builds its list with
+  `BuildIncrementCountCommandList`, which pushes it whatever the guest's `suppress_wfi` bit says
+  (`eden-nx2/src/core/hle/service/nvdrv/devices/nvhost_gpu.cpp`); a listed divergence.
 
 ### The method stream
 
@@ -372,6 +397,12 @@ new code. Eden-NX2 runs the call at once, on the code as it was at the call; thi
 divergence, pinned in G13's tests (decided by the owner, 2026-11-18). If the back has nothing
 pending, the read happens at once.
 
+`MME_DMA_READ` (0x157), the form that reads into data RAM, is performed when it is written, as
+Eden-NX2 does, not at the next barrier; the memo stores no call, 3D or compute, that writes it.
+The compute class's MME DMA methods are register writes only, following Eden-NX2's compute
+front; a trace of a compute macro that uses them would revisit this (decided by the owner,
+2026-11-19).
+
 **The memo** (port of `eden-nx2/src/video_core/macro_memo.h`) sits in front of the interpreter.
 A call qualifies when it read only its parameters and data RAM words: no register reads, no DMA
 reads. Its key is the macro start and the parameters; its guard is the data RAM words it read;
@@ -407,7 +438,7 @@ enum RingEntry<'a> {
     Write { channel: ChannelId, class: ClassId, method: u16, value: u32 },
     Run { channel: ChannelId, class: ClassId, method: u16, words: &'a [u32] },
     Release { channel: ChannelId, release: Release }, // release or reduction, from any engine
-    Syncpoint { id: SyncpointId },    // increment, from a submission's fence or the shim
+    Syncpoint { id: SyncpointId, count: u32 }, // increments, from a submission's fence or the shim
     WaitForIdle { channel: ChannelId },
     SetReference { channel: ChannelId, value: u32 }, // the back closes its open list; no action
     Invalidate { channel: ChannelId, what: Invalidation },
@@ -493,7 +524,10 @@ A draw method (`DRAW_VERTEX_ARRAY_BEGIN_END_A/B`, `DRAW_INDEX_BUFFER_BEGIN_END_A
    blocks (see #13 below): `Ready` gives a `ShaderSet`; `Pending(Ticket)` follows this crate's
    one wait-while-compiling setting (decision 9); `Rejected` skips the draw. The shader set says
    which constant buffers, textures, samplers, images and storage buffers it uses, and where
-   bindless handles come from.
+   bindless handles come from. The swizzles in the key depend on which textures the set binds,
+   which only the lookup tells: the back looks up first with the swizzles the same requests
+   bound last time, and looks up again if the set's bound textures have other swizzles (decided
+   by the owner, 2026-11-19).
 3. Resolve resources: constant buffers from `BIND_GROUP_CONSTANT_BUFFER(j)` (and root tables for
    banks 24–31), textures and samplers from the header and sampler pools by handle, vertex and
    index buffers, render targets. Each becomes a host resource through the buffer and texture
@@ -505,7 +539,22 @@ A draw method (`DRAW_VERTEX_ARRAY_BEGIN_END_A/B`, `DRAW_INDEX_BUFFER_BEGIN_END_A
 4. Emit a `Command::Draw` (see "What the back hands the render backend").
 
 A draw whose shader was rejected is skipped and counted, once per program in the log (negative
-cache, rows 90, 112). Conditional rendering (`SET_RENDER_ENABLE_*`) is evaluated here from the
+cache, rows 90, 112); the shader cache's rejection names the program that failed, so the log can
+be kept per program rather than per set (decided by the owner, 2026-11-19).
+
+Eden-NX2 draws a 3D engine's deferred instances at the end of each macro
+(`Maxwell3D::FinishFrontMacro`), which its ring carries. This ring has no entry for a macro's
+end: the back draws a channel's deferred instances before any entry of that channel that is not
+a `Write` or `Run` of its 3D class, and every channel's before a `Syncpoint`, `Marker` or
+`Present`, so the work after them in the stream comes after the draw. A listed divergence, as
+built in G19 (decided by the owner, 2026-11-19).
+
+**Clears.** `CLEAR_SURFACE` becomes a `Command::Clear` of the bound targets, or a draw when the
+clear is masked or scissored in a way a render-pass clear cannot express, as Eden's
+`DrawManager::Clear` decides (`eden-nx2/src/video_core/engines/draw_manager.cpp`). Slice G24
+owns it (decided by the owner, 2026-11-19).
+
+Conditional rendering (`SET_RENDER_ENABLE_*`) is evaluated here from the
 query value in guest memory, after a catch-up when that value is still pending.
 
 ### Compute: QMD 3.0
@@ -559,6 +608,11 @@ a listed divergence pinned by a test, until a trace settles it ("What to verify"
   copy (row 134). At most `MAX_PENDING_RANGES` (1,024) disjoint ranges are held; one more merges
   them all into the single range covering them, which over-invalidates instead of growing. A
   **guess**, since no reference bounds Eden-NX2's list (decided by the owner, 2026-11-18).
+- **Constant-buffer loads (`LOAD_CONSTANT_BUFFER`).** The back writes each run of data words to
+  guest memory at the constant buffer's address plus the upload offset, as Eden's
+  `ProcessCBMultiData` does (`eden-nx2/src/video_core/engines/maxwell_3d.cpp`), and invalidates
+  the range in the caches like an inline write. Slice G25 owns it (decided by the owner,
+  2026-11-19).
 - **2D (`902D`).** Surface-to-surface blits with scaling and filtering become host blit commands
   when the caches hold either surface, and CPU copies through the layout crate otherwise. Eden's
   software blitter cost 3.6% of the GPU thread on small mip copies (row 137), so the host path is
@@ -588,10 +642,12 @@ passed (**guess**, so that a CPU spinning on a semaphore is not starved; measure
 a first-in, first-out list of (`FenceValue`, fenced actions).
 
 When `Backend::completed()` passes a list's fence, the back performs its actions in order:
-writes the release (4 or 16 bytes, with the timestamp for 16-byte releases, row 52), or applies
-the reduction; latches any registered waiter the new value satisfies; increments `Syncpoints`
-(which pushes `GpuCompletion::SyncpointChanged` to gsv's completion queue when the counter is
-watched); reports markers. Then it wakes the front if anything was latched or reported.
+writes the release (4 or 16 bytes, with the timestamp for 16-byte releases, row 52; the
+timestamp is guest time from the kernel's clock, which `core` passes through the `Gpu`'s config,
+so a replay writes the same value; decided by the owner, 2026-11-19), or applies the reduction;
+latches any registered waiter the new value satisfies; increments `Syncpoints` (which pushes
+`GpuCompletion::SyncpointChanged` to gsv's completion queue when the counter is watched);
+reports markers. Then it wakes the front if anything was latched or reported.
 Completions are batched: one wake for all actions of all lists completed at that point (row 124;
 the owner's decision: "several are batched into one completion check"). Performing these at
 record time instead is kept only as a debugging switch.
@@ -633,6 +689,9 @@ pub trait GpuMemory: Send + Sync {
     fn generation(&self) -> u64;
 }
 ```
+
+The production implementation takes `generation` from the address table's
+`Translate::generation` (decided by the owner, 2026-11-19).
 
 Each GPU thread keeps its own translation cache, invalidated by the version. A cache shared
 between threads crashed in Eden-NX2 when a service thread remapped memory (row 125). A version
@@ -718,8 +777,17 @@ get a stand-in identity fixed by the GPU address, so an image is found again (ro
 thresholds come from the render backend's memory budget (rows 119, 139). The buffer cache starts
 routine eviction at half the budget (at most Eden-NX2's 1 GiB) and turns aggressive at the whole
 budget (at most 2 GiB); the halves are a **guess** to confirm by trace (decided by the owner,
-2026-11-18). The pipeline-key cache also keeps the list of keys seen, so the next boot can
-precompile them (render-backend, "Compiling without stalling a frame").
+2026-11-18). Images the GPU has written are not evicted: with no write-back on eviction yet,
+dropping one would lose its contents, so they stay until the budget refuses new images.
+Write-back eviction is revisited in milestone 4 (decided by the owner, 2026-11-19).
+
+The pipeline-key cache holds at most `MAX_PIPELINES` (65,536) pipelines, a **guess** stricter
+than both references, which have no cap. It also keeps the list of keys seen, so the next boot
+can precompile them (render-backend, "Compiling without stalling a frame"). A key joins the list
+when the backend accepts the pipeline, not when its build succeeds, since builds finish
+asynchronously. The list names each stage by a `ShaderStamp`: a digest of the shader cache's
+entry key, defined with shader-pipeline slice 21. Its 128-bit width is a **guess** (decided by
+the owner, 2026-11-19).
 
 ## Block-linear layout: `starquake-layout`
 
@@ -773,8 +841,9 @@ Every value in a command is already decoded from guest registers and validated. 
 appears only as a typed id from the render backend; no guest address and no wgpu type crosses.
 Shaders cross as the shader crate's naga module, which the back puts in a `ShaderDesc` as
 `ShaderSource::Naga`, converting the shader's resource, input and output tables into the render
-crate's `ShaderInterface`. The recording backend turns a list into text, which is what the
-offline tests snapshot.
+crate's `ShaderInterface`, with the shader's requirements and each binding's array count, so the
+backend reads neither from the naga module (decided by the owner, 2026-11-19). The recording
+backend turns a list into text, which is what the offline tests snapshot.
 
 ## Capture and replay
 
@@ -807,6 +876,13 @@ Recording reads in the order each thread made them, rather than a memory snapsho
 start, is what makes gated command buffers replay correctly: the CPU writes them after
 submission, between the GPU's reads (decision 8).
 
+As built in G20 (decided by the owner, 2026-11-19): the header also carries the render
+backend's `Caps`, its budget, the wait-while-compiling setting, the fence mode and the address
+spaces, and the starting-state records also carry the address tables and the syncpoints. Since
+no front or back snapshot exists yet, a capture starts from a fresh GPU rather than mid-run.
+Until shader-pipeline slice 20 defines the shader capture record, a shader lookup record keeps
+only the requests and the kind of each answer.
+
 ### Replay
 
 `starquake gpu-replay <capture> --until present=N --dump ring|render|writes` builds a `Gpu` with
@@ -817,7 +893,8 @@ crate's: the render backend's host-level capture replays with `starquake render-
 shader capture with `cargo xtask shader-replay` (review guide, M15). A read that is not the
 next one in the log, or a ring entry whose hash differs, stops the replay with the position: a
 divergence is a finding, as in the kernel replay. Single-threaded replay is deterministic on any
-host.
+host. `--until present=N` past the capture's last present replays to the end, says so, and exits
+0 (decided by the owner, 2026-11-19).
 
 ### Fixtures and CI
 
@@ -903,6 +980,25 @@ pub trait Completions: Send + Sync { fn push(&self, completion: GpuCompletion); 
 `Syncpoints`, gsv's `Completions` and the render backend, and hands it to gsv as an
 `Arc<dyn GpuFront>`.
 
+**Presents and address spaces** (as built in G19 and G21; decided by the owner, 2026-11-19,
+provisional). A `PresentRequest` names no address space. The back reads presents through the
+space `set_present_space` names, which the `Gpu` sets to the first address space made: a
+**guess** that a title has one GPU address space. `GpuFront` has no `destroy_address_space`, so
+a space is never forgotten, and which space presents read after that space is destroyed is
+undefined. The request's format word maps 1 to A8B8G8R8 and 4 to A2B10G10R10 (unorm), and its
+pitch is ignored (the image is block-linear): both **guesses**, which a trace of more present
+formats would confirm.
+
+**Idleness** (`Gpu::is_idle`, as built in G21; decided by the owner, 2026-11-19). `core`'s stall
+check (a run whose guest threads all wait ends as an emulator error, `observability.md`) asks
+the GPU whether anything it holds can still change what a guest waits for. When a channel waits
+on an acquire that only the acquire poll can find met, `is_idle` waits up to `IDLE_POLL_WAIT`
+(100 times the poll's longest sleep, 10 ms) for a poll that started after it looked, holding
+core's idle lock, and answers busy if the host has not run the front thread by then. When the
+GPU answers busy, the parked core asks again when the GPU next reports quiet, up to a named
+retry count, so a question that lands in a busy moment is asked again and a stalled run is
+reported as a stall rather than reaching its timeout.
+
 What this spec assumes of gsv:
 
 - gsv creates address spaces and writes new mappings into their `GpuVm` itself (registered
@@ -935,8 +1031,14 @@ protocol and engine state (#12) gets"; review guide, M9). This draft's earlier s
 - `ShaderCache::lookup(req: &[ProgramRequest], variant: &VariantKey, mem: &dyn ProgramMemory,
   state: &dyn EngineState) -> Lookup` never blocks and never translates. `Lookup::Ready` carries
   an `Arc<ShaderSet>` of `HostShader`s; `Lookup::Pending(Ticket)` means translation is running on
-  the shared compile pool; `Lookup::Rejected` carries a reason and is cached negatively until the
-  program's memory is written (rows 90, 112).
+  the shared compile pool; `Lookup::Rejected` carries a reason naming the program that failed and
+  is cached negatively until the program's memory is written (rows 90, 112).
+- The draw path also needs, for each shader of a ready set, its resource table and its
+  `ShaderStamp`, and a way to wait for a pending ticket. G18 built this as the `ShaderLookup`
+  seam: `lookup` answers a `SetLookup` whose ready arm carries the set with each shader's stamp
+  and resources, and `wait(ticket)` blocks the back thread until that translation finishes and
+  gives its result. Shader-pipeline slice 19 adapts the cache to this seam (decided by the
+  owner, 2026-11-19).
 - The back implements `ProgramMemory` (over `GpuVm`) and `EngineState` (constant-buffer words and
   texture kinds from its mirrors). The answers it gives become part of the shader entry's key.
 - The back builds the `VariantKey`, copying in the render backend's `EmulationFlags` and, when
@@ -963,7 +1065,8 @@ back thread:
 - resource creation and destruction by description (buffers, images with format, extent, levels,
   layers, views, samplers, shaders from `ShaderDesc`, pipelines), returning typed ids;
 - `submit(CommandList)`, which hands a list to the render thread and returns its `FenceValue`,
-  and `completed()`; the wake on completion is open (see "Releases and completion");
+  and `completed()`; the back thread wakes on completion through the backend's completion wake
+  (decision of 2026-11-18; "Releases and completion", render-backend "The completion wake");
 - `budget()`, which the caches read for eviction;
 - `Caps`, including `view_swizzle`, and `emulation()`;
 - a present as `Command::Present(PresentDesc)` with a host view, the source rectangle, the
@@ -1025,7 +1128,9 @@ same time.
 | G16 | Buffer cache: guest range to host buffer, write-watch integration (dirty drain also calls the shader cache's `invalidate`), streamed ranges, eviction by budget | G7, #14's resource types | `eden/src/video_core/buffer_cache` (reference only); rows 120, 131, 139 | Fake memory, fake watch, recording backend: CPU write re-uploads once; an ordered unmap drops the range | C |
 | G17 | Texture cache: texture header decode, image identity by address and layout, uploads through G5, render targets, write-back on demand, swizzle in the view or in the variant key by `Caps::view_swizzle` | G5, G7, G10, #14's resource types | `eden/src/video_core/texture_cache` (reference only); rows 69, 87, 103 | Recording backend: same header twice is one image; CPU write invalidates; write-back matches G5 untile; a swizzled texture under a no-swizzle `Caps` gets an identity view | C |
 | G18 | `gpu::back::draw`: derive `DrawDesc` from 3D state; shader lookups (`ProgramMemory`, `EngineState`, `VariantKey` with `EmulationFlags` and swizzles copied in, driver constants, the wait-while-compiling setting); bindings; conditional render | G10, G16, G17, G23, #13's `lookup` types | `eden-nx2/src/video_core/engines/{maxwell_3d,draw_manager}.cpp` (reference) | Register scripts to golden draw descriptions (`insta`), with a fake shader cache returning fixed sets, pending tickets and rejections; every `EmulationFlags` field reaches the key | D |
+| G24 | `gpu::back` clears: `CLEAR_SURFACE` to `Command::Clear` of the bound targets (a render-pass clear), or a draw for a masked or scissored clear (decided by the owner, 2026-11-19) | G10, G17, G18, #14's `Clear` | `eden-nx2/src/video_core/engines/draw_manager.cpp` (`DrawManager::Clear`) | Register scripts to golden command lists (`insta`): a whole-target clear of colour, depth and stencil each, and a masked and a scissored clear that become draws | E |
 | G19 | `gpu::back` executor: ring entries to engines, compute dispatch emission, present as `Command::Present` (no fence wait); the issuing channel on `Release` entries and on copy and QMD releases, with G4's ring (decided 2026-11-18) | G10, G11, G12, G15, G18 | none (new) | Ring text in, command list text out (`insta`) | E |
+| G25 | `LOAD_CONSTANT_BUFFER` data written to guest memory at the constant buffer's address plus the upload offset, with the range invalidated in the caches (decided by the owner, 2026-11-19) | G16, G19 | `eden-nx2/src/video_core/engines/maxwell_3d.cpp` (`ProcessCBMultiData`) | Fake memory: a run of words lands at the upload offset and advances it; a run split across ring entries lands in order; a cached buffer over the range is uploaded again | F |
 | G20 | Capture writer and reader (`SQGC`, including shader lookups with their answers in shader-pipeline slice 20's format), replay memory, `starquake gpu-replay` command, capture builder in `test-support` | G14, G19, shader-pipeline slice 20 | none (new) | Golden bytes for every record kind; a built capture replays to its expected outputs; a tampered read is reported as a divergence | F |
 | G21 | Wiring: `Gpu` implementing `GpuFront`, threads, `Completions` pushes, counters, flight recorder, `gpu.txt` | G14, G19, #11's session types | none (new) | A homebrew-style synthetic stream submitted through a fake gsv produces the expected command lists and completions | F |
 | G22 | Production memory: `GpuMemory` over `GpuVm` and `GuestMemory`, shim reads through `Syncpoints`; the GPU-only store (lazy host pages for sparse regions, host-only render targets in the texture cache, zero reads, free on an applied destroy; review guide, M6) | G7, G17; graphics-server slices 2 and 6 (`Syncpoints` and `GpuVm`, built in this crate) | Rows 30, 57, 80, 85 | Each `Target` kind resolves; first write allocates, unwritten pages read zero, a destroy frees only when applied; nothing charged to guest pools | D |
@@ -1258,6 +1363,8 @@ are in `docs/decision-log.md` (2026-11-12).
   **sparse and huge virtual textures** (row 87): later texture cache and backend work.
 - **GPU state in snapshots** (`observability.md`): register files, macro state, the QMD table
   and mirrors are plain data and serialisable from the start; caches are rebuilt from memory on
-  resume, as the capture start already does.
+  resume, as the capture start already does. Until the front has a snapshot, a restored run uses
+  the null front (it runs no command and completes ordered updates and barriers at once), not a
+  real `Gpu` (decided by the owner, 2026-11-19).
 - **Video decoding** (`host1x`, rows 105, 148) is gsv's and the host's; it does not go through
   this command stream.
