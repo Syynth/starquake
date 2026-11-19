@@ -20,12 +20,13 @@
 //! # Who calls what
 //!
 //! gsv allocates and frees ids, raises maxima to compute fences ([`Syncpoints::increment_max`]),
-//! and marks the ids someone waits on ([`Syncpoints::watch`]). The GPU's back thread (after host
-//! completion) and gsv's video worker call [`Syncpoints::increment`], which pushes
-//! [`GpuCompletion::SyncpointChanged`] to gsv's [`Completions`] only for a watched id;
-//! [`Syncpoints::increment_by`] does several at once with one push (the null GPU front of a run
-//! with no GPU back end, `starquake-core`'s graphics wiring, and its replay). Anyone
-//! reads ([`Syncpoints::read`], [`Syncpoints::reached`]).
+//! and marks the ids someone waits on ([`Syncpoints::watch`]). Incrementers call
+//! [`Syncpoints::increment`], which pushes [`GpuCompletion::SyncpointChanged`] to gsv's
+//! [`Completions`] only for a watched id, or [`Syncpoints::increment_by`], which does several at
+//! once with one push: the GPU's back thread (after host completion) adds a `Syncpoint` ring
+//! entry's whole count with it (`crate::back::fence`, "Waiters and a run of increments"), as do
+//! the null GPU front of a run with no GPU back end (`starquake-core`'s graphics wiring), its
+//! replay, and gsv's video worker. Anyone reads ([`Syncpoints::read`], [`Syncpoints::reached`]).
 //!
 //! Watching and incrementing race. Both sides use sequentially consistent operations in the
 //! same pattern (gsv: set the watched bit, then read the counter; the incrementer: add to the
