@@ -9,6 +9,8 @@ use super::memory::Place;
 use super::value::{Lane, low16, low32};
 use super::{ImageCall, Input, InterpError, Run, Space, Val, type_error};
 
+mod warp;
+
 /// The most arguments any opcode takes.
 const MAX_ARGS: usize = {
     let mut most = 0;
@@ -817,10 +819,16 @@ impl Run<'_> {
         if let Some((width, is_float)) = cbuf_read(opcode) {
             return self.cbuf(&args, width, is_float).map(Some);
         }
+        if let Handled::Done(effect) = self.warp(&args, op)? {
+            return Ok(effect);
+        }
         if let Handled::Done(effect) = self.context(&args, opcode)? {
             return Ok(effect);
         }
         if let Handled::Done(effect) = self.io(&args, opcode)? {
+            return Ok(effect);
+        }
+        if let Handled::Done(effect) = self.masks_and_offsets(&args, opcode)? {
             return Ok(effect);
         }
         let value = match float_op(&args, op)? {
@@ -1056,6 +1064,36 @@ impl Run<'_> {
                     None => return Err(local_out_of_bounds(at, word, len)),
                 }
                 return Ok(Handled::Done(None));
+            }
+            _ => return Ok(Handled::Not),
+        };
+        Ok(Handled::Done(Some(value)))
+    }
+
+    /// The lane masks and the interpolation at an offset (see the module docs): whether the
+    /// opcode is one of them and, if so, its value.
+    fn masks_and_offsets(&mut self, args: &Args, opcode: Opcode) -> Result<Handled, InterpError> {
+        use Opcode as O;
+        let machine = &*self.machine;
+        let (equal, below) = lane_masks(machine.system.lane_id);
+        let value = match opcode {
+            O::SubgroupEqMask => Val::U32(equal),
+            O::SubgroupLtMask => Val::U32(below),
+            O::SubgroupLeMask => Val::U32(below | equal),
+            O::SubgroupGtMask => Val::U32(!(below | equal)),
+            O::SubgroupGeMask => Val::U32(!below),
+            O::InterpolateAtOffset => {
+                let attribute = args.attribute(0)?;
+                let offset = args.u32(1)?;
+                let bits = machine
+                    .interpolated
+                    .get(&(attribute, offset))
+                    .copied()
+                    .ok_or(InterpError::MissingInput {
+                        at: args.at,
+                        input: Input::Interpolated { attribute, offset },
+                    })?;
+                Val::F32(bits)
             }
             _ => return Ok(Handled::Not),
         };
@@ -1557,6 +1595,14 @@ fn indexed_attribute(at: Value, offset: u32) -> Result<crate::ir::Attribute, Int
     u16::try_from(offset >> 2)
         .map(crate::ir::Attribute)
         .map_err(|_| InterpError::AttributeOffset { at, offset })
+}
+
+/// The masks of a warp of 32 lanes with the lanes equal to `lane` and below it: bit `n` for
+/// lane `n` (see the module docs). A lane of 32 or more equals no lane and is above them all.
+fn lane_masks(lane: u32) -> (u32, u32) {
+    let equal = 1_u32.checked_shl(lane).unwrap_or(0);
+    // For a lane below 32, the bits under its own; past the word, every bit (0 - 1 wraps).
+    (equal, equal.wrapping_sub(1))
 }
 
 /// A binary32 function of argument 0 (see [`float::unary_f32`]).

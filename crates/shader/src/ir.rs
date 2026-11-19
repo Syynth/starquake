@@ -15,7 +15,8 @@
 //! - **Operations** ([`Opcode`]) are Eden's table (`opcodes.inc`), with the differences listed
 //!   in the `opcode` module: `Phi` is its own kind of instruction ([`Inst::Phi`]), three
 //!   rescaling-only opcodes are left out, and the uniform register class is added
-//!   ([`Opcode::GetUniformRegister`] and its siblings, [`UniformReg`], [`UniformPred`]).
+//!   ([`Opcode::GetUniformRegister`] and its siblings, [`UniformReg`], [`UniformPred`]), as is
+//!   interpolation at an offset ([`Opcode::InterpolateAtOffset`]).
 //! - **Operands** ([`Operand`]) are values or immediates ([`Imm`]), as Eden's `IR::Value` is an
 //!   instruction or an immediate. Types ([`Type`]) are Eden's, plus the uniform name types.
 //! - **Modifiers** ([`Flags`]) are typed: floating-point controls or texture information, as the
@@ -102,13 +103,23 @@ pub use modifiers::{
     TextureInfo, TextureType,
 };
 pub use opcode::{FlagsKind, Opcode};
-pub use operand::{ATTRIBUTE_WORD_BYTES, Attribute, Imm, Operand, Patch, UniformPred, UniformReg};
+pub use operand::{
+    ATTRIBUTE_COMPONENTS, ATTRIBUTE_WORD_BYTES, Attribute, GENERIC_0_X, Imm, Operand, POSITION_W,
+    POSITION_X, Patch, UniformPred, UniformReg,
+};
 pub use parse::{ParseError, ParseErrorKind};
 pub use types::Type;
 pub use verify::{Site, VerifyError};
 
 /// How deeply structured nodes may nest (see the module docs).
 pub const MAX_NESTING: usize = 256;
+
+/// The lanes of a guest warp, which the warp operations (`VoteAll` to `QuadSwap`) work over:
+/// Eden's emitter keeps a lane index in range with `& 31` (`GuestLane`,
+/// `eden/src/shader_recompiler/backend/spirv/emit_spirv_warp.cpp` @ cf654052), and PR #4588's
+/// `REDUX` walks lanes `0..32`
+/// (`eden-pr4588/src/shader_recompiler/frontend/ampere/ops_memory.cpp` @ e5fb3b97).
+pub const WARP_SIZE: u32 = 32;
 
 /// The id of an instruction and of the value it produces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
