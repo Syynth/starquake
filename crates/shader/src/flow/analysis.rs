@@ -56,6 +56,7 @@ pub struct Analysis {
     indirect_tables: BTreeMap<u32, Vec<u32>>,
     link_register: Vec<u8>,
     visits: u64,
+    peak_pending: usize,
 }
 
 impl Analysis {
@@ -116,10 +117,17 @@ impl Analysis {
         self.visits
     }
 
-    /// The analysis with its work counter cleared, to compare two models' results.
+    /// The most paths that waited to be walked at one time: the measure of the walk's
+    /// memory, which the linear-time tests bound by the program's size.
+    pub fn peak_pending(&self) -> usize {
+        self.peak_pending
+    }
+
+    /// The analysis with its work counters cleared, to compare two models' results.
     #[must_use]
     pub fn without_visits(mut self) -> Self {
         self.visits = 0;
+        self.peak_pending = 0;
         self
     }
 }
@@ -413,7 +421,13 @@ struct Walk<'a> {
     function_by_entry: BTreeMap<u32, u32>,
     /// Per function: each `RET`'s index and the register it returns through.
     returns: Vec<Vec<(u32, u8)>>,
-    work: Vec<Visit>,
+    /// The instructions with a path waiting to be walked from them, last first.
+    work: Vec<u32>,
+    /// Per instruction, the path waiting there: the paths that arrived since it was last
+    /// walked, merged (see `push`).
+    pending: Vec<Option<(Barriers, u32)>>,
+    /// How many entries of `pending` are set.
+    waiting: usize,
 }
 
 /// Walks `code` from instruction 0 under `model` (`AnalyzeFlowImpl`). `tables` gives the
@@ -442,19 +456,28 @@ pub fn analyze(
             indirect_tables: BTreeMap::new(),
             link_register: vec![Gpr::RZ.index()],
             visits: 0,
+            peak_pending: 0,
         },
         seen: vec![None; code.len()],
         function_by_entry: BTreeMap::new(),
         returns: vec![Vec::new()],
-        work: vec![Visit {
-            index: 0,
-            barriers: Barriers::new(),
-            function: 0,
-        }],
+        work: Vec::new(),
+        pending: vec![None; code.len()],
+        waiting: 0,
     };
     walk.set_leader(0);
-    while let Some(visit) = walk.work.pop() {
-        walk.path(visit)?;
+    walk.push(0, Barriers::new(), 0)?;
+    while let Some(index) = walk.work.pop() {
+        let Some((barriers, function)) = at_mut(&mut walk.pending, index).and_then(Option::take)
+        else {
+            continue;
+        };
+        walk.waiting = walk.waiting.saturating_sub(1);
+        walk.path(Visit {
+            index,
+            barriers,
+            function,
+        })?;
     }
     walk.check_syncs()?;
     walk.check_functions()?;
@@ -561,12 +584,39 @@ impl Walk<'_> {
         Ok(true)
     }
 
-    fn push(&mut self, index: u32, barriers: Barriers, function: u32) {
-        self.work.push(Visit {
-            index,
-            barriers,
-            function,
-        });
+    /// Queues a path from `index`. A path already waiting there is merged with it, as the
+    /// join would merge them (the register model's union; the stack model's shorter stack, or
+    /// [`FlowError::StacksDiffer`]; [`FlowError::SharedCode`] for two functions), so at most
+    /// one path waits per instruction and the walk's memory is linear in the program.
+    fn push(&mut self, index: u32, barriers: Barriers, function: u32) -> Result<(), FlowError> {
+        let model = self.model;
+        let Some(slot) = at_mut(&mut self.pending, index) else {
+            return Err(FlowError::TargetOutside {
+                index,
+                target: i64::from(index),
+            });
+        };
+        if let Some((queued, owner)) = slot.as_mut() {
+            if *owner != function {
+                return Err(FlowError::SharedCode { index });
+            }
+            match model {
+                BarrierModel::Registers => *queued = merge(queued, &barriers),
+                BarrierModel::Stack => {
+                    if is_prefix(&barriers, queued) {
+                        *queued = barriers;
+                    } else if !is_prefix(queued, &barriers) {
+                        return Err(FlowError::StacksDiffer { index });
+                    }
+                }
+            }
+            return Ok(());
+        }
+        *slot = Some((barriers, function));
+        self.work.push(index);
+        self.waiting = self.waiting.saturating_add(1);
+        self.result.peak_pending = self.result.peak_pending.max(self.waiting);
+        Ok(())
     }
 
     /// Applies instruction `index`; returns the next instruction on the path, or `None` where
@@ -660,7 +710,7 @@ impl Walk<'_> {
             return Err(FlowError::UniformBranch { index });
         }
         self.mark_leader(target, index)?;
-        self.push(target, barriers.clone(), function);
+        self.push(target, barriers.clone(), function)?;
         if guard.is_true() && second.is_true() {
             return Ok(None);
         }
@@ -703,7 +753,7 @@ impl Walk<'_> {
             self.returns.push(Vec::new());
             self.function_by_entry.insert(target, callee);
             self.mark_leader(target, index)?;
-            self.push(target, barriers.clone(), callee);
+            self.push(target, barriers.clone(), callee)?;
             callee
         };
         if callee == function {
@@ -769,7 +819,7 @@ impl Walk<'_> {
         }
         for &target in &targets {
             self.mark_leader(target, index)?;
-            self.push(target, barriers.clone(), function);
+            self.push(target, barriers.clone(), function)?;
         }
         self.result.indirect_tables.insert(index, targets);
         Ok(None)
@@ -856,7 +906,7 @@ impl Walk<'_> {
             }
             *slot = Some(target);
         }
-        self.push(target, std::mem::take(barriers), function);
+        self.push(target, std::mem::take(barriers), function)?;
         Ok(None)
     }
 

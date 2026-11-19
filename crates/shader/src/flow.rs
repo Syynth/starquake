@@ -68,6 +68,15 @@
 //! | The `MOV`s `CALL` and `RET` linkage reads | Must decode as a `MOV` | Read from their bits alone | `tests::analysis::link_mov_must_decode` |
 //! | Refused targets | [`FlowError::MisalignedTarget`] or [`FlowError::TargetOutside`] | One message for both | `tests::analysis::target_errors_name_their_reason` |
 //! | A `BRX` the decoder refuses | Not tracked by [`find_jump_tables`] (flow analysis refuses it anyway) | Tracked by its bits | `tests::jump_tables::undecodable_brx_is_not_tracked` |
+//! | Paths waiting to be walked from one instruction | Merged into one as they are queued, as the join would merge them | Each queued with its own barrier state | `tests::linear::paths_waiting_at_one_instruction_are_merged` |
+//!
+//! Merging waiting paths gives the same result for every program both accept: the join at the
+//! instruction would merge them the same way, and the walk's result is the fixed point of
+//! those merges. For a program with several faults, which one is reported first can differ,
+//! since the reference's first fault depends on the order its stack of paths is walked in. A
+//! merge of two waiting paths reports what the join would: [`FlowError::SharedCode`] for two
+//! functions, and, in the stack model, [`FlowError::StacksDiffer`] for stacks neither of which
+//! is a prefix of the other.
 //!
 //! `JMX` and `BPT` have no encoding in any reference (slice 6h keeps them as shells), so they
 //! are not recognised: their words are straight-line instructions to the walk. When `JMX` gets
@@ -83,8 +92,10 @@
 //! `TrackCaptureIndirectBranches` (one forward pass that remembers the last match of each
 //! pattern per register), the branch-target test of `ReturnRegisterCopiesLink` (one table of
 //! targets) and the link-register check (one pass, the first overwrite of each function).
-//! Inlining is linear in the inlined graph, which [`MAX_FLOW_BLOCKS`] bounds. Pinned by
-//! `tests::linear::*`.
+//! Inlining is linear in the inlined graph, which [`MAX_FLOW_BLOCKS`] bounds. Memory is linear
+//! too: at most one path waits per instruction, with at most 16 barriers (the reference keeps
+//! every path queued, which a chain of `BRX`s naming the same targets grows by up to 16 per `BRX`).
+//! Pinned by `tests::linear::*`.
 
 mod analysis;
 mod blocks;
@@ -199,7 +210,9 @@ pub enum FlowError {
     },
     /// A relative branch lands on a byte that does not start an instruction ("native branch
     /// destination alignment").
-    #[error("instruction {index} branches to code byte {byte}, which does not start an instruction")]
+    #[error(
+        "instruction {index} branches to code byte {byte}, which does not start an instruction"
+    )]
     MisalignedTarget {
         /// The branch.
         index: u32,
@@ -426,8 +439,9 @@ pub struct IndirectTarget {
 pub enum BlockEnd {
     /// Continue at a block.
     Jump(BlockIndex),
-    /// Continue at `then` where `cond` holds, else at `otherwise`. `cond` is never plain `PT`
-    /// or `!PT` for a test the reference makes on a guard; a branch's second predicate may be.
+    /// Continue at `then` where `cond` holds, else at `otherwise`. `cond` is never `PT` (that
+    /// is a [`BlockEnd::Jump`]), and is `!PT` only when it is the own predicate of a `BRA` or an
+    /// `EXIT` (an instruction whose guard is `!PT` never runs and is skipped).
     Branch {
         /// The predicate tested.
         cond: PredSrc,

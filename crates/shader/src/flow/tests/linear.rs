@@ -128,3 +128,36 @@ fn many_returns_through_copies_are_checked_once() {
         analyze(&code, &BranchTables::new(0), BarrierModel::Registers).expect("accepted");
     assert_eq!(analysis.function_entries().len(), functions + 1);
 }
+
+#[test]
+fn paths_waiting_at_one_instruction_are_merged() {
+    // 0: BRA 16, over 1..15: EXIT; then a chain of BRX, each naming the fifteen exits and the
+    // next BRX, which the walk takes first (targets go on the work list in ascending order).
+    // Paths waiting at the exits are merged, so no more wait than there are instructions.
+    let chain = 4_000_u32;
+    let first = 16;
+    let mut program = Program::new();
+    program.bra(crate::decode::PredSrc::TRUE, "chain");
+    for _ in 1..first {
+        program.op(exit());
+    }
+    program.label("chain");
+    let mut tables = BranchTables::new(0);
+    for n in 0..chain {
+        let mut targets: Vec<u32> = (1..first).collect();
+        targets.push(first + n + 1);
+        tables.insert(first + n, targets);
+        program.item(Item::Brx(BrxSrc::Reg(r(2))));
+    }
+    program.op(exit());
+    let code = program.build();
+    let count = code.len();
+    for model in [BarrierModel::Registers, BarrierModel::Stack] {
+        let analysis = analyze(&code, &tables, model).expect("accepted");
+        assert!(
+            analysis.peak_pending() <= count,
+            "{}",
+            analysis.peak_pending()
+        );
+    }
+}
