@@ -1336,7 +1336,7 @@ fn read_image_dim(reader: &mut Reader) -> Result<ImageDim, DecodeError> {
 }
 
 fn read_order(reader: &mut Reader) -> Result<MemOrder, DecodeError> {
-    read_value(reader, MEM_ORDER, &MemOrder::ALL, MemOrder::bits)
+    read_value(reader, MEM_ORDER, MemOrder::ALL, MemOrder::bits)
 }
 
 /// Reads the access the opcode picks: a memory type for the binary forms, a channel mask for

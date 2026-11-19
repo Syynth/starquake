@@ -22,9 +22,9 @@ use crate::decode::memory::{
     STG_UNIFORM_OPCODE, STL_OPCODE, STL_UNIFORM_OPCODE, STS_OPCODE, STS_UNIFORM_OPCODE,
 };
 use crate::decode::{
-    AtomCmpSrc, AtomDst, AtomOp, CBUF_INDEX, CBUF_OFFSET, CBuf, DST, LdcMode, MemAddr, MemSpace, Named, OpAtom,
-    OpAtomsPopc, OpCCtl, OpErrBar, OpLd, OpLdGsts, OpLdc, OpLdgDepBar, OpMemBar, OpSt, Pred,
-    PredSrc,
+    AtomCmpSrc, AtomDst, AtomOp, CBUF_INDEX, CBUF_OFFSET, CBuf, DST, LdcMode, MemAddr, MemSpace,
+    Named, OpAtom, OpAtomsPopc, OpCCtl, OpErrBar, OpLd, OpLdGsts, OpLdc, OpLdgDepBar, OpMemBar,
+    OpSt, Pred, PredSrc,
 };
 
 /// Refuses `what` unless `absent`: the chosen form has no bits for it.

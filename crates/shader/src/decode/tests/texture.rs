@@ -1000,10 +1000,7 @@ fn every_dimension_decodes() {
     for (bits, dim, name) in image_dims {
         let word = word(0x99a, &[(61, bits), (81, 7), (84, 1)]);
         assert_eq!(image_dim(word), Some(dim));
-        assert_eq!(
-            text(word),
-            format!("suld.d.{name}.u8 pt, r0, [r0], r0;")
-        );
+        assert_eq!(text(word), format!("suld.d.{name}.u8 pt, r0, [r0], r0;"));
     }
 }
 
