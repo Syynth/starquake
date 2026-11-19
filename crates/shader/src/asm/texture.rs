@@ -69,10 +69,10 @@ fn tex_ref(
 /// The fields `TEX`, `TLD`, `TLD4`, `TMML` and `TXD` share: both destinations (`set_dst`, and
 /// `set_reg(64..72, ..)`), both sources, the dimension and the mask.
 fn tex_common(writer: &mut Writer, dsts: [Gpr; 2], srcs: [Gpr; 2], dim: TexDim, mask: ChannelMask) {
-    let [dst, dst2] = dsts;
+    let [first, second] = dsts;
     let [a, b] = srcs;
-    writer.gpr(DST, dst);
-    writer.gpr(TEX_DST2, dst2);
+    writer.gpr(DST, first);
+    writer.gpr(TEX_DST2, second);
     writer.gpr(REG_A, a);
     writer.gpr(REG_B, b);
     writer.set(TEX_DIM, dim.bits());

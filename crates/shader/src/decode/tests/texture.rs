@@ -24,18 +24,20 @@ fn unknown(opcode: u16, bit: u32, width: u32, value: u64) -> DecodeError {
     }
 }
 
-/// NAK's `test_texture`, ported as a fixture table (`nvdisasm_tests.rs` @ 52238762): the
-/// bindless forms with `r0` and `r2` as destinations, `r1` and `r3` as sources, `p0` as the
-/// fault predicate, `2d`, the mask `0x7`, `.ef` and `.nodep`; `TEX` with every level-of-detail
-/// mode and `TLD` with the explicit ones, scalar and not; `TLD4` gathering green with every
-/// offset mode; `TMML`, `TXD`, and `TXQ` with every query. SM 8.6 has every case (the test
-/// skips only below SM 7.0, and `BiasClamp` only from SM 10.0).
-#[test]
-fn texture_text_matches_nak_nvdisasm_cases() {
-    let dsts = [r(0), r(2)];
-    let srcs = [r(1), r(3)];
-    let fault = p(0);
-    let mask = ChannelMask::new(0x7).expect("four bits");
+/// The operands NAK's `test_texture` gives every case: destinations `r0` and `r2`, sources `r1`
+/// and `r3`, the fault predicate `p0` and the mask `0x7`.
+fn nak_operands() -> ([Gpr; 2], [Gpr; 2], Pred, ChannelMask) {
+    (
+        [r(0), r(2)],
+        [r(1), r(3)],
+        p(0),
+        ChannelMask::new(0x7).expect("four bits"),
+    )
+}
+
+/// `test_texture`'s `TEX`, `TLD` and `TLD4` cases with `.scr` on or off (`scr`).
+fn nak_sample_cases(scalar: bool, scr: &str) -> Vec<(Op, String)> {
+    let (dsts, srcs, fault, mask) = nak_operands();
     let lod_modes = [
         (TexLodMode::Auto, ""),
         (TexLodMode::Zero, ".lz"),
@@ -50,18 +52,37 @@ fn texture_text_matches_nak_nvdisasm_cases() {
         (TexOffsetMode::PerPx, ".ptp"),
     ];
     let mut cases: Vec<(Op, String)> = Vec::new();
-    for (scalar, scr) in [(false, ""), (true, ".scr")] {
-        for (lod_mode, lod) in lod_modes {
+    for (lod_mode, lod) in lod_modes {
+        cases.push((
+            Op::Tex(OpTex {
+                dsts,
+                fault,
+                tex: TexRef::Bindless,
+                srcs,
+                dim: TexDim::D2,
+                lod_mode,
+                ndv: false,
+                z_cmpr: false,
+                offset: false,
+                f16: false,
+                eviction: MemEvictionPriority::First,
+                nodep: true,
+                channel_mask: mask,
+                scalar,
+            }),
+            format!("tex{scr}.b{lod}.ef.nodep p0, r2, r0, r1, r3, 2d, 0x7;"),
+        ));
+        if matches!(lod_mode, TexLodMode::Zero | TexLodMode::Lod) {
             cases.push((
-                Op::Tex(OpTex {
+                Op::Tld(OpTld {
                     dsts,
                     fault,
                     tex: TexRef::Bindless,
                     srcs,
                     dim: TexDim::D2,
+                    is_ms: false,
+                    clamp: false,
                     lod_mode,
-                    ndv: false,
-                    z_cmpr: false,
                     offset: false,
                     f16: false,
                     eviction: MemEvictionPriority::First,
@@ -69,50 +90,36 @@ fn texture_text_matches_nak_nvdisasm_cases() {
                     channel_mask: mask,
                     scalar,
                 }),
-                format!("tex{scr}.b{lod}.ef.nodep p0, r2, r0, r1, r3, 2d, 0x7;"),
-            ));
-            if matches!(lod_mode, TexLodMode::Zero | TexLodMode::Lod) {
-                cases.push((
-                    Op::Tld(OpTld {
-                        dsts,
-                        fault,
-                        tex: TexRef::Bindless,
-                        srcs,
-                        dim: TexDim::D2,
-                        is_ms: false,
-                        clamp: false,
-                        lod_mode,
-                        offset: false,
-                        f16: false,
-                        eviction: MemEvictionPriority::First,
-                        nodep: true,
-                        channel_mask: mask,
-                        scalar,
-                    }),
-                    format!("tld{scr}.b{lod}.ef.nodep p0, r2, r0, r1, r3, 2d, 0x7;"),
-                ));
-            }
-        }
-        for (offset_mode, offset) in offset_modes {
-            cases.push((
-                Op::Tld4(OpTld4 {
-                    dsts,
-                    fault,
-                    tex: TexRef::Bindless,
-                    srcs,
-                    dim: TexDim::D2,
-                    comp: TexChannel::G,
-                    offset_mode,
-                    z_cmpr: false,
-                    eviction: MemEvictionPriority::First,
-                    nodep: true,
-                    channel_mask: mask,
-                    scalar,
-                }),
-                format!("tld4{scr}.g.b{offset}.ef.nodep p0, r2, r0, r1, r3, 2d, 0x7;"),
+                format!("tld{scr}.b{lod}.ef.nodep p0, r2, r0, r1, r3, 2d, 0x7;"),
             ));
         }
     }
+    for (offset_mode, offset) in offset_modes {
+        cases.push((
+            Op::Tld4(OpTld4 {
+                dsts,
+                fault,
+                tex: TexRef::Bindless,
+                srcs,
+                dim: TexDim::D2,
+                comp: TexChannel::G,
+                offset_mode,
+                z_cmpr: false,
+                eviction: MemEvictionPriority::First,
+                nodep: true,
+                channel_mask: mask,
+                scalar,
+            }),
+            format!("tld4{scr}.g.b{offset}.ef.nodep p0, r2, r0, r1, r3, 2d, 0x7;"),
+        ));
+    }
+    cases
+}
+
+/// `test_texture`'s `TMML`, `TXD` and `TXQ` cases.
+fn nak_query_cases() -> Vec<(Op, String)> {
+    let (dsts, srcs, fault, mask) = nak_operands();
+    let mut cases: Vec<(Op, String)> = Vec::new();
     cases.push((
         Op::Tmml(OpTmml {
             dsts,
@@ -156,6 +163,23 @@ fn texture_text_matches_nak_nvdisasm_cases() {
             format!("txq.b.nodep r2, r0, r1, tex_header_{name}, 0x7;"),
         ));
     }
+    cases
+}
+
+/// NAK's `test_texture`, ported as a fixture table (`nvdisasm_tests.rs` @ 52238762): the
+/// bindless forms with `r0` and `r2` as destinations, `r1` and `r3` as sources, `p0` as the
+/// fault predicate, `2d`, the mask `0x7`, `.ef` and `.nodep`; `TEX` with every level-of-detail
+/// mode and `TLD` with the explicit ones, scalar and not; `TLD4` gathering green with every
+/// offset mode; `TMML`, `TXD`, and `TXQ` with every query. SM 8.6 has every case (the test
+/// skips only below SM 7.0, and `BiasClamp` only from SM 10.0).
+#[test]
+fn texture_text_matches_nak_nvdisasm_cases() {
+    let cases: Vec<(Op, String)> = [
+        nak_sample_cases(false, ""),
+        nak_sample_cases(true, ".scr"),
+        nak_query_cases(),
+    ]
+    .concat();
     // Per scalar setting: six `TEX`, two `TLD` and three `TLD4`; then `TMML`, `TXD` and three
     // `TXQ`.
     assert_eq!(cases.len(), 2 * (6 + 2 + 3) + 1 + 1 + 3);
@@ -164,385 +188,389 @@ fn texture_text_matches_nak_nvdisasm_cases() {
     }
 }
 
+/// One hand-built word per form of the group, in form order, every field at a distinct value,
+/// and its text.
+const FORM_CASES: [Case; 22] = [
+    // TEX, constant buffer: dst 1, a 2 << 24, b 3 << 32, words 0x10 << 40 (0x40 bytes),
+    // index 5 << 54, .scr 60, dim 1 (2d) << 61, dst2 4 << 64, mask 3 << 72, .aoffi 76,
+    // .ndv 77, .dc 78, .f16 79, fault 5 << 81, evict 2 (.el) << 84, lod 3 (.ll) << 87,
+    // .nodep 90.
+    (
+        0xb60,
+        &[
+            (16, 1),
+            (24, 2),
+            (32, 3),
+            (40, 0x10),
+            (54, 5),
+            (60, 1),
+            (61, 1),
+            (64, 4),
+            (72, 3),
+            (76, 1),
+            (77, 1),
+            (78, 1),
+            (79, 1),
+            (81, 5),
+            (84, 2),
+            (87, 3),
+            (90, 1),
+        ],
+        "tex.scr.ll.aoffi.ndv.dc.f16.el.nodep p5, r4, r1, r2, r3, c[0x5][0x40], 2d, 0x3;",
+    ),
+    // TEX.B: .B 59, dim 7 (array_cube), dst2 RZ, mask 0xf, fault PT, evict 1 (normal).
+    (
+        0x361,
+        &[
+            (16, 6),
+            (24, 7),
+            (32, 8),
+            (59, 1),
+            (61, 7),
+            (64, 0xff),
+            (72, 0xf),
+            (81, 7),
+            (84, 1),
+        ],
+        "tex.b pt, rz, r6, r7, r8, array_cube, 0xf;",
+    ),
+    // TEX.UR: ur9 at 40, bit 91, dim 5 (array_2d), lod 1 (.lz), .f16, evict 0 (.ef).
+    (
+        0xf60,
+        &[
+            (16, 10),
+            (24, 11),
+            (32, 12),
+            (40, 9),
+            (61, 5),
+            (64, 13),
+            (72, 1),
+            (79, 1),
+            (81, 0),
+            (87, 1),
+            (91, 1),
+        ],
+        "tex.lz.f16.ef p0, r13, r10, r11, r12, ur9, array_2d, 0x1;",
+    ),
+    // TLD, constant buffer at both field ends: index 31, words 0x3fff (0xfffc bytes);
+    // dim 2 (3d), .aoffi, .ms 78, .f16, evict 5 (.na), lod 3, .scr, .nodep.
+    (
+        0xb66,
+        &[
+            (16, 1),
+            (24, 2),
+            (32, 3),
+            (40, 0x3fff),
+            (54, 0x1f),
+            (60, 1),
+            (61, 2),
+            (64, 4),
+            (72, 7),
+            (76, 1),
+            (78, 1),
+            (79, 1),
+            (81, 1),
+            (84, 5),
+            (87, 3),
+            (90, 1),
+        ],
+        "tld.scr.ll.aoffi.ms.f16.na.nodep p1, r4, r1, r2, r3, c[0x1f][0xfffc], 3d, 0x7;",
+    ),
+    // TLD.B: dim 0 (1d), lod 1, evict 3 (.lu), b RZ, dst2 RZ.
+    (
+        0x367,
+        &[
+            (16, 5),
+            (24, 6),
+            (32, 0xff),
+            (59, 1),
+            (64, 0xff),
+            (72, 1),
+            (81, 2),
+            (84, 3),
+            (87, 1),
+        ],
+        "tld.b.lz.lu p2, rz, r5, r6, rz, 1d, 0x1;",
+    ),
+    // TLD.UR: ur0, .cl 77, dim 1, lod 3, evict 4 (.eu).
+    (
+        0xf66,
+        &[
+            (16, 8),
+            (24, 9),
+            (32, 10),
+            (40, 0),
+            (61, 1),
+            (64, 11),
+            (72, 0xc),
+            (77, 1),
+            (81, 3),
+            (84, 4),
+            (87, 3),
+            (91, 1),
+        ],
+        "tld.ll.cl.eu p3, r11, r8, r9, r10, ur0, 2d, 0xc;",
+    ),
+    // TLD4, constant buffer: index 2, word 1 (4 bytes), offset mode 2 (.ptp), .dc, comp 3
+    // (.a), dim 5, evict 2, .scr, .nodep.
+    (
+        0xb63,
+        &[
+            (16, 1),
+            (24, 2),
+            (32, 3),
+            (40, 1),
+            (54, 2),
+            (60, 1),
+            (61, 5),
+            (64, 4),
+            (72, 0xf),
+            (76, 2),
+            (78, 1),
+            (81, 4),
+            (84, 2),
+            (87, 3),
+            (90, 1),
+        ],
+        "tld4.scr.a.ptp.dc.el.nodep p4, r4, r1, r2, r3, c[0x2][0x4], array_2d, 0xf;",
+    ),
+    // TLD4.B: comp 1 (.g), offset mode 1 (.aoffi), evict 0.
+    (
+        0x364,
+        &[
+            (16, 20),
+            (24, 21),
+            (32, 22),
+            (59, 1),
+            (61, 1),
+            (64, 23),
+            (72, 3),
+            (76, 1),
+            (81, 0),
+            (87, 1),
+        ],
+        "tld4.g.b.aoffi.ef p0, r23, r20, r21, r22, 2d, 0x3;",
+    ),
+    // TLD4.UR: ur62, comp 0 (.r), dim 3 (cube), evict 1.
+    (
+        0xf63,
+        &[
+            (16, 1),
+            (24, 2),
+            (32, 3),
+            (40, 62),
+            (61, 3),
+            (64, 0xff),
+            (72, 1),
+            (81, 7),
+            (84, 1),
+            (91, 1),
+        ],
+        "tld4.r pt, rz, r1, r2, r3, ur62, cube, 0x1;",
+    ),
+    // TMML, constant buffer: index 3, words 0x20 (0x80), dim 1, .ndv 77, .nodep.
+    (
+        0xb69,
+        &[
+            (16, 1),
+            (24, 2),
+            (32, 3),
+            (40, 0x20),
+            (54, 3),
+            (61, 1),
+            (64, 4),
+            (72, 3),
+            (77, 1),
+            (90, 1),
+        ],
+        "tmml.lod.ndv.nodep r4, r1, r2, r3, c[0x3][0x80], 2d, 0x3;",
+    ),
+    // TMML.B: dim 4 (array_1d).
+    (
+        0x36a,
+        &[
+            (16, 5),
+            (24, 6),
+            (32, 7),
+            (59, 1),
+            (61, 4),
+            (64, 0xff),
+            (72, 1),
+        ],
+        "tmml.b.lod rz, r5, r6, r7, array_1d, 0x1;",
+    ),
+    // TXD, constant buffer: index 4, words 2 (8), dim 5, .aoffi 76, fault 6, evict 2.
+    (
+        0xb6c,
+        &[
+            (16, 1),
+            (24, 2),
+            (32, 3),
+            (40, 2),
+            (54, 4),
+            (61, 5),
+            (64, 4),
+            (72, 0xf),
+            (76, 1),
+            (81, 6),
+            (84, 2),
+            (90, 1),
+        ],
+        "txd.aoffi.el.nodep p6, r4, r1, r2, r3, c[0x4][0x8], array_2d, 0xf;",
+    ),
+    // TXD.B: dim 1, fault PT, evict 1.
+    (
+        0x36d,
+        &[
+            (16, 8),
+            (24, 9),
+            (32, 10),
+            (59, 1),
+            (61, 1),
+            (64, 11),
+            (72, 3),
+            (81, 7),
+            (84, 1),
+        ],
+        "txd.b pt, r11, r8, r9, r10, 2d, 0x3;",
+    ),
+    // TXQ, constant buffer: index 0, words 0x5a (0x168), query 2 at 62, dst2 RZ, mask 7.
+    (
+        0xb6f,
+        &[
+            (16, 1),
+            (24, 2),
+            (40, 0x5a),
+            (62, 2),
+            (64, 0xff),
+            (72, 7),
+            (90, 1),
+        ],
+        "txq.nodep rz, r1, r2, c[0x0][0x168], tex_header_sampler_pos, 0x7;",
+    ),
+    // TXQ.B: query 1.
+    (
+        0x370,
+        &[(16, 3), (24, 4), (59, 1), (62, 1), (64, 5), (72, 1)],
+        "txq.b r5, r3, r4, tex_header_texture_type, 0x1;",
+    ),
+    // SULD.P: dst 1, coord 2, dim 3 (2d) at 61, handle 3 at 64, mask 0xf, order 7
+    // (.strong.gpu) at 77, fault 0, evict 1.
+    (
+        0x998,
+        &[
+            (16, 1),
+            (24, 2),
+            (61, 3),
+            (64, 3),
+            (72, 0xf),
+            (77, 7),
+            (81, 0),
+            (84, 1),
+        ],
+        "suld.p.2d.strong.gpu p0, r1, [r2], r3, 0xf;",
+    ),
+    // SULD.D: dim 5 (3d), type 6 (.b128) at 73, order 10 (.strong.sys), fault PT, evict 0.
+    (
+        0x99a,
+        &[
+            (16, 4),
+            (24, 5),
+            (61, 5),
+            (64, 6),
+            (73, 6),
+            (77, 0xa),
+            (81, 7),
+            (84, 0),
+        ],
+        "suld.d.3d.b128.strong.sys.ef pt, r4, [r5], r6;",
+    ),
+    // SUST.P: coord 1, data 2, dim 1 (1d_buffer), handle 3, mask 1, order 4 (.constant),
+    // evict 2.
+    (
+        0x99c,
+        &[
+            (24, 1),
+            (32, 2),
+            (61, 1),
+            (64, 3),
+            (72, 1),
+            (77, 4),
+            (84, 2),
+        ],
+        "sust.p.1d_buffer.constant.el [r1], r2, r3, 0x1;",
+    ),
+    // SUST.D: dim 2 (array_1d), type 3 (.i16), order 5 (.strong.cta), evict 5.
+    (
+        0x99e,
+        &[
+            (24, 4),
+            (32, 5),
+            (61, 2),
+            (64, 6),
+            (73, 3),
+            (77, 5),
+            (84, 5),
+        ],
+        "sust.d.array_1d.i16.strong.cta.na [r4], r5, r6;",
+    ),
+    // SUATOM: dst 1, coord 2, data 3, dim 4, handle 4, .ba 72, type 5 (.i64), order 0
+    // (.weak), fault 1, evict 1, operation 8 (.exch) at 87.
+    (
+        0x394,
+        &[
+            (16, 1),
+            (24, 2),
+            (32, 3),
+            (61, 4),
+            (64, 4),
+            (72, 1),
+            (73, 5),
+            (81, 1),
+            (84, 1),
+            (87, 8),
+        ],
+        "suatom.p.array_2d.exch.i64.weak.ba p1, r1, [r2], r3, r4;",
+    ),
+    // SUATOM.CAS: type 2 (.u64), order 7, fault PT, evict 0.
+    (
+        0x396,
+        &[
+            (16, 5),
+            (24, 6),
+            (32, 7),
+            (61, 3),
+            (64, 8),
+            (73, 2),
+            (77, 7),
+            (81, 7),
+        ],
+        "suatom.p.2d.cmpexch.packed.u64.strong.gpu.ef pt, r5, [r6], r7, r8;",
+    ),
+    // SURED: dst RZ (as NAK writes), dim 0, type 3 (.f32), order 10, evict 1, operation 7
+    // (.xor).
+    (
+        0x3a0,
+        &[
+            (16, 0xff),
+            (24, 9),
+            (32, 10),
+            (64, 11),
+            (73, 3),
+            (77, 0xa),
+            (81, 7),
+            (84, 1),
+            (87, 7),
+        ],
+        "sured.p.1d.xor.f32.strong.sys pt, rz, [r9], r10, r11;",
+    ),
+];
+
 /// One hand-built word per form of the group, every field at a distinct value, and its text
 /// (unconfirmed: the module docs say which parts `nvdisasm` has confirmed).
 #[test]
 fn hand_built_words_of_each_form_decode() {
-    let cases: [Case; 22] = [
-        // TEX, constant buffer: dst 1, a 2 << 24, b 3 << 32, words 0x10 << 40 (0x40 bytes),
-        // index 5 << 54, .scr 60, dim 1 (2d) << 61, dst2 4 << 64, mask 3 << 72, .aoffi 76,
-        // .ndv 77, .dc 78, .f16 79, fault 5 << 81, evict 2 (.el) << 84, lod 3 (.ll) << 87,
-        // .nodep 90.
-        (
-            0xb60,
-            &[
-                (16, 1),
-                (24, 2),
-                (32, 3),
-                (40, 0x10),
-                (54, 5),
-                (60, 1),
-                (61, 1),
-                (64, 4),
-                (72, 3),
-                (76, 1),
-                (77, 1),
-                (78, 1),
-                (79, 1),
-                (81, 5),
-                (84, 2),
-                (87, 3),
-                (90, 1),
-            ],
-            "tex.scr.ll.aoffi.ndv.dc.f16.el.nodep p5, r4, r1, r2, r3, c[0x5][0x40], 2d, 0x3;",
-        ),
-        // TEX.B: .B 59, dim 7 (array_cube), dst2 RZ, mask 0xf, fault PT, evict 1 (normal).
-        (
-            0x361,
-            &[
-                (16, 6),
-                (24, 7),
-                (32, 8),
-                (59, 1),
-                (61, 7),
-                (64, 0xff),
-                (72, 0xf),
-                (81, 7),
-                (84, 1),
-            ],
-            "tex.b pt, rz, r6, r7, r8, array_cube, 0xf;",
-        ),
-        // TEX.UR: ur9 at 40, bit 91, dim 5 (array_2d), lod 1 (.lz), .f16, evict 0 (.ef).
-        (
-            0xf60,
-            &[
-                (16, 10),
-                (24, 11),
-                (32, 12),
-                (40, 9),
-                (61, 5),
-                (64, 13),
-                (72, 1),
-                (79, 1),
-                (81, 0),
-                (87, 1),
-                (91, 1),
-            ],
-            "tex.lz.f16.ef p0, r13, r10, r11, r12, ur9, array_2d, 0x1;",
-        ),
-        // TLD, constant buffer at both field ends: index 31, words 0x3fff (0xfffc bytes);
-        // dim 2 (3d), .aoffi, .ms 78, .f16, evict 5 (.na), lod 3, .scr, .nodep.
-        (
-            0xb66,
-            &[
-                (16, 1),
-                (24, 2),
-                (32, 3),
-                (40, 0x3fff),
-                (54, 0x1f),
-                (60, 1),
-                (61, 2),
-                (64, 4),
-                (72, 7),
-                (76, 1),
-                (78, 1),
-                (79, 1),
-                (81, 1),
-                (84, 5),
-                (87, 3),
-                (90, 1),
-            ],
-            "tld.scr.ll.aoffi.ms.f16.na.nodep p1, r4, r1, r2, r3, c[0x1f][0xfffc], 3d, 0x7;",
-        ),
-        // TLD.B: dim 0 (1d), lod 1, evict 3 (.lu), b RZ, dst2 RZ.
-        (
-            0x367,
-            &[
-                (16, 5),
-                (24, 6),
-                (32, 0xff),
-                (59, 1),
-                (64, 0xff),
-                (72, 1),
-                (81, 2),
-                (84, 3),
-                (87, 1),
-            ],
-            "tld.b.lz.lu p2, rz, r5, r6, rz, 1d, 0x1;",
-        ),
-        // TLD.UR: ur0, .cl 77, dim 1, lod 3, evict 4 (.eu).
-        (
-            0xf66,
-            &[
-                (16, 8),
-                (24, 9),
-                (32, 10),
-                (40, 0),
-                (61, 1),
-                (64, 11),
-                (72, 0xc),
-                (77, 1),
-                (81, 3),
-                (84, 4),
-                (87, 3),
-                (91, 1),
-            ],
-            "tld.ll.cl.eu p3, r11, r8, r9, r10, ur0, 2d, 0xc;",
-        ),
-        // TLD4, constant buffer: index 2, word 1 (4 bytes), offset mode 2 (.ptp), .dc, comp 3
-        // (.a), dim 5, evict 2, .scr, .nodep.
-        (
-            0xb63,
-            &[
-                (16, 1),
-                (24, 2),
-                (32, 3),
-                (40, 1),
-                (54, 2),
-                (60, 1),
-                (61, 5),
-                (64, 4),
-                (72, 0xf),
-                (76, 2),
-                (78, 1),
-                (81, 4),
-                (84, 2),
-                (87, 3),
-                (90, 1),
-            ],
-            "tld4.scr.a.ptp.dc.el.nodep p4, r4, r1, r2, r3, c[0x2][0x4], array_2d, 0xf;",
-        ),
-        // TLD4.B: comp 1 (.g), offset mode 1 (.aoffi), evict 0.
-        (
-            0x364,
-            &[
-                (16, 20),
-                (24, 21),
-                (32, 22),
-                (59, 1),
-                (61, 1),
-                (64, 23),
-                (72, 3),
-                (76, 1),
-                (81, 0),
-                (87, 1),
-            ],
-            "tld4.g.b.aoffi.ef p0, r23, r20, r21, r22, 2d, 0x3;",
-        ),
-        // TLD4.UR: ur62, comp 0 (.r), dim 3 (cube), evict 1.
-        (
-            0xf63,
-            &[
-                (16, 1),
-                (24, 2),
-                (32, 3),
-                (40, 62),
-                (61, 3),
-                (64, 0xff),
-                (72, 1),
-                (81, 7),
-                (84, 1),
-                (91, 1),
-            ],
-            "tld4.r pt, rz, r1, r2, r3, ur62, cube, 0x1;",
-        ),
-        // TMML, constant buffer: index 3, words 0x20 (0x80), dim 1, .ndv 77, .nodep.
-        (
-            0xb69,
-            &[
-                (16, 1),
-                (24, 2),
-                (32, 3),
-                (40, 0x20),
-                (54, 3),
-                (61, 1),
-                (64, 4),
-                (72, 3),
-                (77, 1),
-                (90, 1),
-            ],
-            "tmml.lod.ndv.nodep r4, r1, r2, r3, c[0x3][0x80], 2d, 0x3;",
-        ),
-        // TMML.B: dim 4 (array_1d).
-        (
-            0x36a,
-            &[
-                (16, 5),
-                (24, 6),
-                (32, 7),
-                (59, 1),
-                (61, 4),
-                (64, 0xff),
-                (72, 1),
-            ],
-            "tmml.b.lod rz, r5, r6, r7, array_1d, 0x1;",
-        ),
-        // TXD, constant buffer: index 4, words 2 (8), dim 5, .aoffi 76, fault 6, evict 2.
-        (
-            0xb6c,
-            &[
-                (16, 1),
-                (24, 2),
-                (32, 3),
-                (40, 2),
-                (54, 4),
-                (61, 5),
-                (64, 4),
-                (72, 0xf),
-                (76, 1),
-                (81, 6),
-                (84, 2),
-                (90, 1),
-            ],
-            "txd.aoffi.el.nodep p6, r4, r1, r2, r3, c[0x4][0x8], array_2d, 0xf;",
-        ),
-        // TXD.B: dim 1, fault PT, evict 1.
-        (
-            0x36d,
-            &[
-                (16, 8),
-                (24, 9),
-                (32, 10),
-                (59, 1),
-                (61, 1),
-                (64, 11),
-                (72, 3),
-                (81, 7),
-                (84, 1),
-            ],
-            "txd.b pt, r11, r8, r9, r10, 2d, 0x3;",
-        ),
-        // TXQ, constant buffer: index 0, words 0x5a (0x168), query 2 at 62, dst2 RZ, mask 7.
-        (
-            0xb6f,
-            &[
-                (16, 1),
-                (24, 2),
-                (40, 0x5a),
-                (62, 2),
-                (64, 0xff),
-                (72, 7),
-                (90, 1),
-            ],
-            "txq.nodep rz, r1, r2, c[0x0][0x168], tex_header_sampler_pos, 0x7;",
-        ),
-        // TXQ.B: query 1.
-        (
-            0x370,
-            &[(16, 3), (24, 4), (59, 1), (62, 1), (64, 5), (72, 1)],
-            "txq.b r5, r3, r4, tex_header_texture_type, 0x1;",
-        ),
-        // SULD.P: dst 1, coord 2, dim 3 (2d) at 61, handle 3 at 64, mask 0xf, order 7
-        // (.strong.gpu) at 77, fault 0, evict 1.
-        (
-            0x998,
-            &[
-                (16, 1),
-                (24, 2),
-                (61, 3),
-                (64, 3),
-                (72, 0xf),
-                (77, 7),
-                (81, 0),
-                (84, 1),
-            ],
-            "suld.p.2d.strong.gpu p0, r1, [r2], r3, 0xf;",
-        ),
-        // SULD.D: dim 5 (3d), type 6 (.b128) at 73, order 10 (.strong.sys), fault PT, evict 0.
-        (
-            0x99a,
-            &[
-                (16, 4),
-                (24, 5),
-                (61, 5),
-                (64, 6),
-                (73, 6),
-                (77, 0xa),
-                (81, 7),
-                (84, 0),
-            ],
-            "suld.d.3d.b128.strong.sys.ef pt, r4, [r5], r6;",
-        ),
-        // SUST.P: coord 1, data 2, dim 1 (1d_buffer), handle 3, mask 1, order 4 (.constant),
-        // evict 2.
-        (
-            0x99c,
-            &[
-                (24, 1),
-                (32, 2),
-                (61, 1),
-                (64, 3),
-                (72, 1),
-                (77, 4),
-                (84, 2),
-            ],
-            "sust.p.1d_buffer.constant.el [r1], r2, r3, 0x1;",
-        ),
-        // SUST.D: dim 2 (array_1d), type 3 (.i16), order 5 (.strong.cta), evict 5.
-        (
-            0x99e,
-            &[
-                (24, 4),
-                (32, 5),
-                (61, 2),
-                (64, 6),
-                (73, 3),
-                (77, 5),
-                (84, 5),
-            ],
-            "sust.d.array_1d.i16.strong.cta.na [r4], r5, r6;",
-        ),
-        // SUATOM: dst 1, coord 2, data 3, dim 4, handle 4, .ba 72, type 5 (.i64), order 0
-        // (.weak), fault 1, evict 1, operation 8 (.exch) at 87.
-        (
-            0x394,
-            &[
-                (16, 1),
-                (24, 2),
-                (32, 3),
-                (61, 4),
-                (64, 4),
-                (72, 1),
-                (73, 5),
-                (81, 1),
-                (84, 1),
-                (87, 8),
-            ],
-            "suatom.p.array_2d.exch.i64.weak.ba p1, r1, [r2], r3, r4;",
-        ),
-        // SUATOM.CAS: type 2 (.u64), order 7, fault PT, evict 0.
-        (
-            0x396,
-            &[
-                (16, 5),
-                (24, 6),
-                (32, 7),
-                (61, 3),
-                (64, 8),
-                (73, 2),
-                (77, 7),
-                (81, 7),
-            ],
-            "suatom.p.2d.cmpexch.packed.u64.strong.gpu.ef pt, r5, [r6], r7, r8;",
-        ),
-        // SURED: dst RZ (as NAK writes), dim 0, type 3 (.f32), order 10, evict 1, operation 7
-        // (.xor).
-        (
-            0x3a0,
-            &[
-                (16, 0xff),
-                (24, 9),
-                (32, 10),
-                (64, 11),
-                (73, 3),
-                (77, 0xa),
-                (81, 7),
-                (84, 1),
-                (87, 7),
-            ],
-            "sured.p.1d.xor.f32.strong.sys pt, rz, [r9], r10, r11;",
-        ),
-    ];
+    let cases = FORM_CASES;
     // One case per form of the group, in form order.
     let opcodes: Vec<u128> = cases.iter().map(|&(opcode, _, _)| opcode).collect();
     let forms: Vec<u128> = texture::FORMS
@@ -559,200 +587,312 @@ fn hand_built_words_of_each_form_decode() {
     }
 }
 
-/// Each modifier bit and each mode value, set alone in a hand-built word, changes the text the
-/// way its field says: the plain word of each instruction, then one bit or value at a time.
+/// `TEX.B r1, r2, r3, 2d`, mask 1, fault `PT`, eviction normal.
+const TEX_B: &[(u32, u128)] = &[
+    (16, 1),
+    (24, 2),
+    (32, 3),
+    (59, 1),
+    (61, 1),
+    (64, 0xff),
+    (72, 1),
+    (81, 7),
+    (84, 1),
+];
+/// `TEX` with the handle `c[0x0][0x0]`, for `.f16`.
+const TEX_CB: &[(u32, u128)] = &[
+    (16, 1),
+    (24, 2),
+    (32, 3),
+    (61, 1),
+    (64, 0xff),
+    (72, 1),
+    (81, 7),
+    (84, 1),
+];
+/// `TEX.B` with the eviction priority 0 (`.ef`).
+const TEX_B_EF: &[(u32, u128)] = &[
+    (16, 1),
+    (24, 2),
+    (32, 3),
+    (59, 1),
+    (61, 1),
+    (64, 0xff),
+    (72, 1),
+    (81, 7),
+];
+/// `TLD.UR` with `ur4`, for `.cl`, `.ms` and `.f16`.
+const TLD_UR: &[(u32, u128)] = &[
+    (16, 1),
+    (24, 2),
+    (32, 3),
+    (40, 4),
+    (61, 1),
+    (64, 0xff),
+    (72, 1),
+    (81, 7),
+    (84, 1),
+    (91, 1),
+];
+/// `TLD4.R.B` and `TXD.B`, which have the same fields at these values.
+const TLD4_B: &[(u32, u128)] = TEX_B;
+/// `TMML.B`.
+const TMML_B: &[(u32, u128)] = &[
+    (16, 1),
+    (24, 2),
+    (32, 3),
+    (59, 1),
+    (61, 1),
+    (64, 0xff),
+    (72, 1),
+];
+/// `TXQ.B`.
+const TXQ_B: &[(u32, u128)] = &[(16, 1), (24, 2), (59, 1), (64, 0xff), (72, 1)];
+/// `SUATOM.ADD.U32.WEAK`, fault `PT`, eviction normal.
+const SUATOM_PLAIN: &[(u32, u128)] = &[(16, 1), (24, 2), (32, 3), (64, 4), (81, 7), (84, 1)];
+
+/// A plain word's opcode and fields, one more field, and the expected text.
+type ModifierCase = (u128, &'static [(u32, u128)], (u32, u128), &'static str);
+
+/// The modifier cases: each plain word with nothing more (`(0, 0)`), then each modifier bit or
+/// each bit of a mode field alone.
+const MODIFIER_CASES: &[ModifierCase] = &[
+    (0x361, TEX_B, (0, 0), "tex.b pt, rz, r1, r2, r3, 2d, 0x1;"),
+    (
+        0x361,
+        TEX_B,
+        (60, 1),
+        "tex.scr.b pt, rz, r1, r2, r3, 2d, 0x1;",
+    ),
+    (
+        0x361,
+        TEX_B,
+        (76, 1),
+        "tex.b.aoffi pt, rz, r1, r2, r3, 2d, 0x1;",
+    ),
+    (
+        0x361,
+        TEX_B,
+        (77, 1),
+        "tex.b.ndv pt, rz, r1, r2, r3, 2d, 0x1;",
+    ),
+    (
+        0x361,
+        TEX_B,
+        (78, 1),
+        "tex.b.dc pt, rz, r1, r2, r3, 2d, 0x1;",
+    ),
+    (
+        0x361,
+        TEX_B,
+        (90, 1),
+        "tex.b.nodep pt, rz, r1, r2, r3, 2d, 0x1;",
+    ),
+    // The eviction priority 1 plus one bit: 3 (.lu), 5 (.na); and 0 (.ef).
+    (
+        0x361,
+        TEX_B,
+        (85, 1),
+        "tex.b.lu pt, rz, r1, r2, r3, 2d, 0x1;",
+    ),
+    (
+        0x361,
+        TEX_B,
+        (86, 1),
+        "tex.b.na pt, rz, r1, r2, r3, 2d, 0x1;",
+    ),
+    (
+        0x361,
+        TEX_B_EF,
+        (0, 0),
+        "tex.b.ef pt, rz, r1, r2, r3, 2d, 0x1;",
+    ),
+    // Each bit of the level-of-detail mode alone: 1 (.lz), 2 (.lb), 4 (.lc).
+    (
+        0x361,
+        TEX_B,
+        (87, 1),
+        "tex.b.lz pt, rz, r1, r2, r3, 2d, 0x1;",
+    ),
+    (
+        0x361,
+        TEX_B,
+        (88, 1),
+        "tex.b.lb pt, rz, r1, r2, r3, 2d, 0x1;",
+    ),
+    (
+        0x361,
+        TEX_B,
+        (89, 1),
+        "tex.b.lc pt, rz, r1, r2, r3, 2d, 0x1;",
+    ),
+    (
+        0xb60,
+        TEX_CB,
+        (0, 0),
+        "tex pt, rz, r1, r2, r3, c[0x0][0x0], 2d, 0x1;",
+    ),
+    (
+        0xb60,
+        TEX_CB,
+        (79, 1),
+        "tex.f16 pt, rz, r1, r2, r3, c[0x0][0x0], 2d, 0x1;",
+    ),
+    (
+        0xf66,
+        TLD_UR,
+        (0, 0),
+        "tld pt, rz, r1, r2, r3, ur4, 2d, 0x1;",
+    ),
+    (
+        0xf66,
+        TLD_UR,
+        (77, 1),
+        "tld.cl pt, rz, r1, r2, r3, ur4, 2d, 0x1;",
+    ),
+    (
+        0xf66,
+        TLD_UR,
+        (78, 1),
+        "tld.ms pt, rz, r1, r2, r3, ur4, 2d, 0x1;",
+    ),
+    (
+        0xf66,
+        TLD_UR,
+        (79, 1),
+        "tld.f16 pt, rz, r1, r2, r3, ur4, 2d, 0x1;",
+    ),
+    (
+        0xf66,
+        TLD_UR,
+        (76, 1),
+        "tld.aoffi pt, rz, r1, r2, r3, ur4, 2d, 0x1;",
+    ),
+    (
+        0xf66,
+        TLD_UR,
+        (60, 1),
+        "tld.scr pt, rz, r1, r2, r3, ur4, 2d, 0x1;",
+    ),
+    (
+        0x364,
+        TLD4_B,
+        (0, 0),
+        "tld4.r.b pt, rz, r1, r2, r3, 2d, 0x1;",
+    ),
+    (
+        0x364,
+        TLD4_B,
+        (76, 1),
+        "tld4.r.b.aoffi pt, rz, r1, r2, r3, 2d, 0x1;",
+    ),
+    (
+        0x364,
+        TLD4_B,
+        (77, 1),
+        "tld4.r.b.ptp pt, rz, r1, r2, r3, 2d, 0x1;",
+    ),
+    (
+        0x364,
+        TLD4_B,
+        (78, 1),
+        "tld4.r.b.dc pt, rz, r1, r2, r3, 2d, 0x1;",
+    ),
+    (
+        0x364,
+        TLD4_B,
+        (90, 1),
+        "tld4.r.b.nodep pt, rz, r1, r2, r3, 2d, 0x1;",
+    ),
+    // Each bit of the component alone: 1 (.g), 2 (.b).
+    (
+        0x364,
+        TLD4_B,
+        (87, 1),
+        "tld4.g.b pt, rz, r1, r2, r3, 2d, 0x1;",
+    ),
+    (
+        0x364,
+        TLD4_B,
+        (88, 1),
+        "tld4.b.b pt, rz, r1, r2, r3, 2d, 0x1;",
+    ),
+    (
+        0x364,
+        TLD4_B,
+        (60, 1),
+        "tld4.scr.r.b pt, rz, r1, r2, r3, 2d, 0x1;",
+    ),
+    (0x36a, TMML_B, (0, 0), "tmml.b.lod rz, r1, r2, r3, 2d, 0x1;"),
+    (
+        0x36a,
+        TMML_B,
+        (77, 1),
+        "tmml.b.lod.ndv rz, r1, r2, r3, 2d, 0x1;",
+    ),
+    (
+        0x36a,
+        TMML_B,
+        (90, 1),
+        "tmml.b.lod.nodep rz, r1, r2, r3, 2d, 0x1;",
+    ),
+    (0x36d, TLD4_B, (0, 0), "txd.b pt, rz, r1, r2, r3, 2d, 0x1;"),
+    (
+        0x36d,
+        TLD4_B,
+        (76, 1),
+        "txd.b.aoffi pt, rz, r1, r2, r3, 2d, 0x1;",
+    ),
+    (
+        0x36d,
+        TLD4_B,
+        (90, 1),
+        "txd.b.nodep pt, rz, r1, r2, r3, 2d, 0x1;",
+    ),
+    (
+        0x370,
+        TXQ_B,
+        (0, 0),
+        "txq.b rz, r1, r2, tex_header_dimension, 0x1;",
+    ),
+    (
+        0x370,
+        TXQ_B,
+        (90, 1),
+        "txq.b.nodep rz, r1, r2, tex_header_dimension, 0x1;",
+    ),
+    (
+        0x394,
+        SUATOM_PLAIN,
+        (0, 0),
+        "suatom.p.1d.add.u32.weak pt, r1, [r2], r3, r4;",
+    ),
+    (
+        0x394,
+        SUATOM_PLAIN,
+        (72, 1),
+        "suatom.p.1d.add.u32.weak.ba pt, r1, [r2], r3, r4;",
+    ),
+    (
+        0x3a0,
+        SUATOM_PLAIN,
+        (72, 1),
+        "sured.p.1d.add.u32.weak.ba pt, r1, [r2], r3, r4;",
+    ),
+];
+
+/// Each modifier bit and each bit of a mode field, set alone in a hand-built word, changes the
+/// text the way its field says ([`MODIFIER_CASES`]): the plain word of each instruction, then
+/// one bit at a time.
 #[test]
 fn hand_built_words_pin_each_modifier_bit() {
-    // TEX.B r1, r2, r3, 2d, mask 1, fault PT, evict normal.
-    let tex = [
-        (16, 1),
-        (24, 2),
-        (32, 3),
-        (59, 1),
-        (61, 1),
-        (64, 0xff),
-        (72, 1),
-        (81, 7),
-        (84, 1),
-    ];
-    let tex_text = |modifiers: &str| format!("tex.b{modifiers} pt, rz, r1, r2, r3, 2d, 0x1;");
-    // TEX with a constant-buffer handle c[0x0][0x0], for .f16.
-    let tex_cb = [
-        (16, 1),
-        (24, 2),
-        (32, 3),
-        (61, 1),
-        (64, 0xff),
-        (72, 1),
-        (81, 7),
-        (84, 1),
-    ];
-    // TLD.UR with ur4, for .cl, .ms and .f16.
-    let tld = [
-        (16, 1),
-        (24, 2),
-        (32, 3),
-        (40, 4),
-        (61, 1),
-        (64, 0xff),
-        (72, 1),
-        (81, 7),
-        (84, 1),
-        (91, 1),
-    ];
-    let tld_text = |modifiers: &str| format!("tld{modifiers} pt, rz, r1, r2, r3, ur4, 2d, 0x1;");
-    // TLD4.B, component red.
-    let tld4 = [
-        (16, 1),
-        (24, 2),
-        (32, 3),
-        (59, 1),
-        (61, 1),
-        (64, 0xff),
-        (72, 1),
-        (81, 7),
-        (84, 1),
-    ];
-    let tld4_text = |modifiers: &str| format!("tld4.r.b{modifiers} pt, rz, r1, r2, r3, 2d, 0x1;");
-    // TMML.B and TXD.B.
-    let tmml = [
-        (16, 1),
-        (24, 2),
-        (32, 3),
-        (59, 1),
-        (61, 1),
-        (64, 0xff),
-        (72, 1),
-    ];
-    let txd = tld4;
-    // TXQ.B.
-    let txq = [(16, 1), (24, 2), (59, 1), (64, 0xff), (72, 1)];
-    // SUATOM.ADD.U32.WEAK, fault PT, evict normal.
-    let suatom = [(16, 1), (24, 2), (32, 3), (64, 4), (81, 7), (84, 1)];
-    let with = |base: &[(u32, u128)], extra: &[(u32, u128)]| -> Vec<(u32, u128)> {
-        base.iter().chain(extra).copied().collect()
-    };
-    let cases: Vec<(u128, Vec<(u32, u128)>, String)> = vec![
-        (0x361, with(&tex, &[]), tex_text("")),
-        (
-            0x361,
-            with(&tex, &[(60, 1)]),
-            "tex.scr.b pt, rz, r1, r2, r3, 2d, 0x1;".into(),
-        ),
-        (0x361, with(&tex, &[(76, 1)]), tex_text(".aoffi")),
-        (0x361, with(&tex, &[(77, 1)]), tex_text(".ndv")),
-        (0x361, with(&tex, &[(78, 1)]), tex_text(".dc")),
-        (0x361, with(&tex, &[(90, 1)]), tex_text(".nodep")),
-        // The eviction priority 1 plus one bit: 3 (.lu), 5 (.na); and 0 alone (.ef).
-        (0x361, with(&tex, &[(85, 1)]), tex_text(".lu")),
-        (0x361, with(&tex, &[(86, 1)]), tex_text(".na")),
-        (0x361, with(&tex[..8], &[(84, 0)]), tex_text(".ef")),
-        // Each bit of the level-of-detail mode alone: 1 (.lz), 2 (.lb), 4 (.lc).
-        (0x361, with(&tex, &[(87, 1)]), tex_text(".lz")),
-        (0x361, with(&tex, &[(88, 1)]), tex_text(".lb")),
-        (0x361, with(&tex, &[(89, 1)]), tex_text(".lc")),
-        (
-            0xb60,
-            with(&tex_cb, &[]),
-            "tex pt, rz, r1, r2, r3, c[0x0][0x0], 2d, 0x1;".into(),
-        ),
-        (
-            0xb60,
-            with(&tex_cb, &[(79, 1)]),
-            "tex.f16 pt, rz, r1, r2, r3, c[0x0][0x0], 2d, 0x1;".into(),
-        ),
-        (0xf66, with(&tld, &[]), tld_text("")),
-        (0xf66, with(&tld, &[(77, 1)]), tld_text(".cl")),
-        (0xf66, with(&tld, &[(78, 1)]), tld_text(".ms")),
-        (0xf66, with(&tld, &[(79, 1)]), tld_text(".f16")),
-        (0xf66, with(&tld, &[(76, 1)]), tld_text(".aoffi")),
-        (
-            0xf66,
-            with(&tld, &[(60, 1)]),
-            "tld.scr pt, rz, r1, r2, r3, ur4, 2d, 0x1;".into(),
-        ),
-        (0x364, with(&tld4, &[]), tld4_text("")),
-        (0x364, with(&tld4, &[(76, 1)]), tld4_text(".aoffi")),
-        (0x364, with(&tld4, &[(77, 1)]), tld4_text(".ptp")),
-        (0x364, with(&tld4, &[(78, 1)]), tld4_text(".dc")),
-        (0x364, with(&tld4, &[(90, 1)]), tld4_text(".nodep")),
-        // Each bit of the component alone: 1 (.g), 2 (.b).
-        (
-            0x364,
-            with(&tld4, &[(87, 1)]),
-            "tld4.g.b pt, rz, r1, r2, r3, 2d, 0x1;".into(),
-        ),
-        (
-            0x364,
-            with(&tld4, &[(88, 1)]),
-            "tld4.b.b pt, rz, r1, r2, r3, 2d, 0x1;".into(),
-        ),
-        (
-            0x364,
-            with(&tld4, &[(60, 1)]),
-            "tld4.scr.r.b pt, rz, r1, r2, r3, 2d, 0x1;".into(),
-        ),
-        (
-            0x36a,
-            with(&tmml, &[]),
-            "tmml.b.lod rz, r1, r2, r3, 2d, 0x1;".into(),
-        ),
-        (
-            0x36a,
-            with(&tmml, &[(77, 1)]),
-            "tmml.b.lod.ndv rz, r1, r2, r3, 2d, 0x1;".into(),
-        ),
-        (
-            0x36a,
-            with(&tmml, &[(90, 1)]),
-            "tmml.b.lod.nodep rz, r1, r2, r3, 2d, 0x1;".into(),
-        ),
-        (
-            0x36d,
-            with(&txd, &[]),
-            "txd.b pt, rz, r1, r2, r3, 2d, 0x1;".into(),
-        ),
-        (
-            0x36d,
-            with(&txd, &[(76, 1)]),
-            "txd.b.aoffi pt, rz, r1, r2, r3, 2d, 0x1;".into(),
-        ),
-        (
-            0x36d,
-            with(&txd, &[(90, 1)]),
-            "txd.b.nodep pt, rz, r1, r2, r3, 2d, 0x1;".into(),
-        ),
-        (
-            0x370,
-            with(&txq, &[]),
-            "txq.b rz, r1, r2, tex_header_dimension, 0x1;".into(),
-        ),
-        (
-            0x370,
-            with(&txq, &[(90, 1)]),
-            "txq.b.nodep rz, r1, r2, tex_header_dimension, 0x1;".into(),
-        ),
-        (
-            0x394,
-            with(&suatom, &[]),
-            "suatom.p.1d.add.u32.weak pt, r1, [r2], r3, r4;".into(),
-        ),
-        (
-            0x394,
-            with(&suatom, &[(72, 1)]),
-            "suatom.p.1d.add.u32.weak.ba pt, r1, [r2], r3, r4;".into(),
-        ),
-        (
-            0x3a0,
-            with(&suatom, &[(72, 1)]),
-            "sured.p.1d.add.u32.weak.ba pt, r1, [r2], r3, r4;".into(),
-        ),
-    ];
-    for (opcode, fields, expected) in cases {
+    for &(opcode, base, extra, expected) in MODIFIER_CASES {
+        let mut fields = base.to_vec();
+        fields.push(extra);
         assert_eq!(
             text(word(opcode, &fields)),
             expected,
-            "{opcode:#x} {fields:?}"
+            "{opcode:#x} {extra:?}"
         );
     }
 }
@@ -846,11 +986,11 @@ fn every_dimension_decodes() {
     }
 }
 
-/// Every value of the group's other enumerated fields, in hand-built words: the level-of-detail
-/// modes, eviction priorities, `TLD4`'s components and offset modes, `TXQ`'s queries, memory
-/// types and orders, atomic types, and the atomic operations of `SUATOM` and `SURED`.
+/// Every value of the texture instructions' other enumerated fields, in hand-built words: the
+/// level-of-detail modes, eviction priorities, `TLD4`'s components and offset modes, and
+/// `TXQ`'s queries.
 #[test]
-fn every_mode_type_and_operation_decodes() {
+fn every_texture_mode_decodes() {
     let tex = |field: (u32, u128)| text(word(0x361, &[(59, 1), (81, 7), (84, 1), field]));
     for (bits, text) in [
         (0, ""),
@@ -905,6 +1045,12 @@ fn every_mode_type_and_operation_decodes() {
             format!("txq.b r0, r0, r0, tex_header_{query}, 0x0;")
         );
     }
+}
+
+/// Every value of the surface instructions' enumerated fields, in hand-built words: memory
+/// types and orders, atomic types, and the atomic operations of `SUATOM` and `SURED`.
+#[test]
+fn every_surface_type_order_and_operation_decodes() {
     let suld = |fields: &[(u32, u128)]| {
         let all: Vec<(u32, u128)> = [(81, 7), (84, 1)].iter().chain(fields).copied().collect();
         text(word(0x99a, &all))
@@ -1081,10 +1227,10 @@ fn handles_at_the_edges_of_their_fields() {
     );
 }
 
-/// The values the group refuses, each alone, one below each decoding, and two refused values
-/// at once, where the lower field is the one named.
+/// The values the texture instructions refuse, each alone, one below each decoding, and two
+/// refused values at once, where the lower field is the one named.
 #[test]
-fn values_the_group_refuses() {
+fn values_the_texture_instructions_refuse() {
     let tex = |fields: &[(u32, u128)]| {
         let all: Vec<(u32, u128)> = [(59, 1)].iter().chain(fields).copied().collect();
         decode(word(0x361, &all))
@@ -1136,6 +1282,20 @@ fn values_the_group_refuses() {
         Err(unknown(0xb6f, 62, 2, 3))
     );
     assert!(decode(word(0xb6f, &[(62, 2)])).is_ok());
+    assert_eq!(
+        tex(&[(61, 6)]).map_err(|error| error.to_string()),
+        Err(
+            "opcode 0x361 has the value 6 in its 3-bit field at bit 61, which its form does not \
+             define"
+                .into()
+        )
+    );
+}
+
+/// The values the surface instructions refuse, each alone, one below each decoding, and two
+/// refused values at once, where the lower field is the one named.
+#[test]
+fn values_the_surface_instructions_refuse() {
     // SULD.D: the dimension, then the memory type, then the order, then the eviction priority.
     let suld = |fields: &[(u32, u128)]| decode(word(0x99a, fields));
     for value in [6, 7] {
@@ -1194,14 +1354,7 @@ fn values_the_group_refuses() {
         decode(word(0x3a0, &[(61, 6)])),
         Err(unknown(0x3a0, 61, 3, 6))
     );
-    assert_eq!(
-        tex(&[(61, 6)]).map_err(|error| error.to_string()),
-        Err(
-            "opcode 0x361 has the value 6 in its 3-bit field at bit 61, which its form does not \
-             define"
-                .into()
-        )
-    );
+    assert!(suld(&[(84, 5)]).is_ok());
 }
 
 /// The `.B` forms require bit 59 and the `.UR` forms bit 91, naming it when clear; the
@@ -1257,7 +1410,7 @@ fn handle_forms_require_their_fixed_bit() {
 
 /// `.F16` (bit 79) and `.CL` (bit 77) decode only in the forms whose rows mark them known: the
 /// constant-buffer and `.UR` forms of `TEX` and `TLD` for `.F16`, `TLD.UR` for `.CL`. Elsewhere
-/// the bit is unknown; the assembler refuses an op that needs it there.
+/// the bit is unknown.
 #[test]
 fn f16_and_clamp_only_where_the_rows_have_them() {
     let handle_bits = |opcode: u16| -> Vec<(u32, u128)> {
@@ -1304,12 +1457,16 @@ fn f16_and_clamp_only_where_the_rows_have_them() {
     .into_iter()
     .flat_map(|opcodes| [Some(opcodes.cbuf), Some(opcodes.bindless), opcodes.uniform])
     .flatten();
-    let f16_forms: Vec<u16> = texture_forms
-        .filter(|&opcode| known(opcode, 79))
-        .collect();
+    let f16_forms: Vec<u16> = texture_forms.filter(|&opcode| known(opcode, 79)).collect();
     assert_eq!(f16_forms, [0xb60, 0xf60, 0xb66, 0xf66]);
     assert!(!known(0xb66, 77) && !known(0x367, 77) && known(0xf66, 77));
+}
 
+/// The assembler refuses `.F16` with a `.B` handle and `.CL` without a `.UR` one, the bits the
+/// rows of those forms leave out (`f16_and_clamp_only_where_the_rows_have_them`), and accepts
+/// them where the forms have them.
+#[test]
+fn encoder_refuses_f16_and_clamp_where_the_forms_lack_them() {
     let tex = |tex, f16| {
         assemble(&Instr::new(Op::Tex(OpTex {
             dsts: [r(1), Gpr::RZ],
@@ -1630,7 +1787,14 @@ fn layout_constants_match_the_references() {
         assert_eq!((field.start, field.width), (start, width));
     }
     assert_eq!(TEX_CBUF_UNIT, 4);
-    // NAK's encoding tables, in each enumeration's declaration order.
+}
+
+/// The group's enumerations against NAK's encoding tables, written out here, in each
+/// enumeration's declaration order (`set_tex_dim`, `set_tex_lod_mode`, `OpTld4`'s and `OpTxq`'s
+/// encoders, `set_image_dim`, `set_mem_type`, `set_eviction_priority`, `set_atom_type`,
+/// `set_atom_op` and `set_mem_order` in `sm70_encode.rs` @ 52238762).
+#[test]
+fn encodings_match_the_references() {
     assert_eq!(
         TexDim::ALL.iter().map(|dim| dim.bits()).collect::<Vec<_>>(),
         [0, 4, 1, 5, 2, 3, 7]

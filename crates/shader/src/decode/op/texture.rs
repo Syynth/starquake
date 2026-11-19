@@ -70,7 +70,11 @@
 //! `.CL` bit 77 only in its `.UR` row. A form cannot know a bit its row does not, so those bits
 //! are rejected in the forms whose rows leave them out (pinned by
 //! `decode::tests::texture::f16_and_clamp_only_where_the_rows_have_them`), and the test
-//! assembler refuses an op that sets them with such a handle.
+//! assembler refuses an op that sets them with such a handle
+//! (`encoder_refuses_f16_and_clamp_where_the_forms_lack_them`). Whether the hardware has them
+//! in the `.B` forms is an open question for the owner: the framework can only drop a row's
+//! bits, not add bits a row leaves out (lead's note on #356), so these forms cannot decode them
+//! even if `nvdisasm` shows they exist.
 //!
 //! # Values the decoder refuses
 //!
@@ -559,7 +563,7 @@ impl AtomOp {
     ];
 
     /// The operation field's value, or `None` for [`AtomOp::CmpExch`], which has an opcode of
-    /// its own (`set_atom_op`: "CmpExch is a separate opcode").
+    /// its own (`set_atom_op`: "`CmpExch` is a separate opcode").
     pub const fn bits(self) -> Option<u64> {
         Some(match self {
             Self::Add => 0,
@@ -718,18 +722,51 @@ impl Handle {
             Self::Uniform => TEX_UNIFORM.mask(),
         }
     }
+
+    /// The kind of `tex`.
+    const fn of(tex: TexRef) -> Self {
+        match tex {
+            TexRef::CBuf(_) => Self::CBuf,
+            TexRef::Bindless => Self::Bindless,
+            TexRef::Uniform(_) => Self::Uniform,
+        }
+    }
+
+    /// Whether `TEX`'s and `TLD`'s forms with this handle have the `.F16` bit: their rows mark
+    /// bit 79 known in the constant-buffer and `.UR` forms only (module docs).
+    const fn f16(self) -> bool {
+        !matches!(self, Self::Bindless)
+    }
+
+    /// Whether `TLD`'s form with this handle has the `.CL` bit: its `.UR` row alone marks bit
+    /// 77 known.
+    const fn clamp(self) -> bool {
+        matches!(self, Self::Uniform)
+    }
+
+    /// The bits `TEX`'s form with this handle has besides [`TEX_FIELDS`]: `.F16` where it has
+    /// it.
+    const fn tex_extra(self) -> u128 {
+        if self.f16() { TEX_F16.mask() } else { 0 }
+    }
+
+    /// The bits `TLD`'s form with this handle has besides [`TLD_FIELDS`]: `.F16` and `.CL`
+    /// where it has them.
+    const fn tld_extra(self) -> u128 {
+        let clamp = if self.clamp() { TLD_CLAMP.mask() } else { 0 };
+        self.tex_extra() | clamp
+    }
 }
 
-/// Whether the forms of `TEX` and `TLD` with a `tex` handle have the `.F16` bit: their rows
-/// mark bit 79 known in the constant-buffer and `.UR` forms only (module docs).
+/// Whether `TEX` and `TLD` have the `.F16` bit with a `tex` handle ([`Handle::f16`]); the
+/// decoder reads it, and the test assembler writes it, only then.
 pub(crate) const fn has_f16(tex: TexRef) -> bool {
-    !matches!(tex, TexRef::Bindless)
+    Handle::of(tex).f16()
 }
 
-/// Whether the form of `TLD` with a `tex` handle has the `.CL` bit: its `.UR` row alone marks
-/// bit 77 known.
+/// Whether `TLD` has the `.CL` bit with a `tex` handle ([`Handle::clamp`]).
 pub(crate) const fn has_clamp(tex: TexRef) -> bool {
-    matches!(tex, TexRef::Uniform(_))
+    Handle::of(tex).clamp()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -867,6 +904,10 @@ fn bindless(f: &mut Formatter<'_>, tex: TexRef) -> fmt::Result {
 
 /// `TEX`: samples a texture (NAK's `OpTex`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent one-bit field of the encoding, as in NAK's OpTex"
+)]
 pub struct OpTex {
     /// The destinations: the first at bits 16..24, the second at [`TEX_DST2`] (`RZ` for none).
     pub dsts: [Gpr; 2],
@@ -957,6 +998,10 @@ fn decode_tex(reader: &mut Reader, kind: Handle) -> Result<Op, DecodeError> {
 
 /// `TLD`: fetches texels by integer coordinates (NAK's `OpTld`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent one-bit field of the encoding, as in NAK's OpTld"
+)]
 pub struct OpTld {
     /// The destinations, as [`OpTex::dsts`].
     pub dsts: [Gpr; 2],
@@ -1667,52 +1712,36 @@ const fn tex_form(opcode: u16, kind: Handle, fields: u128, decode: DecodeFn) -> 
     Form::new(opcode, fields | kind.known(), decode).with_fixed(kind.fixed())
 }
 
-/// The `.F16` bit of `TEX`'s and `TLD`'s forms with a `kind` handle, if they have it.
-const fn f16_bit(kind: Handle) -> u128 {
-    match kind {
-        Handle::Bindless => 0,
-        Handle::CBuf | Handle::Uniform => TEX_F16.mask(),
-    }
+/// `TEX`'s form with a `kind` handle.
+const fn tex(opcode: u16, kind: Handle, decode: DecodeFn) -> Form {
+    tex_form(opcode, kind, TEX_FIELDS | kind.tex_extra(), decode)
+}
+
+/// `TLD`'s form with a `kind` handle.
+const fn tld(opcode: u16, kind: Handle, decode: DecodeFn) -> Form {
+    tex_form(opcode, kind, TLD_FIELDS | kind.tld_extra(), decode)
 }
 
 /// The texture and surface group's forms.
 pub(crate) const FORMS: &[Form] = &[
-    tex_form(
-        TEX_OPCODES.cbuf,
-        Handle::CBuf,
-        TEX_FIELDS | f16_bit(Handle::CBuf),
-        |reader| decode_tex(reader, Handle::CBuf),
-    ),
-    tex_form(
-        TEX_OPCODES.bindless,
-        Handle::Bindless,
-        TEX_FIELDS,
-        |reader| decode_tex(reader, Handle::Bindless),
-    ),
-    tex_form(
-        TEX_UR_OPCODE,
-        Handle::Uniform,
-        TEX_FIELDS | f16_bit(Handle::Uniform),
-        |reader| decode_tex(reader, Handle::Uniform),
-    ),
-    tex_form(
-        TLD_OPCODES.cbuf,
-        Handle::CBuf,
-        TLD_FIELDS | f16_bit(Handle::CBuf),
-        |reader| decode_tld(reader, Handle::CBuf),
-    ),
-    tex_form(
-        TLD_OPCODES.bindless,
-        Handle::Bindless,
-        TLD_FIELDS,
-        |reader| decode_tld(reader, Handle::Bindless),
-    ),
-    tex_form(
-        TLD_UR_OPCODE,
-        Handle::Uniform,
-        TLD_FIELDS | f16_bit(Handle::Uniform) | TLD_CLAMP.mask(),
-        |reader| decode_tld(reader, Handle::Uniform),
-    ),
+    tex(TEX_OPCODES.cbuf, Handle::CBuf, |reader| {
+        decode_tex(reader, Handle::CBuf)
+    }),
+    tex(TEX_OPCODES.bindless, Handle::Bindless, |reader| {
+        decode_tex(reader, Handle::Bindless)
+    }),
+    tex(TEX_UR_OPCODE, Handle::Uniform, |reader| {
+        decode_tex(reader, Handle::Uniform)
+    }),
+    tld(TLD_OPCODES.cbuf, Handle::CBuf, |reader| {
+        decode_tld(reader, Handle::CBuf)
+    }),
+    tld(TLD_OPCODES.bindless, Handle::Bindless, |reader| {
+        decode_tld(reader, Handle::Bindless)
+    }),
+    tld(TLD_UR_OPCODE, Handle::Uniform, |reader| {
+        decode_tld(reader, Handle::Uniform)
+    }),
     tex_form(TLD4_OPCODES.cbuf, Handle::CBuf, TLD4_FIELDS, |reader| {
         decode_tld4(reader, Handle::CBuf)
     }),

@@ -58,7 +58,7 @@ pub(super) fn all() -> Vec<BoxedStrategy<Op>> {
     [textures(), queries(), surfaces()].concat()
 }
 
-/// `TEX`, `TLD` and `TLD4`.
+/// `TEX`, `TLD` and `TLD4` ([`gather`]).
 fn textures() -> Vec<BoxedStrategy<Op>> {
     let tex = (
         (any_dsts(), any_pred(), any_tex_ref(TEX_OPCODES), any_dsts()),
@@ -122,6 +122,11 @@ fn textures() -> Vec<BoxedStrategy<Op>> {
                 })
             },
         );
+    vec![tex.boxed(), tld.boxed(), gather()]
+}
+
+/// `TLD4`.
+fn gather() -> BoxedStrategy<Op> {
     let tld4 = (
         (
             any_dsts(),
@@ -161,7 +166,7 @@ fn textures() -> Vec<BoxedStrategy<Op>> {
                 })
             },
         );
-    vec![tex.boxed(), tld.boxed(), tld4.boxed()]
+    tld4.boxed()
 }
 
 /// `TMML`, `TXD` and `TXQ`.
