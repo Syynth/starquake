@@ -134,3 +134,51 @@ fn a_cpu_release_of_a_parked_acquire_is_busy_through_the_threads() {
     wait_until("the GPU is idle", || r.gpu.is_idle());
     r.gpu.stop().unwrap();
 }
+
+/// A quiet wake that counts its calls.
+#[derive(Default)]
+struct QuietCount(AtomicU64);
+
+impl QuietCount {
+    fn count(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl QuietWake for QuietCount {
+    fn front_quiet(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// The quiet signal through the production front thread on the host clock (the wiring's module
+/// docs, "Idleness", "The quiet signal"): the one wake set is told when the front ends a turn
+/// idle, here the turn that takes a request; a second wake is refused, with its exact words,
+/// and never told. The order inside an idle turn (quiet first, no lock held) is pinned by
+/// `the_quiet_wake_is_told_after_the_front_is_quiet_with_no_lock_held`.
+#[test]
+fn the_production_front_thread_tells_its_one_quiet_wake() {
+    let r = rig();
+    let first = Arc::new(QuietCount::default());
+    let second = Arc::new(QuietCount::default());
+    assert_eq!(
+        r.gpu.set_quiet_wake(Arc::<QuietCount>::clone(&first)),
+        Ok(())
+    );
+    assert_eq!(
+        r.gpu.set_quiet_wake(Arc::<QuietCount>::clone(&second)),
+        Err(QuietWakeTaken)
+    );
+    assert_eq!(
+        QuietWakeTaken.to_string(),
+        "the GPU front already tells another listener when it ends a turn idle"
+    );
+    let before = first.count();
+    // A request the front takes in a turn of its own, which ends idle.
+    r.space();
+    wait_until("the front reports quiet after the request's turn", || {
+        first.count() > before
+    });
+    assert_eq!(second.count(), 0);
+    r.gpu.stop().unwrap();
+}

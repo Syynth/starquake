@@ -177,6 +177,18 @@
 //! (`a_graphics_server_with_a_busy_gpu_is_not_idle` pins only that a busy GPU makes the server
 //! busy).
 //!
+//! The core loop asks [`Graphics::idleness`], which is [`Graphics::is_idle`] with the busy
+//! answer split in two: [`Idleness::GpuBusy`] when everything but the GPU is idle and the GPU
+//! answered busy, [`Idleness::Busy`] when anything else is busy. The rest is asked whatever the
+//! GPU answered, so that a run stalled but for the GPU's answer can be asked again at the GPU's
+//! next quiet signal (`crate::machine`'s `cores` module, "Telling a stalled run"; gpu-protocol,
+//! "Idleness"). The null front never answers `GpuBusy` (`the_null_front_is_never_gpu_busy`);
+//! the split itself is pinned by `idleness_is_gpu_busy_only_when_the_gpu_alone_is_busy`, and,
+//! with the GPU, by `a_graphics_server_with_a_busy_gpu_is_not_idle` (a stopped GPU alone reads
+//! `GpuBusy`) and `a_graphics_server_over_an_idle_gpu_becomes_idle_and_a_queued_completion_reads_busy`
+//! (an idle GPU's server becomes `Idle`, and a queued completion reads `Busy` whatever the GPU
+//! answers).
+//!
 //! # Replay
 //!
 //! The spec's replay: "a fake `GpuFront` takes submissions, and the recorded notes are fed back
@@ -437,6 +449,30 @@ pub struct GpuParts {
     pub watch: Arc<WriteWatch>,
     /// The GPU's settings.
     pub config: GpuConfig,
+}
+
+/// What [`Graphics::idleness`] found (module docs, "Telling a stalled run").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Idleness {
+    /// Nothing left could signal an event without a guest's call first: what
+    /// [`Graphics::is_idle`] calls idle.
+    Idle,
+    /// Everything but the GPU is idle, and the GPU answered busy: a question that can be asked
+    /// again when the GPU next reports quiet (gpu-protocol, "Idleness").
+    GpuBusy,
+    /// Something besides the GPU is busy; the GPU may be busy too.
+    Busy,
+}
+
+/// The graphics server's [`Idleness`] from whether the GPU answered busy (`false` with no GPU)
+/// and whether everything else is idle.
+#[must_use]
+pub(crate) const fn idleness(gpu_busy: bool, rest_idle: bool) -> Idleness {
+    match (gpu_busy, rest_idle) {
+        (false, true) => Idleness::Idle,
+        (true, true) => Idleness::GpuBusy,
+        (_, false) => Idleness::Busy,
+    }
 }
 
 /// Why a note could not be fed back ([`Graphics::replay`]).
@@ -707,19 +743,28 @@ impl Graphics {
     /// call first (module docs, "Telling a stalled run"): nothing queued, no request held by the
     /// shared page, no guest signal of the page waiting for its turn, and no vsync tick to come
     /// (in a run the clock stopped, in a replay no tick fed back). It takes gsv's shared lock,
-    /// so it waits for a drain in progress, whose signals are then made.
+    /// so it waits for a drain in progress, whose signals are then made. It does so even when
+    /// the GPU answered busy ([`Graphics::idleness`]): before the GPU's answer was told apart, a
+    /// busy GPU returned at once, without the lock.
     #[must_use]
     pub fn is_idle(&self) -> bool {
+        self.idleness() == Idleness::Idle
+    }
+
+    /// [`Graphics::is_idle`], saying whether a busy answer came from the GPU alone (module docs,
+    /// "Telling a stalled run"): the GPU is asked first, then the rest is asked whatever the
+    /// GPU answered. So gsv's shared lock is taken, and a drain in progress waited for, even
+    /// when the GPU answered busy.
+    #[must_use]
+    pub fn idleness(&self) -> Idleness {
         // The GPU first: a completion it pushes while this asks is then seen as work in flight
         // or found queued below (module docs, "Telling a stalled run").
-        if self.gpu.as_ref().is_some_and(|gpu| !gpu.is_idle()) {
-            return false;
-        }
+        let gpu_busy = self.gpu.as_ref().is_some_and(|gpu| !gpu.is_idle());
         let ticking = match self.mode {
             FrontMode::Live => self.shared.vsync_deadline().is_some(),
             FrontMode::Replay => false,
         };
-        !ticking && self.is_idle_but_the_clock()
+        idleness(gpu_busy, !ticking && self.is_idle_but_the_clock())
     }
 
     /// Whether the timer thread should run [`Graphics::turn`] at `now`, the loop's own reading
