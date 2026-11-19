@@ -16,6 +16,7 @@ workspace = true
 test-support = []
 
 [dependencies]
+starquake-layout.workspace = true
 starquake-memory.workspace = true
 starquake-shader.workspace = true
 starquake-render.workspace = true

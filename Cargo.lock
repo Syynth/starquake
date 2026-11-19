@@ -1133,6 +1133,7 @@ dependencies = [
  "postcard",
  "proptest",
  "serde",
+ "starquake-layout",
  "starquake-memory",
  "starquake-render",
  "starquake-shader",

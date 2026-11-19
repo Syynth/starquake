@@ -486,8 +486,13 @@ pub enum EncodeError {
     },
 }
 
-/// Decodes a host-encoded reduction (shared by `SEMAPHORED` and `SEM_EXECUTE`).
-fn host_reduction(word: &'static str, op: u32, format: u32) -> Result<Reduction, DecodeError> {
+/// Decodes a host-encoded reduction (shared by `SEMAPHORED`, `SEM_EXECUTE` and the DMA copy
+/// class's `LAUNCH_DMA`, whose `IMIN` to `DEC` take the same values).
+pub(crate) fn host_reduction(
+    word: &'static str,
+    op: u32,
+    format: u32,
+) -> Result<Reduction, DecodeError> {
     let op = match op {
         HOST_REDUCTION_MIN => ReductionOp::Min,
         HOST_REDUCTION_MAX => ReductionOp::Max,
