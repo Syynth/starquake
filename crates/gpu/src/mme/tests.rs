@@ -12,13 +12,13 @@ use proptest::prelude::*;
 use proptest::test_runner::{Config, RngSeed};
 
 use super::testing::{
-    DMA_FIFOED_METHOD, DMA_RAM_METHOD, Host, add_imm, alu, branch, finish, inst0, inst01, jal, loop_, merge, mov,
-    mov_reg, op3, r, run_program, store, with_imm, with_out,
+    DMA_FIFOED_METHOD, DMA_RAM_METHOD, Host, add_imm, alu, branch, finish, inst0, inst01, jal,
+    loop_, merge, mov, mov_reg, op3, r, run_program, store, with_imm, with_out,
 };
 use super::{
-    Alu, AluOp, DATA_RAM_WORDS, DataRam, DataRamLoad, MacroHost, DecodeError, EncodeError, GPR_COUNT, INSTRUCTION_WORDS,
-    Instruction, LOAD_BARRIER, METHOD_MASK, MacroError, Out, OutOp, Pred, Reg, StepLimit,
-    decode_program, encode_program, inst, run,
+    Alu, AluOp, DATA_RAM_WORDS, DataRam, DataRamLoad, DecodeError, EncodeError, GPR_COUNT,
+    INSTRUCTION_WORDS, Instruction, LOAD_BARRIER, METHOD_MASK, MacroError, MacroHost, Out, OutOp,
+    Pred, Reg, StepLimit, decode_program, encode_program, inst, run,
 };
 
 /// The branch offset that ends the macro, as the signed offset the `branch` helper takes.
@@ -1129,6 +1129,19 @@ fn a_data_ram_load_past_the_end_fails_with_the_words_before_it_stored() {
     assert_eq!(word(&ram, end - 1), 0x11);
 }
 
+/// A host that keeps the default `data_ram_load`.
+struct Plain;
+
+impl MacroHost for Plain {
+    fn load(&mut self) -> Option<u32> {
+        None
+    }
+    fn state(&mut self, _: u16) -> u32 {
+        0
+    }
+    fn method(&mut self, _: u16, _: u32) {}
+}
+
 #[test]
 fn an_empty_data_ram_load_and_the_default_hook_store_nothing() {
     let mut host = Host::default();
@@ -1143,17 +1156,6 @@ fn an_empty_data_ram_load_and_the_default_hook_store_nothing() {
     assert_eq!(ram, DataRam::new());
     assert_eq!(host.ram_load_queries, 1);
 
-    /// A host that keeps the default `data_ram_load`.
-    struct Plain;
-    impl MacroHost for Plain {
-        fn load(&mut self) -> Option<u32> {
-            None
-        }
-        fn state(&mut self, _: u16) -> u32 {
-            0
-        }
-        fn method(&mut self, _: u16, _: u32) {}
-    }
     assert_eq!(Plain.data_ram_load(), None::<DataRamLoad<'_>>);
     let mut ram = DataRam::new();
     run(

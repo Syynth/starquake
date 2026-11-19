@@ -6,7 +6,8 @@ use proptest::test_runner::{Config, RngSeed};
 
 use super::*;
 use crate::mme::testing::{
-    DMA_RAM_METHOD, Host, alu, branch, finish, inst0, mov, mov_reg, op3, r, store, with_imm, with_out,
+    DMA_RAM_METHOD, Host, alu, branch, finish, inst0, mov, mov_reg, op3, r, store, with_imm,
+    with_out,
 };
 use crate::mme::{AluOp, LOAD_BARRIER, OutOp, Reg, run};
 

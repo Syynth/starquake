@@ -403,8 +403,8 @@ fn constants_match_the_references() {
     }
     // An independent derivation: every call method a header can name has its own entry.
     for engine in Engine::ALL {
-        let calls = (crate::channel::METHOD_MAX + 1 - engine.first_macro_method())
-            / engine.call_stride();
+        let calls =
+            (crate::channel::METHOD_MAX + 1 - engine.first_macro_method()) / engine.call_stride();
         assert_eq!(usize::try_from(calls).unwrap(), START_ENTRIES);
     }
     // clc797.h: SET_MME_MEM_ADDRESS_A 0x0550 (UPPER 16:0), _B 0x0554, SET_MME_DATA_RAM_ADDRESS
@@ -441,7 +441,10 @@ fn entries_map_calls_to_the_start_table() {
         assert_eq!(engine.entry(first + 2 * 0x80), Some(0x80));
         // The last entry, from both its methods, and none past it.
         let entries = u32::try_from(START_ENTRIES).unwrap();
-        assert_eq!(engine.entry(first + 2 * (entries - 1)), Some(START_ENTRIES - 1));
+        assert_eq!(
+            engine.entry(first + 2 * (entries - 1)),
+            Some(START_ENTRIES - 1)
+        );
         assert_eq!(
             engine.entry(first + 2 * (entries - 1) + 1),
             Some(START_ENTRIES - 1)
@@ -2515,15 +2518,26 @@ fn a_data_ram_read_with_nothing_pending_lands_at_once() {
     rig.upload(&mut chan, Engine::ThreeD, 0, &ram_read_macro(true), 0);
     rig.take();
     rig.write_memory(SOURCE, &WORDS);
-    let report = rig.call(&mut chan, Engine::ThreeD, 0, &ram_parameters(SOURCE, RAM_AT, 3));
+    let report = rig.call(
+        &mut chan,
+        Engine::ThreeD,
+        0,
+        &ram_parameters(SOURCE, RAM_AT, 3),
+    );
     assert_eq!(
         report.result,
         CallResult::Committed(CallOutcome::NotStored(NotMemoised::DataRamLoad))
     );
     assert_eq!(rig.back.queries.get(), 1);
     // The exact words at the exact place, and nothing on either side.
-    assert_eq!(ram_words(&chan, RAM_AT - 1, 5), [0, WORDS[0], WORDS[1], WORDS[2], 0]);
-    assert_eq!(chan.macros.data_ram().get(u32::from(SCRATCH_WORD)), Some(0x55));
+    assert_eq!(
+        ram_words(&chan, RAM_AT - 1, 5),
+        [0, WORDS[0], WORDS[1], WORDS[2], 0]
+    );
+    assert_eq!(
+        chan.macros.data_ram().get(u32::from(SCRATCH_WORD)),
+        Some(0x55)
+    );
     // The macro's DREAD right after the write saw the first word, without a barrier.
     let sent = rig.take();
     assert_eq!(
@@ -2569,7 +2583,10 @@ fn a_data_ram_read_with_pending_back_work_commits_nothing_and_reruns_after_the_c
     // The rerun read without asking the back again, although it still says it is busy.
     assert_eq!(rig.back.queries.get(), 1);
     assert_eq!(ram_words(&chan, RAM_AT, 3), WORDS);
-    assert_eq!(chan.macros.data_ram().get(u32::from(SCRATCH_WORD)), Some(0x55));
+    assert_eq!(
+        chan.macros.data_ram().get(u32::from(SCRATCH_WORD)),
+        Some(0x55)
+    );
     let sent = rig.take();
     assert_eq!(
         sent.last(),
@@ -2616,7 +2633,12 @@ fn an_empty_data_ram_read_reads_nothing_asks_nothing_and_is_not_remembered() {
     rig.back.busy.set(true);
     for index in [RAM_AT, u32::MAX] {
         let unmapped = GPU_BASE + PAGES * PAGE_SIZE;
-        let report = rig.call(&mut chan, Engine::ThreeD, 0, &ram_parameters(unmapped, index, 0));
+        let report = rig.call(
+            &mut chan,
+            Engine::ThreeD,
+            0,
+            &ram_parameters(unmapped, index, 0),
+        );
         assert_eq!(
             report.result,
             CallResult::Committed(CallOutcome::NotStored(NotMemoised::DataRamLoad))
@@ -2668,7 +2690,12 @@ fn ram_read(index: u32, words: u32) -> (CallResult, Chan, Vec<RingEntry<'static>
     rig.upload(&mut chan, Engine::ThreeD, 0, &ram_read_macro(false), 0);
     rig.take();
     rig.write_memory(GPU_BASE, &WORDS);
-    let report = rig.call(&mut chan, Engine::ThreeD, 0, &ram_parameters(GPU_BASE, index, words));
+    let report = rig.call(
+        &mut chan,
+        Engine::ThreeD,
+        0,
+        &ram_parameters(GPU_BASE, index, words),
+    );
     (report.result, chan, rig.take())
 }
 
@@ -2687,7 +2714,10 @@ fn a_data_ram_read_past_the_end_fails_the_call() {
     // Ending exactly at the end: stored, the last word in data RAM's last word.
     let (result, chan, _) = ram_read(end - 3, 3);
     assert_eq!(result, loaded);
-    assert_eq!(ram_words(&chan, end - 4, 4), [0, WORDS[0], WORDS[1], WORDS[2]]);
+    assert_eq!(
+        ram_words(&chan, end - 4, 4),
+        [0, WORDS[0], WORDS[1], WORDS[2]]
+    );
     // One word more: refused, and nothing stored or sent, the scratch word included.
     let (result, chan, sent) = ram_read(end - 3, 4);
     assert_eq!(result, out_of_range(end - 3, 4));
@@ -2704,7 +2734,10 @@ fn a_data_ram_read_past_the_end_fails_the_call() {
     // A length with a high byte, at the edge on both sides.
     let length = 0x102;
     assert_eq!(ram_read(end - length, length).0, loaded);
-    assert_eq!(ram_read(end - length + 1, length).0, out_of_range(end - length + 1, length));
+    assert_eq!(
+        ram_read(end - length + 1, length).0,
+        out_of_range(end - length + 1, length)
+    );
     // The length is cut to DMA_READ_MAX_WORDS before the check, as for a load-FIFO read.
     assert_eq!(ram_read(0, u32::MAX).0, out_of_range(0, DMA_READ_MAX_WORDS));
 }
@@ -2730,7 +2763,12 @@ fn an_unreadable_data_ram_read_fails_the_call() {
     rig.take();
     let before = snapshot(&chan.three_d);
     let end = GPU_BASE + PAGES * PAGE_SIZE;
-    let report = rig.call(&mut chan, Engine::ThreeD, 0, &ram_parameters(end - 4, RAM_AT, 2));
+    let report = rig.call(
+        &mut chan,
+        Engine::ThreeD,
+        0,
+        &ram_parameters(end - 4, RAM_AT, 2),
+    );
     assert_eq!(
         report.result,
         CallResult::Failed {
@@ -2749,7 +2787,12 @@ fn an_unreadable_data_ram_read_fails_the_call() {
     assert_eq!(memo_len(&rig, Engine::ThreeD), 0);
     // Ending exactly at the mapping's end reads.
     rig.write_memory(end - 8, &[0x81, 0x82]);
-    let report = rig.call(&mut chan, Engine::ThreeD, 0, &ram_parameters(end - 8, RAM_AT, 2));
+    let report = rig.call(
+        &mut chan,
+        Engine::ThreeD,
+        0,
+        &ram_parameters(end - 8, RAM_AT, 2),
+    );
     assert!(matches!(report.result, CallResult::Committed(_)));
     assert_eq!(ram_words(&chan, RAM_AT, 2), [0x81, 0x82]);
 }
@@ -2772,8 +2815,13 @@ fn fifo_then_ram(rig: &mut Rig, address: u64, fifo: u32, index: u32, words: u32)
     rig.upload(&mut chan, Engine::ThreeD, 0, &fifo_then_ram_macro(), 0);
     rig.take();
     let [upper, lower, _] = source_parameters(address, 0);
-    rig.call(&mut chan, Engine::ThreeD, 0, &[upper, lower, fifo, index, words])
-        .result
+    rig.call(
+        &mut chan,
+        Engine::ThreeD,
+        0,
+        &[upper, lower, fifo, index, words],
+    )
+    .result
 }
 
 #[test]
@@ -2781,7 +2829,10 @@ fn data_ram_reads_count_toward_the_runs_dma_bound() {
     let loaded = CallResult::Committed(CallOutcome::NotStored(NotMemoised::DataRamLoad));
     let ram = 0x10;
     let fifo = DMA_RUN_MAX_WORDS - ram;
-    assert_eq!(fifo_then_ram(&mut make_rig(), GPU_BASE, fifo, 0, ram), loaded);
+    assert_eq!(
+        fifo_then_ram(&mut make_rig(), GPU_BASE, fifo, 0, ram),
+        loaded
+    );
     assert_eq!(
         fifo_then_ram(&mut make_rig(), GPU_BASE, fifo, 0, ram + 1),
         CallResult::Failed {
@@ -2847,7 +2898,12 @@ fn data_ram_read_checks_come_in_their_documented_order() {
     rig.take();
     rig.back.busy.set(true);
     let unmapped = GPU_BASE + PAGES * PAGE_SIZE;
-    let report = rig.call(&mut chan, Engine::ThreeD, 0, &ram_parameters(unmapped, 0, 1));
+    let report = rig.call(
+        &mut chan,
+        Engine::ThreeD,
+        0,
+        &ram_parameters(unmapped, 0, 1),
+    );
     assert_eq!(report.result, CallResult::CatchUp);
     assert_eq!(rig.back.queries.get(), 1);
     let report = rig.resume(&mut chan, Engine::ThreeD).unwrap();
@@ -2925,7 +2981,12 @@ fn data_ram_reads_are_3d_only_and_land_in_the_data_ram_compute_shares() {
         1,
     );
     rig.take();
-    rig.call(&mut chan, Engine::ThreeD, 0, &ram_parameters(SOURCE, 0x30, 2));
+    rig.call(
+        &mut chan,
+        Engine::ThreeD,
+        0,
+        &ram_parameters(SOURCE, 0x30, 2),
+    );
     let report = rig.call(&mut chan, Engine::Compute, 1, &[0]);
     assert!(matches!(report.result, CallResult::Committed(_)));
     assert_eq!(
