@@ -343,6 +343,7 @@ impl Capture {
     ///
     /// The reference then finds the tables again in the extended code and reads their words
     /// once more, keeping the first base; [`Capture::jump_targets`] serves that second read.
+    #[must_use]
     pub fn resolve_jump_tables<R: ProgramReader + ?Sized>(
         &mut self,
         reader: &R,
@@ -380,6 +381,7 @@ impl Capture {
 
     /// The distinct instruction indices inside the capture that `values` name with `base`,
     /// ascending (the reference's last loop over `result.tables`).
+    #[must_use]
     pub fn jump_targets(&self, base: u32, values: &[u32]) -> Vec<u32> {
         let count = self.instruction_count();
         let mut targets: Vec<u32> = values
@@ -395,6 +397,7 @@ impl Capture {
     /// Reads on from the capture's end until an instruction ends the program past instruction
     /// `furthest`, or leaves the capture as it was (`ResolveCaptureIndirectBranches`' extension
     /// loop).
+    #[must_use]
     pub(crate) fn extend_through<R: ProgramReader + ?Sized>(
         &mut self,
         reader: &R,
