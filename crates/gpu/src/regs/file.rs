@@ -165,17 +165,19 @@ impl Journal {
 }
 
 impl RegFile {
-    /// A file of zeroed registers (and a zeroed shadow file, so the shadow RAM starts in
-    /// [`ShadowMode::Track`], as Eden's zero-initialised `shadow_state` does) for class `class`
+    /// A file of the class's starting values ([`ClassRules::initial_values`], all zero today),
+    /// with a shadow file holding the same values (so the shadow RAM starts in
+    /// [`ShadowMode::Track`], as Eden's zero-initialised `shadow_state` does), for class `class`
     /// on channel `channel`, with the rules [`ClassRules::for_class`] picks and same-value
     /// dropping on.
     pub fn new(channel: ChannelId, class: ClassId) -> Self {
         let rules = ClassRules::for_class(class);
         let registers = usize::try_from(rules.registers()).unwrap_or(0);
+        let values = rules.initial_values();
         let shadow = if rules.shadow_control().is_some() {
-            registers
+            values.clone()
         } else {
-            0
+            Box::default()
         };
         let mut state = vec![0u64; registers.div_ceil(STATE_WORD_BITS)].into_boxed_slice();
         for number in rules.state().iter().flat_map(MethodSpan::numbers) {
@@ -190,8 +192,8 @@ impl RegFile {
             channel,
             class,
             rules,
-            values: vec![0; registers].into_boxed_slice(),
-            shadow: vec![0; shadow].into_boxed_slice(),
+            values,
+            shadow,
             state,
             drop_same_values: true,
             run: Vec::new(),
