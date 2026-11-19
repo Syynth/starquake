@@ -194,7 +194,7 @@ impl Back {
     fn handle(&mut self, entry: RingEntry<'static>) {
         {
             match &entry {
-                RingEntry::Release(release) => {
+                RingEntry::Release { release, .. } => {
                     let action = FencedAction::Release {
                         memory: Arc::<Memory>::clone(&self.memory),
                         space: SPACE,

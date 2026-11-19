@@ -412,6 +412,7 @@ impl Front {
                 ticket,
             } => {
                 let change = self.spaces.get(&space).map(|known| VmChange {
+                    space,
                     vm: Arc::clone(&known.vm),
                     update,
                 });

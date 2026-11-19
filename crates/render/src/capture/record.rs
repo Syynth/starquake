@@ -302,6 +302,7 @@ impl CapturedTarget {
     pub const fn of(target: &PresentTarget) -> Self {
         match target {
             PresentTarget::Offscreen => Self::Offscreen,
+            PresentTarget::Window(_) => Self::Window,
         }
     }
 }

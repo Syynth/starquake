@@ -3,6 +3,7 @@
 //! completion queue and the front's wake-up. Every wait is bounded.
 
 mod production;
+mod seams;
 mod waiters;
 
 use std::collections::VecDeque;
@@ -103,10 +104,10 @@ fn within<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> T {
 
 /// A settable clock whose timestamps read [`TIMESTAMP`].
 #[derive(Default)]
-struct Clock(Mutex<Duration>);
+pub(crate) struct Clock(Mutex<Duration>);
 
 impl Clock {
-    fn set(&self, now: Duration) {
+    pub(crate) fn set(&self, now: Duration) {
         *self.0.lock().unwrap() = now;
     }
 }
@@ -122,7 +123,7 @@ impl FenceClock for Clock {
 
 /// gsv's completion queue, recorded.
 #[derive(Default)]
-struct Pushed(Mutex<Vec<GpuCompletion>>);
+pub(crate) struct Pushed(Mutex<Vec<GpuCompletion>>);
 
 impl Pushed {
     fn all(&self) -> Vec<GpuCompletion> {
@@ -138,7 +139,7 @@ impl Completions for Pushed {
 
 /// The front's wake-up, recorded.
 #[derive(Default)]
-struct Front(Mutex<Vec<Report>>);
+pub(crate) struct Front(Mutex<Vec<Report>>);
 
 impl Front {
     fn all(&self) -> Vec<Report> {
@@ -208,8 +209,8 @@ struct LateState {
 /// values can be scripted out of order ([`LateBackend::script`]); [`LateBackend::refuse_next`]
 /// refuses one list (after which the next is accepted); and [`LateBackend::finish_silently`]
 /// completes without the wake, to play a backend that breaks the contract.
-struct LateBackend {
-    inner: RecordingBackend,
+pub(crate) struct LateBackend {
+    pub(crate) inner: RecordingBackend,
     state: Mutex<LateState>,
     moved: Condvar,
     wake: CompletionWake,
@@ -217,8 +218,14 @@ struct LateBackend {
 
 impl LateBackend {
     fn new(wake: CompletionWake) -> Self {
+        Self::with_caps(caps(), 0, wake)
+    }
+
+    /// A late backend with `caps` and a memory budget of `memory_allowed` bytes (the executor's
+    /// tests, slice G19, draw through it).
+    pub(crate) fn with_caps(caps: Caps, memory_allowed: u64, wake: CompletionWake) -> Self {
         Self {
-            inner: RecordingBackend::new(caps(), 0),
+            inner: RecordingBackend::new(caps, memory_allowed),
             state: Mutex::new(LateState::default()),
             moved: Condvar::new(),
             wake,
@@ -237,7 +244,7 @@ impl LateBackend {
         self.state().refuse_next = true;
     }
 
-    fn submitted(&self) -> Vec<FenceValue> {
+    pub(crate) fn submitted(&self) -> Vec<FenceValue> {
         self.state().submitted.clone()
     }
 
@@ -247,7 +254,7 @@ impl LateBackend {
     }
 
     /// Completes everything up to `fence`, then wakes.
-    fn finish(&self, fence: FenceValue) {
+    pub(crate) fn finish(&self, fence: FenceValue) {
         self.set_completed(fence);
         self.wake.wake();
     }
@@ -466,6 +473,8 @@ fn a_new_fence_path_has_nothing_recorded_in_flight_or_counted() {
                 waiter: 0,
                 elapsed: 0,
                 set_reference: 0,
+                catch_up: 0,
+                channel_removed: 0,
             },
             lost_wakes: 0,
             failed_releases: 0,
@@ -555,6 +564,7 @@ fn nothing_is_visible_before_its_list_completes() {
         token: MarkerToken(7),
         ordered: Some(OrderedUpdate {
             change: Some(VmChange {
+                space: SPACE,
                 vm: Arc::clone(&vm),
                 update: VmUpdate::Unmap {
                     range: PageRange::new(vm_base, PAGE_SIZE).unwrap(),
@@ -754,6 +764,8 @@ fn each_close_reason_is_counted_on_its_own() {
         CloseReason::Waiter,
         CloseReason::Elapsed,
         CloseReason::SetReference,
+        CloseReason::CatchUp,
+        CloseReason::ChannelRemoved,
     ];
     for reason in reasons {
         let mut r = rig();
@@ -767,6 +779,8 @@ fn each_close_reason_is_counted_on_its_own() {
             CloseReason::Waiter => expected.waiter = 1,
             CloseReason::Elapsed => expected.elapsed = 1,
             CloseReason::SetReference => expected.set_reference = 1,
+            CloseReason::CatchUp => expected.catch_up = 1,
+            CloseReason::ChannelRemoved => expected.channel_removed = 1,
         }
         assert_eq!(r.fences.counters().closed, expected, "{reason:?}");
     }
@@ -1393,6 +1407,7 @@ fn an_ordered_update_is_applied_before_its_report() {
         token: MarkerToken(1),
         ordered: Some(OrderedUpdate {
             change: Some(VmChange {
+                space: SPACE,
                 vm: Arc::clone(&vm),
                 update: VmUpdate::DestroyMemory {
                     range: PageRange::new(GPU_BASE, PAGE_SIZE).unwrap(),
@@ -1440,6 +1455,7 @@ fn markers_report_their_token_and_only_what_they_carry() {
             MarkerToken(3),
             Some(OrderedUpdate {
                 change: Some(VmChange {
+                    space: SPACE,
                     vm: Arc::clone(&vm),
                     update: unmap,
                 }),

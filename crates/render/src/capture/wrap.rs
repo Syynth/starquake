@@ -425,9 +425,10 @@ impl Backend for CapturingBackend {
 
     fn set_present_target(&self, target: PresentTarget) -> Result<(), RenderError> {
         self.recorded(|_| {
+            let captured = CapturedTarget::of(&target);
             let result = self.inner.set_present_target(target);
             let rec = Record::PresentTarget(TargetRecord {
-                target: CapturedTarget::of(&target),
+                target: captured,
                 result: Created::of(&result),
             });
             (result, Some(rec))

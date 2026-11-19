@@ -31,7 +31,11 @@
 //!   unchanged; Eden's `ReadBlock` reads whatever the memory manager gives.
 //!
 //! The catch-up the spec asks for "when that value is still pending" (a release not yet
-//! performed will write it) is the executor's (slice G19): this reads guest memory as it is.
+//! performed will write it) is the executor's (slice G19, `back::exec`): before it hands the
+//! draw path a `SET_RENDER_ENABLE_C` word, it makes every pending release of [`report_range`]
+//! visible. This reads guest memory as it is.
+
+use core::ops::Range;
 
 use super::DrawError;
 use super::shaders::read_words;
@@ -42,18 +46,39 @@ use crate::memory::GpuMemory;
 /// Words in the report a conditional mode reads (Eden's `ReportSemaphore::Compare`).
 pub const REPORT_WORDS: usize = 6;
 
-/// Whether the next draw renders (module docs).
-pub fn render_enabled<M: GpuMemory + ?Sized>(
-    mirror: &Mirror,
-    memory: &M,
-) -> Result<bool, DrawError> {
+/// The bytes of the report `SET_RENDER_ENABLE_C`'s mode reads ([`REPORT_WORDS`] words at
+/// `SET_RENDER_ENABLE_A/B`), for a mode that reads one; `None` when the override or the mode
+/// decides alone, when a field holds a value the header does not define (the draw path then
+/// refuses the mode), or when the report would run past the end of the address space.
+pub fn report_range(mirror: &Mirror) -> Option<Range<u64>> {
+    let Ok(Decision::Report { address, .. }) = decide(mirror) else {
+        return None;
+    };
+    let bytes = u64::try_from(REPORT_WORDS * size_of::<u32>()).ok()?;
+    Some(address..address.checked_add(bytes)?)
+}
+
+/// What decides the next draw: the override or the mode alone, or a report in memory.
+enum Decision {
+    /// The override or the mode decides.
+    Decided(bool),
+    /// The report at `address` decides, compared as `mode` says.
+    Report { mode: u32, address: u64 },
+}
+
+/// The override and the mode, read from the mirror (module docs).
+fn decide(mirror: &Mirror) -> Result<Decision, DrawError> {
     let override_mode = mirror
         .reg(&clc797::SET_RENDER_ENABLE_OVERRIDE, &[])?
         .named(clc797::SET_RENDER_ENABLE_OVERRIDE_MODE)?
         .value;
     match override_mode {
-        clc797::SET_RENDER_ENABLE_OVERRIDE_MODE_ALWAYS_RENDER => return Ok(true),
-        clc797::SET_RENDER_ENABLE_OVERRIDE_MODE_NEVER_RENDER => return Ok(false),
+        clc797::SET_RENDER_ENABLE_OVERRIDE_MODE_ALWAYS_RENDER => {
+            return Ok(Decision::Decided(true));
+        }
+        clc797::SET_RENDER_ENABLE_OVERRIDE_MODE_NEVER_RENDER => {
+            return Ok(Decision::Decided(false));
+        }
         _ => {}
     }
     let mode = mirror
@@ -61,8 +86,8 @@ pub fn render_enabled<M: GpuMemory + ?Sized>(
         .named(clc797::SET_RENDER_ENABLE_C_MODE)?
         .value;
     match mode {
-        clc797::SET_RENDER_ENABLE_C_MODE_TRUE => return Ok(true),
-        clc797::SET_RENDER_ENABLE_C_MODE_FALSE => return Ok(false),
+        clc797::SET_RENDER_ENABLE_C_MODE_TRUE => return Ok(Decision::Decided(true)),
+        clc797::SET_RENDER_ENABLE_C_MODE_FALSE => return Ok(Decision::Decided(false)),
         _ => {}
     }
     let upper = mirror
@@ -72,6 +97,18 @@ pub fn render_enabled<M: GpuMemory + ?Sized>(
         .reg(&clc797::SET_RENDER_ENABLE_B, &[])?
         .field(clc797::SET_RENDER_ENABLE_B_OFFSET_LOWER)?;
     let address = (u64::from(upper) << u32::BITS) | u64::from(lower);
+    Ok(Decision::Report { mode, address })
+}
+
+/// Whether the next draw renders (module docs).
+pub fn render_enabled<M: GpuMemory + ?Sized>(
+    mirror: &Mirror,
+    memory: &M,
+) -> Result<bool, DrawError> {
+    let (mode, address) = match decide(mirror)? {
+        Decision::Decided(renders) => return Ok(renders),
+        Decision::Report { mode, address } => (mode, address),
+    };
     let [
         initial_sequence,
         initial_mode,

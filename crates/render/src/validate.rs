@@ -54,7 +54,11 @@ use crate::command::{
 };
 use crate::error::RenderError;
 use crate::format::{FormatAspect, PixelFormat};
-use crate::pipeline::{GraphicsPipelineDesc, PolygonMode, RasterState, Topology, VertexLayout};
+use crate::id::ShaderId;
+use crate::pipeline::{
+    ComputePipelineDesc, GraphicsPipelineDesc, PolygonMode, RasterState, Stages, Topology,
+    VertexLayout,
+};
 use crate::resource::{
     AddressMode, BorderColor, BufferDesc, Extent3d, ReductionMode, SamplerDesc, TextureDesc,
     TextureDimension, TextureUsage, ViewDesc, ViewDimension,
@@ -571,6 +575,71 @@ pub fn validate_graphics_pipeline(
         require(caps, Features::LOGIC_OP, "logic operations")?;
     }
     Ok(())
+}
+
+/// A pipeline names a shader id that no live shader has.
+pub const NO_SHADER: &str = "no live shader has this id";
+
+/// A call names a pipeline id that no live pipeline has.
+pub const NO_PIPELINE: &str = "no live pipeline has this id";
+
+/// Checks that each shader a graphics pipeline names is live and was created for the stage it
+/// fills, in the order vertex, tessellation control, tessellation evaluation, geometry,
+/// fragment; `stage_of` gives a live shader's stage, or the error for an id that names none.
+/// Every backend's `create_graphics_pipeline` calls it, after [`validate_graphics_pipeline`].
+pub fn validate_pipeline_stages(
+    stages: &Stages,
+    mut stage_of: impl FnMut(ShaderId) -> Result<ShaderStage, RenderError>,
+) -> Result<(), RenderError> {
+    for (id, stage, wrong) in [
+        (
+            Some(stages.vertex),
+            ShaderStage::Vertex,
+            "a pipeline's vertex shader is not a vertex shader",
+        ),
+        (
+            stages.tess_control,
+            ShaderStage::TessControl,
+            "a pipeline's tessellation control shader is not one",
+        ),
+        (
+            stages.tess_eval,
+            ShaderStage::TessEval,
+            "a pipeline's tessellation evaluation shader is not one",
+        ),
+        (
+            stages.geometry,
+            ShaderStage::Geometry,
+            "a pipeline's geometry shader is not a geometry shader",
+        ),
+        (
+            stages.fragment,
+            ShaderStage::Fragment,
+            "a pipeline's fragment shader is not a fragment shader",
+        ),
+    ] {
+        if let Some(id) = id
+            && stage_of(id)? != stage
+        {
+            return Err(RenderError::Invalid(wrong));
+        }
+    }
+    Ok(())
+}
+
+/// Checks that a compute pipeline's shader is live and a compute shader, as
+/// [`validate_pipeline_stages`] does for a graphics pipeline.
+pub fn validate_compute_stage(
+    desc: &ComputePipelineDesc,
+    stage_of: impl FnOnce(ShaderId) -> Result<ShaderStage, RenderError>,
+) -> Result<(), RenderError> {
+    if stage_of(desc.shader)? == ShaderStage::Compute {
+        Ok(())
+    } else {
+        Err(RenderError::Invalid(
+            "a compute pipeline's shader is not a compute shader",
+        ))
+    }
 }
 
 /// Tessellation in pairs and with patches; optional stages supported.

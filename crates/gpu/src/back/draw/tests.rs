@@ -132,7 +132,7 @@ fn memory() -> Memory {
 }
 
 /// The exit-only program, translated for `stage`: a real host shader for the fake cache's sets.
-fn host_shader(stage: GuestStage) -> HostShader {
+pub(crate) fn host_shader(stage: GuestStage) -> HostShader {
     let code = assemble_program(&[Instr::new(Op::Exit(OpExit {
         keep_ref_count: false,
         no_at_exit: false,

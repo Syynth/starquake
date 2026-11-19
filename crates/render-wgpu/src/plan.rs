@@ -42,7 +42,8 @@ use starquake_render::{
 use std::collections::BTreeSet;
 
 /// A list with a blit.
-pub const BLITS_NOT_YET: &str = "the wgpu backend cannot blit yet (pipelines arrive with slice R6)";
+pub const BLITS_NOT_YET: &str =
+    "the wgpu backend cannot blit yet (blits need the host shaders' pipelines, a later slice)";
 /// A list with a draw or a dispatch.
 pub const DRAWS_NOT_YET: &str =
     "the wgpu backend cannot draw or dispatch yet (draws arrive with slice R7)";
@@ -289,12 +290,17 @@ pub enum Step {
         /// What is read.
         from: ReadFrom,
     },
-    /// A present to the offscreen target.
+    /// A present: counted on the offscreen target, blitted into a window (`crate::window`).
     Present {
         /// The command.
         desc: PresentDesc,
         /// The view's format.
         format: PixelFormat,
+        /// The view's format in wgpu's terms, which the window blit copies and samples as.
+        host: wgpu::TextureFormat,
+        /// The presented rectangle in the view's base level and layer (slice 0 of a 3D
+        /// texture), rounded out to whole blocks: what the window blit copies.
+        source: TexelBox,
         /// What a dumped frame reads, or `None` when the frame is not dumped, its format is
         /// compressed, or its padded read would not fit the largest buffer (then a dump's
         /// pixels are unknown).
@@ -444,10 +450,10 @@ fn clear_step(tables: &Tables, clear: &ClearDesc) -> Result<Step, RenderError> {
     }))
 }
 
-/// The step for a present: what a dumped frame reads, from the view's base level at its base
-/// layer (slice 0 of a 3D texture), as the recording backend reads it. A dump whose padded read
-/// would not fit the largest buffer (`rules::check_read_size`) reads nothing, and its pixels
-/// are reported unknown.
+/// The step for a present: the presented rectangle in the view's base level at its base layer
+/// (slice 0 of a 3D texture), which a window blit copies and a dumped frame reads, as the
+/// recording backend reads it. A dump whose padded read would not fit the largest buffer
+/// (`rules::check_read_size`) reads nothing, and its pixels are reported unknown.
 fn present_step(tables: &Tables, caps: &Caps, present: PresentDesc) -> Result<Step, RenderError> {
     let (view, tex) = tables.view(present.view)?;
     validate::validate_present(
@@ -458,34 +464,37 @@ fn present_step(tables: &Tables, caps: &Caps, present: PresentDesc) -> Result<St
         &present,
     )?;
     let format = view.desc.format;
+    let host = host_format(format)?;
+    let z = if tex.desc.dimension == TextureDimension::D3 {
+        0
+    } else {
+        view.desc.base_layer
+    };
+    let r = present.src_rect;
+    let region = TextureRegion {
+        texture: view.texture,
+        mip: view.desc.base_mip,
+        origin: Origin3d { x: r.x, y: r.y, z },
+        extent: Extent3d {
+            width: r.width,
+            height: r.height,
+            depth_or_layers: 1,
+        },
+    };
+    let (source, rows) = texel_box(format, &region)?;
     let read = if present.dump && !format.is_compressed() {
-        let z = if tex.desc.dimension == TextureDimension::D3 {
-            0
-        } else {
-            view.desc.base_layer
-        };
-        let r = present.src_rect;
-        let region = TextureRegion {
-            texture: view.texture,
-            mip: view.desc.base_mip,
-            origin: Origin3d { x: r.x, y: r.y, z },
-            extent: Extent3d {
-                width: r.width,
-                height: r.height,
-                depth_or_layers: 1,
-            },
-        };
-        let (at, rows) = texel_box(format, &region)?;
         let max = caps.limits.max_buffer_size;
         rules::check_read_size(rows.row_bytes, rows.rows, rows.images, max)
             .ok()
-            .map(|()| (at, rows))
+            .map(|()| (source, rows))
     } else {
         None
     };
     Ok(Step::Present {
         desc: present,
         format,
+        host,
+        source,
         read,
     })
 }

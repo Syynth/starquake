@@ -245,9 +245,9 @@ pub const INLINE_TO_MEMORY_SUBCHANNEL: u8 = 2;
 /// The class a fresh channel has bound on `subchannel`: inline-to-memory (`0xA140`,
 /// `classes/cla140.h`) on [`INLINE_TO_MEMORY_SUBCHANNEL`], nothing elsewhere.
 ///
-/// The intended contract, not yet in force: the back's channel state (slices G10 and G19)
-/// must start from this function, because subchannel 2's starting binding never reaches the
-/// back as a [`RingEntry::Bind`]. Nothing outside this module calls it yet.
+/// The back's channel state starts from this function, because subchannel 2's starting binding
+/// never reaches the back as a [`RingEntry::Bind`]: the executor (slice G19,
+/// `crate::back::exec::Executor::add_channel`) binds each new channel's subchannels with it.
 pub fn initial_binding(subchannel: Subchannel) -> Option<ClassId> {
     (subchannel.get() == INLINE_TO_MEMORY_SUBCHANNEL).then_some(ClassId(cla140::CLASS))
 }

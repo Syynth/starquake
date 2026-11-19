@@ -16,8 +16,8 @@
 //!   [`Producer`] for the front and a [`Consumer`] for the back, with back-pressure and batched
 //!   publishing, and a [`ConsumerWake`] that wakes the back without an entry (slice G15).
 //!
-//! The front loop (G14, [`crate::front`]) pushes into it; the back's executor (G19) is not here
-//! yet.
+//! The front loop (G14, [`crate::front`]) pushes into it; the back's executor (G19,
+//! [`crate::back::exec`]) takes from it.
 
 mod encode;
 mod entry;

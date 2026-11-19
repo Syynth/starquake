@@ -1226,6 +1226,7 @@ dependencies = [
  "png",
  "postcard",
  "proptest",
+ "raw-window-handle",
  "serde",
  "sha2",
  "thiserror",
@@ -1235,6 +1236,8 @@ dependencies = [
 name = "starquake-render-wgpu"
 version = "0.0.0"
 dependencies = [
+ "naga",
+ "objc2",
  "starquake-render",
  "thiserror",
  "tracing",

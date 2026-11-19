@@ -1,8 +1,9 @@
 //! What `core` configures the wgpu backend with, beside the completion wake.
 //!
 //! The spec has `core` pass each backend the compile pool, the wait-while-compiling setting and
-//! the completion wake (docs/specs/render-backend.md, "The trait"); the first two arrive with
-//! pipelines (slice R6). The memory limit stands in for the device's budget until verification 8
+//! the completion wake (docs/specs/render-backend.md, "The trait"); the first two are
+//! arguments of `WgpuBackend::with_compile_pool` (slice R6), since a pool is shared and not a
+//! plain value. The memory limit stands in for the device's budget until verification 8
 //! says what wgpu exposes ("Memory budget and eviction"). None of these is a hidden input: a
 //! backend's results depend only on the trait calls, its `Caps` and this configuration
 //! ("Render capture v2", "What R5 and R6 must do now").
