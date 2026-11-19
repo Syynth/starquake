@@ -44,13 +44,7 @@ enum Shuffle {
 
 /// The source lane and in-range flag of a shuffle run by `lane` (Eden's emitters, see the
 /// module docs).
-fn shuffle_source(
-    kind: Shuffle,
-    lane: u32,
-    index: u32,
-    clamp: u32,
-    segment: u32,
-) -> (u32, bool) {
+fn shuffle_source(kind: Shuffle, lane: u32, index: u32, clamp: u32, segment: u32) -> (u32, bool) {
     let not_segment = !segment;
     let min_lane = lane & segment;
     let max_lane = min_lane | (clamp & not_segment);

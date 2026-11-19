@@ -131,20 +131,23 @@ fn an_index_shuffle_reads_its_lane_in_range() {
         (INACTIVE_LANE_VALUE, true)
     );
     // The comparison is signed: a clamp of all ones is -1, below every lane.
-    assert_eq!(
-        shuffle("ShuffleIndex", 5, 5, 0xffff_ffff, 0),
-        (OWN, false)
-    );
+    assert_eq!(shuffle("ShuffleIndex", 5, 5, 0xffff_ffff, 0), (OWN, false));
 }
 
 #[test]
 fn an_up_shuffle_counts_down_from_its_lane() {
     // Lane 5, clamp 0: in range while the source is at least lane 0.
     assert_eq!(shuffle("ShuffleUp", 5, 0, 0, 0), (OWN, true));
-    assert_eq!(shuffle("ShuffleUp", 5, 5, 0, 0), (INACTIVE_LANE_VALUE, true));
+    assert_eq!(
+        shuffle("ShuffleUp", 5, 5, 0, 0),
+        (INACTIVE_LANE_VALUE, true)
+    );
     assert_eq!(shuffle("ShuffleUp", 5, 6, 0, 0), (OWN, false));
     // Clamp 3: lane 3 is the lowest in range.
-    assert_eq!(shuffle("ShuffleUp", 5, 2, 3, 0), (INACTIVE_LANE_VALUE, true));
+    assert_eq!(
+        shuffle("ShuffleUp", 5, 2, 3, 0),
+        (INACTIVE_LANE_VALUE, true)
+    );
     assert_eq!(shuffle("ShuffleUp", 5, 3, 3, 0), (OWN, false));
     // The delta is taken modulo 32.
     assert_eq!(shuffle("ShuffleUp", 5, 32, 0, 0), (OWN, true));
@@ -194,7 +197,11 @@ fn quad_operations_read_within_the_quad() {
         u32_of(value)
     };
     assert_eq!(broadcast(2), OWN);
-    assert_eq!(broadcast(6), OWN, "only the low two bits of the index count");
+    assert_eq!(
+        broadcast(6),
+        OWN,
+        "only the low two bits of the index count"
+    );
     assert_eq!(broadcast(1), INACTIVE_LANE_VALUE);
     let swap = |direction: u32| {
         let (value, _) = two(
@@ -206,7 +213,11 @@ fn quad_operations_read_within_the_quad() {
         u32_of(value)
     };
     for direction in 0..3 {
-        assert_eq!(swap(direction), INACTIVE_LANE_VALUE, "direction {direction}");
+        assert_eq!(
+            swap(direction),
+            INACTIVE_LANE_VALUE,
+            "direction {direction}"
+        );
     }
     // Eden's fallback flips `direction + 1`, which wraps to 0 here: this lane.
     assert_eq!(swap(u32::MAX), OWN);
@@ -236,7 +247,8 @@ block2:
 
 #[test]
 fn in_bounds_of_anything_but_a_shuffle_is_unsupported() {
-    let text = "block0:\n    %0 = IAdd32 u32 0x1, u32 0x2\n    %1 = GetInBoundsFromOp %0\n    return\n";
+    let text =
+        "block0:\n    %0 = IAdd32 u32 0x1, u32 0x2\n    %1 = GetInBoundsFromOp %0\n    return\n";
     assert_eq!(
         run(text, &mut on_lane(0))
             .err()
