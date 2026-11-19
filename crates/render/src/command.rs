@@ -47,6 +47,12 @@ impl StagingSlice {
         &mut self.bytes
     }
 
+    /// The contents, taken out of the slice; for a backend that keeps the bytes of a submitted
+    /// list without copying them.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
     /// Length in bytes.
     pub const fn len(&self) -> usize {
         self.bytes.len()

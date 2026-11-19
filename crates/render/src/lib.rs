@@ -83,6 +83,7 @@ pub use id::{
     ViewId,
 };
 pub use pipeline::{ComputePipelineDesc, EmulationFlags, GraphicsPipelineDesc};
+pub use recording::slots::Slots;
 pub use recording::{FrameDump, RecordingBackend};
 pub use resource::{BufferDesc, BufferUsage, SamplerDesc, TextureDesc, TextureUsage, ViewDesc};
 pub use shader::{ResourceBinding, ShaderDesc, ShaderInterface, ShaderSource, ShaderStage};

@@ -2967,6 +2967,10 @@ fn error_messages_are_plain_words() {
         RenderError::DeviceLost.to_string(),
         "the host device was lost"
     );
+    assert_eq!(
+        RenderError::Unsupported("the backend cannot draw yet").to_string(),
+        "the backend cannot draw yet"
+    );
     let unknown = crate::caps::Features::from_bits(1 << 31).expect_err("unknown");
     assert_eq!(
         RenderError::from(unknown).to_string(),
