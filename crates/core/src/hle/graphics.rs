@@ -140,9 +140,11 @@
 //! turn never delivers; in a replay no tick fed back) and then the kernel says so. With
 //! [`NullFront`] nothing is in flight on a GPU, so that is everything the turn could still
 //! signal. With the GPU, the GPU must be idle too (`Gpu::is_idle`: nothing queued for its front,
-//! every entry applied, no list in flight), asked before gsv's queue, so that a completion the
-//! GPU pushes while the question is asked is either seen as work in flight or found queued
-//! (`a_graphics_server_with_a_busy_gpu_is_not_idle`).
+//! every entry applied, no list in flight or open, and, while a channel is parked on an acquire,
+//! a poll run after the question began that found it still parked, which it waits for at most
+//! `starquake_gpu::wiring::IDLE_POLL_WAIT`), asked before gsv's queue, so
+//! that a completion the GPU pushes while the question is asked is either seen as work in flight
+//! or found queued (`a_graphics_server_with_a_busy_gpu_is_not_idle`).
 //!
 //! # Replay
 //!

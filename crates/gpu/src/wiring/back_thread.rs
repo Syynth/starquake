@@ -14,7 +14,7 @@
 //! - **A channel is forgotten** when the front has dropped it, with the number of ring entries the
 //!   front had pushed by then ([`crate::front::ChannelRetired`]): the back forgets it once it has
 //!   taken that many, so every entry the channel made is applied first
-//!   (`a_destroyed_channel_is_forgotten_after_its_last_entry`). A forget that is not yet due holds
+//!   (`a_forget_waits_for_the_entries_pushed_before_it`). A forget that is not yet due holds
 //!   the controls posted after it, which is in time for them: a channel made after it is used
 //!   only by entries pushed after the destroy.
 //!
@@ -24,10 +24,15 @@
 //! # How it ends
 //!
 //! The loop ends when the ring's producer is gone and every entry it published has been taken
-//! (the front thread ended: [`crate::ring::PopError::Disconnected`]), or when [`BackInbox::stop`]
-//! was called, at its next wake. A corrupt ring ends it with [`BackError::Ring`]. Any other
-//! failure of the wait (the backend refused a list closed for an empty ring) is logged, counted
-//! in [`BackStatus::wait_failures`], and the loop goes on.
+//! (the front thread ended: [`crate::ring::PopError::Disconnected`]); the producer's drop wakes
+//! the back, and the controls due by then are applied before the last publish
+//! (`published_work_is_applied_after_the_producer_is_gone`,
+//! `a_forget_that_falls_due_at_the_disconnect_is_applied`). The wiring stops it with
+//! [`BackInbox::stop`] only when the front thread failed: it then ends at its next pass, before
+//! it takes anything more, so entries published and not yet taken are dropped
+//! (`a_stop_ends_the_loop_before_published_work`). A corrupt ring ends it with
+//! [`BackError::Ring`]. Any other failure of the wait (the backend refused a list closed for an
+//! empty ring) is logged, counted in [`BackStatus::wait_failures`], and the loop goes on.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -92,7 +97,8 @@ impl BackInbox {
         self.wake.wake();
     }
 
-    /// Asks the back thread to end at its next wake, and wakes it.
+    /// Asks the back thread to end at its next pass, without taking what is left on the ring,
+    /// and wakes it (module docs, "How it ends").
     pub(super) fn stop(&self) {
         self.stopping.store(true, Ordering::SeqCst);
         self.wake.wake();

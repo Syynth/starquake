@@ -1,6 +1,8 @@
 //! The back thread's loop, one pass at a time and with no thread: where a control is applied
 //! against the ring entries around it (`back_thread`'s module docs).
 
+use starquake_render::command::{Command, Marker};
+
 use crate::back::fence::{FrontWake, Report, WaiterTable};
 use crate::ring::{PopError, Producer, Release, ReleaseOp};
 
@@ -314,4 +316,96 @@ fn a_corrupt_ring_ends_the_loop_with_its_error() {
         matches!(error, BackError::Ring(PopError::Corrupt(_))),
         "{error}"
     );
+}
+
+#[test]
+fn a_stop_ends_the_loop_before_published_work() {
+    // The error path's stop (the wiring's module docs, "Shutdown"): what is published and not
+    // yet taken is dropped.
+    let mut l = back_loop();
+    for control in l.space_and_channel() {
+        l.back.inbox.post(control);
+    }
+    l.push_release(0x55);
+    l.back.inbox.stop();
+    assert!(!l.back.step(PATIENCE).unwrap());
+    assert_eq!(l.word(), 0);
+    assert_eq!(l.back.shared.status().taken, 0);
+}
+
+#[test]
+fn published_work_is_applied_after_the_producer_is_gone() {
+    // The normal shutdown: the front published a release and dropped its producer; the back
+    // takes the release, writes it, and only then ends.
+    let mut l = back_loop();
+    for control in l.space_and_channel() {
+        l.back.inbox.post(control);
+    }
+    l.push_release(0x55);
+    let Loop {
+        back,
+        producer,
+        guest,
+    } = l;
+    drop(producer);
+    let shared = Arc::clone(&back.shared);
+    back.run().unwrap();
+    assert_eq!(cpu_word(&guest, SEM), 0x55);
+    assert_eq!(shared.status().taken, 1);
+}
+
+#[test]
+fn a_forget_that_falls_due_at_the_disconnect_is_applied() {
+    // The forget is posted while the back sleeps on the empty ring, due at once, and the
+    // producer is dropped with it: the pass that sees the disconnect applies it before its
+    // last publish.
+    let mut l = back_loop();
+    for control in l.space_and_channel() {
+        l.back.inbox.post(control);
+    }
+    // A pass applies them and takes the wake their posts rang, so the next pass sleeps.
+    l.step();
+    assert_eq!(l.back.channels.len(), 1);
+    let Loop {
+        mut back, producer, ..
+    } = l;
+    let inbox = Arc::clone(&back.inbox);
+    let producer = Mutex::new(Some(producer));
+    back.ring.set_after_last_look(Box::new(move || {
+        let Some(producer) = producer.lock().unwrap().take() else {
+            return;
+        };
+        inbox.post(Control::Forget {
+            channel: CHANNEL,
+            after: 0,
+        });
+        drop(producer);
+    }));
+    assert!(!back.step(PATIENCE).unwrap());
+    assert!(back.channels.is_empty());
+    assert_eq!(back.shared.status().channels, 0);
+}
+
+#[test]
+fn an_entry_that_records_commands_is_in_flight_before_its_list_closes() {
+    // A command recorded on the open list, then a release behind it: the pass that applies the
+    // release publishes the open list as in flight, before any list is closed. The next wait
+    // closes it on the empty ring, but publishes only after its sleep.
+    let mut l = back_loop();
+    for control in l.space_and_channel() {
+        l.back.inbox.post(control);
+    }
+    l.back
+        .exec
+        .fences_mut()
+        .record(Command::Marker(Marker { submit: 1, draw: 2 }))
+        .unwrap();
+    l.push_release(0x55);
+    l.step();
+    assert_eq!(l.back.exec.fences().lists_in_flight(), 0);
+    assert_eq!(l.back.exec.fences().open_commands(), 1);
+    assert_eq!(l.back.shared.in_flight.load(Ordering::SeqCst), 1);
+    assert_eq!(l.back.shared.status().in_flight, 1);
+    // The release waits on the open list.
+    assert_eq!(l.word(), 0);
 }

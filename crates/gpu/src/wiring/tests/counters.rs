@@ -10,10 +10,11 @@ use super::*;
 
 /// An idle look: every input at its idle value, the counts and the activity not zero.
 const IDLE: Looked = Looked {
-    quiet: true,
+    quiet: Some(9),
     sent: 7,
     taken: 7,
     in_flight: 0,
+    quiet_after: Some(9),
     before: 3,
     after: 3,
 };
@@ -24,7 +25,26 @@ fn idleness_needs_every_input_idle() {
     // Each input made busy alone.
     let busy = [
         Looked {
-            quiet: false,
+            quiet: None,
+            ..IDLE
+        },
+        Looked {
+            quiet_after: None,
+            ..IDLE
+        },
+        // A turn started between the two reads, in either order of the counts.
+        Looked {
+            quiet_after: Some(10),
+            ..IDLE
+        },
+        Looked {
+            quiet: Some(10),
+            ..IDLE
+        },
+        // Both reads busy.
+        Looked {
+            quiet: None,
+            quiet_after: None,
             ..IDLE
         },
         Looked { taken: 6, ..IDLE },
@@ -83,7 +103,7 @@ fn a_back_report_bumps_the_activity_before_and_after_it_reaches_the_front() {
             incremented: 1,
             latched: false,
             markers: 0,
-            failed: Vec::new(),
+            failed: FailedReleases::default(),
         }]
     );
 }
@@ -135,7 +155,13 @@ fn each_counter_comes_from_its_source() {
             lost_wakes: 303,
             failed_releases: 304,
         },
-        ..BackStatus::default()
+        // What the back holds now: not counters, and not read.
+        channels: 501,
+        spaces: 502,
+        taken: 503,
+        in_flight: 504,
+        wait_failures: 305,
+        refused_controls: 306,
     };
     let counters = GpuCounters::new(&front, &back, 401, 402);
     let expected = GpuCounters {
@@ -156,6 +182,7 @@ fn each_counter_comes_from_its_source() {
         entries_applied: 201,
         entries_refused: 202,
         unhandled_words: 203,
+        captures: 204,
         presents: 205,
         dispatches: 206,
         dispatches_skipped: 207,
@@ -169,6 +196,8 @@ fn each_counter_comes_from_its_source() {
         lists_submitted: 255,
         lost_wakes: 303,
         failed_releases: 304,
+        back_wait_failures: 305,
+        refused_controls: 306,
     };
     assert_eq!(counters, expected);
 }

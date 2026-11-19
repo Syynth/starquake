@@ -215,18 +215,21 @@ fn the_gpus_counters_json_is_pinned() {
         entries_applied: 15,
         entries_refused: 16,
         unhandled_words: 17,
-        presents: 18,
-        dispatches: 19,
-        dispatches_skipped: 20,
-        write_backs: 21,
-        write_back_failures: 22,
-        render_catch_ups: 23,
-        render_catch_up_failures: 24,
-        fenced_actions: 25,
-        fenced_actions_skipped_empty: 26,
-        lists_submitted: 27,
-        lost_wakes: 28,
-        failed_releases: 29,
+        captures: 18,
+        presents: 19,
+        dispatches: 20,
+        dispatches_skipped: 21,
+        write_backs: 22,
+        write_back_failures: 23,
+        render_catch_ups: 24,
+        render_catch_up_failures: 25,
+        fenced_actions: 26,
+        fenced_actions_skipped_empty: 27,
+        lists_submitted: 28,
+        lost_wakes: 29,
+        failed_releases: 30,
+        back_wait_failures: 31,
+        refused_controls: 32,
     };
     assert_eq!(
         serde_json::to_string(&counters).unwrap(),
@@ -234,10 +237,11 @@ fn the_gpus_counters_json_is_pinned() {
          \"increments\":5,\"acquires_parked\":6,\"fence_waits\":7,\"sync_waits\":8,\
          \"macro_catch_ups\":9,\"polls\":10,\"ordered\":11,\"macro_failures\":12,\
          \"channels_stopped\":13,\"presents_pushed\":14,\"entries_applied\":15,\
-         \"entries_refused\":16,\"unhandled_words\":17,\"presents\":18,\"dispatches\":19,\
-         \"dispatches_skipped\":20,\"write_backs\":21,\"write_back_failures\":22,\
-         \"render_catch_ups\":23,\"render_catch_up_failures\":24,\"fenced_actions\":25,\
-         \"fenced_actions_skipped_empty\":26,\"lists_submitted\":27,\"lost_wakes\":28,\
-         \"failed_releases\":29}"
+         \"entries_refused\":16,\"unhandled_words\":17,\"captures\":18,\"presents\":19,\
+         \"dispatches\":20,\"dispatches_skipped\":21,\"write_backs\":22,\
+         \"write_back_failures\":23,\"render_catch_ups\":24,\"render_catch_up_failures\":25,\
+         \"fenced_actions\":26,\"fenced_actions_skipped_empty\":27,\"lists_submitted\":28,\
+         \"lost_wakes\":29,\"failed_releases\":30,\"back_wait_failures\":31,\
+         \"refused_controls\":32}"
     );
 }

@@ -14,7 +14,7 @@
 //! | an ordered update or a barrier queued | `GpuFront::update_vm`, `GpuFront::barrier` |
 //! | a present queued | `GpuFront::present` |
 //! | a channel destroyed | `GpuFront::destroy_channel` |
-//! | a batch of fenced actions performed: releases, increments, whether a waiter was latched, markers, and each failed release | the back's report to the front (`back::fence`'s `FrontWake`) |
+//! | a batch of fenced actions performed: releases, increments, whether a waiter was latched, markers, the first [`FAILURES_KEPT`] failed releases and how many failed | the back's report to the front (`back::fence`'s `FrontWake`) |
 //! | a completion pushed by the front or the back: `GpuQueueRoom`, `GpuOrdered` | the GPU's completion queue (`SyncpointChanged` is pushed by `Syncpoints` itself, which the wiring does not wrap, and is not recorded) |
 //!
 //! [`FlightRecorder::text`] adds the channels a structural error stopped, from the front's own
@@ -28,6 +28,15 @@
 //! The text is plain words, one event per line, numbered from 0 in the order recorded; when more
 //! events were recorded than are kept, the first line says how many were dropped.
 //!
+//! # Memory
+//!
+//! Every event kept has a bounded size: each variant holds fixed-size values but `Performed`,
+//! whose failed releases are cut to the first [`FAILURES_KEPT`] with a count of the rest
+//! ([`FailedReleases`]). A batch of the fence path can hold any number of failed releases (one
+//! per release to an unmapped address), so without the cut a hostile stream could make each of
+//! the kept events as large as it liked. The recorder therefore holds at most its capacity times
+//! the largest event (`a_batchs_failures_are_kept_up_to_the_cap_and_counted`).
+//!
 //! [`GpuConfig`]: super::GpuConfig
 
 use std::collections::VecDeque;
@@ -40,6 +49,37 @@ use crate::interface::{
     AsId, ChannelId, Fence, GpuCompletion, PresentRequest, Submitted, SyncpointId, Ticket, VmUpdate,
 };
 use crate::ring::RingEntry;
+
+/// The failed releases a `Performed` event keeps of one batch (module docs, "Memory").
+pub const FAILURES_KEPT: usize = 8;
+
+/// The failed releases of one batch, as the recorder keeps them (module docs, "Memory"): the
+/// first [`FAILURES_KEPT`], in order, and how many failed in all.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FailedReleases {
+    first: Vec<ReleaseFailure>,
+    total: usize,
+}
+
+impl FailedReleases {
+    /// The first [`FAILURES_KEPT`] of `failed`, and its length.
+    pub fn new(failed: &[ReleaseFailure]) -> Self {
+        Self {
+            first: failed.iter().take(FAILURES_KEPT).copied().collect(),
+            total: failed.len(),
+        }
+    }
+
+    /// The failures kept, in order.
+    pub fn kept(&self) -> &[ReleaseFailure] {
+        &self.first
+    }
+
+    /// How many releases of the batch failed, kept or not.
+    pub const fn total(&self) -> usize {
+        self.total
+    }
+}
 
 /// One event the flight recorder keeps (module docs, "What is recorded").
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,8 +149,8 @@ pub enum GpuEvent {
         latched: bool,
         /// Markers performed.
         markers: usize,
-        /// Releases that failed, in order.
-        failed: Vec<ReleaseFailure>,
+        /// Releases that failed: the first [`FAILURES_KEPT`] in order, and how many.
+        failed: FailedReleases,
     },
     /// The front or the back pushed a completion to gsv.
     Completion(GpuCompletion),
@@ -225,10 +265,14 @@ impl fmt::Display for GpuEvent {
                     f,
                     "performed {released} releases, {incremented} increments, {markers} markers, {latched}"
                 )?;
-                for failure in failed {
+                for failure in failed.kept() {
                     write!(f, "; {failure}")?;
                 }
-                Ok(())
+                match failed.total().saturating_sub(failed.kept().len()) {
+                    0 => Ok(()),
+                    1 => f.write_str("; and 1 more failed release"),
+                    more => write!(f, "; and {more} more failed releases"),
+                }
             }
             Self::Completion(completion) => match completion {
                 GpuCompletion::SyncpointChanged { id, value } => {

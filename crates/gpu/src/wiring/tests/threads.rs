@@ -371,7 +371,13 @@ fn both_threads_end_when_the_gpu_stops() {
     let channel = r.channel();
     r.gpu
         .submit(channel, plain(vec![r.entry(CMD, &releases(SEM, 3))]));
+    // The front has read the submission (a stop the front sees first drops what it has not
+    // read); the back may or may not have taken the release yet.
+    wait_until("the front finishes the submission", || {
+        r.gpu.status.published().counters.submissions == 1
+    });
     assert!(r.gpu.is_running());
+    let guest = Arc::clone(&r.guest);
     let gpu = Arc::new(r.gpu);
     let stopping = Arc::clone(&gpu);
     let (sent, stopped) = mpsc::channel();
@@ -384,8 +390,13 @@ fn both_threads_end_when_the_gpu_stops() {
         .expect("the GPU's threads did not end in time");
     assert_eq!(result, Ok(()));
     assert!(!gpu.is_running());
+    // What the front pushed was applied before the back ended.
+    assert_eq!(cpu_word(&guest, SEM), 3);
+    // A stopped GPU is never idle: its front is stopping, never quiet (module docs, "Idleness").
+    assert!(!gpu.is_idle());
     // A second stop does nothing.
     assert!(gpu.stop().is_ok());
+    assert!(!gpu.is_idle());
 }
 
 #[test]
@@ -400,4 +411,13 @@ fn dropping_the_gpu_ends_its_threads() {
     dropped
         .recv_timeout(PATIENCE)
         .expect("dropping the GPU did not end its threads in time");
+}
+
+#[test]
+fn only_a_failed_front_stops_the_back_before_it_drains() {
+    assert!(!stops_the_back(&Ok(())));
+    assert!(stops_the_back(&Err(FrontError::Panicked)));
+    assert!(stops_the_back(&Err(FrontError::Ring(
+        crate::ring::PushError::Disconnected
+    ))));
 }

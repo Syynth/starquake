@@ -112,7 +112,11 @@
 //!   the front drops it, with how many ring entries it had pushed by then ([`Front::sent`]): the
 //!   back forgets the channel once it has taken that many, so every entry the channel made
 //!   reaches the back before it is forgotten.
-//! - **Idleness**: an idle turn marks [`FrontShared::is_quiet`] (in [`Front::run_observed`]).
+//! - **Idleness**: every turn makes [`FrontShared::is_quiet`] false when it starts
+//!   ([`FrontShared::take`]), whatever it took, since a turn the acquire poll starts takes
+//!   nothing; an idle turn makes it true again after the observer has run (in
+//!   [`Front::run_observed`]). [`Front::waits_on_poll`] tells the wiring whether a channel waits
+//!   on something only the poll finds.
 //!
 //! # Not here
 //!
@@ -303,6 +307,13 @@ impl Front {
     /// `n`-th entry (from 0) as the one pushed when this was `n`.
     pub fn sent(&self) -> u64 {
         self.ring.sent()
+    }
+
+    /// Whether the acquire poll is scheduled: a channel waits on an acquire or a fence, which
+    /// the poll rechecks (module docs, "One turn", step 3). A CPU write or an increment from
+    /// outside the GPU can end such a wait, and only the poll finds it.
+    pub fn waits_on_poll(&self) -> bool {
+        self.poll_due.is_some()
     }
 
     /// The counters so far.

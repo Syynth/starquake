@@ -141,9 +141,12 @@ struct Inbox {
     /// Something happened since the front last parked or took the inbox.
     signalled: bool,
     stopping: bool,
-    /// The front took requests or reports and has not yet ended a turn idle since
+    /// The front started a turn ([`FrontShared::take`]) and has not yet ended one idle since
     /// ([`FrontShared::is_quiet`]).
     busy: bool,
+    /// Turns the front has started: every [`FrontShared::take`] counts one
+    /// ([`FrontShared::quiet_turn`]).
+    turns: u64,
 }
 
 /// What the front takes in one look.
@@ -158,6 +161,8 @@ pub(super) struct Taken {
 pub struct FrontShared {
     inbox: Mutex<Inbox>,
     wake: Condvar,
+    /// Rung when the front ends a turn idle, for [`FrontShared::wait_quiet`].
+    quieted: Condvar,
     dropped: AtomicU64,
 }
 
@@ -285,22 +290,50 @@ impl FrontShared {
     }
 
     /// Whether the front has nothing to do that it knows of: no request or back report waits to
-    /// be taken, and the front has ended a turn idle ([`FrontShared::mark_idle`]) since it last
-    /// took any. Read under the inbox's lock, so a request the front has taken but not yet
-    /// acted on reads as busy.
+    /// be taken, the front is not stopping, and the front has ended a turn idle
+    /// ([`FrontShared::mark_idle`]) since it last started one ([`FrontShared::take`]). Read
+    /// under the inbox's lock, so a turn in progress reads as busy, whatever it took: a turn
+    /// that took nothing can still start work, when the acquire poll falls due in it
+    /// (`a_turn_that_takes_nothing_is_busy_until_it_ends_idle`).
     pub fn is_quiet(&self) -> bool {
+        self.quiet_turn().is_some()
+    }
+
+    /// [`FrontShared::is_quiet`], with the number of turns the front had started when it was
+    /// read: two reads that both answer the same number saw no turn start between them, so what
+    /// the front published at the end of its last turn is what it holds now (the wiring's
+    /// module docs, "Idleness").
+    pub fn quiet_turn(&self) -> Option<u64> {
         let inbox = self.lock();
-        inbox.requests.is_empty()
-            && inbox.reports == BackReports::default()
-            && !inbox.busy
-            && !inbox.stopping
+        Self::quiet(&inbox).then_some(inbox.turns)
     }
 
     /// The front ended a turn idle ([`super::Turn::Idle`]): what it took has been acted on.
+    /// Wakes [`FrontShared::wait_quiet`].
     pub(crate) fn mark_idle(&self) {
         // A request or report that came since the turn's look keeps [`FrontShared::is_quiet`]
         // false on its own, so the flag can be cleared whatever arrived.
         self.lock().busy = false;
+        self.quieted.notify_all();
+    }
+
+    /// Waits at most `timeout` until [`FrontShared::is_quiet`]; whether it is. Woken when the
+    /// front ends a turn idle; a request or report queued meanwhile keeps it waiting.
+    pub fn wait_quiet(&self, timeout: Duration) -> bool {
+        let inbox = self.lock();
+        let (inbox, _) = self
+            .quieted
+            .wait_timeout_while(inbox, timeout, |inbox| !Self::quiet(inbox))
+            .unwrap_or_else(PoisonError::into_inner);
+        Self::quiet(&inbox)
+    }
+
+    /// [`FrontShared::is_quiet`] on the locked inbox.
+    fn quiet(inbox: &Inbox) -> bool {
+        inbox.requests.is_empty()
+            && inbox.reports == BackReports::default()
+            && !inbox.busy
+            && !inbox.stopping
     }
 
     /// Destroys `channel`: later submissions to it are dropped, and the front drops what it
@@ -329,13 +362,13 @@ impl FrontShared {
         self.wake.notify_one();
     }
 
-    /// Takes everything queued and reported since the last look.
+    /// Takes everything queued and reported since the last look, starting a turn: the front is
+    /// busy ([`FrontShared::is_quiet`]) from here until it ends a turn idle, whatever it took.
     pub(super) fn take(&self) -> Taken {
         let mut inbox = self.lock();
         inbox.signalled = false;
-        if !inbox.requests.is_empty() || inbox.reports != BackReports::default() {
-            inbox.busy = true;
-        }
+        inbox.busy = true;
+        inbox.turns = inbox.turns.wrapping_add(1);
         Taken {
             requests: std::mem::take(&mut inbox.requests),
             reports: std::mem::take(&mut inbox.reports),

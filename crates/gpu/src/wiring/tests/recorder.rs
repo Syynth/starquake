@@ -157,10 +157,10 @@ fn work_cases() -> Vec<(GpuEvent, &'static str)> {
                 incremented: 3,
                 latched: true,
                 markers: 1,
-                failed: vec![ReleaseFailure {
+                failed: FailedReleases::new(&[ReleaseFailure {
                     address: 0x40,
                     fault: GpuFault::Unmapped { va: 0x40 },
-                }],
+                }]),
             },
             "performed 2 releases, 3 increments, 1 markers, a waiter latched; the release at \
              GPU address 0x40 was not performed: GPU address 0x40 is not mapped",
@@ -195,5 +195,67 @@ fn each_event_is_written_in_plain_words() {
     assert_eq!(
         present.to_string(),
         RingEntry::Present(present_request()).to_string()
+    );
+}
+
+/// `count` failed releases, each at its own address (0x1000 apart, from 0x1000).
+fn failures(count: usize) -> Vec<ReleaseFailure> {
+    (1..=u64::try_from(count).unwrap())
+        .map(|i| ReleaseFailure {
+            address: i * 0x1000,
+            fault: GpuFault::Unmapped { va: i * 0x1000 },
+        })
+        .collect()
+}
+
+/// A `Performed` event's text for `count` failures.
+fn performed_text(count: usize) -> String {
+    GpuEvent::Performed {
+        released: 0,
+        incremented: 0,
+        latched: false,
+        markers: 0,
+        failed: FailedReleases::new(&failures(count)),
+    }
+    .to_string()
+}
+
+#[test]
+fn a_batchs_failures_are_kept_up_to_the_cap_and_counted() {
+    // Exactly at the cap: every failure kept, in order, and nothing more said.
+    let at = FailedReleases::new(&failures(FAILURES_KEPT));
+    assert_eq!(at.kept(), failures(FAILURES_KEPT));
+    assert_eq!(at.total(), FAILURES_KEPT);
+    assert!(!performed_text(FAILURES_KEPT).contains("more failed"));
+    // One past it: the first `FAILURES_KEPT` kept, the last counted.
+    let past = FailedReleases::new(&failures(FAILURES_KEPT + 1));
+    assert_eq!(past.kept(), failures(FAILURES_KEPT));
+    assert_eq!(past.total(), FAILURES_KEPT + 1);
+    let last_kept = failures(FAILURES_KEPT)[FAILURES_KEPT - 1];
+    let text = performed_text(FAILURES_KEPT + 1);
+    assert!(
+        text.ends_with(&format!("; {last_kept}; and 1 more failed release")),
+        "{text}"
+    );
+    assert_eq!(
+        performed_text(FAILURES_KEPT + 2)
+            .rsplit("; ")
+            .next()
+            .unwrap(),
+        "and 2 more failed releases"
+    );
+    // A hostile batch costs the recorder no more than one at the cap.
+    let hostile = FailedReleases::new(&failures(100_000));
+    assert_eq!(hostile.kept().len(), FAILURES_KEPT);
+    assert_eq!(hostile.total(), 100_000);
+}
+
+#[test]
+fn a_batch_with_no_failures_says_nothing_of_them() {
+    let none = FailedReleases::new(&[]);
+    assert_eq!((none.kept(), none.total()), (&[][..], 0));
+    assert_eq!(
+        performed_text(0),
+        "performed 0 releases, 0 increments, 0 markers, no waiter latched"
     );
 }

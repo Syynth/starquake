@@ -37,15 +37,31 @@
 //!
 //! Pushed to gsv's [`Completions`] by the front thread (`GpuQueueRoom`) and the back thread
 //! (`GpuOrdered`, after the marker's update is applied; `SyncpointChanged`, by `Syncpoints` when
-//! the back increments a watched counter). Each push from the front or the back goes through
-//! this module's recorder first (`recorder`).
+//! the back increments a watched counter). `GpuQueueRoom` and `GpuOrdered` are pushed through
+//! the queue this module gives the front and the fence path, which records each push in the
+//! flight recorder first (`recorder`). `SyncpointChanged` is not: `Syncpoints` is built by the
+//! caller over gsv's own queue ([`GpuDeps::syncpoints`]) and pushes to it directly, so the
+//! recorder never sees it.
 //!
 //! # Presents
 //!
 //! A present names no address space, so the back reads every present through one: the first
 //! address space made. A **guess**: one GPU address space per title, which presents read (the
 //! executor's module docs, "Presents"; issue #330's scope note). A title that presents from a
-//! second space would show nothing from it (the present is refused and counted).
+//! second space would show nothing from it (the present is refused and counted). The present
+//! space stays the first made for the whole run, even once gsv has destroyed it (next section):
+//! presents then read through a table gsv no longer changes. **Owner question**: whether a
+//! present should follow a later space when the first is destroyed.
+//!
+//! # Address-space lifetime
+//!
+//! gsv destroys address spaces (closing `nvhost-as-gpu`) and never reuses their ids, but
+//! [`GpuFront`] (the spec's interface) has no call that tells the GPU, so nothing here forgets a
+//! space: [`Gpu`]'s set of spaces, the front's space table and its [`VmMemory`], and the back
+//! executor's spaces with their translation caches grow by one space for each space a title
+//! makes, for the rest of the run. A title that opens and closes `nvhost-as-gpu` in a loop grows
+//! them without bound. **Owner question**: a destroy hook on `GpuVmFront` (a spec change), or a
+//! cap on the spaces a title may make.
 //!
 //! # The channel on `Release`
 //!
@@ -57,29 +73,68 @@
 //!
 //! # Observability
 //!
-//! [`Gpu::counters`] gives [`GpuCounters`], every counter of the front, the executor and the
-//! fence path, flattened for `summary.json`; [`Gpu::flight_recorder`] gives `gpu.txt`'s text
+//! [`Gpu::counters`] gives [`GpuCounters`] for `summary.json`: the exact set it flattens is in
+//! its docs (the front's, the executor's and the fence path's counters, two of the back
+//! thread's, and two of this module's). [`Gpu::flight_recorder`] gives `gpu.txt`'s text
 //! (`recorder`).
 //!
 //! # Idleness
 //!
 //! [`Gpu::is_idle`] says whether nothing the GPU holds can still change anything a guest waits
-//! for: the front is quiet ([`FrontShared::is_quiet`]: nothing queued for it, and it has ended a
-//! turn idle since it last took anything), the back has taken every entry the front pushed, and
-//! no command list is in flight or open. A channel parked on an acquire the CPU must release, or
-//! an ordered update behind it, does not make the GPU busy: only the guest can end that wait.
-//! The front's pushed count is stored before it marks itself quiet; the back stores its lists in
-//! flight before its taken count; and the back's report of a completion to the front bumps a
-//! counter before and after it reaches the front, which [`Gpu::is_idle`] reads first and last, so
-//! a completion that lands while it looks makes the answer "busy". It can answer "busy" for a GPU
-//! that is idle (a look that overlaps a completion); it does not answer "idle" while an entry is
-//! unapplied or a list is in flight (`the_gpu_is_busy_while_a_list_is_in_flight`).
+//! for. It is built from looks ([`Gpu::look`]); one look finds the GPU idle when:
+//!
+//! - the front is quiet ([`FrontShared::quiet_turn`]: nothing queued for it, not stopping, and
+//!   it has ended a turn idle since it last started one), in a first and a last read that name
+//!   the same number of turns, so no turn started while it looked;
+//! - the back has taken every entry the front pushed by the end of its last turn;
+//! - no command list is in flight or open on the back;
+//! - no back report reached the front while it looked.
+//!
+//! Every turn makes the front busy when it starts ([`FrontShared::take`]), whatever it took: a
+//! turn the acquire poll starts takes nothing, and still resumes channels and pushes entries
+//! (`a_turn_the_poll_starts_is_busy`). The front publishes its pushed count, its polls and
+//! whether the poll is scheduled at the end of each turn, before an idle turn marks it quiet;
+//! the back stores its lists in flight before its taken count; and the back's report of a
+//! completion to the front bumps a counter before and after it reaches the front, which a look
+//! reads first and last.
+//!
+//! **A channel waiting on the poll.** A channel parked on an acquire, or on a fence, waits on
+//! something a CPU write (or an increment from outside the GPU) can end, and only the next poll
+//! finds it. So when a look finds the GPU idle but the poll scheduled, [`Gpu::is_idle`] waits
+//! for the front to finish a poll that started after the look and then to end a turn idle, at
+//! most [`IDLE_POLL_WAIT`] for both, and looks again: idle only if that second look is idle too.
+//! A poll counted past the first look's started after it, since no turn was in progress while
+//! the first look read the front quiet. A poll that finds the wait ended
+//! resumes the channel, and its turn ends busy, so the second look says "busy"
+//! (`a_released_acquire_is_busy_until_a_poll_has_looked`,
+//! `a_cpu_release_of_a_parked_acquire_is_busy_through_the_threads`); one that finds nothing
+//! leaves the GPU idle (`a_channel_parked_on_an_unreleased_acquire_is_idle`). A channel that
+//! still waits after that poll waits on something only the guest can end.
+//!
+//! **Owner question**, the trade-off of that wait: `core` asks once, as the last vCPU parks,
+//! with its cores' idle lock held, so the wait holds that lock for up to [`IDLE_POLL_WAIT`];
+//! and a front thread the host does not run within it makes the answer "busy", so `core` does
+//! not end a run it would have called stalled. The other choice is to count a scheduled poll as
+//! busy, which never calls a run with a channel parked on an acquire stalled.
+//!
+//! It can answer "busy" for a GPU that is idle (a look that overlaps a completion or a turn, or
+//! a poll the host is slow to run); it does not answer "idle" while an entry is unapplied or a
+//! list is in flight or open (`the_gpu_is_busy_while_a_list_is_in_flight`,
+//! `an_entry_that_records_commands_is_in_flight_before_its_list_closes`). After [`Gpu::stop`]
+//! it answers "busy" for good: a stopping front is never quiet
+//! (`both_threads_end_when_the_gpu_stops`).
 //!
 //! # Shutdown
 //!
-//! [`Gpu::stop`] (and dropping the `Gpu`) stops the front thread, which publishes what it pushed
-//! and drops the ring's producer; the back thread then takes what is left and ends. Both threads
-//! are joined (`both_threads_end_when_the_gpu_stops`).
+//! [`Gpu::stop`] (and dropping the `Gpu`) stops the front thread at its next look: requests it
+//! has not yet read are dropped, and it publishes what it pushed and drops the ring's producer;
+//! that wakes the back thread, which takes and applies every
+//! entry left on the ring and ends at [`crate::ring::PopError::Disconnected`]. The open list
+//! and lists still in flight are not waited for: a fenced action attached to one is not
+//! performed (one with no work before it is performed when it is taken). If the front thread
+//! failed, its ring may be corrupt, so the back is told to stop at its next wake instead. Both
+//! threads are joined (`both_threads_end_when_the_gpu_stops`, which checks a release submitted
+//! just before the stop is written; `published_work_is_applied_after_the_producer_is_gone`).
 //!
 //! # Not here
 //!
@@ -97,9 +152,9 @@ mod tests;
 use std::collections::BTreeSet;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use starquake_memory::{GuestMemory, WriteWatch};
@@ -113,7 +168,7 @@ use crate::channel::ChannelError;
 use crate::front::Front;
 use crate::front::{
     FrontClock, FrontCounters, FrontDeps, FrontError, FrontShared, FrontThread, HostClock,
-    OrderedTable, spawn_observed,
+    OrderedTable, POLL_LONGEST_SLEEP, spawn_observed,
 };
 use crate::interface::{
     AsId, ChannelConfig, ChannelFront, ChannelId, Completions, GpuCompletion, GpuError, GpuFront,
@@ -127,7 +182,7 @@ use crate::vm::GpuVm;
 use back_thread::{Back, BackInbox, BackShared, Control};
 
 pub use back_thread::{BACK_WAIT, BackError, BackStatus};
-pub use recorder::{FlightRecorder, GpuEvent};
+pub use recorder::{FAILURES_KEPT, FailedReleases, FlightRecorder, GpuEvent};
 
 /// The events the flight recorder keeps by default: the spec's "last few thousand".
 pub const RECORDER_EVENTS: usize = 4096;
@@ -237,9 +292,20 @@ pub enum WiringError {
     Back(#[from] BackError),
 }
 
-/// Every counter of the GPU (gpu-protocol, "Observability"), flattened for `summary.json`. The
-/// spec lists, besides what is here: writes dropped as same-value, macro calls, memo hits and
-/// the ring's peak occupancy, which no slice counts yet.
+/// The GPU's counters (gpu-protocol, "Observability"), flattened for `summary.json`: every field
+/// of [`FrontCounters`], [`ExecCounters`] and [`FenceCounters`] (the close reasons of
+/// [`FenceCounters::closed`] summed into `lists_submitted`), [`BackStatus::wait_failures`] and
+/// [`BackStatus::refused_controls`], and the wiring's own two counts of submissions answered
+/// `Full` and dropped. [`GpuCounters::new`] names every field of those four structs, so a field
+/// added to one does not compile until it is placed here or named as left out; the only ones left
+/// out are [`BackStatus`]'s `channels`, `spaces`, `taken` and `in_flight`, which say what the
+/// back holds now and are not counts of events. The spec lists, besides what is here: writes
+/// dropped as same-value, macro calls, memo hits and the ring's peak occupancy, which no slice
+/// counts yet.
+///
+/// [`ExecCounters`]: crate::back::exec::ExecCounters
+/// [`FenceCounters`]: crate::back::fence::FenceCounters
+/// [`FenceCounters::closed`]: crate::back::fence::FenceCounters::closed
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct GpuCounters {
     /// Command words executed by the front.
@@ -276,6 +342,8 @@ pub struct GpuCounters {
     pub entries_refused: u64,
     /// Words to classes with no engine.
     pub unhandled_words: u64,
+    /// `CaptureControl` entries the back took.
+    pub captures: u64,
     /// Presents recorded.
     pub presents: u64,
     /// Dispatches recorded.
@@ -300,64 +368,137 @@ pub struct GpuCounters {
     pub lost_wakes: u64,
     /// Releases that failed.
     pub failed_releases: u64,
+    /// Waits of the back thread that failed other than by the ring.
+    pub back_wait_failures: u64,
+    /// Address-space and channel changes the back refused.
+    pub refused_controls: u64,
 }
 
 impl GpuCounters {
     fn new(front: &FrontCounters, back: &BackStatus, full: u64, dropped: u64) -> Self {
-        let closed = back.fences.closed;
+        // Every field named, no `..`: a new counter is a compile error here (type docs).
+        let FrontCounters {
+            words,
+            submissions,
+            increments,
+            parks,
+            fence_waits,
+            sync_waits,
+            catch_ups: macro_catch_ups,
+            polls,
+            ordered,
+            macro_failures,
+            stopped_channels,
+            presents: presents_pushed,
+        } = *front;
+        let BackStatus {
+            exec,
+            fences,
+            channels: _,
+            spaces: _,
+            taken: _,
+            in_flight: _,
+            wait_failures,
+            refused_controls,
+        } = *back;
+        let crate::back::exec::ExecCounters {
+            applied,
+            failed,
+            unhandled_words,
+            captures,
+            presents,
+            dispatches,
+            dispatches_skipped,
+            write_backs,
+            write_back_failures,
+            catch_ups: render_catch_ups,
+            catch_up_failures: render_catch_up_failures,
+        } = exec;
+        let crate::back::fence::FenceCounters {
+            fenced,
+            skipped_empty,
+            closed,
+            lost_wakes,
+            failed_releases,
+        } = fences;
+        let crate::back::fence::ClosedCounts {
+            ring_empty,
+            present,
+            wait_for_idle,
+            waiter,
+            elapsed,
+            set_reference,
+            catch_up,
+            channel_removed,
+        } = closed;
         let lists = [
-            closed.ring_empty,
-            closed.present,
-            closed.wait_for_idle,
-            closed.waiter,
-            closed.elapsed,
-            closed.set_reference,
-            closed.catch_up,
-            closed.channel_removed,
+            ring_empty,
+            present,
+            wait_for_idle,
+            waiter,
+            elapsed,
+            set_reference,
+            catch_up,
+            channel_removed,
         ]
         .iter()
         .fold(0u64, |sum, &count| sum.saturating_add(count));
         Self {
-            words: front.words,
-            submissions: front.submissions,
+            words,
+            submissions,
             submissions_full: full,
             submissions_dropped: dropped,
-            increments: front.increments,
-            acquires_parked: front.parks,
-            fence_waits: front.fence_waits,
-            sync_waits: front.sync_waits,
-            macro_catch_ups: front.catch_ups,
-            polls: front.polls,
-            ordered: front.ordered,
-            macro_failures: front.macro_failures,
-            channels_stopped: front.stopped_channels,
-            presents_pushed: front.presents,
-            entries_applied: back.exec.applied,
-            entries_refused: back.exec.failed,
-            unhandled_words: back.exec.unhandled_words,
-            presents: back.exec.presents,
-            dispatches: back.exec.dispatches,
-            dispatches_skipped: back.exec.dispatches_skipped,
-            write_backs: back.exec.write_backs,
-            write_back_failures: back.exec.write_back_failures,
-            render_catch_ups: back.exec.catch_ups,
-            render_catch_up_failures: back.exec.catch_up_failures,
-            fenced_actions: back.fences.fenced,
-            fenced_actions_skipped_empty: back.fences.skipped_empty,
+            increments,
+            acquires_parked: parks,
+            fence_waits,
+            sync_waits,
+            macro_catch_ups,
+            polls,
+            ordered,
+            macro_failures,
+            channels_stopped: stopped_channels,
+            presents_pushed,
+            entries_applied: applied,
+            entries_refused: failed,
+            unhandled_words,
+            captures,
+            presents,
+            dispatches,
+            dispatches_skipped,
+            write_backs,
+            write_back_failures,
+            render_catch_ups,
+            render_catch_up_failures,
+            fenced_actions: fenced,
+            fenced_actions_skipped_empty: skipped_empty,
             lists_submitted: lists,
-            lost_wakes: back.fences.lost_wakes,
-            failed_releases: back.fences.failed_releases,
+            lost_wakes,
+            failed_releases,
+            back_wait_failures: wait_failures,
+            refused_controls,
         }
     }
+}
+
+/// What the front thread publishes at the end of each turn, before an idle turn marks the front
+/// quiet (module docs, "Idleness").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Published {
+    /// The front's counters; `polls` counts the polls of finished turns only.
+    counters: FrontCounters,
+    /// [`Front::sent`].
+    sent: u64,
+    /// [`Front::waits_on_poll`].
+    waiting: bool,
 }
 
 /// What the front thread publishes after each turn, and the idleness counter (module docs,
 /// "Idleness").
 #[derive(Default)]
 struct Status {
-    front: Mutex<FrontCounters>,
-    /// [`Front::sent`], stored after each turn.
-    sent: AtomicU64,
+    front: Mutex<Published>,
+    /// Rung after each turn's publication, for [`Status::wait_for_poll`].
+    turned: Condvar,
     /// Bumped before and after each back report reaches the front.
     activity: AtomicU64,
     /// Submissions answered `Full`.
@@ -365,8 +506,33 @@ struct Status {
 }
 
 impl Status {
-    fn front(&self) -> FrontCounters {
-        *self.front.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock(&self) -> MutexGuard<'_, Published> {
+        // A plain value, written whole: a poisoned lock is usable.
+        self.front.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn published(&self) -> Published {
+        *self.lock()
+    }
+
+    /// Stores what the front thread publishes at the end of a turn, and wakes
+    /// [`Status::wait_for_poll`].
+    fn publish(&self, published: Published) {
+        *self.lock() = published;
+        self.turned.notify_all();
+    }
+
+    /// Waits at most `timeout` until the front has finished a turn that polled, past the
+    /// `polls` it had published; whether one did.
+    fn wait_for_poll(&self, polls: u64, timeout: Duration) -> bool {
+        let guard = self.lock();
+        let (guard, _) = self
+            .turned
+            .wait_timeout_while(guard, timeout, |published| {
+                published.counters.polls <= polls
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        guard.counters.polls > polls
     }
 
     fn bump(&self) {
@@ -389,7 +555,7 @@ impl FrontWake for ReportToFront {
             incremented: report.incremented,
             latched: report.latched,
             markers: report.markers.len(),
-            failed: report.failed.clone(),
+            failed: FailedReleases::new(&report.failed),
         });
         self.front.wake(report);
         self.status.bump();
@@ -473,11 +639,11 @@ impl Gpu {
         .with_retired(Arc::<BackInbox>::clone(&inbox));
         let observed = Arc::clone(&status);
         let front = spawn_observed(front, move |front| {
-            *observed
-                .front
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = front.counters();
-            observed.sent.store(front.sent(), Ordering::SeqCst);
+            observed.publish(Published {
+                counters: front.counters(),
+                sent: front.sent(),
+                waiting: front.waits_on_poll(),
+            });
         })?;
 
         let env = FenceEnv {
@@ -552,9 +718,12 @@ impl Gpu {
             return Ok(());
         };
         let front = threads.front.stop();
-        // The producer is gone with the front thread; the stop is only a safety net for a back
-        // thread that would otherwise wait for its next wake.
-        self.inbox.stop();
+        // The front thread published what it pushed and dropped the ring's producer, which wakes
+        // the back: it takes every entry left and ends at `PopError::Disconnected` (module docs,
+        // "Shutdown"). Only a failed front is not waited for: its ring may be corrupt.
+        if stops_the_back(&front) {
+            self.inbox.stop();
+        }
         let back = threads.back.join().unwrap_or(Err(BackError::Panicked));
         front?;
         back?;
@@ -571,7 +740,7 @@ impl Gpu {
     /// Every counter (module docs, "Observability").
     pub fn counters(&self) -> GpuCounters {
         GpuCounters::new(
-            &self.status.front(),
+            &self.status.published().counters,
             &self.back.status(),
             self.status.full.load(Ordering::Relaxed),
             self.shared.dropped_submissions(),
@@ -593,47 +762,98 @@ impl Gpu {
         &self.recorder
     }
 
-    /// Whether nothing the GPU holds can still change anything (module docs, "Idleness").
+    /// Whether nothing the GPU holds can still change anything a guest waits for (module docs,
+    /// "Idleness"). While a channel waits on something only the acquire poll finds, it waits at
+    /// most [`IDLE_POLL_WAIT`] for a poll that starts after it began and the idle turn after it,
+    /// and answers "busy" when they have not come by then. "Busy" after [`Gpu::stop`].
     pub fn is_idle(&self) -> bool {
+        let Some(first) = self.look() else {
+            return false;
+        };
+        if !first.waiting {
+            return true;
+        }
+        // A poll that started after the look, then the idle turn that follows it (the front
+        // publishes before it marks itself quiet), within one budget.
+        let started = Instant::now();
+        if !self.status.wait_for_poll(first.polls, IDLE_POLL_WAIT) {
+            return false;
+        }
+        let left = IDLE_POLL_WAIT.saturating_sub(started.elapsed());
+        self.shared.wait_quiet(left) && self.look().is_some()
+    }
+
+    /// One look (module docs, "Idleness"): what the front published, if the GPU is idle but for
+    /// what the poll may still find. It never waits.
+    fn look(&self) -> Option<Seen> {
         let before = self.status.activity.load(Ordering::SeqCst);
-        let quiet = self.shared.is_quiet();
-        let sent = self.status.sent.load(Ordering::SeqCst);
+        let quiet = self.shared.quiet_turn();
+        let published = self.status.published();
         let taken = self.back.taken.load(Ordering::SeqCst);
         let in_flight = self.back.in_flight.load(Ordering::SeqCst);
+        let quiet_after = self.shared.quiet_turn();
         let after = self.status.activity.load(Ordering::SeqCst);
         idle(Looked {
             quiet,
-            sent,
+            sent: published.sent,
             taken,
             in_flight,
+            quiet_after,
             before,
             after,
+        })
+        .then_some(Seen {
+            polls: published.counters.polls,
+            waiting: published.waiting,
         })
     }
 }
 
-/// What [`Gpu::is_idle`] read, in the order it read it.
+/// Whether [`Gpu::stop`] tells the back thread to stop rather than letting it take what is left
+/// on the ring (module docs, "Shutdown"): only when the front thread ended with `front`'s error.
+fn stops_the_back(front: &Result<(), FrontError>) -> bool {
+    front.is_err()
+}
+
+/// How long [`Gpu::is_idle`] waits for an acquire poll (module docs, "Idleness"): 100 times
+/// [`POLL_LONGEST_SLEEP`], the longest the front sleeps between two polls, for the host to run
+/// the front thread.
+pub const IDLE_POLL_WAIT: Duration = POLL_LONGEST_SLEEP.saturating_mul(100);
+
+/// What an idle look found of the acquire poll.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Seen {
+    /// Polls the front had finished.
+    polls: u64,
+    /// Whether a channel waits on something only the poll finds.
+    waiting: bool,
+}
+
+/// What [`Gpu::look`] read, in the order it read it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Looked {
-    /// [`FrontShared::is_quiet`].
-    quiet: bool,
-    /// Entries the front had pushed at its last turn.
+    /// [`FrontShared::quiet_turn`], read first.
+    quiet: Option<u64>,
+    /// Entries the front had pushed at the end of its last turn.
     sent: u64,
     /// Entries the back has taken.
     taken: u64,
     /// Lists in flight or open on the back.
     in_flight: u64,
+    /// [`FrontShared::quiet_turn`], read again.
+    quiet_after: Option<u64>,
     /// The activity counter, read first.
     before: u64,
     /// The activity counter, read last.
     after: u64,
 }
 
-/// Whether what [`Gpu::is_idle`] read says the GPU is idle (module docs, "Idleness"): the front
-/// quiet, every entry it pushed taken, no list in flight or open, and no back report reaching the
-/// front while it looked.
+/// Whether what [`Gpu::look`] read says the GPU is idle (module docs, "Idleness"): the front
+/// quiet in both reads with no turn started between them, every entry it pushed taken, no list in
+/// flight or open, and no back report reaching the front while it looked.
 fn idle(looked: Looked) -> bool {
-    looked.quiet
+    looked.quiet.is_some()
+        && looked.quiet == looked.quiet_after
         && looked.sent == looked.taken
         && looked.in_flight == 0
         && looked.before == looked.after

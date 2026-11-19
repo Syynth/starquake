@@ -5,10 +5,12 @@
 //!
 //! `back` drives the back thread's loop one pass at a time, with no thread, where an order
 //! between a control and an entry has to be pinned exactly; `recorder` tests the flight
-//! recorder's text.
+//! recorder's text; `idle` drives idleness with the acquire poll, some of it on a front clock
+//! held still.
 
 mod back;
 mod counters;
+mod idle;
 mod recorder;
 mod threads;
 
@@ -205,6 +207,11 @@ fn table() -> Arc<GpuVm> {
 }
 
 fn rig_on(late: bool) -> Rig {
+    rig_with(late, Arc::new(HostClock::new()))
+}
+
+/// [`rig_on`] with `front_clock` on the front thread.
+fn rig_with(late: bool, front_clock: Arc<dyn FrontClock>) -> Rig {
     let size = usize::try_from(PAGES * PAGE_SIZE).unwrap();
     let guest = Arc::new(FlatMemory::new(CPU_BASE, size));
     let pushed = Arc::new(Pushed::default());
@@ -235,7 +242,7 @@ fn rig_on(late: bool) -> Rig {
             shaders: Box::new(NoShaders),
             guest: Arc::<FlatMemory>::clone(&guest),
             watch: Arc::new(WriteWatch::new()),
-            front_clock: Arc::new(HostClock::new()),
+            front_clock,
             fence_clock: Arc::new(Clock::default()),
         },
         GpuConfig::default(),
@@ -376,6 +383,14 @@ fn release(pb: &mut PushBuffer, address: u64, payload: u32) {
     })
     .unwrap();
     semaphored(pb, address, payload, word);
+}
+
+/// A stream that waits for `address` to hold `payload`, then releases `then` at `release_at`.
+fn acquires_then_releases(address: u64, payload: u32, release_at: u64, then: u32) -> Vec<u32> {
+    let mut pb = PushBuffer::new();
+    acquire(&mut pb, address, payload);
+    release(&mut pb, release_at, then);
+    pb.into_words()
 }
 
 /// A stream that releases `payload` at `address`.

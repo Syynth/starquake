@@ -363,3 +363,55 @@ fn the_front_is_quiet_only_once_a_turn_ends_idle_after_it_took_its_requests() {
     r.shared.stop();
     assert!(!r.shared.is_quiet(), "a stopping front is not quiet");
 }
+
+#[test]
+fn a_taken_back_report_keeps_the_front_busy_until_it_ends_idle() {
+    // A report taken, with no request: the front resumes channels for it and has pushed nothing
+    // yet, so it is busy until it ends a turn idle.
+    let shared = FrontShared::new();
+    assert!(shared.is_quiet());
+    crate::back::fence::FrontWake::wake(
+        &shared,
+        &crate::back::fence::Report {
+            latched: true,
+            ..crate::back::fence::Report::default()
+        },
+    );
+    let taken = shared.take();
+    assert!(taken.requests.is_empty());
+    assert!(taken.reports.released);
+    assert!(!shared.is_quiet(), "the report is taken, not yet acted on");
+    shared.mark_idle();
+    assert!(shared.is_quiet());
+}
+
+#[test]
+fn a_turn_that_takes_nothing_is_busy_until_it_ends_idle() {
+    // A turn the acquire poll starts takes nothing and can still resume channels.
+    let shared = FrontShared::new();
+    let before = shared.quiet_turn().unwrap();
+    let taken = shared.take();
+    assert!(taken.requests.is_empty());
+    assert_eq!(taken.reports, BackReports::default());
+    assert_eq!(shared.quiet_turn(), None);
+    shared.mark_idle();
+    // Quiet again, one turn on.
+    assert_eq!(shared.quiet_turn(), Some(before + 1));
+}
+
+#[test]
+fn waiting_for_quiet_ends_when_the_front_ends_a_turn_idle() {
+    let shared = Arc::new(FrontShared::new());
+    // Quiet already: no wait.
+    assert!(shared.wait_quiet(Duration::ZERO));
+    let _taken = shared.take();
+    // Busy, and nothing ends the turn: the wait runs out.
+    assert!(!shared.wait_quiet(Duration::from_millis(1)));
+    let marking = Arc::clone(&shared);
+    let marker = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(5));
+        marking.mark_idle();
+    });
+    assert!(shared.wait_quiet(Duration::from_secs(20)));
+    marker.join().unwrap();
+}

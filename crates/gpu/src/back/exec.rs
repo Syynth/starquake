@@ -153,9 +153,10 @@
 //!
 //! A present names no address space ([`PresentRequest`] carries only a GPU address), so presents
 //! read through the space [`Executor::set_present_space`] names; the wiring (slice G21,
-//! `crate::wiring`) sets it to the first address space made. A **guess**: one GPU address space per title. The image is a block-linear 2D image
-//! of the request's size and block height, in the texture cache as any sampled texture
-//! (`present`), so a frame the GPU rendered is found as the render target it was drawn into.
+//! `crate::wiring`) sets it to the first address space made. A **guess**: one GPU address space
+//! per title. The image is a block-linear 2D image of the request's size and block height, in
+//! the texture cache as any sampled texture (`present`), so a frame the GPU rendered is found as
+//! the render target it was drawn into.
 //! The frame number counts presents from 0. The command carries no fence wait (owner's
 //! decision of 2026-11-12, "Presents pace the game through a buffer queue"); it is ordered after
 //! every command before it by its place in the list, and the list is closed after it.
@@ -622,6 +623,12 @@ impl Executor {
     /// The fence path, for its counters and lists in flight.
     pub fn fences(&self) -> &Fences {
         &self.fences
+    }
+
+    /// The fence path, to record on its open list, for tests of the back thread's idleness.
+    #[cfg(test)]
+    pub(crate) fn fences_mut(&mut self) -> &mut Fences {
+        &mut self.fences
     }
 
     /// The class bound on `subchannel` of `channel`, if the channel is known and the subchannel
