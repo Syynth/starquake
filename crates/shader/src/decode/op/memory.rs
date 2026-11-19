@@ -93,10 +93,32 @@
 //!   `BAR` does (`op::control`); the stricter reading was taken here because no reference names
 //!   those fields.
 //!
+//! # Reference conflicts
+//!
+//! Two immediate offsets are read differently by the references. The decoder keeps a value
+//! that loses no bit of the field, so either reading can be recovered from it, and the
+//! translator decides which holds:
+//!
+//! - **The 24-bit offset of local and shared addresses with `RZ`.** NAK's `offset` is an
+//!   `i32` (`set_field(40..64, self.offset)`), and PR #4588 sign-extends the field for global
+//!   addresses (`Visitor::GlobalAddress`: `static_cast<s32>(offset << 8) >> 8`) and for local
+//!   and shared ones with a register (`Visitor::SharedOffset`, the same shift). But with `RZ`,
+//!   `Visitor::SharedOffset` returns the field unsigned (`if (reg == 255) return
+//!   ir.Imm32(offset);`), for `LDS`, `STS`, `ATOMS`, `LDL` and `STL` (`ops_memory.cpp`
+//!   @ e5fb3b97). The decoder always sign-extends ([`MemAddr::offset`]) and prints
+//!   `[rz+-0x800000]` for the field `0x800000`. Slice 12e decides which reading holds.
+//! - **`LDC`'s 16-bit immediate offset.** NAK's `CBufRef::offset` is a `u16`, and the decoder
+//!   keeps it so: `ldc r1, c[0x5][r6+0xffff]`. PR #4588 reads it signed and adds it to the
+//!   offset register (`ops_misc.cpp`, `Visitor::LDC`: `static_cast<s16>(Take(38, 16))`, then
+//!   `ir.IAdd(X(offset_reg), ir.Imm32(static_cast<u32>(offset)))`), so the field `0xffff` is
+//!   `-1` there. Slice 12e or 13 decides which reading holds.
+//!
 //! # Divergences from PR #4588's table
 //!
 //! | Rows | What this decoder does | Pinned by |
 //! |---|---|---|
+//! | The offset (bits 40..64) of `LDS`, `STS`, `ATOMS`, `LDL` and `STL` with `RZ` | Sign-extended, where PR #4588's translator reads it unsigned (a reference conflict, above) | `decode::tests::memory::shared_and_local_offsets_with_rz_are_sign_extended` |
+//! | `LDC`'s offset (bits 38..54) | Unsigned, where PR #4588's translator reads it signed (a reference conflict, above) | `decode::tests::memory::ldc_offsets_with_an_offset_register_are_unsigned` |
 //! | Bit 91 of `LDG` `0x381`, `STG` `0x386`, `STL` `0x387`, `STS` `0x388` and `LDC` `0xb82` | Rejected: NAK writes it clear in these forms (`set_bit(91, has_ugpr)` without uniform registers; `set_bit(91, false); // Bound`), which have no uniform register for it to enable, and PR #4588's translator requires it clear (`"native global load flags"`, `"native bindless constant load"`, and the others) | `decode::tests::memory::memory_rows_drop_exactly_the_listed_bits` |
 //! | Bits 64..71 and 91 of `ATOMG` `0x3a8` | Rejected: the row is the uniform form's (`0x9a8`); NAK's `0x3a8` has no uniform register (`set_reg_addr(24..32, .., 72)` only), and PR #4588's translator reads neither there | `memory_rows_drop_exactly_the_listed_bits` |
 //! | `LDGSTS` bits 44..48, 71, 72..74, 77..84 and 85..87 | Rejected: PR #4588's translator requires them clear or does not read them | `memory_rows_drop_exactly_the_listed_bits`, `ldgsts_requires_the_bits_pr_4588_requires` |
@@ -193,8 +215,12 @@ macro_rules! coded {
 /// The address register of every load, store, atomic and `CCTL` (NAK: `set_reg_addr(24..32, ..)`
 /// or `set_reg_src(24..32, &self.addr)`).
 pub(crate) const MEM_ADDR: Field = Field::new(24, Gpr::BITS);
-/// The signed 24-bit address offset of loads, stores and atomics (NAK: `set_field(40..64,
-/// self.offset)`; PR #4588: `Take(40, 24)`, sign-extended from bit 23).
+/// The 24-bit address offset of loads, stores and atomics (NAK: `set_field(40..64,
+/// self.offset)`, an `i32`; PR #4588: `Take(40, 24)`), which the decoder sign-extends from bit
+/// 23. PR #4588 sign-extends it only for global addresses (`Visitor::GlobalAddress`) and for
+/// local or shared addresses with a register; with `RZ`, `Visitor::SharedOffset` (`LDS`,
+/// `STS`, `ATOMS`, `LDL`, `STL`) returns it unsigned (`ir.Imm32(offset)`). A reference
+/// conflict (module docs, "Reference conflicts").
 pub(crate) const MEM_OFFSET: Field = Field::new(40, 24);
 /// The data register of stores and atomics but compare-and-swap (NAK: `set_reg_src(32..40,
 /// &self.data)`).
@@ -385,7 +411,9 @@ pub struct MemAddr {
     pub reg_64: bool,
     /// The uniform register, in the uniform forms.
     pub uniform: Option<UniformAddr>,
-    /// The byte offset, a signed 24-bit number ([`MEM_OFFSET`]).
+    /// The byte offset, the 24-bit field sign-extended ([`MEM_OFFSET`]). PR #4588 reads a
+    /// local or shared offset with `RZ` unsigned instead (module docs, "Reference conflicts");
+    /// the `i32` keeps every field value, so either reading can be recovered from it.
     pub offset: i32,
 }
 
@@ -904,7 +932,8 @@ coded! {
 pub struct OpLdc {
     /// The first destination register.
     pub dst: Gpr,
-    /// The buffer and the immediate byte offset.
+    /// The buffer and the immediate byte offset, read unsigned as NAK's `CBufRef::offset`
+    /// (`u16`); PR #4588 reads it signed (module docs, "Reference conflicts").
     pub cbuf: CBufRef,
     /// A register added to the offset; `RZ` for none.
     pub offset: Gpr,

@@ -927,6 +927,11 @@ fn other_offsets_at_the_edges_of_their_fields() {
         text(word(0xfae, &[(48, 0x8000), (74, 7), (84, 1), (90, 3)])),
         "ldgsts.e.bypass.128 [r0+-0x80000], [r0.64], 0x0, p0;"
     );
+    // The enable predicate `PT` (7 at bits 87..90) is left out.
+    assert_eq!(
+        text(word(0xfae, &[(74, 7), (84, 1), (87, 7), (90, 3)])),
+        "ldgsts.e.bypass.128 [r0], [r0.64], 0x0;"
+    );
     assert_eq!(
         text(word(
             0xb82,
@@ -934,6 +939,112 @@ fn other_offsets_at_the_edges_of_their_fields() {
         )),
         "ldc.u8 r1, c[0x1f][0xffff];"
     );
+}
+
+/// A reference conflict (`op::memory`'s module docs, "Reference conflicts"): with `RZ`, PR
+/// #4588's `Visitor::SharedOffset` reads the 24-bit offset of `LDS`, `STS`, `ATOMS`, `LDL` and
+/// `STL` unsigned, so the field `0x800000` is `+0x800000` there; the decoder sign-extends it, as
+/// for every other address, to `-0x800000`, and prints `rz+-0x800000`. The register case beside
+/// it is where the references agree.
+#[test]
+fn shared_and_local_offsets_with_rz_are_sign_extended() {
+    let rz = u128::from(Gpr::RZ.index());
+    let edge = 1_u128 << (MEM_OFFSET.width - 1);
+    let cases: [(u16, &str, &str); 5] = [
+        (
+            LDS_OPCODE,
+            "lds r1, [rz+-0x800000];",
+            "lds r1, [r2+-0x800000];",
+        ),
+        (
+            STS_OPCODE,
+            "sts [rz+-0x800000], r3;",
+            "sts [r2+-0x800000], r3;",
+        ),
+        (
+            ATOMS_OPCODE,
+            "atoms.add r1, [rz+-0x800000], r3;",
+            "atoms.add r1, [r2+-0x800000], r3;",
+        ),
+        (
+            LDL_OPCODE,
+            "ldl r1, [rz+-0x800000];",
+            "ldl r1, [r2+-0x800000];",
+        ),
+        (
+            STL_OPCODE,
+            "stl [rz+-0x800000], r3;",
+            "stl [r2+-0x800000], r3;",
+        ),
+    ];
+    for (opcode, with_rz, with_reg) in cases {
+        // The local forms' eviction priority, normal (printed as nothing); the shared forms
+        // have no field there.
+        let eviction = if matches!(opcode, LDL_OPCODE | STL_OPCODE) {
+            u128::from(MemEvictionPriority::Normal.bits())
+        } else {
+            0
+        };
+        // 32 bits, printed as nothing.
+        let ty = if opcode == ATOMS_OPCODE {
+            AtomType::U32.bits()
+        } else {
+            MemType::B32.bits()
+        };
+        // The stores have no destination field.
+        let dst = u128::from(!matches!(opcode, STS_OPCODE | STL_OPCODE));
+        for (reg, expected) in [(rz, with_rz), (2, with_reg)] {
+            let instruction = word(
+                u128::from(opcode),
+                &[
+                    (16, dst),
+                    (24, reg),
+                    (32, 3),
+                    (40, edge),
+                    (73, u128::from(ty)),
+                    (84, eviction),
+                ],
+            );
+            let offset = match op_of(instruction) {
+                Op::Ld(ld) => Some(ld.addr.offset),
+                Op::St(st) => Some(st.addr.offset),
+                Op::Atom(atom) => Some(atom.addr.offset),
+                _ => None,
+            }
+            .expect("a load, store or atomic");
+            assert_eq!(offset, -0x80_0000, "{opcode:#x}");
+            assert_eq!(text(instruction), expected, "{opcode:#x}");
+        }
+    }
+}
+
+/// A reference conflict (`op::memory`'s module docs, "Reference conflicts"): PR #4588's
+/// `Visitor::LDC` reads the 16-bit offset signed (`static_cast<s16>(Take(38, 16))`) and adds it
+/// to the offset register; the decoder keeps NAK's unsigned `u16`, below, at and above the sign
+/// bit, with an offset register other than `RZ`.
+#[test]
+fn ldc_offsets_with_an_offset_register_are_unsigned() {
+    for (field, offset, expected) in [
+        (0x7fff, 0x7fff_u16, "ldc r1, c[0x5][r6+0x7fff];"),
+        (0x8000, 0x8000, "ldc r1, c[0x5][r6+0x8000];"),
+        (0xffff, 0xffff, "ldc r1, c[0x5][r6+0xffff];"),
+    ] {
+        let instruction = word(
+            u128::from(LDC_OPCODE),
+            &[(16, 1), (24, 6), (38, field), (54, 5), (73, 4)],
+        );
+        let ldc = match op_of(instruction) {
+            Op::Ldc(ldc) => Some(ldc),
+            _ => None,
+        }
+        .expect("an LDC");
+        assert_eq!(
+            (ldc.offset, ldc.cbuf.offset, ldc.cbuf.buf),
+            (r(6), offset, CBuf::Binding(5)),
+            "{field:#x}"
+        );
+        assert_eq!(text(instruction), expected, "{field:#x}");
+    }
 }
 
 /// The encoder at and one past the edge of each signed or narrow field it checks.
@@ -1140,7 +1251,10 @@ fn atomic_and_barrier_field_values_match_the_references() {
         );
     }
     assert_eq!(AtomOp::ENCODED, atom_ops.map(|(value, _)| value));
-    assert_eq!(AtomOp::CmpExch(AtomCmpSrc::Separate { cmpr: r(1) }).bits(), None);
+    assert_eq!(
+        AtomOp::CmpExch(AtomCmpSrc::Separate { cmpr: r(1) }).bits(),
+        None
+    );
     let cctl_ops = [
         (CCtlOp::Pf1, 0, false),
         (CCtlOp::Pf2, 1, false),
@@ -1319,6 +1433,12 @@ fn values_the_group_refuses() {
         (0x9a8, vec![(77, 3), (87, 9)], unknown(0x9a8, 77, 4, 3)),
         (0x9a8, vec![(84, 6), (87, 9)], unknown(0x9a8, 84, 3, 6)),
         (0x98c, vec![(73, 7), (87, 9)], unknown(0x98c, 73, 3, 7)),
+        // The stores and atomics read the memory or atomic type (73) before the space's order
+        // (77) and eviction priority (84).
+        (0x986, vec![(73, 7), (77, 1)], unknown(0x986, 73, 3, 7)),
+        (0x387, vec![(73, 7), (84, 7)], unknown(0x387, 73, 3, 7)),
+        (0x9a8, vec![(73, 7), (77, 1)], unknown(0x9a8, 73, 3, 7)),
+        (0x98e, vec![(73, 7), (84, 6)], unknown(0x98e, 73, 3, 7)),
     ];
     for (opcode, fields, error) in cases {
         assert_eq!(
@@ -1343,6 +1463,15 @@ fn values_the_group_refuses() {
         } else {
             assert_eq!(result, Err(unknown(0x986, 77, 4, value)), "{value:#x}");
         }
+    }
+    // Every four-bit cache operation past the nine NAK names (0 to 8) is refused.
+    let cctl_ops = u64::try_from(CCtlOp::ALL.len()).expect("a handful of operations");
+    for value in cctl_ops..1 << CCTL_OP.width {
+        assert_eq!(
+            decode(word(0x98f, &[(87, u128::from(value))])),
+            Err(unknown(0x98f, 87, 4, value)),
+            "{value}"
+        );
     }
     // `RED`'s three-bit operation names an operation in every value.
     for value in 0..8 {
@@ -1687,25 +1816,42 @@ fn unencodable_ldc_and_atomics_are_errors() {
             },
             "atom has no bits for a uniform address register".into(),
         ),
-        // The surface atomics' packed compare source has no memory-atomic form; without the
-        // refusal it would encode as an `ADD` (the operation field left clear).
-        (
-            OpAtom {
-                op: AtomOp::CmpExch(AtomCmpSrc::Packed),
-                ..atom
-            },
-            "atom has no bits for a packed compare source".into(),
-        ),
-        (
-            OpAtom {
-                op: AtomOp::CmpExch(AtomCmpSrc::Packed),
-                ..shared
-            },
-            "atom has no bits for a packed compare source".into(),
-        ),
     ];
     for (op, message) in atom_cases {
         assert_eq!(refused(Op::Atom(op)), Err(message));
+    }
+}
+
+/// The surface atomics' packed compare source ([`AtomCmpSrc::Packed`], shared with
+/// `op::texture`) has no memory-atomic form, global or shared: the encoder refuses it with a
+/// plain-word message. Without the refusal it would encode as an `ADD` (the operation field
+/// left clear), and the separate source beside it still encodes.
+#[test]
+fn memory_atomics_refuse_a_packed_compare_source() {
+    let global = OpAtom {
+        dst: AtomDst::Reg(r(1)),
+        addr: addr(None, true),
+        data: r(3),
+        op: AtomOp::CmpExch(AtomCmpSrc::Packed),
+        atom_type: AtomType::U32,
+        space: global(MemOrder::Weak, MemEvictionPriority::Normal),
+        pred_dst: Pred::PT,
+    };
+    let shared = OpAtom {
+        space: MemSpace::Shared(OffsetStride::X1),
+        addr: addr(None, false),
+        ..global
+    };
+    for atom in [global, shared] {
+        assert_eq!(
+            refused(Op::Atom(atom)),
+            Err("atom has no bits for a packed compare source".into())
+        );
+        let separate = OpAtom {
+            op: AtomOp::CmpExch(AtomCmpSrc::Separate { cmpr: r(4) }),
+            ..atom
+        };
+        assert!(refused(Op::Atom(separate)).is_ok());
     }
 }
 
