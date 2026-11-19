@@ -31,6 +31,11 @@
 //! 6. the layouts ([`layout`]);
 //! 7. for a graphics pipeline, the fixed-function state ([`state`]).
 //!
+//! A compute pipeline has no description to check against `Caps` or fixed-function state, so
+//! steps 2 and 7 do not apply to it. The order is pinned by `tests::pipeline_checks_run_in_order`,
+//! `tests::nothing_is_created_once_the_device_is_lost` (step 3) and
+//! `tests::requirements_come_after_the_ids_and_before_the_layout` (step 5).
+//!
 //! Then the id is allocated, the pipeline's status is `Compiling`, and one job goes to the
 //! compile pool ([`CompilePool`]) before the call returns. wgpu's pipeline creation is
 //! synchronous, so the job calls it on a pool worker: it creates the shaders' wgpu modules (once

@@ -374,7 +374,7 @@ fn vertex_buffers(desc: &GraphicsPipelineDesc) -> Result<Vec<BufferPlan>, Render
 
 /// The fixed-function state of a description the shared checks accepted, or the refusal
 /// (module docs). Checked in the order: vertex formats, topology, culling, colour targets
-/// (a fragment shader, then each target's format in index order), the depth/stencil format.
+/// (a fragment shader, then the target formats), the depth/stencil format.
 pub(crate) fn graphics(desc: &GraphicsPipelineDesc) -> Result<GraphicsPlan, RenderError> {
     let buffers = vertex_buffers(desc)?;
     let topology = topology(desc.topology).ok_or(RenderError::Unsupported(ADJACENCY))?;
