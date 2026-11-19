@@ -1072,15 +1072,17 @@ fn a_flight_recorder_that_cannot_be_written_out_is_reported_however_the_run_ende
         "the flight recorder could not be written out: {}",
         DumpError::BadMagic
     );
-    // A clean exit does not stay one.
-    assert_eq!(
-        settle_dump(lost(), ExitReason::ProcessExited),
-        (
-            ExitReason::EmulatorError(message.clone()),
-            empty_dump(),
-            Some(message.clone())
-        )
-    );
+    // A clean exit does not stay one, nor does a run that presented its frames.
+    for clean in [ExitReason::ProcessExited, ExitReason::FramesReached] {
+        assert_eq!(
+            settle_dump(lost(), clean),
+            (
+                ExitReason::EmulatorError(message.clone()),
+                empty_dump(),
+                Some(message.clone())
+            )
+        );
+    }
     // A timeout, a crash and an emulator error keep their reason, and the loss is still said.
     let crash = ExitReason::GuestCrashed(Box::new(CrashReport::new(
         Exception::UndefinedInstruction,

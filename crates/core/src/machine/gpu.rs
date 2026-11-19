@@ -54,6 +54,13 @@
 //! ([`GPU_FAILED`]); a crash, a timeout or an emulator error keeps its own reason, which matters
 //! more, and the failure is logged (`after_stop`, tested for every ending with and without a
 //! failure). A GPU whose threads already ended is not waited for: it can never be idle again.
+//!
+//! **No test pins the wait itself.** Removing it leaves every test here passing: whether the
+//! GPU's front has read a request by the time it is stopped (which drops what it has not read,
+//! `starquake_gpu::wiring`, "Shutdown") depends on host timing, and in the tests' runs the last
+//! present is handed long enough before the end that the front has always read it. The warning
+//! for a GPU still busy is not pinned either: no test can make the GPU stay busy for
+//! [`GPU_DRAIN_WAIT`] without a backend that never completes, which the run does not build.
 
 use std::num::NonZeroU64;
 use std::sync::Arc;
