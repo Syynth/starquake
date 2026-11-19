@@ -7,7 +7,9 @@
 //! commands to the open list. Eden draws deferred instances (`DrawDeferred`) after each macro;
 //! the ring marks no macro's end, so the executor calls [`Draws::flush`] at the boundaries its
 //! module docs list ("Deferred instanced draws"). It hands each run of `LOAD_ROOT_TABLE` words
-//! to [`Draws::load_root_table`] before the selector write that follows the run.
+//! to [`Draws::load_root_table`] before the selector write that follows the run. A word written
+//! to `CLEAR_SURFACE` is a clear ([`clear`], slice G24), which shares the draw path's render
+//! targets, conditional render answer and host-object lifetime.
 //!
 //! # A draw, step by step
 //!

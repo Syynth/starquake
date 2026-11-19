@@ -161,7 +161,12 @@ impl Rig {
     }
 
     fn set(&mut self, method: &Method, indices: &[u32], value: u32) {
-        assert_eq!(self.put(method, indices, value), Ok(None), "{}", method.name);
+        assert_eq!(
+            self.put(method, indices, value),
+            Ok(None),
+            "{}",
+            method.name
+        );
     }
 
     /// Writes `word` to `CLEAR_SURFACE`.
@@ -203,10 +208,7 @@ impl Rig {
 
     /// `SET_CT_SELECT` with `count` targets, mapped to themselves.
     fn ct_select(&mut self, count: u32) {
-        let targets = [
-            clc797::SET_CT_SELECT_TARGET0,
-            clc797::SET_CT_SELECT_TARGET1,
-        ];
+        let targets = [clc797::SET_CT_SELECT_TARGET0, clc797::SET_CT_SELECT_TARGET1];
         let mut word = fields(&[(clc797::SET_CT_SELECT_TARGET_COUNT, count)]);
         for (index, field) in (0u32..).zip(targets) {
             word = field.insert(word, index).unwrap();
@@ -274,7 +276,11 @@ impl Rig {
 
     /// Scissor 0 on, from `x` to `x_end` and `y` to `y_end`, and `USE_SCISSOR0`.
     fn scissor(&mut self, x: u32, x_end: u32, y: u32, y_end: u32) {
-        self.set(&clc797::SET_SCISSOR_ENABLE, &[0], clc797::SET_SCISSOR_ENABLE_V_TRUE);
+        self.set(
+            &clc797::SET_SCISSOR_ENABLE,
+            &[0],
+            clc797::SET_SCISSOR_ENABLE_V_TRUE,
+        );
         self.set(
             &clc797::SET_SCISSOR_HORIZONTAL,
             &[0],
@@ -291,7 +297,10 @@ impl Rig {
                 (clc797::SET_SCISSOR_VERTICAL_YMAX, y_end),
             ]),
         );
-        self.control(fields(&[(clc797::SET_CLEAR_SURFACE_CONTROL_USE_SCISSOR0, 1)]));
+        self.control(fields(&[(
+            clc797::SET_CLEAR_SURFACE_CONTROL_USE_SCISSOR0,
+            1,
+        )]));
     }
 
     fn control(&mut self, word: u32) {
@@ -316,7 +325,11 @@ impl Rig {
             from: CopyRegion::Texture(TextureRegion {
                 texture,
                 mip: 0,
-                origin: Origin3d { x: 0, y: 0, z: layer },
+                origin: Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: layer,
+                },
                 extent: Extent3d {
                     width: WIDTH,
                     height: HEIGHT,
@@ -464,6 +477,13 @@ fn clear_registers_are_where_the_header_puts_them() {
     assert_eq!(clc797::SET_STENCIL_MASK_V, Field::new(7, 0));
     assert_eq!(clc797::SET_STENCIL_FUNC_MASK.byte_address, 0x1398);
     assert_eq!(clc797::SET_STENCIL_FUNC_MASK_V, Field::new(7, 0));
+    assert_eq!(clc797::SET_SCISSOR_ENABLE.byte_address, 0x0e00);
+    assert_eq!(clc797::SET_SCISSOR_HORIZONTAL.byte_address, 0x0e04);
+    assert_eq!(clc797::SET_SCISSOR_VERTICAL.byte_address, 0x0e08);
+    assert_eq!(clc797::SET_SCISSOR_HORIZONTAL_XMIN, Field::new(15, 0));
+    assert_eq!(clc797::SET_SCISSOR_HORIZONTAL_XMAX, Field::new(31, 16));
+    assert_eq!(clc797::SET_SCISSOR_VERTICAL_YMIN, Field::new(15, 0));
+    assert_eq!(clc797::SET_SCISSOR_VERTICAL_YMAX, Field::new(31, 16));
     // Eden's `stencil_partial` constant.
     assert_eq!(FULL_STENCIL_MASK, 0xff);
     assert_eq!(CLEAR_METHODS[0].byte_address, 0x19d0);
@@ -617,8 +637,14 @@ fn integer_clear_values_follow_edens_formula() {
     );
     // A float or normalised format takes the floats as they are, each channel distinct.
     let floats = [0.25, -2.0, 3.5, 100.0];
-    assert_eq!(color_value(P::R32G32B32A32Float, floats), ClearValue::Float(floats));
-    assert_eq!(color_value(P::A8B8G8R8Unorm, floats), ClearValue::Float(floats));
+    assert_eq!(
+        color_value(P::R32G32B32A32Float, floats),
+        ClearValue::Float(floats)
+    );
+    assert_eq!(
+        color_value(P::A8B8G8R8Unorm, floats),
+        ClearValue::Float(floats)
+    );
 }
 
 #[test]
@@ -683,10 +709,19 @@ fn clamp_to_area_keeps_what_lies_inside() {
         height,
     };
     // Ending exactly at the area's end: unchanged; one past: one shorter.
-    assert_eq!(clamp_to_area(rect(2, 1, 6, 5), 8, 6), Some(rect(2, 1, 6, 5)));
-    assert_eq!(clamp_to_area(rect(2, 1, 7, 6), 8, 6), Some(rect(2, 1, 6, 5)));
+    assert_eq!(
+        clamp_to_area(rect(2, 1, 6, 5), 8, 6),
+        Some(rect(2, 1, 6, 5))
+    );
+    assert_eq!(
+        clamp_to_area(rect(2, 1, 7, 6), 8, 6),
+        Some(rect(2, 1, 6, 5))
+    );
     // Starting on the last column and row: one texel; at the end: nothing.
-    assert_eq!(clamp_to_area(rect(7, 5, 9, 9), 8, 6), Some(rect(7, 5, 1, 1)));
+    assert_eq!(
+        clamp_to_area(rect(7, 5, 9, 9), 8, 6),
+        Some(rect(7, 5, 1, 1))
+    );
     assert_eq!(clamp_to_area(rect(8, 0, 9, 9), 8, 6), None);
     assert_eq!(clamp_to_area(rect(0, 6, 9, 9), 8, 6), None);
     // An empty extent, or an empty area.
@@ -993,7 +1028,11 @@ fn a_disabled_scissor_0_is_the_whole_target() {
     let mut rig = Rig::new();
     rig.basic();
     rig.scissor(1, 5, 2, 4);
-    rig.set(&clc797::SET_SCISSOR_ENABLE, &[0], clc797::SET_SCISSOR_ENABLE_V_FALSE);
+    rig.set(
+        &clc797::SET_SCISSOR_ENABLE,
+        &[0],
+        clc797::SET_SCISSOR_ENABLE_V_FALSE,
+    );
     assert_eq!(rig.clear(color(ColorWrites::ALL)), ONLY_COLOR);
     assert_eq!(rig.clears()[0].rect, None);
 }
@@ -1201,6 +1240,33 @@ fn a_colour_target_that_is_not_bound_is_skipped() {
         ..color(ColorWrites::ALL)
     };
     assert_eq!(rig.clear(last), skipped);
+    // A count past the eight colour targets bounds nothing beyond them.
+    rig.ct_select(clc797::SET_CT_SELECT_TARGET_COUNT.max());
+    assert_eq!(rig.clear(last), skipped);
+    let ninth = ClearSurface {
+        target: COLOR_TARGETS,
+        ..color(ColorWrites::ALL)
+    };
+    assert_eq!(rig.clear(ninth), skipped);
+}
+
+#[test]
+fn a_word_asking_nothing_reads_no_state() {
+    let mut rig = Rig::new();
+    rig.basic();
+    // A colour target format no draw could use: any clear that reads the targets fails.
+    rig.set(
+        &clc797::SET_COLOR_TARGET_FORMAT,
+        &[0],
+        clc797::SET_COLOR_TARGET_FORMAT_V_Z1R5G5B5,
+    );
+    assert_eq!(rig.clear_word(0), Ok(Cleared::NOTHING));
+    assert_eq!(
+        rig.clear_word(color(ColorWrites::ALL).encode().unwrap()),
+        Err(DrawError::TargetFormat {
+            value: clc797::SET_COLOR_TARGET_FORMAT_V_Z1R5G5B5
+        })
+    );
 }
 
 #[test]
@@ -1220,6 +1286,27 @@ fn the_cleared_colour_target_is_the_one_mrt_select_names() {
     assert_eq!(rig.texels(t1, 0), vec![0xff; pixels]);
     // Target 0 was not even made.
     assert!(rig.textures.entries().all(|e| e.info.address != TARGET0));
+}
+
+#[test]
+fn a_target_at_address_zero_is_cleared_like_any_other() {
+    let mut rig = Rig::new();
+    rig.color_target(0, 0, clc797::SET_COLOR_TARGET_FORMAT_V_A8B8G8R8, 1);
+    rig.ct_select(1);
+    rig.depth_target(clc797::SET_ZT_FORMAT_V_ZF32, WIDTH, HEIGHT, 1);
+    rig.address(&clc797::SET_ZT_A, &clc797::SET_ZT_B, &[], 0);
+    let surface = ClearSurface {
+        depth: true,
+        ..color(ColorWrites::ALL)
+    };
+    assert_eq!(
+        rig.clear(surface),
+        Cleared {
+            color: Some(Part::Cleared),
+            depth_stencil: Some(Part::Cleared),
+        }
+    );
+    assert_eq!(rig.clears().len(), 2);
 }
 
 #[test]
@@ -1290,7 +1377,11 @@ fn only_the_aspects_the_format_has_are_cleared() {
         let cleared = rig.clear(depth_stencil(depth, stencil));
         match expect {
             Err(skip) => {
-                assert_eq!(cleared.depth_stencil, Some(Part::Skipped(skip)), "{format:#x}");
+                assert_eq!(
+                    cleared.depth_stencil,
+                    Some(Part::Skipped(skip)),
+                    "{format:#x}"
+                );
                 assert!(rig.commands().is_empty());
             }
             Ok(value) => {
@@ -1325,13 +1416,19 @@ fn a_layer_past_the_targets_is_skipped() {
         rig.clear(last(2)),
         Cleared {
             color: Some(Part::Cleared),
-            depth_stencil: Some(Part::Skipped(ClearSkip::Layer { layer: 2, layers: 2 })),
+            depth_stencil: Some(Part::Skipped(ClearSkip::Layer {
+                layer: 2,
+                layers: 2
+            })),
         }
     );
     // One past the colour target's.
     assert_eq!(
         rig.clear(last(3)).color,
-        Some(Part::Skipped(ClearSkip::Layer { layer: 3, layers: 3 }))
+        Some(Part::Skipped(ClearSkip::Layer {
+            layer: 3,
+            layers: 3
+        }))
     );
     insta::assert_snapshot!(rig.submit());
 }
@@ -1535,7 +1632,12 @@ fn a_masked_colour_clear_is_a_draw_through_the_mask() {
 #[test]
 fn a_masked_integer_clear_draws_the_converted_value() {
     let mut rig = Rig::new();
-    rig.color_target(0, TARGET0, clc797::SET_COLOR_TARGET_FORMAT_V_AS8BS8GS8RS8, 1);
+    rig.color_target(
+        0,
+        TARGET0,
+        clc797::SET_COLOR_TARGET_FORMAT_V_AS8BS8GS8RS8,
+        1,
+    );
     rig.ct_select(1);
     rig.clear_color([1.0, 0.5, 0.0, 2.0]);
     assert_eq!(rig.clear(color(ColorWrites::RED)).color, Some(Part::Drawn));
@@ -1666,7 +1768,10 @@ fn pipelines_are_kept_up_to_the_cap() {
     rig.basic();
     rig.draws.clears.pipeline_limit = 2;
     assert_eq!(rig.clear(color(ColorWrites::RED)).color, Some(Part::Drawn));
-    assert_eq!(rig.clear(color(ColorWrites::GREEN)).color, Some(Part::Drawn));
+    assert_eq!(
+        rig.clear(color(ColorWrites::GREEN)).color,
+        Some(Part::Drawn)
+    );
     assert_eq!(rig.draws.clear_pipelines(), 2);
     // The same mask again reuses its pipeline.
     assert_eq!(rig.clear(color(ColorWrites::RED)).color, Some(Part::Drawn));
@@ -1731,7 +1836,10 @@ fn a_failed_pipeline_skips_its_clears() {
     );
     assert_eq!(rig.commands().len(), before);
     // Another mask's pipeline is unaffected.
-    assert_eq!(rig.clear(color(ColorWrites::GREEN)).color, Some(Part::Drawn));
+    assert_eq!(
+        rig.clear(color(ColorWrites::GREEN)).color,
+        Some(Part::Drawn)
+    );
 }
 
 #[test]
@@ -1758,7 +1866,10 @@ fn every_clear_object_is_destroyed_after_the_last_fence() {
         .filter(|l| l.starts_with("destroy"))
         .collect();
     assert_eq!(destroyed.len(), 6, "{snapshot}");
-    assert!(destroyed.iter().all(|l| l.contains("after fence 1")), "{snapshot}");
+    assert!(
+        destroyed.iter().all(|l| l.contains("after fence 1")),
+        "{snapshot}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1846,7 +1957,10 @@ fn the_aspect_comes_before_the_depth_value_and_the_value_before_the_layer() {
     rig.clear_depth(0.5);
     assert_eq!(
         rig.clear(past).depth_stencil,
-        Some(Part::Skipped(ClearSkip::Layer { layer: 4, layers: 1 }))
+        Some(Part::Skipped(ClearSkip::Layer {
+            layer: 4,
+            layers: 1
+        }))
     );
 }
 

@@ -249,7 +249,10 @@ pub(crate) fn color_target(
 }
 
 /// The depth target's image.
-pub(crate) fn depth_target(three_d: ThreeD<'_>, samples: SampleLayout) -> Result<ImageInfo, DrawError> {
+pub(crate) fn depth_target(
+    three_d: ThreeD<'_>,
+    samples: SampleLayout,
+) -> Result<ImageInfo, DrawError> {
     let zt = three_d.zt();
     let format = depth_format(zt.format()?.value)?;
     let width = zt.width()?;

@@ -10,8 +10,9 @@
 //! # A clear, step by step
 //!
 //! This is Eden-NX2's `RasterizerVulkan::Clear`, which Eden's `DrawManager::Clear` calls once
-//! `ShouldExecute` passes, with a layer count of 1. Each step is a check of that function; the
-//! order is its order.
+//! `ShouldExecute` passes, with a layer count of 1. Steps 1 to 5 make its checks in its order;
+//! the checks it does not make (a slice or layer past the target, a NaN depth value, a failed
+//! pipeline) are listed under "Divergences from Eden-NX2" and "Guesses".
 //!
 //! 1. **Conditional render**: a clear while the guest disabled rendering does nothing
 //!    ([`ClearSkip::RenderDisabled`]), as `DrawManager::Clear` tests `ShouldExecute` first.
@@ -70,13 +71,26 @@
 //! to build skips its clears ([`ClearSkip::PipelineFailed`]). Every host object here is
 //! destroyed when the draw path is dropped, after its last submitted fence.
 //!
+//! # The spec's offline test
+//!
+//! gpu-protocol's slice table gives G24's test as "a whole-target clear of colour, depth and
+//! stencil each, and a masked and a scissored clear that become draws". Here a scissored clear
+//! with every channel is a [`Command::Clear`] with a rectangle, since the render backend's clear
+//! takes one ("colour, depth, stencil; whole or rect", render-backend, "Commands"), as the
+//! spec's "Clears" paragraph allows ("a draw when the clear is masked or scissored in a way a
+//! render-pass clear cannot express") and issue #428 asks ("a clear rectangle where the backend
+//! can"). Only a masked clear is a draw. An **owner question**: whether the table's wording
+//! should follow. `tests::golden_scissored`, `tests::golden_masked`.
+//!
 //! # Errors and what they leave
 //!
-//! Every check that can skip a part comes before the targets are resolved; a part whose target,
-//! pipeline or staging memory cannot be had fails the clear ([`DrawError`]) before any clear or
-//! draw command is appended, so a clear appends its commands whole or not at all. Uploads the
-//! texture cache appended while resolving stay, as for a draw (`back::draw`, "Errors and what
-//! they leave").
+//! Every check that can skip a part comes before the targets are resolved, except a failed
+//! pipeline ([`ClearSkip::PipelineFailed`]), which is known only once the part's target is
+//! resolved and its pipeline looked up. A part whose target, pipeline or staging memory cannot be
+//! had fails the clear ([`DrawError`]) before any clear or draw command is appended, so a clear
+//! appends its commands whole or not at all (`tests::a_failed_part_appends_no_part_of_the_clear`).
+//! What resolving did stays: uploads the texture cache appended, a target marked GPU-modified, a
+//! pipeline made, as for a draw (`back::draw`, "Errors and what they leave").
 //!
 //! # Sources
 //!
@@ -110,12 +124,16 @@
 //!
 //! Each is pinned by the test named, in `clear/tests.rs`.
 //!
-//! - **One layer, always.** Eden-NX2 defers a clear at layer 0 with no render pass open into the
-//!   next render pass's load operation (`scheduler.DeferColorClear`), which clears every layer
-//!   of a layered framebuffer; otherwise it clears the one layer `RT_ARRAY_INDEX` names
-//!   (`VkClearRect`'s `baseArrayLayer`, `layerCount` 1). Here a clear is always of that one
-//!   layer, as Eden mainline's `ClearAttachments` path.
+//! - **One layer, always.** Eden (both pins) defers a whole, unmasked clear at layer 0 with no
+//!   render pass open into the next render pass's load operation (`scheduler.DeferColorClear`,
+//!   realised by `Scheduler::RealizeDeferredClear` in `vk_scheduler.cpp`), which clears every
+//!   layer of a layered framebuffer; otherwise it clears the one layer `RT_ARRAY_INDEX` names
+//!   (`ClearAttachments` with `VkClearRect`'s `baseArrayLayer`, `layerCount` 1). Here a clear is
+//!   always of that one layer, as the `ClearAttachments` path.
 //!   `a_clear_of_layer_zero_of_a_layered_target_clears_that_layer_alone`.
+//! - **A target at GPU address 0 is cleared like any other**, as G18 draws to it
+//!   ([`super::targets`]); Eden's `FindColorBuffer` and `FindDepthBuffer` give no view for
+//!   address 0, so it clears nothing there. `a_target_at_address_zero_is_cleared_like_any_other`.
 //! - **A layer past the target's is skipped** ([`ClearSkip::Layer`]), where Eden hands Vulkan a
 //!   layer the framebuffer does not have. `a_layer_past_the_targets_is_skipped`.
 //! - **A colour target that is not bound is skipped** ([`ClearSkip::NotBound`]). Eden's
@@ -151,8 +169,9 @@
 //! - `SET_CLEAR_SURFACE_CONTROL`'s `RESPECT_STENCIL_MASK`, `USE_CLEAR_RECT` and
 //!   `USE_VIEWPORT_CLIP0`, and `SET_CLEAR_RECT_HORIZONTAL` and `_VERTICAL`: Eden reads only
 //!   `use_scissor`. A partial stencil mask is always respected and a mask of 0 is a full clear,
-//!   as Eden's `stencil_partial` test has it. A **guess** that NVN2 leaves the three bits as
-//!   Mesa's NVK sets them (clear rect and viewport clip off); a trace would confirm.
+//!   as Eden's `stencil_partial` test has it. A **guess** that NVN2's clears do not depend on
+//!   the three bits (a title clearing through the clear rect would be bounded by scissor 0 or
+//!   by nothing here); a trace of NVN2's `SET_CLEAR_SURFACE_CONTROL` writes would confirm.
 //!   `the_unread_control_bits_change_nothing`.
 //! - Eden's `IsFullClear`, which lets a whole-target clear skip uploading the target first:
 //!   here the target is uploaded if it must be and then cleared, which costs an upload and
@@ -181,26 +200,26 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use starquake_layout::ImageDim;
+use starquake_render::caps::GUEST_COLOR_TARGETS;
 use starquake_render::command::{
-    Binding, BindingResource, BufferSlice, ClearDesc, ClearValue, CopyRegion, DrawDesc,
-    DrawParams, DynamicValues, Rect, RenderTargets, Viewport,
+    Binding, BindingResource, BufferSlice, ClearDesc, ClearValue, CopyRegion, DrawDesc, DrawParams,
+    DynamicValues, Rect, RenderTargets, Viewport,
 };
 use starquake_render::host_shaders::{self, OUTPUT_LOCATION};
 use starquake_render::pipeline::{
     BlendComponent, BlendFactor, BlendOperation, BlendState, ColorWrites, CullMode, DepthBias,
-    DepthStencilState, FrontFace, PolygonMode, RasterState, Stages, StencilFace,
-    StencilOperation, StencilState, TargetFormats, Topology, VertexLayout,
+    DepthStencilState, FrontFace, PolygonMode, RasterState, Stages, StencilFace, StencilOperation,
+    StencilState, TargetFormats, Topology, VertexLayout,
 };
 use starquake_render::resource::CompareFunction;
 use starquake_render::shader::{
     InterfaceVariable, Interpolation, ScalarKind, ShaderDesc, ShaderInterface, ShaderSource,
     ShaderStage,
 };
-use starquake_render::caps::GUEST_COLOR_TARGETS;
 use starquake_render::{
-    Backend, BufferDesc, BufferId, BufferUsage, Command, CommandList, EmulationFlags,
-    FenceValue, GraphicsPipelineDesc, HostShader, PipelineId, PipelineStatus, PixelFormat,
-    ResourceId, ShaderId, StagingSlice, ViewId,
+    Backend, BufferDesc, BufferId, BufferUsage, Command, CommandList, EmulationFlags, FenceValue,
+    GraphicsPipelineDesc, HostShader, PipelineId, PipelineStatus, PixelFormat, ResourceId,
+    ShaderId, StagingSlice, ViewId,
 };
 
 use super::{DrawContext, DrawError, fixed, targets};
@@ -522,7 +541,9 @@ impl Values {
     fn read(mirror: &Mirror) -> Result<Self, DrawError> {
         let mut color = [0.0; 4];
         for (index, slot) in (0u32..).zip(color.iter_mut()) {
-            *slot = mirror.reg(&clc797::SET_COLOR_CLEAR_VALUE, &[index])?.float();
+            *slot = mirror
+                .reg(&clc797::SET_COLOR_CLEAR_VALUE, &[index])?
+                .float();
         }
         Ok(Self {
             color,
@@ -613,9 +634,18 @@ impl Entry {
         };
         let (resources, outputs) = match self {
             Self::Vertex => (Vec::new(), Vec::new()),
-            Self::Float => (host_shaders::clear::RESOURCES.to_vec(), vec![output(ScalarKind::Float)]),
-            Self::Sint => (host_shaders::clear::RESOURCES.to_vec(), vec![output(ScalarKind::Sint)]),
-            Self::Uint => (host_shaders::clear::RESOURCES.to_vec(), vec![output(ScalarKind::Uint)]),
+            Self::Float => (
+                host_shaders::clear::RESOURCES.to_vec(),
+                vec![output(ScalarKind::Float)],
+            ),
+            Self::Sint => (
+                host_shaders::clear::RESOURCES.to_vec(),
+                vec![output(ScalarKind::Sint)],
+            ),
+            Self::Uint => (
+                host_shaders::clear::RESOURCES.to_vec(),
+                vec![output(ScalarKind::Uint)],
+            ),
             Self::Depth => (host_shaders::clear::RESOURCES.to_vec(), Vec::new()),
         };
         ShaderInterface {
@@ -682,7 +712,8 @@ impl Target {
         if info.dim == ImageDim::D3 && info.depth > 1 {
             return Err(ClearSkip::VolumeTarget);
         }
-        let layers = if info.dim == ImageDim::D3 { 1 } else { info.layers };
+        // A 3D target is one layer (`targets::color_target`), so this bounds its one slice too.
+        let layers = info.layers;
         if layer >= layers {
             return Err(ClearSkip::Layer { layer, layers });
         }
@@ -767,11 +798,8 @@ impl Clears {
         // Step 3.
         let three_d = mirror.three_d()?;
         let bound = targets::targets(mirror)?;
-        let control = ClearControl::from_word(
-            mirror
-                .reg(&clc797::SET_CLEAR_SURFACE_CONTROL, &[])?
-                .word(),
-        );
+        let control =
+            ClearControl::from_word(mirror.reg(&clc797::SET_CLEAR_SURFACE_CONTROL, &[])?.word());
         let scissor = if control.use_scissor0() {
             fixed::guest_scissor(three_d, 0)?
         } else {
@@ -1271,9 +1299,8 @@ fn depth_stencil_part(
         None
     };
     let target = Target::check(info, surface.layer)?;
-    let partial = use_stencil
-        && values.stencil_mask != FULL_STENCIL_MASK
-        && values.stencil_mask != 0;
+    let partial =
+        use_stencil && values.stencil_mask != FULL_STENCIL_MASK && values.stencil_mask != 0;
     Ok(DepthStencilPart {
         target,
         depth,

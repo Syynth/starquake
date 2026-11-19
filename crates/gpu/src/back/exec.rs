@@ -53,7 +53,8 @@
 //! Each word reaches its engine one at a time, after the mirror stored it, since the engines
 //! read their registers from the mirror (an inline upload reads `LOAD_INLINE_DATA` there):
 //!
-//! - **3D (`C797`)**: [`Draws::method`] (draw triggers, conditional render), the inline upload
+//! - **3D (`C797`)**: [`Draws::method`] (draw triggers, `CLEAR_SURFACE` clears, conditional
+//!   render), the inline upload
 //!   ([`INLINE_C797`]), and each run of `LOAD_ROOT_TABLE` words to [`Draws::load_root_table`]
 //!   as a whole.
 //! - **Compute (`C7C0`)**: the inline upload ([`INLINE_C7C0`]) and [`QmdTable::compute_method`];
@@ -69,7 +70,8 @@
 //! ([`ShaderCache`]'s `invalidate`). Then, before a draw or dispatch, the merged inline writes
 //! ([`PendingWrites::flush`]) reach the caches (a DMA or 2D launch flushes them itself). A
 //! word "starts a draw" here when its method is one of the draw path's
-//! ([`crate::back::draw::call::DRAW_METHODS`], [`crate::back::draw::call::UNHANDLED_METHODS`]);
+//! ([`crate::back::draw::call::DRAW_METHODS`], [`crate::back::draw::call::UNHANDLED_METHODS`],
+//! and `CLEAR_SURFACE`, [`crate::back::draw::clear::CLEAR_METHODS`]);
 //! a dispatch, when it is the last inline QMD word or `SEND_SIGNALING_PCAS2_B`; a copy, when it
 //! is a `LAUNCH_DMA` or `PIXELS_FROM_MEMORY_SRC_Y0_INT`.
 //!
@@ -147,7 +149,9 @@
 //! path that did not make the last draw is told its targets are gone the same way
 //! (`tests::two_channels_drawing_into_one_list_each_set_their_targets`), and so is one drawing
 //! after a dispatch or present
-//! (`tests::a_dispatch_between_two_draws_makes_the_second_set_its_targets`).
+//! (`tests::a_dispatch_between_two_draws_makes_the_second_set_its_targets`), or after another
+//! engine's clear that drew (`back::draw::clear`, "The draw-based clear";
+//! `tests::clear::a_masked_clear_on_another_channel_makes_the_next_draw_set_its_targets`).
 //!
 //! # Presents
 //!
