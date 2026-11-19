@@ -172,8 +172,8 @@ pub use defaults::{DEFAULTS_2D, DEFAULTS_3D, RegisterDefault};
 pub(crate) use file::Journal;
 pub use file::{EntrySink, RegFile, RegsError, ShadowMode};
 pub use rules::{
-    COMPUTE, ClassRules, DATA_LOADS_3D, FALCON04_SCRATCH_VALUE, LOAD_CONSTANT_BUFFER_COUNT,
-    MethodSpan, OTHER, SIDE_EFFECTS_3D, SIDE_EFFECTS_COMPUTE, SideEffect, SideEffectRule, THREE_D,
-    TWO_D, WORD_BYTES,
+    COMPUTE, CONSTANT_BUFFER_LOADS, ClassRules, DATA_LOADS_3D, FALCON04_SCRATCH_VALUE,
+    LOAD_CONSTANT_BUFFER_COUNT, MethodSpan, OTHER, SIDE_EFFECTS_3D, SIDE_EFFECTS_COMPUTE,
+    SideEffect, SideEffectRule, THREE_D, TWO_D, WORD_BYTES,
 };
 pub use state_3d::STATE_3D;

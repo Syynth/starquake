@@ -3,7 +3,7 @@
 use super::*;
 use crate::capture::{
     Access, BackRecord, Capture, Divergence, FrontRecord, Output, ReplayError, ReplayOptions,
-    Thread, replay, writes_text,
+    Thread, entry_hash, replay, writes_text,
 };
 use crate::ring::{RingEntry, write_text};
 
@@ -427,6 +427,57 @@ fn a_fence_wait_reads_the_syncpoint_value_the_back_left() {
         .front
         .retain(|record| !matches!(record, FrontRecord::Syncpoint { .. }));
     assert!(replay(unset.clone(), ReplayOptions::default()).is_err());
+}
+
+/// A submission's `u32::MAX` increments are one `ring` record, the hash of the entry with its
+/// count (the format stays version 1: no capture has shipped), and the capture replays; the
+/// same entry with a count of 1 in that record's place is a difference at its index.
+#[test]
+fn a_counted_syncpoint_entry_is_one_ring_record() {
+    let mut builder = builder();
+    let channel = channel(&mut builder);
+    let mut submission = submission_at(&builder, CMD, &releases(SEM, 1));
+    submission.increments = u32::MAX;
+    builder.submit(channel, submission).unwrap();
+    builder.run().unwrap();
+    let mut capture = Capture::parse(&builder.finish().unwrap().to_bytes().unwrap()).unwrap();
+    let counted = RingEntry::Syncpoint {
+        id: syncpoint(),
+        count: u32::MAX,
+    };
+    let hash = entry_hash(&counted).unwrap();
+    let rings: Vec<usize> = capture
+        .outputs
+        .iter()
+        .enumerate()
+        .filter(|(_, output)| matches!(output, Output::Ring { .. }))
+        .map(|(at, _)| at)
+        .collect();
+    let counted_at: Vec<usize> = rings
+        .iter()
+        .copied()
+        .filter(|&at| capture.outputs[at] == Output::Ring { hash })
+        .collect();
+    assert_eq!(counted_at.len(), 1);
+    let output = replay(capture.clone(), ReplayOptions::default()).unwrap();
+    let syncpoints: Vec<&RingEntry<'_>> = output
+        .ring
+        .iter()
+        .filter(|entry| matches!(entry, RingEntry::Syncpoint { .. }))
+        .collect();
+    assert_eq!(syncpoints, [&counted]);
+    let index = rings.iter().position(|&at| at == counted_at[0]).unwrap();
+    let one = RingEntry::Syncpoint {
+        id: syncpoint(),
+        count: 1,
+    };
+    capture.outputs[counted_at[0]] = Output::Ring {
+        hash: entry_hash(&one).unwrap(),
+    };
+    assert_eq!(
+        replay(capture, ReplayOptions::default()).unwrap_err(),
+        ReplayError::RingDiffers { index }
+    );
 }
 
 /// A `SYNC_WAIT` entry waits until the back reports the work before it performed: the front
