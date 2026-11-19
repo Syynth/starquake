@@ -108,7 +108,8 @@ fn accepted(op: Op) {
     assert!(build(&[Instr::new(op)]).is_ok(), "{op:?} refused");
 }
 
-/// Each check refuses with its named value and a message in plain words.
+/// Each check refuses with its named value and a message in plain words: `BMSK`, the bindless
+/// source, the checks of `MOV`, `IADD3` and `LEA`, and `PRMT`'s mode.
 #[test]
 fn each_check_names_its_reason() {
     use IntegerUnsupported as U;
@@ -189,6 +190,15 @@ fn each_check_names_its_reason() {
             U::PermuteMode,
             "a prmt mode other than the default is not supported",
         ),
+    ];
+    assert_refusals(cases);
+}
+
+/// The checks of `PRMT`'s selector, `IMAD`, `IMAD.WIDE`, `SGXT`, `IDP` and `ISETP`, as above.
+#[test]
+fn each_later_check_names_its_reason() {
+    use IntegerUnsupported as U;
+    let cases: Vec<(Op, IntegerUnsupported, &str)> = vec![
         (
             Op::Prmt(prmt(reg(3), PrmtMode::Index)),
             U::PermuteSelector,
@@ -285,6 +295,11 @@ fn each_check_names_its_reason() {
             "an isetp.ex is not supported",
         ),
     ];
+    assert_refusals(cases);
+}
+
+/// Each case is refused with its value and message, and leaves the function untouched.
+fn assert_refusals(cases: Vec<(Op, IntegerUnsupported, &str)>) {
     for (op, what, message) in cases {
         let error = refusal(op);
         assert_eq!(error, IntegerError::Unsupported(what), "{op:?}");
@@ -326,8 +341,8 @@ fn iadd3_carry_inputs() {
     ] {
         for overflow in [[Pred::PT; 2], [p(1), Pred::PT]] {
             let op = OpIAdd3 {
-                carry,
                 overflow,
+                carry,
                 ..plain
             };
             assert_eq!(

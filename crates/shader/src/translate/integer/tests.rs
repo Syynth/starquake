@@ -149,6 +149,46 @@ pub(super) const VALUES: [u32; 8] = [
     0x1234_5678,
 ];
 
+/// The low word of `value`.
+pub(super) fn lo32(value: u64) -> u32 {
+    u32::try_from(value & u64::from(u32::MAX)).unwrap_or(0)
+}
+
+/// The high word of `value`.
+pub(super) fn hi32(value: u64) -> u32 {
+    lo32(value >> 32)
+}
+
+/// `value`'s bits as a signed integer.
+pub(super) fn to_i32(value: u32) -> i32 {
+    i32::from_ne_bytes(value.to_ne_bytes())
+}
+
+/// `value`'s bits as an unsigned integer.
+pub(super) fn to_u32(value: i32) -> u32 {
+    u32::from_ne_bytes(value.to_ne_bytes())
+}
+
+/// `value`'s bits as a signed 64-bit integer.
+pub(super) fn to_i64(value: u64) -> i64 {
+    i64::from_ne_bytes(value.to_ne_bytes())
+}
+
+/// `value`'s bits as an unsigned 64-bit integer.
+pub(super) fn to_u64(value: i64) -> u64 {
+    u64::from_ne_bytes(value.to_ne_bytes())
+}
+
+/// `value` sign-extended to 64 bits.
+pub(super) fn sext(value: u32) -> u64 {
+    to_u64(i64::from(to_i32(value)))
+}
+
+/// The signed 64-bit product of two words, as its bits.
+pub(super) fn signed_product(a: u32, b: u32) -> u64 {
+    to_u64(i64::from(to_i32(a)) * i64::from(to_i32(b)))
+}
+
 proptest! {
     #![proptest_config(config())]
 

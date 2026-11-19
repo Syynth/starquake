@@ -143,7 +143,7 @@ fn a_two_instruction_carry_chain_adds_64_bits() {
         (u64::MAX, 1),
         (0x1234_5678_9abc_def0, 0x0fed_cba9_8765_4321),
     ] {
-        let words = |v: u64| [(v & 0xffff_ffff) as u32, (v >> 32) as u32];
+        let words = |v: u64| [lo32(v), hi32(v)];
         let [xl, xh] = words(x);
         let [yl, yh] = words(y);
         let mut machine = machine_with(&[0, 0, xl, xh, yl, yh]);
@@ -223,7 +223,7 @@ fn lea_shifts_and_adds() {
                 &mut machine,
             );
             let wide = u64::from(shifted) + u64::from(b);
-            assert_eq!(machine.regs[0], wide as u32);
+            assert_eq!(machine.regs[0], lo32(wide));
             assert_eq!(machine.preds[3], wide >> 32 != 0, "{a:#x} {b:#x} {shift}");
 
             // `.X`: the carry predicate adds one, and a negated `b` is a bitwise not.
@@ -237,7 +237,7 @@ fn lea_shifts_and_adds() {
                 };
                 run_op(Op::LeaX(OpLeaX { lea: op }), &mut machine);
                 let wide = u64::from(shifted) + u64::from(!b) + u64::from(carry);
-                assert_eq!(machine.regs[0], wide as u32);
+                assert_eq!(machine.regs[0], lo32(wide));
                 assert_eq!(machine.preds[4], wide >> 32 != 0);
             }
         }
@@ -254,7 +254,7 @@ fn lea_hi_takes_the_high_word() {
             (0xffff_ffff, 0, 1),
         ] {
             let wide = (u64::from(high) << 32) | u64::from(a);
-            let top = ((wide << shift) >> 32) as u32;
+            let top = hi32(wide << shift);
             let mut machine = machine_with(&[0, a, b, high]);
             let op = OpLea {
                 dst_high: true,
@@ -268,8 +268,8 @@ fn lea_hi_takes_the_high_word() {
                 "{a:#x} {high:#x} {shift}"
             );
 
-            let signed = i64::from(a as i32) as u64;
-            let top = ((signed << shift) >> 32) as u32;
+            let signed = sext(a);
+            let top = hi32(signed << shift);
             let mut machine = machine_with(&[0, a, b]);
             let op = OpLea {
                 dst_high: true,
@@ -288,7 +288,7 @@ fn lea_hi_takes_the_high_word() {
                 ..lea(0, reg(1), reg(2), shift)
             };
             run_op(Op::LeaX(OpLeaX { lea: op }), &mut machine);
-            let top = ((wide << shift) >> 32) as u32;
+            let top = hi32(wide << shift);
             assert_eq!(machine.regs[0], top.wrapping_add(b).wrapping_add(1));
         }
     }
@@ -328,7 +328,7 @@ fn lea_hi_x_subtracts_a_negated_addend() {
         ..lea(0, reg(1), neg(2), 4)
     };
     run_op(Op::LeaX(OpLeaX { lea: op }), &mut machine);
-    let top = ((((u64::from(high)) << 32 | u64::from(a)) << 4) >> 32) as u32;
+    let top = hi32(((u64::from(high)) << 32 | u64::from(a)) << 4);
     assert_eq!(machine.regs[0], top.wrapping_sub(b).wrapping_add(1));
 }
 
@@ -382,7 +382,7 @@ fn one_source_instructions() {
             ],
             &mut machine,
         );
-        assert_eq!(machine.regs[2], (value as i32).wrapping_abs() as u32);
+        assert_eq!(machine.regs[2], to_u32(to_i32(value).wrapping_abs()));
         assert_eq!(machine.regs[3], value.reverse_bits());
         assert_eq!(machine.regs[4], value.count_ones());
         assert_eq!(machine.regs[5], (!value).count_ones());
@@ -407,16 +407,12 @@ fn brev_takes_every_source_form() {
 #[test]
 fn flo_finds_the_leading_bit() {
     let msb = |value: u32, signed: bool| -> u32 {
-        let bits = if signed && (value as i32) < 0 {
+        let bits = if signed && to_i32(value) < 0 {
             !value
         } else {
             value
         };
-        if bits == 0 {
-            u32::MAX
-        } else {
-            31 - bits.leading_zeros()
-        }
+        if bits == 0 { u32::MAX } else { bits.ilog2() }
     };
     for value in VALUES {
         for signed in [false, true] {
@@ -464,8 +460,8 @@ fn imnmx_and_sel_pick_by_predicate() {
                 run_op(Op::IMnMx(op), &mut machine);
                 let take_min = !negated;
                 let (lo, hi) = if signed {
-                    let (x, y) = (a as i32, b as i32);
-                    (x.min(y) as u32, x.max(y) as u32)
+                    let (x, y) = (to_i32(a), to_i32(b));
+                    (to_u32(x.min(y)), to_u32(x.max(y)))
                 } else {
                     (a.min(b), a.max(b))
                 };
@@ -502,7 +498,7 @@ fn sgxt_extends_the_low_bits() {
                 } else {
                     let shift = 32 - bits;
                     if signed {
-                        (((value << shift) as i32) >> shift) as u32
+                        to_u32(to_i32(value << shift) >> shift)
                     } else {
                         (value << shift) >> shift
                     }
@@ -538,7 +534,7 @@ fn prmt_picks_bytes() {
     ] {
         let expected = (0..4).fold(0_u32, |acc, byte| {
             let nibble = (selector >> (4 * byte)) & 0xf;
-            let picked = bytes[(nibble & 7) as usize];
+            let picked = bytes[usize::try_from(nibble & 7).unwrap_or(0)];
             let value = if nibble & 8 != 0 {
                 if picked & 0x80 != 0 { 0xff } else { 0 }
             } else {
@@ -580,18 +576,14 @@ fn shf_model(
     let x = u64::from(low) | (u64::from(high) << 32);
     let signed = matches!(ty, ShfType::I64 | ShfType::I32);
     let shifted = if right && signed {
-        let x = x as i64;
-        x.checked_shr(shift).unwrap_or(x >> 63) as u64
+        let x = to_i64(x);
+        to_u64(x.checked_shr(shift).unwrap_or(x >> 63))
     } else if right {
         x.checked_shr(shift).unwrap_or(0)
     } else {
         x.checked_shl(shift).unwrap_or(0)
     };
-    if hi {
-        (shifted >> 32) as u32
-    } else {
-        shifted as u32
-    }
+    if hi { hi32(shifted) } else { lo32(shifted) }
 }
 
 /// `SHF` follows NAK's type encoding and shift amounts (the decoder reads the type field as NAK
@@ -682,11 +674,11 @@ fn imad_multiplies_and_adds() {
                 a.wrapping_mul(b).wrapping_add(!c).wrapping_add(1)
             );
             let unsigned = (u64::from(a) * u64::from(b)) >> 32;
-            assert_eq!(machine.regs[7], (unsigned as u32).wrapping_add(c));
-            let signed = (i64::from(a as i32) * i64::from(b as i32)) >> 32;
+            assert_eq!(machine.regs[7], lo32(unsigned).wrapping_add(c));
+            let signed = signed_product(a, b) >> 32;
             assert_eq!(
                 machine.regs[8],
-                (signed as u32).wrapping_add(c),
+                lo32(signed).wrapping_add(c),
                 "{a:#x} {b:#x}"
             );
         }
@@ -710,12 +702,12 @@ fn imad_wide_writes_a_pair() {
         for b in [3_u32, 0xffff_ffff, 0x8000_0000] {
             for signed in [false, true] {
                 let product = if signed {
-                    (i64::from(a as i32) * i64::from(b as i32)) as u64
+                    signed_product(a, b)
                 } else {
                     u64::from(a) * u64::from(b)
                 };
                 let addend = 0xffff_ffff_8000_0001_u64;
-                let split = |v: u64| [v as u32, (v >> 32) as u32];
+                let split = |v: u64| [lo32(v), hi32(v)];
                 let mut machine =
                     machine_with(&[0, a, b, 0, 0, 0, split(addend)[0], split(addend)[1]]);
                 machine.uniform_regs[2] = split(addend)[0];
@@ -764,7 +756,7 @@ fn idp_2a_dots_halves_with_bytes() {
 /// Eden's `IntegerCompare`.
 fn compare(cmp: IntCmpOp, signed: bool, a: u32, b: u32) -> bool {
     let ord = if signed {
-        (a as i32).cmp(&(b as i32))
+        to_i32(a).cmp(&to_i32(b))
     } else {
         a.cmp(&b)
     };

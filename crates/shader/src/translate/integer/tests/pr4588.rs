@@ -98,25 +98,8 @@ fn three_input_addition_produces_both_cumulative_carry_predicates() {
                                     true,
                                 ];
                                 machine.preds[..7].copy_from_slice(&preds);
-                                let mut expected = 0_u64;
-                                for (i, value) in (0_u8..).zip(values) {
-                                    expected += if negatives & (1 << i) != 0 {
-                                        u64::from(value ^ 0xffff_ffff) + u64::from(!extended)
-                                    } else {
-                                        u64::from(value)
-                                    };
-                                }
-                                let carry = |c: u8| {
-                                    let value = if c & 7 == 7 {
-                                        true
-                                    } else {
-                                        preds[usize::from(c & 7)]
-                                    };
-                                    value != (c & 8 != 0)
-                                };
-                                if extended {
-                                    expected += u64::from(carry(first)) + u64::from(carry(second));
-                                }
+                                let carries = extended.then_some([first, second]);
+                                let expected = three_input_sum(values, negatives, carries, preds);
                                 let mut expected_preds = preds;
                                 expected_preds[0] = expected >= 1 << 32;
                                 expected_preds[1] = expected >= 2 << 32;
@@ -124,7 +107,7 @@ fn three_input_addition_produces_both_cumulative_carry_predicates() {
                                 if destination != 255 {
                                     assert_eq!(
                                         machine.regs[usize::from(destination)],
-                                        expected as u32
+                                        lo32(expected)
                                     );
                                 }
                                 assert_eq!(machine.preds[..7], expected_preds);
@@ -140,6 +123,29 @@ fn three_input_addition_produces_both_cumulative_carry_predicates() {
             }
         }
     }
+}
+
+/// The PR's expected sum: each negated value as `~x`, plus one without `.X`; with `.X`
+/// (`carries`) each carry code's value (low three bits the predicate, 7 for PT; bit 3 negates).
+fn three_input_sum(
+    values: [u32; 3],
+    negatives: u8,
+    carries: Option<[u8; 2]>,
+    preds: [bool; 7],
+) -> u64 {
+    let mut expected = 0_u64;
+    for (i, value) in (0_u8..).zip(values) {
+        expected += if negatives & (1 << i) != 0 {
+            u64::from(value ^ 0xffff_ffff) + u64::from(carries.is_none())
+        } else {
+            u64::from(value)
+        };
+    }
+    for code in carries.into_iter().flatten() {
+        let value = code & 7 == 7 || preds[usize::from(code & 7)];
+        expected += u64::from(value != (code & 8 != 0));
+    }
+    expected
 }
 
 /// "Native subtraction carry chains retain the full unsigned 64-bit difference":
@@ -170,12 +176,11 @@ fn subtraction_carry_chains_retain_the_full_unsigned_64_bit_difference() {
         let function = build(&[Instr::new(low), Instr::new(high)]).expect("translates");
         for a in values {
             for b in values {
-                let mut machine =
-                    machine_with(&[a as u32, (a >> 32) as u32, b as u32, (b >> 32) as u32]);
+                let mut machine = machine_with(&[lo32(a), hi32(a), lo32(b), hi32(b)]);
                 let preds = [true, false, true, false, true, false, true];
                 machine.preds[..7].copy_from_slice(&preds);
                 let mut expected_preds = preds;
-                expected_preds[0] = a as u32 >= b as u32;
+                expected_preds[0] = lo32(a) >= lo32(b);
                 machine.run(&function).expect("runs");
                 let d = usize::from(destination);
                 let result = u64::from(machine.regs[d + 1]) << 32 | u64::from(machine.regs[d]);
@@ -202,16 +207,13 @@ fn register_to_predicate_writes_only_masked_predicate_bits() {
             machine.regs[5] = (value << shift) | (0xa5a5_a5a5 & !(0xff << shift));
             machine.preds[..7].copy_from_slice(&[true, false, true, false, true, false, true]);
             machine.run(&function).expect("runs");
-            for bit in 0..7 {
+            for (bit, pred) in machine.preds.iter().take(7).enumerate() {
                 let expected = if bit < 3 {
                     value & (1 << bit) != 0
                 } else {
                     bit % 2 == 0
                 };
-                assert_eq!(
-                    machine.preds[bit as usize], expected,
-                    "byte {byte} value {value}"
-                );
+                assert_eq!(*pred, expected, "byte {byte} value {value} P{bit}");
             }
         }
     }
@@ -305,7 +307,7 @@ fn byte_permutation_retains_selectors_and_aliases() {
                         let bytes = u64::from(if zero_second { 0 } else { b }) << 32 | u64::from(a);
                         let expected = (0..4).fold(0_u32, |acc, byte| {
                             let pick = (selector >> (byte * 4)) & 7;
-                            acc | (((bytes >> (pick * 8)) & 0xff) as u32) << (byte * 8)
+                            acc | lo32((bytes >> (pick * 8)) & 0xff) << (byte * 8)
                         });
                         machine.run(&function).expect("runs");
                         assert_eq!(machine.regs[usize::from(destination)], expected);
@@ -369,10 +371,10 @@ fn wide_multiply_reads_both_words_of_a_constant_buffer_addend() {
                     for c in [0_u64, 0xffff_ffff, 0x1234_5678_8765_4321, u64::MAX] {
                         let mut machine = machine_with(&[a, 0, b]);
                         let mut words = vec![0; 0x80];
-                        words.extend([c as u32, (c >> 32) as u32]);
+                        words.extend([lo32(c), hi32(c)]);
                         with_cbuf(&mut machine, 0, &words);
                         let product = if signed {
-                            (i64::from(a as i32) * i64::from(b as i32)) as u64
+                            signed_product(a, b)
                         } else {
                             u64::from(a) * u64::from(b)
                         };
@@ -414,11 +416,11 @@ fn high_lea_adds_the_base_after_scaling() {
                         machine.uniform_regs[4] = base;
                         machine.run(&function).expect("runs");
                         let extended = if signed_scale {
-                            i64::from(value as i32) as u64
+                            sext(value)
                         } else {
                             u64::from(value)
                         };
-                        let expected = ((extended << shift) >> 32) as u32;
+                        let expected = hi32(extended << shift);
                         assert_eq!(machine.regs[0], expected.wrapping_add(base));
                     }
                 }
@@ -525,8 +527,8 @@ fn integer_multiply_preserves_high_words_and_modular_multiply_add() {
             let expected = match mode {
                 5 => a.wrapping_sub(0xfedc_ba98),
                 4 => (a << 4).wrapping_add(0x70),
-                0 => (product >> 32) as u32,
-                _ => (product as u32).wrapping_add(0xfedc_ba98),
+                0 => hi32(product),
+                _ => lo32(product).wrapping_add(0xfedc_ba98),
             };
             assert_eq!(machine.regs[3], expected, "mode {mode} a {a:#x}");
         }
@@ -566,12 +568,7 @@ fn lea_hi_x_carries_into_the_high_word() {
     });
     let function = build(&[Instr::new(low), Instr::new(high)]).expect("translates");
     for (index, base) in [(0x8000_0000_u64, 0xffff_fff0_u64), (0x1_0000_0001, 0x10)] {
-        let mut machine = machine_with(&[
-            index as u32,
-            (index >> 32) as u32,
-            base as u32,
-            (base >> 32) as u32,
-        ]);
+        let mut machine = machine_with(&[lo32(index), hi32(index), lo32(base), hi32(base)]);
         machine.run(&function).expect("runs");
         let pointer = u64::from(machine.regs[1]) << 32 | u64::from(machine.regs[4]);
         assert_eq!(
