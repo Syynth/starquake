@@ -49,7 +49,8 @@
 //! # The syncpoint shim
 //!
 //! The shim page ([`crate::vm::SHIM_PAGES`] page, nvhost-as-gpu ioctl 0xB, row 46) holds one
-//! 32-bit word per syncpoint, [`SHIM_STRIDE`] bytes apart, for [`SYNCPOINT_COUNT`] syncpoints:
+//! 32-bit word per syncpoint, [`SHIM_STRIDE`] bytes apart, for
+//! [`SYNCPOINT_COUNT`](crate::interface::SYNCPOINT_COUNT) syncpoints:
 //! PR #4588's `GetNativeSyncpointShim` reports `stride = sizeof(u32)` and `count = 192`
 //! (`eden-pr4588/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp` @ e5fb3b97).
 //!
@@ -94,13 +95,16 @@
 //!   is only proposed (`docs/proposals.md`); copies are enough here.
 //! - The semaphore mirror page (row 35, graphics-server verification item 8): releases land at
 //!   the address given.
+//! - The fence path (`back::fence`) latches waiters with the words a release would have
+//!   written, so a release to the shim latches with its payload, not the counter's new value;
+//!   an open item listed in that module's docs.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use starquake_memory::{GuestMemory, PAGE_SIZE};
 
 use super::{GpuFault, GpuMemory, Translate, TranslationCache, page_pieces};
-use crate::interface::{SYNCPOINT_COUNT, SyncpointId, Target};
+use crate::interface::{SyncpointId, Target};
 use crate::syncpoint::Syncpoints;
 use crate::vm::{GpuOnlyWrite, GpuVm, Translation};
 
@@ -309,13 +313,13 @@ fn out_of_range(va: u64, len: usize) -> GpuFault {
     }
 }
 
-/// The syncpoint whose shim word holds byte `within` of the shim page, if any.
+/// The syncpoint whose shim word holds byte `within` of the shim page, if any: none from word
+/// [`SYNCPOINT_COUNT`](crate::interface::SYNCPOINT_COUNT) on, which [`SyncpointId::new`]
+/// refuses.
 fn shim_syncpoint(within: u64) -> Option<SyncpointId> {
-    let word = within / SHIM_STRIDE;
-    if word >= u64::from(SYNCPOINT_COUNT) {
-        return None;
-    }
-    u8::try_from(word).ok().and_then(SyncpointId::new)
+    u8::try_from(within / SHIM_STRIDE)
+        .ok()
+        .and_then(SyncpointId::new)
 }
 
 /// Copies the shim page's bytes from `within` into `out` (module docs, "The syncpoint shim"):

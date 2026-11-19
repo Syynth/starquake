@@ -10,7 +10,7 @@ use std::time::Duration;
 use starquake_memory::{Fault, FlatMemory, GuestMemory, PAGE_SIZE, PageRange};
 
 use super::*;
-use crate::interface::{Completions, GpuCompletion, Kind, RegionId, VmUpdate};
+use crate::interface::{Completions, GpuCompletion, Kind, RegionId, SYNCPOINT_COUNT, VmUpdate};
 use crate::vm::SHIM_PAGES;
 
 // ---------------------------------------------------------------------------------------------
