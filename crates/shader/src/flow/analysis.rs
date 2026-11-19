@@ -105,8 +105,10 @@ impl Analysis {
         self.indirect_tables.get(&index).map(Vec::as_slice)
     }
 
-    /// How many times the walk stepped onto an instruction: the measure of its work, which the
-    /// linear-time test bounds.
+    /// How many times the walk applied an instruction: once when a path first reaches it and
+    /// once more each time a path changes the barrier state recorded there. A path that
+    /// arrives with a state already covered stops without applying it. The measure of the
+    /// walk's work, which the linear-time tests bound.
     pub fn visits(&self) -> u64 {
         self.visits
     }
@@ -484,10 +486,10 @@ impl Walk<'_> {
                     last: self.count.saturating_sub(1),
                 });
             }
-            self.result.visits = self.result.visits.saturating_add(1);
             if !self.join(index, &mut barriers, function)? {
                 return Ok(());
             }
+            self.result.visits = self.result.visits.saturating_add(1);
             if let Some(reachable) = at_mut(&mut self.result.reachable, index) {
                 *reachable = true;
             }
