@@ -147,9 +147,11 @@ use crate::ir::{
 };
 
 /// The work limit [`structure`] and [`IrBlocks::structure`] use (see the module docs, "Limits").
-/// A **guess**: 2^28 units, about a second on a host core, far more than a program at the
-/// capture's cap should need; to check against real programs (an owner question, like flow
-/// analysis's `MAX_FLOW_BLOCKS`).
+/// A **guess**: 2^28 units, to check against real programs (an owner question, like flow
+/// analysis's `MAX_FLOW_BLOCKS`). A run of diamonds takes the same work for each diamond
+/// (`tests::limits::work_grows_linearly_with_a_run_of_diamonds`; 145 units each when this
+/// was written), so the limit allows about 1.8 million of them; graphs that nest deeply cost
+/// more per block.
 pub const MAX_STRUCTURE_WORK: u64 = 1 << 28;
 
 /// Why a function cannot be structured.

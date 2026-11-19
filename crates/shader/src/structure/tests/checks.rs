@@ -208,6 +208,30 @@ fn errors_read_as_plain_words() {
             "a goto would be lifted over a break, which the structurizer does not support",
         ),
         (
+            StructureError::Ir(crate::ir::BuildError::Full),
+            "the IR cannot hold the structured function: the function has more than 4294967295 \
+             instructions or blocks",
+        ),
+        (
+            StructureError::Internal(Invariant::Parents),
+            "the structurizer broke an invariant of its own: a statement's parents do not lead \
+             to the root",
+        ),
+        (
+            StructureError::Internal(Invariant::Siblings),
+            "the structurizer broke an invariant of its own: a range of statements is not a run \
+             of siblings",
+        ),
+        (
+            StructureError::Internal(Invariant::Movement),
+            "the structurizer broke an invariant of its own: a goto cannot move from where it is",
+        ),
+        (
+            StructureError::Internal(Invariant::Kind),
+            "the structurizer broke an invariant of its own: a statement is not of the kind \
+             expected",
+        ),
+        (
             StructureError::Internal(Invariant::Unterminated(block(1))),
             "the structurizer broke an invariant of its own: block1 has no terminator",
         ),

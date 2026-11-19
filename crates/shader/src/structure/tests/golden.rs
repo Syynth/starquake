@@ -33,6 +33,25 @@ fn a_single_block_returns() {
     assert_eq!(machine.regs[1], 7);
 }
 
+#[test]
+fn control_that_can_fall_off_the_end_reaches_unreachable() {
+    // block1 (which nothing reaches) jumps back to block0: the goto is lifted into a loop
+    // around both blocks, and control after the loop falls off the end of the program, where
+    // Eden emits `Unreachable`. When the last statement is a `return`, nothing follows it.
+    let looping = structured("block0:\n    return\nblock1:\n    jump block0\n").function;
+    let nodes = looping.structure().expect("structured");
+    assert!(matches!(nodes.last(), Some(crate::ir::Node::Unreachable)));
+    assert!(matches!(
+        nodes.get(nodes.len() - 2),
+        Some(crate::ir::Node::Loop { .. })
+    ));
+    let single = structured(SINGLE).function;
+    assert!(matches!(
+        single.structure().expect("structured").last(),
+        Some(crate::ir::Node::Return)
+    ));
+}
+
 /// A diamond: block0 tests p0, block1 and block2 are the arms, block3 the join.
 const DIAMOND: &str = "block0:
     %0 = GetPred p0
