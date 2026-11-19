@@ -50,19 +50,22 @@ fn int_type(writer: &mut Writer, size: Field, signed: Field, ty: IntType) {
     writer.flag(signed, ty.is_signed());
 }
 
-/// Sets the high-half select of a register source, refusing it where the form has no bit for
-/// it (`allowed`: a 16-bit register in a form with bit 60). A clear select writes nothing: bit
-/// 60 is the immediate's in form 4.
+/// Sets the high-half select of a 16-bit source `src`, refusing it where the form has no bit
+/// for it: a source that is not 16-bit (`half` false) or an immediate, whose form 4 has bit 60
+/// in the immediate (NAK writes the swizzle from `encode_alu_reg`, `encode_alu_cb` and
+/// `encode_alu_ureg` only). A clear select writes nothing.
 fn high_half(
     writer: &mut Writer,
     mnemonic: &'static str,
     high: bool,
-    allowed: bool,
+    half: bool,
+    src: AluSrc,
 ) -> Result<(), EncodeError> {
-    if high && !allowed {
+    if high && !(half && !matches!(src, AluSrc::Imm(_))) {
         return Err(no_bits(
             mnemonic,
-            "the high half of a source other than a 16-bit register",
+            "the high half of a source other than a 16-bit register, constant buffer or \
+             uniform register",
         ));
     }
     if high {
@@ -193,12 +196,7 @@ impl Encode for OpMuFu {
             [None, Some(self.src), None],
             true,
         )?;
-        high_half(
-            writer,
-            Self::MNEMONIC,
-            self.high,
-            self.f16 && matches!(self.src, AluSrc::Reg { .. }),
-        )?;
+        high_half(writer, Self::MNEMONIC, self.high, self.f16, self.src)?;
         writer.gpr(DST, self.dst);
         writer.flag(MUFU_F16, self.f16);
         writer.set(MUFU_OP, self.op.bits());
@@ -227,6 +225,8 @@ impl Encode for OpFRnd {
     fn encode(&self, writer: &mut Writer) -> Result<(), EncodeError> {
         let opcode = conversion_opcode(FRND_OPCODE, FRND_WIDE_OPCODE, self.wide);
         writer.alu(Self::MNEMONIC, opcode, [None, Some(self.src), None], true)?;
+        let half = self.src_type == FloatType::F16;
+        high_half(writer, Self::MNEMONIC, self.high, half, self.src)?;
         writer.gpr(DST, self.dst);
         float_type(writer, CVT_SRC_SIZE, self.src_type);
         writer.flag(FTZ, self.ftz);
@@ -240,6 +240,8 @@ impl Encode for OpF2F {
     fn encode(&self, writer: &mut Writer) -> Result<(), EncodeError> {
         let opcode = conversion_opcode(F2F_OPCODE, F2F_WIDE_OPCODE, self.wide);
         writer.alu(Self::MNEMONIC, opcode, [None, Some(self.src), None], true)?;
+        let half = self.src_type == FloatType::F16;
+        high_half(writer, Self::MNEMONIC, self.high, half, self.src)?;
         writer.gpr(DST, self.dst);
         float_type(writer, CVT_DST_SIZE, self.dst_type);
         rnd(writer, self.rnd);
@@ -253,9 +255,8 @@ impl Encode for OpF2I {
     fn encode(&self, writer: &mut Writer) -> Result<(), EncodeError> {
         let opcode = conversion_opcode(F2I_OPCODE, F2I_WIDE_OPCODE, self.wide);
         writer.alu(Self::MNEMONIC, opcode, [None, Some(self.src), None], true)?;
-        let half =
-            self.src_type == FloatType::F16 && matches!(self.src, AluSrc::Reg { .. }) && !self.wide;
-        high_half(writer, Self::MNEMONIC, self.high, half)?;
+        let half = self.src_type == FloatType::F16;
+        high_half(writer, Self::MNEMONIC, self.high, half, self.src)?;
         writer.gpr(DST, self.dst);
         int_type(writer, CVT_DST_SIZE, F2I_SIGNED, self.dst_type);
         writer.flag(F2I_NTZ, self.ntz);

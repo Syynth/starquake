@@ -117,7 +117,10 @@ use super::control::PRED_DST;
 pub use super::memory::{AtomCmpSrc, AtomOp, AtomType, MemEvictionPriority, MemOrder, MemType};
 use super::{Named, Op, memory, shells};
 #[cfg(test)]
-use {super::super::form::ReferenceRow, proptest::strategy::BoxedStrategy};
+use {
+    super::super::form::{Namer, ReferenceRow},
+    proptest::strategy::BoxedStrategy,
+};
 
 // ---------------------------------------------------------------------------------------------
 // Fields every texture instruction shares.
@@ -525,51 +528,6 @@ impl Handle {
             Self::Uniform => TEX_UNIFORM.mask(),
         }
     }
-
-    /// The kind of `tex`.
-    const fn of(tex: TexRef) -> Self {
-        match tex {
-            TexRef::CBuf(_) => Self::CBuf,
-            TexRef::Bindless => Self::Bindless,
-            TexRef::Uniform(_) => Self::Uniform,
-        }
-    }
-
-    /// Whether `TEX`'s and `TLD`'s forms with this handle have the `.F16` bit: their rows mark
-    /// bit 79 known in the constant-buffer and `.UR` forms only (module docs).
-    const fn f16(self) -> bool {
-        !matches!(self, Self::Bindless)
-    }
-
-    /// Whether `TLD`'s form with this handle has the `.CL` bit: its `.UR` row alone marks bit
-    /// 77 known.
-    const fn clamp(self) -> bool {
-        matches!(self, Self::Uniform)
-    }
-
-    /// The bits `TEX`'s form with this handle has besides [`TEX_FIELDS`]: `.F16` where it has
-    /// it.
-    const fn tex_extra(self) -> u128 {
-        if self.f16() { TEX_F16.mask() } else { 0 }
-    }
-
-    /// The bits `TLD`'s form with this handle has besides [`TLD_FIELDS`]: `.F16` and `.CL`
-    /// where it has them.
-    const fn tld_extra(self) -> u128 {
-        let clamp = if self.clamp() { TLD_CLAMP.mask() } else { 0 };
-        self.tex_extra() | clamp
-    }
-}
-
-/// Whether `TEX` and `TLD` have the `.F16` bit with a `tex` handle ([`Handle::f16`]); the
-/// decoder reads it, and the test assembler writes it, only then.
-pub(crate) const fn has_f16(tex: TexRef) -> bool {
-    Handle::of(tex).f16()
-}
-
-/// Whether `TLD` has the `.CL` bit with a `tex` handle ([`Handle::clamp`]).
-pub(crate) const fn has_clamp(tex: TexRef) -> bool {
-    Handle::of(tex).clamp()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -730,7 +688,7 @@ pub struct OpTex {
     pub z_cmpr: bool,
     /// `.AOFFI`: add an immediate offset from the sources.
     pub offset: bool,
-    /// `.F16`: half-precision results (not in the `.B` form: module docs).
+    /// `.F16`: half-precision results (module docs).
     pub f16: bool,
     /// The eviction priority.
     pub eviction: MemEvictionPriority,
@@ -788,7 +746,7 @@ fn decode_tex(reader: &mut Reader, kind: Handle) -> Result<Op, DecodeError> {
         ndv: reader.flag(TEX_NDV),
         z_cmpr: reader.flag(TEX_DC),
         offset: reader.flag(TEX_OFFSET),
-        f16: has_f16(tex) && reader.flag(TEX_F16),
+        f16: reader.flag(TEX_F16),
         eviction,
         nodep: reader.flag(TEX_NODEP),
         channel_mask: read_mask(reader),
@@ -818,14 +776,14 @@ pub struct OpTld {
     pub dim: TexDim,
     /// `.MS`: a multisampled texture.
     pub is_ms: bool,
-    /// `.CL`: a level-of-detail clamp (the `.UR` form only: module docs).
+    /// `.CL`: a level-of-detail clamp (module docs).
     pub clamp: bool,
     /// The level-of-detail mode (NAK encodes only [`TexLodMode::Zero`] and
     /// [`TexLodMode::Lod`]).
     pub lod_mode: TexLodMode,
     /// `.AOFFI`.
     pub offset: bool,
-    /// `.F16` (not in the `.B` form).
+    /// `.F16` (module docs).
     pub f16: bool,
     /// The eviction priority.
     pub eviction: MemEvictionPriority,
@@ -879,10 +837,10 @@ fn decode_tld(reader: &mut Reader, kind: Handle) -> Result<Op, DecodeError> {
         srcs: read_srcs(reader),
         dim,
         is_ms: reader.flag(TLD_MS),
-        clamp: has_clamp(tex) && reader.flag(TLD_CLAMP),
+        clamp: reader.flag(TLD_CLAMP),
         lod_mode,
         offset: reader.flag(TEX_OFFSET),
-        f16: has_f16(tex) && reader.flag(TEX_F16),
+        f16: reader.flag(TEX_F16),
         eviction,
         nodep: reader.flag(TEX_NODEP),
         channel_mask: read_mask(reader),
@@ -1429,11 +1387,12 @@ fn decode_suatom(reader: &mut Reader) -> Result<Op, DecodeError> {
 // ---------------------------------------------------------------------------------------------
 // The form table.
 
-/// The fields of `TEX`'s forms besides the handle.
+/// The fields of `TEX`'s forms besides the handle, `.F16` included in every form (module docs).
 const TEX_FIELDS: u128 = mask_of(&[
     DST,
     REG_A,
     REG_B,
+    TEX_F16,
     TEX_SCALAR,
     TEX_DIM,
     TEX_DST2,
@@ -1446,8 +1405,11 @@ const TEX_FIELDS: u128 = mask_of(&[
     TEX_LOD,
     TEX_NODEP,
 ]);
-/// The fields of `TLD`'s forms besides the handle, `.F16` and `.CL`.
+/// The fields of `TLD`'s forms besides the handle, `.F16` and `.CL` included in every form
+/// (module docs).
 const TLD_FIELDS: u128 = mask_of(&[
+    TEX_F16,
+    TLD_CLAMP,
     DST,
     REG_A,
     REG_B,
@@ -1517,12 +1479,12 @@ const fn tex_form(opcode: u16, kind: Handle, fields: u128, decode: DecodeFn) -> 
 
 /// `TEX`'s form with a `kind` handle.
 const fn tex(opcode: u16, kind: Handle, decode: DecodeFn) -> Form {
-    tex_form(opcode, kind, TEX_FIELDS | kind.tex_extra(), decode)
+    tex_form(opcode, kind, TEX_FIELDS, decode)
 }
 
 /// `TLD`'s form with a `kind` handle.
 const fn tld(opcode: u16, kind: Handle, decode: DecodeFn) -> Form {
-    tex_form(opcode, kind, TLD_FIELDS | kind.tld_extra(), decode)
+    tex_form(opcode, kind, TLD_FIELDS, decode)
 }
 
 /// The texture and surface group's forms.
@@ -1624,11 +1586,14 @@ pub(crate) const TLD4_UR_DROPPED: u128 = 1 << 89;
 pub(crate) const REFERENCE_ROWS: &[ReferenceRow] = &[
     ReferenceRow::new(0xb60, [0xffff_ffff, 0xf7ff_ffff, 0x07fe_ffff, 0xffff_fe00]),
     ReferenceRow::new(0x361, [0xffff_ffff, 0xf800_00ff, 0x07fe_7fff, 0xffff_fe00])
+        .adding(TEX_F16.mask(), Namer::Pr4588Translator)
         .fixing(TEX_BINDLESS.mask()),
     ReferenceRow::new(0xf60, [0xffff_ffff, 0xf000_3fff, 0x0ffe_ffff, 0xffff_fe00])
         .fixing(TEX_UNIFORM.mask()),
-    ReferenceRow::new(0xb66, [0xffff_ffff, 0xf7ff_ffff, 0x07fe_dfff, 0xffff_fe00]),
+    ReferenceRow::new(0xb66, [0xffff_ffff, 0xf7ff_ffff, 0x07fe_dfff, 0xffff_fe00])
+        .adding(TLD_CLAMP.mask(), Namer::NakComment),
     ReferenceRow::new(0x367, [0xffff_ffff, 0xf800_00ff, 0x07fe_5fff, 0xffff_fe00])
+        .adding(TEX_F16.mask() | TLD_CLAMP.mask(), Namer::NakComment)
         .fixing(TEX_BINDLESS.mask()),
     ReferenceRow::new(0xf66, [0xffff_ffff, 0xf000_3fff, 0x0ffe_ffff, 0xffff_fe00])
         .fixing(TEX_UNIFORM.mask()),

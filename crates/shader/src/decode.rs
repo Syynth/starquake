@@ -102,7 +102,7 @@ use thiserror::Error;
 pub(crate) use alu::{AluForm, Slot, Source};
 pub(crate) use fields::*;
 #[cfg(test)]
-pub(crate) use form::{Form, GROUP_HOOKS, GROUPS};
+pub(crate) use form::{Form, GROUP_HOOKS, GROUPS, ReferenceRow};
 pub use instruction::{Field, Instruction, LengthError};
 // The control-instruction opcodes and fields program capture reads before full decoding
 // (`crate::capture`), named once in `op::control`.

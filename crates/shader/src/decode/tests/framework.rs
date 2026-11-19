@@ -4,11 +4,12 @@
 use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
 
-use super::super::form::{Form, Reader};
+use super::super::form::{Form, Namer, Reader};
 use super::super::op::{attribute, control, float, half_double, integer, memory, tensor};
 use super::super::op::{texture, uniform};
 use super::*;
 use crate::asm::Writer;
+use crate::testing::form_and_row;
 
 /// Every shell, from every group.
 fn shells() -> Vec<Op> {
@@ -36,19 +37,17 @@ fn decoded() -> Vec<&'static str> {
         .collect()
 }
 
-/// The mnemonics the forms of `forms` decode to, sorted, without repeats: each form's word with
-/// only its opcode and fixed bits set (which every form accepts:
-/// `every_bit_outside_a_form_is_rejected`), and each such word with one more of the form's
-/// known bits set, where it decodes (`IADD3.X` and `LEA.X` share their forms with `IADD3` and
-/// `LEA`, told apart by bit 74: `op::integer`; `OUT` and `OUT.FINAL` share their forms and
-/// differ in the type field: `op::attribute`).
+/// The mnemonics the forms of `forms` decode to, sorted, without repeats: each form's canonical
+/// word (which every form accepts: `canonical_words_decode`), and each such word with one more
+/// of the form's known bits set, where it decodes (`IADD3.X` and `LEA.X` share their forms with
+/// `IADD3` and `LEA`, told apart by bit 74: `op::integer`; `OUT` and `OUT.FINAL` share their
+/// forms and differ in the type field: `op::attribute`).
 fn mnemonics_of(forms: &[Form]) -> Vec<&'static str> {
     let mut mnemonics: Vec<&str> = forms
         .iter()
         .flat_map(|form| {
-            let bare =
-                Instruction::from_bits(form.fixed).with_field(OPCODE, u64::from(form.opcode));
-            let bare_op = decode(bare).expect("a form's bare word decodes").op;
+            let bare = canonical_word(form.opcode);
+            let bare_op = decode(bare).expect("a form's canonical word decodes").op;
             let one_more = (0..128)
                 .filter(move |bit| form.known & !COMMON & (1 << bit) != 0)
                 .filter_map(move |bit| decode(Instruction::from_bits(bare.bits() | 1 << bit)).ok())
@@ -140,9 +139,10 @@ fn alu_forms_put_sources_where_the_table_says() {
 /// Every form's fixed bits are required (step 3): the uniform-register ALU forms' bit 91 (PR
 /// #4588: "native uniform source flag"), and the control group's (the uniform `BRA`'s bits
 /// 87..89 and 91, `BRXU`'s bit 91), and `LDTRAM`'s bit 91. Every form with fixed bits refuses a
-/// word without them, naming the lowest, and accepts one with them; a form without fixed bits
-/// accepts the bare word. Which forms have which fixed bits is pinned by each group's rows
-/// (`masks_match_the_reference_table`).
+/// word without them, naming the lowest (step 3, before step 4 can refuse a field the canonical
+/// word sets), and accepts its canonical word, which has them; a form with neither fixed bits
+/// nor a canonical word accepts the bare word. Which forms have which fixed bits is pinned by
+/// each group's rows (`masks_match_the_reference_table`).
 #[test]
 fn fixed_bits_are_required() {
     let required = [
@@ -169,8 +169,12 @@ fn fixed_bits_are_required() {
     }
     for (opcode, _, fixed) in forms() {
         let word = Instruction::default().with_field(OPCODE, u64::from(opcode));
+        let canonical = canonical_word(opcode);
+        assert!(decode(canonical).is_ok(), "{opcode:#x}");
         if fixed == 0 {
-            assert!(decode(word).is_ok(), "{opcode:#x}");
+            if canonical == word {
+                assert!(decode(word).is_ok(), "{opcode:#x}");
+            }
         } else {
             assert_eq!(
                 decode(word),
@@ -179,9 +183,12 @@ fn fixed_bits_are_required() {
                     bit: fixed.trailing_zeros()
                 })
             );
-            assert!(
-                decode(Instruction::from_bits(word.bits() | fixed)).is_ok(),
-                "{opcode:#x}"
+            assert_eq!(
+                decode(Instruction::from_bits(canonical.bits() & !fixed)),
+                Err(DecodeError::MissingBit {
+                    opcode,
+                    bit: fixed.trailing_zeros()
+                })
             );
         }
     }
@@ -189,6 +196,179 @@ fn fixed_bits_are_required() {
         decode(Instruction::default().with_field(OPCODE, 0xc23)).map_err(|e| e.to_string()),
         Err("opcode 0xc23 has bit 91 clear, which its form requires set".into())
     );
+}
+
+/// The bits each form adds to its PR #4588 row, with the reference that names each, written
+/// out as literals from the references rather than from the shipping constants, so a wrong
+/// bit, form or namer in a group's rows fails here:
+///
+/// - bit 60, NAK's encoder: the swizzle of an `F16` source (`set_swizzle(60..62, ..)`, which
+///   `encode_alu_reg`, `encode_alu_cb` and `encode_alu_ureg` call for an `F16` source type), in
+///   the forms of `F2F` (`0x104`, `0x110`), `FRND` (`0x107`, `0x113`), `F2I` (`0x105`,
+///   `0x111`) and `MUFU` (`0x108`) whose rows leave it out: every register, constant-buffer
+///   and uniform-register form but `MUFU`'s and the narrow `F2I`'s register forms, whose rows
+///   have it;
+/// - bit 79 of `TEX.B` (`0x361`), PR #4588's translator: `Visitor::TEX` takes `half = Take(79,
+///   1)` for every form it accepts, `0x361` (`register_handle`) included;
+/// - bits 77 (`.CL`) of `TLD` (`0xb66`, `0x367`) and 79 (`.F16`) of `TLD.B` (`0x367`), NAK's
+///   comments in `impl SM70Op for OpTld` ("bit 77: .CL" below SM 12.0, "bits 79..81: .F16"),
+///   which cover every handle.
+#[test]
+fn added_bits_are_the_listed_cases() {
+    let mut expected: Vec<(u16, u32, Namer)> = [
+        0x304, 0xb04, 0xd04, 0x310, 0xb10, 0xd10, 0x307, 0xb07, 0xd07, 0x313, 0xb13, 0xd13, 0xb08,
+        0xd08, 0xb05, 0xd05, 0x311, 0xb11, 0xd11,
+    ]
+    .into_iter()
+    .map(|opcode| (opcode, 60, Namer::NakEncoder))
+    .collect();
+    expected.extend([
+        (0x361, 79, Namer::Pr4588Translator),
+        (0xb66, 77, Namer::NakComment),
+        (0x367, 77, Namer::NakComment),
+        (0x367, 79, Namer::NakComment),
+    ]);
+    let mut actual = Vec::new();
+    for hooks in &GROUP_HOOKS {
+        for row in hooks.reference_rows {
+            for namer in Namer::ALL {
+                let bits = row.added_by(namer);
+                actual.extend(
+                    (0..128)
+                        .filter(|bit| bits & (1 << bit) != 0)
+                        .map(|bit| (row.opcode, bit, namer)),
+                );
+            }
+        }
+    }
+    let key = |&(opcode, bit, namer): &(u16, u32, Namer)| (opcode, bit, namer.index());
+    expected.sort_by_key(key);
+    actual.sort_by_key(key);
+    assert_eq!(actual, expected);
+}
+
+/// The namers' positions, and a row's added bits: per namer, accumulated over calls, and joined
+/// by [`super::super::form::ReferenceRow::added`].
+#[test]
+fn added_bits_accumulate_per_namer() {
+    for (index, namer) in Namer::ALL.into_iter().enumerate() {
+        assert_eq!(namer.index(), index);
+    }
+    let row = super::super::form::ReferenceRow::new(0x123, [0; 4])
+        .adding(0b001, Namer::NakEncoder)
+        .adding(0b100, Namer::Pr4588Translator)
+        .adding(0b010, Namer::NakEncoder);
+    assert_eq!(row.added_by(Namer::NakEncoder), 0b011);
+    assert_eq!(row.added_by(Namer::NakComment), 0);
+    assert_eq!(row.added_by(Namer::Pr4588Translator), 0b100);
+    assert_eq!(row.added(), 0b111);
+    assert_eq!(super::super::form::ReferenceRow::new(0x123, [0; 4]).added(), 0);
+}
+
+/// Every bit a form adds to its row decodes, prints and round-trips: for each, a word of the
+/// form (from the form's own generator of words, with the fixed seed) that decodes both with
+/// the bit set and with it clear, whose two texts differ and which both re-assemble to
+/// themselves, scheduling bits aside. A layout may read an added bit only in some words (a
+/// high half only for an `F16` source), so the search draws words until both decode.
+#[test]
+fn added_bits_decode_print_and_round_trip() {
+    /// The most words drawn per added bit.
+    const TRIES: usize = 4096;
+    let mut runner = TestRunner::new(config());
+    let mut checked = 0;
+    for hooks in &GROUP_HOOKS {
+        for row in hooks.reference_rows {
+            let (form, _) = form_and_row(row.opcode);
+            let words = any_word_of(vec![*form]);
+            let added = row.added();
+            for bit in (0..128).filter(|bit| added & (1 << bit) != 0) {
+                let found = (0..TRIES).find_map(|_| {
+                    let word = words.new_tree(&mut runner).expect("a word").current();
+                    let with = Instruction::from_bits(word.bits() | (1 << bit));
+                    let without = Instruction::from_bits(word.bits() & !(1 << bit));
+                    Some([(decode(with).ok()?, with), (decode(without).ok()?, without)])
+                });
+                let opcode = row.opcode;
+                let [(with, _), (without, _)] =
+                    found.unwrap_or_else(|| panic!("{opcode:#x} bit {bit}: no word decodes"));
+                assert_ne!(with.to_string(), without.to_string(), "{opcode:#x} {bit}");
+                for (instr, word) in found.into_iter().flatten() {
+                    assert_eq!(
+                        assemble(&instr).map(|again| again.bits()),
+                        Ok(word.bits() & !SCHEDULING.mask()),
+                        "{opcode:#x} bit {bit}"
+                    );
+                }
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, 23);
+}
+
+/// Every form decodes its canonical word, whose fields are the form's own (not its opcode,
+/// common fields or fixed bits). A form has a canonical word only where its bare word (opcode
+/// and fixed bits alone) is refused for a zero that names nothing, in a field the canonical
+/// word sets; every other form's bare word decodes. Which forms these are, and the exact
+/// refusal, are each group's (`float32::bare_words_refuse_the_zeros_pr_4588_refuses`).
+#[test]
+fn canonical_words_decode() {
+    let mut with_canonical = 0;
+    for (forms, hooks) in GROUPS.iter().zip(&GROUP_HOOKS) {
+        for (form, row) in forms.iter().zip(hooks.reference_rows) {
+            let opcode = form.opcode;
+            assert_eq!(row.canonical & !form.known, 0, "{opcode:#x}");
+            assert_eq!(row.canonical & (COMMON | form.fixed), 0, "{opcode:#x}");
+            assert!(decode(canonical_word(opcode)).is_ok(), "{opcode:#x}");
+            let bare = Instruction::from_bits(form.fixed).with_field(OPCODE, u64::from(opcode));
+            if row.canonical == 0 {
+                assert!(decode(bare).is_ok(), "{opcode:#x}");
+                continue;
+            }
+            with_canonical += 1;
+            match decode(bare) {
+                Err(DecodeError::UnknownValue {
+                    opcode: refused,
+                    bit,
+                    width,
+                    value: 0,
+                }) => {
+                    assert_eq!(refused, opcode);
+                    assert_ne!(Field::new(bit, width).mask() & row.canonical, 0);
+                }
+                other => panic!("{opcode:#x}: {other:?}"),
+            }
+        }
+    }
+    // FMUL's four forms; FRND, F2F, F2I and I2F, eight each (two opcodes of four forms); I2FP's
+    // four (`op::float`'s rows).
+    assert_eq!(with_canonical, 4 + 8 * 4 + 4);
+}
+
+/// `field_value` places a value as `Instruction::with_field` does: at a field's ends, with the
+/// bits above its width dropped, and nothing for a zero value or a zero width.
+#[test]
+fn field_values_match_with_field() {
+    use super::super::form::field_value;
+    let cases = [
+        (Field::new(75, 2), 2),
+        (Field::new(84, 3), 4),
+        (Field::new(84, 3), 0b1101),
+        (Field::new(0, 12), 0xfff),
+        (Field::new(120, 8), 0xa5),
+        (Field::new(64, 64), u64::MAX),
+        (Field::new(40, 0), 1),
+        (Field::bit(127), 1),
+        (Field::new(32, 5), 0),
+    ];
+    for (field, value) in cases {
+        assert_eq!(
+            field_value(field, value),
+            Instruction::default().with_field(field, value).bits(),
+            "{field:?} {value:#x}"
+        );
+    }
+    assert_eq!(field_value(Field::new(84, 3), 0b1101), 0b101 << 84);
 }
 
 /// A word of FFMA with a bound constant buffer `c[3][0x40]` in source 1.

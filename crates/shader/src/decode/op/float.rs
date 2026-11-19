@@ -135,7 +135,7 @@ use super::{Named, Op, shells};
 #[cfg(test)]
 use {
     super::super::fields::{SLOT_ABS, SLOT_NEG, SLOT_UNIFORM, SRC0_ABS, SRC2_ABS, SRC2_NEG},
-    super::super::form::ReferenceRow,
+    super::super::form::{Namer, ReferenceRow, field_value},
     proptest::strategy::BoxedStrategy,
 };
 
@@ -351,13 +351,9 @@ impl Display for PredSetOp {
 }
 
 /// A float type, as a conversion's size field encodes it: log2 of its byte count (NAK's
-/// `FloatType` and `(bits / 8).ilog2()`).
+/// `FloatType` and `(bits / 8).ilog2()`). Size 0, one byte, names no type (module docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FloatType {
-    /// Size 0, one byte: no 8-bit float exists on SM86 and neither reference defines this
-    /// encoding for these instructions (see the module docs); decoded so the field reads every
-    /// value.
-    F8,
     /// Size 1, 16 bits.
     F16,
     /// Size 2, 32 bits.
@@ -368,27 +364,32 @@ pub enum FloatType {
 
 impl FloatType {
     /// Every type, in encoding order.
-    pub const ALL: [Self; 4] = [Self::F8, Self::F16, Self::F32, Self::F64];
+    pub const ALL: [Self; 3] = [Self::F16, Self::F32, Self::F64];
 
     /// The size field's encoding.
     pub const fn bits(self) -> u64 {
         match self {
-            Self::F8 => 0,
             Self::F16 => 1,
             Self::F32 => 2,
             Self::F64 => 3,
         }
     }
 
-    /// The type a size encoding names; only the low two bits are read.
-    pub const fn from_bits(bits: u64) -> Self {
-        Self::ALL[(bits & 3) as usize]
+    /// The type a size encoding names: none for 0, which NAK's `FloatType` cannot encode (it
+    /// has `F16`, `F32` and `F64`) and every conversion of PR #4588's translator refuses, nor
+    /// for a value wider than the two-bit field.
+    pub const fn from_bits(bits: u64) -> Option<Self> {
+        match bits {
+            1 => Some(Self::F16),
+            2 => Some(Self::F32),
+            3 => Some(Self::F64),
+            _ => None,
+        }
     }
 
     /// The type's width in bits.
     pub const fn width(self) -> u32 {
         match self {
-            Self::F8 => 8,
             Self::F16 => 16,
             Self::F32 => 32,
             Self::F64 => 64,
@@ -397,10 +398,9 @@ impl FloatType {
 }
 
 impl Display for FloatType {
-    /// NAK's `FloatType` printer; `.f8` is a guess.
+    /// NAK's `FloatType` printer.
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::F8 => ".f8",
             Self::F16 => ".f16",
             Self::F32 => ".f32",
             Self::F64 => ".f64",
@@ -586,11 +586,10 @@ pub(crate) const FMUL_OPCODE: u16 = 0x020;
 /// `FMUL`'s scale (`set_field(84..87, 0x4_u8); // TODO: PDIV`; PR #4588: `Take(84, 3)`).
 pub(crate) const FMUL_SCALE: Field = Field::new(84, 3);
 
-/// `FMUL`'s scale of its first operand: a power of two, `2^(code - 4)` (module docs).
+/// `FMUL`'s scale of its first operand: a power of two, `2^(code - 4)` (module docs). Code 0
+/// names no scale (PR #4588: `Require(scale >= 1 && scale <= 7, "native FMUL scale")`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FMulScale {
-    /// 0: divide by 16 (a guess; PR #4588 refuses it).
-    D16,
     /// 1: divide by 8.
     D8,
     /// 2: divide by 4.
@@ -609,8 +608,7 @@ pub enum FMulScale {
 
 impl FMulScale {
     /// Every scale, in encoding order.
-    pub const ALL: [Self; 8] = [
-        Self::D16,
+    pub const ALL: [Self; 7] = [
         Self::D8,
         Self::D4,
         Self::D2,
@@ -623,7 +621,6 @@ impl FMulScale {
     /// The three-bit encoding.
     pub const fn bits(self) -> u64 {
         match self {
-            Self::D16 => 0,
             Self::D8 => 1,
             Self::D4 => 2,
             Self::D2 => 3,
@@ -634,15 +631,24 @@ impl FMulScale {
         }
     }
 
-    /// The scale an encoding names; only the low three bits are read.
-    pub const fn from_bits(bits: u64) -> Self {
-        Self::ALL[(bits & 7) as usize]
+    /// The scale an encoding names: none for 0, which PR #4588 refuses (`Require(scale >= 1 &&
+    /// scale <= 7, "native FMUL scale")`), nor for a value wider than the three-bit field.
+    pub const fn from_bits(bits: u64) -> Option<Self> {
+        match bits {
+            1 => Some(Self::D8),
+            2 => Some(Self::D4),
+            3 => Some(Self::D2),
+            4 => Some(Self::None),
+            5 => Some(Self::M2),
+            6 => Some(Self::M4),
+            7 => Some(Self::M8),
+            _ => None,
+        }
     }
 
     /// The power of two the first operand is scaled by (PR #4588's `ScaleFactor`: `code - 4`).
     pub const fn exponent(self) -> i8 {
         match self {
-            Self::D16 => -4,
             Self::D8 => -3,
             Self::D4 => -2,
             Self::D2 => -1,
@@ -658,7 +664,6 @@ impl Display for FMulScale {
     /// Maxwell's `nvdisasm` names, `.d2` to `.m8` (a guess for SM86); nothing for no scaling.
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::D16 => ".d16",
             Self::D8 => ".d8",
             Self::D4 => ".d4",
             Self::D2 => ".d2",
@@ -712,6 +717,9 @@ impl Display for OpFMul {
 
 fn decode_fmul(reader: &mut Reader) -> Result<Op, DecodeError> {
     let form = alu::form(reader)?;
+    let scale_bits = reader.field(FMUL_SCALE);
+    let scale = FMulScale::from_bits(scale_bits)
+        .ok_or_else(|| reader.unknown_value(FMUL_SCALE, scale_bits))?;
     Ok(Op::FMul(OpFMul {
         dst: reader.gpr(DST),
         srcs: [
@@ -723,7 +731,7 @@ fn decode_fmul(reader: &mut Reader) -> Result<Op, DecodeError> {
         rnd: RoundMode::from_bits(reader.field(RND)),
         ftz: reader.flag(FTZ),
         dnz: reader.flag(DNZ),
-        scale: FMulScale::from_bits(reader.field(FMUL_SCALE)),
+        scale,
     }))
 }
 
@@ -1243,15 +1251,27 @@ fn decode_mufu(reader: &mut Reader) -> Result<Op, DecodeError> {
         op,
         src: alu::src(reader, form, Source::One, true),
         f16,
-        high: f16 && form == AluForm::Reg && reader.flag(HIGH_HALF),
+        high: f16 && has_high_half(form) && reader.flag(HIGH_HALF),
     }))
 }
 
-/// The high-half bit if `form` has it (form 1, a register in the wide slot).
+/// Whether a one-source instruction's 16-bit source in `form` has a high-half select: in forms
+/// 1, 5 and 6, whose source NAK writes with `encode_alu_reg`, `encode_alu_cb` and
+/// `encode_alu_ureg`, each of which calls `set_swizzle(60..62, ..)` for an `F16` source; not in
+/// form 4, whose bit 60 is the immediate's.
+const fn has_high_half(form: AluForm) -> bool {
+    matches!(
+        form,
+        AluForm::Reg | AluForm::CBufSrc1 | AluForm::UniformSrc1
+    )
+}
+
+/// The high-half bit if `form` has it ([`has_high_half`]).
 const fn high_half_known(form: AluForm) -> u128 {
-    match form {
-        AluForm::Reg => HIGH_HALF.mask(),
-        _ => 0,
+    if has_high_half(form) {
+        HIGH_HALF.mask()
+    } else {
+        0
     }
 }
 
@@ -1446,9 +1466,17 @@ fn is_wide(reader: &Reader, wide: u16) -> bool {
     base_opcode(reader) == u64::from(wide)
 }
 
-/// Reads a float type from a size field.
-fn float_type(reader: &mut Reader, field: Field) -> FloatType {
-    FloatType::from_bits(reader.field(field))
+/// Reads a float type from a size field; size 0 names none ([`FloatType::from_bits`]) and is
+/// [`DecodeError::UnknownValue`].
+fn float_type(reader: &mut Reader, field: Field) -> Result<FloatType, DecodeError> {
+    let bits = reader.field(field);
+    FloatType::from_bits(bits).ok_or_else(|| reader.unknown_value(field, bits))
+}
+
+/// Reads the high-half select of a conversion's source of `src_type` in `form`: only for an
+/// `F16` source in a form that has the bit ([`has_high_half`]).
+fn conversion_high(reader: &mut Reader, form: AluForm, src_type: FloatType) -> bool {
+    src_type == FloatType::F16 && has_high_half(form) && reader.flag(HIGH_HALF)
 }
 
 /// Reads an integer type from a size field and a signed bit.
@@ -1477,6 +1505,9 @@ pub struct OpFRnd {
     pub rnd: RoundMode,
     /// Flush denormal inputs and results to zero.
     pub ftz: bool,
+    /// For a 16-bit operand other than an immediate, its high half (NAK's swizzle `Yy`; only
+    /// with an `F16` source).
+    pub high: bool,
     /// The 64-bit opcode (module docs).
     pub wide: bool,
 }
@@ -1487,7 +1518,8 @@ impl Named for OpFRnd {
 
 impl Display for OpFRnd {
     /// NAK's `test_float_ops`: `frnd`, `.ftz`, `.f64` when both types are 64-bit and nothing
-    /// when both are 32-bit, then the integer rounding. Both types for other pairs are a guess.
+    /// when both are 32-bit, then the integer rounding. Both types for other pairs, and the
+    /// operand's `.h1`, are a guess.
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str("frnd")?;
         flag(f, self.ftz, ".ftz")?;
@@ -1496,34 +1528,38 @@ impl Display for OpFRnd {
         } else if self.dst_type != FloatType::F32 {
             write!(f, "{}", self.dst_type)?;
         }
-        write!(
-            f,
-            "{} {}, {}",
-            IntRound(self.rnd),
-            self.dst,
-            FloatOperand(self.src)
-        )
+        write!(f, "{} {}, ", IntRound(self.rnd), self.dst)?;
+        half_source(f, self.src, self.high)
     }
 }
 
 fn decode_frnd(reader: &mut Reader) -> Result<Op, DecodeError> {
     let form = alu::form(reader)?;
+    let dst_type = float_type(reader, CVT_DST_SIZE)?;
+    let src_type = float_type(reader, CVT_SRC_SIZE)?;
     Ok(Op::FRnd(OpFRnd {
         dst: reader.gpr(DST),
         src: alu::src(reader, form, Source::One, true),
-        dst_type: float_type(reader, CVT_DST_SIZE),
-        src_type: float_type(reader, CVT_SRC_SIZE),
+        dst_type,
+        src_type,
         rnd: RoundMode::from_bits(reader.field(RND)),
         ftz: reader.flag(FTZ),
+        high: conversion_high(reader, form, src_type),
         wide: is_wide(reader, FRND_WIDE_OPCODE),
     }))
+}
+
+/// The fields of `FRND` and `F2F` in `form`: both float types, the rounding mode, `.FTZ` and
+/// the high-half select where the form has it.
+const fn float_conversion_fields(form: AluForm) -> u128 {
+    mask_of(&[CVT_DST_SIZE, RND, FTZ, CVT_SRC_SIZE]) | high_half_known(form)
 }
 
 /// `FRND` with 9-bit opcode `base` in `form`.
 const fn frnd(base: u16, form: AluForm) -> Form {
     Form::new(
         form.opcode(base),
-        conversion_known(form, true, mask_of(&[CVT_DST_SIZE, RND, FTZ, CVT_SRC_SIZE])),
+        conversion_known(form, true, float_conversion_fields(form)),
         decode_frnd,
     )
     .with_fixed(alu::fixed(form))
@@ -1544,6 +1580,9 @@ pub struct OpF2F {
     pub rnd: RoundMode,
     /// Flush denormal inputs and results to zero.
     pub ftz: bool,
+    /// For a 16-bit operand other than an immediate, its high half (NAK's swizzle `Yy`; only
+    /// with an `F16` source).
+    pub high: bool,
     /// The 64-bit opcode (module docs).
     pub wide: bool,
 }
@@ -1553,31 +1592,32 @@ impl Named for OpF2F {
 }
 
 impl Display for OpF2F {
-    /// NAK's `test_float_ops`: `f2f`, `.ftz`, both types, the rounding mode.
+    /// NAK's `test_float_ops`: `f2f`, `.ftz`, both types, the rounding mode; the operand's
+    /// `.h1` is a guess.
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str("f2f")?;
         flag(f, self.ftz, ".ftz")?;
         write!(
             f,
-            "{}{}{} {}, {}",
-            self.dst_type,
-            self.src_type,
-            self.rnd,
-            self.dst,
-            FloatOperand(self.src)
-        )
+            "{}{}{} {}, ",
+            self.dst_type, self.src_type, self.rnd, self.dst
+        )?;
+        half_source(f, self.src, self.high)
     }
 }
 
 fn decode_f2f(reader: &mut Reader) -> Result<Op, DecodeError> {
     let form = alu::form(reader)?;
+    let dst_type = float_type(reader, CVT_DST_SIZE)?;
+    let src_type = float_type(reader, CVT_SRC_SIZE)?;
     Ok(Op::F2F(OpF2F {
         dst: reader.gpr(DST),
         src: alu::src(reader, form, Source::One, true),
-        dst_type: float_type(reader, CVT_DST_SIZE),
-        src_type: float_type(reader, CVT_SRC_SIZE),
+        dst_type,
+        src_type,
         rnd: RoundMode::from_bits(reader.field(RND)),
         ftz: reader.flag(FTZ),
+        high: conversion_high(reader, form, src_type),
         wide: is_wide(reader, F2F_WIDE_OPCODE),
     }))
 }
@@ -1586,7 +1626,7 @@ fn decode_f2f(reader: &mut Reader) -> Result<Op, DecodeError> {
 const fn f2f(base: u16, form: AluForm) -> Form {
     Form::new(
         form.opcode(base),
-        conversion_known(form, true, mask_of(&[CVT_DST_SIZE, RND, FTZ, CVT_SRC_SIZE])),
+        conversion_known(form, true, float_conversion_fields(form)),
         decode_f2f,
     )
     .with_fixed(alu::fixed(form))
@@ -1613,8 +1653,8 @@ pub struct OpF2I {
     pub ftz: bool,
     /// `.NTZ` (NAK always writes it clear).
     pub ntz: bool,
-    /// For a 16-bit register operand, its high half (only with an `F16` source, a register, and
-    /// the narrow opcode: PR #4588's row `0x311` has no bit 60).
+    /// For a 16-bit operand other than an immediate, its high half (NAK's swizzle `Yy`; only
+    /// with an `F16` source).
     pub high: bool,
     /// The 64-bit opcode (module docs).
     pub wide: bool,
@@ -1646,8 +1686,7 @@ impl Display for OpF2I {
 fn decode_f2i(reader: &mut Reader) -> Result<Op, DecodeError> {
     let form = alu::form(reader)?;
     let wide = is_wide(reader, F2I_WIDE_OPCODE);
-    let src_type = float_type(reader, CVT_SRC_SIZE);
-    let half = src_type == FloatType::F16 && form == AluForm::Reg && !wide;
+    let src_type = float_type(reader, CVT_SRC_SIZE)?;
     Ok(Op::F2I(OpF2I {
         dst: reader.gpr(DST),
         src: alu::src(reader, form, Source::One, true),
@@ -1656,24 +1695,21 @@ fn decode_f2i(reader: &mut Reader) -> Result<Op, DecodeError> {
         rnd: RoundMode::from_bits(reader.field(RND)),
         ftz: reader.flag(FTZ),
         ntz: reader.flag(F2I_NTZ),
-        high: half && reader.flag(HIGH_HALF),
+        high: conversion_high(reader, form, src_type),
         wide,
     }))
 }
 
-/// `F2I` with 9-bit opcode `base` in `form`: the narrow opcode's form 1 has the high-half bit.
+/// `F2I` with 9-bit opcode `base` in `form`: both opcodes have the high-half bit in the forms
+/// that have it ([`has_high_half`]).
 const fn f2i(base: u16, form: AluForm) -> Form {
-    let half = if base == F2I_OPCODE {
-        high_half_known(form)
-    } else {
-        0
-    };
     Form::new(
         form.opcode(base),
         conversion_known(
             form,
             true,
-            mask_of(&[F2I_SIGNED, CVT_DST_SIZE, F2I_NTZ, RND, FTZ, CVT_SRC_SIZE]) | half,
+            mask_of(&[F2I_SIGNED, CVT_DST_SIZE, F2I_NTZ, RND, FTZ, CVT_SRC_SIZE])
+                | high_half_known(form),
         ),
         decode_f2i,
     )
@@ -1747,7 +1783,7 @@ fn decode_i2f(reader: &mut Reader) -> Result<Op, DecodeError> {
     Ok(Op::I2F(OpI2F {
         dst: reader.gpr(DST),
         src: alu::src(reader, form, Source::One, false),
-        dst_type: float_type(reader, CVT_DST_SIZE),
+        dst_type: float_type(reader, CVT_DST_SIZE)?,
         src_type,
         rnd: RoundMode::from_bits(reader.field(RND)),
         select,
@@ -1815,7 +1851,7 @@ fn decode_i2fp(reader: &mut Reader) -> Result<Op, DecodeError> {
     Ok(Op::I2FP(OpI2FP {
         dst: reader.gpr(DST),
         src: alu::src(reader, form, Source::One, false),
-        dst_type: float_type(reader, CVT_DST_SIZE),
+        dst_type: float_type(reader, CVT_DST_SIZE)?,
         src_type: int_type(reader, CVT_SRC_SIZE, I2F_SIGNED),
         rnd: RoundMode::from_bits(reader.field(RND)),
     }))
@@ -2029,6 +2065,22 @@ pub(crate) const SLOT_MODIFIERS: u128 = mask_of(&[SLOT_ABS, SLOT_NEG]);
 /// source 0's absolute value and source 2's modifiers.
 #[cfg(test)]
 pub(crate) const F2FP_DROPPED: u128 = mask_of(&[SRC0_ABS, SRC2_ABS, SRC2_NEG]);
+/// The bit that the forms of `F2F`, `FRND`, `F2I` and `MUFU` add where PR #4588's rows leave it
+/// out: the high-half select of a 16-bit source, which NAK's encoder writes in forms 1, 5 and 6
+/// ([`has_high_half`]; module docs).
+#[cfg(test)]
+pub(crate) const NAK_HIGH_HALF: u128 = HIGH_HALF.mask();
+/// The canonical fields of `FMUL`'s forms: scale 4, no scaling (NAK's `set_field(84..87,
+/// 0x4_u8)`), since the bare word's scale 0 is refused.
+#[cfg(test)]
+pub(crate) const FMUL_CANONICAL: u128 = field_value(FMUL_SCALE, FMulScale::None.bits());
+/// The canonical destination type of a conversion: `F32` (NAK writes `(32 / 8).ilog2()`), since
+/// the bare word's size 0 is refused.
+#[cfg(test)]
+pub(crate) const CVT_DST_F32: u128 = field_value(CVT_DST_SIZE, FloatType::F32.bits());
+/// The canonical source type of a conversion: `F32`, as for [`CVT_DST_F32`].
+#[cfg(test)]
+pub(crate) const CVT_SRC_F32: u128 = field_value(CVT_SRC_SIZE, FloatType::F32.bits());
 
 /// PR #4588's rows for the group's forms, in [`FORMS`] order
 /// (`eden-pr4588/src/shader_recompiler/frontend/ampere/ampere_isa_table.h` @ e5fb3b97; each
@@ -2057,14 +2109,18 @@ pub(crate) const REFERENCE_ROWS: &[ReferenceRow] = &[
         .fixing(SLOT_UNIFORM.mask()),
     // FMUL.
     ReferenceRow::new(0x220, [0xffff_ffff, 0xc000_00ff, 0x0071_ffff, 0xffff_fe00])
-        .dropping(IGNORED_SLOT_DROPPED),
+        .dropping(IGNORED_SLOT_DROPPED)
+        .with_canonical(FMUL_CANONICAL),
     ReferenceRow::new(0x820, [0xffff_ffff, 0xffff_ffff, 0x0071_ffff, 0xffff_fe00])
-        .dropping(IGNORED_SLOT_DROPPED),
+        .dropping(IGNORED_SLOT_DROPPED)
+        .with_canonical(FMUL_CANONICAL),
     ReferenceRow::new(0xa20, [0xffff_ffff, 0xc7ff_ffff, 0x0871_ffff, 0xffff_fe00])
-        .dropping(IGNORED_SLOT_DROPPED),
+        .dropping(IGNORED_SLOT_DROPPED)
+        .with_canonical(FMUL_CANONICAL),
     ReferenceRow::new(0xc20, [0xffff_ffff, 0xc000_003f, 0x0871_ffff, 0xffff_fe00])
         .dropping(IGNORED_SLOT_DROPPED)
-        .fixing(SLOT_UNIFORM.mask()),
+        .fixing(SLOT_UNIFORM.mask())
+        .with_canonical(FMUL_CANONICAL),
     // FMNMX.
     ReferenceRow::new(0x209, [0xffff_ffff, 0xc000_00ff, 0x0783_031e, 0xffff_fe00])
         .dropping(FMNMX_DROPPED),
@@ -2094,71 +2150,126 @@ pub(crate) const REFERENCE_ROWS: &[ReferenceRow] = &[
     // MUFU.
     ReferenceRow::new(0x308, [0x00ff_ffff, 0xd000_00ff, 0x0000_fe00, 0xffff_fe00]),
     ReferenceRow::new(0x908, [0x00ff_ffff, 0xffff_ffff, 0x0000_fe00, 0xffff_fe00]),
-    ReferenceRow::new(0xb08, [0x00ff_ffff, 0xc7ff_ffff, 0x0800_fe00, 0xffff_fe00]),
+    ReferenceRow::new(0xb08, [0x00ff_ffff, 0xc7ff_ffff, 0x0800_fe00, 0xffff_fe00])
+        .adding(NAK_HIGH_HALF, Namer::NakEncoder),
     ReferenceRow::new(0xd08, [0x00ff_ffff, 0xc000_003f, 0x0800_fe00, 0xffff_fe00])
+        .adding(NAK_HIGH_HALF, Namer::NakEncoder)
         .fixing(SLOT_UNIFORM.mask()),
     // FSWZADD.
     ReferenceRow::new(0x822, [0xffff_ffff, 0x0000_00ff, 0x0001_e0ff, 0xffff_fe00]),
     // FRND, then its 64-bit opcode.
-    ReferenceRow::new(0x307, [0x00ff_ffff, 0xc000_00ff, 0x0031_d800, 0xffff_fe00]),
-    ReferenceRow::new(0x907, [0x00ff_ffff, 0xffff_ffff, 0x0031_d800, 0xffff_fe00]),
-    ReferenceRow::new(0xb07, [0x00ff_ffff, 0xc7ff_ffff, 0x0831_d800, 0xffff_fe00]),
+    ReferenceRow::new(0x307, [0x00ff_ffff, 0xc000_00ff, 0x0031_d800, 0xffff_fe00])
+        .adding(NAK_HIGH_HALF, Namer::NakEncoder)
+        .with_canonical(CVT_DST_F32 | CVT_SRC_F32),
+    ReferenceRow::new(0x907, [0x00ff_ffff, 0xffff_ffff, 0x0031_d800, 0xffff_fe00])
+        .with_canonical(CVT_DST_F32 | CVT_SRC_F32),
+    ReferenceRow::new(0xb07, [0x00ff_ffff, 0xc7ff_ffff, 0x0831_d800, 0xffff_fe00])
+        .adding(NAK_HIGH_HALF, Namer::NakEncoder)
+        .with_canonical(CVT_DST_F32 | CVT_SRC_F32),
     ReferenceRow::new(0xd07, [0x00ff_ffff, 0xc000_003f, 0x0831_d800, 0xffff_fe00])
-        .fixing(SLOT_UNIFORM.mask()),
-    ReferenceRow::new(0x313, [0x00ff_ffff, 0xc000_00ff, 0x0031_d800, 0xffff_fe00]),
-    ReferenceRow::new(0x913, [0x00ff_ffff, 0xffff_ffff, 0x0031_d800, 0xffff_fe00]),
-    ReferenceRow::new(0xb13, [0x00ff_ffff, 0xc7ff_ffff, 0x0831_d800, 0xffff_fe00]),
+        .adding(NAK_HIGH_HALF, Namer::NakEncoder)
+        .fixing(SLOT_UNIFORM.mask())
+        .with_canonical(CVT_DST_F32 | CVT_SRC_F32),
+    ReferenceRow::new(0x313, [0x00ff_ffff, 0xc000_00ff, 0x0031_d800, 0xffff_fe00])
+        .adding(NAK_HIGH_HALF, Namer::NakEncoder)
+        .with_canonical(CVT_DST_F32 | CVT_SRC_F32),
+    ReferenceRow::new(0x913, [0x00ff_ffff, 0xffff_ffff, 0x0031_d800, 0xffff_fe00])
+        .with_canonical(CVT_DST_F32 | CVT_SRC_F32),
+    ReferenceRow::new(0xb13, [0x00ff_ffff, 0xc7ff_ffff, 0x0831_d800, 0xffff_fe00])
+        .adding(NAK_HIGH_HALF, Namer::NakEncoder)
+        .with_canonical(CVT_DST_F32 | CVT_SRC_F32),
     ReferenceRow::new(0xd13, [0x00ff_ffff, 0xc000_003f, 0x0831_d800, 0xffff_fe00])
-        .fixing(SLOT_UNIFORM.mask()),
+        .adding(NAK_HIGH_HALF, Namer::NakEncoder)
+        .fixing(SLOT_UNIFORM.mask())
+        .with_canonical(CVT_DST_F32 | CVT_SRC_F32),
     // F2F, then its 64-bit opcode.
-    ReferenceRow::new(0x304, [0x00ff_ffff, 0xc000_00ff, 0x0031_d800, 0xffff_fe00]),
-    ReferenceRow::new(0x904, [0x00ff_ffff, 0xffff_ffff, 0x0031_d800, 0xffff_fe00]),
-    ReferenceRow::new(0xb04, [0x00ff_ffff, 0xc7ff_ffff, 0x0831_d800, 0xffff_fe00]),
+    ReferenceRow::new(0x304, [0x00ff_ffff, 0xc000_00ff, 0x0031_d800, 0xffff_fe00])
+        .adding(NAK_HIGH_HALF, Namer::NakEncoder)
+        .with_canonical(CVT_DST_F32 | CVT_SRC_F32),
+    ReferenceRow::new(0x904, [0x00ff_ffff, 0xffff_ffff, 0x0031_d800, 0xffff_fe00])
+        .with_canonical(CVT_DST_F32 | CVT_SRC_F32),
+    ReferenceRow::new(0xb04, [0x00ff_ffff, 0xc7ff_ffff, 0x0831_d800, 0xffff_fe00])
+        .adding(NAK_HIGH_HALF, Namer::NakEncoder)
+        .with_canonical(CVT_DST_F32 | CVT_SRC_F32),
     ReferenceRow::new(0xd04, [0x00ff_ffff, 0xc000_003f, 0x0831_d800, 0xffff_fe00])
-        .fixing(SLOT_UNIFORM.mask()),
-    ReferenceRow::new(0x310, [0x00ff_ffff, 0xc000_00ff, 0x0031_d800, 0xffff_fe00]),
-    ReferenceRow::new(0x910, [0x00ff_ffff, 0xffff_ffff, 0x0031_d800, 0xffff_fe00]),
-    ReferenceRow::new(0xb10, [0x00ff_ffff, 0xc7ff_ffff, 0x0831_d800, 0xffff_fe00]),
+        .adding(NAK_HIGH_HALF, Namer::NakEncoder)
+        .fixing(SLOT_UNIFORM.mask())
+        .with_canonical(CVT_DST_F32 | CVT_SRC_F32),
+    ReferenceRow::new(0x310, [0x00ff_ffff, 0xc000_00ff, 0x0031_d800, 0xffff_fe00])
+        .adding(NAK_HIGH_HALF, Namer::NakEncoder)
+        .with_canonical(CVT_DST_F32 | CVT_SRC_F32),
+    ReferenceRow::new(0x910, [0x00ff_ffff, 0xffff_ffff, 0x0031_d800, 0xffff_fe00])
+        .with_canonical(CVT_DST_F32 | CVT_SRC_F32),
+    ReferenceRow::new(0xb10, [0x00ff_ffff, 0xc7ff_ffff, 0x0831_d800, 0xffff_fe00])
+        .adding(NAK_HIGH_HALF, Namer::NakEncoder)
+        .with_canonical(CVT_DST_F32 | CVT_SRC_F32),
     ReferenceRow::new(0xd10, [0x00ff_ffff, 0xc000_003f, 0x0831_d800, 0xffff_fe00])
-        .fixing(SLOT_UNIFORM.mask()),
+        .adding(NAK_HIGH_HALF, Namer::NakEncoder)
+        .fixing(SLOT_UNIFORM.mask())
+        .with_canonical(CVT_DST_F32 | CVT_SRC_F32),
     // F2I, then its 64-bit opcode.
-    ReferenceRow::new(0x305, [0x00ff_ffff, 0xd000_00ff, 0x0031_f900, 0xffff_fe00]),
-    ReferenceRow::new(0x905, [0x00ff_ffff, 0xffff_ffff, 0x0031_f900, 0xffff_fe00]),
-    ReferenceRow::new(0xb05, [0x00ff_ffff, 0xc7ff_ffff, 0x0831_f900, 0xffff_fe00]),
+    ReferenceRow::new(0x305, [0x00ff_ffff, 0xd000_00ff, 0x0031_f900, 0xffff_fe00])
+        .with_canonical(CVT_SRC_F32),
+    ReferenceRow::new(0x905, [0x00ff_ffff, 0xffff_ffff, 0x0031_f900, 0xffff_fe00])
+        .with_canonical(CVT_SRC_F32),
+    ReferenceRow::new(0xb05, [0x00ff_ffff, 0xc7ff_ffff, 0x0831_f900, 0xffff_fe00])
+        .adding(NAK_HIGH_HALF, Namer::NakEncoder)
+        .with_canonical(CVT_SRC_F32),
     ReferenceRow::new(0xd05, [0x00ff_ffff, 0xc000_003f, 0x0831_f900, 0xffff_fe00])
-        .fixing(SLOT_UNIFORM.mask()),
-    ReferenceRow::new(0x311, [0x00ff_ffff, 0xc000_00ff, 0x0031_f900, 0xffff_fe00]),
-    ReferenceRow::new(0x911, [0x00ff_ffff, 0xffff_ffff, 0x0031_f900, 0xffff_fe00]),
-    ReferenceRow::new(0xb11, [0x00ff_ffff, 0xc7ff_ffff, 0x0831_f900, 0xffff_fe00]),
+        .adding(NAK_HIGH_HALF, Namer::NakEncoder)
+        .fixing(SLOT_UNIFORM.mask())
+        .with_canonical(CVT_SRC_F32),
+    ReferenceRow::new(0x311, [0x00ff_ffff, 0xc000_00ff, 0x0031_f900, 0xffff_fe00])
+        .adding(NAK_HIGH_HALF, Namer::NakEncoder)
+        .with_canonical(CVT_SRC_F32),
+    ReferenceRow::new(0x911, [0x00ff_ffff, 0xffff_ffff, 0x0031_f900, 0xffff_fe00])
+        .with_canonical(CVT_SRC_F32),
+    ReferenceRow::new(0xb11, [0x00ff_ffff, 0xc7ff_ffff, 0x0831_f900, 0xffff_fe00])
+        .adding(NAK_HIGH_HALF, Namer::NakEncoder)
+        .with_canonical(CVT_SRC_F32),
     ReferenceRow::new(0xd11, [0x00ff_ffff, 0xc000_003f, 0x0831_f900, 0xffff_fe00])
-        .fixing(SLOT_UNIFORM.mask()),
+        .adding(NAK_HIGH_HALF, Namer::NakEncoder)
+        .fixing(SLOT_UNIFORM.mask())
+        .with_canonical(CVT_SRC_F32),
     // I2F, then its 64-bit opcode.
     ReferenceRow::new(0x306, [0x00ff_ffff, 0xf000_00ff, 0x0030_dc00, 0xffff_fe00])
-        .dropping(SLOT_MODIFIERS),
-    ReferenceRow::new(0x906, [0x00ff_ffff, 0xffff_ffff, 0x0030_dc00, 0xffff_fe00]),
+        .dropping(SLOT_MODIFIERS)
+        .with_canonical(CVT_DST_F32),
+    ReferenceRow::new(0x906, [0x00ff_ffff, 0xffff_ffff, 0x0030_dc00, 0xffff_fe00])
+        .with_canonical(CVT_DST_F32),
     ReferenceRow::new(0xb06, [0x00ff_ffff, 0xf7ff_ffff, 0x0830_dc00, 0xffff_fe00])
-        .dropping(SLOT_MODIFIERS),
+        .dropping(SLOT_MODIFIERS)
+        .with_canonical(CVT_DST_F32),
     ReferenceRow::new(0xd06, [0x00ff_ffff, 0xf000_003f, 0x0830_dc00, 0xffff_fe00])
         .dropping(SLOT_MODIFIERS)
-        .fixing(SLOT_UNIFORM.mask()),
+        .fixing(SLOT_UNIFORM.mask())
+        .with_canonical(CVT_DST_F32),
     ReferenceRow::new(0x312, [0x00ff_ffff, 0xf000_00ff, 0x0030_dc00, 0xffff_fe00])
-        .dropping(SLOT_MODIFIERS),
-    ReferenceRow::new(0x912, [0x00ff_ffff, 0xffff_ffff, 0x0030_dc00, 0xffff_fe00]),
+        .dropping(SLOT_MODIFIERS)
+        .with_canonical(CVT_DST_F32),
+    ReferenceRow::new(0x912, [0x00ff_ffff, 0xffff_ffff, 0x0030_dc00, 0xffff_fe00])
+        .with_canonical(CVT_DST_F32),
     ReferenceRow::new(0xb12, [0x00ff_ffff, 0xf7ff_ffff, 0x0830_dc00, 0xffff_fe00])
-        .dropping(SLOT_MODIFIERS),
+        .dropping(SLOT_MODIFIERS)
+        .with_canonical(CVT_DST_F32),
     ReferenceRow::new(0xd12, [0x00ff_ffff, 0xf000_003f, 0x0830_dc00, 0xffff_fe00])
         .dropping(SLOT_MODIFIERS)
-        .fixing(SLOT_UNIFORM.mask()),
+        .fixing(SLOT_UNIFORM.mask())
+        .with_canonical(CVT_DST_F32),
     // I2FP.
     ReferenceRow::new(0x245, [0x00ff_ffff, 0xc000_00ff, 0x0830_dc00, 0xffff_fe00])
-        .dropping(SLOT_MODIFIERS | SLOT_UNIFORM.mask()),
+        .dropping(SLOT_MODIFIERS | SLOT_UNIFORM.mask())
+        .with_canonical(CVT_DST_F32),
     ReferenceRow::new(0x845, [0x00ff_ffff, 0xffff_ffff, 0x0830_dc00, 0xffff_fe00])
-        .dropping(SLOT_UNIFORM.mask()),
+        .dropping(SLOT_UNIFORM.mask())
+        .with_canonical(CVT_DST_F32),
     ReferenceRow::new(0xa45, [0x00ff_ffff, 0xc7ff_ffff, 0x0830_dc00, 0xffff_fe00])
-        .dropping(SLOT_MODIFIERS),
+        .dropping(SLOT_MODIFIERS)
+        .with_canonical(CVT_DST_F32),
     ReferenceRow::new(0xc45, [0x00ff_ffff, 0xc000_003f, 0x0830_dc00, 0xffff_fe00])
         .dropping(SLOT_MODIFIERS)
-        .fixing(SLOT_UNIFORM.mask()),
+        .fixing(SLOT_UNIFORM.mask())
+        .with_canonical(CVT_DST_F32),
     // F2FP.
     ReferenceRow::new(0x23e, [0xffff_ffff, 0xc000_00ff, 0x0001_cfff, 0xffff_fe00])
         .dropping(SLOT_MODIFIERS | F2FP_DROPPED),

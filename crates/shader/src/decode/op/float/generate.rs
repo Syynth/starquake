@@ -60,8 +60,10 @@ const fn is_uniform(src: AluSrc) -> bool {
     matches!(src, AluSrc::UniformReg { .. })
 }
 
-const fn is_reg(src: AluSrc) -> bool {
-    matches!(src, AluSrc::Reg { .. })
+/// Whether a 16-bit `src` of a one-source instruction has a high-half select: every source but
+/// an immediate (`op::float`'s `has_high_half`).
+const fn has_high_half(src: AluSrc) -> bool {
+    !matches!(src, AluSrc::Imm(_))
 }
 
 /// Every operation of the group, one generator each.
@@ -165,7 +167,7 @@ fn mufu() -> BoxedStrategy<Op> {
                 op,
                 src,
                 f16,
-                high: high && f16 && is_reg(src),
+                high: high && f16 && has_high_half(src),
             })
         }))
     .boxed()
@@ -286,9 +288,9 @@ fn frnd() -> BoxedStrategy<Op> {
         any_src(),
         (any_float_type(), any_float_type()),
         any_rnd(),
-        any::<[bool; 2]>(),
+        any::<[bool; 3]>(),
     )
-        .prop_map(|(dst, src, (dst_type, src_type), rnd, [ftz, wide])| {
+        .prop_map(|(dst, src, (dst_type, src_type), rnd, [ftz, high, wide])| {
             Op::FRnd(OpFRnd {
                 dst,
                 src,
@@ -296,6 +298,7 @@ fn frnd() -> BoxedStrategy<Op> {
                 src_type,
                 rnd,
                 ftz,
+                high: high && src_type == FloatType::F16 && has_high_half(src),
                 wide,
             })
         }))
@@ -308,9 +311,9 @@ fn f2f() -> BoxedStrategy<Op> {
         any_src(),
         (any_float_type(), any_float_type()),
         any_rnd(),
-        any::<[bool; 2]>(),
+        any::<[bool; 3]>(),
     )
-        .prop_map(|(dst, src, (dst_type, src_type), rnd, [ftz, wide])| {
+        .prop_map(|(dst, src, (dst_type, src_type), rnd, [ftz, high, wide])| {
             Op::F2F(OpF2F {
                 dst,
                 src,
@@ -318,6 +321,7 @@ fn f2f() -> BoxedStrategy<Op> {
                 src_type,
                 rnd,
                 ftz,
+                high: high && src_type == FloatType::F16 && has_high_half(src),
                 wide,
             })
         }))
@@ -334,7 +338,7 @@ fn f2i() -> BoxedStrategy<Op> {
     )
         .prop_map(
             |(dst, src, (dst_type, src_type), rnd, [ftz, ntz, high, wide])| {
-                let half = src_type == FloatType::F16 && is_reg(src) && !wide;
+                let half = src_type == FloatType::F16 && has_high_half(src);
                 Op::F2I(OpF2I {
                     dst,
                     src,
