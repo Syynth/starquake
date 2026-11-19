@@ -6,6 +6,7 @@
 //! *back* owns engine state (3D, compute/QMD, DMA, inline-to-memory) and records draws into the
 //! render backend.
 
+pub mod back;
 pub mod channel;
 pub mod classes;
 pub mod field;
