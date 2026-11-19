@@ -355,6 +355,24 @@ fn votes_on_one_lane() {
     }
 }
 
+/// Each vote names its IR operation (one lane cannot tell `ALL` from `ANY`).
+#[test]
+fn each_vote_names_its_operation() {
+    for (op, name) in [
+        (VoteOp::All, "VoteAll"),
+        (VoteOp::Any, "VoteAny"),
+        (VoteOp::Eq, "VoteEqual"),
+    ] {
+        for instr in [
+            Instr::new(vote(op, Gpr::RZ, p(2), src(1))),
+            Instr::new(voteu(op, UniformReg::URZ, up(2), src(1))),
+        ] {
+            let text = accepted(COMPUTE, instr).0.to_string();
+            assert!(text.contains(&format!("%1: u1 = {name} %0\n")), "{text}");
+        }
+    }
+}
+
 #[test]
 fn vote_golden_ir() {
     let (ir, _) = accepted(COMPUTE, Instr::new(vote(VoteOp::Any, r(5), p(2), not(1))));
@@ -911,6 +929,30 @@ fn pr_warp_reduction() {
             assert_eq!(machine.uniform_regs[5], value, "{op:?}");
             assert_eq!(machine.preds, preds);
         }
+    }
+}
+
+/// Each operation's first lane combines its identity with lane 0's value by the operation
+/// `Visitor::REDUX` names (one lane cannot tell `SUM` from `OR`, so this pins the opcode).
+#[test]
+fn each_reduction_combines_with_its_operation() {
+    let cases = [
+        (ReduxOp::And, "BitwiseAnd32 u32 0xffffffff, %5"),
+        (ReduxOp::Or, "BitwiseOr32 u32 0x0, %5"),
+        (ReduxOp::Xor, "BitwiseXor32 u32 0x0, %5"),
+        (ReduxOp::Sum, "IAdd32 u32 0x0, %5"),
+        (ReduxOp::Min { signed: false }, "UMin32 u32 0xffffffff, %5"),
+        (ReduxOp::Min { signed: true }, "SMin32 u32 0x7fffffff, %5"),
+        (ReduxOp::Max { signed: false }, "UMax32 u32 0x0, %5"),
+        (ReduxOp::Max { signed: true }, "SMax32 u32 0x80000000, %5"),
+    ];
+    for (op, first) in cases {
+        let (ir, _) = accepted(COMPUTE, Instr::new(redux(op, ur(5), r(3))));
+        let text = ir.to_string();
+        assert!(
+            text.contains(&format!("    %6: u32 = {first}\n")),
+            "{op:?}: {text}"
+        );
     }
 }
 
