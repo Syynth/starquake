@@ -20,9 +20,10 @@
 //! warp group (`op::control`), every instruction of it but `JMX` and `BPT`; slice 6g's
 //! attribute and system-value group (`op::attribute`), every instruction of it, `S2R` grown to
 //! its uniform form `S2UR`; slice 6b's 32-bit float and conversion group (`op::float`), every
-//! instruction of it in the vector datapath's forms; and slice 6a's integer group
-//! (`op::integer`), every instruction of it in the vector datapath's forms. Every other opcode
-//! is [`DecodeError::UnknownOpcode`].
+//! instruction of it in the vector datapath's forms; slice 6a's integer group
+//! (`op::integer`), every instruction of it in the vector datapath's forms; and slice 6e's
+//! memory group (`op::memory`), every instruction of it in the vector datapath's forms. Every
+//! other opcode is [`DecodeError::UnknownOpcode`].
 //!
 //! **Strict decoding** (owner's decision 4, 2026-11-12): a word with a bit set that its form
 //! does not explain is rejected, never decoded with the bit ignored. The decoder checks, in this
@@ -33,13 +34,17 @@
 //!    the lowest such bit, as PR #4588's `FirstUnknownBit` does (`frontend/ampere/isa.h`);
 //! 3. every fixed bit of the form is set (bit 91 of the uniform-register ALU forms; bits 87..89
 //!    and 91 of the uniform `BRA` and bit 91 of `BRXU`, `op::control`; bit 91 of `LDTRAM`,
-//!    `op::attribute`; the integer group's fixed predicate fields, `op::integer`), else
+//!    `op::attribute`; the integer group's fixed predicate fields, `op::integer`; bit 91 of the
+//!    bindless `LDC` and the bits PR #4588 requires set in `LDGSTS` and `ATOMS.POPC`,
+//!    `op::memory`), else
 //!    [`DecodeError::MissingBit`] naming the lowest clear one;
 //! 4. the form's function reads its fields, else [`DecodeError::UnknownValue`] for a field whose
 //!    value names nothing (a vote or reduction operation past the defined ones: `op::control`;
 //!    a `MUFU` function or a comparison's combine operation past them: `op::float`; an
 //!    interpolation mode, pixel value or stage-buffer type past NAK's: `op::attribute`;
-//!    `ISETP`'s combining operation 3 and `PRMT`'s mode 7: `op::integer`);
+//!    `ISETP`'s combining operation 3 and `PRMT`'s mode 7: `op::integer`; a memory type, order,
+//!    eviction priority, atomic type or operation, cache operation or `MEMBAR` scope past the
+//!    ones the references name: `op::memory`);
 //! 5. every set bit was read, else [`DecodeError::UnknownBit`] naming the lowest unread one. A
 //!    form explains some bits only in some of its layouts or operations: in the constant-buffer
 //!    ALU forms a bound buffer reads its index (bits 54..59) and a bindless one its uniform
@@ -70,7 +75,10 @@
 //! slots without modifiers) in `op::float`'s and pinned in `tests::float32`; the integer
 //! group's (the absolute-value and modifier bits its sources do not have, forms 2, 3 and 7 of
 //! the instructions without source 2, and the bits PR #4588's translator requires clear) in
-//! `op::integer`'s, pinned in `tests::integer`.
+//! `op::integer`'s, pinned in `tests::integer`; the memory group's (bit 91 of the forms
+//! without a uniform register, `ATOMG` `0x3a8`'s uniform-register bits, and the bits PR #4588's
+//! translator requires clear or set in `LDGSTS` and `ATOMS.POPC`) in `op::memory`'s, pinned in
+//! `tests::memory`.
 
 mod alu;
 mod fields;

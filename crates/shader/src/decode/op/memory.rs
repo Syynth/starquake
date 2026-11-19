@@ -27,7 +27,7 @@
 //!
 //! NAK encodes two forms of most memory instructions: the uniform one (`0x9..`), with a uniform
 //! register added to the address, which SM 7.3 and later get (`has_ugpr`), and the older one
-//! (`0x3..`) without it. Both are decoded: PR #4588's translator reads titles' `STL` (`0x387`),
+//! (`0x3..`) without it. Both are decoded: PR #4588's translator handles `STL` (`0x387`),
 //! `STS` (`0x388`) and `ATOMS` (`0x38c`) in the older form, and NAK still encodes the
 //! compare-and-swap atomics (`0x3a9`, `0x38d`) only so. `LDL` and `LDS` have only the uniform
 //! form (`0x983`, `0x984`), and so does `RED` (`0x98e`), which NAK writes in the uniform layout
