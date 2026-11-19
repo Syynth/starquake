@@ -499,6 +499,26 @@ Landed, the first milestone 3 wave: G8 (the channel pusher, #319, PR #335), G9 (
 | decided (decision log, 2026-11-18, "gpu-protocol errata from wave 36") | **What a QMD request that fails at run time leaves behind.** #336 keeps the request's own change, as Eden-NX2 does, and documents the exact sets; the spec does not say | #323 | gpu-protocol |
 | decided (decision log, 2026-11-18, "gpu-protocol errata from wave 36") | **Replay of data-upload runs:** runs to data-upload methods send shadow values, where Eden-NX2's fast paths upload the raw words. A possible compatibility difference | #320 | gpu-protocol |
 
+### From wave 37 (ledger: #22)
+
+Landed: G13 (the front macro host, #324, PR #340) and G11 (DMA copy, inline-to-memory and 2D on the CPU path, #322, PR #341). G10 (#321) was built and pushed but stopped before its checks; wave 38 resumes it from its branch. Wiring notes for G14 and G19 are comments on #325 and #330.
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| proposed | **Engine register reset values:** seed Eden's `InitializeRegisterDefaults` (and Fermi2D's depth of 1, already exported as `twod::BLIT_RESET_REGISTERS`) through G10's `ClassRules::initial_values`, which seeds the front file, the shadow file and the back mirror from one place. Wave 36's row; G14 and G19 need it before real streams | #321, #322 | area:gpu |
+| proposed | **`MME_DMA_READ` (0x157) into data RAM** at `SET_MME_DATA_RAM_ADDRESS`: Eden-NX2 performs it, G13 does not (row 58 names only the FIFO form). The memo must not store such calls, since they change data RAM without a barrier | #324 | area:gpu |
+| proposed | **The 2D format converter:** port `eden-nx2/src/video_core/engines/sw_blitter/converter.cpp` (about 1,200 lines). Blits between formats (`BlitConversion`) and bilinear filtering of formats other than the two 8888 ones (`BlitFilter`) are refused today | #322 | area:gpu |
+| proposed | **GPU counters for MME DMA reads, catch-ups and reruns**, folded into wave 36's front counters row; verification item 3 cannot be read from a run today | #324 | area:gpu |
+| proposed | **Macro store tests:** the cross-channel rewrite counter and `forget_channel` for the compute store and start entries; the memo stores a call whose write left the register file (arena space only) | #324 | area:gpu |
+| proposed | **Root tables for constant-buffer banks 24 to 31** have no owner yet (G18, with verification item 6) | #321 | area:gpu |
+| awaiting the owner | **`SET_PROGRAM_REGION` does not exist in `clc797.h`.** The spec's "3D: from state to a draw" names it; Ampere pipelines take a 64-bit address each through `SET_PIPELINE_PROGRAM_ADDRESS_A` and `_B` | #321 | gpu-protocol |
+| awaiting the owner | **`clc7c0.h` does list the compute macro calls** (`CALL_MME_MACRO` at byte 0x3800); the spec's facts table says it does not | #324 | gpu-protocol |
+| awaiting the owner | **Two code stores per process:** both references hold a 3D store and a compute store, and a channel's compute class uses the 3D store until it writes 0x45 or 0x47. The spec (and decision 11's wording) says one code store; G13 follows the references | #324 | gpu-protocol |
+| awaiting the owner | **The macro start table's size:** `clc797.h` lists 256 `CALL_MME_MACRO` elements; Eden-NX2 wraps at 0x80, and G13 follows it | #324 | gpu-protocol |
+| awaiting the owner | **A catch-up rerun after another channel rewrites the code:** G13 records the start the abandoned run used and reruns from it, reading the code as it is at the resume; listed as a divergence | #324 | gpu-protocol |
+| awaiting the owner | **Overlapping copies:** G11 reads each line whole before writing it for a pitch-to-pitch DMA copy, as Eden-NX2 does, and reads the whole source region first (at most `MAX_COPY_BYTES`) for a copy with a block-linear side and for every 2D blit. The spec does not say | #322 | gpu-protocol |
+| awaiting the owner | **Guessed bounds with no reference behind them:** at most 2^18 method writes and 0x1000 DMA words per macro run; `MAX_COPY_BYTES` (256 MiB) and `MAX_PENDING_RANGES` (1,024) for copies; vertex stream sizes (16 `SET_VERTEX_STREAM_SIZE` elements for 32 streams). Record them in the spec as guesses to confirm by trace | #321, #322, #324 | gpu-protocol |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
@@ -735,3 +755,13 @@ passed to build agents as a provisional rule for the next wave.
 - Structurally invalid input (an unaligned address where alignment is documented) is refused at the API boundary with a named error, tested one step off the valid value.
 - Where a failure can come after a state change began, the docs list which failing paths leave state untouched and which keep their own change, and a test pins one of each.
 - Docs that claim reference or spec behaviour list every divergence (error reporting, check order, masked bits, read-back values), each with a named test; one that contradicts an approved spec sentence quotes it as an owner question in the module docs.
+
+### From wave 37 (ledger: #22)
+
+- A change that adds a way a function stops, returns or clears state updates every doc passage that lists those outcomes.
+- State shared across channels or engines is bound when the work starts, not at resume (or a generation is recorded and checked), with a test where a sibling rewrites it in between.
+- A chunked copy checks whether source and destination can overlap, and tests an overlap longer than one chunk.
+- A divergence that applies to sibling modules sharing one helper is listed, with a named test, in each module.
+- Reset and default register values come from the reference constructor, cited, and are tested with those registers left unwritten.
+- A function that promises a flush or cleanup on error has a failure-path test asserting the exact ordered events.
+- Register and field widths and signedness come from the reference types, tested with a value at or above 2^31.
