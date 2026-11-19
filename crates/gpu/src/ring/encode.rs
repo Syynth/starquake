@@ -23,6 +23,7 @@
 //! | 8 marker | | 0 | token |
 //! | 9 present | | format | address; width, height; pitch, block height; shown x, y; shown width, height; layer; display |
 //! | 10 capture | command 9:8 (1 start, 2 stop) | 0 | |
+//! | 11 set reference | | channel | value (low half) |
 //!
 //! A release's reduction and format use the `RED_*` encoding of `classes/clc797.h`, through the
 //! same helpers as `MME_DMA_REDUCTION` ([`crate::sema`]). Kind 0 is not an entry, so zeroed ring
@@ -99,10 +100,12 @@ pub enum Kind {
     Present,
     /// [`RingEntry::CaptureControl`].
     CaptureControl,
+    /// [`RingEntry::SetReference`].
+    SetReference,
 }
 
 /// Every kind with its header value and its name in the text form.
-pub(super) const KINDS: [(Kind, u32, &str); 10] = [
+pub(super) const KINDS: [(Kind, u32, &str); 11] = [
     (Kind::Bind, 1, "bind"),
     (Kind::Write, 2, "write"),
     (Kind::Run, 3, "run"),
@@ -113,6 +116,7 @@ pub(super) const KINDS: [(Kind, u32, &str); 10] = [
     (Kind::Marker, 8, "marker"),
     (Kind::Present, 9, "present"),
     (Kind::CaptureControl, 10, "capture"),
+    (Kind::SetReference, 11, "set-reference"),
 ];
 
 impl Kind {
@@ -153,6 +157,7 @@ impl Kind {
             RingEntry::Marker { .. } => Self::Marker,
             RingEntry::Present(_) => Self::Present,
             RingEntry::CaptureControl(_) => Self::CaptureControl,
+            RingEntry::SetReference { .. } => Self::SetReference,
         }
     }
 }
@@ -279,7 +284,10 @@ pub fn encoded_words(entry: &RingEntry<'_>) -> usize {
         | RingEntry::WaitForIdle { .. }
         | RingEntry::Invalidate { .. }
         | RingEntry::CaptureControl(_) => 1,
-        RingEntry::Bind { .. } | RingEntry::Write { .. } | RingEntry::Marker { .. } => 2,
+        RingEntry::Bind { .. }
+        | RingEntry::Write { .. }
+        | RingEntry::Marker { .. }
+        | RingEntry::SetReference { .. } => 2,
         RingEntry::Release(_) => 3,
         RingEntry::Present(_) => 8,
         RingEntry::Run { words, .. } => run_words(words.len()),
@@ -355,6 +363,9 @@ pub fn encode(entry: &RingEntry<'_>, out: &mut Vec<u64>) -> Result<(), EncodeErr
             out.push(word(low, channel.0));
         }
         RingEntry::Marker { token } => out.extend([word(head, 0), token.0]),
+        RingEntry::SetReference { channel, value } => {
+            out.extend([word(head, channel.0), word(*value, 0)]);
+        }
         RingEntry::Present(present) => {
             let image = &present.image;
             let shown = &present.shown;
@@ -395,7 +406,7 @@ pub fn entry_words(head: u64) -> Result<(Kind, usize), DecodeError> {
             run_words(count)
         }
         Kind::Syncpoint | Kind::WaitForIdle | Kind::Invalidate | Kind::CaptureControl => 1,
-        Kind::Bind | Kind::Write | Kind::Marker => 2,
+        Kind::Bind | Kind::Write | Kind::Marker | Kind::SetReference => 2,
         Kind::Release => 3,
         Kind::Present => 8,
     };
@@ -626,6 +637,13 @@ pub fn decode(words: &[u64]) -> Result<(RingEntry<'static>, usize), DecodeError>
             }),
         Kind::Present => entry.present(),
         Kind::CaptureControl => entry.capture(),
+        Kind::SetReference => entry
+            .check_low(&[])
+            .and_then(|()| entry.check_high_zero(1))
+            .map(|()| RingEntry::SetReference {
+                channel: ChannelId(high),
+                value: halves(entry.at(1)).0,
+            }),
     }?;
     Ok((entry, len))
 }

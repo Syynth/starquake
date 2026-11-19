@@ -2108,3 +2108,31 @@ fn a_parked_channel_reports_the_park_before_a_hold() {
         Ok(RunOutcome::Parked(_))
     ));
 }
+
+#[test]
+fn words_read_counts_executed_words_across_calls_and_entries() {
+    // A fresh channel has read nothing.
+    let mut rig = make_rig();
+    assert_eq!(rig.channel.words_read(), 0);
+    // Three immediates: a quantum of 2 executes two (the third, read ahead in the same chunk,
+    // is not counted), and the next call the third.
+    let mut pb = PushBuffer::new();
+    pb.immediate(2, 0x100, 1).unwrap();
+    pb.immediate(2, 0x100, 2).unwrap();
+    pb.immediate(2, 0x100, 3).unwrap();
+    rig.start(CMD, pb.words());
+    assert_eq!(
+        rig.channel.run(&rig.mem, &mut rig.sink, 2),
+        Ok(RunOutcome::QuantumUsed)
+    );
+    assert_eq!(rig.channel.words_read(), 2);
+    assert_eq!(rig.run(), Ok(RunOutcome::EntryDone));
+    assert_eq!(rig.channel.words_read(), 3);
+    // A second entry adds its own words; an empty one adds none.
+    rig.start(CMD2, &pb.words()[..1]);
+    assert_eq!(rig.run(), Ok(RunOutcome::EntryDone));
+    assert_eq!(rig.channel.words_read(), 4);
+    rig.start(CMD2, &[]);
+    assert_eq!(rig.run(), Ok(RunOutcome::EntryDone));
+    assert_eq!(rig.channel.words_read(), 4);
+}

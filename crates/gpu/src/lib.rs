@@ -11,6 +11,7 @@ pub mod channel;
 pub mod classes;
 pub mod field;
 pub mod fifo;
+pub mod front;
 pub mod interface;
 pub mod macros;
 pub mod memory;

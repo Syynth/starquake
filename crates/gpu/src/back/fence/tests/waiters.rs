@@ -1,14 +1,19 @@
 //! The acquire waiter table: register, replace, remove, latch, and the close-trigger query.
 
 use super::super::{Waiter, WaiterTable};
-use crate::interface::ChannelId;
+use crate::interface::{AsId, ChannelId};
 use crate::sema::AcquireOp;
 
 const ADDRESS: u64 = 0x1_2345_6780;
+/// Not 0, so a hard-coded space fails.
+const SPACE: AsId = AsId(0x31);
+/// Another address space.
+const OTHER_SPACE: AsId = AsId(0x32);
 
 fn waiter(channel: u32, op: AcquireOp, payload: u32) -> Waiter {
     Waiter {
         channel: ChannelId(channel),
+        space: SPACE,
         address: ADDRESS,
         op,
         payload,
@@ -20,9 +25,9 @@ fn a_fresh_table_is_empty_and_answers_no() {
     let table = WaiterTable::new();
     assert!(table.is_empty());
     assert_eq!(table.len(), 0);
-    assert!(!table.has_waiter(ADDRESS));
+    assert!(!table.has_waiter(SPACE, ADDRESS));
     assert!(!table.is_latched(ChannelId(0)));
-    assert!(!table.on_write(ADDRESS, 0));
+    assert!(!table.on_write(SPACE, ADDRESS, 0));
     assert!(!table.remove(ChannelId(0)));
 }
 
@@ -30,20 +35,20 @@ fn a_fresh_table_is_empty_and_answers_no() {
 fn a_write_that_meets_the_condition_latches_and_a_later_write_does_not_unlatch() {
     let table = WaiterTable::new();
     table.register(waiter(3, AcquireOp::Equal, 0x5293));
-    assert!(table.has_waiter(ADDRESS));
+    assert!(table.has_waiter(SPACE, ADDRESS));
     // Not met: nothing latches.
-    assert!(!table.on_write(ADDRESS, 0x5292));
+    assert!(!table.on_write(SPACE, ADDRESS, 0x5292));
     assert!(!table.is_latched(ChannelId(3)));
     // Met: latched, and no longer counted as waiting for a release.
-    assert!(table.on_write(ADDRESS, 0x5293));
+    assert!(table.on_write(SPACE, ADDRESS, 0x5293));
     assert!(table.is_latched(ChannelId(3)));
-    assert!(!table.has_waiter(ADDRESS));
+    assert!(!table.has_waiter(SPACE, ADDRESS));
     // Row 70: the counter moves on past the value; the waiter stays latched, and a second
     // latch of it is not reported.
-    assert!(!table.on_write(ADDRESS, 0x5310));
+    assert!(!table.on_write(SPACE, ADDRESS, 0x5310));
     assert!(table.is_latched(ChannelId(3)));
     // The value comes round again: the waiter is already latched, so nothing new is.
-    assert!(!table.on_write(ADDRESS, 0x5293));
+    assert!(!table.on_write(SPACE, ADDRESS, 0x5293));
     assert!(table.is_latched(ChannelId(3)));
 }
 
@@ -51,10 +56,10 @@ fn a_write_that_meets_the_condition_latches_and_a_later_write_does_not_unlatch()
 fn a_write_elsewhere_latches_nothing() {
     let table = WaiterTable::new();
     table.register(waiter(1, AcquireOp::Equal, 7));
-    assert!(!table.on_write(ADDRESS + 4, 7));
-    assert!(!table.on_write(ADDRESS - 4, 7));
+    assert!(!table.on_write(SPACE, ADDRESS + 4, 7));
+    assert!(!table.on_write(SPACE, ADDRESS - 4, 7));
     assert!(!table.is_latched(ChannelId(1)));
-    assert!(!table.has_waiter(ADDRESS + 4));
+    assert!(!table.has_waiter(SPACE, ADDRESS + 4));
 }
 
 #[test]
@@ -76,8 +81,11 @@ fn every_acquire_condition_latches() {
     for (op, payload, meets, misses) in cases {
         let table = WaiterTable::new();
         table.register(waiter(9, op, payload));
-        assert!(!table.on_write(ADDRESS, misses), "{op:?} {misses:#x}");
-        assert!(table.on_write(ADDRESS, meets), "{op:?} {meets:#x}");
+        assert!(
+            !table.on_write(SPACE, ADDRESS, misses),
+            "{op:?} {misses:#x}"
+        );
+        assert!(table.on_write(SPACE, ADDRESS, meets), "{op:?} {meets:#x}");
         assert!(table.is_latched(ChannelId(9)), "{op:?}");
     }
 }
@@ -86,12 +94,12 @@ fn every_acquire_condition_latches() {
 fn registering_again_replaces_the_channels_waiter_unlatched() {
     let table = WaiterTable::new();
     table.register(waiter(2, AcquireOp::Equal, 1));
-    assert!(table.on_write(ADDRESS, 1));
+    assert!(table.on_write(SPACE, ADDRESS, 1));
     table.register(waiter(2, AcquireOp::Equal, 5));
     assert_eq!(table.len(), 1);
     assert!(!table.is_latched(ChannelId(2)));
-    assert!(!table.on_write(ADDRESS, 1));
-    assert!(table.on_write(ADDRESS, 5));
+    assert!(!table.on_write(SPACE, ADDRESS, 1));
+    assert!(table.on_write(SPACE, ADDRESS, 5));
 }
 
 #[test]
@@ -105,7 +113,7 @@ fn removing_a_waiter_leaves_the_others() {
     assert_eq!(table.len(), 1);
     assert!(!table.is_empty());
     // Only channel 5 latches; channel 4 is gone.
-    assert!(table.on_write(ADDRESS, 1));
+    assert!(table.on_write(SPACE, ADDRESS, 1));
     assert!(table.is_latched(ChannelId(5)));
     assert!(!table.is_latched(ChannelId(4)));
 }
@@ -118,11 +126,11 @@ fn removing_the_sole_waiter_empties_the_table() {
     let table = WaiterTable::new();
     table.register(waiter(6, AcquireOp::Equal, 1));
     assert_eq!(table.len(), 1);
-    assert!(table.has_waiter(ADDRESS));
+    assert!(table.has_waiter(SPACE, ADDRESS));
     assert!(table.remove(ChannelId(6)));
     assert!(table.is_empty());
     assert_eq!(table.len(), 0);
-    assert!(!table.has_waiter(ADDRESS));
+    assert!(!table.has_waiter(SPACE, ADDRESS));
     assert!(!table.is_latched(ChannelId(6)));
     assert!(!table.remove(ChannelId(6)));
 }
@@ -133,22 +141,34 @@ fn one_write_latches_every_waiter_it_meets_and_only_those() {
     table.register(waiter(6, AcquireOp::GreaterOrEqual, 3));
     table.register(waiter(7, AcquireOp::GreaterOrEqual, 4));
     table.register(waiter(8, AcquireOp::GreaterOrEqual, 5));
-    assert!(table.on_write(ADDRESS, 4));
+    assert!(table.on_write(SPACE, ADDRESS, 4));
     assert!(table.is_latched(ChannelId(6)));
     assert!(table.is_latched(ChannelId(7)));
     assert!(!table.is_latched(ChannelId(8)));
     // Channel 8 still waits for a release there.
-    assert!(table.has_waiter(ADDRESS));
+    assert!(table.has_waiter(SPACE, ADDRESS));
 }
 
 #[test]
-fn waiters_meet_by_gpu_address_alone() {
-    // Open (module docs): two channels whose acquires read the same GPU address are latched by
-    // one release there, whichever address space they belong to.
+fn waiters_of_another_address_space_are_not_latched() {
+    // Two channels of different address spaces parked on the same GPU address: a release in one
+    // space latches only that space's waiter, and the other's is still waited on.
     let table = WaiterTable::new();
     table.register(waiter(10, AcquireOp::Equal, 2));
-    table.register(waiter(11, AcquireOp::Equal, 2));
-    assert!(table.on_write(ADDRESS, 2));
+    table.register(Waiter {
+        space: OTHER_SPACE,
+        ..waiter(11, AcquireOp::Equal, 2)
+    });
+    assert!(table.has_waiter(SPACE, ADDRESS));
+    assert!(table.has_waiter(OTHER_SPACE, ADDRESS));
+    assert!(!table.has_waiter(AsId(0x33), ADDRESS));
+    assert!(table.on_write(SPACE, ADDRESS, 2));
     assert!(table.is_latched(ChannelId(10)));
+    assert!(!table.is_latched(ChannelId(11)));
+    assert!(!table.has_waiter(SPACE, ADDRESS));
+    assert!(table.has_waiter(OTHER_SPACE, ADDRESS));
+    // A write in a third space latches nothing; one in the other space latches its waiter.
+    assert!(!table.on_write(AsId(0x33), ADDRESS, 2));
+    assert!(table.on_write(OTHER_SPACE, ADDRESS, 2));
     assert!(table.is_latched(ChannelId(11)));
 }

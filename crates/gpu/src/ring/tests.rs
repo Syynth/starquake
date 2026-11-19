@@ -171,6 +171,14 @@ fn golden_host() -> Vec<(RingEntry<'static>, Vec<u64>)> {
             RingEntry::CaptureControl(CaptureCommand::Stop),
             vec![0x0000_0000_0000_020a],
         ),
+        (
+            // Kind 11, the channel in the header's high half, the value in word 1's low half.
+            RingEntry::SetReference {
+                channel: ChannelId(0x16),
+                value: 0x8765_4321,
+            },
+            vec![0x0000_0016_0000_000b, 0x0000_0000_8765_4321],
+        ),
     ]
 }
 
@@ -309,10 +317,18 @@ fn an_empty_run_is_two_words() {
 
 #[test]
 fn malformed_words_are_exact_errors() {
+    // The kinds are numbered 1 to `KINDS.len()`, so the next number is the first undefined one.
+    let first_undefined = u32::try_from(KINDS.len()).unwrap() + 1;
+    assert_eq!(first_undefined, 12);
     let cases: Vec<(Vec<u64>, DecodeError)> = vec![
         (vec![], DecodeError::Empty),
         (vec![0], DecodeError::UnknownKind { kind: 0 }),
-        (vec![11], DecodeError::UnknownKind { kind: 11 }),
+        (
+            vec![u64::from(first_undefined)],
+            DecodeError::UnknownKind {
+                kind: first_undefined,
+            },
+        ),
         (
             vec![0x0000_0011_0000_0501],
             DecodeError::Truncated {
@@ -427,6 +443,32 @@ fn malformed_host_entries_are_exact_errors() {
                 bits: 0x1_0000_0000,
             },
         ),
+        // Set reference: nothing in the header's low half but the kind, nothing in word 1's
+        // high half.
+        (
+            vec![0x0000_0016_0000_010b, 0x5],
+            DecodeError::Reserved {
+                kind: Kind::SetReference,
+                word: 0,
+                bits: 0x100,
+            },
+        ),
+        (
+            vec![0x0000_0016_0000_000b, 0x1_0000_0005],
+            DecodeError::Reserved {
+                kind: Kind::SetReference,
+                word: 1,
+                bits: 0x1_0000_0000,
+            },
+        ),
+        (
+            vec![0x0000_0016_0000_000b],
+            DecodeError::Truncated {
+                kind: Kind::SetReference,
+                needed: 2,
+                available: 1,
+            },
+        ),
     ];
     for (words, error) in cases {
         assert_eq!(decode(&words), Err(error), "{words:x?}");
@@ -535,6 +577,7 @@ fn entries_name_their_channel_and_own_their_words() {
             | RingEntry::Write { channel, .. }
             | RingEntry::Run { channel, .. }
             | RingEntry::WaitForIdle { channel }
+            | RingEntry::SetReference { channel, .. }
             | RingEntry::Invalidate { channel, .. } => Some(*channel),
             _ => None,
         };
@@ -563,6 +606,7 @@ fn every_golden_entry_has_its_text() {
          shown=3,5,1270,710 layer=33 display=34",
         "capture command=start",
         "capture command=stop",
+        "set-reference channel=22 value=0x87654321",
     ];
     let entries: Vec<RingEntry<'static>> = golden().into_iter().map(|(entry, _)| entry).collect();
     for (entry, text) in entries.iter().zip(expected) {
@@ -652,6 +696,14 @@ fn hand_written_lines_parse() {
             },
         ),
         ("syncpoint id=0", RingEntry::Syncpoint { id: syncpoint(0) }),
+        // A set reference in decimal, at the value's largest.
+        (
+            "set-reference channel=9 value=4294967295",
+            RingEntry::SetReference {
+                channel: ChannelId(9),
+                value: u32::MAX,
+            },
+        ),
     ];
     for (line, entry) in cases {
         assert_eq!(parse_entry(line), Ok(entry), "{line}");
@@ -971,6 +1023,10 @@ fn entry() -> impl Strategy<Value = RingEntry<'static>> {
         present().prop_map(RingEntry::Present),
         prop::sample::select(vec![CaptureCommand::Start, CaptureCommand::Stop])
             .prop_map(RingEntry::CaptureControl),
+        (any::<u32>(), any::<u32>()).prop_map(|(channel, value)| RingEntry::SetReference {
+            channel: ChannelId(channel),
+            value,
+        }),
     ]
 }
 
