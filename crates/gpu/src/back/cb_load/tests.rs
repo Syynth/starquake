@@ -174,8 +174,8 @@ fn a_run_lands_at_the_selected_address_plus_the_offset_in_one_write() {
 
 #[test]
 fn every_constant_buffer_method_loads_into_the_selected_buffer() {
-    for (k, index) in (0u32..).zip([0, 7, LOAD_CONSTANT_BUFFER_COUNT - 1]) {
-        let offset = 0x10 * k;
+    for index in 0..LOAD_CONSTANT_BUFFER_COUNT {
+        let offset = 0x10 * index;
         let m = mirror(BUFFER, SIZE, offset);
         let memory = Memory::new();
         let mut pending = PendingWrites::new();
@@ -252,13 +252,20 @@ fn the_selector_and_offset_are_the_headers_registers_and_fields() {
 
 #[test]
 fn the_size_edge_accepts_a_word_ending_at_it_and_refuses_one_past() {
-    // The last word that fits, then one byte further: refused before anything is written.
+    // The last word that fits, then one byte further: refused before anything is written. The
+    // bits above `SIZE` (16:0) are set and ignored, so a size read as the whole register word
+    // would accept the refused cases.
+    let size_word = 0xfffe_0000 | SIZE;
+    assert_eq!(
+        clc797::SET_CONSTANT_BUFFER_SELECTOR_A_SIZE.get(size_word),
+        SIZE
+    );
     let memory = Memory::new();
     let mut pending = PendingWrites::new();
     let last = SIZE - 4;
     assert_eq!(
         run(
-            &mirror(BUFFER, SIZE, last),
+            &mirror(BUFFER, size_word, last),
             &[0x7777_7777],
             &memory,
             &mut pending
@@ -271,7 +278,7 @@ fn the_size_edge_accepts_a_word_ending_at_it_and_refuses_one_past() {
     for offset in [last + 1, SIZE] {
         assert_eq!(
             run(
-                &mirror(BUFFER, SIZE, offset),
+                &mirror(BUFFER, size_word, offset),
                 &[0x7777_7777],
                 &memory,
                 &mut pending
@@ -304,6 +311,23 @@ fn a_run_whose_last_word_passes_the_size_writes_none_of_its_words() {
     let at = BUFFER + u64::from(start);
     assert_eq!(memory.writes(), [(at, 8)]);
     assert_eq!(pending.ranges(), only(at..at + 8));
+}
+
+#[test]
+fn a_run_with_two_words_past_the_size_reports_the_first() {
+    // Both words of the run pass the size, at offsets `SIZE` and `SIZE + 4`: the first in word
+    // order is reported, through the upload as well as through `check`.
+    let memory = Memory::new();
+    let mut pending = PendingWrites::new();
+    assert_eq!(
+        run(&mirror(BUFFER, SIZE, SIZE), &[1, 2], &memory, &mut pending),
+        Err(ConstantBufferError::PastEnd {
+            offset: SIZE,
+            size: SIZE
+        })
+    );
+    assert_eq!(memory.writes(), []);
+    assert!(pending.is_empty());
 }
 
 #[test]

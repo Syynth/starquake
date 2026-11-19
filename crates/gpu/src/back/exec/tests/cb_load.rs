@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::back::cb_load::ConstantBufferError;
-use crate::regs::{CONSTANT_BUFFER_LOADS, RegFile};
+use crate::regs::{CONSTANT_BUFFER_LOADS, RegFile, WORD_BYTES};
 use crate::ring::MAX_RUN_WORDS;
 
 /// The buffer the front-driven test selects: past every other address the rig uses, with room
@@ -173,20 +173,82 @@ fn a_load_past_the_size_is_the_exact_error_and_keeps_the_words_in_the_mirror() {
 
 #[test]
 fn only_the_3d_class_loads_constant_buffers() {
-    // The compute class's method at the same number is not a constant-buffer load, even with
-    // the 3D class selecting a buffer on the same channel.
+    // The compute, DMA and 2D classes' method at the same number is not a constant-buffer load,
+    // even with the 3D class selecting a buffer on the same channel.
+    for (class, subchannel) in [(clc7c0::CLASS, 1), (clc7b5::CLASS, 4), (cl902d::CLASS, 3)] {
+        let mut rig = Rig::new();
+        rig.run("bind channel=3 subchannel=0 class=0xc797\n");
+        rig.run(&select(CB, BIG, 0));
+        rig.run(&format!(
+            "bind channel=3 subchannel={subchannel} class={class:#x}\n"
+        ));
+        let entry = RingEntry::Write {
+            channel: CHANNEL,
+            class: ClassId(class),
+            method: load(0),
+            value: 0x7777_7777,
+        };
+        assert_eq!(rig.exec.apply(&entry), Ok(()), "{class:#x}");
+        assert_eq!(rig.word(CB), 0, "{class:#x}");
+    }
+}
+
+#[test]
+fn a_split_run_whose_second_entry_passes_the_size_keeps_the_first_and_writes_none_of_the_second() {
+    // The front's own register file splits a run of `MAX_RUN_WORDS` + 3 words into two `Run`
+    // entries. The size ends two words into the second entry, so its third word passes it: the
+    // all-or-nothing unit is one entry, so the first entry's words stay written and none of the
+    // second's are.
+    let first_words = u32::try_from(MAX_RUN_WORDS).unwrap();
+    let size = (first_words + 2) * WORD_BYTES;
+    let words: Vec<u32> = (0..first_words + 3).map(|k| 0xe000_0000 | k).collect();
+    let mut front = RegFile::new(CHANNEL, ClassId(THREE_D));
+    let mut entries: Vec<RingEntry<'static>> = Vec::new();
+    for (method, value) in [
+        (&clc797::SET_CONSTANT_BUFFER_SELECTOR_A, size),
+        (
+            &clc797::SET_CONSTANT_BUFFER_SELECTOR_B,
+            u32::try_from(CB >> 32).unwrap(),
+        ),
+        (
+            &clc797::SET_CONSTANT_BUFFER_SELECTOR_C,
+            u32::try_from(CB & 0xffff_ffff).unwrap(),
+        ),
+        (&clc797::LOAD_CONSTANT_BUFFER_OFFSET, 0),
+    ] {
+        front.write(method.method(), value, &mut entries).unwrap();
+    }
+    let method = CONSTANT_BUFFER_LOADS.element(4).unwrap();
+    front.write_run(method, &words, &mut entries).unwrap();
+    let runs: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| matches!(entry, RingEntry::Run { .. }))
+        .map(|(k, _)| k)
+        .collect();
+    assert_eq!(runs.len(), 2);
+
     let mut rig = Rig::new();
     rig.run("bind channel=3 subchannel=0 class=0xc797\n");
-    rig.run(&select(CB, BIG, 0));
-    rig.run("bind channel=3 subchannel=1 class=0xc7c0\n");
-    let entry = RingEntry::Write {
-        channel: CHANNEL,
-        class: ClassId(COMPUTE),
-        method: load(0),
-        value: 0x7777_7777,
-    };
-    assert_eq!(rig.exec.apply(&entry), Ok(()));
-    assert_eq!(rig.word(CB), 0);
+    for entry in &entries[..runs[1]] {
+        assert_eq!(rig.exec.apply(entry), Ok(()), "{entry}");
+    }
+    assert_eq!(
+        rig.exec.apply(&entries[runs[1]]),
+        Err(ExecError::ConstantBuffer(ConstantBufferError::PastEnd {
+            offset: size,
+            size,
+        }))
+    );
+    // The first entry's words landed.
+    for (k, &word) in (0u64..).zip(&words[..MAX_RUN_WORDS]) {
+        assert_eq!(rig.word(CB + 4 * k), word, "word {k}");
+    }
+    // None of the second entry's bytes were written, the two that fit included.
+    let second = CB + u64::from(first_words * WORD_BYTES);
+    for k in 0..3 {
+        assert_eq!(rig.word(second + 4 * k), 0, "second entry, word {k}");
+    }
 }
 
 #[test]

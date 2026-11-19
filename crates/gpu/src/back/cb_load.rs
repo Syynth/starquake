@@ -29,7 +29,13 @@
 //!    first the size bound, then the address: a word whose end (offset plus 4) passes the size
 //!    is [`ConstantBufferError::PastEnd`]; a word whose end passes the 64-bit address space is
 //!    [`ConstantBufferError::AddressOverflow`]. The first word that fails is reported, and a
-//!    refused load writes nothing and invalidates nothing.
+//!    refused load writes nothing and invalidates nothing. The unit of this all-or-nothing rule
+//!    is one `Write` or `Run` ring entry, not one guest upload: the front splits a long run into
+//!    entries of at most [`crate::ring::MAX_RUN_WORDS`] words (Eden-NX2's
+//!    `MaxMultiWords`), and guest data can span GPFIFO entries, so an upload whose second
+//!    entry passes the size keeps the first entry's words in guest memory
+//!    (`a_split_run_whose_second_entry_passes_the_size_keeps_the_first_and_writes_none_of_the_second`
+//!    in the executor's tests).
 //! 4. Writes the words in pieces: words whose offsets follow one another go to guest memory in
 //!    one [`GpuMemory::write`], as Eden-NX2 writes a run with one `WriteBlockCached`; a jump in
 //!    the offset (its wrap within the 16-bit field, below) starts a new piece. A run of `n`
@@ -48,14 +54,23 @@
 //!
 //! Each is pinned by the test named (in `tests`).
 //!
-//! - **The whole extent is bounded by the size, and a load past it writes nothing.** Eden-NX2
-//!   checks only where the run starts, `ASSERT(regs.const_buffer.offset <=
-//!   regs.const_buffer.size)`, and an `ASSERT` logs without stopping, so Eden-NX2 writes the run
-//!   wherever it reaches, past the size or from an offset at the size. Here the bounds check
-//!   against the size covers every word's end (issue #429), and one word past it refuses the
-//!   whole entry, the words before it included (the house rule that every check runs before the
-//!   first write). `the_size_edge_accepts_a_word_ending_at_it_and_refuses_one_past`,
-//!   `a_run_whose_last_word_passes_the_size_writes_none_of_its_words`.
+//! - **The whole extent is bounded by the size, and a load past it writes nothing (an open
+//!   owner question).** The approved gpu-protocol spec says: "The back writes each run of data
+//!   words to guest memory at the constant buffer's address plus the upload offset, as Eden's
+//!   `ProcessCBMultiData` does". Eden-NX2 checks only where the run starts,
+//!   `ASSERT(regs.const_buffer.offset <= regs.const_buffer.size)`, and an `ASSERT` logs without
+//!   stopping, so Eden-NX2 writes the run wherever it reaches, past the size or from an offset
+//!   at the size. Here the bounds check against the size covers every word's end (issue #429),
+//!   and one word past it refuses the whole entry, the words before it included (the house rule
+//!   that every check runs before the first write). This departs from the spec sentence and is
+//!   not settled: the owner chooses between (a) keeping this refusal, and amending the spec to
+//!   say the load is bounded by the size, or (b) following the spec sentence and Eden-NX2,
+//!   writing every word wherever it reaches and only logging a word past the size. The unit of
+//!   the refusal is one ring entry (step 3), so a guest upload split across entries can be half
+//!   written either way. `the_size_edge_accepts_a_word_ending_at_it_and_refuses_one_past`,
+//!   `a_run_whose_last_word_passes_the_size_writes_none_of_its_words`,
+//!   `a_run_with_two_words_past_the_size_reports_the_first`, and the executor's
+//!   `a_split_run_whose_second_entry_passes_the_size_keeps_the_first_and_writes_none_of_the_second`.
 //! - **A buffer address of zero is not refused here.** Eden-NX2 asserts `buffer_address != 0` (a
 //!   log) and writes anyway; here the write goes to the address space too, whose memory refuses
 //!   an unmapped page. `a_buffer_at_address_zero_is_written_like_any_other`.
@@ -67,8 +82,11 @@
 //! - **The selector's fields are the header's.** Eden-NX2's `ConstantBuffer::Address()` shifts
 //!   the whole `address_high` word and compares the whole `size` word; here the address takes
 //!   `ADDRESS_UPPER` (7:0) and the size `SIZE` (16:0), and the bits above are ignored (decision
-//!   10: the headers for layouts), as a bind reads them.
-//!   `a_run_lands_at_the_selected_address_plus_the_offset_in_one_write`.
+//!   10: the headers for layouts), as a bind reads them. The address half:
+//!   `a_run_lands_at_the_selected_address_plus_the_offset_in_one_write`; the size half, with
+//!   junk above `SIZE` in a refusing case:
+//!   `the_size_edge_accepts_a_word_ending_at_it_and_refuses_one_past`; both fields from the
+//!   header's register numbers: `the_selector_and_offset_are_the_headers_registers_and_fields`.
 //! - **The offset is the 16-bit field.** Eden-NX2 adds to the whole register, so a run that
 //!   passes offset 0xFFFC goes on to 0x10000; the front here advances the offset within its
 //!   field (`regs` module docs, "The constant-buffer offset wraps within its field"), so the
@@ -81,6 +99,14 @@
 //! (`check_refuses_a_word_ending_past_the_address_space`). **Unreachable from the executor:**
 //! [`ConstantBufferError::State`], which [`Mirror::run_positions`] returns only for a register
 //! outside the file, and the 3D file the executor hands over holds `LOAD_CONSTANT_BUFFER_OFFSET`.
+//!
+//! # Not read
+//!
+//! - `SET_RENDER_ENABLE_CONTROL` (byte 0x030c) `CONDITIONAL_LOAD_CONSTANT_BUFFER` (0:0,
+//!   `classes/clc797.h`), which makes constant-buffer loads conditional on render enable.
+//!   Eden-NX2 declares the register as `render_enable_control_load_const_buffer`
+//!   (`eden-nx2/src/video_core/engines/maxwell_3d.h`, at 0x030C) but no code reads it, so
+//!   Eden-NX2 loads unconditionally; loading unconditionally here matches the reference.
 
 #[cfg(test)]
 mod tests;
