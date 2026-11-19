@@ -125,11 +125,22 @@ starquake run <program>
     --snapshot-every 30s
     --artifacts <dir>
     --window                    show frames in a plain window while running
+    --capture render            write a render capture (proposed, below)
+    --capture-limit <size>      stop capturing past this size (proposed, below)
 
 starquake gpu-replay <capture> --until present=N --dump ring|render|writes
 starquake render-replay <capture> --png <dir>
+    [--backend recording|wgpu] [--until present=N] [--retranslate]
+    [--memory-limit <size>] [--artifacts <dir>]          (options proposed, below)
 cargo xtask shader-replay <folder>
 ```
+
+Proposed by the render capture v2 draft, awaiting the owner (`render-backend.md`, "Render capture
+v2", decision 17): `--capture render` writes `render.sqrc` into the artifacts folder, a capture
+of every call the render backend received from its construction, which `render-replay` replays on
+a fresh backend; `--capture-limit` (default 4 GiB, a guess) closes it early. The flag takes a list
+so the GPU capture (`SQGC`) can join it if gpu-protocol chooses; neither capture has a switch in
+this contract today.
 
 `--window` is for watching bring-up live; it changes nothing the guest sees, and a run without it
 needs no display (`render-backend.md`, decision 11). The three replay commands are offline and
@@ -159,6 +170,7 @@ The artifacts folder always contains:
 | `guest_log.txt` | The text the guest wrote with debug output calls |
 | `gpu.txt` | The GPU's own flight recorder: recent submissions, acquires parked and resumed, releases, macro and channel errors, presents (`gpu-protocol.md`, "Observability") |
 | `snapshots/` | When requested |
+| `render.sqrc` | With `--capture render` (proposed, above): the render capture |
 
 `summary.json` also carries the graphics counters, cheap enough to keep on: from the GPU, words
 parsed, writes dropped as same-value, macro calls and memo hits, acquires parked, catch-ups,
