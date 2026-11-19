@@ -32,7 +32,7 @@ pub(crate) struct Scan {
 }
 
 /// [`Instruction::SIZE`] as a signed number for target arithmetic.
-const INSTRUCTION_BYTES: i64 = Instruction::SIZE as i64;
+const INSTRUCTION_BYTES: i64 = super::INSTRUCTION_SIZE.cast_signed();
 
 /// The instruction index a branch at `index` with byte displacement `displacement` reaches, or
 /// why it reaches none (`Observe`: `target = index * 16 + 16 + relative`, refused when
