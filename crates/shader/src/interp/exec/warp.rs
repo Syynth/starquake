@@ -22,7 +22,9 @@
 //! - `GetInBoundsFromOp` gives the in-range flag the shuffle it names last computed
 //!   (`SetInBoundsFlag`); naming anything else is [`InterpError::Unsupported`].
 //!
-//! The lane id is checked against [`WARP_SIZE`] by every operation that reads it.
+//! The lane id is checked against [`WARP_SIZE`] by the ballot, the shuffles and the quad
+//! operations, which read it (`tests::warp::the_lane_id_must_be_inside_the_warp`); `LaneId`
+//! itself gives the lane id unchecked, as before.
 
 use super::super::{INACTIVE_LANE_VALUE, InterpError, Run, Val};
 use super::{Args, Handled};

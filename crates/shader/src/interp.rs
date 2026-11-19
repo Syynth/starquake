@@ -110,7 +110,7 @@
 //!   out of range or is this lane, and [`INACTIVE_LANE_VALUE`] when it is another lane (SPIR-V
 //!   leaves a read of an inactive invocation undefined; translators read every lane and
 //!   select the active ones, as PR #4588's `REDUX` does). A lane id of [`WARP_SIZE`] or more
-//!   is [`InterpError::LaneOutsideWarp`]. Results that need several active lanes are checked
+//!   is [`InterpError::LaneOutsideWarp`] for the ballot, the shuffles and the quad operations. Results that need several active lanes are checked
 //!   as golden IR by the translators' tests. Derivatives and the lane masks are not
 //!   supported.
 //!
