@@ -42,7 +42,17 @@
 //! coalesce").
 //!
 //! [`ShaderCache::wait`] blocks until a ticket's set is settled and gives the result, as a
-//! lookup would; [`ShaderCache::wait_timeout`] gives up after a time.
+//! lookup would; [`ShaderCache::wait_timeout`] gives up after a time. A ticket keeps the shader
+//! of every member a lookup of its set found ready, so a lookup whose own miss flushes the
+//! settled entries (module docs, "Limits"), its set's ready members included, still waits to
+//! [`CacheLookup::Ready`] with the shaders it found; pinned by
+//! `tests::races::a_lookup_that_flushes_its_own_ready_member_still_waits_to_ready`.
+//!
+//! The stamp's key bytes are written into one scratch buffer the cache keeps, so a lookup does
+//! not allocate them. A lookup does allocate its member list and its ready list, each one entry
+//! per request (at most the seven stages of a pipeline from G18): the ready list is the
+//! [`CacheLookup::Ready`] it returns, and a pending set's member list becomes its ticket's.
+//! These two allocations per lookup are accepted.
 //!
 //! # Invalidation
 //!
@@ -57,7 +67,8 @@
 //!
 //! A rejection is remembered where its cause lies (spec, "Negative cache"; rows 90 and 112):
 //!
-//! - a program that cannot be captured, in the address map, until a byte it read is written;
+//! - a program that cannot be captured, in the address map, until a range holding a byte it
+//!   read or tried to read is invalidated (below, "A refusal kept after a map");
 //! - a program [`Translator::program`] rejects, in the program entries, by content hash: bytes
 //!   written back unchanged are rejected again without asking the translator;
 //! - a shader the translation rejects, or that needs a device feature the target lacks
@@ -72,6 +83,26 @@
 //! hash), so the GPU crate can log and count a rejection once per program (owner's ruling 10 of
 //! 2026-11-19). The reason includes the first unsupported instruction and its index where the
 //! translator's rejection has them ([`Rejection::Decode`]).
+//!
+//! ## A refusal kept after a map
+//!
+//! Only [`ShaderCache::invalidate`] drops an address-map entry, and G18 calls it for the CPU
+//! writes it drains, for GPU writes, and for the virtual-memory updates it applies (unmap,
+//! modify-kind, destroy memory, destroy sparse region): never for a map. A capture refused
+//! because a byte it tried could not be read ([`crate::capture::CaptureError`]'s
+//! `HeaderUnreadable` and `InstructionUnreadable`) is therefore kept when that memory is mapped
+//! later with no write after it, and a program used before its memory was mapped stays rejected
+//! for the rest of the run. G18's `GuestPrograms` reports every read fault as unmapped (an
+//! unmapped page, an out-of-range read, a guest fault, a shim write), so each of those causes is
+//! kept the same way. Pinned by
+//! `tests::rejections::a_refused_capture_stays_refused_when_its_memory_is_mapped_without_a_write`.
+//!
+//! This departs from the spec, whose address map is "Valid until any byte of the program's
+//! captured range is written or unmapped" and whose negative cache keeps a rejection "until its
+//! memory is written": neither says a refusal outlives a map of the bytes it could not read.
+//! An **owner question**, with two ways out: the GPU crate invalidates the mapped range on a
+//! map as it does on an unmap, or the cache does not keep refusals caused by unreadable bytes
+//! (`HeaderUnreadable`, `InstructionUnreadable`) and captures them again on every lookup.
 //!
 //! # Translations and the executor
 //!
@@ -91,14 +122,19 @@
 //! |---|---|---|
 //! | Address map | [`MAX_ADDRESSES`] entries | every entry is dropped |
 //! | Programs | [`MAX_PROGRAMS`] entries and [`MAX_PROGRAM_BYTES`] of captured bytes | every entry is dropped |
-//! | Shaders | [`MAX_SHADERS`] entries and [`MAX_SHADER_BYTES`], each charged its program's captured bytes | every ready and rejected entry is dropped; if the pending ones still fill it, the request is refused ([`CacheRefusal::Full`]), not remembered |
+//! | Shaders | [`MAX_SHADERS`] entries and [`MAX_SHADER_BYTES`], each charged its program's captured bytes | every ready and rejected entry is dropped; if the pending ones still fill it, the request is refused, not remembered: [`CacheRefusal::Full`] when the count binds (whether or not the bytes do too), else [`CacheRefusal::OverBudget`] |
 //! | Tickets | [`MAX_TICKETS`] | tickets whose sets have nothing pending are dropped, then the oldest |
 //!
 //! Captured bytes stand for the memory a program entry and a shader hold, which grows with the
 //! program (spec: "every stage is linear or close to it in the program size"). A flush costs
-//! captures and translations, never a wrong shader. A ticket whose set lost a ready shader to a
-//! flush before it was waited for, or that was dropped, answers [`CacheLookup::Pending`], which
-//! the GPU crate takes as a translation that never finished.
+//! captures and translations, never a wrong shader. A ticket whose set lost to a flush a shader
+//! that no lookup of the set found ready (it finished after the last lookup), or that was
+//! dropped, answers [`CacheLookup::Pending`], which the GPU crate takes as a translation that
+//! never finished.
+//!
+//! The shaders a ticket keeps are outside the shader entries' caps once a flush drops their
+//! entries: at most [`MAX_TICKETS`] tickets, each keeping at most one shader per request of its
+//! set, outlive a flush until their tickets are spent or dropped.
 //!
 //! # G18's seam
 //!
@@ -127,6 +163,8 @@
 //!   question loop needs the program's questions there and `wait` has no engine state to answer
 //!   them with. [`Translator::program`] does the stage-independent part only (decoding and
 //!   structuring); the rest runs on the executor.
+//! - **A refused capture outlives a map of the bytes it could not read**: an owner question
+//!   (above, "A refusal kept after a map").
 //! - **Jump tables do not extend the capture yet** (row 92): [`Translator::program`] gets the
 //!   capture as slice 3 makes it. Driving [`crate::capture::Capture::resolve_jump_tables`] with
 //!   the answers needs slice 10's table finding through the seam.
@@ -261,13 +299,28 @@ pub enum CacheRefusal {
         /// The features needed and not supported.
         missing: Requirements,
     },
-    /// Every shader entry the cache may hold is a translation in progress.
+    /// Every shader entry the cache may hold is a translation in progress. Reported when the
+    /// count binds, whether or not the byte budget binds too.
     #[error(
         "the shader cache is full: all {limit} of its shader entries are translations in progress"
     )]
     Full {
         /// The cap on shader entries.
         limit: usize,
+    },
+    /// The translations in progress are charged so many bytes that the shader's charge does
+    /// not fit the byte budget, while the count has room.
+    #[error(
+        "the shader cache is full: its translations in progress are charged {charged} of its \
+         {limit} bytes, and this shader needs {needed} more"
+    )]
+    OverBudget {
+        /// The bytes the translations in progress are charged together.
+        charged: u64,
+        /// The shader's own charge: its program's captured bytes.
+        needed: u64,
+        /// The byte budget of the shader entries.
+        limit: u64,
     },
 }
 
@@ -470,6 +523,14 @@ struct Member {
 /// One request resolved: its member and, when ready, its shader; or the rejection.
 type Resolved<S> = Result<(Member, Option<Arc<S>>), Arc<ProgramRejection>>;
 
+/// A pending set's ticket entry: its members, and for each member the shader a lookup of the
+/// set found ready, if any, so a flush of its entry before the wait does not lose it.
+struct TicketSet<S> {
+    members: Vec<Member>,
+    /// One per member, in order.
+    held: Vec<Option<Arc<S>>>,
+}
+
 /// Where a set stands.
 enum SetState<S> {
     /// Some shader is still being translated.
@@ -490,10 +551,12 @@ pub struct ShaderCache<T: Translator> {
     shaders: HashMap<ShaderStamp, ShaderEntry<T::Shader>>,
     shader_bytes: u64,
     inbox: Arc<Inbox<T::Shader>>,
-    tickets: BTreeMap<Ticket, Vec<Member>>,
+    tickets: BTreeMap<Ticket, TicketSet<T::Shader>>,
     set_tickets: HashMap<Vec<Member>, Ticket>,
     next_ticket: u64,
     counters: CacheCounters,
+    /// The bytes of the last stamp's key, kept so a lookup does not allocate them anew.
+    key_scratch: Vec<u8>,
 }
 
 impl<T: Translator> core::fmt::Debug for ShaderCache<T> {
@@ -536,6 +599,7 @@ impl<T: Translator> ShaderCache<T> {
             set_tickets: HashMap::new(),
             next_ticket: 1,
             counters: CacheCounters::default(),
+            key_scratch: Vec::new(),
         }
     }
 
@@ -581,7 +645,18 @@ impl<T: Translator> ShaderCache<T> {
             }
             return CacheLookup::Ready(ready);
         }
-        CacheLookup::Pending(self.ticket_for(members))
+        // `ready` holds the ready members' shaders in member order; the members with equal
+        // stamps share one entry, so they are all ready or all not.
+        let mut ready = ready.into_iter().peekable();
+        let held = members
+            .iter()
+            .map(|member| {
+                ready
+                    .next_if(|shader| shader.stamp == member.stamp)
+                    .map(|shader| shader.shader)
+            })
+            .collect();
+        CacheLookup::Pending(self.ticket_for(members, held))
     }
 
     /// Blocks until `ticket`'s set is settled and gives the result as a lookup would; an
@@ -610,15 +685,14 @@ impl<T: Translator> ShaderCache<T> {
     }
 
     fn wait_until(&mut self, ticket: Ticket, deadline: Option<Instant>) -> CacheLookup<T::Shader> {
-        let Some(members) = self.tickets.get(&ticket).cloned() else {
-            return CacheLookup::Pending(ticket);
-        };
         loop {
             self.collect();
-            match self.set_state(ticket, &members) {
+            let Some(set) = self.tickets.get(&ticket) else {
+                return CacheLookup::Pending(ticket);
+            };
+            match self.set_state(ticket, set) {
                 SetState::Done(result) => {
-                    self.tickets.remove(&ticket);
-                    self.set_tickets.remove(members.as_slice());
+                    self.drop_ticket(ticket);
                     return result;
                 }
                 SetState::Pending => {
@@ -630,14 +704,14 @@ impl<T: Translator> ShaderCache<T> {
         }
     }
 
-    /// Where the set of `members`, ticket `ticket`, stands: the first rejected member in
-    /// order, else pending while any member is, else ready; [`CacheLookup::Pending`] when a
-    /// member's entry is gone.
-    fn set_state(&self, ticket: Ticket, members: &[Member]) -> SetState<T::Shader> {
-        let mut ready = Vec::with_capacity(members.len());
+    /// Where `set`, ticket `ticket`, stands: the first rejected member in order, else pending
+    /// while any member is, else ready; [`CacheLookup::Pending`] when a member's entry is gone
+    /// and no lookup of the set found its shader ready.
+    fn set_state(&self, ticket: Ticket, set: &TicketSet<T::Shader>) -> SetState<T::Shader> {
+        let mut ready = Vec::with_capacity(set.members.len());
         let mut pending = false;
         let mut gone = false;
-        for member in members {
+        for (member, held) in set.members.iter().zip(&set.held) {
             match self.shaders.get(&member.stamp).map(|entry| &entry.state) {
                 Some(ShaderState::Rejected(reason)) => {
                     return SetState::Done(CacheLookup::Rejected(Arc::new(ProgramRejection {
@@ -651,7 +725,13 @@ impl<T: Translator> ShaderCache<T> {
                     stamp: member.stamp,
                     shader: Arc::clone(shader),
                 }),
-                None => gone = true,
+                None => match held {
+                    Some(shader) => ready.push(ReadyShader {
+                        stamp: member.stamp,
+                        shader: Arc::clone(shader),
+                    }),
+                    None => gone = true,
+                },
             }
         }
         if pending {
@@ -727,7 +807,7 @@ impl<T: Translator> ShaderCache<T> {
             answers: &answers,
             variant,
         }
-        .stamp();
+        .stamp_with(&mut self.key_scratch);
         let member = Member {
             request,
             hash: found.hash,
@@ -940,18 +1020,33 @@ impl<T: Translator> ShaderCache<T> {
             .values()
             .fold(0, |total: u64, entry| total.saturating_add(entry.charge));
         self.counters.shader_flushes = self.counters.shader_flushes.saturating_add(1);
-        if fits(self) {
-            Ok(())
-        } else {
-            Err(Arc::new(Rejection::Cache(CacheRefusal::Full {
+        let refusal = if self.shaders.len() >= self.limits.shaders {
+            CacheRefusal::Full {
                 limit: self.limits.shaders,
-            })))
-        }
+            }
+        } else if fits(self) {
+            return Ok(());
+        } else {
+            CacheRefusal::OverBudget {
+                charged: self.shader_bytes,
+                needed: charge,
+                limit: self.limits.shader_bytes,
+            }
+        };
+        Err(Arc::new(Rejection::Cache(refusal)))
     }
 
-    /// The ticket of the pending set `members`: the one it already has, or a new one.
-    fn ticket_for(&mut self, members: Vec<Member>) -> Ticket {
+    /// The ticket of the pending set `members`, whose ready shaders this lookup found are
+    /// `held`: the one it already has, keeping every shader a lookup of it found, or a new one.
+    fn ticket_for(&mut self, members: Vec<Member>, held: Vec<Option<Arc<T::Shader>>>) -> Ticket {
         if let Some(&ticket) = self.set_tickets.get(members.as_slice()) {
+            if let Some(set) = self.tickets.get_mut(&ticket) {
+                for (kept, found) in set.held.iter_mut().zip(held) {
+                    if found.is_some() {
+                        *kept = found;
+                    }
+                }
+            }
             return ticket;
         }
         if self.tickets.len() >= self.limits.tickets {
@@ -959,7 +1054,13 @@ impl<T: Translator> ShaderCache<T> {
         }
         let ticket = Ticket::new(self.next_ticket);
         self.next_ticket = self.next_ticket.saturating_add(1);
-        self.tickets.insert(ticket, members.clone());
+        self.tickets.insert(
+            ticket,
+            TicketSet {
+                members: members.clone(),
+                held,
+            },
+        );
         self.set_tickets.insert(members, ticket);
         ticket
     }
@@ -971,8 +1072,8 @@ impl<T: Translator> ShaderCache<T> {
         let settled: Vec<Ticket> = self
             .tickets
             .iter()
-            .filter(|(_, members)| {
-                !members.iter().any(|member| {
+            .filter(|(_, set)| {
+                !set.members.iter().any(|member| {
                     matches!(
                         shaders.get(&member.stamp).map(|entry| &entry.state),
                         Some(ShaderState::Pending)
@@ -994,8 +1095,8 @@ impl<T: Translator> ShaderCache<T> {
     }
 
     fn drop_ticket(&mut self, ticket: Ticket) {
-        if let Some(members) = self.tickets.remove(&ticket) {
-            self.set_tickets.remove(&members);
+        if let Some(set) = self.tickets.remove(&ticket) {
+            self.set_tickets.remove(&set.members);
         }
     }
 }

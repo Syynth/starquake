@@ -367,6 +367,30 @@ fn every_refusal_reads_in_plain_words() {
         "the shader cache is full: all 3 of its shader entries are translations in progress"
     );
     assert_eq!(
+        CacheRefusal::OverBudget {
+            charged: 0,
+            needed: 5,
+            limit: 4
+        }
+        .to_string(),
+        "the shader cache is full: its translations in progress are charged 0 of its 4 bytes, \
+         and this shader needs 5 more"
+    );
+    assert_eq!(
+        CacheRefusal::Unsupported {
+            missing: Requirements {
+                subgroup: true,
+                f16: true,
+                f64: true,
+                i64: true,
+                i64_atomics: true,
+            }
+        }
+        .to_string(),
+        "the shader needs subgroup operations, 16-bit floats, 64-bit floats, 64-bit integers, \
+         64-bit integer atomics, which the host lacks"
+    );
+    assert_eq!(
         Rejection::Cache(CacheRefusal::Abandoned).to_string(),
         "the translation stopped before it finished"
     );
@@ -374,4 +398,64 @@ fn every_refusal_reads_in_plain_words() {
         Rejection::Capture(CaptureError::NoEnd).to_string(),
         "no instruction within the first 65536 ends the program"
     );
+}
+
+/// Divergence (module docs, "The negative cache"): a capture refused because memory past the
+/// mapped run was unreadable stays refused when that memory is mapped later with no write the
+/// cache is told of; only an invalidation of the bytes it tried clears it.
+#[test]
+fn a_refused_capture_stays_refused_when_its_memory_is_mapped_without_a_write() {
+    let mut rig = Rig::new();
+    let fillers: Vec<u8> = (0..2).flat_map(|tag| filler(tag).to_le_bytes()).collect();
+    let mapped_end = rig.memory.end();
+    let at = mapped_end - fillers.len() as u64;
+    rig.memory.write(at, &fillers);
+    let request = ProgramRequest {
+        stage: GuestStage::Compute,
+        address: at,
+    };
+    let first = rejected(rig.lookup(&[request]));
+    assert_eq!(
+        *first.reason,
+        Rejection::Capture(CaptureError::InstructionUnreadable {
+            index: 2,
+            offset: fillers.len() as u64,
+        })
+    );
+    // The guest maps the next bytes, already holding an `EXIT`; no write reaches the cache.
+    rig.memory.bytes.extend_from_slice(&exit().to_le_bytes());
+    let again = rejected(rig.lookup(&[request]));
+    assert_eq!(again.reason, first.reason);
+    assert_eq!(rig.counters().captures, 1);
+    // An invalidation of the first byte the capture tried clears it.
+    rig.cache.invalidate(mapped_end..mapped_end + 1);
+    pending(rig.lookup(&[request]));
+    assert_eq!(rig.counters().captures, 2);
+}
+
+#[test]
+fn each_missing_feature_is_found_alone_and_a_supported_one_is_not() {
+    type Field = fn(&mut Requirements);
+    let fields: [(&str, Field); 5] = [
+        ("subgroup operations", |r| r.subgroup = true),
+        ("16-bit floats", |r| r.f16 = true),
+        ("64-bit floats", |r| r.f64 = true),
+        ("64-bit integers", |r| r.i64 = true),
+        ("64-bit integer atomics", |r| r.i64_atomics = true),
+    ];
+    for (name, set) in fields {
+        let mut one = Requirements::default();
+        set(&mut one);
+        assert_eq!(super::super::feature_names(one), name);
+        assert_eq!(
+            super::super::missing_features(one, Requirements::default()),
+            Some(one),
+            "{name} lacked"
+        );
+        assert_eq!(
+            super::super::missing_features(one, one),
+            None,
+            "{name} supported"
+        );
+    }
 }

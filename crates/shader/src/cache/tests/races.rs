@@ -131,3 +131,101 @@ fn a_late_result_for_a_settled_entry_changes_nothing() {
     assert_eq!(again[0].1.hash, hash);
     assert_eq!(rig.counters().rejections, 0);
 }
+
+#[test]
+fn a_lookup_that_flushes_its_own_ready_member_still_waits_to_ready() {
+    let mut rig = Rig::with_limits(Limits {
+        shaders: 2,
+        ..Limits::SHIPPING
+    });
+    rig.place(A, GuestStage::Vertex, &program(GuestStage::Vertex, &[1]));
+    rig.place(B, GuestStage::Pixel, &program(GuestStage::Pixel, &[2]));
+    rig.place(C, GuestStage::Vertex, &program(GuestStage::Vertex, &[3]));
+    pending(rig.lookup(&[vertex(A)]));
+    pending(rig.lookup(&[vertex(C)]));
+    rig.executor.run_all();
+    let first = ready(rig.lookup(&[vertex(A)])).remove(0);
+    ready(rig.lookup(&[vertex(C)]));
+    assert_eq!(rig.counters().shader_flushes, 0);
+    // A is ready when the lookup finds it; B's miss then finds the layer full and drops the
+    // settled entries, A's included.
+    let ticket = pending(rig.lookup(&[vertex(A), pixel(B)]));
+    assert_eq!(rig.counters().shader_flushes, 1);
+    assert!(!rig.cache.shaders.contains_key(&first.0));
+    assert!(rig.executor.run_next());
+    let shaders = ready(rig.cache.wait_timeout(ticket, WATCHDOG));
+    assert_eq!(shaders.len(), 2);
+    assert_eq!(shaders[0].0, first.0);
+    assert!(Arc::ptr_eq(&shaders[0].1, &first.1));
+    assert_eq!(shaders[1].1.stage, GuestStage::Pixel);
+    // A was not translated again.
+    assert_eq!(rig.counters().translations, 3);
+    assert!(!rig.cache.tickets.contains_key(&ticket));
+}
+
+#[test]
+fn a_coalesced_lookup_keeps_the_ready_members_it_found() {
+    const D: u64 = BASE + 0x7000;
+    let mut rig = Rig::with_limits(Limits {
+        shaders: 3,
+        ..Limits::SHIPPING
+    });
+    rig.place(A, GuestStage::Vertex, &program(GuestStage::Vertex, &[1]));
+    rig.place(B, GuestStage::Pixel, &program(GuestStage::Pixel, &[2]));
+    rig.place(C, GuestStage::Vertex, &program(GuestStage::Vertex, &[3]));
+    rig.place(D, GuestStage::Vertex, &program(GuestStage::Vertex, &[4]));
+    let ticket = pending(rig.lookup(&[vertex(A), pixel(B)]));
+    // A's job runs, B's does not; the next lookup of the set finds A ready, on the same ticket.
+    assert!(rig.executor.run_next());
+    assert_eq!(pending(rig.lookup(&[vertex(A), pixel(B)])), ticket);
+    // Two more programs fill the layer; the second drops A's settled entry.
+    pending(rig.lookup(&[vertex(C)]));
+    pending(rig.lookup(&[vertex(D)]));
+    assert_eq!(rig.counters().shader_flushes, 1);
+    // B's job is the oldest still queued.
+    assert!(rig.executor.run_next());
+    let shaders = ready(rig.cache.wait_timeout(ticket, WATCHDOG));
+    assert_eq!(shaders.len(), 2);
+    assert_eq!(shaders[0].1.stage, GuestStage::Vertex);
+    assert_eq!(shaders[1].1.stage, GuestStage::Pixel);
+}
+
+#[test]
+fn a_coalesced_lookup_that_finds_a_member_pending_keeps_the_shader_found_before() {
+    const D: u64 = BASE + 0x7000;
+    const E: u64 = BASE + 0x9000;
+    const F: u64 = BASE + 0xb000;
+    let mut rig = Rig::with_limits(Limits {
+        shaders: 3,
+        ..Limits::SHIPPING
+    });
+    for (tag, address) in (1..).zip([A, C, D, E, F]) {
+        rig.place(
+            address,
+            GuestStage::Vertex,
+            &program(GuestStage::Vertex, &[tag]),
+        );
+    }
+    rig.place(B, GuestStage::Pixel, &program(GuestStage::Pixel, &[9]));
+    pending(rig.lookup(&[vertex(A)]));
+    assert!(rig.executor.run_next());
+    let first = ready(rig.lookup(&[vertex(A)])).remove(0);
+    // The set's ticket holds A's shader.
+    let ticket = pending(rig.lookup(&[vertex(A), pixel(B)]));
+    // C and D fill the layer and drop A's entry; their jobs run, B's does not.
+    pending(rig.lookup(&[vertex(C)]));
+    pending(rig.lookup(&[vertex(D)]));
+    assert!(rig.executor.run_last());
+    assert!(rig.executor.run_last());
+    // The set again: A is translated anew and pending, on the same ticket.
+    assert_eq!(pending(rig.lookup(&[vertex(A), pixel(B)])), ticket);
+    assert!(rig.executor.run_last());
+    // E and F drop A's new entry while B is still pending; then B's job runs.
+    pending(rig.lookup(&[vertex(E)]));
+    pending(rig.lookup(&[vertex(F)]));
+    assert!(!rig.cache.shaders.contains_key(&first.0));
+    assert!(rig.executor.run_next());
+    let shaders = ready(rig.cache.wait_timeout(ticket, WATCHDOG));
+    assert!(Arc::ptr_eq(&shaders[0].1, &first.1));
+    assert_eq!(shaders[1].1.stage, GuestStage::Pixel);
+}

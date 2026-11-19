@@ -324,6 +324,65 @@ fn an_invalidated_page_drops_only_the_programs_on_it() {
     assert_eq!(rig.seam.cache().tracked_ranges().len(), 2);
 }
 
+/// How many bytes the cache reads for the program [`Memory::place`] writes.
+fn program_extent() -> u64 {
+    let mut rig = Rig::new(MAX_READY_SETS);
+    rig.lookup(&[vertex(A)]);
+    let ranges = rig.seam.cache().tracked_ranges();
+    assert_eq!(ranges.len(), 1);
+    ranges[0].end - ranges[0].start
+}
+
+/// A rig whose memory holds one vertex program at `address`, looked up once.
+fn rig_with_program_at(address: u64) -> Rig {
+    let mut rig = Rig::new(MAX_READY_SETS);
+    rig.memory = Memory::new();
+    rig.memory.place(address, 1);
+    rig.lookup(&[vertex(address)]);
+    assert_eq!(rig.seam.cache().counters().captures, 1);
+    rig
+}
+
+#[test]
+fn a_program_starting_on_a_pages_last_byte_is_dropped_with_that_page() {
+    let address = B - 1;
+    let mut rig = rig_with_program_at(address);
+    // The page after the one it starts on, which it also reads: dropped too.
+    rig.seam
+        .invalidate(PageRange::new(B, PAGE_SIZE).expect("a page"));
+    rig.lookup(&[vertex(address)]);
+    assert_eq!(rig.seam.cache().counters().captures, 2);
+    // The page it starts on, by its last byte only.
+    rig.seam
+        .invalidate(PageRange::new(A, PAGE_SIZE).expect("a page"));
+    rig.lookup(&[vertex(address)]);
+    assert_eq!(rig.seam.cache().counters().captures, 3);
+}
+
+#[test]
+fn a_program_ending_one_byte_into_a_page_is_dropped_with_that_page() {
+    let extent = program_extent();
+    let address = B + 1 - extent;
+    let mut rig = rig_with_program_at(address);
+    let tracked = rig.seam.cache().tracked_ranges();
+    assert_eq!(tracked.len(), 1);
+    assert_eq!(
+        (tracked[0].start, tracked[0].end),
+        (address, B + 1),
+        "the program's last byte is the page's first"
+    );
+    // The page after B's touches nothing.
+    rig.seam
+        .invalidate(PageRange::new(B + PAGE_SIZE, PAGE_SIZE).expect("a page"));
+    rig.lookup(&[vertex(address)]);
+    assert_eq!(rig.seam.cache().counters().captures, 1);
+    // B's page, by its first byte only.
+    rig.seam
+        .invalidate(PageRange::new(B, PAGE_SIZE).expect("a page"));
+    rig.lookup(&[vertex(address)]);
+    assert_eq!(rig.seam.cache().counters().captures, 2);
+}
+
 #[test]
 fn the_kept_sets_empty_at_their_cap() {
     for (limit, kept) in [(2, 2), (1, 1)] {

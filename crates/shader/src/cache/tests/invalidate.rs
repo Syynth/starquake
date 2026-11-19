@@ -315,3 +315,29 @@ fn a_program_at_the_top_of_the_address_space_is_rejected_not_wrapped() {
     assert_eq!(rig.cache.tracked_ranges().first(), Some(&(at..at + 1)));
     assert_eq!(rig.cache.tracked_ranges().len(), 1);
 }
+
+#[test]
+fn every_stage_at_one_address_has_its_own_entry() {
+    let mut rig = Rig::new();
+    rig.place(A, GuestStage::Vertex, &small());
+    let stages = [
+        GuestStage::VertexCullBeforeFetch,
+        GuestStage::Vertex,
+        GuestStage::TessellationInit,
+        GuestStage::Tessellation,
+        GuestStage::Geometry,
+        GuestStage::Pixel,
+        GuestStage::Compute,
+    ];
+    for stage in stages {
+        // Looked up one at a time: a rejection of one stage's capture ends only its lookup.
+        rig.lookup(&[ProgramRequest { stage, address: A }]);
+    }
+    assert_eq!(rig.counters().captures, 7);
+    assert_eq!(rig.cache.addresses.len(), 7);
+    // Found again, each stage its own entry: no capture.
+    for stage in stages {
+        rig.lookup(&[ProgramRequest { stage, address: A }]);
+    }
+    assert_eq!(rig.counters().captures, 7);
+}

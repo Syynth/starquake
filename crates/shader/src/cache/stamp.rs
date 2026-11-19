@@ -65,11 +65,24 @@ pub(super) struct ShaderKey<'a> {
 }
 
 impl ShaderKey<'_> {
-    /// The key's stamp.
-    pub(super) fn stamp(&self) -> ShaderStamp {
-        let mut writer = KeyWriter::default();
+    /// The key's stamp, writing the key's bytes into `scratch`, which is cleared first and
+    /// kept by the caller so the next stamp reuses its allocation (the lookup is on every
+    /// draw's path).
+    pub(super) fn stamp_with(&self, scratch: &mut Vec<u8>) -> ShaderStamp {
+        scratch.clear();
+        let mut writer = KeyWriter {
+            bytes: std::mem::take(scratch),
+        };
         self.hash(&mut writer);
-        ShaderStamp(XxHash3_128::oneshot(&writer.bytes))
+        let stamp = ShaderStamp(XxHash3_128::oneshot(&writer.bytes));
+        *scratch = writer.bytes;
+        stamp
+    }
+
+    /// The key's stamp, with a scratch of its own.
+    #[cfg(test)]
+    pub(super) fn stamp(&self) -> ShaderStamp {
+        self.stamp_with(&mut Vec::new())
     }
 }
 

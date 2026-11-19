@@ -29,8 +29,10 @@ pub const MAX_EXTENT: u64 =
 pub(super) enum Captured {
     /// The program was captured; its content hash names its program entry (layer 2).
     Program(ContentHash),
-    /// The program could not be captured: the negative entry, kept until the bytes it read are
-    /// written.
+    /// The program could not be captured: the negative entry, kept until a range holding a
+    /// byte it read or tried to read is invalidated. A later map of memory it could not read,
+    /// with no write after it, does not clear it (a divergence and owner question: the parent's
+    /// module docs, "A refusal kept after a map").
     Refused(Arc<Rejection>),
 }
 

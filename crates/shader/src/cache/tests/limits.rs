@@ -171,13 +171,71 @@ fn the_shader_entries_hold_exactly_their_byte_budget() {
         let requests = place_many(&mut rig, 2);
         pending(rig.lookup(&requests[..1]));
         let second = rig.lookup(&requests[1..2]);
-        assert_eq!(
-            matches!(second, CacheLookup::Rejected(_)),
-            refused,
-            "budget {budget}"
-        );
+        if refused {
+            assert_eq!(
+                *rejected(second).reason,
+                Rejection::Cache(CacheRefusal::OverBudget {
+                    charged: len,
+                    needed: len,
+                    limit: budget,
+                }),
+                "budget {budget}"
+            );
+        } else {
+            pending(second);
+        }
         assert_eq!(rig.cache.shader_bytes, if refused { len } else { 2 * len });
     }
+}
+
+#[test]
+fn a_refusal_at_the_byte_budget_names_the_budget_not_the_count() {
+    let long = program(GuestStage::Vertex, &[1, 2, 3, 4]);
+    let short = one(9);
+    let (charged, needed) = (long.len() as u64, short.len() as u64);
+    assert_ne!(charged, needed);
+    // One byte short of both: the count (a thousand) has room, the budget does not.
+    let limit = charged + needed - 1;
+    let mut rig = Rig::with_limits(Limits {
+        shader_bytes: limit,
+        ..LOOSE
+    });
+    rig.place(A, GuestStage::Vertex, &long);
+    rig.place(B, GuestStage::Vertex, &short);
+    pending(rig.lookup(&[vertex(A)]));
+    let rejection = rejected(rig.lookup(&[vertex(B)]));
+    assert_eq!(
+        *rejection.reason,
+        Rejection::Cache(CacheRefusal::OverBudget {
+            charged,
+            needed,
+            limit,
+        })
+    );
+    assert_eq!(
+        rejection.reason.to_string(),
+        format!(
+            "the shader cache is full: its translations in progress are charged {charged} of its \
+             {limit} bytes, and this shader needs {needed} more"
+        )
+    );
+    assert_eq!(rig.cache.shaders.len(), 1);
+}
+
+#[test]
+fn a_refusal_at_both_caps_names_the_count() {
+    let len = one(0).len() as u64;
+    let mut rig = Rig::with_limits(Limits {
+        shaders: 1,
+        shader_bytes: len,
+        ..LOOSE
+    });
+    let requests = place_many(&mut rig, 2);
+    pending(rig.lookup(&requests[..1]));
+    assert_eq!(
+        *rejected(rig.lookup(&requests[1..2])).reason,
+        Rejection::Cache(CacheRefusal::Full { limit: 1 })
+    );
 }
 
 #[test]

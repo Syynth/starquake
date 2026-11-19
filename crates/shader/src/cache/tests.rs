@@ -982,3 +982,23 @@ fn decode_rejection(index: usize) -> Rejection {
 fn no_exit() -> Rejection {
     Rejection::Translate(TranslateError::NoExit)
 }
+
+#[test]
+fn a_stamp_does_not_depend_on_what_the_scratch_held_before() {
+    let hash = hash_of(GuestStage::Vertex, &program(GuestStage::Vertex, &[1]));
+    let answers = Answers::new();
+    let variant = VariantKey::default();
+    let key = super::ShaderKey {
+        version: TRANSLATOR_VERSION,
+        target: &TARGET,
+        stage: GuestStage::Vertex,
+        hash,
+        answers: &answers,
+        variant: &variant,
+    };
+    let fresh = key.stamp_with(&mut Vec::new());
+    let mut scratch = vec![0xa5; 64];
+    assert_eq!(key.stamp_with(&mut scratch), fresh);
+    // Reused: the same stamp again.
+    assert_eq!(key.stamp_with(&mut scratch), fresh);
+}
