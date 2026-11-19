@@ -18,15 +18,29 @@
 //!   each such buffer is mapped (`Buffer::map_async`), and wgpu calls the mapping back once the
 //!   submission has finished.
 //!
-//! A copy between a buffer and a texture is one wgpu copy when its rows are a multiple of 256
-//! bytes (`COPY_BYTES_PER_ROW_ALIGNMENT`) or it is one row, and otherwise one copy per row, since
-//! the backend keeps buffer data tightly packed and wgpu needs 256-byte row strides for copies of
-//! several rows. The cost is bounded by the rows of the texture the copy names.
+//! A copy between a guest buffer and a texture is one wgpu copy when its rows are a multiple of
+//! 256 bytes (`COPY_BYTES_PER_ROW_ALIGNMENT`) or it is one row, and otherwise one copy per row,
+//! since guest buffer data is tightly packed and wgpu needs 256-byte row strides for copies of
+//! several rows. The per-row copies are made one at a time as they are encoded ([`row_copies`]
+//! is an iterator), so their number, bounded by the rows of the box the copy names, costs
+//! encoding time but no memory. A depth or stencil copy takes the per-row path only with one
+//! row in each layer, where each copy still covers the level's width and height
+//! ([`crate::rules::check_depth_buffer_rows`]).
+//!
+//! A readback of a texture, and a dumped frame, is always one wgpu copy: it reads into a buffer
+//! of its own whose rows are padded to 256 bytes ([`crate::rules::padded_read`]; the check pass
+//! refuses a readback whose padded read would not fit the largest buffer), and the padding is
+//! stripped when the bytes are copied out ([`unpad`]).
 //!
 //! A clear of a whole level clears each layer (or slice) in a render pass of its own; a clear of
-//! a rectangle clears a scratch texture of the rectangle's size once and copies it into each
-//! layer, since wgpu clears only whole attachments (the shared checks keep that path to colour,
-//! single-sampled views, [`crate::rules::check_clear_area`]).
+//! a rectangle clears a scratch texture once and copies the rectangle from it into each layer,
+//! since wgpu clears only whole attachments (the shared checks keep that path to colour,
+//! single-sampled views, [`crate::rules::check_clear_area`]). One list's rectangle clears share
+//! one scratch texture per view format, made on the first such clear, as wide as the widest and
+//! as tall as the tallest rectangle the list clears in that format ([`scratch_sizes`]), so a list
+//! holds at most one scratch per format however many rectangles it clears. The scratch textures
+//! are host memory the budget does not count, each within the widest and the tallest level the
+//! list clears in its format; wgpu releases them when the list's last submission finishes.
 //!
 //! # Settling
 //!
@@ -50,7 +64,8 @@ use starquake_render::{
     BufferId, FenceValue, Frame, FrameDump, FrameSink, PixelFormat, PresentFeedback,
     PresentOutcome, Readback, ReadbackId, ResourceId, SamplerId, TextureId, ViewId,
 };
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -170,18 +185,43 @@ enum ReadTarget {
     Dump,
 }
 
+/// Where a read's bytes are in its buffer.
+#[derive(Clone, Copy, Debug)]
+enum ReadLayout {
+    /// `len` bytes from byte `skip`.
+    Packed {
+        /// Where the bytes start.
+        skip: u64,
+        /// How many bytes.
+        len: u64,
+    },
+    /// `rows`, each `stride` bytes apart ([`unpad`]).
+    Padded {
+        /// The packed rows.
+        rows: Rows,
+        /// Bytes from one row's start to the next.
+        stride: u32,
+    },
+}
+
 /// A buffer being read back.
 #[derive(Debug)]
 struct Read {
     target: ReadTarget,
     /// The buffer, or `None` when the source could not be found (a host error, already counted).
     buffer: Option<wgpu::Buffer>,
-    /// Where the bytes start in the buffer.
-    skip: u64,
-    /// How many bytes.
-    len: u64,
+    /// Where the bytes are in the buffer.
+    layout: ReadLayout,
     /// Set by the mapping callback: whether the map succeeded.
     mapped: Arc<Mutex<Option<bool>>>,
+}
+
+/// The scratch textures one list's rectangle clears share (module docs).
+struct Scratch {
+    /// The size each format's scratch is made at.
+    sizes: HashMap<wgpu::TextureFormat, (u32, u32)>,
+    /// The scratch textures made so far.
+    made: HashMap<wgpu::TextureFormat, (wgpu::Texture, wgpu::TextureView)>,
 }
 
 /// A present waiting for its list to finish.
@@ -436,14 +476,13 @@ impl Render {
         })
     }
 
-    /// Encodes a read of `from` into a buffer of its own.
+    /// Encodes a read of `from` into a buffer of its own, in one copy.
     fn read(&self, encoder: &mut wgpu::CommandEncoder, target: ReadTarget, from: ReadFrom) -> Read {
         let mapped = Arc::default();
-        let missing = |len| Read {
+        let missing = |layout| Read {
             target,
             buffer: None,
-            skip: 0,
-            len,
+            layout,
             mapped: Arc::clone(&mapped),
         };
         match from {
@@ -452,8 +491,9 @@ impl Render {
                 offset,
                 size,
             } => {
+                let packed = |skip| ReadLayout::Packed { skip, len: size };
                 let Some(src) = self.buffer(buffer) else {
-                    return missing(size);
+                    return missing(packed(0));
                 };
                 let align = wgpu::COPY_BUFFER_ALIGNMENT;
                 let start = offset - offset % align;
@@ -467,22 +507,36 @@ impl Render {
                 Read {
                     target,
                     buffer: Some(dst),
-                    skip: offset - start,
-                    len: size,
+                    layout: packed(offset - start),
                     mapped,
                 }
             }
             ReadFrom::Texture { at, rows } => {
-                let Some(texture) = self.texture(at.texture) else {
-                    return missing(rows.total());
+                // The check pass refused a read whose padded size overflows or is too large
+                // (`rules::check_read_size`); `None` here would be a bug, reported unknown.
+                let padded = crate::rules::padded_read(rows.row_bytes, rows.rows, rows.images);
+                let Some((stride, size)) = padded else {
+                    self.shared
+                        .host_error(&"a checked texture read had no padded size");
+                    return missing(ReadLayout::Packed { skip: 0, len: 0 });
                 };
-                let dst = self.read_buffer(rows.total());
-                copy_rows(encoder, texture, at, &dst, 0, rows, Direction::ToBuffer);
+                let layout = ReadLayout::Padded { rows, stride };
+                let Some(texture) = self.texture(at.texture) else {
+                    return missing(layout);
+                };
+                let dst = self.read_buffer(size);
+                encoder.copy_texture_to_buffer(
+                    texel_copy(texture, at),
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &dst,
+                        layout: read_copy_layout(rows, stride),
+                    },
+                    extent(at),
+                );
                 Read {
                     target,
                     buffer: Some(dst),
-                    skip: 0,
-                    len: rows.total(),
+                    layout,
                     mapped,
                 }
             }
@@ -495,6 +549,10 @@ impl Render {
         let mut recorded = false;
         let mut reads = Vec::new();
         let mut presents = Vec::new();
+        let mut scratch = Scratch {
+            sizes: scratch_sizes(&work.steps),
+            made: HashMap::new(),
+        };
         for step in work.steps {
             let upload = matches!(step, Step::WriteBuffer { .. } | Step::WriteTexture { .. });
             if upload && recorded {
@@ -503,7 +561,7 @@ impl Render {
             }
             // An upload leaves the encoder empty of commands: none before it, or just submitted.
             recorded = !upload;
-            self.step(&mut encoder, step, &mut reads, &mut presents);
+            self.step(&mut encoder, step, &mut reads, &mut presents, &mut scratch);
         }
         let submission = self.queue.submit([encoder.finish()]);
         for read in &reads {
@@ -539,6 +597,7 @@ impl Render {
         step: Step,
         reads: &mut Vec<Read>,
         presents: &mut Vec<PresentRec>,
+        scratch: &mut Scratch,
     ) {
         match step {
             Step::WriteBuffer {
@@ -601,7 +660,7 @@ impl Render {
                     );
                 }
             }
-            Step::Clear(clear) => self.clear(encoder, &clear),
+            Step::Clear(clear) => self.clear(encoder, &clear, scratch),
             Step::Readback { id, from } => {
                 reads.push(self.read(encoder, ReadTarget::Readback(id), from));
             }
@@ -616,7 +675,7 @@ impl Render {
         }
     }
 
-    fn clear(&self, encoder: &mut wgpu::CommandEncoder, step: &ClearStep) {
+    fn clear(&self, encoder: &mut wgpu::CommandEncoder, step: &ClearStep, scratch: &mut Scratch) {
         let Some(texture) = self.texture(step.texture) else {
             return;
         };
@@ -656,22 +715,39 @@ impl Render {
             height: rect.height,
             depth_or_array_layers: 1,
         };
-        let scratch = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: None,
-            size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: step.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let scratch_view = scratch.create_view(&wgpu::TextureViewDescriptor::default());
-        clear_pass(encoder, &scratch_view, None, step.ops, step.format);
+        let (scratch, scratch_view) = match scratch.made.entry(step.format) {
+            std::collections::hash_map::Entry::Occupied(made) => made.into_mut(),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                // `scratch_sizes` saw this clear; its own size is the fallback all the same.
+                let (width, height) = scratch
+                    .sizes
+                    .get(&step.format)
+                    .copied()
+                    .unwrap_or((rect.width, rect.height));
+                let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: None,
+                    size: wgpu::Extent3d {
+                        width: width.max(rect.width),
+                        height: height.max(rect.height),
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: step.format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                });
+                self.shared.scratch_textures.fetch_add(1, Ordering::Relaxed);
+                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                slot.insert((texture, view))
+            }
+        };
+        clear_pass(encoder, scratch_view, None, step.ops, step.format);
         for z in first..end {
             encoder.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
-                    texture: &scratch,
+                    texture: scratch,
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
@@ -775,11 +851,14 @@ impl Render {
             return None;
         }
         let bytes = match buffer.get_mapped_range(..) {
-            Ok(view) => {
-                let start = usize::try_from(read.skip).ok()?;
-                let end = start.checked_add(usize::try_from(read.len).ok()?)?;
-                view.get(start..end).map(<[u8]>::to_vec)
-            }
+            Ok(view) => match read.layout {
+                ReadLayout::Packed { skip, len } => {
+                    let start = usize::try_from(skip).ok()?;
+                    let end = start.checked_add(usize::try_from(len).ok()?)?;
+                    view.get(start..end).map(<[u8]>::to_vec)
+                }
+                ReadLayout::Padded { rows, stride } => unpad(&view, rows, stride),
+            },
             Err(error) => {
                 self.shared.host_error(&error);
                 None
@@ -878,23 +957,21 @@ fn copy_rows(
     rows: Rows,
     direction: Direction,
 ) {
-    let mut copy = |layout: wgpu::TexelCopyBufferLayout, at: TexelBox| {
+    for (layout, part) in row_copies(at, offset, rows, texture.format().block_dimensions().1) {
         let buffer = wgpu::TexelCopyBufferInfo { buffer, layout };
         match direction {
             Direction::ToTexture => {
-                encoder.copy_buffer_to_texture(buffer, texel_copy(texture, at), extent(at));
+                encoder.copy_buffer_to_texture(buffer, texel_copy(texture, part), extent(part));
             }
             Direction::ToBuffer => {
-                encoder.copy_texture_to_buffer(texel_copy(texture, at), buffer, extent(at));
+                encoder.copy_texture_to_buffer(texel_copy(texture, part), buffer, extent(part));
             }
         }
-    };
-    for (layout, part) in row_copies(at, offset, rows, texture.format().block_dimensions().1) {
-        copy(layout, part);
     }
 }
 
-/// The copies [`copy_rows`] makes, as buffer layouts and texture boxes (module docs).
+/// The copies [`copy_rows`] makes, as buffer layouts and texture boxes (module docs), one at a
+/// time: one item when the rows are aligned, else one per row of blocks, in packed order.
 ///
 /// Every layout names its row stride. wgpu-hal 30.0.2's Metal encoder passes a missing
 /// `bytes_per_row` to Metal as 0 (`src/metal/command.rs`, `copy_texture_to_buffer` and
@@ -906,21 +983,24 @@ pub fn row_copies(
     offset: u64,
     rows: Rows,
     block_height: u32,
-) -> Vec<(wgpu::TexelCopyBufferLayout, TexelBox)> {
+) -> impl Iterator<Item = (wgpu::TexelCopyBufferLayout, TexelBox)> {
     let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-    if rows.row_bytes.is_multiple_of(align) {
-        let layout = wgpu::TexelCopyBufferLayout {
+    let aligned = rows.row_bytes.is_multiple_of(align);
+    let whole = aligned.then_some((
+        wgpu::TexelCopyBufferLayout {
             offset,
             bytes_per_row: Some(rows.row_bytes),
             rows_per_image: Some(rows.rows),
-        };
-        return vec![(layout, at)];
-    }
+        },
+        at,
+    ));
     let stride = rows.row_bytes.checked_next_multiple_of(align);
-    let mut out = Vec::new();
-    let mut place = offset;
-    for image in 0..rows.images {
-        for row in 0..rows.rows {
+    let images = if aligned { 0 } else { rows.images };
+    let per_row = (0..images).flat_map(move |image| {
+        (0..rows.rows).map(move |row| {
+            let index = u64::from(image)
+                .saturating_mul(rows.rows.into())
+                .saturating_add(row.into());
             let part = TexelBox {
                 origin: starquake_render::resource::Origin3d {
                     x: at.origin.x,
@@ -934,18 +1014,60 @@ pub fn row_copies(
                 },
                 ..at
             };
-            out.push((
-                wgpu::TexelCopyBufferLayout {
-                    offset: place,
-                    bytes_per_row: stride,
-                    rows_per_image: Some(1),
-                },
-                part,
-            ));
-            place = place.saturating_add(rows.row_bytes.into());
+            let layout = wgpu::TexelCopyBufferLayout {
+                offset: offset.saturating_add(index.saturating_mul(rows.row_bytes.into())),
+                bytes_per_row: stride,
+                rows_per_image: Some(1),
+            };
+            (layout, part)
+        })
+    });
+    whole.into_iter().chain(per_row)
+}
+
+/// The buffer layout of a texture read's one copy: `rows` from byte 0, each `stride` bytes
+/// apart ([`crate::rules::padded_read`]).
+pub fn read_copy_layout(rows: Rows, stride: u32) -> wgpu::TexelCopyBufferLayout {
+    wgpu::TexelCopyBufferLayout {
+        offset: 0,
+        bytes_per_row: Some(stride),
+        rows_per_image: Some(rows.rows),
+    }
+}
+
+/// The packed bytes of `rows` read with each row `stride` bytes apart from the start of
+/// `padded`, or `None` when `padded` is too short or a size overflows.
+pub fn unpad(padded: &[u8], rows: Rows, stride: u32) -> Option<Vec<u8>> {
+    let row_bytes = usize::try_from(rows.row_bytes).ok()?;
+    let stride = usize::try_from(stride).ok()?;
+    let count = usize::try_from(rows.rows)
+        .ok()?
+        .checked_mul(usize::try_from(rows.images).ok()?)?;
+    let mut out = Vec::with_capacity(count.checked_mul(row_bytes)?);
+    for i in 0..count {
+        let start = i.checked_mul(stride)?;
+        out.extend_from_slice(padded.get(start..start.checked_add(row_bytes)?)?);
+    }
+    Some(out)
+}
+
+/// The size of each format's scratch texture for the rectangle clears in `steps`: the largest
+/// width and the largest height any of them clears in that format (module docs).
+pub fn scratch_sizes(steps: &[Step]) -> HashMap<wgpu::TextureFormat, (u32, u32)> {
+    let mut sizes: HashMap<wgpu::TextureFormat, (u32, u32)> = HashMap::new();
+    for step in steps {
+        if let Step::Clear(ClearStep {
+            format,
+            rect: Some(rect),
+            ..
+        }) = step
+        {
+            let size = sizes.entry(*format).or_insert((0, 0));
+            size.0 = size.0.max(rect.width);
+            size.1 = size.1.max(rect.height);
         }
     }
-    out
+    sizes
 }
 
 #[cfg(test)]

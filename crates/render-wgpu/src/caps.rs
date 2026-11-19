@@ -38,6 +38,29 @@
 //! - **Formats**: for a guest format with a wgpu form ([`crate::format::texture_format`]) whose
 //!   required features the device has, what wgpu reports for that form ([`format_features`]);
 //!   nothing for every other format.
+//!
+//! # Where `Caps` claims more than the backend does
+//!
+//! [`FormatFeatures::COPY`] reads "copied to and from, uploaded and read back", and is reported
+//! wherever wgpu allows both copy usages, which it does for every depth and stencil format. But
+//! wgpu copies one aspect at a time, and does not copy into `Depth32Float` from a buffer, so
+//! the backend moves depth and stencil texels to and from buffers only where wgpu can
+//! (`crate::rules::check_buffer_texture`): `D16_UNORM` and `S8_UINT` both ways, `D32_FLOAT` out
+//! only (texture-to-buffer copies and readbacks), each covering the level's width and height.
+//! These keep `COPY` while the backend refuses:
+//!
+//! - an upload or buffer-to-texture copy into `D32_FLOAT`;
+//! - every upload, buffer copy and readback of `D32_FLOAT_S8_UINT`, which is also the format the
+//!   shared fallback picks for `D24_UNORM_S8_UINT` (with a texel conversion where it crosses
+//!   guest memory), so the spec's "converted on upload and readback" fails at `submit` for it;
+//! - a copy between a guest buffer and a depth or stencil texture of several rows that are not
+//!   a multiple of 256 bytes, and one covering part of the level's width or height.
+//!
+//! Moving two-aspect texels needs the copy to name an aspect, which the backend-neutral copy
+//! commands do not, or a conversion pass the backend does not have yet. Whether `Caps` should
+//! drop `COPY` for these formats, or the commands gain an aspect, is an open question for the
+//! owner; until then each refusal is a named `RenderError::Unsupported` from `submit`
+//! (`rules::tests::depth_and_stencil_buffer_copies_follow_wgpu_in_order`).
 
 use crate::format::texture_format;
 use starquake_render::caps::{DynamicState, StageSupport};

@@ -165,6 +165,7 @@ fn run(w: &World, commands: Vec<Command>) -> Result<Checked, RenderError> {
     check(
         &w.tables,
         &test_caps(),
+        true,
         &BTreeSet::new(),
         CommandList { commands },
     )
@@ -559,21 +560,21 @@ fn readback_ids_are_used_once() {
         commands: vec![read(1), read(2)],
     };
     assert_eq!(
-        check(&w.tables, &test_caps(), &taken, list).err(),
+        check(&w.tables, &test_caps(), true, &taken, list).err(),
         Some(RenderError::Invalid(READBACK_TAKEN))
     );
     let mut w = world();
-    let depth_tex = add_texture(
+    let two_aspects = add_texture(
         &mut w.tables,
-        texture(PixelFormat::D16Unorm, 4, 4, TextureUsage::COPY_SRC),
+        texture(PixelFormat::D32FloatS8Uint, 4, 4, TextureUsage::COPY_SRC),
     );
     let read_depth = Command::Readback {
-        from: region(depth_tex, 0, 0, 4, 4),
+        from: region(two_aspects, 0, 0, 4, 4),
         id: ReadbackId::new(9, 0),
     };
     assert_eq!(
         run(&w, vec![read_depth.clone()]).err(),
-        Some(RenderError::Unsupported(rules::DEPTH_BUFFER_COPY))
+        Some(RenderError::Unsupported(rules::DEPTH_STENCIL_BUFFER_COPY))
     );
     // Both faults: the wgpu rule (3) comes before the readback id rule (4).
     let taken = BTreeSet::from([ReadbackId::new(9, 0)]);
@@ -581,8 +582,126 @@ fn readback_ids_are_used_once() {
         commands: vec![read_depth],
     };
     assert_eq!(
-        check(&w.tables, &test_caps(), &taken, list).err(),
-        Some(RenderError::Unsupported(rules::DEPTH_BUFFER_COPY))
+        check(&w.tables, &test_caps(), true, &taken, list).err(),
+        Some(RenderError::Unsupported(rules::DEPTH_STENCIL_BUFFER_COPY))
+    );
+    // A single-aspect depth texture reads back where the device can copy depth texels.
+    let d16 = add_texture(
+        &mut w.tables,
+        texture(PixelFormat::D16Unorm, 4, 4, TextureUsage::COPY_SRC),
+    );
+    let read_d16 = || CommandList {
+        commands: vec![Command::Readback {
+            from: region(d16, 0, 0, 4, 4),
+            id: ReadbackId::new(10, 0),
+        }],
+    };
+    let none = BTreeSet::new();
+    assert!(check(&w.tables, &test_caps(), true, &none, read_d16()).is_ok());
+    assert_eq!(
+        check(&w.tables, &test_caps(), false, &none, read_d16()).err(),
+        Some(RenderError::Unsupported(rules::DEPTH_COPIES))
+    );
+}
+
+#[test]
+fn texture_readbacks_fit_the_largest_buffer_with_padded_rows() {
+    let w = world();
+    // The 8x4 RGBA8 texture: rows of 32 bytes pad to 256, so the read takes 4 * 256 bytes.
+    let (stride, size) = rules::padded_read(32, 4, 1).expect("small");
+    assert_eq!(stride, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+    assert_eq!(size, 4 * u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
+    let with_max = |max| {
+        let mut caps = test_caps();
+        caps.limits.max_buffer_size = max;
+        caps
+    };
+    let read = |id| Command::Readback {
+        from: region(w.rgba, 0, 0, 8, 4),
+        id: ReadbackId::new(id, 0),
+    };
+    let none = BTreeSet::new();
+    let list = |commands| CommandList { commands };
+    assert!(check(&w.tables, &with_max(size), true, &none, list(vec![read(1)])).is_ok());
+    assert_eq!(
+        check(
+            &w.tables,
+            &with_max(size - 1),
+            true,
+            &none,
+            list(vec![read(1)])
+        )
+        .err(),
+        Some(RenderError::Unsupported(rules::READ_TOO_LARGE))
+    );
+    // The packed size (128 bytes) is not what is measured.
+    assert_eq!(
+        check(&w.tables, &with_max(128), true, &none, list(vec![read(1)])).err(),
+        Some(RenderError::Unsupported(rules::READ_TOO_LARGE))
+    );
+    // Both faults: the size (rule 3) before a taken readback id (rule 4).
+    let taken = BTreeSet::from([ReadbackId::new(1, 0)]);
+    assert_eq!(
+        check(
+            &w.tables,
+            &with_max(size - 1),
+            true,
+            &taken,
+            list(vec![read(1)])
+        )
+        .err(),
+        Some(RenderError::Unsupported(rules::READ_TOO_LARGE))
+    );
+    // A dumped frame that would not fit reads nothing (its pixels are unknown), and is not
+    // refused; one exactly at the limit reads.
+    let present = Command::Present(PresentDesc {
+        view: w.rgba_view,
+        src_rect: Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 4,
+        },
+        transform: PresentTransform::Identity,
+        frame: 1,
+        dump: true,
+    });
+    let at_limit = check(
+        &w.tables,
+        &with_max(size),
+        true,
+        &none,
+        list(vec![present.clone()]),
+    )
+    .expect("accepted");
+    assert!(as_present(&at_limit.steps[0]).1.is_some());
+    let over = check(
+        &w.tables,
+        &with_max(size - 1),
+        true,
+        &none,
+        list(vec![present]),
+    )
+    .expect("accepted");
+    assert_eq!(as_present(&over.steps[0]).1, None);
+}
+
+#[test]
+fn padded_reads_overflow_to_none() {
+    assert_eq!(rules::padded_read(u32::MAX, 1, 1), None, "the stride");
+    let stride = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    assert_eq!(
+        rules::padded_read(stride, u32::MAX, 1),
+        Some((stride, u64::from(stride) * u64::from(u32::MAX)))
+    );
+    assert_eq!(
+        rules::padded_read(stride, u32::MAX, u32::MAX),
+        None,
+        "the size"
+    );
+    assert_eq!(
+        rules::check_read_size(u32::MAX, 1, 1, u64::MAX),
+        Err(RenderError::Unsupported(rules::READ_TOO_LARGE))
     );
 }
 

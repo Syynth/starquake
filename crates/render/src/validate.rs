@@ -33,11 +33,13 @@
 //! - A copy must not read and write overlapping bytes of one buffer (same buffer id, byte ranges
 //!   sharing a byte) or of one texture's mip level (same texture id and mip, regions sharing a
 //!   texel on every axis): Vulkan leaves overlapping copies undefined (guess: from memory of its
-//!   documentation). wgpu refuses more: every copy within one buffer, and every copy within one
-//!   mip level of one texture whose layer ranges overlap, whatever the regions (wgpu-core
-//!   30.0.2, `SameSourceDestinationBuffer` and `validate_copy_within_same_texture`), which the
-//!   wgpu backend refuses itself (`starquake-render-wgpu`, `rules`). The check uses the ids the
-//!   [`Resolved`] sides carry, so every backend refuses at least these lists.
+//!   documentation). wgpu refuses more: every copy within one buffer, every copy within one mip
+//!   level of a 1D, 2D or cube texture whose layer ranges overlap, whatever the regions' x and
+//!   y, and every copy within one mip level of a 3D texture whose regions start at the same
+//!   slice (wgpu-core 30.0.2, `SameSourceDestinationBuffer` and
+//!   `validate_copy_within_same_texture`, which compares a 3D copy's first slices only), which
+//!   the wgpu backend refuses itself (`starquake-render-wgpu`, `rules`). The check uses the ids
+//!   the [`Resolved`] sides carry, so every backend refuses at least these lists.
 //! - Texture data outside a texture is tightly packed ([`packed_size`]; this crate's choice).
 //!
 //! Clears, blits and presents are checked in [`view_ops`], whose functions are re-exported here.

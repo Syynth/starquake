@@ -38,7 +38,10 @@
 //! call (its slot moves to the next generation) and queues the host object's release behind
 //! every list already queued, so a list checked while the id was live is encoded with the object
 //! still there. A destroy of an id that is not live, or is already waiting, is refused and
-//! counted ([`WgpuBackend::refused_destroys`]).
+//! counted ([`WgpuBackend::refused_destroys`]). The waiting destroys are indexed by id and by
+//! fence value ([`Pending`]): a `destroy` looks its id up instead of scanning them, and a
+//! settle frees the ones due, in fence order and in call order among equal values, without
+//! visiting the others.
 //!
 //! # Lost device
 //!
@@ -48,6 +51,13 @@
 //! stop waiting; and the wake is called so the back thread looks. The run ends there
 //! (render-backend, "Errors and untrusted input": exit code 2, which `core` maps). Lists still
 //! queued or in flight never complete.
+//!
+//! # Dropping
+//!
+//! Dropping the backend sets the shutdown flag and joins the render thread, which waits up to
+//! [`thread::SHUTDOWN_WAIT`] for lists in flight. When the drop runs on the render thread itself
+//! (a completion wake or a frame sink held the last handle), it does not join: the thread sees
+//! the flag once the wake or sink returns and ends by itself.
 //!
 //! # No hidden inputs
 //!
@@ -79,6 +89,7 @@ use starquake_render::{
     SamplerDesc, SamplerId, ShaderDesc, ShaderId, StagingSlice, TextureDesc, TextureId, ViewDesc,
     ViewId, WaitOutcome,
 };
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::pin::pin;
@@ -133,13 +144,100 @@ fn block_on<F: Future>(future: F) -> Result<F::Output, NewError> {
     }
 }
 
+/// Destroys waiting for their fence value, indexed by id (`contains` is a lookup) and by fence
+/// value (`take_due` visits only the entries it returns, and the first one it leaves).
+#[derive(Debug)]
+pub(crate) struct Pending<K> {
+    /// The ids waiting.
+    waiting: BTreeSet<K>,
+    /// The ids waiting for each fence value, in call order.
+    by_fence: BTreeMap<FenceValue, Vec<K>>,
+}
+
+impl<K> Default for Pending<K> {
+    fn default() -> Self {
+        Self {
+            waiting: BTreeSet::new(),
+            by_fence: BTreeMap::new(),
+        }
+    }
+}
+
+impl<K: Ord + Copy> Pending<K> {
+    /// Whether `id` is waiting.
+    pub(crate) fn contains(&self, id: &K) -> bool {
+        self.waiting.contains(id)
+    }
+
+    /// Makes `id` wait for `after`; returns `false`, changing nothing, when it is waiting already.
+    pub(crate) fn push(&mut self, id: K, after: FenceValue) -> bool {
+        if !self.waiting.insert(id) {
+            return false;
+        }
+        self.by_fence.entry(after).or_default().push(id);
+        true
+    }
+
+    /// Takes the ids whose fence value is at or below `completed`, in fence order and in call
+    /// order among equal values.
+    pub(crate) fn take_due(&mut self, completed: FenceValue) -> Vec<K> {
+        let mut due = Vec::new();
+        while let Some(entry) = self.by_fence.first_entry() {
+            if *entry.key() > completed {
+                break;
+            }
+            for id in entry.remove() {
+                self.waiting.remove(&id);
+                due.push(id);
+            }
+        }
+        due
+    }
+
+    /// How many ids are waiting.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.waiting.len()
+    }
+}
+
+/// A [`ResourceId`] ordered by kind, index and generation, for [`Pending`]'s index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PendingId(pub(crate) ResourceId);
+
+impl PendingId {
+    /// The fields the order compares: one value per id, so equal keys are equal ids.
+    fn key(self) -> (u8, u32, u32) {
+        match self.0 {
+            ResourceId::Buffer(i) => (0, i.index(), i.generation()),
+            ResourceId::Texture(i) => (1, i.index(), i.generation()),
+            ResourceId::View(i) => (2, i.index(), i.generation()),
+            ResourceId::Sampler(i) => (3, i.index(), i.generation()),
+            ResourceId::Shader(i) => (4, i.index(), i.generation()),
+            ResourceId::Pipeline(i) => (5, i.index(), i.generation()),
+        }
+    }
+}
+
+impl Ord for PendingId {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.key().cmp(&other.key())
+    }
+}
+
+impl PartialOrd for PendingId {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// Everything the submitting side keeps, under one lock.
 #[derive(Debug, Default)]
 pub(crate) struct State {
     /// The live resources.
     pub(crate) tables: Tables,
-    /// Destroys waiting for their fence value, in call order.
-    pub(crate) pending: Vec<(ResourceId, FenceValue)>,
+    /// Destroys waiting for their fence value.
+    pub(crate) pending: Pending<PendingId>,
     /// The last fence value handed out.
     pub(crate) submitted: FenceValue,
     /// The highest fence value finished.
@@ -208,14 +306,10 @@ impl State {
         }
     }
 
-    /// Frees every waiting destroy whose fence value has passed, in call order.
+    /// Frees every waiting destroy whose fence value has passed, in fence order and in call
+    /// order among equal values ([`Pending::take_due`]).
     pub(crate) fn free_passed(&mut self) {
-        let completed = self.completed;
-        let (due, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending)
-            .into_iter()
-            .partition(|(_, after)| *after <= completed);
-        self.pending = waiting;
-        for (id, _) in due {
+        for PendingId(id) in self.pending.take_due(self.completed) {
             self.free(id);
         }
     }
@@ -233,6 +327,8 @@ pub(crate) struct Shared {
     pub(crate) wake: CompletionWake,
     /// Errors wgpu reported that the checks did not catch, and failed readback maps.
     pub(crate) host_errors: AtomicU64,
+    /// Scratch textures the render thread has made for rectangle clears (`crate::thread`).
+    pub(crate) scratch_textures: AtomicU64,
 }
 
 impl Shared {
@@ -264,6 +360,9 @@ pub struct WgpuBackend {
     features: wgpu::Features,
     /// Whether views may reinterpret their texture's format (`DownlevelFlags::VIEW_FORMATS`).
     reinterpret: bool,
+    /// Whether depth and stencil texels may be copied to and from buffers
+    /// (`DownlevelFlags::DEPTH_TEXTURE_AND_BUFFER_COPIES`).
+    depth_copies: bool,
     config: WgpuConfig,
     report: AdapterReport,
     shared: Arc<Shared>,
@@ -318,6 +417,7 @@ impl WgpuBackend {
             moved: Condvar::new(),
             wake,
             host_errors: AtomicU64::new(0),
+            scratch_textures: AtomicU64::new(0),
         });
         let thread = thread::start(device, queue, Arc::clone(&shared))
             .map_err(|e| NewError::Thread(e.to_string()))?;
@@ -326,6 +426,7 @@ impl WgpuBackend {
             formats,
             features,
             reinterpret: downlevel.contains(wgpu::DownlevelFlags::VIEW_FORMATS),
+            depth_copies: downlevel.contains(wgpu::DownlevelFlags::DEPTH_TEXTURE_AND_BUFFER_COPIES),
             config,
             report,
             shared,
@@ -388,6 +489,12 @@ impl WgpuBackend {
         self.shared.work.notify_one();
     }
 
+    /// How many scratch textures the render thread has made for rectangle clears.
+    #[cfg(test)]
+    pub(crate) fn scratch_textures(&self) -> u64 {
+        self.shared.scratch_textures.load(Ordering::Relaxed)
+    }
+
     /// Makes the render thread lose the device, as a driver failure would.
     #[cfg(test)]
     pub(crate) fn lose_device_for_test(&self) {
@@ -396,13 +503,25 @@ impl WgpuBackend {
     }
 }
 
+/// Whether a backend dropped on `current` should join its render thread `render`: not when they
+/// are the same thread, which happens when a completion wake or a frame sink, called on the
+/// render thread, holds the last handle to the backend. That thread then sees the shutdown flag
+/// when the call returns and ends by itself.
+fn should_join(render: std::thread::ThreadId, current: std::thread::ThreadId) -> bool {
+    render != current
+}
+
 impl Drop for WgpuBackend {
     fn drop(&mut self) {
         self.shared.state().shutdown = true;
         self.shared.work.notify_all();
-        if let Some(thread) = self.thread.take()
-            && thread.join().is_err()
-        {
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        if !should_join(thread.thread().id(), std::thread::current().id()) {
+            return;
+        }
+        if thread.join().is_err() {
             tracing::error!("the render thread ended by a panic");
         }
     }
@@ -512,7 +631,7 @@ impl Backend for WgpuBackend {
 
     fn destroy(&self, resource: ResourceId, after: FenceValue) {
         let mut state = self.shared.state();
-        let waiting = state.pending.iter().any(|(id, _)| *id == resource);
+        let waiting = state.pending.contains(&PendingId(resource));
         if !state.is_live(resource) || waiting {
             state.refused_destroys = state.refused_destroys.saturating_add(1);
         } else if after <= state.completed {
@@ -520,7 +639,7 @@ impl Backend for WgpuBackend {
             drop(state);
             self.shared.work.notify_one();
         } else {
-            state.pending.push((resource, after));
+            state.pending.push(PendingId(resource), after);
         }
     }
 
@@ -569,7 +688,13 @@ impl Backend for WgpuBackend {
         let fence = state.submitted.next().ok_or(RenderError::Overflow {
             what: "fence value",
         })?;
-        let checked = plan::check(&state.tables, &self.caps, &state.reserved, list)?;
+        let checked = plan::check(
+            &state.tables,
+            &self.caps,
+            self.depth_copies,
+            &state.reserved,
+            list,
+        )?;
         state.reserved.extend(checked.readbacks.iter().copied());
         state.submitted = fence;
         let sink = state.sink.clone();

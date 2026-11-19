@@ -1328,3 +1328,584 @@ fn readback_ids_are_reserved_until_taken() {
         assert_eq!(gpu.host_errors(), 0);
     });
 }
+
+#[test]
+fn aligned_rows_copy_in_one_go_as_the_recording_backend_does() {
+    bounded(|| {
+        let Some(gpu) = backend("aligned_rows") else {
+            return;
+        };
+        let mut p = Pair::new(gpu);
+        // 64-wide RGBA8: rows of exactly 256 bytes, several rows, several layers or slices.
+        let array = p.texture(&texture_desc(
+            TextureDimension::D2,
+            PixelFormat::A8B8G8R8Unorm,
+            (64, 4, 3),
+            1,
+            COPIES,
+        ));
+        let deep = p.texture(&texture_desc(
+            TextureDimension::D3,
+            PixelFormat::A8B8G8R8Unorm,
+            (64, 4, 3),
+            1,
+            COPIES,
+        ));
+        // 128-wide BC1: 32 blocks of 8 bytes, block rows of 256 bytes, two block rows.
+        let bc = p.texture(&texture_desc(
+            TextureDimension::D2,
+            PixelFormat::Bc1RgbaUnorm,
+            (128, 8, 1),
+            1,
+            COPIES,
+        ));
+        let layer = 64 * 4 * 4;
+        let buf = p.buffer(16384);
+        p.run(vec![upload(pattern(16384, 29), slice(buf, 0, 16384))])
+            .expect("accepted");
+        let mut list = vec![
+            upload(
+                pattern(3 * layer, 31),
+                region(array, 0, (0, 0, 0), (64, 4, 3)),
+            ),
+            upload(
+                pattern(3 * layer, 37),
+                region(deep, 0, (0, 0, 0), (64, 4, 3)),
+            ),
+            upload(pattern(512, 41), region(bc, 0, (0, 0, 0), (128, 8, 1))),
+            // Buffer to texture at nonzero offsets on block boundaries.
+            Command::Copy(CopyDesc {
+                src: slice(buf, 256, 2 * 1024),
+                dst: region(array, 0, (0, 0, 1), (64, 4, 2)),
+            }),
+            Command::Copy(CopyDesc {
+                src: slice(buf, 4100, 2 * 1024),
+                dst: region(deep, 0, (0, 0, 1), (64, 4, 2)),
+            }),
+            Command::Copy(CopyDesc {
+                src: slice(buf, 8200, 512),
+                dst: region(bc, 0, (0, 0, 0), (128, 8, 1)),
+            }),
+            // Texture to buffer, the same way.
+            Command::Copy(CopyDesc {
+                src: region(array, 0, (0, 0, 0), (64, 4, 3)),
+                dst: slice(buf, 12288, 3 * 1024),
+            }),
+            Command::Copy(CopyDesc {
+                src: region(deep, 0, (0, 1, 1), (64, 2, 2)),
+                dst: slice(buf, 9000, 2 * 512),
+            }),
+        ];
+        let reads = [
+            region(array, 0, (0, 0, 0), (64, 4, 3)),
+            region(array, 0, (0, 1, 1), (64, 2, 2)),
+            region(deep, 0, (0, 0, 0), (64, 4, 3)),
+            region(bc, 0, (0, 0, 0), (128, 8, 1)),
+        ];
+        for r in reads {
+            list.push(p.readback(r));
+        }
+        list.push(p.readback(slice(buf, 0, 16384)));
+        p.run(list).expect("accepted");
+        assert_eq!(p.matched, 5);
+    });
+}
+
+#[test]
+fn depth_and_stencil_texels_copy_as_wgpu_allows() {
+    bounded(|| {
+        let Some(gpu) = backend("depth_copies") else {
+            return;
+        };
+        if !gpu.depth_copies {
+            eprintln!("skipping depth_copies: this device cannot copy depth texels to buffers");
+            return;
+        }
+        let mut p = Pair::new(gpu);
+        // Rows of 256 bytes, so guest buffer copies of several rows are one wgpu copy each.
+        let d16 = p.texture(&texture_desc(
+            TextureDimension::D2,
+            PixelFormat::D16Unorm,
+            (128, 4, 2),
+            1,
+            COPIES,
+        ));
+        let s8 = p.texture(&texture_desc(
+            TextureDimension::D2,
+            PixelFormat::S8Uint,
+            (256, 2, 1),
+            1,
+            COPIES,
+        ));
+        let d32 = p.texture(&texture_desc(
+            TextureDimension::D2,
+            PixelFormat::D32Float,
+            (64, 4, 1),
+            1,
+            TARGET,
+        ));
+        // One row of texels in each of two layers, rows of 16 bytes: one copy per layer.
+        let line = p.texture(&texture_desc(
+            TextureDimension::D2,
+            PixelFormat::D16Unorm,
+            (8, 1, 2),
+            1,
+            COPIES,
+        ));
+        let d32_view = p.view(
+            d32,
+            &whole_view(PixelFormat::D32Float, ViewDimension::D2, (0, 1)),
+        );
+        let buf = p.buffer(8192);
+        p.run(vec![upload(pattern(8192, 43), slice(buf, 0, 8192))])
+            .expect("accepted");
+        let mut list = vec![
+            upload(pattern(2048, 47), region(d16, 0, (0, 0, 0), (128, 4, 2))),
+            upload(pattern(512, 53), region(s8, 0, (0, 0, 0), (256, 2, 1))),
+            upload(pattern(32, 57), region(line, 0, (0, 0, 0), (8, 1, 2))),
+            Command::Clear(ClearDesc {
+                target: d32_view,
+                value: ClearValue::Depth(0.25),
+                rect: None,
+            }),
+            // Out of each into the buffer at offsets on 4 bytes, then into D16, S8 and the
+            // one-row texture from it.
+            Command::Copy(CopyDesc {
+                src: region(d16, 0, (0, 0, 1), (128, 4, 1)),
+                dst: slice(buf, 4, 1024),
+            }),
+            Command::Copy(CopyDesc {
+                src: region(s8, 0, (0, 0, 0), (256, 2, 1)),
+                dst: slice(buf, 1100, 512),
+            }),
+            Command::Copy(CopyDesc {
+                src: region(d32, 0, (0, 0, 0), (64, 4, 1)),
+                dst: slice(buf, 2000, 1024),
+            }),
+            Command::Copy(CopyDesc {
+                src: region(line, 0, (0, 0, 0), (8, 1, 2)),
+                dst: slice(buf, 3100, 32),
+            }),
+            Command::Copy(CopyDesc {
+                src: slice(buf, 4000, 1024),
+                dst: region(d16, 0, (0, 0, 0), (128, 4, 1)),
+            }),
+            Command::Copy(CopyDesc {
+                src: slice(buf, 5200, 512),
+                dst: region(s8, 0, (0, 0, 0), (256, 2, 1)),
+            }),
+            Command::Copy(CopyDesc {
+                src: slice(buf, 6000, 16),
+                dst: region(line, 0, (0, 0, 1), (8, 1, 1)),
+            }),
+        ];
+        for r in [
+            region(d16, 0, (0, 0, 0), (128, 4, 2)),
+            region(d16, 0, (0, 0, 1), (128, 4, 1)),
+            region(s8, 0, (0, 0, 0), (256, 2, 1)),
+            region(d32, 0, (0, 0, 0), (64, 4, 1)),
+            region(line, 0, (0, 0, 0), (8, 1, 2)),
+        ] {
+            list.push(p.readback(r));
+        }
+        list.push(p.readback(slice(buf, 0, 8192)));
+        p.run(list).expect("accepted");
+        assert_eq!(p.matched, 6);
+        assert_eq!(p.gpu.host_errors(), 0);
+    });
+}
+
+#[test]
+fn depth_buffer_copies_wgpu_cannot_make_are_refused() {
+    bounded(|| {
+        let Some(gpu) = backend("depth_refusals") else {
+            return;
+        };
+        if !gpu.depth_copies {
+            eprintln!("skipping depth_refusals: this device cannot copy depth texels to buffers");
+            return;
+        }
+        let mut p = Pair::new(gpu);
+        let d16 = p.texture(&texture_desc(
+            TextureDimension::D2,
+            PixelFormat::D16Unorm,
+            (128, 4, 1),
+            1,
+            COPIES,
+        ));
+        let d32 = p.texture(&texture_desc(
+            TextureDimension::D2,
+            PixelFormat::D32Float,
+            (64, 4, 1),
+            1,
+            COPIES,
+        ));
+        let buf = p.buffer(2048);
+        // What wgpu refuses and the recording backend accepts.
+        let small = p.texture(&texture_desc(
+            TextureDimension::D2,
+            PixelFormat::D16Unorm,
+            (8, 4, 1),
+            1,
+            COPIES,
+        ));
+        let one = |c| CommandList { commands: vec![c] };
+        let refused = |m| Err(RenderError::Unsupported(m));
+        assert_eq!(
+            p.gpu.submit(one(upload(
+                vec![0; 1024],
+                region(d32, 0, (0, 0, 0), (64, 4, 1))
+            ))),
+            refused(crate::rules::DEPTH32_DESTINATION)
+        );
+        assert_eq!(
+            p.gpu.submit(one(Command::Copy(CopyDesc {
+                src: region(d16, 0, (0, 0, 0), (128, 4, 1)),
+                dst: slice(buf, 2, 1024),
+            }))),
+            refused(crate::rules::DEPTH_OFFSET)
+        );
+        assert_eq!(
+            p.gpu.submit(one(Command::Readback {
+                from: region(d16, 0, (0, 0, 0), (127, 4, 1)),
+                id: ReadbackId::new(900, 0),
+            })),
+            refused(crate::rules::WHOLE_COPY)
+        );
+        assert_eq!(
+            p.gpu.submit(one(Command::Copy(CopyDesc {
+                src: region(small, 0, (0, 0, 0), (8, 4, 1)),
+                dst: slice(buf, 0, 64),
+            }))),
+            refused(crate::rules::DEPTH_ROWS)
+        );
+        // An upload and a readback of the same texture have no row limit.
+        let list = vec![
+            upload(pattern(64, 59), region(small, 0, (0, 0, 0), (8, 4, 1))),
+            p.readback(region(small, 0, (0, 0, 0), (8, 4, 1))),
+        ];
+        p.run(list).expect("accepted");
+        assert_eq!(p.matched, 1);
+        assert_eq!(p.gpu.host_errors(), 0);
+    });
+}
+
+#[test]
+fn a_lists_rectangle_clears_share_one_scratch_per_format() {
+    bounded(|| {
+        let Some(gpu) = backend("scratch") else {
+            return;
+        };
+        let mut p = Pair::new(gpu);
+        let wide = p.texture(&texture_desc(
+            TextureDimension::D2,
+            PixelFormat::A8B8G8R8Uint,
+            (32, 16, 2),
+            1,
+            TARGET,
+        ));
+        let wide_view = p.view(
+            wide,
+            &whole_view(PixelFormat::A8B8G8R8Uint, ViewDimension::D2Array, (0, 2)),
+        );
+        let small = p.texture(&texture_desc(
+            TextureDimension::D2,
+            PixelFormat::R32Uint,
+            (8, 8, 1),
+            1,
+            TARGET,
+        ));
+        let small_view = p.view(
+            small,
+            &whole_view(PixelFormat::R32Uint, ViewDimension::D2, (0, 1)),
+        );
+        let rect = |target, n: u32, x, y, width, height| {
+            Command::Clear(ClearDesc {
+                target,
+                value: ClearValue::Uint([n, n + 1, n + 2, n + 3]),
+                rect: Some(Rect {
+                    x,
+                    y,
+                    width,
+                    height,
+                }),
+            })
+        };
+        let mut list = vec![
+            upload(
+                pattern(32 * 16 * 4 * 2, 59),
+                region(wide, 0, (0, 0, 0), (32, 16, 2)),
+            ),
+            upload(
+                pattern(8 * 8 * 4, 61),
+                region(small, 0, (0, 0, 0), (8, 8, 1)),
+            ),
+            rect(wide_view, 10, 1, 1, 30, 2),
+            rect(wide_view, 20, 2, 3, 3, 12),
+            rect(small_view, 30, 1, 2, 5, 5),
+            rect(wide_view, 40, 5, 5, 9, 9),
+            rect(small_view, 50, 0, 0, 2, 7),
+        ];
+        list.push(p.readback(region(wide, 0, (0, 0, 0), (32, 16, 2))));
+        list.push(p.readback(region(small, 0, (0, 0, 0), (8, 8, 1))));
+        p.run(list).expect("accepted");
+        assert_eq!(p.matched, 2);
+        assert_eq!(p.gpu.scratch_textures(), 2, "one per format in the list");
+        // A list of its own makes its own.
+        let list = vec![
+            rect(small_view, 60, 3, 3, 1, 1),
+            p.readback(region(small, 0, (0, 0, 0), (8, 8, 1))),
+        ];
+        p.run(list).expect("accepted");
+        assert_eq!(p.gpu.scratch_textures(), 3);
+    });
+}
+
+#[test]
+fn a_dumped_frame_reads_the_views_base_level_and_layer() {
+    bounded(|| {
+        let Some(gpu) = backend("dump_base") else {
+            return;
+        };
+        let p = Pair::new(gpu);
+        let tex = p.texture(&texture_desc(
+            TextureDimension::D2,
+            PixelFormat::A8B8G8R8Unorm,
+            (8, 8, 3),
+            2,
+            TARGET,
+        ));
+        let view = p.view(
+            tex,
+            &ViewDesc {
+                base_mip: 1,
+                base_layer: 1,
+                ..whole_view(PixelFormat::A8B8G8R8Unorm, ViewDimension::D2, (1, 1))
+            },
+        );
+        let list = CommandList {
+            commands: vec![
+                upload(
+                    pattern(8 * 8 * 4 * 3, 67),
+                    region(tex, 0, (0, 0, 0), (8, 8, 3)),
+                ),
+                upload(
+                    pattern(4 * 4 * 4 * 3, 71),
+                    region(tex, 1, (0, 0, 0), (4, 4, 3)),
+                ),
+                Command::Present(PresentDesc {
+                    view,
+                    src_rect: Rect {
+                        x: 1,
+                        y: 1,
+                        width: 2,
+                        height: 3,
+                    },
+                    transform: PresentTransform::Identity,
+                    frame: 1,
+                    dump: true,
+                }),
+            ],
+        };
+        assert_eq!(p.rec.submit(list.clone()), Ok(FenceValue::new(1)));
+        finish(&p.gpu, p.gpu.submit(list).expect("accepted"));
+        let expected = p.rec.take_frame_dumps();
+        assert_eq!(expected.len(), 1);
+        assert!(matches!(expected[0].pixels, Readback::Bytes(_)), "known");
+        assert_eq!(p.gpu.take_frame_dumps(), expected);
+        assert_eq!(p.gpu.host_errors(), 0);
+    });
+}
+
+#[test]
+fn the_budget_counts_every_level_and_every_sample() {
+    bounded(|| {
+        let Some(gpu) = backend("budget") else {
+            return;
+        };
+        let format = PixelFormat::A8B8G8R8Unorm;
+        if !gpu.formats.samples(format).supports(4) {
+            eprintln!("skipping budget: this device has no 4x {format}");
+            return;
+        }
+        let p = Pair::new(gpu);
+        let multisampled = TextureDesc {
+            sample_count: 4,
+            ..texture_desc(
+                TextureDimension::D2,
+                format,
+                (16, 8, 1),
+                1,
+                TextureUsage::RENDER_TARGET,
+            )
+        };
+        let mipped = texture_desc(TextureDimension::D2, format, (16, 8, 1), 3, COPIES);
+        p.texture(&multisampled);
+        p.texture(&mipped);
+        // Derived from the descriptions: texel bytes times texels, per level, per sample.
+        let texel = u64::from(format.bytes_per_block());
+        let ms = 16 * 8 * texel * u64::from(multisampled.sample_count);
+        let levels = (16 * 8 + 8 * 4 + 4 * 2) * texel;
+        assert_eq!(p.gpu.budget().used, ms + levels);
+        assert_eq!(p.gpu.budget().used, p.rec.budget().used);
+    });
+}
+
+#[test]
+fn the_last_handle_dropped_on_the_render_thread_does_not_join_it() {
+    bounded(|| {
+        let holder: Arc<Mutex<Option<Arc<WgpuBackend>>>> = Arc::new(Mutex::new(None));
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let rx = Arc::new(Mutex::new(rx));
+        let wake = {
+            let (holder, rx) = (Arc::clone(&holder), Arc::clone(&rx));
+            CompletionWake::new(move || {
+                let taken = holder.lock().expect("unpoisoned").take();
+                if let Some(last) = taken {
+                    // Wait until the test has dropped its own handle, so this one is the last.
+                    let _ = rx.lock().expect("unpoisoned").recv_timeout(LIST_WAIT);
+                    drop(last);
+                }
+            })
+        };
+        let Some(gpu) = open("drop_on_render_thread", WgpuConfig::DEFAULT, wake) else {
+            return;
+        };
+        let gpu = Arc::new(gpu);
+        let shared = Arc::clone(&gpu.shared);
+        *holder.lock().expect("unpoisoned") = Some(Arc::clone(&gpu));
+        gpu.submit(CommandList::new()).expect("empty list");
+        drop(gpu);
+        tx.send(()).expect("the wake waits");
+        // The render thread ends by itself: every other handle to the shared state goes.
+        let deadline = Instant::now() + LIST_WAIT;
+        while Arc::strong_count(&shared) > 1 {
+            assert!(Instant::now() < deadline, "the render thread ended");
+            std::thread::yield_now();
+        }
+        let state = shared.state();
+        assert!(state.shutdown, "dropped");
+        assert!(!state.lost, "the render thread did not panic");
+    });
+}
+
+#[test]
+fn a_backend_joins_its_render_thread_only_from_another_thread() {
+    let here = std::thread::current().id();
+    let there = std::thread::spawn(|| std::thread::current().id())
+        .join()
+        .expect("joined");
+    assert!(!should_join(here, here));
+    assert!(should_join(there, here));
+}
+
+thread_local! {
+    /// Comparisons made by [`Counted`] on this thread.
+    static COMPARES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A key that counts its comparisons, equality ones too.
+#[derive(Clone, Copy, Debug)]
+struct Counted(u64);
+
+impl PartialEq for Counted {
+    fn eq(&self, other: &Self) -> bool {
+        COMPARES.with(|c| c.set(c.get() + 1));
+        self.0 == other.0
+    }
+}
+
+impl Eq for Counted {}
+
+impl Ord for Counted {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        COMPARES.with(|c| c.set(c.get() + 1));
+        self.0.cmp(&other.0)
+    }
+}
+
+impl PartialOrd for Counted {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Comparisons `f` makes.
+fn compares(f: impl FnOnce()) -> u64 {
+    let before = COMPARES.with(std::cell::Cell::get);
+    f();
+    COMPARES.with(std::cell::Cell::get) - before
+}
+
+#[test]
+fn a_destroy_costs_the_same_however_many_wait() {
+    let per_call = |n: u64| {
+        let mut pending = Pending::default();
+        for i in 0..n {
+            assert!(pending.push(Counted(i), FenceValue::new(1000 + i)));
+        }
+        let lookup = compares(|| assert!(pending.contains(&Counted(n / 2))));
+        let refused = compares(|| assert!(!pending.push(Counted(n - 1), FenceValue::new(1))));
+        let settle = compares(|| assert_eq!(pending.take_due(FenceValue::new(999)), Vec::new()));
+        assert_eq!(pending.len(), usize::try_from(n).expect("small"));
+        (lookup, refused, settle)
+    };
+    let (small, big) = (per_call(16), per_call(1 << 16));
+    // A scan of the waiting ids would make about 2^15 comparisons for the big set; the index
+    // makes a few per tree level, and a settle with nothing due compares no id.
+    assert!(big.0 <= 128 && big.1 <= 128, "{small:?} {big:?}");
+    assert_eq!((small.2, big.2), (0, 0));
+}
+
+#[test]
+fn due_destroys_come_out_in_fence_then_call_order() {
+    let mut pending = Pending::default();
+    for (id, after) in [(1, 3), (2, 1), (3, 3), (4, 2), (5, 4), (6, 1)] {
+        assert!(pending.push(Counted(id), FenceValue::new(after)));
+    }
+    assert!(
+        !pending.push(Counted(4), FenceValue::new(9)),
+        "waiting already"
+    );
+    assert_eq!(pending.take_due(FenceValue::ZERO), Vec::new());
+    assert_eq!(
+        pending.take_due(FenceValue::new(1)),
+        vec![Counted(2), Counted(6)],
+        "equal to the completed value is due"
+    );
+    assert_eq!(
+        pending.take_due(FenceValue::new(3)),
+        vec![Counted(4), Counted(1), Counted(3)]
+    );
+    assert!(
+        !pending.contains(&Counted(1)),
+        "taken ids are no longer waiting"
+    );
+    assert!(pending.contains(&Counted(5)), "one above stays");
+    assert!(
+        pending.push(Counted(1), FenceValue::new(9)),
+        "a taken id may wait again"
+    );
+    assert_eq!(
+        pending.take_due(FenceValue::new(u64::MAX)),
+        vec![Counted(5), Counted(1)]
+    );
+    assert_eq!(pending.len(), 0);
+}
+
+#[test]
+fn pending_ids_of_different_kinds_or_generations_differ() {
+    let mut pending = Pending::default();
+    let buffer = PendingId(ResourceId::Buffer(BufferId::new(1, 2)));
+    assert!(pending.push(buffer, FenceValue::new(5)));
+    for other in [
+        ResourceId::Texture(TextureId::new(1, 2)),
+        ResourceId::View(ViewId::new(1, 2)),
+        ResourceId::Sampler(SamplerId::new(1, 2)),
+        ResourceId::Buffer(BufferId::new(1, 3)),
+        ResourceId::Buffer(BufferId::new(2, 2)),
+    ] {
+        assert!(!pending.contains(&PendingId(other)), "{other:?}");
+    }
+    assert!(pending.contains(&PendingId(ResourceId::Buffer(BufferId::new(1, 2)))));
+}

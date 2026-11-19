@@ -23,11 +23,18 @@
 //!
 //! - an upload or buffer-to-buffer copy whose buffer range is not 4-byte aligned, and a buffer
 //!   copy within one buffer;
-//! - a texture copy within one mip level of one texture whose layer ranges overlap, between
-//!   formats that differ by more than sRGB, or covering part of a depth, stencil or
+//! - a texture copy between formats that differ by more than sRGB; within one mip level of one
+//!   texture, a 1D, 2D or cube copy whose layer ranges overlap and a 3D copy whose regions start
+//!   at the same slice; and a copy covering part of the width or height of a depth, stencil or
 //!   multisampled level;
-//! - an upload, buffer copy or readback of depth or stencil texels, and a buffer side of a
-//!   texture copy that does not start on a texel block;
+//! - an upload, buffer copy or readback of two-aspect depth-stencil texels; an upload or buffer
+//!   copy into `D32_FLOAT`; any of them for depth or stencil texels on a device without
+//!   `DownlevelFlags::DEPTH_TEXTURE_AND_BUFFER_COPIES`, covering part of the level's width or
+//!   height, or with a buffer side off a 4-byte boundary; and a copy between a buffer and a
+//!   depth or stencil texture of several rows that are not a multiple of 256 bytes;
+//! - a buffer side of a colour texture copy that does not start on a texel block;
+//! - a texture readback whose rows, padded to 256 bytes, would not fit the largest buffer (a
+//!   dumped frame in that case is not refused: its pixels are reported unknown);
 //! - a partial clear of a depth, stencil or multisampled view;
 //! - the texture shapes, view formats and border colours wgpu cannot make.
 //!

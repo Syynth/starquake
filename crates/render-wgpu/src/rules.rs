@@ -35,15 +35,48 @@
 //!   the backend reads the aligned range around them.
 //! - [`check_buffer_copy`]: a buffer-to-buffer copy is between two buffers, even when the
 //!   ranges do not overlap (`copy_buffer_to_buffer`, `TransferError::SameSourceDestinationBuffer`).
-//! - [`check_buffer_texture`]: a copy between a buffer and a texture, an upload into a texture
-//!   and a readback of a texture move colour texels only, and the buffer side starts on a
-//!   multiple of the format's block size (`validate_texture_buffer_copy`). Depth and stencil
-//!   texels go through the fallback conversions later (render-backend, "Formats").
+//! - [`check_buffer_texture`], in this order, for a copy between a buffer and a texture, an
+//!   upload into a texture and a readback of a texture (`validate_texture_copy_src_format`,
+//!   `validate_texture_copy_dst_format`, `validate_texture_buffer_copy` and
+//!   `validate_texture_copy_range`):
+//!   1. a colour texture's buffer side starts on a multiple of the format's block size
+//!      (`UnalignedBufferOffset`), and nothing else below applies to it;
+//!   2. a depth or stencil texture's texels move only for a single-aspect format (`D16_UNORM`,
+//!      `D32_FLOAT`, `S8_UINT`): this backend names no aspect in a copy, and wgpu copies one
+//!      aspect at a time (`CopyAspectNotOne`);
+//!   3. nothing is copied into a `D32_FLOAT` texture (wgpu's `Depth32Float` is never a copy
+//!      destination, `CopyToForbiddenTextureFormat`);
+//!   4. the device can copy depth and stencil texels to and from buffers
+//!      (`DownlevelFlags::DEPTH_TEXTURE_AND_BUFFER_COPIES`);
+//!   5. the buffer side starts on a multiple of [`DEPTH_COPY_OFFSET_ALIGNMENT`] bytes, wgpu's
+//!      offset alignment for every depth-stencil format;
+//!   6. the texture side covers the whole width and height of its mip level, with any layers
+//!      (`UnsupportedPartialTransfer`).
+//!
+//!   And [`check_depth_buffer_rows`], for a copy between a guest buffer and a depth or stencil
+//!   texture (not an upload or a readback): its rows are a multiple of 256 bytes
+//!   (`COPY_BYTES_PER_ROW_ALIGNMENT`) or it has one row of texels in each layer. Guest buffer
+//!   data is tightly packed, so wgpu's 256-byte row stride fits it only then, and the one copy
+//!   per row a colour copy falls back to is a partial copy wgpu refuses for these formats.
+//!   An upload (`Queue::write_texture` needs no stride alignment) and a readback (read with
+//!   padded rows, [`check_read_size`]) have no such limit.
+//!
+//!   Two-aspect texels (`D32_FLOAT_S8_UINT`, the format the fallback picks for
+//!   `D24_UNORM_S8_UINT`) are refused by 2; [`crate::caps`] says what that leaves `Caps`
+//!   claiming.
 //! - [`check_texture_copy`], in this order: a texture-to-texture copy is between formats that
-//!   differ at most in sRGB; within one texture, it is between different mip levels or layer
-//!   ranges that do not overlap, even when the regions do not (`validate_copy_within_same_texture`,
-//!   which compares the z ranges of the two sides); and a copy of a depth, stencil or
-//!   multisampled texture covers the whole mip level (`validate_texture_copy_range`).
+//!   differ at most in sRGB; within one mip level of one texture, a 1D, 2D or cube copy is
+//!   between layer ranges that do not overlap, whatever the regions' x and y, and a 3D copy is
+//!   between regions whose first slices differ (`validate_copy_within_same_texture`, to which
+//!   wgpu passes the copy's layer count for a 2D texture and 1 for a 1D or 3D one; the shared
+//!   checks have already refused regions that share a texel); and a copy of a depth, stencil
+//!   or multisampled texture covers the whole width and height of the mip level, with any
+//!   layers (`validate_texture_copy_range`, whose z check never asks for the whole extent).
+//! - [`check_read_size`]: a readback of a texture reads into a buffer of its own in one copy,
+//!   with each row padded to wgpu's 256-byte row stride (`COPY_BYTES_PER_ROW_ALIGNMENT`), and
+//!   that buffer must fit `Caps::limits.max_buffer_size`; a bigger one is refused. A frame dump
+//!   whose read would not fit is not refused: its pixels are reported unknown
+//!   ([`crate::plan`]).
 //! - [`check_clear_area`]: a clear of part of a multisampled or depth or stencil view is
 //!   refused; the backend clears part of a view by clearing a scratch texture and copying it in,
 //!   which those copies forbid.
@@ -91,9 +124,17 @@ pub const MULTISAMPLED_VIEW: &str = "a view of a multisampled texture is 2D unde
 /// A buffer range off the copy alignment.
 pub const BUFFER_ALIGNMENT: &str =
     "a buffer range the wgpu backend writes or copies starts and ends on a 4-byte boundary";
-/// A buffer copy of depth or stencil texels.
-pub const DEPTH_BUFFER_COPY: &str =
-    "the wgpu backend does not copy depth or stencil texels to or from buffers yet";
+/// A buffer copy of a two-aspect depth-stencil texture's texels.
+pub const DEPTH_STENCIL_BUFFER_COPY: &str =
+    "the wgpu backend does not copy depth-stencil texels to or from buffers yet";
+/// An upload or buffer copy into a 32-bit float depth texture.
+pub const DEPTH32_DESTINATION: &str =
+    "wgpu cannot copy into a 32-bit float depth texture from a buffer";
+/// A buffer copy of depth or stencil texels on a device that cannot make one.
+pub const DEPTH_COPIES: &str = "this device cannot copy depth or stencil texels to or from buffers";
+/// A buffer side of a depth or stencil copy that is not on a 4-byte boundary.
+pub const DEPTH_OFFSET: &str =
+    "a buffer copied to or from a depth or stencil texture starts on a 4-byte boundary";
 /// A buffer side of a texture copy that is not on a block boundary.
 pub const BLOCK_OFFSET: &str =
     "a buffer copied to or from a texture starts on a multiple of the texel block size";
@@ -101,12 +142,12 @@ pub const BLOCK_OFFSET: &str =
 pub const COPY_FORMATS: &str = "a wgpu texture copy is between formats that differ at most in sRGB";
 /// A buffer-to-buffer copy within one buffer.
 pub const SAME_BUFFER: &str = "a wgpu buffer copy is between two buffers";
-/// A texture-to-texture copy within one mip level and overlapping layers of one texture.
+/// A texture-to-texture copy within one mip level of one texture whose layer ranges overlap (for
+/// a 3D texture, whose first slices are equal).
 pub const SAME_LEVEL: &str =
     "a wgpu copy within one texture is between different mip levels or layers";
-/// A partial copy of a depth, stencil or multisampled texture.
-pub const WHOLE_COPY: &str =
-    "a wgpu copy of a depth, stencil or multisampled texture covers the whole mip level";
+/// A copy of part of the width or height of a depth, stencil or multisampled texture's level.
+pub const WHOLE_COPY: &str = "a wgpu copy of a depth, stencil or multisampled texture covers the whole width and height of its mip level";
 /// A partial clear of a depth, stencil or multisampled view.
 pub const WHOLE_CLEAR: &str =
     "the wgpu backend clears depth, stencil and multisampled views only whole";
@@ -255,25 +296,126 @@ pub fn check_buffer_copy(src: BufferId, dst: BufferId) -> Result<(), RenderError
     }
 }
 
-/// Checks the texture side of a buffer copy, an upload or a readback, of `format`, whose buffer
-/// side starts at `buffer_offset` (an upload's staging bytes start at 0).
-pub fn check_buffer_texture(format: PixelFormat, buffer_offset: u64) -> Result<(), RenderError> {
-    if format.aspect() != FormatAspect::Color {
-        return Err(unsupported(DEPTH_BUFFER_COPY));
-    }
-    if buffer_offset.is_multiple_of(format.bytes_per_block().into()) {
+/// Which way a copy between a buffer and a texture moves texels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TexelFlow {
+    /// From a buffer or staging memory into the texture (an upload or a buffer-to-texture copy).
+    IntoTexture,
+    /// From the texture into a buffer (a texture-to-buffer copy or a readback).
+    OutOfTexture,
+}
+
+/// A copy between a guest buffer and a depth or stencil texture of several rows that are not a
+/// multiple of 256 bytes.
+pub const DEPTH_ROWS: &str = "a wgpu copy between a buffer and a depth or stencil texture has rows of a multiple of 256 bytes or one row";
+
+/// Checks the rows of a copy between a guest buffer and a texture of `format`: `rows` rows of
+/// `row_bytes` bytes in each layer (module docs). Colour formats always pass.
+pub fn check_depth_buffer_rows(
+    format: PixelFormat,
+    row_bytes: u32,
+    rows: u32,
+) -> Result<(), RenderError> {
+    let color = format.aspect() == FormatAspect::Color;
+    if color || rows <= 1 || row_bytes.is_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) {
         Ok(())
     } else {
-        Err(unsupported(BLOCK_OFFSET))
+        Err(unsupported(DEPTH_ROWS))
     }
 }
 
-/// Whether `region` covers its whole mip level of `desc`.
-fn whole_level(desc: &TextureDesc, region: &TextureRegion) -> bool {
+/// The buffer offset alignment of a depth or stencil copy: wgpu-core 30.0.2
+/// `validate_texture_buffer_copy` uses 4 for every depth-stencil format, whatever its texel
+/// size.
+pub const DEPTH_COPY_OFFSET_ALIGNMENT: u64 = 4;
+
+/// Checks the texture side of a buffer copy, an upload or a readback of `region` of `desc`,
+/// whose buffer side starts at `buffer_offset` (an upload's staging bytes start at 0), in the
+/// order of the module docs. `depth_copies` is whether the device can copy depth and stencil
+/// texels to and from buffers (`DownlevelFlags::DEPTH_TEXTURE_AND_BUFFER_COPIES`).
+pub fn check_buffer_texture(
+    desc: &TextureDesc,
+    region: &TextureRegion,
+    buffer_offset: u64,
+    flow: TexelFlow,
+    depth_copies: bool,
+) -> Result<(), RenderError> {
+    let format = desc.format;
+    if format.aspect() == FormatAspect::Color {
+        return if buffer_offset.is_multiple_of(format.bytes_per_block().into()) {
+            Ok(())
+        } else {
+            Err(unsupported(BLOCK_OFFSET))
+        };
+    }
+    if !matches!(
+        texture_format(format),
+        Some(
+            wgpu::TextureFormat::Depth16Unorm
+                | wgpu::TextureFormat::Depth32Float
+                | wgpu::TextureFormat::Stencil8
+        )
+    ) {
+        return Err(unsupported(DEPTH_STENCIL_BUFFER_COPY));
+    }
+    if flow == TexelFlow::IntoTexture && format == PixelFormat::D32Float {
+        return Err(unsupported(DEPTH32_DESTINATION));
+    }
+    if !depth_copies {
+        return Err(unsupported(DEPTH_COPIES));
+    }
+    if !buffer_offset.is_multiple_of(DEPTH_COPY_OFFSET_ALIGNMENT) {
+        return Err(unsupported(DEPTH_OFFSET));
+    }
+    if !whole_width_and_height(desc, region) {
+        return Err(unsupported(WHOLE_COPY));
+    }
+    Ok(())
+}
+
+/// Whether `region` covers the whole width and height of its mip level of `desc`, with any
+/// layers or slices (wgpu's partial-copy check skips z, `validate_texture_copy_range`). A mip
+/// level the description lacks is never covered.
+fn whole_width_and_height(desc: &TextureDesc, region: &TextureRegion) -> bool {
     let Some(level) = desc.mip_extent(region.mip) else {
         return false;
     };
-    region.origin.x == 0 && region.origin.y == 0 && region.origin.z == 0 && region.extent == level
+    region.origin.x == 0
+        && region.origin.y == 0
+        && region.extent.width == level.width
+        && region.extent.height == level.height
+}
+
+/// A texture readback whose rows, each padded to wgpu's 256-byte row stride, take more bytes
+/// than the largest buffer.
+pub const READ_TOO_LARGE: &str =
+    "a texture readback with its rows padded to 256 bytes is larger than the largest buffer";
+
+/// The row stride and the size in bytes of a read of `rows` rows of `row_bytes` bytes in each
+/// of `images` images, with every row padded to `COPY_BYTES_PER_ROW_ALIGNMENT` so that one wgpu
+/// copy reads them all (`crate::thread`), or `None` when either overflows.
+pub fn padded_read(row_bytes: u32, rows: u32, images: u32) -> Option<(u32, u64)> {
+    let stride = row_bytes.checked_next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)?;
+    let size = u64::from(stride)
+        .checked_mul(rows.into())?
+        .checked_mul(images.into())?;
+    Some((stride, size))
+}
+
+/// Checks that a texture readback of `rows` rows of `row_bytes` bytes in each of `images`
+/// images, padded as [`padded_read`] pads it, fits in a buffer of `max_buffer_size` bytes
+/// (`Caps::limits`). The read buffer is a wgpu buffer like any other, and the padding is what
+/// bounds its size: at most 255 bytes more per row than the packed bytes.
+pub fn check_read_size(
+    row_bytes: u32,
+    rows: u32,
+    images: u32,
+    max_buffer_size: u64,
+) -> Result<(), RenderError> {
+    match padded_read(row_bytes, rows, images) {
+        Some((_, size)) if size <= max_buffer_size => Ok(()),
+        _ => Err(unsupported(READ_TOO_LARGE)),
+    }
 }
 
 /// Checks a texture-to-texture copy that has passed `validate_copy`.
@@ -287,19 +429,24 @@ pub fn check_texture_copy(
     if base(src.format).is_none() || base(src.format) != base(dst.format) {
         return Err(unsupported(COPY_FORMATS));
     }
-    let layers = |r: &TextureRegion| {
-        let start = u64::from(r.origin.z);
-        start..start + u64::from(r.extent.depth_or_layers)
-    };
-    let (s, d) = (layers(src_region), layers(dst_region));
-    if src_region.texture == dst_region.texture
-        && src_region.mip == dst_region.mip
-        && s.start < d.end
-        && d.start < s.end
-    {
-        return Err(unsupported(SAME_LEVEL));
+    if src_region.texture == dst_region.texture && src_region.mip == dst_region.mip {
+        let (s, d) = (src_region.origin.z, dst_region.origin.z);
+        let overlap = if src.dimension == TextureDimension::D3 {
+            // wgpu passes a 3D copy a layer count of 1: only an equal first slice is refused.
+            s == d
+        } else {
+            // Each side's own range (the shared checks make the two extents equal).
+            let end = |start: u32, r: &TextureRegion| {
+                u64::from(start) + u64::from(r.extent.depth_or_layers)
+            };
+            u64::from(s) < end(d, dst_region) && u64::from(d) < end(s, src_region)
+        };
+        if overlap {
+            return Err(unsupported(SAME_LEVEL));
+        }
     }
-    let partial = !whole_level(src, src_region) || !whole_level(dst, dst_region);
+    let partial =
+        !whole_width_and_height(src, src_region) || !whole_width_and_height(dst, dst_region);
     let restricted = src.format.aspect() != FormatAspect::Color || src.sample_count > 1;
     if restricted && partial {
         return Err(unsupported(WHOLE_COPY));

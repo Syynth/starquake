@@ -311,7 +311,7 @@ fn buffer_ranges_are_aligned_at_both_ends() {
 }
 
 #[test]
-fn buffer_sides_of_texture_copies_are_colour_on_block_boundaries() {
+fn buffer_sides_of_colour_copies_start_on_block_boundaries() {
     let cases = [
         (PixelFormat::A8B8G8R8Unorm, 4, Ok(())),
         (PixelFormat::A8B8G8R8Unorm, 2, Err(refused(BLOCK_OFFSET))),
@@ -325,18 +325,142 @@ fn buffer_sides_of_texture_copies_are_colour_on_block_boundaries() {
             8,
             Err(refused(BLOCK_OFFSET)),
         ),
-        (PixelFormat::D16Unorm, 0, Err(refused(DEPTH_BUFFER_COPY))),
-        (PixelFormat::S8Uint, 0, Err(refused(DEPTH_BUFFER_COPY))),
-        // Both faults: depth is reported first.
-        (PixelFormat::D32Float, 1, Err(refused(DEPTH_BUFFER_COPY))),
     ];
     for (format, offset, expected) in cases {
+        let desc = texture(format, 8, 8, SAMPLED);
+        // A partial region, with no device support for depth copies: neither matters to colour.
+        let part = region(0, 4, 4, 4);
+        for flow in [TexelFlow::IntoTexture, TexelFlow::OutOfTexture] {
+            assert_eq!(
+                check_buffer_texture(&desc, &part, offset, flow, false),
+                expected,
+                "{format} {offset} {flow:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn depth_and_stencil_buffer_copies_follow_wgpu_in_order() {
+    use TexelFlow::{IntoTexture, OutOfTexture};
+    let at = |format| texture(format, 8, 8, SAMPLED);
+    let whole = region(0, 0, 8, 8);
+    let check = |format, offset, flow, device| {
+        check_buffer_texture(&at(format), &whole, offset, flow, device)
+    };
+    // What wgpu allows: both ways for D16 and S8, out of D32 only.
+    for format in [PixelFormat::D16Unorm, PixelFormat::S8Uint] {
+        for flow in [IntoTexture, OutOfTexture] {
+            assert_eq!(check(format, 0, flow, true), Ok(()), "{format} {flow:?}");
+            assert_eq!(
+                check(format, DEPTH_COPY_OFFSET_ALIGNMENT, flow, true),
+                Ok(())
+            );
+        }
+    }
+    assert_eq!(check(PixelFormat::D32Float, 8, OutOfTexture, true), Ok(()));
+    // 2: two-aspect texels, either way.
+    for flow in [IntoTexture, OutOfTexture] {
         assert_eq!(
-            check_buffer_texture(format, offset),
-            expected,
-            "{format} {offset}"
+            check(PixelFormat::D32FloatS8Uint, 0, flow, true),
+            Err(refused(DEPTH_STENCIL_BUFFER_COPY))
         );
     }
+    // 3: into D32.
+    assert_eq!(
+        check(PixelFormat::D32Float, 0, IntoTexture, true),
+        Err(refused(DEPTH32_DESTINATION))
+    );
+    // 4: the device's downlevel flag.
+    assert_eq!(
+        check(PixelFormat::D16Unorm, 0, OutOfTexture, false),
+        Err(refused(DEPTH_COPIES))
+    );
+    // 5: four bytes, not the texel size (2 for D16, 1 for S8), one either side of the edge.
+    for format in [PixelFormat::D16Unorm, PixelFormat::S8Uint] {
+        for offset in [
+            DEPTH_COPY_OFFSET_ALIGNMENT - 1,
+            u64::from(format.bytes_per_block()),
+            DEPTH_COPY_OFFSET_ALIGNMENT + 1,
+        ] {
+            assert_eq!(
+                check(format, offset, OutOfTexture, true),
+                Err(refused(DEPTH_OFFSET)),
+                "{format} {offset}"
+            );
+        }
+    }
+    // 6: the whole width and height, any layers.
+    let array = TextureDesc {
+        size: Extent3d {
+            width: 8,
+            height: 8,
+            depth_or_layers: 3,
+        },
+        ..at(PixelFormat::D16Unorm)
+    };
+    let one_layer = TextureRegion {
+        origin: Origin3d { x: 0, y: 0, z: 2 },
+        ..whole
+    };
+    assert_eq!(
+        check_buffer_texture(&array, &one_layer, 0, OutOfTexture, true),
+        Ok(())
+    );
+    for part in [
+        region(0, 0, 7, 8),
+        region(0, 1, 7, 8),
+        TextureRegion {
+            origin: Origin3d { x: 0, y: 1, z: 0 },
+            extent: Extent3d {
+                width: 8,
+                height: 7,
+                depth_or_layers: 1,
+            },
+            ..whole
+        },
+        TextureRegion { mip: 1, ..whole },
+    ] {
+        assert_eq!(
+            check_buffer_texture(&array, &part, 0, IntoTexture, true),
+            Err(refused(WHOLE_COPY)),
+            "{part:?}"
+        );
+    }
+}
+
+#[test]
+fn depth_and_stencil_buffer_copy_rules_report_the_earlier_fault() {
+    use TexelFlow::IntoTexture;
+    let at = |format| texture(format, 8, 8, SAMPLED);
+    // Each pair of faults reports the earlier rule.
+    let part = region(0, 1, 7, 8);
+    assert_eq!(
+        check_buffer_texture(
+            &at(PixelFormat::D32FloatS8Uint),
+            &part,
+            1,
+            IntoTexture,
+            false
+        ),
+        Err(refused(DEPTH_STENCIL_BUFFER_COPY)),
+        "2 before 3, 4, 5 and 6"
+    );
+    assert_eq!(
+        check_buffer_texture(&at(PixelFormat::D32Float), &part, 1, IntoTexture, false),
+        Err(refused(DEPTH32_DESTINATION)),
+        "3 before 4, 5 and 6"
+    );
+    assert_eq!(
+        check_buffer_texture(&at(PixelFormat::D16Unorm), &part, 1, IntoTexture, false),
+        Err(refused(DEPTH_COPIES)),
+        "4 before 5 and 6"
+    );
+    assert_eq!(
+        check_buffer_texture(&at(PixelFormat::D16Unorm), &part, 1, IntoTexture, true),
+        Err(refused(DEPTH_OFFSET)),
+        "5 before 6"
+    );
 }
 
 fn region(texture: u32, x: u32, width: u32, height: u32) -> TextureRegion {
@@ -583,4 +707,170 @@ fn host_buffers_round_up_to_the_copy_alignment() {
     assert_eq!(host_buffer_size(5), Some(8));
     assert_eq!(host_buffer_size(u64::MAX - 3), Some(u64::MAX - 3));
     assert_eq!(host_buffer_size(u64::MAX - 2), None);
+}
+
+#[test]
+fn depth_and_stencil_copies_cover_x_and_y_with_any_layers() {
+    // A 4-layer depth array (a cube's six faces are the same rule): wgpu's partial-copy check
+    // covers x and y only, so one layer is a whole copy.
+    let array = TextureDesc {
+        size: Extent3d {
+            width: 8,
+            height: 8,
+            depth_or_layers: 4,
+        },
+        ..texture(PixelFormat::D32Float, 8, 8, SAMPLED)
+    };
+    let layer = |texture, z, layers| TextureRegion {
+        origin: Origin3d { x: 0, y: 0, z },
+        extent: Extent3d {
+            width: 8,
+            height: 8,
+            depth_or_layers: layers,
+        },
+        ..region(texture, 0, 8, 8)
+    };
+    assert_eq!(
+        check_texture_copy(&array, &layer(0, 2, 1), &array, &layer(1, 3, 1)),
+        Ok(()),
+        "one layer of a depth array"
+    );
+    assert_eq!(
+        check_texture_copy(&array, &layer(0, 1, 3), &array, &layer(1, 0, 3)),
+        Ok(()),
+        "three of four layers"
+    );
+    // One texel short in x or y, or one texel in from the edge, on either side.
+    let narrow = TextureRegion {
+        extent: Extent3d {
+            width: 7,
+            height: 8,
+            depth_or_layers: 1,
+        },
+        ..layer(0, 2, 1)
+    };
+    let short = TextureRegion {
+        extent: Extent3d {
+            width: 8,
+            height: 7,
+            depth_or_layers: 1,
+        },
+        ..layer(1, 3, 1)
+    };
+    let shifted_y = TextureRegion {
+        origin: Origin3d { x: 0, y: 1, z: 3 },
+        extent: Extent3d {
+            width: 8,
+            height: 7,
+            depth_or_layers: 1,
+        },
+        ..layer(1, 3, 1)
+    };
+    for (src, dst) in [
+        (narrow, layer(1, 3, 1)),
+        (layer(0, 2, 1), short),
+        (layer(0, 2, 1), shifted_y),
+    ] {
+        assert_eq!(
+            check_texture_copy(&array, &src, &array, &dst),
+            Err(refused(WHOLE_COPY)),
+            "{src:?} {dst:?}"
+        );
+    }
+    // A stencil array follows the same rule.
+    let stencil = TextureDesc {
+        format: PixelFormat::S8Uint,
+        ..array
+    };
+    assert_eq!(
+        check_texture_copy(&stencil, &layer(0, 0, 1), &stencil, &layer(1, 1, 1)),
+        Ok(())
+    );
+    assert_eq!(
+        check_texture_copy(&stencil, &narrow, &stencil, &layer(1, 1, 1)),
+        Err(refused(WHOLE_COPY))
+    );
+}
+
+#[test]
+fn copies_within_one_3d_texture_need_another_first_slice() {
+    let deep = TextureDesc {
+        dimension: TextureDimension::D3,
+        size: Extent3d {
+            width: 8,
+            height: 8,
+            depth_or_layers: 6,
+        },
+        ..texture(PixelFormat::A8B8G8R8Unorm, 8, 8, SAMPLED)
+    };
+    let at = |x, z| TextureRegion {
+        origin: Origin3d { x, y: 0, z },
+        extent: Extent3d {
+            width: 2,
+            height: 2,
+            depth_or_layers: 3,
+        },
+        ..region(0, 0, 1, 1)
+    };
+    // Regions apart in x whose slice ranges overlap: wgpu passes a 3D copy a layer count of 1,
+    // so only the first slices are compared.
+    assert_eq!(
+        check_texture_copy(&deep, &at(0, 0), &deep, &at(4, 1)),
+        Ok(()),
+        "first slices 0 and 1"
+    );
+    assert_eq!(
+        check_texture_copy(&deep, &at(0, 2), &deep, &at(4, 0)),
+        Ok(()),
+        "first slices 2 and 0"
+    );
+    assert_eq!(
+        check_texture_copy(&deep, &at(0, 1), &deep, &at(4, 1)),
+        Err(refused(SAME_LEVEL)),
+        "equal first slices"
+    );
+    // The same regions in a 2D array: the layer ranges overlap, so wgpu refuses.
+    let array = TextureDesc {
+        dimension: TextureDimension::D2,
+        ..deep
+    };
+    assert_eq!(
+        check_texture_copy(&array, &at(0, 0), &array, &at(4, 1)),
+        Err(refused(SAME_LEVEL))
+    );
+    assert_eq!(
+        check_texture_copy(&array, &at(0, 0), &array, &at(4, 3)),
+        Ok(()),
+        "layer ranges that touch at the end bound"
+    );
+}
+
+#[test]
+fn depth_buffer_copies_have_aligned_rows_or_one_row() {
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    for format in [
+        PixelFormat::D16Unorm,
+        PixelFormat::S8Uint,
+        PixelFormat::D32Float,
+    ] {
+        assert_eq!(
+            check_depth_buffer_rows(format, align, 4),
+            Ok(()),
+            "{format}"
+        );
+        assert_eq!(check_depth_buffer_rows(format, 2 * align, 2), Ok(()));
+        assert_eq!(check_depth_buffer_rows(format, 16, 1), Ok(()), "one row");
+        for row_bytes in [16, align - 1, align + 1] {
+            assert_eq!(
+                check_depth_buffer_rows(format, row_bytes, 2),
+                Err(refused(DEPTH_ROWS)),
+                "{format} {row_bytes}"
+            );
+        }
+    }
+    // Colour copies fall back to one copy per row instead.
+    assert_eq!(
+        check_depth_buffer_rows(PixelFormat::A8B8G8R8Unorm, 16, 4),
+        Ok(())
+    );
 }

@@ -28,7 +28,7 @@
 //! and the tightly packed row layout of every buffer side (`starquake_render::validate::packed_size`).
 
 use crate::format::texture_format;
-use crate::rules::{self, HostTexture};
+use crate::rules::{self, HostTexture, TexelFlow};
 use starquake_render::command::{
     ClearDesc, ClearValue, CopyRegion, PresentDesc, Rect, RenderTargets, TextureRegion,
 };
@@ -295,8 +295,9 @@ pub enum Step {
         desc: PresentDesc,
         /// The view's format.
         format: PixelFormat,
-        /// What a dumped frame reads, or `None` when the frame is not dumped or its format is
-        /// compressed (then a dump's pixels are unknown).
+        /// What a dumped frame reads, or `None` when the frame is not dumped, its format is
+        /// compressed, or its padded read would not fit the largest buffer (then a dump's
+        /// pixels are unknown).
         read: Option<(TexelBox, Rows)>,
     },
 }
@@ -312,9 +313,12 @@ pub struct Checked {
 
 /// Checks `list` and turns it into steps (module docs). `taken` holds the readback ids waiting
 /// to be taken or in flight.
+/// `depth_copies` is whether the device can copy depth and stencil texels to and from buffers
+/// (`rules::check_buffer_texture`).
 pub fn check(
     tables: &Tables,
     caps: &Caps,
+    depth_copies: bool,
     taken: &BTreeSet<ReadbackId>,
     list: CommandList,
 ) -> Result<Checked, RenderError> {
@@ -322,12 +326,12 @@ pub fn check(
     let mut used = BTreeSet::new();
     for command in list.commands {
         let step = match command {
-            Command::Upload { from, to } => upload_step(tables, from, &to)?,
+            Command::Upload { from, to } => upload_step(tables, depth_copies, from, &to)?,
             Command::Copy(copy) => {
                 let src = resolve(tables, &copy.src)?;
                 let dst = resolve(tables, &copy.dst)?;
                 validate::validate_copy(src, dst)?;
-                copy_step(src, dst)?
+                copy_step(src, dst, depth_copies)?
             }
             Command::Blit(_) => return Err(RenderError::Unsupported(BLITS_NOT_YET)),
             Command::Draw(_) | Command::Dispatch(_) => {
@@ -348,8 +352,11 @@ pub fn check(
                         size: slice.size,
                     },
                     Resolved::Texture { desc, region } => {
-                        rules::check_buffer_texture(desc.format, 0)?;
+                        let flow = TexelFlow::OutOfTexture;
+                        rules::check_buffer_texture(desc, region, 0, flow, depth_copies)?;
                         let (at, rows) = texel_box(desc.format, region)?;
+                        let max = caps.limits.max_buffer_size;
+                        rules::check_read_size(rows.row_bytes, rows.rows, rows.images, max)?;
                         ReadFrom::Texture { at, rows }
                     }
                 };
@@ -359,7 +366,7 @@ pub fn check(
                 out.readbacks.push(id);
                 Step::Readback { id, from }
             }
-            Command::Present(present) => present_step(tables, present)?,
+            Command::Present(present) => present_step(tables, caps, present)?,
             Command::Marker(_) => continue,
         };
         out.steps.push(step);
@@ -368,7 +375,12 @@ pub fn check(
 }
 
 /// The step for an upload of `from` into `to`.
-fn upload_step(tables: &Tables, from: StagingSlice, to: &CopyRegion) -> Result<Step, RenderError> {
+fn upload_step(
+    tables: &Tables,
+    depth_copies: bool,
+    from: StagingSlice,
+    to: &CopyRegion,
+) -> Result<Step, RenderError> {
     let len = u64::try_from(from.len()).unwrap_or(u64::MAX);
     let resolved = resolve(tables, to)?;
     validate::validate_upload(len, resolved)?;
@@ -382,7 +394,7 @@ fn upload_step(tables: &Tables, from: StagingSlice, to: &CopyRegion) -> Result<S
             }
         }
         Resolved::Texture { desc, region } => {
-            rules::check_buffer_texture(desc.format, 0)?;
+            rules::check_buffer_texture(desc, region, 0, TexelFlow::IntoTexture, depth_copies)?;
             let (at, rows) = texel_box(desc.format, region)?;
             Step::WriteTexture {
                 at,
@@ -433,8 +445,10 @@ fn clear_step(tables: &Tables, clear: &ClearDesc) -> Result<Step, RenderError> {
 }
 
 /// The step for a present: what a dumped frame reads, from the view's base level at its base
-/// layer (slice 0 of a 3D texture), as the recording backend reads it.
-fn present_step(tables: &Tables, present: PresentDesc) -> Result<Step, RenderError> {
+/// layer (slice 0 of a 3D texture), as the recording backend reads it. A dump whose padded read
+/// would not fit the largest buffer (`rules::check_read_size`) reads nothing, and its pixels
+/// are reported unknown.
+fn present_step(tables: &Tables, caps: &Caps, present: PresentDesc) -> Result<Step, RenderError> {
     let (view, tex) = tables.view(present.view)?;
     validate::validate_present(
         ResolvedView {
@@ -461,7 +475,11 @@ fn present_step(tables: &Tables, present: PresentDesc) -> Result<Step, RenderErr
                 depth_or_layers: 1,
             },
         };
-        Some(texel_box(format, &region)?)
+        let (at, rows) = texel_box(format, &region)?;
+        let max = caps.limits.max_buffer_size;
+        rules::check_read_size(rows.row_bytes, rows.rows, rows.images, max)
+            .ok()
+            .map(|()| (at, rows))
     } else {
         None
     };
@@ -526,7 +544,11 @@ pub fn texel_box(
 }
 
 /// The step for a copy that has passed `validate_copy`, after wgpu's rules.
-fn copy_step(src: Resolved<'_>, dst: Resolved<'_>) -> Result<Step, RenderError> {
+fn copy_step(
+    src: Resolved<'_>,
+    dst: Resolved<'_>,
+    depth_copies: bool,
+) -> Result<Step, RenderError> {
     Ok(match (src, dst) {
         (Resolved::Buffer { slice: s, .. }, Resolved::Buffer { slice: d, .. }) => {
             rules::check_buffer_range(s.offset, s.size)?;
@@ -541,8 +563,10 @@ fn copy_step(src: Resolved<'_>, dst: Resolved<'_>) -> Result<Step, RenderError> 
             }
         }
         (Resolved::Buffer { slice, .. }, Resolved::Texture { desc, region }) => {
-            rules::check_buffer_texture(desc.format, slice.offset)?;
+            let flow = TexelFlow::IntoTexture;
+            rules::check_buffer_texture(desc, region, slice.offset, flow, depth_copies)?;
             let (at, rows) = texel_box(desc.format, region)?;
+            rules::check_depth_buffer_rows(desc.format, rows.row_bytes, rows.rows)?;
             Step::BufferToTexture {
                 buffer: slice.buffer,
                 offset: slice.offset,
@@ -551,8 +575,10 @@ fn copy_step(src: Resolved<'_>, dst: Resolved<'_>) -> Result<Step, RenderError> 
             }
         }
         (Resolved::Texture { desc, region }, Resolved::Buffer { slice, .. }) => {
-            rules::check_buffer_texture(desc.format, slice.offset)?;
+            let flow = TexelFlow::OutOfTexture;
+            rules::check_buffer_texture(desc, region, slice.offset, flow, depth_copies)?;
             let (at, rows) = texel_box(desc.format, region)?;
+            rules::check_depth_buffer_rows(desc.format, rows.row_bytes, rows.rows)?;
             Step::TextureToBuffer {
                 at,
                 buffer: slice.buffer,
