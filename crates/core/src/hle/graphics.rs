@@ -44,9 +44,22 @@
 //!
 //! # The GPU front
 //!
-//! The GPU's own front (gpu-protocol, `crates/gpu`'s `GpuFront`, issue 12) is not built yet, so
-//! the front is [`NullFront`], which runs nothing. It does what the spec asks of the front's
-//! order and completion with no GPU behind it, so that a title waiting on the GPU is not stuck:
+//! gsv's servers take the GPU front as one `Arc<dyn GpuFront>` (`starquake_gpu::interface`,
+//! "`GpuFront` in parts"), each its part by upcasting. A graphics server has one of two:
+//!
+//! - **The GPU** ([`Graphics::with_gpu`]): `starquake_gpu::wiring::Gpu`, with its front and back
+//!   threads, built here with the `Syncpoints`, gsv's completion queue as its `Completions`, and
+//!   the render backend, shader cache, guest memory and write watch the caller gives in
+//!   [`GpuParts`] (gpu-protocol, "Graphics server sessions (#11)": "`core` creates the `Gpu`
+//!   ... and hands it to gsv"). Always a run ([`FrontMode::Live`]): the GPU completes its work
+//!   on its own (`a_run_with_the_gpu_completes_what_waits_on_it`, in `hle/tests/graphics.rs`).
+//!   Which backend a run uses, and when a run builds one, is render-backend slice R12's: the
+//!   machine still builds the null front ([`Graphics::new`]).
+//! - **The null front** ([`NullFront`], [`Graphics::new`]): for a run with no GPU back end, and
+//!   for every replay.
+//!
+//! [`NullFront`] runs nothing. It does what the spec asks of the front's order and completion
+//! with no GPU behind it, so that a title waiting on the GPU is not stuck:
 //!
 //! - an ordered update with a ticket, and a barrier, are done at once: it pushes
 //!   `GpuOrdered { ticket }` to the queue (spec: "Signals with no host work behind them happen at
@@ -126,8 +139,12 @@
 //! come: in a run the clock stopped, whatever a restored snapshot left fed back, which a live
 //! turn never delivers; in a replay no tick fed back) and then the kernel says so. With
 //! [`NullFront`] nothing is in flight on a GPU, so that is everything the turn could still
-//! signal; a GPU front with work in flight must add that (a follow-up for
-//! issue 12's front).
+//! signal. With the GPU, the GPU must be idle too (`Gpu::is_idle`: nothing queued for its front,
+//! every entry applied, no list in flight or open, and, while a channel is parked on an acquire,
+//! a poll run after the question began that found it still parked, which it waits for at most
+//! `starquake_gpu::wiring::IDLE_POLL_WAIT`), asked before gsv's queue, so
+//! that a completion the GPU pushes while the question is asked is either seen as work in flight
+//! or found queued (`a_graphics_server_with_a_busy_gpu_is_not_idle`).
 //!
 //! # Replay
 //!
@@ -189,11 +206,15 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
+use starquake_gpu::back::exec::ShaderCache;
+use starquake_gpu::channel::ChannelError;
+use starquake_gpu::front::HostClock;
 use starquake_gpu::interface::{
-    ChannelId, Completions, GpuCompletion, PresentRequest, SyncpointId, Ticket, VmUpdate,
+    ChannelId, Completions, GpuCompletion, GpuFront, PresentRequest, SyncpointId, Ticket, VmUpdate,
 };
 use starquake_gpu::syncpoint::Syncpoints;
 use starquake_gpu::vm::GpuVm;
+use starquake_gpu::wiring::{Gpu, GpuConfig, GpuDeps, GpuRing, WiringError};
 use starquake_gsv::completion::{Completion, CompletionQueue, Wake};
 use starquake_gsv::gpu::{self as gsv_gpu, AsId, GpuVmFront};
 use starquake_gsv::note::Note;
@@ -210,7 +231,8 @@ use starquake_kernel::dispatch::{DeviceShareError, Dispatcher, WakeError};
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::memory::DeviceShareToken;
 use starquake_kernel::result::{KernelError, SvcError, SvcResult};
-use starquake_memory::GuestMemory;
+use starquake_memory::{GuestMemory, WriteWatch};
+use starquake_render::Backend;
 use starquake_services::framework::{Halt, Notify, UnknownPolicy};
 use starquake_trace::{Env, EnvError, EventKind, HostNanos, Recorder, ThreadId};
 
@@ -361,6 +383,30 @@ impl ChannelFront for NullFront {
     }
 }
 
+impl GpuFront for NullFront {
+    /// Never: it reads no stream, so none can stop a channel.
+    fn channel_error(&self, _channel: ChannelId) -> Option<ChannelError> {
+        None
+    }
+}
+
+/// What a run gives [`Graphics::with_gpu`] to build the GPU with (module docs, "The GPU front").
+pub struct GpuParts {
+    /// The ring between the GPU's threads, made first so `backend` is built with its completion
+    /// wake ([`GpuRing::completion_wake`]).
+    pub ring: GpuRing,
+    /// The render backend.
+    pub backend: Arc<dyn Backend>,
+    /// The shader cache behind the GPU's draw path (its seam, `ShaderCache`).
+    pub shaders: Box<dyn ShaderCache + Send>,
+    /// The title's memory.
+    pub guest: Arc<dyn GuestMemory>,
+    /// The title's write watch, shared with the kernel.
+    pub watch: Arc<WriteWatch>,
+    /// The GPU's settings.
+    pub config: GpuConfig,
+}
+
 /// Why a note could not be fed back ([`Graphics::replay`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ReplayError {
@@ -381,7 +427,12 @@ pub enum ReplayError {
 /// The graphics server of a run: its shared state and its GPU front (module docs).
 pub struct Graphics {
     shared: Arc<Shared>,
-    front: Arc<NullFront>,
+    /// The front gsv's servers are given.
+    front: Arc<dyn GpuFront>,
+    /// The front, when it is the null front.
+    null: Option<Arc<NullFront>>,
+    /// The front, when it is the GPU.
+    gpu: Option<Arc<Gpu>>,
     /// Whether the run's own inputs complete things, or only recorded notes: the front's mode,
     /// which also picks the vsync clock's turn (module docs, "The timer thread's turn").
     mode: FrontMode,
@@ -392,14 +443,8 @@ impl Graphics {
     /// [`GSV_ROOT`], and a [`NullFront`] in `mode` (module docs, "What is built").
     #[must_use]
     pub fn new(mode: FrontMode, wake: Option<Arc<dyn Wake>>) -> Self {
-        let mut queue = CompletionQueue::new();
-        if let Some(wake) = wake {
-            queue = queue.with_wake(wake);
-        }
-        let queue = Arc::new(queue);
-        let completions: Arc<dyn Completions> = Arc::<CompletionQueue>::clone(&queue);
-        let syncpoints = Arc::new(Syncpoints::new(completions));
-        let front = Arc::new(NullFront::new(
+        let (queue, syncpoints) = Self::queue_and_syncpoints(wake);
+        let null = Arc::new(NullFront::new(
             mode,
             Arc::clone(&syncpoints),
             Arc::clone(&queue),
@@ -407,9 +452,65 @@ impl Graphics {
         let shared = Arc::new(Shared::new(syncpoints, queue, GSV_ROOT));
         Self {
             shared,
-            front,
+            front: Arc::<NullFront>::clone(&null),
+            null: Some(null),
+            gpu: None,
             mode,
         }
+    }
+
+    /// The queue, rung through `wake` if given, the syncpoints, gsv's shared state recording for
+    /// [`GSV_ROOT`], and the GPU over them and `parts`, in a run (module docs, "The GPU front").
+    ///
+    /// # Errors
+    ///
+    /// [`WiringError::Spawn`] when the GPU's threads cannot be started.
+    pub fn with_gpu(wake: Option<Arc<dyn Wake>>, parts: GpuParts) -> Result<Self, WiringError> {
+        let (queue, syncpoints) = Self::queue_and_syncpoints(wake);
+        let GpuParts {
+            ring,
+            backend,
+            shaders,
+            guest,
+            watch,
+            config,
+        } = parts;
+        let gpu = Arc::new(Gpu::new(
+            GpuDeps {
+                ring,
+                syncpoints: Arc::clone(&syncpoints),
+                completions: Arc::<CompletionQueue>::clone(&queue),
+                backend,
+                shaders,
+                guest,
+                watch,
+                front_clock: Arc::new(HostClock::new()),
+                fence_clock: Arc::new(HostClock::new()),
+            },
+            config,
+        )?);
+        let shared = Arc::new(Shared::new(syncpoints, queue, GSV_ROOT));
+        Ok(Self {
+            shared,
+            front: Arc::<Gpu>::clone(&gpu),
+            null: None,
+            gpu: Some(gpu),
+            mode: FrontMode::Live,
+        })
+    }
+
+    /// The completion queue, rung through `wake` if given, and the syncpoints that push to it.
+    fn queue_and_syncpoints(
+        wake: Option<Arc<dyn Wake>>,
+    ) -> (Arc<CompletionQueue>, Arc<Syncpoints>) {
+        let mut queue = CompletionQueue::new();
+        if let Some(wake) = wake {
+            queue = queue.with_wake(wake);
+        }
+        let queue = Arc::new(queue);
+        let completions: Arc<dyn Completions> = Arc::<CompletionQueue>::clone(&queue);
+        let syncpoints = Arc::new(Syncpoints::new(completions));
+        (queue, syncpoints)
     }
 
     /// gsv's shared state, with its syncpoints and queue.
@@ -418,10 +519,23 @@ impl Graphics {
         &self.shared
     }
 
-    /// The GPU front.
+    /// The GPU front gsv's servers are given.
     #[must_use]
-    pub const fn front(&self) -> &Arc<NullFront> {
+    pub const fn front(&self) -> &Arc<dyn GpuFront> {
         &self.front
+    }
+
+    /// The null front, when the front is the null front.
+    #[must_use]
+    pub const fn null_front(&self) -> Option<&Arc<NullFront>> {
+        self.null.as_ref()
+    }
+
+    /// The GPU, when the front is the GPU: its counters (`summary.json`'s, gpu-protocol
+    /// "Observability") and its flight recorder (`gpu.txt`).
+    #[must_use]
+    pub const fn gpu(&self) -> Option<&Arc<Gpu>> {
+        self.gpu.as_ref()
     }
 
     /// Puts gsv's servers in front of `dispatcher` (module docs, "What is built"), telling
@@ -442,12 +556,12 @@ impl Graphics {
             syncpt::syncpt_server(policy, Arc::clone(&self.shared)).with_service_id(GSV_SYNCPT);
         dispatcher.add_server(syncpt::SYNCPT_NAME, GSV_SYNCPT, None, Box::new(syncpt))?;
 
-        let vm: Arc<dyn GpuVmFront> = Arc::<NullFront>::clone(&self.front);
+        let vm: Arc<dyn GpuVmFront> = Arc::<dyn GpuFront>::clone(&self.front);
         let gpu = gsv_gpu::gpu_server(Arc::clone(&self.shared), Arc::clone(&vm), policy)
             .with_service_id(GSV_GPU);
         dispatcher.add_server(gsv_gpu::GPU_NAME, GSV_GPU, None, Box::new(gpu))?;
 
-        let channels: Arc<dyn ChannelFront> = Arc::<NullFront>::clone(&self.front);
+        let channels: Arc<dyn ChannelFront> = Arc::<dyn GpuFront>::clone(&self.front);
         let family = NvsrvFamily::new(Arc::clone(&self.shared), Arc::clone(&vm))
             .with_channel_front(channels);
         let delivering = Arc::new(Delivering {
@@ -524,6 +638,11 @@ impl Graphics {
     /// so it waits for a drain in progress, whose signals are then made.
     #[must_use]
     pub fn is_idle(&self) -> bool {
+        // The GPU first: a completion it pushes while this asks is then seen as work in flight
+        // or found queued below (module docs, "Telling a stalled run").
+        if self.gpu.as_ref().is_some_and(|gpu| !gpu.is_idle()) {
+            return false;
+        }
         let ticking = match self.mode {
             FrontMode::Live => self.shared.vsync_deadline().is_some(),
             FrontMode::Replay => false,

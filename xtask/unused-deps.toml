@@ -27,11 +27,3 @@
 # crate's own Cargo.toml. Each entry has a non-blank `reason`; an entry names the planned task or
 # the document row that says why the dependency is wanted.
 
-[[allow]]
-package = "starquake-core"
-dependencies = [
-    "starquake-render",
-    "starquake-shader",
-]
-reason = "core wires the whole stack (docs/architecture.md, 'Crates and dependency direction'); the walking skeleton joins the loader, cpu, kernel, trace, IPC and service crates, and the graphics layers join it as later milestones land (docs/roadmap.md, 'Route to milestone 1')"
-

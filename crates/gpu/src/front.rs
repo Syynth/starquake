@@ -35,13 +35,14 @@
 //!    ([`FrontShared::take`]). Markers the back reported end `SYNC_WAIT`s and catch-ups (the
 //!    waiting macro call runs again then).
 //! 2. Applies the requests in call order: address spaces and channels are made, submissions go
-//!    into their channel's queue, updates and barriers record their channels' positions, and
+//!    into their channel's queue, updates, barriers and presents record their channels'
+//!    positions (`ordered`), and
 //!    destroyed channels are dropped (their waiter removed, their process's upload record of
 //!    them forgotten, [`ProcessMacros::forget_channel`]).
 //! 3. Rechecks every waiting channel if the back reported a release or an increment, a
 //!    submission arrived, or the poll is due (spec, "Semaphore acquires", step 3). A latched
 //!    acquire resumes at once, even if the word has moved on (row 70).
-//! 4. Emits every ordered update that is ready (`ordered`).
+//! 4. Emits every ordered update, barrier and present that is ready (`ordered`).
 //! 5. Runs every runnable channel once, round robin from the channel after the one that ran
 //!    first in the previous turn, each for up to [`QUANTUM`] words.
 //! 6. Emits ordered updates again (channels may have finished the submissions they waited for),
@@ -99,10 +100,26 @@
 //! `a_raw_entry_with_its_low_address_bits_set_is_not_unaligned`). Only a hand-built
 //! `GpEntry` given straight to a `Channel` can be unaligned.
 //!
+//! # What the wiring adds
+//!
+//! The wiring (slice G21, `crate::wiring`) implements `GpuFront` over [`FrontShared`] and runs
+//! this loop on the front thread with [`Front::run_observed`], which hands it the front after
+//! every turn for its counters. Three hooks serve it:
+//!
+//! - **Presents** ([`FrontShared::present`]) wait like a barrier and are pushed as `Present`
+//!   entries once every submission queued before them has been read (`ordered`, "Presents").
+//! - **A destroyed channel is reported** to [`ChannelRetired`] ([`Front::with_retired`]) when
+//!   the front drops it, with how many ring entries it had pushed by then ([`Front::sent`]): the
+//!   back forgets the channel once it has taken that many, so every entry the channel made
+//!   reaches the back before it is forgotten.
+//! - **Idleness**: every turn makes [`FrontShared::is_quiet`] false when it starts
+//!   ([`FrontShared::take`]), whatever it took, since a turn the acquire poll starts takes
+//!   nothing; an idle turn makes it true again after the observer has run (in
+//!   [`Front::run_observed`]). [`Front::waits_on_poll`] tells the wiring whether a channel waits
+//!   on something only the poll finds.
+//!
 //! # Not here
 //!
-//! - `GpuFront` itself, which gsv calls (G21, the wiring), and presents (`GpuFront::present`,
-//!   which the wiring turns into a `Present` entry).
 //! - Snapshotting the front's state.
 
 mod lane;
@@ -126,17 +143,18 @@ use crate::channel::ChannelError;
 use crate::interface::{AsId, ChannelId, Completions, GpuCompletion, charge};
 use crate::macros::ProcessMacros;
 use crate::memory::GpuMemory;
-use crate::ring::{Producer, PushError};
+use crate::ring::{Producer, PushError, RingEntry};
 use crate::syncpoint::Syncpoints;
 use crate::vm::GpuVm;
 
 pub use lane::MAX_OTHER_FILES;
+use ordered::Emit;
 pub use ordered::OrderedTable;
 pub use poll::{
     Backoff, FrontClock, HostClock, IDLE_PARK, POLL_FIRST_SLEEP, POLL_LONGEST_SLEEP, POLL_SPINS,
 };
 pub use shared::{CreateError, FrontShared, fits};
-pub use thread::{FrontThread, spawn};
+pub use thread::{FrontThread, spawn, spawn_observed};
 
 use lane::{Lane, LaneCx, Wait};
 use ordered::Pending;
@@ -197,6 +215,15 @@ pub struct FrontCounters {
     pub macro_failures: u64,
     /// Channels stopped by a structural error.
     pub stopped_channels: u64,
+    /// Presents pushed (`ordered`, "Presents").
+    pub presents: u64,
+}
+
+/// Told when the front drops a destroyed channel (module docs, "What the wiring adds").
+pub trait ChannelRetired: Send + Sync {
+    /// The front dropped `channel` after pushing `after` ring entries ([`Front::sent`]); it
+    /// pushes nothing of the channel from then on.
+    fn retired(&self, channel: ChannelId, after: u64);
 }
 
 /// What the front is made with.
@@ -243,6 +270,7 @@ pub struct Front {
     /// When the poll is next due, while a channel waits on an acquire or a fence.
     poll_due: Option<Duration>,
     counters: FrontCounters,
+    retired: Option<Arc<dyn ChannelRetired>>,
 }
 
 impl Front {
@@ -263,7 +291,29 @@ impl Front {
             backoff: Backoff::new(),
             poll_due: None,
             counters: FrontCounters::default(),
+            retired: None,
         }
+    }
+
+    /// The front, telling `retired` of every channel it drops (module docs, "What the wiring
+    /// adds").
+    #[must_use]
+    pub fn with_retired(mut self, retired: Arc<dyn ChannelRetired>) -> Self {
+        self.retired = Some(retired);
+        self
+    }
+
+    /// Ring entries of every kind pushed so far, markers included: the back takes the
+    /// `n`-th entry (from 0) as the one pushed when this was `n`.
+    pub fn sent(&self) -> u64 {
+        self.ring.sent()
+    }
+
+    /// Whether the acquire poll is scheduled: a channel waits on an acquire or a fence, which
+    /// the poll rechecks (module docs, "One turn", step 3). A CPU write or an increment from
+    /// outside the GPU can end such a wait, and only the poll finds it.
+    pub fn waits_on_poll(&self) -> bool {
+        self.poll_due.is_some()
     }
 
     /// The counters so far.
@@ -328,14 +378,30 @@ impl Front {
     /// # Errors
     ///
     /// The turn's [`FrontError`].
-    pub fn run(mut self) -> Result<(), FrontError> {
+    pub fn run(self) -> Result<(), FrontError> {
+        self.run_observed(|_| {})
+    }
+
+    /// [`Front::run`], calling `observe` with the front after every turn, and marking the
+    /// shared state quiet ([`FrontShared::is_quiet`]) after each idle turn, after `observe`.
+    ///
+    /// # Errors
+    ///
+    /// The turn's [`FrontError`].
+    pub fn run_observed(mut self, mut observe: impl FnMut(&Self)) -> Result<(), FrontError> {
         loop {
-            match self.turn()? {
+            let turn = self.turn();
+            observe(&self);
+            match turn? {
                 Turn::Worked => {}
                 Turn::Stopped => return Ok(()),
-                Turn::Idle { park } if park.is_zero() => std::hint::spin_loop(),
                 Turn::Idle { park } => {
-                    self.shared.park(park);
+                    self.shared.mark_idle();
+                    if park.is_zero() {
+                        std::hint::spin_loop();
+                    } else {
+                        self.shared.park(park);
+                    }
                 }
             }
         }
@@ -423,7 +489,7 @@ impl Front {
                     .map(|(&id, lane)| (id, lane.taken))
                     .collect();
                 self.pending.push_back(Pending {
-                    update: OrderedUpdate { change, ticket },
+                    what: Emit::Ordered(OrderedUpdate { change, ticket }),
                     positions,
                 });
                 false
@@ -435,10 +501,22 @@ impl Front {
                     .map(|(&id, lane)| (id, lane.taken))
                     .collect();
                 self.pending.push_back(Pending {
-                    update: OrderedUpdate {
+                    what: Emit::Ordered(OrderedUpdate {
                         change: None,
                         ticket: Some(ticket),
-                    },
+                    }),
+                    positions,
+                });
+                false
+            }
+            Request::Present { request } => {
+                let positions = self
+                    .lanes
+                    .iter()
+                    .map(|(&id, lane)| (id, lane.taken))
+                    .collect();
+                self.pending.push_back(Pending {
+                    what: Emit::Present(request),
                     positions,
                 });
                 false
@@ -451,6 +529,9 @@ impl Front {
                     }
                 }
                 self.shared.forget(channel);
+                if let Some(retired) = &self.retired {
+                    retired.retired(channel, self.ring.sent());
+                }
                 false
             }
         }
@@ -538,10 +619,18 @@ impl Front {
                 continue;
             }
             if let Some(pending) = self.pending.remove(index) {
-                let token = self.ring.reserve_token();
-                self.ordered.insert(token, pending.update);
-                self.ring.push_marker(token);
-                self.counters.ordered = self.counters.ordered.saturating_add(1);
+                match pending.what {
+                    Emit::Ordered(update) => {
+                        let token = self.ring.reserve_token();
+                        self.ordered.insert(token, update);
+                        self.ring.push_marker(token);
+                        self.counters.ordered = self.counters.ordered.saturating_add(1);
+                    }
+                    Emit::Present(request) => {
+                        crate::regs::EntrySink::send(&mut self.ring, RingEntry::Present(request));
+                        self.counters.presents = self.counters.presents.saturating_add(1);
+                    }
+                }
                 emitted = true;
             }
         }

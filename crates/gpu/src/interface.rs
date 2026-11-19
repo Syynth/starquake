@@ -11,13 +11,30 @@
 //! [`Completions`], slice 6's [`Target`], [`RegionId`], [`Kind`] and [`VmUpdate`], and the front
 //! loop's (G14) [`AsId`], [`GpfifoEntry`], [`Submission`], [`Submitted`], [`ChannelConfig`] and
 //! [`CHANNEL_QUEUE_ENTRIES`] with its [`charge`], which gsv defined until the front existed and
-//! now re-exports. The
-//! block's `Syncpoints` and `GpuVm` have behaviour, not only a shape, so they live in
-//! [`crate::syncpoint`] and [`crate::vm`]. The rest of the block (`GpuFront`, `GpuError`) belongs
-//! here too when its slice (the wiring, G21) lands.
+//! now re-exports, and the wiring's (G21) [`GpuFront`] with [`GpuError`]. The block's
+//! `Syncpoints` and `GpuVm` have behaviour, not only a shape, so they live in
+//! [`crate::syncpoint`] and [`crate::vm`].
+//!
+//! # `GpuFront` in parts
+//!
+//! The spec's `GpuFront` is one trait of nine methods. gsv's servers each use a part of it, and
+//! defined those parts as traits of their own until this crate had a front (issue #332): the
+//! address tables' [`GpuVmFront`] (`create_address_space`, `update_vm`, `barrier`), the channels'
+//! [`ChannelFront`] (`create_channel`, `bind_class`, `submit`, `destroy_channel`) and the vsync
+//! latch's [`PresentFront`] (`present`). They are defined here now, with the spec's names and
+//! signatures, and gsv re-exports them where it named them. [`GpuFront`] is the three together
+//! plus the spec's `channel_error`, so a type that implements it is every part gsv asks for:
+//! `core` hands gsv one `Arc<dyn GpuFront>`, and each server takes its part by upcasting. The
+//! method set is the spec's nine; only the grouping is new.
+
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use starquake_memory::PageRange;
+
+use crate::channel::ChannelError;
+use crate::vm::GpuVm;
+
 /// The area of an image a present shows ([`PresentRequest::shown`]): the render backend's
 /// rectangle, named here so that gsv, which builds a [`PresentRequest`] and does not depend on
 /// the render crate, can name it too.
@@ -294,6 +311,67 @@ pub struct PresentRequest {
     pub layer: LayerId,
     /// The display.
     pub display: DisplayId,
+}
+
+/// The GPU front refused a request (graphics-server's `GpuError`). It carries no reason: gsv
+/// answers every refusal the same way, and the front logs why it refused (`crate::wiring`).
+/// gsv defined it until this crate had a front; it moved here unchanged (issue #332).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("the GPU front refused the request")]
+pub struct GpuError;
+
+/// What gsv asks of the GPU's front for its address tables: the address-table part of the spec's
+/// `GpuFront` (graphics-server, "What this spec offers and assumes of the GPU front/back";
+/// gpu-protocol, "Graphics server sessions (#11)"), with the spec's names and signatures.
+///
+/// Called with gsv's shared lock held: an implementation must not block on the GPU or call into
+/// gsv (it reports only through [`Completions::push`]).
+pub trait GpuVmFront: Send + Sync {
+    /// A new address space with its table.
+    fn create_address_space(&self, space: AsId, vm: Arc<GpuVm>);
+
+    /// An ordered update of `space`'s table, applied once no work queued before it can use the
+    /// old mapping; `done` is reported back when it is applied, if given.
+    fn update_vm(&self, space: AsId, update: VmUpdate, done: Option<Ticket>);
+
+    /// Reports `done` once all work and updates queued before it are finished.
+    fn barrier(&self, done: Ticket);
+}
+
+/// What gsv asks of the GPU's front for channels: the channel part of the spec's `GpuFront`,
+/// with the spec's names and signatures.
+///
+/// Called with gsv's shared lock held: an implementation must not block on the GPU or call into
+/// gsv (it reports only through [`Completions::push`]).
+pub trait ChannelFront: Send + Sync {
+    /// A new channel in `config`'s address space, incrementing `config`'s syncpoint.
+    fn create_channel(&self, config: ChannelConfig) -> Result<ChannelId, GpuError>;
+
+    /// Binds object class `class` on `channel`.
+    fn bind_class(&self, channel: ChannelId, class: u32) -> Result<(), GpuError>;
+
+    /// Queues `submission` on `channel`, or answers [`Submitted::Full`] and queues nothing.
+    fn submit(&self, channel: ChannelId, submission: Submission) -> Submitted;
+
+    /// Destroys `channel`.
+    fn destroy_channel(&self, channel: ChannelId);
+}
+
+/// Where the GPU front takes a latched frame: the present part of the spec's `GpuFront` (`fn
+/// present(&self, request: PresentRequest)`, "no fence: gsv latched it after its fence was
+/// reached").
+pub trait PresentFront: Send + Sync {
+    /// Shows `request`, ordered after the work queued before it.
+    fn present(&self, request: PresentRequest);
+}
+
+/// The spec's `GpuFront` (gpu-protocol, "Graphics server sessions (#11)"): the parts gsv's
+/// servers use, and `channel_error` (module docs, "`GpuFront` in parts"). Implemented by
+/// `crate::wiring::Gpu`, and by `core`'s null front for runs with no GPU back end.
+pub trait GpuFront: GpuVmFront + ChannelFront + PresentFront {
+    /// The structural error that stopped `channel`'s stream, if one did (gpu-protocol,
+    /// "Malformed streams": "the channel stops with a channel error ... and gsv is told").
+    fn channel_error(&self, channel: ChannelId) -> Option<ChannelError>;
 }
 
 #[cfg(test)]

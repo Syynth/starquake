@@ -152,10 +152,11 @@
 //! # Presents
 //!
 //! A present names no address space ([`PresentRequest`] carries only a GPU address), so presents
-//! read through the space [`Executor::set_present_space`] names; the wiring (slice G21) sets the
-//! title's. A **guess**: one GPU address space per title. The image is a block-linear 2D image
-//! of the request's size and block height, in the texture cache as any sampled texture
-//! (`present`), so a frame the GPU rendered is found as the render target it was drawn into.
+//! read through the space [`Executor::set_present_space`] names; the wiring (slice G21,
+//! `crate::wiring`) sets it to the first address space made. A **guess**: one GPU address space
+//! per title. The image is a block-linear 2D image of the request's size and block height, in
+//! the texture cache as any sampled texture (`present`), so a frame the GPU rendered is found as
+//! the render target it was drawn into.
 //! The frame number counts presents from 0. The command carries no fence wait (owner's
 //! decision of 2026-11-12, "Presents pace the game through a buffer queue"); it is ordered after
 //! every command before it by its place in the list, and the list is closed after it.
@@ -223,6 +224,7 @@ use compute::ComputeSink;
 use sinks::{CacheSink, Drained};
 
 pub use compute::ComputeError;
+pub use present::{PRESENT_FORMAT_RGB10A2, PRESENT_FORMAT_RGBA8};
 
 /// The shader cache as the executor sees it: the draw path's lookups ([`ShaderLookup`]) and the
 /// invalidations the back thread sends it for CPU writes, GPU writes and unmaps
@@ -623,6 +625,12 @@ impl Executor {
         &self.fences
     }
 
+    /// The fence path, to record on its open list, for tests of the back thread's idleness.
+    #[cfg(test)]
+    pub(crate) fn fences_mut(&mut self) -> &mut Fences {
+        &mut self.fences
+    }
+
     /// The class bound on `subchannel` of `channel`, if the channel is known and the subchannel
     /// bound.
     pub fn bound(&self, channel: ChannelId, subchannel: Subchannel) -> Option<ClassId> {
@@ -665,9 +673,7 @@ impl Executor {
         ring: &mut crate::ring::Consumer,
         timeout: Duration,
     ) -> Result<Step, FenceError> {
-        let woke = self.fences.wait(ring, timeout);
-        self.after_fences();
-        match woke? {
+        match self.wait(ring, timeout)? {
             crate::back::fence::Woke::Entry(entry) => Ok(match self.apply(&entry) {
                 Ok(()) => Step::Applied,
                 Err(error) => Step::Refused(error),
@@ -675,6 +681,25 @@ impl Executor {
             crate::back::fence::Woke::Completed(_) => Ok(Step::Completed),
             crate::back::fence::Woke::TimedOut => Ok(Step::TimedOut),
         }
+    }
+
+    /// The first half of [`Executor::step`]: the back thread's wait for its next piece of work
+    /// ([`Fences::wait`]), with what it applied handed on, but an entry not yet applied. For a
+    /// caller with something to do between taking an entry and applying it (the wiring's back
+    /// thread, `crate::wiring`, adds and forgets channels by ring position), which then calls
+    /// [`Executor::apply`].
+    ///
+    /// # Errors
+    ///
+    /// [`FenceError`] from the wait itself, as for [`Executor::step`].
+    pub fn wait(
+        &mut self,
+        ring: &mut crate::ring::Consumer,
+        timeout: Duration,
+    ) -> Result<crate::back::fence::Woke, FenceError> {
+        let woke = self.fences.wait(ring, timeout);
+        self.after_fences();
+        woke
     }
 
     /// Applies one ring entry (module docs, "Routing"). An error is logged at debug level and

@@ -717,8 +717,9 @@ reason = "declared in the root ahead of its first user"
 
     #[test]
     fn the_shipped_allowlist_is_valid() {
-        let list = Allowlist::parse(ALLOWLIST).unwrap();
-        assert!(list.pairs().next().is_some());
+        // The list may be empty: it is exact, and its last `[[allow]]` entry went when `core`
+        // started using the render and shader crates (issue #332). Valid is what it must be.
+        assert!(Allowlist::parse(ALLOWLIST).is_ok());
     }
 
     #[test]
