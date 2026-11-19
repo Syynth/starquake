@@ -54,6 +54,30 @@
 //! since `Caps` cannot say so). Without a depth test the depth state compares `Always` and does
 //! not write, as Vulkan does with the test off.
 //!
+//! Three states Vulkan and Eden accept, which wgpu-core 30.0.2 refuses when it creates the
+//! pipeline (`create_render_pipeline`'s depth-stencil block in `src/device/resource.rs`), are
+//! changed here rather than left to fail the pipeline, so its draws are not all skipped:
+//!
+//! - **A depth bias off triangles.** wgpu-core refuses a non-zero bias (constant or slope,
+//!   `DepthBiasState::is_enabled`) or a non-zero clamp on a topology that is not a triangle list
+//!   or strip (`DepthBiasWithIncompatibleTopology`). The GPU crate hands the guest's bias to
+//!   points and lines when the guest sets the offset enables, and Vulkan applies depth bias to
+//!   polygons only, so the bias (constant, slope and clamp) is zeroed unless wgpu's topology is
+//!   a triangle one (`wgpu::PrimitiveTopology::is_triangles`). Pinned by
+//!   `tests::depth_bias_is_dropped_off_triangles`.
+//! - **A stencil test on a depth-only target** (`D16_UNORM`, `D32_FLOAT`). wgpu-core refuses an
+//!   enabled stencil state (`StencilState::is_enabled`) on a format without a stencil aspect
+//!   (`FormatNotStencil`). Vulkan treats the missing aspect as the test passing, which is what
+//!   no stencil state does, so the stencil state is dropped.
+//! - **A depth test or write on a stencil-only target** (`S8_UINT`). wgpu-core refuses an
+//!   enabled depth state (`DepthStencilState::is_depth_enabled`: a compare other than `Always`,
+//!   or a write) on a format without a depth aspect (`FormatNotDepth`). As with stencil, the
+//!   missing aspect passes, so the depth state compares `Always` and does not write.
+//!
+//! The aspects are the format's ([`starquake_render::PixelFormat::aspect`]). The last two are
+//! pinned by `tests::depth_and_stencil_state_follow_the_formats_aspects`, and all three build on
+//! a GPU in `pipeline::tests::depth_and_stencil_state_wgpu_refuses_as_given_builds`.
+//!
 //! # Colour targets and blending
 //!
 //! Each target's format must have a wgpu form ([`TARGET_FORMAT`]). wgpu refuses a min or max
@@ -65,6 +89,7 @@
 use crate::convert::compare;
 use crate::format::texture_format;
 use starquake_render::RenderError;
+use starquake_render::format::FormatAspect;
 use starquake_render::pipeline::{
     BlendComponent, BlendFactor, BlendOperation, BlendState, ColorWrites, CullMode,
     DepthStencilState, FrontFace, GraphicsPipelineDesc, PolygonMode, StencilFace, StencilOperation,
@@ -298,33 +323,55 @@ fn bias_constant(constant: f32) -> i32 {
     constant.round() as i32
 }
 
+/// Which aspects a depth/stencil target format has: (depth, stencil).
+const fn aspects(format: starquake_render::PixelFormat) -> (bool, bool) {
+    match format.aspect() {
+        FormatAspect::Depth => (true, false),
+        FormatAspect::Stencil => (false, true),
+        FormatAspect::DepthStencil => (true, true),
+        // The shared checks refuse a colour format as the depth/stencil target, and wgpu-core
+        // would too (`FormatNotDepthOrStencil`); nothing of the state applies to it.
+        FormatAspect::Color => (false, false),
+    }
+}
+
+/// The depth and stencil state for a target of `format`, drawing `topology` (module docs,
+/// "Rasterisation, depth and stencil"): the state of an aspect the format lacks is dropped, and
+/// so is the bias off triangles.
 fn depth_stencil(
     format: starquake_render::PixelFormat,
     state: &DepthStencilState,
     bias: starquake_render::pipeline::DepthBias,
+    topology: wgpu::PrimitiveTopology,
 ) -> Result<wgpu::DepthStencilState, RenderError> {
-    let stencil = state
-        .stencil
-        .map_or_else(wgpu::StencilState::default, |s| wgpu::StencilState {
-            front: stencil_face(s.front),
-            back: stencil_face(s.back),
-            read_mask: s.read_mask,
-            write_mask: s.write_mask,
-        });
-    Ok(wgpu::DepthStencilState {
-        format: texture_format(format).ok_or(RenderError::Unsupported(TARGET_FORMAT))?,
-        depth_write_enabled: Some(state.depth_test.is_some() && state.depth_write),
-        depth_compare: Some(
-            state
-                .depth_test
-                .map_or(wgpu::CompareFunction::Always, compare),
-        ),
-        stencil,
-        bias: wgpu::DepthBiasState {
+    let host = texture_format(format).ok_or(RenderError::Unsupported(TARGET_FORMAT))?;
+    let (has_depth, has_stencil) = aspects(format);
+    let stencil =
+        state
+            .stencil
+            .filter(|_| has_stencil)
+            .map_or_else(wgpu::StencilState::default, |s| wgpu::StencilState {
+                front: stencil_face(s.front),
+                back: stencil_face(s.back),
+                read_mask: s.read_mask,
+                write_mask: s.write_mask,
+            });
+    let depth_test = state.depth_test.filter(|_| has_depth);
+    let bias = if topology.is_triangles() {
+        wgpu::DepthBiasState {
             constant: bias_constant(bias.constant),
             slope_scale: bias.slope_scale,
             clamp: bias.clamp,
-        },
+        }
+    } else {
+        wgpu::DepthBiasState::default()
+    };
+    Ok(wgpu::DepthStencilState {
+        format: host,
+        depth_write_enabled: Some(depth_test.is_some() && state.depth_write),
+        depth_compare: Some(depth_test.map_or(wgpu::CompareFunction::Always, compare)),
+        stencil,
+        bias,
     })
 }
 
@@ -419,7 +466,7 @@ pub(crate) fn graphics(desc: &GraphicsPipelineDesc) -> Result<GraphicsPlan, Rend
         .collect::<Result<Vec<_>, _>>()?;
     let depth_stencil = targets
         .depth_stencil
-        .map(|format| depth_stencil(format, &desc.depth_stencil, raster.depth_bias))
+        .map(|format| depth_stencil(format, &desc.depth_stencil, raster.depth_bias, topology))
         .transpose()?;
     Ok(GraphicsPlan {
         buffers,

@@ -554,6 +554,67 @@ fn hand_written_modules_become_pipelines() {
     });
 }
 
+/// The depth and stencil states wgpu-core would refuse as given (a bias on lines, a stencil test
+/// on a depth-only target, a depth test on a stencil-only one) build: `state` drops the part
+/// wgpu cannot take (`state` module docs, "Rasterisation, depth and stencil").
+#[test]
+fn depth_and_stencil_state_wgpu_refuses_as_given_builds() {
+    use starquake_render::pipeline::{DepthBias, StencilFace, StencilOperation, StencilState};
+    use starquake_render::resource::CompareFunction;
+    bounded(|| {
+        let Some(gpu) = gpu(
+            "depth and stencil",
+            Arc::new(ThreadPool),
+            WhileCompiling::Wait,
+        ) else {
+            return;
+        };
+        let vs = vertex(&gpu);
+        let depth_only = || {
+            let mut d = graphics_desc(vs, None);
+            d.targets.colors = [None; starquake_render::caps::GUEST_COLOR_TARGETS];
+            d
+        };
+        let face = StencilFace {
+            compare: CompareFunction::Equal,
+            fail: StencilOperation::Keep,
+            depth_fail: StencilOperation::IncrementClamp,
+            pass: StencilOperation::Replace,
+        };
+        let stencil = StencilState {
+            front: face,
+            back: face,
+            read_mask: 0xff,
+            write_mask: 0xff,
+        };
+        let mut biased_lines = depth_only();
+        biased_lines.topology = Topology::Lines;
+        biased_lines.targets.depth_stencil = Some(PixelFormat::D32Float);
+        biased_lines.raster.depth_bias = DepthBias {
+            constant: 2.0,
+            slope_scale: 1.5,
+            clamp: 0.0,
+        };
+        let mut stencil_on_d16 = depth_only();
+        stencil_on_d16.targets.depth_stencil = Some(PixelFormat::D16Unorm);
+        stencil_on_d16.depth_stencil.stencil = Some(stencil);
+        let mut depth_on_s8 = depth_only();
+        depth_on_s8.targets.depth_stencil = Some(PixelFormat::S8Uint);
+        depth_on_s8.depth_stencil.depth_test = Some(CompareFunction::Less);
+        depth_on_s8.depth_stencil.depth_write = true;
+        depth_on_s8.depth_stencil.stencil = Some(stencil);
+        for (what, desc) in [
+            ("a bias on lines", biased_lines),
+            ("a stencil test on D16", stencil_on_d16),
+            ("a depth test on S8", depth_on_s8),
+        ] {
+            let id = gpu.create_graphics_pipeline(desc).expect(what);
+            assert_eq!(settled(&gpu, id), PipelineStatus::Ready, "{what}");
+        }
+        assert_eq!(gpu.host_errors(), 0);
+    });
+}
+
 #[test]
 fn a_binding_array_becomes_a_pipeline_with_an_explicit_layout() {
     bounded(|| {

@@ -1,6 +1,8 @@
 use super::*;
 use crate::fixtures::{graphics_desc, no_blend};
-use starquake_render::pipeline::{DepthBias, StencilState, VertexBufferLayout, VertexLayout};
+use starquake_render::pipeline::{
+    DepthBias, DepthStencilState, StencilState, VertexBufferLayout, VertexLayout,
+};
 use starquake_render::resource::CompareFunction;
 use starquake_render::{PixelFormat, ShaderId};
 
@@ -475,14 +477,16 @@ fn every_blend_factor_and_operation_maps_by_name() {
 #[test]
 fn depth_and_stencil_convert() {
     let mut d = desc();
-    d.targets.depth_stencil = Some(PixelFormat::D32Float);
+    // A format with both aspects, so neither part is dropped (`depth_and_stencil_state_follow_
+    // the_formats_aspects` covers the one-aspect formats).
+    d.targets.depth_stencil = Some(PixelFormat::D32FloatS8Uint);
     // No depth test: always passes, never writes, even with the write flag set.
     d.depth_stencil.depth_write = true;
     let ds = graphics(&d)
         .expect("accepted")
         .depth_stencil
         .expect("depth state");
-    assert_eq!(ds.format, wgpu::TextureFormat::Depth32Float);
+    assert_eq!(ds.format, wgpu::TextureFormat::Depth32FloatStencil8);
     assert_eq!(ds.depth_compare, Some(wgpu::CompareFunction::Always));
     assert_eq!(ds.depth_write_enabled, Some(false));
     assert_eq!(ds.stencil, wgpu::StencilState::default());
@@ -551,6 +555,150 @@ fn depth_and_stencil_convert() {
         stencil_operation(StencilOperation::DecrementWrap),
         wgpu::StencilOperation::DecrementWrap
     );
+}
+
+/// A stencil state whose every field differs from wgpu's default, in our terms and wgpu's.
+fn stencil_pair() -> (StencilState, wgpu::StencilState) {
+    let ours = StencilState {
+        front: StencilFace {
+            compare: CompareFunction::Equal,
+            fail: StencilOperation::Zero,
+            depth_fail: StencilOperation::IncrementWrap,
+            pass: StencilOperation::Replace,
+        },
+        back: StencilFace {
+            compare: CompareFunction::NotEqual,
+            fail: StencilOperation::Invert,
+            depth_fail: StencilOperation::DecrementClamp,
+            pass: StencilOperation::IncrementClamp,
+        },
+        read_mask: 0x0f,
+        write_mask: 0xf0,
+    };
+    let theirs = wgpu::StencilState {
+        front: wgpu::StencilFaceState {
+            compare: wgpu::CompareFunction::Equal,
+            fail_op: wgpu::StencilOperation::Zero,
+            depth_fail_op: wgpu::StencilOperation::IncrementWrap,
+            pass_op: wgpu::StencilOperation::Replace,
+        },
+        back: wgpu::StencilFaceState {
+            compare: wgpu::CompareFunction::NotEqual,
+            fail_op: wgpu::StencilOperation::Invert,
+            depth_fail_op: wgpu::StencilOperation::DecrementClamp,
+            pass_op: wgpu::StencilOperation::IncrementClamp,
+        },
+        read_mask: 0x0f,
+        write_mask: 0xf0,
+    };
+    (ours, theirs)
+}
+
+/// A depth test, a depth write and a stencil test on each depth/stencil format wgpu has: the
+/// state of an aspect the format lacks is dropped, so wgpu-core's `FormatNotDepth` and
+/// `FormatNotStencil` checks (`DepthStencilState::is_depth_enabled`,
+/// `StencilState::is_enabled`) pass. Which format has which aspect is written out by hand.
+#[test]
+fn depth_and_stencil_state_follow_the_formats_aspects() {
+    let (stencil, host_stencil) = stencil_pair();
+    // Format, whether it has depth, whether it has stencil.
+    let cases = [
+        (PixelFormat::D16Unorm, true, false),
+        (PixelFormat::D32Float, true, false),
+        (PixelFormat::S8Uint, false, true),
+        (PixelFormat::D32FloatS8Uint, true, true),
+    ];
+    for (format, depth, has_stencil) in cases {
+        let mut d = desc();
+        d.targets.depth_stencil = Some(format);
+        d.depth_stencil = DepthStencilState {
+            depth_test: Some(CompareFunction::Less),
+            depth_write: true,
+            stencil: Some(stencil),
+        };
+        let ds = graphics(&d)
+            .expect("accepted")
+            .depth_stencil
+            .expect("depth state");
+        let (compare, write) = if depth {
+            (wgpu::CompareFunction::Less, true)
+        } else {
+            (wgpu::CompareFunction::Always, false)
+        };
+        assert_eq!(ds.depth_compare, Some(compare), "{format:?}");
+        assert_eq!(ds.depth_write_enabled, Some(write), "{format:?}");
+        assert_eq!(ds.is_depth_enabled(), depth, "{format:?}");
+        let expected = if has_stencil {
+            host_stencil.clone()
+        } else {
+            wgpu::StencilState::default()
+        };
+        assert_eq!(ds.stencil, expected, "{format:?}");
+        assert_eq!(ds.stencil.is_enabled(), has_stencil, "{format:?}");
+    }
+}
+
+/// Each bias term alone, and all three, on every topology wgpu draws: kept on triangles and
+/// dropped elsewhere, so wgpu-core's `DepthBiasWithIncompatibleTopology` check passes. Which
+/// guest topology is drawn as triangles is written out by hand.
+#[test]
+fn depth_bias_is_dropped_off_triangles() {
+    let biases = [
+        DepthBias {
+            constant: 2.0,
+            slope_scale: 0.0,
+            clamp: 0.0,
+        },
+        DepthBias {
+            constant: 0.0,
+            slope_scale: 1.5,
+            clamp: 0.0,
+        },
+        DepthBias {
+            constant: 0.0,
+            slope_scale: 0.0,
+            clamp: 0.25,
+        },
+        DepthBias {
+            constant: 2.0,
+            slope_scale: 1.5,
+            clamp: 0.25,
+        },
+    ];
+    let cases = [
+        (Topology::Points, false),
+        (Topology::Lines, false),
+        (Topology::LineLoop, false),
+        (Topology::LineStrip, false),
+        (Topology::Triangles, true),
+        (Topology::TriangleStrip, true),
+        (Topology::TriangleFan, true),
+        (Topology::Quads, true),
+        (Topology::QuadStrip, true),
+        (Topology::Polygon, true),
+    ];
+    for bias in biases {
+        for (guest, triangles) in cases {
+            let mut d = desc();
+            d.targets.depth_stencil = Some(PixelFormat::D32Float);
+            d.topology = guest;
+            d.raster.depth_bias = bias;
+            let ds = graphics(&d)
+                .expect("accepted")
+                .depth_stencil
+                .expect("depth state");
+            let expected = if triangles {
+                wgpu::DepthBiasState {
+                    constant: bias_constant(bias.constant),
+                    slope_scale: bias.slope_scale,
+                    clamp: bias.clamp,
+                }
+            } else {
+                wgpu::DepthBiasState::default()
+            };
+            assert_eq!(ds.bias, expected, "{guest:?} {bias:?}");
+        }
+    }
 }
 
 #[test]
