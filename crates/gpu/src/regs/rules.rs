@@ -6,11 +6,12 @@
 //! [`crate::classes`]. Sources are relative to the reference folder (`tools/refs-path.sh`), at
 //! the commits pinned in `docs/references.md`.
 
-use crate::classes::{Method, clc7c0, clc797};
+use crate::classes::{Method, cl902d, clc7c0, clc797};
 use crate::field::Field;
 use crate::fifo::METHOD_ADDRESS;
 use crate::ring::ClassId;
 
+use super::defaults::{DEFAULTS_2D, DEFAULTS_3D, RegisterDefault};
 use super::state_3d::STATE_3D;
 
 /// The bytes in a data word: the step of every byte offset that advances by one word.
@@ -248,50 +249,66 @@ pub struct ClassRules {
     data_loads: &'static [MethodSpan],
     state: &'static [MethodSpan],
     side_effects: &'static [SideEffect],
+    defaults: &'static [RegisterDefault],
 }
 
 /// The 3D class (`AMPERE_B`, `0xC797`): registers below its macro range (`CALL_MME_MACRO`,
 /// method 0xE00), shadow RAM controlled by `SET_MME_SHADOW_RAM_CONTROL` with the data loads
-/// [`DATA_LOADS_3D`], the state table [`STATE_3D`] and the side effects [`SIDE_EFFECTS_3D`].
+/// [`DATA_LOADS_3D`], the state table [`STATE_3D`], the side effects [`SIDE_EFFECTS_3D`] and
+/// the reset values [`DEFAULTS_3D`].
 pub const THREE_D: ClassRules = ClassRules {
     registers: clc797::CALL_MME_MACRO.method(),
     shadow_control: Some(clc797::SET_MME_SHADOW_RAM_CONTROL.method()),
     data_loads: DATA_LOADS_3D,
     state: STATE_3D,
     side_effects: SIDE_EFFECTS_3D,
+    defaults: DEFAULTS_3D,
 };
 
 /// The compute class (`AMPERE_COMPUTE_B`, `0xC7C0`): registers below its macro range
 /// (`CALL_MME_MACRO`, method 0xE00, as Eden-NX2's `kepler_compute.cpp` calls macros from 0xE00),
 /// no shadow RAM (the gpu-protocol spec applies it "for 3D", and Eden-NX2's compute engine has
-/// none, so no data loads either), no state methods (Eden-NX2's compute front sends every write, `FrontCallMethod`), and
-/// the side effects [`SIDE_EFFECTS_COMPUTE`].
+/// none, so no data loads either), no state methods (Eden-NX2's compute front sends every write, `FrontCallMethod`),
+/// the side effects [`SIDE_EFFECTS_COMPUTE`], and no reset values (Eden-NX2's `KeplerCompute`
+/// constructor sets no register).
 pub const COMPUTE: ClassRules = ClassRules {
     registers: clc7c0::CALL_MME_MACRO.method(),
     shadow_control: None,
     data_loads: &[],
     state: &[],
     side_effects: SIDE_EFFECTS_COMPUTE,
+    defaults: &[],
 };
 
-/// Every other class (DMA copy, inline-to-memory, 2D, and any class no rule set names): every
+/// Every other class (DMA copy, inline-to-memory, and any class no rule set names): every
 /// method a method header can address (`NVC76F_DMA_METHOD_ADDRESS`, 12 bits), no shadow RAM (so
-/// no data loads), no state methods and no side effects, so every write is sent.
+/// no data loads), no state methods and no side effects, so every write is sent, and no reset
+/// values (Eden-NX2's `MaxwellDMA` and `KeplerMemory` constructors set no register).
 pub const OTHER: ClassRules = ClassRules {
     registers: METHOD_ADDRESS.max() + 1,
     shadow_control: None,
     data_loads: &[],
     state: &[],
     side_effects: &[],
+    defaults: &[],
+};
+
+/// The 2D class (`FERMI_TWOD_A`, `0x902D`): as [`OTHER`] (every method a method header can
+/// address, no shadow RAM, no state methods, no side effects), with the reset values
+/// [`DEFAULTS_2D`].
+pub const TWO_D: ClassRules = ClassRules {
+    defaults: DEFAULTS_2D,
+    ..OTHER
 };
 
 impl ClassRules {
-    /// The rules for class `class`: [`THREE_D`] for `0xC797`, [`COMPUTE`] for `0xC7C0`, and
-    /// [`OTHER`] for every other class.
+    /// The rules for class `class`: [`THREE_D`] for `0xC797`, [`COMPUTE`] for `0xC7C0`,
+    /// [`TWO_D`] for `0x902D`, and [`OTHER`] for every other class.
     pub fn for_class(class: ClassId) -> &'static Self {
         match class.0 {
             clc797::CLASS => &THREE_D,
             clc7c0::CLASS => &COMPUTE,
+            cl902d::CLASS => &TWO_D,
             _ => &OTHER,
         }
     }
@@ -327,15 +344,32 @@ impl ClassRules {
         self.side_effects
     }
 
-    /// The registers' values when a file of the class is made: the one starting state that
-    /// both the front's [`super::RegFile`] (and its shadow file) and the back's mirror
-    /// (`crate::back::state::Mirror`) begin from, so a same-value write the front drops is never
-    /// one the back has not seen. Every register is zero today. Eden sets some 3D registers to
-    /// non-zero defaults at boot (`InitializeRegisterDefaults` in
-    /// `eden-nx2/src/video_core/engines/maxwell_3d.cpp`, then copied into the shadow file);
-    /// seeding them belongs here, for both sides at once (an open follow-up of slice G9).
+    /// The reset values: what each listed register holds when a file of the class is made.
+    pub const fn defaults(&self) -> &'static [RegisterDefault] {
+        self.defaults
+    }
+
+    /// The registers' values when a file of the class is made: zero, except for the registers
+    /// [`ClassRules::defaults`] lists, which hold their reset values. The one starting state
+    /// that both the front's [`super::RegFile`] (and its shadow file, which starts equal to
+    /// the register file, as Eden's `shadow_state = regs` does at the end of
+    /// `InitializeRegisterDefaults`) and the back's mirror (`crate::back::state::Mirror`) begin
+    /// from, so a same-value write the front drops is never one the back has not seen. A
+    /// default outside the file is skipped (none is: pinned by
+    /// `reset_values_name_registers_of_the_file_once`).
     pub fn initial_values(&self) -> Box<[u32]> {
         let registers = usize::try_from(self.registers).unwrap_or(0);
-        vec![0; registers].into_boxed_slice()
+        let mut values = vec![0; registers].into_boxed_slice();
+        for default in self.defaults {
+            for number in default.span.numbers() {
+                if let Some(slot) = usize::try_from(number)
+                    .ok()
+                    .and_then(|index| values.get_mut(index))
+                {
+                    *slot = default.value;
+                }
+            }
+        }
+        values
     }
 }
