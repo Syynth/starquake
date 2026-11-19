@@ -72,10 +72,12 @@
 //!   `converter.cpp`; not ported), bilinear filtering of other formats, a negative or inverted
 //!   rectangle or an empty source for a non-empty destination (Eden-NX2 casts to `u32`), a
 //!   block-linear region outside its surface, and a blit past [`super::MAX_COPY_BYTES`]. Pinned
-//!   by `refusals_are_exact`.
+//!   by `refusals_are_exact`, `rectangle_filter_and_size_refusals_are_exact` and
+//!   `the_size_bound_is_checked_at_the_edge`.
 //! - **Eden-NX2's pitch adjustment changes nothing here.** `need_align_to_pitch` moves a pitch
 //!   source's address by `src_x0` pixels when its region passes `pitch / bpp`; pitch regions are
-//!   not bounded by their width here, so the same bytes are read either way.
+//!   not bounded by their width here, so the same bytes are read either way. Pinned by
+//!   `a_pitch_region_is_not_bounded_by_its_width`.
 //! - **Not read, as in Eden-NX2:** `SET_DST_LAYER` (the class has no source layer method;
 //!   Eden-NX2 logs a non-zero layer of either surface and goes on),
 //!   `SET_DST_COLOR_RENDER_TO_ZETA_SURFACE` (so a depth surface uses the colour GOB too; the
@@ -280,7 +282,8 @@ fn rects(regs: Registers<'_>) -> Result<(Rect, Rect), CopyError> {
         d::PIXELS_FROM_MEMORY_SRC_Y0_INT,
         d::SET_PIXELS_FROM_MEMORY_SRC_Y0_FRAC,
     ));
-    if d::SET_PIXELS_FROM_MEMORY_SAMPLE_MODE_ORIGIN.get(regs.get(d::SET_PIXELS_FROM_MEMORY_SAMPLE_MODE))
+    if d::SET_PIXELS_FROM_MEMORY_SAMPLE_MODE_ORIGIN
+        .get(regs.get(d::SET_PIXELS_FROM_MEMORY_SAMPLE_MODE))
         == d::SET_PIXELS_FROM_MEMORY_SAMPLE_MODE_ORIGIN_CORNER
     {
         src_x -= i128::from((du_dx >> 33) << 32);
@@ -393,9 +396,7 @@ impl Blit {
                 step_y: step(source_rect.height, destination_rect.height),
             }
         };
-        let bytes = |rect: Rect| {
-            u128::from(rect.width) * u128::from(rect.height) * u128::from(bpp)
-        };
+        let bytes = |rect: Rect| u128::from(rect.width) * u128::from(rect.height) * u128::from(bpp);
         check_size(bytes(source_rect).max(bytes(destination_rect)))?;
         let source = surface(regs, CopySide::Source, bpp, source_rect)?;
         let destination = surface(regs, CopySide::Destination, bpp, destination_rect)?;
@@ -408,9 +409,7 @@ impl Blit {
             side: CopySide::Source,
         };
         let source_cover = source.cover(region(source_rect))?.ok_or(empty)?;
-        let destination_cover = destination
-            .cover(region(destination_rect))?
-            .ok_or(empty)?;
+        let destination_cover = destination.cover(region(destination_rect))?.ok_or(empty)?;
         Ok(Some(Self {
             bpp,
             source_rect,
@@ -480,7 +479,8 @@ impl Blit {
         y: u32,
         out: &mut [u8],
     ) -> Result<(), CopyError> {
-        let (y_low, y_high, wy) = position(y, self.source_rect.height, self.destination_rect.height);
+        let (y_low, y_high, wy) =
+            position(y, self.source_rect.height, self.destination_rect.height);
         let low = rows.get(&self.source, memory, y_low)?.to_vec();
         let high = rows.get(&self.source, memory, y_high)?;
         let bpp = self.bpp as usize;
@@ -621,9 +621,8 @@ fn surface(
     if m.layout_field.get(regs.get(m.layout)) == m.pitch_value {
         let pitch = i64::from(regs.get(m.pitch));
         // The region's first byte; line `l` then follows at `l * pitch`.
-        let start = i128::from(address)
-            + i128::from(rect.y) * i128::from(pitch)
-            + i128::from(origin_x_b);
+        let start =
+            i128::from(address) + i128::from(rect.y) * i128::from(pitch) + i128::from(origin_x_b);
         let start = u64::try_from(start).map_err(|_| CopyError::Extent { side })?;
         return Ok(Surface::pitch(side, start, pitch));
     }

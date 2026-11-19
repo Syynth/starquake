@@ -89,8 +89,8 @@
 //!   source or destination (Eden-NX2 ignores `SRC_TYPE` and `DST_TYPE`), a block width other than
 //!   one GOB (Eden-NX2's `UNIMPLEMENTED_IF`, which goes on), a block height or depth past
 //!   `THIRTYTWO_GOBS` (Eden-NX2 shifts by any 4-bit value), and a copy past
-//!   [`super::MAX_COPY_BYTES`]. Pinned by `refusals_are_exact` and
-//!   `the_size_bound_is_checked_at_the_edge`.
+//!   [`super::MAX_COPY_BYTES`]. Pinned by `refusals_are_exact`,
+//!   `address_remap_and_block_refusals_are_exact` and `the_size_bound_is_checked_at_the_edge`.
 //! - **Not read, as in Eden-NX2:** `INTERRUPT_TYPE` (Eden-NX2 asserts `NONE`; nothing here raises
 //!   GPU interrupts, so any value copies), `SET_*_LAYER` (Eden-NX2 refuses a non-zero
 //!   destination layer only on pitch-to-block-linear), the block size's `GOB_HEIGHT`, the 32-bit
@@ -280,7 +280,7 @@ impl Remap {
             (0u32..destinations).zip(selects.iter_mut().zip(SELECTORS))
         {
             // The DST_Y, _Z and _W values equal DST_X's
-            // (`tests::dma::constants_match_the_header_written_out`).
+            // (`tests::dma::remap_selector_values_match_the_header_written_out`).
             *select = match field.get(word) {
                 value @ (c::SET_REMAP_COMPONENTS_DST_X_SRC_X
                 | c::SET_REMAP_COMPONENTS_DST_X_SRC_Y
@@ -503,7 +503,11 @@ fn side(
 ) -> Result<Surface, CopyError> {
     let (address, pitch_method) = match side {
         CopySide::Source => (
-            regs.address(c::OFFSET_IN_UPPER, c::OFFSET_IN_UPPER_UPPER, c::OFFSET_IN_LOWER),
+            regs.address(
+                c::OFFSET_IN_UPPER,
+                c::OFFSET_IN_UPPER_UPPER,
+                c::OFFSET_IN_LOWER,
+            ),
             c::PITCH_IN,
         ),
         CopySide::Destination => (

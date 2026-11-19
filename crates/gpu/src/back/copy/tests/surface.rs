@@ -9,7 +9,7 @@ use super::super::surface::{
 };
 use super::super::{CopyError, MAX_PENDING_RANGES};
 use super::*;
-use crate::classes::{cl902d, cla140, clc797, clc7b5, clc7c0};
+use crate::classes::{cl902d, cla140, clc7b5, clc7c0, clc797};
 
 #[test]
 fn every_class_defines_the_same_largest_block() {
@@ -43,9 +43,20 @@ fn every_class_defines_the_same_largest_block() {
     }
 }
 
-fn desc(width_b: u64, height: u32, depth: u32, bh: u32, bd: u32, origin: (u64, u32)) -> BlockLinearDesc {
+fn desc(
+    width_b: u64,
+    height: u32,
+    depth: u32,
+    bh: u32,
+    bd: u32,
+    origin: (u64, u32),
+) -> BlockLinearDesc {
     BlockLinearDesc {
-        block: BlockFields { width: ONE_GOB, height: bh, depth: bd },
+        block: BlockFields {
+            width: ONE_GOB,
+            height: bh,
+            depth: bd,
+        },
         width_b,
         height,
         depth,
@@ -61,9 +72,22 @@ fn a_width_or_origin_past_32_bits_is_an_overflow() {
         error: LayoutError::Overflow,
     });
     let big = u64::from(u32::MAX) + 1;
-    assert_eq!(Surface::block_linear(CopySide::Source, 0, &desc(big, 1, 1, 0, 0, (0, 0))), overflow);
-    assert_eq!(Surface::block_linear(CopySide::Source, 0, &desc(64, 1, 1, 0, 0, (big, 0))), overflow);
-    assert!(Surface::block_linear(CopySide::Source, 0, &desc(big - 1, 1, 1, 0, 0, (big - 1, 0))).is_ok());
+    assert_eq!(
+        Surface::block_linear(CopySide::Source, 0, &desc(big, 1, 1, 0, 0, (0, 0))),
+        overflow
+    );
+    assert_eq!(
+        Surface::block_linear(CopySide::Source, 0, &desc(64, 1, 1, 0, 0, (big, 0))),
+        overflow
+    );
+    assert!(
+        Surface::block_linear(
+            CopySide::Source,
+            0,
+            &desc(big - 1, 1, 1, 0, 0, (big - 1, 0))
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -76,7 +100,12 @@ fn a_cover_past_the_address_space_is_an_extent_error() {
     .unwrap();
     let region = Region { width: 1, lines: 1 };
     // The padded surface is 512 bytes: ending exactly at 2^64 is not representable as an end.
-    assert_eq!(surface.cover(region), Err(CopyError::Extent { side: CopySide::Destination }));
+    assert_eq!(
+        surface.cover(region),
+        Err(CopyError::Extent {
+            side: CopySide::Destination
+        })
+    );
     let surface = Surface::block_linear(
         CopySide::Destination,
         u64::MAX - 64 * 8,
@@ -86,10 +115,21 @@ fn a_cover_past_the_address_space_is_an_extent_error() {
     assert_eq!(surface.cover(region), Ok(Some(u64::MAX - 512..u64::MAX)));
     // A pitch line ending exactly at u64::MAX fits; one more byte does not.
     let pitch = Surface::pitch(CopySide::Source, u64::MAX - 0x20, 0x10);
-    assert_eq!(pitch.cover(Region { width: 0x10, lines: 2 }), Ok(Some(u64::MAX - 0x20..u64::MAX)));
     assert_eq!(
-        pitch.cover(Region { width: 0x11, lines: 2 }),
-        Err(CopyError::Extent { side: CopySide::Source })
+        pitch.cover(Region {
+            width: 0x10,
+            lines: 2
+        }),
+        Ok(Some(u64::MAX - 0x20..u64::MAX))
+    );
+    assert_eq!(
+        pitch.cover(Region {
+            width: 0x11,
+            lines: 2
+        }),
+        Err(CopyError::Extent {
+            side: CopySide::Source
+        })
     );
     // An empty region has no cover, whatever its surface.
     assert_eq!(pitch.cover(Region { width: 0, lines: 2 }), Ok(None));
@@ -137,7 +177,7 @@ proptest! {
             return Ok(());
         }
         let cover = cover.unwrap().unwrap();
-        let bl = Bl { width, height, depth, bh: bh as u8, bd: bd as u8 };
+        let bl = Bl { width, height, depth, bh: u8::try_from(bh).unwrap(), bd: u8::try_from(bd).unwrap() };
         prop_assert_eq!(cover.clone(), GPU_BASE..GPU_BASE + bl.size());
         for line in 0..lines {
             let mut buf = vec![0; w as usize];
@@ -170,17 +210,28 @@ fn pending_writes_merge_overlapping_and_touching_ranges() {
     // One byte apart stays apart.
     assert_eq!(pending_after(&[10..20, 21..30]), vec![10..20, 21..30]);
     // A range bridging several merges them all.
-    assert_eq!(pending_after(&[0..5, 10..15, 20..25, 30..35, 4..21]), vec![0..25, 30..35]);
+    assert_eq!(
+        pending_after(&[0..5, 10..15, 20..25, 30..35, 4..21]),
+        vec![0..25, 30..35]
+    );
     // Out-of-order pushes come out sorted.
-    assert_eq!(pending_after(&[50..60, 0..5, 30..31]), vec![0..5, 30..31, 50..60]);
+    assert_eq!(
+        pending_after(&[50..60, 0..5, 30..31]),
+        vec![0..5, 30..31, 50..60]
+    );
     // An empty range is ignored.
-    assert_eq!(pending_after(&[5..5, 7..3]), Vec::<Range<u64>>::new());
+    assert_eq!(
+        pending_after(&[5..5, Range { start: 7, end: 3 }]),
+        Vec::<Range<u64>>::new()
+    );
 }
 
 #[test]
 fn pending_writes_collapse_past_the_cap() {
     // MAX_PENDING_RANGES disjoint ranges stay; one more collapses everything into one cover.
-    let ranges: Vec<Range<u64>> = (0..MAX_PENDING_RANGES as u64).map(|i| i * 10..i * 10 + 5).collect();
+    let ranges: Vec<Range<u64>> = (0..MAX_PENDING_RANGES as u64)
+        .map(|i| i * 10..i * 10 + 5)
+        .collect();
     assert_eq!(pending_after(&ranges), ranges);
     let mut more = ranges.clone();
     more.push(1_000_000..1_000_001);
@@ -198,7 +249,10 @@ fn flush_hands_over_every_range_in_order_and_empties_the_list() {
     pending.add(0..10);
     let mut sink = Recorder::default();
     pending.flush(&mut sink);
-    assert_eq!(sink.events, vec![Event::Invalidate(0..10), Event::Invalidate(30..40)]);
+    assert_eq!(
+        sink.events,
+        vec![Event::Invalidate(0..10), Event::Invalidate(30..40)]
+    );
     assert!(pending.is_empty());
     pending.flush(&mut sink);
     assert_eq!(sink.events.len(), 2);
@@ -207,7 +261,11 @@ fn flush_hands_over_every_range_in_order_and_empties_the_list() {
 #[test]
 fn region_bytes_cannot_overflow() {
     assert_eq!(
-        Region { width: u64::MAX, lines: u32::MAX }.bytes(),
+        Region {
+            width: u64::MAX,
+            lines: u32::MAX
+        }
+        .bytes(),
         u128::from(u64::MAX) * u128::from(u32::MAX)
     );
     assert!(Region { width: 0, lines: 3 }.is_empty());

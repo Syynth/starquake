@@ -21,8 +21,15 @@ use crate::sema::{
 /// One side of a test copy.
 #[derive(Clone, Copy, Debug)]
 enum Side {
-    Pitch { address: u64, pitch: i32 },
-    Bl { address: u64, bl: Bl, origin: (u32, u32) },
+    Pitch {
+        address: u64,
+        pitch: i32,
+    },
+    Bl {
+        address: u64,
+        bl: Bl,
+        origin: (u32, u32),
+    },
 }
 
 impl Side {
@@ -63,7 +70,8 @@ fn regs_for(copy: &Copy) -> Regs {
         } else {
             (c::OFFSET_OUT_UPPER, c::OFFSET_OUT_LOWER, c::PITCH_OUT)
         };
-        regs.set(upper, hi(side.address())).set(lower, lo(side.address()));
+        regs.set(upper, hi(side.address()))
+            .set(lower, lo(side.address()));
         let layout = if is_source {
             c::LAUNCH_DMA_SRC_MEMORY_LAYOUT
         } else {
@@ -81,21 +89,37 @@ fn regs_for(copy: &Copy) -> Regs {
                     c::LAUNCH_DMA_SRC_MEMORY_LAYOUT_BLOCKLINEAR,
                 );
                 if is_source {
-                    regs.field(c::SET_SRC_BLOCK_SIZE, c::SET_SRC_BLOCK_SIZE_HEIGHT, bl.bh.into())
-                        .field(c::SET_SRC_BLOCK_SIZE, c::SET_SRC_BLOCK_SIZE_DEPTH, bl.bd.into())
-                        .set(c::SET_SRC_WIDTH, bl.width)
-                        .set(c::SET_SRC_HEIGHT, bl.height)
-                        .set(c::SET_SRC_DEPTH, bl.depth)
-                        .field(c::SET_SRC_ORIGIN, c::SET_SRC_ORIGIN_X, origin.0)
-                        .field(c::SET_SRC_ORIGIN, c::SET_SRC_ORIGIN_Y, origin.1);
+                    regs.field(
+                        c::SET_SRC_BLOCK_SIZE,
+                        c::SET_SRC_BLOCK_SIZE_HEIGHT,
+                        bl.bh.into(),
+                    )
+                    .field(
+                        c::SET_SRC_BLOCK_SIZE,
+                        c::SET_SRC_BLOCK_SIZE_DEPTH,
+                        bl.bd.into(),
+                    )
+                    .set(c::SET_SRC_WIDTH, bl.width)
+                    .set(c::SET_SRC_HEIGHT, bl.height)
+                    .set(c::SET_SRC_DEPTH, bl.depth)
+                    .field(c::SET_SRC_ORIGIN, c::SET_SRC_ORIGIN_X, origin.0)
+                    .field(c::SET_SRC_ORIGIN, c::SET_SRC_ORIGIN_Y, origin.1);
                 } else {
-                    regs.field(c::SET_DST_BLOCK_SIZE, c::SET_DST_BLOCK_SIZE_HEIGHT, bl.bh.into())
-                        .field(c::SET_DST_BLOCK_SIZE, c::SET_DST_BLOCK_SIZE_DEPTH, bl.bd.into())
-                        .set(c::SET_DST_WIDTH, bl.width)
-                        .set(c::SET_DST_HEIGHT, bl.height)
-                        .set(c::SET_DST_DEPTH, bl.depth)
-                        .field(c::SET_DST_ORIGIN, c::SET_DST_ORIGIN_X, origin.0)
-                        .field(c::SET_DST_ORIGIN, c::SET_DST_ORIGIN_Y, origin.1);
+                    regs.field(
+                        c::SET_DST_BLOCK_SIZE,
+                        c::SET_DST_BLOCK_SIZE_HEIGHT,
+                        bl.bh.into(),
+                    )
+                    .field(
+                        c::SET_DST_BLOCK_SIZE,
+                        c::SET_DST_BLOCK_SIZE_DEPTH,
+                        bl.bd.into(),
+                    )
+                    .set(c::SET_DST_WIDTH, bl.width)
+                    .set(c::SET_DST_HEIGHT, bl.height)
+                    .set(c::SET_DST_DEPTH, bl.depth)
+                    .field(c::SET_DST_ORIGIN, c::SET_DST_ORIGIN_X, origin.0)
+                    .field(c::SET_DST_ORIGIN, c::SET_DST_ORIGIN_Y, origin.1);
                 }
             }
         }
@@ -118,11 +142,16 @@ fn gather(mem: &Memory, side: Side, length: u32, lines: u32) -> Vec<u8> {
     match side {
         Side::Pitch { address, pitch } => (0..lines)
             .flat_map(|l| {
-                let start = (i128::from(address) + i128::from(l) * i128::from(pitch)) as u64;
+                let start =
+                    u64::try_from(i128::from(address) + i128::from(l) * i128::from(pitch)).unwrap();
                 read(mem, start, length.into())
             })
             .collect(),
-        Side::Bl { address, bl, origin } => {
+        Side::Bl {
+            address,
+            bl,
+            origin,
+        } => {
             let tiled = read(mem, address, bl.size());
             bl.untile(&tiled, origin, length, lines)
         }
@@ -135,16 +164,29 @@ fn scatter(before: &[u8], side: Side, linear: &[u8], length: u32, lines: u32) ->
     match side {
         Side::Pitch { address, pitch } => {
             for l in 0..lines {
-                let start = (i128::from(address - GPU_BASE) + i128::from(l) * i128::from(pitch))
-                    as usize;
+                let start = usize::try_from(
+                    i128::from(address - GPU_BASE) + i128::from(l) * i128::from(pitch),
+                )
+                .unwrap();
                 let row = &linear[(l * length) as usize..((l + 1) * length) as usize];
                 after[start..start + length as usize].copy_from_slice(row);
             }
         }
-        Side::Bl { address, bl, origin } => {
-            let start = (address - GPU_BASE) as usize;
-            let end = start + bl.size() as usize;
-            bl.tile(&mut after[start..end], linear, length as usize, origin, length, lines);
+        Side::Bl {
+            address,
+            bl,
+            origin,
+        } => {
+            let start = us(address - GPU_BASE);
+            let end = start + us(bl.size());
+            bl.tile(
+                &mut after[start..end],
+                linear,
+                length as usize,
+                origin,
+                length,
+                lines,
+            );
         }
     }
     after
@@ -155,7 +197,13 @@ fn check_against_layout(copy: Copy) {
     let mem = memory();
     let lines = if copy.multi_line { copy.lines } else { 1 };
     let linear = gather(&mem, copy.source, copy.length, lines);
-    let expected = scatter(&snapshot(&mem), copy.destination, &linear, copy.length, lines);
+    let expected = scatter(
+        &snapshot(&mem),
+        copy.destination,
+        &linear,
+        copy.length,
+        lines,
+    );
     let mut sink = Recorder::default();
     launch(&mem, &regs_for(&copy), &mut sink).unwrap();
     assert!(snapshot(&mem) == expected, "{copy:?}");
@@ -167,8 +215,14 @@ const DST: u64 = GPU_BASE + 0x9_0000;
 #[test]
 fn pitch_to_pitch_copies_each_line_at_its_own_pitch() {
     check_against_layout(Copy {
-        source: Side::Pitch { address: SRC + 3, pitch: 0x150 },
-        destination: Side::Pitch { address: DST + 5, pitch: 0x230 },
+        source: Side::Pitch {
+            address: SRC + 3,
+            pitch: 0x150,
+        },
+        destination: Side::Pitch {
+            address: DST + 5,
+            pitch: 0x230,
+        },
         length: 0x123,
         lines: 7,
         multi_line: true,
@@ -177,10 +231,23 @@ fn pitch_to_pitch_copies_each_line_at_its_own_pitch() {
 
 #[test]
 fn pitch_to_block_linear_matches_the_layout_crates_tile() {
-    let bl = Bl { width: 300, height: 70, depth: 1, bh: 2, bd: 0 };
+    let bl = Bl {
+        width: 300,
+        height: 70,
+        depth: 1,
+        bh: 2,
+        bd: 0,
+    };
     check_against_layout(Copy {
-        source: Side::Pitch { address: SRC + 1, pitch: 211 },
-        destination: Side::Bl { address: DST, bl, origin: (37, 9) },
+        source: Side::Pitch {
+            address: SRC + 1,
+            pitch: 211,
+        },
+        destination: Side::Bl {
+            address: DST,
+            bl,
+            origin: (37, 9),
+        },
         length: 200,
         lines: 50,
         multi_line: true,
@@ -189,10 +256,23 @@ fn pitch_to_block_linear_matches_the_layout_crates_tile() {
 
 #[test]
 fn block_linear_to_pitch_matches_the_layout_crates_untile() {
-    let bl = Bl { width: 256, height: 40, depth: 1, bh: 1, bd: 0 };
+    let bl = Bl {
+        width: 256,
+        height: 40,
+        depth: 1,
+        bh: 1,
+        bd: 0,
+    };
     check_against_layout(Copy {
-        source: Side::Bl { address: SRC, bl, origin: (17, 3) },
-        destination: Side::Pitch { address: DST + 7, pitch: 250 },
+        source: Side::Bl {
+            address: SRC,
+            bl,
+            origin: (17, 3),
+        },
+        destination: Side::Pitch {
+            address: DST + 7,
+            pitch: 250,
+        },
         length: 230,
         lines: 33,
         multi_line: true,
@@ -204,12 +284,24 @@ fn block_linear_to_block_linear_matches_untile_then_tile() {
     check_against_layout(Copy {
         source: Side::Bl {
             address: SRC,
-            bl: Bl { width: 192, height: 64, depth: 1, bh: 3, bd: 0 },
+            bl: Bl {
+                width: 192,
+                height: 64,
+                depth: 1,
+                bh: 3,
+                bd: 0,
+            },
             origin: (64, 8),
         },
         destination: Side::Bl {
             address: DST,
-            bl: Bl { width: 500, height: 30, depth: 1, bh: 0, bd: 0 },
+            bl: Bl {
+                width: 500,
+                height: 30,
+                depth: 1,
+                bh: 0,
+                bd: 0,
+            },
             origin: (3, 1),
         },
         length: 128,
@@ -223,14 +315,23 @@ fn bl_side(address: u64, region: (u32, u32)) -> impl Strategy<Value = Side> {
     (0u32..64, 0u32..20, 0u8..=2, 0u32..=40, 0u32..=10).prop_map(
         move |(ox, oy, bh, extra_w, extra_h)| Side::Bl {
             address,
-            bl: Bl { width: ox + w + extra_w, height: oy + h + extra_h, depth: 1, bh, bd: 0 },
+            bl: Bl {
+                width: ox + w + extra_w,
+                height: oy + h + extra_h,
+                depth: 1,
+                bh,
+                bd: 0,
+            },
             origin: (ox, oy),
         },
     )
 }
 
 fn pitch_side(address: u64, w: u32) -> impl Strategy<Value = Side> {
-    (0u32..60).prop_map(move |extra| Side::Pitch { address, pitch: (w + extra) as i32 })
+    (0u32..60).prop_map(move |extra| Side::Pitch {
+        address,
+        pitch: (w + extra).cast_signed(),
+    })
 }
 
 fn any_side(address: u64, region: (u32, u32)) -> impl Strategy<Value = Side> {
@@ -239,8 +340,12 @@ fn any_side(address: u64, region: (u32, u32)) -> impl Strategy<Value = Side> {
 
 fn any_copy() -> impl Strategy<Value = Copy> {
     (1u32..=150, 1u32..=24).prop_flat_map(|region| {
-        (any_side(SRC, region), any_side(DST, region)).prop_map(move |(source, destination)| {
-            Copy { source, destination, length: region.0, lines: region.1, multi_line: true }
+        (any_side(SRC, region), any_side(DST, region)).prop_map(move |(source, destination)| Copy {
+            source,
+            destination,
+            length: region.0,
+            lines: region.1,
+            multi_line: true,
         })
     })
 }
@@ -263,8 +368,14 @@ proptest! {
 #[test]
 fn without_multi_line_only_the_first_line_is_copied() {
     check_against_layout(Copy {
-        source: Side::Pitch { address: SRC, pitch: 0x100 },
-        destination: Side::Pitch { address: DST, pitch: 0x100 },
+        source: Side::Pitch {
+            address: SRC,
+            pitch: 0x100,
+        },
+        destination: Side::Pitch {
+            address: DST,
+            pitch: 0x100,
+        },
         length: 0x80,
         lines: 9,
         multi_line: false,
@@ -276,8 +387,14 @@ fn a_line_longer_than_a_chunk_is_copied_whole() {
     // Two and a half chunks in one line, each side unaligned.
     let length = u32::try_from(super::super::dma::CHUNK_BYTES * 5 / 2).unwrap() + 3;
     check_against_layout(Copy {
-        source: Side::Pitch { address: SRC + 1, pitch: 0 },
-        destination: Side::Pitch { address: DST + 2, pitch: 0 },
+        source: Side::Pitch {
+            address: SRC + 1,
+            pitch: 0,
+        },
+        destination: Side::Pitch {
+            address: DST + 2,
+            pitch: 0,
+        },
         length,
         lines: 1,
         multi_line: true,
@@ -287,11 +404,24 @@ fn a_line_longer_than_a_chunk_is_copied_whole() {
 #[test]
 fn lines_past_the_last_row_continue_in_the_next_slice() {
     // 3 rows per slice from origin row 5 of 8: lines 0..3 in slice 0, 3..6 in slice 1.
-    let bl = Bl { width: 64, height: 8, depth: 4, bh: 0, bd: 1 };
+    let bl = Bl {
+        width: 64,
+        height: 8,
+        depth: 4,
+        bh: 0,
+        bd: 1,
+    };
     let mem = memory();
     let copy = Copy {
-        source: Side::Pitch { address: SRC, pitch: 40 },
-        destination: Side::Bl { address: DST, bl, origin: (8, 5) },
+        source: Side::Pitch {
+            address: SRC,
+            pitch: 40,
+        },
+        destination: Side::Bl {
+            address: DST,
+            bl,
+            origin: (8, 5),
+        },
         length: 40,
         lines: 6,
         multi_line: true,
@@ -319,16 +449,48 @@ fn lines_past_the_last_row_continue_in_the_next_slice() {
 // --- Remap ---
 
 fn remap(regs: &mut Regs, size: u32, sources: u32, destinations: u32, selects: [u32; 4]) {
-    regs.field(c::LAUNCH_DMA, c::LAUNCH_DMA_REMAP_ENABLE, c::LAUNCH_DMA_REMAP_ENABLE_TRUE)
-        .field(c::SET_REMAP_COMPONENTS, c::SET_REMAP_COMPONENTS_COMPONENT_SIZE, size - 1)
-        .field(c::SET_REMAP_COMPONENTS, c::SET_REMAP_COMPONENTS_NUM_SRC_COMPONENTS, sources - 1)
-        .field(c::SET_REMAP_COMPONENTS, c::SET_REMAP_COMPONENTS_NUM_DST_COMPONENTS, destinations - 1)
-        .field(c::SET_REMAP_COMPONENTS, c::SET_REMAP_COMPONENTS_DST_X, selects[0])
-        .field(c::SET_REMAP_COMPONENTS, c::SET_REMAP_COMPONENTS_DST_Y, selects[1])
-        .field(c::SET_REMAP_COMPONENTS, c::SET_REMAP_COMPONENTS_DST_Z, selects[2])
-        .field(c::SET_REMAP_COMPONENTS, c::SET_REMAP_COMPONENTS_DST_W, selects[3])
-        .set(c::SET_REMAP_CONST_A, 0xa1a2_a3a4)
-        .set(c::SET_REMAP_CONST_B, 0xb1b2_b3b4);
+    regs.field(
+        c::LAUNCH_DMA,
+        c::LAUNCH_DMA_REMAP_ENABLE,
+        c::LAUNCH_DMA_REMAP_ENABLE_TRUE,
+    )
+    .field(
+        c::SET_REMAP_COMPONENTS,
+        c::SET_REMAP_COMPONENTS_COMPONENT_SIZE,
+        size - 1,
+    )
+    .field(
+        c::SET_REMAP_COMPONENTS,
+        c::SET_REMAP_COMPONENTS_NUM_SRC_COMPONENTS,
+        sources - 1,
+    )
+    .field(
+        c::SET_REMAP_COMPONENTS,
+        c::SET_REMAP_COMPONENTS_NUM_DST_COMPONENTS,
+        destinations - 1,
+    )
+    .field(
+        c::SET_REMAP_COMPONENTS,
+        c::SET_REMAP_COMPONENTS_DST_X,
+        selects[0],
+    )
+    .field(
+        c::SET_REMAP_COMPONENTS,
+        c::SET_REMAP_COMPONENTS_DST_Y,
+        selects[1],
+    )
+    .field(
+        c::SET_REMAP_COMPONENTS,
+        c::SET_REMAP_COMPONENTS_DST_Z,
+        selects[2],
+    )
+    .field(
+        c::SET_REMAP_COMPONENTS,
+        c::SET_REMAP_COMPONENTS_DST_W,
+        selects[3],
+    )
+    .set(c::SET_REMAP_CONST_A, 0xa1a2_a3a4)
+    .set(c::SET_REMAP_CONST_B, 0xb1b2_b3b4);
 }
 
 const X: u32 = c::SET_REMAP_COMPONENTS_DST_X_SRC_X;
@@ -356,13 +518,19 @@ fn remap_model(src: &[u8], old: &[u8], size: usize, selects: &[u32]) -> Vec<u8> 
 
 /// A pitch-to-pitch remapped copy of 5 elements by 3 lines, checked against the model.
 fn check_remap(size: u32, sources: u32, selects: &[u32]) {
-    let destinations = selects.len() as u32;
+    let destinations = u32::try_from(selects.len()).unwrap();
     let mut all = [KEEP; 4];
     all[..selects.len()].copy_from_slice(selects);
     let (s, d) = ((size * sources) as usize, (size * destinations) as usize);
     let copy = Copy {
-        source: Side::Pitch { address: SRC + 1, pitch: 0x40 },
-        destination: Side::Pitch { address: DST + 3, pitch: 0x50 },
+        source: Side::Pitch {
+            address: SRC + 1,
+            pitch: 0x40,
+        },
+        destination: Side::Pitch {
+            address: DST + 3,
+            pitch: 0x50,
+        },
         length: 5,
         lines: 3,
         multi_line: true,
@@ -375,8 +543,8 @@ fn check_remap(size: u32, sources: u32, selects: &[u32]) {
     let mut expected = before.clone();
     for line in 0..3usize {
         for e in 0..5usize {
-            let src_at = (SRC + 1 - GPU_BASE) as usize + line * 0x40 + e * s;
-            let dst_at = (DST + 3 - GPU_BASE) as usize + line * 0x50 + e * d;
+            let src_at = us(SRC + 1 - GPU_BASE) + line * 0x40 + e * s;
+            let dst_at = us(DST + 3 - GPU_BASE) + line * 0x50 + e * d;
             let element = remap_model(
                 &before[src_at..src_at + s],
                 &before[dst_at..dst_at + d],
@@ -386,7 +554,10 @@ fn check_remap(size: u32, sources: u32, selects: &[u32]) {
             expected[dst_at..dst_at + d].copy_from_slice(&element);
         }
     }
-    assert!(snapshot(&mem) == expected, "size {size} sources {sources} {selects:?}");
+    assert!(
+        snapshot(&mem) == expected,
+        "size {size} sources {sources} {selects:?}"
+    );
 }
 
 #[test]
@@ -413,12 +584,25 @@ fn remap_changes_the_element_size_between_sides() {
 #[test]
 fn remap_with_a_block_linear_destination_counts_width_and_origin_in_elements() {
     // Elements of 4 one-byte components: width 20 elements is 80 bytes, origin x 3 is 12 bytes.
-    let bl = Bl { width: 80, height: 16, depth: 1, bh: 1, bd: 0 };
+    let bl = Bl {
+        width: 80,
+        height: 16,
+        depth: 1,
+        bh: 1,
+        bd: 0,
+    };
     let mem = memory();
     let before = snapshot(&mem);
     let copy = Copy {
-        source: Side::Pitch { address: SRC, pitch: 64 },
-        destination: Side::Bl { address: DST, bl: Bl { width: 20, ..bl }, origin: (3, 2) },
+        source: Side::Pitch {
+            address: SRC,
+            pitch: 64,
+        },
+        destination: Side::Bl {
+            address: DST,
+            bl: Bl { width: 20, ..bl },
+            origin: (3, 2),
+        },
         length: 10,
         lines: 4,
         multi_line: true,
@@ -429,14 +613,14 @@ fn remap_with_a_block_linear_destination_counts_width_and_origin_in_elements() {
     // The model: reverse each 4-byte element, then tile 40 bytes by 4 rows at (12, 2).
     let mut linear = Vec::new();
     for line in 0..4u64 {
-        let start = (SRC - GPU_BASE + line * 64) as usize;
+        let start = us(SRC - GPU_BASE + line * 64);
         for e in 0..10 {
             let mut element = before[start + e * 4..start + e * 4 + 4].to_vec();
             element.reverse();
             linear.extend(element);
         }
     }
-    let mut tiled = before[(DST - GPU_BASE) as usize..(DST - GPU_BASE + bl.size()) as usize].to_vec();
+    let mut tiled = before[us(DST - GPU_BASE)..us(DST - GPU_BASE + bl.size())].to_vec();
     bl.tile(&mut tiled, &linear, 40, (12, 2), 40, 4);
     assert_eq!(read(&mem, DST, bl.size()), tiled);
 }
@@ -447,8 +631,14 @@ fn remap_with_a_block_linear_destination_counts_width_and_origin_in_elements() {
 fn semaphore_launch(f: impl FnOnce(&mut Regs)) -> Result<Vec<Release>, CopyError> {
     let mem = memory();
     let mut regs = regs_for(&Copy {
-        source: Side::Pitch { address: SRC, pitch: 0 },
-        destination: Side::Pitch { address: DST, pitch: 0 },
+        source: Side::Pitch {
+            address: SRC,
+            pitch: 0,
+        },
+        destination: Side::Pitch {
+            address: DST,
+            pitch: 0,
+        },
         length: 0,
         lines: 1,
         multi_line: false,
@@ -480,7 +670,10 @@ fn semaphore_fields_give_the_exact_release() {
         Ok(vec![Release {
             address: SEM_ADDRESS,
             payload: 0x1122_3344,
-            form: ReleaseForm { size: PayloadSize::Four, timestamp: false },
+            form: ReleaseForm {
+                size: PayloadSize::Four,
+                timestamp: false
+            },
             op: ReleaseOp::Write,
         }])
     );
@@ -496,7 +689,10 @@ fn semaphore_fields_give_the_exact_release() {
         Ok(vec![Release {
             address: SEM_ADDRESS,
             payload: 0x5566_7788_1122_3344,
-            form: ReleaseForm { size: PayloadSize::Eight, timestamp: true },
+            form: ReleaseForm {
+                size: PayloadSize::Eight,
+                timestamp: true
+            },
             op: ReleaseOp::Write,
         }])
     );
@@ -513,8 +709,14 @@ fn semaphore_fields_give_the_exact_release() {
     ];
     for (value, op) in reductions {
         for (sign, format) in [
-            (c::LAUNCH_DMA_SEMAPHORE_REDUCTION_SIGN_SIGNED, ReductionFormat::Signed),
-            (c::LAUNCH_DMA_SEMAPHORE_REDUCTION_SIGN_UNSIGNED, ReductionFormat::Unsigned),
+            (
+                c::LAUNCH_DMA_SEMAPHORE_REDUCTION_SIGN_SIGNED,
+                ReductionFormat::Signed,
+            ),
+            (
+                c::LAUNCH_DMA_SEMAPHORE_REDUCTION_SIGN_UNSIGNED,
+                ReductionFormat::Unsigned,
+            ),
         ] {
             let releases = semaphore_launch(|r| {
                 semaphore_type(r, c::LAUNCH_DMA_SEMAPHORE_TYPE_RELEASE_ONE_WORD_SEMAPHORE)
@@ -531,7 +733,10 @@ fn semaphore_fields_give_the_exact_release() {
                 Ok(vec![Release {
                     address: SEM_ADDRESS,
                     payload: 0x1122_3344,
-                    form: ReleaseForm { size: PayloadSize::Four, timestamp: false },
+                    form: ReleaseForm {
+                        size: PayloadSize::Four,
+                        timestamp: false
+                    },
                     op: ReleaseOp::Reduce(Reduction { op, format }),
                 }]),
                 "reduction {value} sign {sign}"
@@ -556,16 +761,46 @@ fn a_reduction_field_without_enable_is_a_write() {
 #[test]
 fn the_dma_reduction_values_are_the_host_encodings() {
     // `sema::host_reduction` decodes `LAUNCH_DMA_SEMAPHORE_REDUCTION`: the values must agree.
-    assert_eq!(c::LAUNCH_DMA_SEMAPHORE_REDUCTION_IMIN, sema::HOST_REDUCTION_MIN);
-    assert_eq!(c::LAUNCH_DMA_SEMAPHORE_REDUCTION_IMAX, sema::HOST_REDUCTION_MAX);
-    assert_eq!(c::LAUNCH_DMA_SEMAPHORE_REDUCTION_IXOR, sema::HOST_REDUCTION_XOR);
-    assert_eq!(c::LAUNCH_DMA_SEMAPHORE_REDUCTION_IAND, sema::HOST_REDUCTION_AND);
-    assert_eq!(c::LAUNCH_DMA_SEMAPHORE_REDUCTION_IOR, sema::HOST_REDUCTION_OR);
-    assert_eq!(c::LAUNCH_DMA_SEMAPHORE_REDUCTION_IADD, sema::HOST_REDUCTION_ADD);
-    assert_eq!(c::LAUNCH_DMA_SEMAPHORE_REDUCTION_INC, sema::HOST_REDUCTION_INC);
-    assert_eq!(c::LAUNCH_DMA_SEMAPHORE_REDUCTION_DEC, sema::HOST_REDUCTION_DEC);
-    assert_eq!(c::LAUNCH_DMA_SEMAPHORE_REDUCTION_SIGN_SIGNED, sema::HOST_FORMAT_SIGNED);
-    assert_eq!(c::LAUNCH_DMA_SEMAPHORE_REDUCTION_SIGN_UNSIGNED, sema::HOST_FORMAT_UNSIGNED);
+    assert_eq!(
+        c::LAUNCH_DMA_SEMAPHORE_REDUCTION_IMIN,
+        sema::HOST_REDUCTION_MIN
+    );
+    assert_eq!(
+        c::LAUNCH_DMA_SEMAPHORE_REDUCTION_IMAX,
+        sema::HOST_REDUCTION_MAX
+    );
+    assert_eq!(
+        c::LAUNCH_DMA_SEMAPHORE_REDUCTION_IXOR,
+        sema::HOST_REDUCTION_XOR
+    );
+    assert_eq!(
+        c::LAUNCH_DMA_SEMAPHORE_REDUCTION_IAND,
+        sema::HOST_REDUCTION_AND
+    );
+    assert_eq!(
+        c::LAUNCH_DMA_SEMAPHORE_REDUCTION_IOR,
+        sema::HOST_REDUCTION_OR
+    );
+    assert_eq!(
+        c::LAUNCH_DMA_SEMAPHORE_REDUCTION_IADD,
+        sema::HOST_REDUCTION_ADD
+    );
+    assert_eq!(
+        c::LAUNCH_DMA_SEMAPHORE_REDUCTION_INC,
+        sema::HOST_REDUCTION_INC
+    );
+    assert_eq!(
+        c::LAUNCH_DMA_SEMAPHORE_REDUCTION_DEC,
+        sema::HOST_REDUCTION_DEC
+    );
+    assert_eq!(
+        c::LAUNCH_DMA_SEMAPHORE_REDUCTION_SIGN_SIGNED,
+        sema::HOST_FORMAT_SIGNED
+    );
+    assert_eq!(
+        c::LAUNCH_DMA_SEMAPHORE_REDUCTION_SIGN_UNSIGNED,
+        sema::HOST_FORMAT_UNSIGNED
+    );
 }
 
 // --- Faults at the edge ---
@@ -583,8 +818,14 @@ fn edge_copy(source_len_past: Option<u64>, destination_len_past: Option<u64>) ->
         None => DST,
     };
     Copy {
-        source: Side::Pitch { address: source, pitch: 0 },
-        destination: Side::Pitch { address: destination, pitch: 0 },
+        source: Side::Pitch {
+            address: source,
+            pitch: 0,
+        },
+        destination: Side::Pitch {
+            address: destination,
+            pitch: 0,
+        },
         length: 0x40,
         lines: 1,
         multi_line: false,
@@ -597,11 +838,19 @@ const HOLE: u64 = GPU_BASE + 100 * PAGE_SIZE;
 fn a_source_ending_at_the_hole_copies_and_one_byte_more_faults_there() {
     let mem = memory_with_hole(100);
     assert_eq!(
-        launch(&mem, &regs_for(&edge_copy(Some(0), None)), &mut Recorder::default()),
+        launch(
+            &mem,
+            &regs_for(&edge_copy(Some(0), None)),
+            &mut Recorder::default()
+        ),
         Ok(())
     );
     assert_eq!(
-        launch(&mem, &regs_for(&edge_copy(Some(1), None)), &mut Recorder::default()),
+        launch(
+            &mem,
+            &regs_for(&edge_copy(Some(1), None)),
+            &mut Recorder::default()
+        ),
         Err(CopyError::Fault {
             side: CopySide::Source,
             fault: GpuFault::Unmapped { va: HOLE },
@@ -613,11 +862,19 @@ fn a_source_ending_at_the_hole_copies_and_one_byte_more_faults_there() {
 fn a_destination_ending_at_the_hole_copies_and_one_byte_more_faults_there() {
     let mem = memory_with_hole(100);
     assert_eq!(
-        launch(&mem, &regs_for(&edge_copy(None, Some(0))), &mut Recorder::default()),
+        launch(
+            &mem,
+            &regs_for(&edge_copy(None, Some(0))),
+            &mut Recorder::default()
+        ),
         Ok(())
     );
     assert_eq!(
-        launch(&mem, &regs_for(&edge_copy(None, Some(1))), &mut Recorder::default()),
+        launch(
+            &mem,
+            &regs_for(&edge_copy(None, Some(1))),
+            &mut Recorder::default()
+        ),
         Err(CopyError::Fault {
             side: CopySide::Destination,
             fault: GpuFault::Unmapped { va: HOLE },
@@ -629,17 +886,33 @@ fn a_destination_ending_at_the_hole_copies_and_one_byte_more_faults_there() {
 fn a_block_linear_destination_reaching_the_hole_faults_at_its_first_byte() {
     // A 64-byte-wide surface of 8 rows per GOB: 512 bytes per GOB, 8 GOBs a page. Rows 0..64
     // fill page 99 exactly (64 rows of 64 bytes); row 64 starts in the hole.
-    let bl = Bl { width: 64, height: 72, depth: 1, bh: 0, bd: 0 };
+    let bl = Bl {
+        width: 64,
+        height: 72,
+        depth: 1,
+        bh: 0,
+        bd: 0,
+    };
     let start = HOLE - PAGE_SIZE;
     let mem = memory_with_hole(100);
     let mut copy = Copy {
-        source: Side::Pitch { address: SRC, pitch: 64 },
-        destination: Side::Bl { address: start, bl, origin: (0, 0) },
+        source: Side::Pitch {
+            address: SRC,
+            pitch: 64,
+        },
+        destination: Side::Bl {
+            address: start,
+            bl,
+            origin: (0, 0),
+        },
         length: 64,
         lines: 64,
         multi_line: true,
     };
-    assert_eq!(launch(&mem, &regs_for(&copy), &mut Recorder::default()), Ok(()));
+    assert_eq!(
+        launch(&mem, &regs_for(&copy), &mut Recorder::default()),
+        Ok(())
+    );
     copy.lines = 65;
     assert_eq!(
         launch(&mem, &regs_for(&copy), &mut Recorder::default()),
@@ -654,7 +927,11 @@ fn a_block_linear_destination_reaching_the_hole_faults_at_its_first_byte() {
 fn with_both_sides_faulting_the_source_is_reported() {
     let mem = memory_with_hole(100);
     assert_eq!(
-        launch(&mem, &regs_for(&edge_copy(Some(1), Some(1))), &mut Recorder::default()),
+        launch(
+            &mem,
+            &regs_for(&edge_copy(Some(1), Some(1))),
+            &mut Recorder::default()
+        ),
         Err(CopyError::Fault {
             side: CopySide::Source,
             fault: GpuFault::Unmapped { va: HOLE },
@@ -667,14 +944,23 @@ fn a_fault_found_by_the_probe_writes_nothing_and_the_next_launch_works() {
     let mem = memory_with_hole(100);
     // Many lines are fine; only the last line's end reaches the hole.
     let mut copy = Copy {
-        source: Side::Pitch { address: HOLE - 0x40 * 8, pitch: 0x40 },
-        destination: Side::Pitch { address: DST, pitch: 0x40 },
+        source: Side::Pitch {
+            address: HOLE - 0x40 * 8,
+            pitch: 0x40,
+        },
+        destination: Side::Pitch {
+            address: DST,
+            pitch: 0x40,
+        },
         length: 0x40,
         lines: 9,
         multi_line: true,
     };
     let mut regs = regs_for(&copy);
-    semaphore_type(&mut regs, c::LAUNCH_DMA_SEMAPHORE_TYPE_RELEASE_ONE_WORD_SEMAPHORE);
+    semaphore_type(
+        &mut regs,
+        c::LAUNCH_DMA_SEMAPHORE_TYPE_RELEASE_ONE_WORD_SEMAPHORE,
+    );
     let before = read(&mem, DST, 0x40 * 9);
     let mut sink = Recorder::default();
     assert_eq!(
@@ -688,9 +974,15 @@ fn a_fault_found_by_the_probe_writes_nothing_and_the_next_launch_works() {
     assert_eq!(sink.events, vec![]);
     copy.lines = 8;
     let mut regs = regs_for(&copy);
-    semaphore_type(&mut regs, c::LAUNCH_DMA_SEMAPHORE_TYPE_RELEASE_ONE_WORD_SEMAPHORE);
+    semaphore_type(
+        &mut regs,
+        c::LAUNCH_DMA_SEMAPHORE_TYPE_RELEASE_ONE_WORD_SEMAPHORE,
+    );
     assert_eq!(launch(&mem, &regs, &mut sink), Ok(()));
-    assert_eq!(read(&mem, DST, 0x40 * 8), read(&mem, HOLE - 0x40 * 8, 0x40 * 8));
+    assert_eq!(
+        read(&mem, DST, 0x40 * 8),
+        read(&mem, HOLE - 0x40 * 8, 0x40 * 8)
+    );
     assert_eq!(sink.releases().len(), 1);
 }
 
@@ -699,22 +991,45 @@ fn a_fault_found_by_the_probe_writes_nothing_and_the_next_launch_works() {
 #[test]
 fn the_sink_sees_pending_then_current_then_invalidate_then_release() {
     let mem = memory();
-    let bl = Bl { width: 128, height: 16, depth: 1, bh: 1, bd: 0 };
+    let bl = Bl {
+        width: 128,
+        height: 16,
+        depth: 1,
+        bh: 1,
+        bd: 0,
+    };
     let copy = Copy {
-        source: Side::Pitch { address: SRC + 0x10, pitch: -0x100 },
-        destination: Side::Bl { address: DST, bl, origin: (4, 2) },
+        source: Side::Pitch {
+            address: SRC + 0x10,
+            pitch: -0x100,
+        },
+        destination: Side::Bl {
+            address: DST,
+            bl,
+            origin: (4, 2),
+        },
         length: 0x20,
         lines: 3,
         multi_line: true,
     };
     let mut regs = regs_for(&copy);
-    semaphore_type(&mut regs, c::LAUNCH_DMA_SEMAPHORE_TYPE_RELEASE_ONE_WORD_SEMAPHORE)
-        .set(c::SET_SEMAPHORE_B, 0x40);
+    semaphore_type(
+        &mut regs,
+        c::LAUNCH_DMA_SEMAPHORE_TYPE_RELEASE_ONE_WORD_SEMAPHORE,
+    )
+    .set(c::SET_SEMAPHORE_B, 0x40);
     let mut pending = PendingWrites::new();
     pending.add(0x300..0x310);
     pending.add(0x100..0x108);
     let mut sink = Recorder::default();
-    dma_method(c::LAUNCH_DMA.method(), &regs.0, &mem, &mut pending, &mut sink).unwrap();
+    dma_method(
+        c::LAUNCH_DMA.method(),
+        &regs.0,
+        &mem,
+        &mut pending,
+        &mut sink,
+    )
+    .unwrap();
     assert!(pending.is_empty());
     assert_eq!(
         sink.events,
@@ -730,7 +1045,10 @@ fn the_sink_sees_pending_then_current_then_invalidate_then_release() {
             Event::Release(Release {
                 address: 0x40,
                 payload: 0,
-                form: ReleaseForm { size: PayloadSize::Four, timestamp: false },
+                form: ReleaseForm {
+                    size: PayloadSize::Four,
+                    timestamp: false
+                },
                 op: ReleaseOp::Write,
             }),
         ]
@@ -741,12 +1059,21 @@ fn the_sink_sees_pending_then_current_then_invalidate_then_release() {
 fn a_launch_that_fails_still_flushes_the_pending_writes() {
     let mem = memory();
     let mut regs = regs_for(&edge_copy(None, None));
-    semaphore_type(&mut regs, c::LAUNCH_DMA_SEMAPHORE_TYPE_RELEASE_CONDITIONAL_INTR_SEMAPHORE);
+    semaphore_type(
+        &mut regs,
+        c::LAUNCH_DMA_SEMAPHORE_TYPE_RELEASE_CONDITIONAL_INTR_SEMAPHORE,
+    );
     let mut pending = PendingWrites::new();
     pending.add(0x10..0x20);
     let mut sink = Recorder::default();
     assert_eq!(
-        dma_method(c::LAUNCH_DMA.method(), &regs.0, &mem, &mut pending, &mut sink),
+        dma_method(
+            c::LAUNCH_DMA.method(),
+            &regs.0,
+            &mem,
+            &mut pending,
+            &mut sink
+        ),
         Err(CopyError::SemaphoreType(
             c::LAUNCH_DMA_SEMAPHORE_TYPE_RELEASE_CONDITIONAL_INTR_SEMAPHORE
         ))
@@ -763,7 +1090,10 @@ fn other_methods_do_nothing_and_leave_pending_writes_alone() {
     pending.add(0x10..0x20);
     let mut sink = Recorder::default();
     for method in [c::LINE_COUNT.method(), c::LAUNCH_DMA.method() + 1, 0] {
-        assert_eq!(dma_method(method, &regs.0, &mem, &mut pending, &mut sink), Ok(()));
+        assert_eq!(
+            dma_method(method, &regs.0, &mem, &mut pending, &mut sink),
+            Ok(())
+        );
     }
     assert_eq!(pending.ranges(), vec![0x10..0x20]);
     assert_eq!(sink.events, vec![]);
@@ -772,32 +1102,50 @@ fn other_methods_do_nothing_and_leave_pending_writes_alone() {
 
 // --- Refusals ---
 
-#[test]
-fn refusals_are_exact() {
-    let mem = memory();
-    let base = Copy {
-        source: Side::Pitch { address: SRC, pitch: 0x40 },
+/// The copy the refusal tests change one register of.
+fn refusal_base() -> Copy {
+    Copy {
+        source: Side::Pitch {
+            address: SRC,
+            pitch: 0x40,
+        },
         destination: Side::Bl {
             address: DST,
-            bl: Bl { width: 64, height: 8, depth: 1, bh: 0, bd: 0 },
+            bl: Bl {
+                width: 64,
+                height: 8,
+                depth: 1,
+                bh: 0,
+                bd: 0,
+            },
             origin: (0, 0),
         },
         length: 0x40,
         lines: 8,
         multi_line: true,
-    };
-    let run = |f: &dyn Fn(&mut Regs)| {
-        let mut regs = regs_for(&base);
-        f(&mut regs);
-        let before = snapshot(&mem);
-        let mut sink = Recorder::default();
-        let result = launch(&mem, &regs, &mut sink);
-        if result.is_err() {
-            assert!(snapshot(&mem) == before, "a refused launch wrote");
-            assert_eq!(sink.events, vec![], "a refused launch reached the sink");
-        }
-        result
-    };
+    }
+}
+
+/// Launches the refusal base changed by `f`; a refused launch must leave memory and the sink
+/// untouched.
+fn refused(f: &dyn Fn(&mut Regs)) -> Result<(), CopyError> {
+    let mem = memory();
+    let mut regs = regs_for(&refusal_base());
+    f(&mut regs);
+    let before = snapshot(&mem);
+    let mut sink = Recorder::default();
+    let result = launch(&mem, &regs, &mut sink);
+    if result.is_err() {
+        assert!(snapshot(&mem) == before, "a refused launch wrote");
+        assert_eq!(sink.events, vec![], "a refused launch reached the sink");
+    }
+    result
+}
+
+#[test]
+fn refusals_are_exact() {
+    let mem = memory();
+    let base = refusal_base();
     // The register file.
     assert_eq!(
         dma_method(
@@ -807,14 +1155,22 @@ fn refusals_are_exact() {
             &mut PendingWrites::new(),
             &mut Recorder::default()
         ),
-        Err(CopyError::Registers { len: DMA_REGISTERS_NEEDED - 1, needed: DMA_REGISTERS_NEEDED })
+        Err(CopyError::Registers {
+            len: DMA_REGISTERS_NEEDED - 1,
+            needed: DMA_REGISTERS_NEEDED
+        })
     );
     // The semaphore.
     assert_eq!(
-        run(&|r| {
-            semaphore_type(r, c::LAUNCH_DMA_SEMAPHORE_TYPE_RELEASE_CONDITIONAL_INTR_SEMAPHORE);
+        refused(&|r| {
+            semaphore_type(
+                r,
+                c::LAUNCH_DMA_SEMAPHORE_TYPE_RELEASE_CONDITIONAL_INTR_SEMAPHORE,
+            );
         }),
-        Err(CopyError::SemaphoreType(c::LAUNCH_DMA_SEMAPHORE_TYPE_RELEASE_CONDITIONAL_INTR_SEMAPHORE))
+        Err(CopyError::SemaphoreType(
+            c::LAUNCH_DMA_SEMAPHORE_TYPE_RELEASE_CONDITIONAL_INTR_SEMAPHORE
+        ))
     );
     for float in [
         c::LAUNCH_DMA_SEMAPHORE_REDUCTION_FADD,
@@ -822,7 +1178,7 @@ fn refusals_are_exact() {
         c::LAUNCH_DMA_SEMAPHORE_REDUCTION_FMAX,
     ] {
         assert_eq!(
-            run(&|r| {
+            refused(&|r| {
                 semaphore_type(r, c::LAUNCH_DMA_SEMAPHORE_TYPE_RELEASE_ONE_WORD_SEMAPHORE)
                     .field(
                         c::LAUNCH_DMA,
@@ -842,7 +1198,7 @@ fn refusals_are_exact() {
         c::LAUNCH_DMA_SEMAPHORE_REDUCTION_INVALIDE,
     ] {
         assert_eq!(
-            run(&|r| {
+            refused(&|r| {
                 semaphore_type(r, c::LAUNCH_DMA_SEMAPHORE_TYPE_RELEASE_ONE_WORD_SEMAPHORE)
                     .field(
                         c::LAUNCH_DMA,
@@ -857,57 +1213,93 @@ fn refusals_are_exact() {
             }))
         );
     }
+}
+
+#[test]
+fn address_remap_and_block_refusals_are_exact() {
     // Physical addresses, source before destination.
     assert_eq!(
-        run(&|r| {
-            r.field(c::LAUNCH_DMA, c::LAUNCH_DMA_SRC_TYPE, c::LAUNCH_DMA_SRC_TYPE_PHYSICAL)
-                .field(c::LAUNCH_DMA, c::LAUNCH_DMA_DST_TYPE, c::LAUNCH_DMA_DST_TYPE_PHYSICAL);
+        refused(&|r| {
+            r.field(
+                c::LAUNCH_DMA,
+                c::LAUNCH_DMA_SRC_TYPE,
+                c::LAUNCH_DMA_SRC_TYPE_PHYSICAL,
+            )
+            .field(
+                c::LAUNCH_DMA,
+                c::LAUNCH_DMA_DST_TYPE,
+                c::LAUNCH_DMA_DST_TYPE_PHYSICAL,
+            );
         }),
-        Err(CopyError::Physical { side: CopySide::Source })
+        Err(CopyError::Physical {
+            side: CopySide::Source
+        })
     );
     assert_eq!(
-        run(&|r| {
-            r.field(c::LAUNCH_DMA, c::LAUNCH_DMA_DST_TYPE, c::LAUNCH_DMA_DST_TYPE_PHYSICAL);
+        refused(&|r| {
+            r.field(
+                c::LAUNCH_DMA,
+                c::LAUNCH_DMA_DST_TYPE,
+                c::LAUNCH_DMA_DST_TYPE_PHYSICAL,
+            );
         }),
-        Err(CopyError::Physical { side: CopySide::Destination })
+        Err(CopyError::Physical {
+            side: CopySide::Destination
+        })
     );
     // Remap: an undefined selector, and a source component past the count.
     assert_eq!(
-        run(&|r| remap(r, 1, 4, 2, [X, 7, KEEP, KEEP])),
-        Err(CopyError::RemapSelector { component: 1, value: 7 })
+        refused(&|r| remap(r, 1, 4, 2, [X, 7, KEEP, KEEP])),
+        Err(CopyError::RemapSelector {
+            component: 1,
+            value: 7
+        })
     );
     assert_eq!(
-        run(&|r| remap(r, 1, 2, 3, [X, Y, Z, 7])),
-        Err(CopyError::RemapSource { component: 2, read: 2, sources: 2 })
+        refused(&|r| remap(r, 1, 2, 3, [X, Y, Z, 7])),
+        Err(CopyError::RemapSource {
+            component: 2,
+            read: 2,
+            sources: 2
+        })
     );
     // A selector past NUM_DST_COMPONENTS is not read.
-    assert_eq!(run(&|r| remap(r, 1, 1, 1, [X, 7, 7, 7])), Ok(()));
+    assert_eq!(refused(&|r| remap(r, 1, 1, 1, [X, 7, 7, 7])), Ok(()));
     // Block fields, width before height before depth.
     assert_eq!(
-        run(&|r| {
+        refused(&|r| {
             r.field(c::SET_DST_BLOCK_SIZE, c::SET_DST_BLOCK_SIZE_WIDTH, 1)
                 .field(c::SET_DST_BLOCK_SIZE, c::SET_DST_BLOCK_SIZE_HEIGHT, 6)
                 .field(c::SET_DST_BLOCK_SIZE, c::SET_DST_BLOCK_SIZE_DEPTH, 6);
         }),
-        Err(CopyError::BlockWidth { side: CopySide::Destination, value: 1 })
+        Err(CopyError::BlockWidth {
+            side: CopySide::Destination,
+            value: 1
+        })
     );
     let top = c::SET_DST_BLOCK_SIZE_HEIGHT_THIRTYTWO_GOBS;
     assert_eq!(
-        run(&|r| {
+        refused(&|r| {
             r.field(c::SET_DST_BLOCK_SIZE, c::SET_DST_BLOCK_SIZE_HEIGHT, top + 1)
                 .field(c::SET_DST_BLOCK_SIZE, c::SET_DST_BLOCK_SIZE_DEPTH, top + 1);
         }),
-        Err(CopyError::BlockHeight { side: CopySide::Destination, value: top + 1 })
+        Err(CopyError::BlockHeight {
+            side: CopySide::Destination,
+            value: top + 1
+        })
     );
     assert_eq!(
-        run(&|r| {
+        refused(&|r| {
             r.field(c::SET_DST_BLOCK_SIZE, c::SET_DST_BLOCK_SIZE_DEPTH, top + 1);
         }),
-        Err(CopyError::BlockDepth { side: CopySide::Destination, value: top + 1 })
+        Err(CopyError::BlockDepth {
+            side: CopySide::Destination,
+            value: top + 1
+        })
     );
     // The largest defined block is accepted (the region still fits).
     assert_eq!(
-        run(&|r| {
+        refused(&|r| {
             r.field(c::SET_DST_BLOCK_SIZE, c::SET_DST_BLOCK_SIZE_HEIGHT, top)
                 .field(c::SET_DST_BLOCK_SIZE, c::SET_DST_BLOCK_SIZE_DEPTH, 0);
         })
@@ -916,10 +1308,14 @@ fn refusals_are_exact() {
     );
     // A pitch line start below address 0, and an end past 2^64.
     assert_eq!(
-        run(&|r| {
-            r.set(c::OFFSET_IN_UPPER, 0).set(c::OFFSET_IN_LOWER, 0x100).set(c::PITCH_IN, (-0x40i32).cast_unsigned());
+        refused(&|r| {
+            r.set(c::OFFSET_IN_UPPER, 0)
+                .set(c::OFFSET_IN_LOWER, 0x100)
+                .set(c::PITCH_IN, (-0x40i32).cast_unsigned());
         }),
-        Err(CopyError::Extent { side: CopySide::Source })
+        Err(CopyError::Extent {
+            side: CopySide::Source
+        })
     );
 }
 
@@ -927,7 +1323,10 @@ fn refusals_are_exact() {
 fn error_messages_are_plain_words() {
     let cases: [(CopyError, &str); 6] = [
         (
-            CopyError::Fault { side: CopySide::Source, fault: GpuFault::Unmapped { va: 0x1000 } },
+            CopyError::Fault {
+                side: CopySide::Source,
+                fault: GpuFault::Unmapped { va: 0x1000 },
+            },
             "the copy's source: GPU address 0x1000 is not mapped",
         ),
         (
@@ -937,13 +1336,32 @@ fn error_messages_are_plain_words() {
             },
             "the copy's destination surface: the region does not fit in the level",
         ),
-        (CopyError::Registers { len: 0, needed: 1 }, "the register file holds 0 registers, the engine reads 1"),
         (
-            CopyError::TooLarge { bytes: u128::from(MAX_COPY_BYTES) + 1, max: MAX_COPY_BYTES },
+            CopyError::Registers { len: 0, needed: 1 },
+            "the register file holds 0 registers, the engine reads 1",
+        ),
+        (
+            CopyError::TooLarge {
+                bytes: u128::from(MAX_COPY_BYTES) + 1,
+                max: MAX_COPY_BYTES,
+            },
             "the copy moves 268435457 bytes, more than the 268435456 allowed",
         ),
-        (CopyError::BlockWidth { side: CopySide::Source, value: 2 }, "the copy's source block width field is 2, but only one GOB (0) is defined"),
-        (CopyError::RemapSource { component: 0, read: 3, sources: 1 }, "remap component 0 reads source component 3 of 1"),
+        (
+            CopyError::BlockWidth {
+                side: CopySide::Source,
+                value: 2,
+            },
+            "the copy's source block width field is 2, but only one GOB (0) is defined",
+        ),
+        (
+            CopyError::RemapSource {
+                component: 0,
+                read: 3,
+                sources: 1,
+            },
+            "remap component 0 reads source component 3 of 1",
+        ),
     ];
     for (error, text) in cases {
         assert_eq!(error.to_string(), text);
@@ -955,15 +1373,24 @@ fn the_size_bound_is_checked_at_the_edge() {
     assert_eq!(check_size(u128::from(MAX_COPY_BYTES)), Ok(()));
     assert_eq!(
         check_size(u128::from(MAX_COPY_BYTES) + 1),
-        Err(CopyError::TooLarge { bytes: u128::from(MAX_COPY_BYTES) + 1, max: MAX_COPY_BYTES })
+        Err(CopyError::TooLarge {
+            bytes: u128::from(MAX_COPY_BYTES) + 1,
+            max: MAX_COPY_BYTES
+        })
     );
     // Through a launch: 2^14 lines of 2^14 bytes is MAX_COPY_BYTES; one byte more per line is
     // refused before anything is read (the source would fault). Remap makes the destination the
     // larger side: four 1-byte components from one.
     let mem = memory_with_hole(0);
     let mut copy = Copy {
-        source: Side::Pitch { address: GPU_BASE, pitch: 0 },
-        destination: Side::Pitch { address: GPU_BASE, pitch: 0 },
+        source: Side::Pitch {
+            address: GPU_BASE,
+            pitch: 0,
+        },
+        destination: Side::Pitch {
+            address: GPU_BASE,
+            pitch: 0,
+        },
         length: (1 << 14) + 1,
         lines: 1 << 14,
         multi_line: true,
@@ -972,11 +1399,17 @@ fn the_size_bound_is_checked_at_the_edge() {
         bytes: u128::from(MAX_COPY_BYTES) + (1 << 14),
         max: MAX_COPY_BYTES,
     });
-    assert_eq!(launch(&mem, &regs_for(&copy), &mut Recorder::default()), refused);
+    assert_eq!(
+        launch(&mem, &regs_for(&copy), &mut Recorder::default()),
+        refused
+    );
     copy.length = 1 << 14;
     assert_eq!(
         launch(&mem, &regs_for(&copy), &mut Recorder::default()),
-        Err(CopyError::Fault { side: CopySide::Source, fault: GpuFault::Unmapped { va: GPU_BASE } })
+        Err(CopyError::Fault {
+            side: CopySide::Source,
+            fault: GpuFault::Unmapped { va: GPU_BASE }
+        })
     );
     copy.length = (1 << 12) + 1;
     copy.lines = 1 << 14;
@@ -984,7 +1417,10 @@ fn the_size_bound_is_checked_at_the_edge() {
     remap(&mut regs, 1, 1, 4, [X, X, X, X]);
     assert_eq!(
         launch(&mem, &regs, &mut Recorder::default()),
-        Err(CopyError::TooLarge { bytes: u128::from(MAX_COPY_BYTES) + 4 * (1 << 14), max: MAX_COPY_BYTES })
+        Err(CopyError::TooLarge {
+            bytes: u128::from(MAX_COPY_BYTES) + 4 * (1 << 14),
+            max: MAX_COPY_BYTES
+        })
     );
 }
 
@@ -996,8 +1432,14 @@ fn divergence_upper_address_bits_are_seventeen() {
     // field (Eden-NX2's `upper & 0xff`) would drop.
     assert!(hi(GPU_BASE) > 0xff);
     check_against_layout(Copy {
-        source: Side::Pitch { address: SRC, pitch: 0x10 },
-        destination: Side::Pitch { address: DST, pitch: 0x10 },
+        source: Side::Pitch {
+            address: SRC,
+            pitch: 0x10,
+        },
+        destination: Side::Pitch {
+            address: DST,
+            pitch: 0x10,
+        },
         length: 0x10,
         lines: 2,
         multi_line: true,
@@ -1019,32 +1461,63 @@ fn divergence_transfer_type_none_moves_nothing() {
     let mem = memory();
     let before = snapshot(&mem);
     let mut regs = regs_for(&edge_copy(None, None));
-    regs.field(c::LAUNCH_DMA, c::LAUNCH_DMA_DATA_TRANSFER_TYPE, c::LAUNCH_DMA_DATA_TRANSFER_TYPE_NONE);
-    semaphore_type(&mut regs, c::LAUNCH_DMA_SEMAPHORE_TYPE_RELEASE_ONE_WORD_SEMAPHORE);
+    regs.field(
+        c::LAUNCH_DMA,
+        c::LAUNCH_DMA_DATA_TRANSFER_TYPE,
+        c::LAUNCH_DMA_DATA_TRANSFER_TYPE_NONE,
+    );
+    semaphore_type(
+        &mut regs,
+        c::LAUNCH_DMA_SEMAPHORE_TYPE_RELEASE_ONE_WORD_SEMAPHORE,
+    );
     let mut sink = Recorder::default();
     launch(&mem, &regs, &mut sink).unwrap();
     assert!(snapshot(&mem) == before);
     assert_eq!(sink.events.len(), 1);
     assert_eq!(sink.releases().len(), 1);
     // Pipelined moves bytes as non-pipelined does.
-    regs.field(c::LAUNCH_DMA, c::LAUNCH_DMA_DATA_TRANSFER_TYPE, c::LAUNCH_DMA_DATA_TRANSFER_TYPE_PIPELINED);
+    regs.field(
+        c::LAUNCH_DMA,
+        c::LAUNCH_DMA_DATA_TRANSFER_TYPE,
+        c::LAUNCH_DMA_DATA_TRANSFER_TYPE_PIPELINED,
+    );
     launch(&mem, &regs, &mut Recorder::default()).unwrap();
     assert_eq!(read(&mem, DST, 0x40), read(&mem, SRC, 0x40));
 }
 
 #[test]
 fn divergence_a_one_line_copy_follows_the_layout_bits() {
-    let bl = Bl { width: 128, height: 16, depth: 1, bh: 1, bd: 0 };
+    let bl = Bl {
+        width: 128,
+        height: 16,
+        depth: 1,
+        bh: 1,
+        bd: 0,
+    };
     check_against_layout(Copy {
-        source: Side::Pitch { address: SRC, pitch: 0 },
-        destination: Side::Bl { address: DST, bl, origin: (5, 11) },
+        source: Side::Pitch {
+            address: SRC,
+            pitch: 0,
+        },
+        destination: Side::Bl {
+            address: DST,
+            bl,
+            origin: (5, 11),
+        },
         length: 100,
         lines: 3,
         multi_line: false,
     });
     check_against_layout(Copy {
-        source: Side::Bl { address: SRC, bl, origin: (20, 9) },
-        destination: Side::Pitch { address: DST, pitch: 0 },
+        source: Side::Bl {
+            address: SRC,
+            bl,
+            origin: (20, 9),
+        },
+        destination: Side::Pitch {
+            address: DST,
+            pitch: 0,
+        },
         length: 100,
         lines: 3,
         multi_line: false,
@@ -1059,15 +1532,23 @@ fn divergence_remap_applies_the_selectors_on_every_path() {
     let mem = memory();
     let before = read(&mem, SRC, 8);
     let mut regs = regs_for(&Copy {
-        source: Side::Pitch { address: SRC, pitch: 0 },
-        destination: Side::Pitch { address: DST, pitch: 0 },
+        source: Side::Pitch {
+            address: SRC,
+            pitch: 0,
+        },
+        destination: Side::Pitch {
+            address: DST,
+            pitch: 0,
+        },
         length: 2,
         lines: 1,
         multi_line: false,
     });
     remap(&mut regs, 1, 4, 4, [W, Z, Y, X]);
     launch(&mem, &regs, &mut Recorder::default()).unwrap();
-    let expected = [before[3], before[2], before[1], before[0], before[7], before[6], before[5], before[4]];
+    let expected = [
+        before[3], before[2], before[1], before[0], before[7], before[6], before[5], before[4],
+    ];
     assert_eq!(read(&mem, DST, 8), expected);
 }
 
@@ -1077,8 +1558,14 @@ fn divergence_one_byte_constant_fill_uses_the_low_byte() {
     // 0xa1a2a3a4 stored little-endian: a4 a3 a2 a1 ...); here each element is the low byte.
     let mem = memory();
     let mut regs = regs_for(&Copy {
-        source: Side::Pitch { address: SRC, pitch: 0 },
-        destination: Side::Pitch { address: DST, pitch: 0 },
+        source: Side::Pitch {
+            address: SRC,
+            pitch: 0,
+        },
+        destination: Side::Pitch {
+            address: DST,
+            pitch: 0,
+        },
         length: 6,
         lines: 1,
         multi_line: false,
@@ -1091,10 +1578,23 @@ fn divergence_one_byte_constant_fill_uses_the_low_byte() {
 #[test]
 fn divergence_a_region_past_the_surface_is_refused() {
     let mem = memory();
-    let bl = Bl { width: 64, height: 16, depth: 2, bh: 1, bd: 0 };
+    let bl = Bl {
+        width: 64,
+        height: 16,
+        depth: 2,
+        bh: 1,
+        bd: 0,
+    };
     let copy = |length: u32, lines: u32, origin: (u32, u32)| Copy {
-        source: Side::Pitch { address: SRC, pitch: 64 },
-        destination: Side::Bl { address: DST, bl, origin },
+        source: Side::Pitch {
+            address: SRC,
+            pitch: 64,
+        },
+        destination: Side::Bl {
+            address: DST,
+            bl,
+            origin,
+        },
         length,
         lines,
         multi_line: true,
@@ -1104,25 +1604,80 @@ fn divergence_a_region_past_the_surface_is_refused() {
         error: LayoutError::RegionOutOfBounds,
     });
     // x: the end exactly at the width fits, one past does not.
-    assert_eq!(launch(&mem, &regs_for(&copy(60, 1, (4, 0))), &mut Recorder::default()), Ok(()));
-    assert_eq!(launch(&mem, &regs_for(&copy(61, 1, (4, 0))), &mut Recorder::default()), out);
+    assert_eq!(
+        launch(
+            &mem,
+            &regs_for(&copy(60, 1, (4, 0))),
+            &mut Recorder::default()
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        launch(
+            &mem,
+            &regs_for(&copy(61, 1, (4, 0))),
+            &mut Recorder::default()
+        ),
+        out
+    );
     // Lines: 12 rows from row 4, twice (two slices), fit; one more line does not.
-    assert_eq!(launch(&mem, &regs_for(&copy(8, 24, (0, 4))), &mut Recorder::default()), Ok(()));
-    assert_eq!(launch(&mem, &regs_for(&copy(8, 25, (0, 4))), &mut Recorder::default()), out);
+    assert_eq!(
+        launch(
+            &mem,
+            &regs_for(&copy(8, 24, (0, 4))),
+            &mut Recorder::default()
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        launch(
+            &mem,
+            &regs_for(&copy(8, 25, (0, 4))),
+            &mut Recorder::default()
+        ),
+        out
+    );
     // An origin row at the height.
-    assert_eq!(launch(&mem, &regs_for(&copy(8, 1, (0, 16))), &mut Recorder::default()), out);
-    assert_eq!(launch(&mem, &regs_for(&copy(8, 1, (0, 15))), &mut Recorder::default()), Ok(()));
+    assert_eq!(
+        launch(
+            &mem,
+            &regs_for(&copy(8, 1, (0, 16))),
+            &mut Recorder::default()
+        ),
+        out
+    );
+    assert_eq!(
+        launch(
+            &mem,
+            &regs_for(&copy(8, 1, (0, 15))),
+            &mut Recorder::default()
+        ),
+        Ok(())
+    );
 }
 
 #[test]
 fn divergence_slices_keep_the_pitch_stride() {
     // Origin row 6 of 8: two lines per slice. Line 2 (slice 1, row 6) reads the pitch side's
     // line 2, at 2 * pitch, not Eden-NX2's 1 * pitch * 8 + 0.
-    let bl = Bl { width: 64, height: 8, depth: 2, bh: 0, bd: 0 };
+    let bl = Bl {
+        width: 64,
+        height: 8,
+        depth: 2,
+        bh: 0,
+        bd: 0,
+    };
     let mem = memory();
     let copy = Copy {
-        source: Side::Pitch { address: SRC, pitch: 0x40 },
-        destination: Side::Bl { address: DST, bl, origin: (0, 6) },
+        source: Side::Pitch {
+            address: SRC,
+            pitch: 0x40,
+        },
+        destination: Side::Bl {
+            address: DST,
+            bl,
+            origin: (0, 6),
+        },
         length: 0x40,
         lines: 3,
         multi_line: true,
@@ -1130,23 +1685,48 @@ fn divergence_slices_keep_the_pitch_stride() {
     let line2 = read(&mem, SRC + 2 * 0x40, 0x40);
     launch(&mem, &regs_for(&copy), &mut Recorder::default()).unwrap();
     let tiled = read(&mem, DST, bl.size());
-    let offset = starquake_layout::block_linear_offset(&bl.tiling(), bl.extent(), Offset4D::new(0, 6, 1, 0)).unwrap() as usize;
+    let offset = us(starquake_layout::block_linear_offset(
+        &bl.tiling(),
+        bl.extent(),
+        Offset4D::new(0, 6, 1, 0),
+    )
+    .unwrap());
     assert_eq!(&tiled[offset..offset + 16], &line2[..16]);
 }
 
 #[test]
 fn divergence_a_negative_pitch_walks_down_on_every_path() {
-    let bl = Bl { width: 128, height: 16, depth: 1, bh: 1, bd: 0 };
+    let bl = Bl {
+        width: 128,
+        height: 16,
+        depth: 1,
+        bh: 1,
+        bd: 0,
+    };
     check_against_layout(Copy {
-        source: Side::Pitch { address: SRC + 0x1000, pitch: -0x90 },
-        destination: Side::Bl { address: DST, bl, origin: (1, 1) },
+        source: Side::Pitch {
+            address: SRC + 0x1000,
+            pitch: -0x90,
+        },
+        destination: Side::Bl {
+            address: DST,
+            bl,
+            origin: (1, 1),
+        },
         length: 0x70,
         lines: 9,
         multi_line: true,
     });
     check_against_layout(Copy {
-        source: Side::Bl { address: SRC, bl, origin: (1, 1) },
-        destination: Side::Pitch { address: DST + 0x1000, pitch: -0x90 },
+        source: Side::Bl {
+            address: SRC,
+            bl,
+            origin: (1, 1),
+        },
+        destination: Side::Pitch {
+            address: DST + 0x1000,
+            pitch: -0x90,
+        },
         length: 0x70,
         lines: 9,
         multi_line: true,
@@ -1158,10 +1738,19 @@ fn fields_that_are_not_read_change_nothing() {
     let copy = Copy {
         source: Side::Bl {
             address: SRC,
-            bl: Bl { width: 128, height: 16, depth: 1, bh: 1, bd: 0 },
+            bl: Bl {
+                width: 128,
+                height: 16,
+                depth: 1,
+                bh: 1,
+                bd: 0,
+            },
             origin: (2, 3),
         },
-        destination: Side::Pitch { address: DST, pitch: 0x80 },
+        destination: Side::Pitch {
+            address: DST,
+            pitch: 0x80,
+        },
         length: 0x50,
         lines: 5,
         multi_line: true,
@@ -1170,17 +1759,32 @@ fn fields_that_are_not_read_change_nothing() {
     launch(&plain, &regs_for(&copy), &mut Recorder::default()).unwrap();
     let noisy = memory();
     let mut regs = regs_for(&copy);
-    regs.field(c::LAUNCH_DMA, c::LAUNCH_DMA_INTERRUPT_TYPE, c::LAUNCH_DMA_INTERRUPT_TYPE_BLOCKING)
-        .field(c::LAUNCH_DMA, c::LAUNCH_DMA_FLUSH_ENABLE, c::LAUNCH_DMA_FLUSH_ENABLE_TRUE)
-        .set(c::SET_SRC_LAYER, 3)
-        .set(c::SET_DST_LAYER, 4)
-        .field(c::SET_SRC_BLOCK_SIZE, c::SET_SRC_BLOCK_SIZE_GOB_HEIGHT, c::SET_SRC_BLOCK_SIZE_GOB_HEIGHT_GOB_HEIGHT_FERMI_8)
-        .set(c::SET_SRC_PHYS_MODE, 1)
-        .set(c::SET_DST_PHYS_MODE, 1)
-        .set(c::SET_RENDER_ENABLE_C, 0);
+    regs.field(
+        c::LAUNCH_DMA,
+        c::LAUNCH_DMA_INTERRUPT_TYPE,
+        c::LAUNCH_DMA_INTERRUPT_TYPE_BLOCKING,
+    )
+    .field(
+        c::LAUNCH_DMA,
+        c::LAUNCH_DMA_FLUSH_ENABLE,
+        c::LAUNCH_DMA_FLUSH_ENABLE_TRUE,
+    )
+    .set(c::SET_SRC_LAYER, 3)
+    .set(c::SET_DST_LAYER, 4)
+    .field(
+        c::SET_SRC_BLOCK_SIZE,
+        c::SET_SRC_BLOCK_SIZE_GOB_HEIGHT,
+        c::SET_SRC_BLOCK_SIZE_GOB_HEIGHT_GOB_HEIGHT_FERMI_8,
+    )
+    .set(c::SET_SRC_PHYS_MODE, 1)
+    .set(c::SET_DST_PHYS_MODE, 1)
+    .set(c::SET_RENDER_ENABLE_C, 0);
     // The 32-bit origins sit past the methods a launch reads; widen the file to hold them.
     regs.0.resize(c::DST_ORIGIN_Y.method() as usize + 1, 0);
-    regs.set(c::SRC_ORIGIN_X, 9).set(c::SRC_ORIGIN_Y, 9).set(c::DST_ORIGIN_X, 9).set(c::DST_ORIGIN_Y, 9);
+    regs.set(c::SRC_ORIGIN_X, 9)
+        .set(c::SRC_ORIGIN_Y, 9)
+        .set(c::DST_ORIGIN_X, 9)
+        .set(c::DST_ORIGIN_Y, 9);
     launch(&noisy, &regs, &mut Recorder::default()).unwrap();
     assert!(snapshot(&plain) == snapshot(&noisy));
 }
@@ -1189,7 +1793,10 @@ fn fields_that_are_not_read_change_nothing() {
 fn dma_registers_needed_covers_every_method_read() {
     // The highest method a launch reads is SET_SRC_ORIGIN (byte 0x73C).
     assert_eq!(DMA_REGISTERS_NEEDED, 0x73c / 4 + 1);
-    assert_eq!(c::SET_SRC_ORIGIN.method() as usize + 1, DMA_REGISTERS_NEEDED);
+    assert_eq!(
+        c::SET_SRC_ORIGIN.method() as usize + 1,
+        DMA_REGISTERS_NEEDED
+    );
 }
 
 /// The header's byte addresses and field positions, written out (`clc7b5.h`), and the register
@@ -1259,7 +1866,11 @@ fn constants_match_the_header_written_out() {
     for (field, (high, low)) in fields {
         assert_eq!(field, Field::new(high, low));
     }
-    // The values the module matches on.
+}
+
+/// The values the module matches on, written out from `clc7b5.h`.
+#[test]
+fn values_match_the_header_written_out() {
     assert_eq!(
         [
             c::LAUNCH_DMA_SEMAPHORE_TYPE_NONE,
@@ -1273,11 +1884,20 @@ fn constants_match_the_header_written_out() {
     assert_eq!(c::LAUNCH_DMA_DST_MEMORY_LAYOUT_PITCH, 1);
     assert_eq!(c::LAUNCH_DMA_DATA_TRANSFER_TYPE_NONE, 0);
     assert_eq!(
-        [c::LAUNCH_DMA_SEMAPHORE_REDUCTION_FADD, c::LAUNCH_DMA_SEMAPHORE_REDUCTION_FMIN, c::LAUNCH_DMA_SEMAPHORE_REDUCTION_FMAX],
+        [
+            c::LAUNCH_DMA_SEMAPHORE_REDUCTION_FADD,
+            c::LAUNCH_DMA_SEMAPHORE_REDUCTION_FMIN,
+            c::LAUNCH_DMA_SEMAPHORE_REDUCTION_FMAX
+        ],
         [0xa, 0xb, 0xc]
     );
     assert_eq!(c::LAUNCH_DMA_SEMAPHORE_PAYLOAD_SIZE_TWO_WORD, 1);
-    // The selector values: DST_Y, _Z and _W name the same values as DST_X.
+}
+
+/// The remap selector values: `DST_Y`, `_Z` and `_W` name the same values as `DST_X`
+/// (`clc7b5.h`).
+#[test]
+fn remap_selector_values_match_the_header_written_out() {
     let x = [
         c::SET_REMAP_COMPONENTS_DST_X_SRC_X,
         c::SET_REMAP_COMPONENTS_DST_X_SRC_Y,

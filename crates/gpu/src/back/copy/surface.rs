@@ -60,7 +60,8 @@ pub(crate) struct BlockFields {
 /// The largest block height or depth any copy class defines: `THIRTYTWO_GOBS`, 5, in
 /// `clc7b5.h`, `cla140.h`, `clc797.h`, `clc7c0.h` and `cl902d.h` alike (pinned by
 /// `tests::surface::every_class_defines_the_same_largest_block`).
-pub(crate) const MAX_BLOCK_LOG2: u32 = crate::classes::clc7b5::SET_DST_BLOCK_SIZE_HEIGHT_THIRTYTWO_GOBS;
+pub(crate) const MAX_BLOCK_LOG2: u32 =
+    crate::classes::clc7b5::SET_DST_BLOCK_SIZE_HEIGHT_THIRTYTWO_GOBS;
 
 /// The only block width any copy class defines: `ONE_GOB`, 0.
 pub(crate) const ONE_GOB: u32 = crate::classes::clc7b5::SET_DST_BLOCK_SIZE_WIDTH_ONE_GOB;
@@ -179,8 +180,7 @@ impl Surface {
         let layout = |error| CopyError::Layout { side, error };
         let tiling = Tiling::new(GobType::TuringColor2d, 0, height, depth).map_err(layout)?;
         let width = u32::try_from(desc.width_b).map_err(|_| layout(LayoutError::Overflow))?;
-        let origin_x =
-            u32::try_from(desc.origin_x_b).map_err(|_| layout(LayoutError::Overflow))?;
+        let origin_x = u32::try_from(desc.origin_x_b).map_err(|_| layout(LayoutError::Overflow))?;
         Ok(Self {
             side,
             address,
@@ -295,9 +295,8 @@ impl Surface {
                         .and_then(|done| start.checked_add(done))
                         .ok_or_else(out)?;
                     let to_line_end = GOB_LINE_WIDTH_B - sx % GOB_LINE_WIDTH_B;
-                    let step = usize::try_from(to_line_end).map_or(len - done, |step| {
-                        step.min(len - done)
-                    });
+                    let step = usize::try_from(to_line_end)
+                        .map_or(len - done, |step| step.min(len - done));
                     let offset = block_linear_offset(
                         &surface.tiling,
                         surface.extent,

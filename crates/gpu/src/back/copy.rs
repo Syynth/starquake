@@ -31,14 +31,17 @@
 //! 2. [`CopySink::make_current`] for the GPU range covering the source, then the destination:
 //!    memory read, or partly overwritten, as plain bytes, which is where an image the caches
 //!    hold must be written back first (decision 4: write-back only when something reads the
-//!    memory as plain bytes, "which a copy does").
+//!    memory as plain bytes, "which a copy does"). An inline upload makes this call once, for
+//!    its destination, when it is launched, and skips step 1.
 //! 3. [`CopySink::invalidate`] for the range covering the destination, after the bytes are
 //!    written (an inline word's runs go to [`PendingWrites`] instead).
 //! 4. [`CopySink::release`] for the semaphore, if the launch asks for one: a fenced release,
 //!    performed by the fence path (slice G15) once the host GPU has finished the work before it
 //!    (decision 2).
 //!
-//! Pinned by `tests::dma::the_sink_sees_pending_then_current_then_invalidate_then_release`.
+//! Pinned by `tests::dma::the_sink_sees_pending_then_current_then_invalidate_then_release`,
+//! `tests::twod::the_sink_sees_pending_then_current_then_invalidate` and
+//! `tests::inline::a_launch_reports_the_destination_cover_before_any_word`.
 //!
 //! # Failures and what they leave
 //!
@@ -75,7 +78,7 @@ use crate::ring::Release;
 use crate::sema::DecodeError;
 
 pub use dma::{DMA_REGISTERS_NEEDED, dma_method};
-pub use inline::{INLINE_A140, INLINE_C797, INLINE_C7C0, InlineClass, InlineUpload};
+pub use inline::{INLINE_A140, INLINE_C7C0, INLINE_C797, InlineClass, InlineUpload};
 pub use surface::CopySide;
 pub use twod::{BILINEAR_FORMATS, BLIT_REGISTERS_NEEDED, blit_method, bytes_per_pixel};
 
@@ -214,7 +217,9 @@ pub enum CopyError {
         format: u32,
     },
     /// A 2D blit between different formats, which needs a format conversion.
-    #[error("a 2D blit from format {from:#x} to format {to:#x} needs a conversion, which is not supported")]
+    #[error(
+        "a 2D blit from format {from:#x} to format {to:#x} needs a conversion, which is not supported"
+    )]
     BlitConversion {
         /// The source format.
         from: u32,
@@ -271,7 +276,10 @@ impl PendingWrites {
 
     /// The pending ranges, in increasing address order.
     pub fn ranges(&self) -> Vec<Range<u64>> {
-        self.ranges.iter().map(|(&start, &end)| start..end).collect()
+        self.ranges
+            .iter()
+            .map(|(&start, &end)| start..end)
+            .collect()
     }
 
     /// Whether nothing is pending.
@@ -342,8 +350,10 @@ impl<'a> Registers<'a> {
     }
 
     /// The value of `method` (element 0 of an array method). A method past the file reads as
-    /// zero; every caller's `needed` covers the methods it reads (pinned by each engine's
-    /// `*_registers_needed_covers_every_method_read` test).
+    /// zero; each engine's `needed` is one past the highest method it reads (pinned by
+    /// `tests::dma::dma_registers_needed_covers_every_method_read`,
+    /// `tests::twod::blit_registers_needed_covers_every_method_read` and
+    /// `tests::inline::constants_match_the_headers_written_out`).
     pub fn get(self, method: Method) -> u32 {
         usize::try_from(method.method())
             .ok()

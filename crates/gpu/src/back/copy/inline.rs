@@ -341,7 +341,11 @@ fn completion(
         ReleaseOp::Write
     };
     Ok(Some(Release {
-        address: regs.address(class.semaphore_a, class.semaphore_a_upper, class.semaphore_b),
+        address: regs.address(
+            class.semaphore_a,
+            class.semaphore_a_upper,
+            class.semaphore_b,
+        ),
         payload: u64::from(regs.get(class.semaphore_c)),
         form: ReleaseForm {
             size: PayloadSize::Four,
@@ -386,7 +390,8 @@ impl Transfer {
         let count = (self.total - self.written).min(bytes.len() as u64);
         let pieces = self.pieces(self.written..self.written + count);
         for (line, x, _) in &pieces {
-            self.destination.probe(memory, *line..*line + 1, x.clone())?;
+            self.destination
+                .probe(memory, *line..*line + 1, x.clone())?;
         }
         for (line, x, within) in pieces {
             let data = bytes.get(within).unwrap_or_default();

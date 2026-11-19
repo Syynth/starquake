@@ -36,10 +36,16 @@ type Memory = TestGpuMemory<FlatMemory>;
 fn memory() -> Memory {
     let size = usize::try_from(PAGES * PAGE_SIZE).unwrap();
     let mem = TestGpuMemory::new(FlatMemory::new(CPU_BASE, size));
-    mem.map(PageRange::new(GPU_BASE, PAGES * PAGE_SIZE).unwrap(), CPU_BASE)
-        .unwrap();
-    mem.map(PageRange::new(LOW_BASE, PAGES * PAGE_SIZE).unwrap(), CPU_BASE)
-        .unwrap();
+    mem.map(
+        PageRange::new(GPU_BASE, PAGES * PAGE_SIZE).unwrap(),
+        CPU_BASE,
+    )
+    .unwrap();
+    mem.map(
+        PageRange::new(LOW_BASE, PAGES * PAGE_SIZE).unwrap(),
+        CPU_BASE,
+    )
+    .unwrap();
     let pattern: Vec<u8> = (0..PAGES * PAGE_SIZE)
         .map(|o| (o.wrapping_mul(7).wrapping_add(o / 251) & 0xff) as u8)
         .collect();
@@ -53,8 +59,11 @@ fn memory_with_hole(hole: u64) -> Memory {
     let size = usize::try_from(PAGES * PAGE_SIZE).unwrap();
     let mem = TestGpuMemory::new(FlatMemory::new(CPU_BASE, size));
     if hole > 0 {
-        mem.map(PageRange::new(GPU_BASE, hole * PAGE_SIZE).unwrap(), CPU_BASE)
-            .unwrap();
+        mem.map(
+            PageRange::new(GPU_BASE, hole * PAGE_SIZE).unwrap(),
+            CPU_BASE,
+        )
+        .unwrap();
     }
     let after = (hole + 1) * PAGE_SIZE;
     mem.map(
@@ -138,11 +147,16 @@ impl Regs {
 }
 
 fn lo(x: u64) -> u32 {
-    x as u32
+    u32::try_from(x & u64::from(u32::MAX)).unwrap()
+}
+
+/// `x` as a buffer index.
+fn us(x: u64) -> usize {
+    usize::try_from(x).unwrap()
 }
 
 fn hi(x: u64) -> u32 {
-    (x >> 32) as u32
+    u32::try_from(x >> 32).unwrap()
 }
 
 /// A block-linear surface as the oracle sees it: the colour GOB, one GOB wide, `2^bh` GOBs tall
