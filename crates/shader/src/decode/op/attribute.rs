@@ -40,8 +40,10 @@
 //!   express (spec, the gap table: "Interpolation at an offset or a sample"); the decoder reads
 //!   them all and leaves the refusal to the translator.
 //! - **Special register names** are Eden's `SpecialRegister` enumerators, lower-cased
-//!   ([`SpecialReg`]); NAK prints only the number. Index 255 is printed `srz`, a guess: PR
-//!   #4588 reads `CS2R`'s 255 as zero ("native special register pair", `ops_misc.cpp`).
+//!   ([`SpecialReg`]), and NAK's `NAK_SV_VARIABLE_RATE` (132), which Eden's list stops short
+//!   of; NAK prints only the number. Index 255 is printed `srz`, a guess: PR #4588 reads
+//!   `CS2R`'s 255 as zero ("native special register pair", `ops_misc.cpp`). Every name is a
+//!   guess at `nvdisasm`'s spelling.
 //!
 //! # Divergences from PR #4588's table
 //!
@@ -554,8 +556,10 @@ pub struct SpecialReg(pub u8);
 /// with `_X`, `_Y` and `_Z` of the thread and block ids written `.x`, `.y`, `.z`
 /// (`eden/src/shader_recompiler/frontend/maxwell/translate/impl/move_special_register.cpp`
 /// @ cf654052). `None` where Eden's enumerator is a bare number (`SR12`). The numbering is
-/// Maxwell's; that SM86 keeps it is a guess that PR #4588 shares (`ops_misc.cpp`, `S2R`, reads
-/// 0, 33 to 39 and 56 to 60 by these numbers) and `nvdisasm` would confirm.
+/// Maxwell's. NAK's SM 7.0 and later numbering (`nak_private.h`, `enum nak_sv`) agrees with it
+/// at every index NAK names (0, 2, 3, 15, 16, 17, 19, 28, 29, 32 to 35, 37 to 39, 56 to 60, 80
+/// and 81) and PR #4588 reads 0, 33 to 39 and 56 to 60 by it (`ops_misc.cpp`, `S2R`); that SM86
+/// keeps Eden's numbers at the other indices is a guess `nvdisasm` would confirm.
 const SPECIAL_REG_NAMES: [Option<&str>; 100] = [
     Some("sr_laneid"),
     Some("sr_clock"),
@@ -676,16 +680,21 @@ impl SpecialReg {
     pub const CTAID_Y: Self = Self(38);
     /// `SR_CTAID_Z = 39`.
     pub const CTAID_Z: Self = Self(39);
-    /// `SR_CLOCKLO = 80`, the low word of the clock, which NAK's `CS2R` reads.
+    /// `SR_CLOCKLO = 80`, the low word of the clock, which NAK's `CS2R` reads (`nak_private.h`:
+    /// `NAK_SV_CLOCK_LO = 0x50`).
     pub const CLOCK_LO: Self = Self(80);
+    /// NAK's `NAK_SV_VARIABLE_RATE = 0x84` (`nak_private.h`), past Eden's list.
+    pub const VARIABLE_RATE: Self = Self(0x84);
     /// The zero register, 255, which `CS2R` reads as zero (PR #4588, `ops_misc.cpp`, `CS2R`:
     /// `Require(Take(72, 8) == 255, "native special register pair")`, then writes 0).
     pub const SRZ: Self = Self(255);
 
     /// The register's name, if the references name it ([`SpecialReg::SRZ`] is `srz`, a guess).
     pub fn name(self) -> Option<&'static str> {
-        if self == Self::SRZ {
-            return Some("srz");
+        match self {
+            Self::SRZ => return Some("srz"),
+            Self::VARIABLE_RATE => return Some("sr_variable_rate"),
+            _ => {}
         }
         SPECIAL_REG_NAMES
             .get(usize::from(self.0))

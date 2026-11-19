@@ -516,8 +516,49 @@ const EDEN_NAMES: &[(u8, &str)] = &[
     (97, "sr_circularqueueentryindex"),
     (98, "sr_circularqueueentryaddresslow"),
     (99, "sr_circularqueueentryaddresshigh"),
+    (132, "sr_variable_rate"),
     (255, "srz"),
 ];
+
+/// NAK's special register numbers for SM 7.0 and later (`mesa-nouveau/src/nouveau/compiler/
+/// nak_private.h` @ 52238762, `enum nak_sv`), written out, with the name each must print: a
+/// second source for the numbering, checked against [`EDEN_NAMES`].
+const NAK_SV: &[(u8, &str)] = &[
+    (0x00, "sr_laneid"),
+    (0x02, "sr_virtcfg"),
+    (0x03, "sr_virtid"),
+    (0x0f, "sr_ordering_ticket"),
+    (0x10, "sr_prim_type"),
+    (0x11, "sr_invocation_id"),
+    (0x13, "sr_thread_kill"),
+    (0x1c, "sr_affinity"),
+    (0x1d, "sr_invocation_info"),
+    (0x20, "sr_tid"),
+    (0x21, "sr_tid.x"),
+    (0x22, "sr_tid.y"),
+    (0x23, "sr_tid.z"),
+    (0x25, "sr_ctaid.x"),
+    (0x26, "sr_ctaid.y"),
+    (0x27, "sr_ctaid.z"),
+    (0x38, "sr_eqmask"),
+    (0x39, "sr_ltmask"),
+    (0x3a, "sr_lemask"),
+    (0x3b, "sr_gtmask"),
+    (0x3c, "sr_gemask"),
+    (0x50, "sr_clocklo"),
+    (0x51, "sr_clockhi"),
+    (0x84, "sr_variable_rate"),
+];
+
+/// NAK's numbers agree with Eden's at every index NAK names (`NAK_SV_COMBINED_TID` is Eden's
+/// `SR_TID`, `NAK_SV_LANEMASK_EQ` its `SR_EQMASK`), and each prints its name.
+#[test]
+fn nak_and_eden_number_the_special_registers_alike() {
+    for &(index, name) in NAK_SV {
+        assert_eq!(expected_name(index), name, "{index:#x}");
+        assert_eq!(SpecialReg(index).to_string(), name, "{index:#x}");
+    }
+}
 
 /// The expected name of special register `index`.
 fn expected_name(index: u8) -> String {
@@ -560,6 +601,7 @@ fn every_special_register_prints_its_name() {
         (SpecialReg::CTAID_Y, 38),
         (SpecialReg::CTAID_Z, 39),
         (SpecialReg::CLOCK_LO, 80),
+        (SpecialReg::VARIABLE_RATE, 132),
         (SpecialReg::SRZ, 255),
     ];
     for (sr, index) in constants {
@@ -569,6 +611,8 @@ fn every_special_register_prints_its_name() {
     // Unnamed indices have no name; the first past Eden's enum is unnamed too.
     assert_eq!(SpecialReg(12).name(), None);
     assert_eq!(SpecialReg(100).name(), None);
+    assert_eq!(SpecialReg(131).name(), None);
+    assert_eq!(SpecialReg(133).name(), None);
     assert_eq!(SpecialReg(254).name(), None);
 }
 
