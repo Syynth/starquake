@@ -475,6 +475,44 @@ fn the_timer_thread_s_graphics_turn_ends_a_guest_s_wait() {
 
 // ----- The shared page through the real timer thread -------------------------------------------
 
+/// The events of a run's flight recorder, in order, each with its time on the environment's
+/// clock in nanoseconds: the event's guest time at the run's counter rate, rounded down by less
+/// than [`counter_tick`].
+fn timed_events(report: &RunReport) -> Vec<(EventKind, u64)> {
+    let hz = u128::from(timebase().rate().hz());
+    Dump::from_bytes(&report.events)
+        .unwrap()
+        .merged()
+        .into_iter()
+        .map(|event| {
+            let nanos = u128::from(event.time.0) * 1_000_000_000 / hz;
+            (event.kind, u64::try_from(nanos).unwrap())
+        })
+        .collect()
+}
+
+/// One tick of the run's counter in nanoseconds, rounded up: the most [`timed_events`] rounds
+/// a time down by.
+fn counter_tick() -> u64 {
+    1_000_000_000_u64.div_ceil(timebase().rate().hz())
+}
+
+/// The notes with `code` that gsv's root recorded in `events`, in order: each one's value and
+/// time.
+fn gsv_notes(events: &[(EventKind, u64)], code: u32) -> Vec<(u64, u64)> {
+    events
+        .iter()
+        .filter_map(|&(kind, time)| match kind {
+            EventKind::ServiceNote {
+                service,
+                code: noted,
+                value,
+            } if service == crate::hle::GSV_ROOT && noted == code => Some((value, time)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// How many times the page guest asks: the first may be answered at once (the page shows no
 /// value yet), every later one is held to the bound, its counter unmoved.
 const PAGE_ROUNDS: usize = 9;
@@ -648,25 +686,28 @@ fn page_guest(script: &Script, page: &Arc<FlatMemory>, writable: u64) -> Scripte
 }
 
 /// A held page request is answered by the real timer thread at the bound, well before the next
-/// preemption: each wait after the first (a request whose counter has not moved, so held to
-/// [`ANSWER_BOUND`]) ends, by the median, in under half of [`PREEMPTION_INTERVAL_NS`]. Each of
-/// these makes that so, and without any one of them the request waits for the next preemption
-/// tick, which runs the turn and reschedules anyway: the thread sleeps no later than the page's
-/// deadline, the turn reads its time from the environment's clock (a turn at a time that never
-/// passes the bound never answers: every wait then ends at [`ANSWER_WAIT`]), and the cores are
-/// rescheduled after the turn, so the answer's signal wakes the waiting thread's core at once.
+/// preemption: each request after the first (one whose counter has not moved, so held to
+/// [`ANSWER_BOUND`]) is answered, by the median, at least the bound after the guest asked (by the
+/// guest's own clock) and less than half of [`PREEMPTION_INTERVAL_NS`] after it (by the flight
+/// recorder: from the request's `SignalEvent` to the `SyncptPageAcknowledged` note the timer
+/// thread records as it answers; `observability.md`, "Stalls and host timing"). Each of these
+/// makes that so, and without either the request waits for the next preemption tick: the
+/// thread sleeps no later than the page's deadline, and the turn reads its time from the
+/// environment's clock (a turn at a time that never passes the bound never answers: every wait
+/// then ends at [`ANSWER_WAIT`]).
 ///
-/// It cannot see whether the queue rings the timer thread: the guest's timed wait gives the
-/// kernel a deadline, which wakes the thread soon after the signal anyway.
-/// `a_completion_queued_for_the_graphics_server_rings_the_timer_thread` pins the ring.
+/// It times the timer thread, not the guest's wake, which also waits for the core's host thread
+/// to be scheduled: timed by the guest's clock, under `taskpolicy -c utility` with 16 busy
+/// processes on the same Mac, it failed 1 run in 40 and 9 in 60 with the timer thread on time.
+/// So it no longer sees that the cores are rescheduled after the turn, which wakes the waiting
+/// thread's core at once. It cannot see whether the queue rings the timer thread either: the
+/// guest's timed wait gives the kernel a deadline, which wakes the thread soon after the signal
+/// anyway. `a_completion_queued_for_the_graphics_server_rings_the_timer_thread` pins the ring.
 ///
 /// The thread must also sleep *to* the bound where the host ends timed waits late on purpose
 /// (macOS timer coalescing; `machine/timer.rs`, "Sleeping to a deadline"). Asking for each sleep
 /// in one wait, as it did before it measured that lateness, CI's hosted macOS runners saw
-/// medians of 5.07 to 5.19 ms (held waits of 1.75 to 5.68 ms, 5 runs), and an Apple Silicon Mac
-/// under `taskpolicy -c utility` failed 20 runs of 20; with the waits sized by the measured
-/// lateness it passed 30 of 30 there (the worst median 3.1 ms), and its medians without the
-/// clamp were 1.2 ms at most (30 runs).
+/// medians of 5.07 to 5.19 ms by the guest's clock (held waits of 1.75 to 5.68 ms, 5 runs).
 #[test]
 fn a_held_page_request_is_answered_at_the_bound_by_the_timer_thread() {
     let guest = super::Guest::new(&page_program());
@@ -714,18 +755,42 @@ fn a_held_page_request_is_answered_at_the_bound_by_the_timer_thread() {
     for (round, (result, _)) in vars.answers.iter().enumerate() {
         assert_eq!(*result, 0, "wait {round} ended with {result:#x}");
     }
-    let mut held: Vec<Duration> = vars.answers[1..]
+    // At least the bound, by the guest's own clock (read before its signal and after its wake).
+    let mut waited: Vec<Duration> = vars.answers[1..]
         .iter()
         .map(|(_, waited)| *waited)
         .collect();
+    waited.sort();
+    let bound = Duration::from_nanos(ANSWER_BOUND);
+    assert!(waited[waited.len() / 2] >= bound, "held waits {waited:?}");
+    // Well under half a preemption interval, by the flight recorder: from each request's
+    // `SignalEvent` to the `SyncptPageAcknowledged` note the timer thread records as it answers.
+    let events = timed_events(&report);
+    let asked: Vec<u64> = events
+        .iter()
+        .filter_map(|&(kind, time)| match kind {
+            EventKind::Svc { id, result, .. }
+                if id == u32::from(SvcId::SignalEvent.number()) && result.0 == 0 =>
+            {
+                Some(time)
+            }
+            _ => None,
+        })
+        .collect();
+    let answered = gsv_notes(&events, starquake_gsv::note::SYNCPT_PAGE_ACKNOWLEDGED);
+    assert_eq!((asked.len(), answered.len()), (PAGE_ROUNDS, PAGE_ROUNDS));
+    let mut held: Vec<Duration> = asked[1..]
+        .iter()
+        .zip(&answered[1..])
+        .map(|(&asked, &(_, answered))| {
+            assert!(answered > asked, "{asked} {answered}");
+            Duration::from_nanos(answered + counter_tick() - asked)
+        })
+        .collect();
     held.sort();
     let median = held[held.len() / 2];
-    let bound = Duration::from_nanos(ANSWER_BOUND);
     let preemption = Duration::from_nanos(PREEMPTION_INTERVAL_NS);
-    assert!(
-        median >= bound && median < preemption / 2,
-        "held waits {held:?}"
-    );
+    assert!(median < preemption / 2, "held answers {held:?}");
     // Each held request's answer is in the trace: the value and the acknowledge notes.
     let acknowledged = format!(
         "note service={} code={}",
