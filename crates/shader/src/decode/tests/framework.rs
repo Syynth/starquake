@@ -38,17 +38,22 @@ fn decoded() -> Vec<&'static str> {
 
 /// The mnemonics the forms of `forms` decode to, sorted, without repeats: each form's word with
 /// only its opcode and fixed bits set (which every form accepts:
-/// `every_bit_outside_a_form_is_rejected`).
+/// `every_bit_outside_a_form_is_rejected`), and each such word with one more of the form's
+/// known bits set, where it decodes (`IADD3.X` and `LEA.X` share their forms with `IADD3` and
+/// `LEA`, told apart by bit 74: `op::integer`; `OUT` and `OUT.FINAL` share their forms and
+/// differ in the type field: `op::attribute`).
 fn mnemonics_of(forms: &[Form]) -> Vec<&'static str> {
     let mut mnemonics: Vec<&str> = forms
         .iter()
-        .map(|form| {
-            let word =
+        .flat_map(|form| {
+            let bare =
                 Instruction::from_bits(form.fixed).with_field(OPCODE, u64::from(form.opcode));
-            decode(word)
-                .expect("a form's bare word decodes")
-                .op
-                .mnemonic()
+            let bare_op = decode(bare).expect("a form's bare word decodes").op;
+            let one_more = (0..128)
+                .filter(move |bit| form.known & !COMMON & (1 << bit) != 0)
+                .filter_map(move |bit| decode(Instruction::from_bits(bare.bits() | 1 << bit)).ok())
+                .map(|instr| instr.op.mnemonic());
+            std::iter::once(bare_op.mnemonic()).chain(one_more)
         })
         .collect();
     mnemonics.sort_unstable();
@@ -134,10 +139,10 @@ fn alu_forms_put_sources_where_the_table_says() {
 
 /// Every form's fixed bits are required (step 3): the uniform-register ALU forms' bit 91 (PR
 /// #4588: "native uniform source flag"), and the control group's (the uniform `BRA`'s bits
-/// 87..89 and 91, `BRXU`'s bit 91). Every form with fixed bits refuses a word without them,
-/// naming the lowest, and accepts one with them; a form without fixed bits accepts the bare
-/// word. Which forms have which fixed bits is
-/// pinned by each group's rows (`masks_match_the_reference_table`).
+/// 87..89 and 91, `BRXU`'s bit 91), and `LDTRAM`'s bit 91. Every form with fixed bits refuses a
+/// word without them, naming the lowest, and accepts one with them; a form without fixed bits
+/// accepts the bare word. Which forms have which fixed bits is pinned by each group's rows
+/// (`masks_match_the_reference_table`).
 #[test]
 fn fixed_bits_are_required() {
     let required = [
@@ -147,6 +152,20 @@ fn fixed_bits_are_required() {
     ];
     for opcode in required {
         assert_eq!(lookup(opcode).expect("a form").fixed, SLOT_UNIFORM.mask());
+    }
+    // Slice 6a's uniform-register forms, written out (`op::integer`'s rows); some have fixed
+    // fields of their own besides bit 91.
+    let integer_uniform: [u16; 25] = [
+        0xc10, 0xe10, 0xc11, 0xe11, 0xc12, 0xe12, 0xc13, 0xc16, 0xe16, 0xc17, 0xc19, 0xe19, 0xc1a,
+        0xc1b, 0xc24, 0xe24, 0xc25, 0xe25, 0xc26, 0xe26, 0xc0c, 0xc07, 0xd00, 0xd01, 0xd09,
+    ];
+    for opcode in integer_uniform {
+        let fixed = lookup(opcode).expect("a form").fixed;
+        assert_eq!(
+            fixed & SLOT_UNIFORM.mask(),
+            SLOT_UNIFORM.mask(),
+            "{opcode:#x}"
+        );
     }
     for (opcode, _, fixed) in forms() {
         let word = Instruction::default().with_field(OPCODE, u64::from(opcode));
@@ -576,7 +595,7 @@ fn decoded_operations_name_their_mnemonic() {
         pred: PredSrc::TRUE,
     });
     let s2r = Op::S2R(OpS2R {
-        dst: r(0),
+        dst: S2RDst::Reg(r(0)),
         sr: SpecialReg::LANE_ID,
     });
     assert_eq!(mov(r(0), MovSrc::Imm(0)).mnemonic(), "mov");

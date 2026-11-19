@@ -32,6 +32,16 @@ pub(crate) fn test_caps() -> Caps {
     )
 }
 
+/// The draw limits of a device with wgpu's default limits, every feature, and `caps`' largest
+/// buffer.
+pub(crate) fn draw_limits(caps: &Caps) -> crate::draw::DrawLimits {
+    crate::draw::DrawLimits::new(
+        &wgpu::Limits::default(),
+        wgpu::Features::all(),
+        caps.limits.max_buffer_size,
+    )
+}
+
 /// A one-level, one-sample 2D texture of `format`, `width` by `height`.
 pub(crate) fn texture(
     format: PixelFormat,

@@ -52,12 +52,15 @@ pub(crate) mod tensor;
 pub(crate) mod texture;
 pub(crate) mod uniform;
 
-pub use attribute::SpecialReg;
+pub use attribute::{
+    InterpFreq, InterpLoc, IsbeAccess, IsbeMemType, OutType, PixVal, S2RDst, SpecialReg,
+};
 pub use control::{
     BMovDir, BarMode, BarRed, Barrier, BraCond, BranchOffset, BrxSrc, MatchOp, ReduxOp, ShflOp,
     ShflSrc, VoteDst, VoteOp,
 };
-pub use integer::MovSrc;
+pub use float::{FMulScale, FSwzAddOp, FloatCmpOp, FloatType, IntType, MuFuOp, PredSetOp};
+pub use integer::{IMadMode, IntCmpOp, MovSrc, PLop3Src, PrmtMode, ShfType};
 
 /// An operation's mnemonic, as `nvdisasm` writes it lower-cased (for a shell, a guess).
 pub(crate) trait Named {
