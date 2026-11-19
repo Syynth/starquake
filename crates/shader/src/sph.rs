@@ -17,8 +17,8 @@
 //!   1 for vertex, tessellation and geometry programs, type 2 for pixel programs.
 //! - Cross-checked with NAK's writer, `mesa-nouveau/src/nouveau/compiler/nak/sph.rs` @ 52238762
 //!   (MIT, Copyright 2023 Collabora, Ltd.), and Eden's reader,
-//!   `eden/src/shader_recompiler/program_header.h` @ cf654052, whose 80-byte layout (version 3,
-//!   the first 20 words) agrees with every position read here.
+//!   `eden/src/shader_recompiler/program_header.h` @ cf654052, an 80-byte layout (version 3, the
+//!   first 20 words): every field Eden names is at the position read here.
 //! - The size, 128 bytes ([`HEADER_BYTES`]), is cited, not measured: NAK writes
 //!   `SPHV4_SHADER_HEADER_SIZE` = 32 words for SM 7.3 and later, and PR #4588 skips 128 bytes in
 //!   front of a graphics program (`eden-pr4588/src/video_core/shader_environment.cpp`,
@@ -49,19 +49,22 @@
 //!
 //! # Bits not read
 //!
-//! The parser reads every bit `clc797sph.h` names, plus the five common fields the module
-//! `layout` takes from version 3 or NAK, and ignores exactly these bits, whatever they hold
+//! The parser reads every field `clc797sph.h` names except `RESERVED_COMMON_A` and the padding.
+//! It reads `RESERVED_COMMON_B` (bits 26 and 27) and `RESERVED_COMMON_C` (bits 96 to 119) as
+//! the version 3 fields at those positions, and the unnamed bits 24 and 25 as NAK's (the private
+//! `layout` module cites each). It ignores exactly these bits, whatever they hold
 //! (`ignored_bits_are_exactly_the_unnamed_ones` flips every bit of the header to check it):
 //!
-//! - both types: 21 to 23 (21 and 23 are unnamed; 22 is `RESERVED_COMMON_A`), 124 to 127 and
-//!   148 to 151 (unnamed in version 4; version 3's `RESERVED_COMMON_B` and `RESERVED_COMMON_C`,
-//!   where NAK writes the per-patch attribute count's two halves, `set_per_patch_attribute_count`);
-//! - type 1: bit 187 of each map (347, 587, 827, unnamed, between the fog coordinate and the
+//! - both types: 21 to 23 (22 is `RESERVED_COMMON_A`; 21 and 23 are unnamed), 124 to 127 and
+//!   148 to 151 (unnamed in version 4; version 3's `RESERVED_COMMON_B` and `RESERVED_COMMON_C`);
+//! - type 1: bit 187 of each map (347, 587, 827: unnamed, between the fog coordinate and the
 //!   tessellation point) and the padding, 880 to 1023;
-//! - type 2: 475 (the same unnamed bit), 612 to 639, and the padding, 872 to 1023.
+//! - type 2: 475 (the same unnamed bit), 612 to 639 (unnamed), and the padding, 872 to 1023.
 //!
-//! None of them is refused when set: NAK writes four of the "reserved" ones on SM 7.3 and later
-//! (above), so a set reserved bit is not evidence of a malformed header.
+//! None of them is refused when set. NAK writes into two of these ranges on every SM: a
+//! tessellation control program's per-patch attribute count goes into bits 124 to 127 (low
+//! half) and 148 to 151 (high half) as well as its own field (`set_per_patch_attribute_count`),
+//! so a set reserved bit is not evidence of a malformed header.
 //!
 //! # Where this differs from the references
 //!
@@ -249,8 +252,7 @@ impl ComponentMask {
     reason = "mirrors the header's one-bit fields one for one"
 )]
 pub struct Common {
-    /// `MRT_ENABLE`. NAK's note: whether colour 0 is broadcast to every target is the opposite
-    /// of this bit's name; NAK always sets it.
+    /// `MRT_ENABLE` (NAK sets it for every pixel program, `encode_header`).
     pub mrt_enable: bool,
     /// `KILLS_PIXELS`.
     pub kills_pixels: bool,

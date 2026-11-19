@@ -5,10 +5,10 @@
 //! `LICENSES/`). Each constant names the `NVC797_SPHV4T1_*` or `NVC797_SPHV4T2_*` define it
 //! comes from; the header writes a field as `MW(high:low)`, an inclusive bit range over the
 //! header read as one 1024-bit little-endian number (bit `n` is bit `n % 32` of word `n / 32`).
-//! Five common fields that `clc797sph.h` leaves reserved come from the version 3 header
-//! (`mesa-nouveau/src/nouveau/headers/nvidia/classes/cla097sph.h`, `NVA097_SPHV3T1_*`) or from
-//! NAK's writer (`mesa-nouveau/src/nouveau/compiler/nak/sph.rs`), which writes them for SM 7.3
-//! and later too; each says so.
+//! Five common fields that `clc797sph.h` leaves unnamed or reserved come from the version 3
+//! header (`mesa-nouveau/src/nouveau/headers/nvidia/classes/cla097sph.h`, `NVA097_SPHV3T1_*`) or
+//! from NAK's writer (`mesa-nouveau/src/nouveau/compiler/nak/sph.rs`), which writes them for
+//! SM 7.3 and later too; each says so.
 //!
 //! The three attribute maps of a vertex, tessellation or geometry header (input, output and the
 //! map `clc797sph.h` calls VMAP) share one layout at three bases, so their fields are written
@@ -53,12 +53,12 @@ impl HeaderField {
         self.start.saturating_add(self.width)
     }
 
-    /// The field's value in its low bits: the ones of a `width`-bit number (32 bits for a width
-    /// of 32 or more).
+    /// The ones of a `width`-bit number (32 bits for a width of 32 or more; none for a width
+    /// of 0, where the shift by 32 fails).
     pub(crate) const fn ones(self) -> u32 {
         match u32::MAX.checked_shr(32_u32.saturating_sub(self.width)) {
-            Some(ones) if self.width != 0 => ones,
-            _ => 0,
+            Some(ones) => ones,
+            None => 0,
         }
     }
 
