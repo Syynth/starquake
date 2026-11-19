@@ -120,6 +120,7 @@ use super::super::instruction::Field;
 use super::super::operand::{AluSrc, CBufRef, Gpr, Pred, PredSrc, UniformPredSrc, UniformReg};
 use super::super::print::{IntOperand, flag};
 use super::control::{COND, COND_NOT, PRED_DST};
+use super::float::PredSetOp;
 use super::{Named, Op, shells};
 #[cfg(test)]
 use {
@@ -246,7 +247,7 @@ pub(crate) const ISETP_EX: Field = Field::bit(72);
 /// Signed (`set_field(73..74, ..)`: `I32` 1, `U32` 0).
 pub(crate) const ISETP_SIGNED: Field = Field::bit(73);
 /// The combining operation (`set_pred_set_op(74..76, ..)`).
-pub(crate) const ISETP_SET_OP: Field = Field::new(74, 2);
+pub(crate) const ISETP_SET_OP: Field = Field::new(74, PredSetOp::BITS);
 /// The comparison (`set_int_cmp_op(76..79, ..)`).
 pub(crate) const ISETP_CMP: Field = Field::new(76, 3);
 
@@ -1732,52 +1733,6 @@ fn decode_idp(reader: &mut Reader) -> Result<Op, DecodeError> {
 
 // ---------------------------------------------------------------------------------------------
 // ISETP.
-
-/// How a comparison combines with the accumulator predicate (NAK's `PredSetOp` and
-/// `set_pred_set_op`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum PredSetOp {
-    /// 0.
-    And,
-    /// 1.
-    Or,
-    /// 2.
-    Xor,
-}
-
-impl PredSetOp {
-    /// Every operation, in encoding order.
-    pub const ALL: [Self; 3] = [Self::And, Self::Or, Self::Xor];
-
-    /// The two-bit encoding.
-    pub const fn bits(self) -> u64 {
-        match self {
-            Self::And => 0,
-            Self::Or => 1,
-            Self::Xor => 2,
-        }
-    }
-
-    /// The operation an encoding names; 3 names none.
-    pub const fn from_bits(bits: u64) -> Option<Self> {
-        match bits {
-            0 => Some(Self::And),
-            1 => Some(Self::Or),
-            2 => Some(Self::Xor),
-            _ => None,
-        }
-    }
-}
-
-impl Display for PredSetOp {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::And => ".and",
-            Self::Or => ".or",
-            Self::Xor => ".xor",
-        })
-    }
-}
 
 /// An integer comparison (NAK's `IntCmpOp` and `set_int_cmp_op`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
