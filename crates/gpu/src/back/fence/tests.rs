@@ -1471,6 +1471,12 @@ fn a_backend_that_forgets_the_wake_is_caught_by_the_recheck_and_counted() {
     consumer.set_longest_sleep(Duration::from_millis(5));
     let backend = Arc::new(LateBackend::new(consumer.waker().completion_wake()));
     let mut r = rig_on(Arc::clone(&backend), Mode::Fenced);
+    // A first list completes and is performed by a direct completion check (its wake is not
+    // needed, and would be left for the wait below), so the value last seen is not the
+    // starting one.
+    let first = r.list_with_release(SEM2, 0x78);
+    backend.finish_silently(first);
+    assert_eq!(r.fences.complete(), released(1));
     let fence = r.list_with_release(SEM, 0x79);
     let mut pending = Some(fence);
     consumer.set_after_last_look(Box::new(move || {
@@ -1491,7 +1497,7 @@ fn a_backend_that_forgets_the_wake_is_caught_by_the_recheck_and_counted() {
         warnings[0].contains("moved without a completion wake"),
         "{warnings:?}"
     );
-    assert!(warnings[0].contains("seen=0;completed=1;"), "{warnings:?}");
+    assert!(warnings[0].contains("seen=1;completed=2;"), "{warnings:?}");
 }
 
 #[test]
@@ -1499,6 +1505,10 @@ fn a_recheck_that_finds_nothing_moved_counts_no_lost_wake() {
     let (_producer, mut consumer) = ring(64).unwrap();
     consumer.set_longest_sleep(Duration::from_millis(5));
     let mut r = rig();
+    // A list completed and performed earlier: `completed()` is not at its starting value.
+    let first = r.list_with_release(SEM2, 0x78);
+    r.backend.finish(first);
+    assert_eq!(r.fences.complete(), released(1));
     let ((woke, events), r) = within(move || {
         let woke = captured(|| r.fences.wait(&mut consumer, FOREVER));
         (woke, r)

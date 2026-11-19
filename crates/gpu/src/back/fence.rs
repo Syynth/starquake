@@ -112,7 +112,10 @@
 //! safety net and finds `completed()` moved since the last completion check is a lost wake: it is
 //! logged at warning level, counted in [`FenceCounters::lost_wakes`], and the completed work is
 //! performed. A wake that arrives just as the safety net runs out is returned as a wake, not
-//! counted.
+//! counted. A wake for a completion that an earlier [`Fences::complete`] already performed is
+//! left on the ring, and makes the next wait return an empty [`Woke::Completed`] at once (a
+//! spurious wake costs one look; pinned by
+//! `the_recording_backends_wake_reaches_the_back_threads_ring`).
 //!
 //! # Divergences from Eden-NX2
 //!
