@@ -188,25 +188,27 @@ fn texture_text_matches_nak_nvdisasm_cases() {
     }
 }
 
-/// One hand-built word per form of the group, in form order, every field at a distinct value,
-/// and its text.
+/// One hand-built word per form of the group, in form order, and its text. Within each word,
+/// every field set above 1 has a value no other field of the word has, but for `RZ` (0xff),
+/// which two register fields of a word may share, so a swapped read of two fields fails
+/// (`form_cases_give_each_field_a_distinct_value` checks this of the table).
 const FORM_CASES: [Case; 22] = [
-    // TEX, constant buffer: dst 1, a 2 << 24, b 3 << 32, words 0x10 << 40 (0x40 bytes),
-    // index 5 << 54, .scr 60, dim 1 (2d) << 61, dst2 4 << 64, mask 3 << 72, .aoffi 76,
+    // TEX, constant buffer: dst 8, a 9 << 24, b 10 << 32, words 0x10 << 40 (0x40 bytes),
+    // index 12 << 54, .scr 60, dim 4 (array_1d) << 61, dst2 11 << 64, mask 6 << 72, .aoffi 76,
     // .ndv 77, .dc 78, .f16 79, fault 5 << 81, evict 2 (.el) << 84, lod 3 (.ll) << 87,
     // .nodep 90.
     (
         0xb60,
         &[
-            (16, 1),
-            (24, 2),
-            (32, 3),
+            (16, 8),
+            (24, 9),
+            (32, 10),
             (40, 0x10),
-            (54, 5),
+            (54, 12),
             (60, 1),
-            (61, 1),
-            (64, 4),
-            (72, 3),
+            (61, 4),
+            (64, 11),
+            (72, 6),
             (76, 1),
             (77, 1),
             (78, 1),
@@ -216,23 +218,23 @@ const FORM_CASES: [Case; 22] = [
             (87, 3),
             (90, 1),
         ],
-        "tex.scr.ll.aoffi.ndv.dc.f16.el.nodep p5, r4, r1, r2, r3, c[0x5][0x40], 2d, 0x3;",
+        "tex.scr.ll.aoffi.ndv.dc.f16.el.nodep p5, r11, r8, r9, r10, c[0xc][0x40], array_1d, 0x6;",
     ),
-    // TEX.B: .B 59, dim 7 (array_cube), dst2 RZ, mask 0xf, fault PT, evict 1 (normal).
+    // TEX.B: .B 59, dim 7 (array_cube), dst2 RZ, mask 0xf, fault 3, evict 1 (normal).
     (
         0x361,
         &[
             (16, 6),
-            (24, 7),
-            (32, 8),
+            (24, 8),
+            (32, 9),
             (59, 1),
             (61, 7),
             (64, 0xff),
             (72, 0xf),
-            (81, 7),
+            (81, 3),
             (84, 1),
         ],
-        "tex.b pt, rz, r6, r7, r8, array_cube, 0xf;",
+        "tex.b p3, rz, r6, r8, r9, array_cube, 0xf;",
     ),
     // TEX.UR: ur9 at 40, bit 91, dim 5 (array_2d), lod 1 (.lz), .f16, evict 0 (.ef).
     (
@@ -253,28 +255,28 @@ const FORM_CASES: [Case; 22] = [
         "tex.lz.f16.ef p0, r13, r10, r11, r12, ur9, array_2d, 0x1;",
     ),
     // TLD, constant buffer at both field ends: index 31, words 0x3fff (0xfffc bytes);
-    // dim 2 (3d), .aoffi, .ms 78, .f16, evict 5 (.na), lod 3, .scr, .nodep.
+    // dim 2 (3d), .aoffi, .ms 78, .f16, fault 4, evict 5 (.na), lod 3, .scr, .nodep.
     (
         0xb66,
         &[
-            (16, 1),
-            (24, 2),
-            (32, 3),
+            (16, 8),
+            (24, 9),
+            (32, 10),
             (40, 0x3fff),
             (54, 0x1f),
             (60, 1),
             (61, 2),
-            (64, 4),
+            (64, 11),
             (72, 7),
             (76, 1),
             (78, 1),
             (79, 1),
-            (81, 1),
+            (81, 4),
             (84, 5),
             (87, 3),
             (90, 1),
         ],
-        "tld.scr.ll.aoffi.ms.f16.na.nodep p1, r4, r1, r2, r3, c[0x1f][0xfffc], 3d, 0x7;",
+        "tld.scr.ll.aoffi.ms.f16.na.nodep p4, r11, r8, r9, r10, c[0x1f][0xfffc], 3d, 0x7;",
     ),
     // TLD.B: dim 0 (1d), lod 1, evict 3 (.lu), b RZ, dst2 RZ.
     (
@@ -292,7 +294,7 @@ const FORM_CASES: [Case; 22] = [
         ],
         "tld.b.lz.lu p2, rz, r5, r6, rz, 1d, 0x1;",
     ),
-    // TLD.UR: ur0, .cl 77, dim 1, lod 3, evict 4 (.eu).
+    // TLD.UR: ur0, .cl 77, dim 1, fault 2, evict 4 (.eu), lod 3.
     (
         0xf66,
         &[
@@ -304,35 +306,35 @@ const FORM_CASES: [Case; 22] = [
             (64, 11),
             (72, 0xc),
             (77, 1),
-            (81, 3),
+            (81, 2),
             (84, 4),
             (87, 3),
             (91, 1),
         ],
-        "tld.ll.cl.eu p3, r11, r8, r9, r10, ur0, 2d, 0xc;",
+        "tld.ll.cl.eu p2, r11, r8, r9, r10, ur0, 2d, 0xc;",
     ),
-    // TLD4, constant buffer: index 2, word 1 (4 bytes), offset mode 2 (.ptp), .dc, comp 3
-    // (.a), dim 5, evict 2, .scr, .nodep.
+    // TLD4, constant buffer: index 12, words 13 (0x34 bytes), offset mode 2 (.ptp), .dc,
+    // comp 3 (.a), dim 7 (array_cube), fault 4, evict 5 (.na), .scr, .nodep.
     (
         0xb63,
         &[
-            (16, 1),
-            (24, 2),
-            (32, 3),
-            (40, 1),
-            (54, 2),
+            (16, 8),
+            (24, 9),
+            (32, 10),
+            (40, 13),
+            (54, 12),
             (60, 1),
-            (61, 5),
-            (64, 4),
+            (61, 7),
+            (64, 11),
             (72, 0xf),
             (76, 2),
             (78, 1),
             (81, 4),
-            (84, 2),
+            (84, 5),
             (87, 3),
             (90, 1),
         ],
-        "tld4.scr.a.ptp.dc.el.nodep p4, r4, r1, r2, r3, c[0x2][0x4], array_2d, 0xf;",
+        "tld4.scr.a.ptp.dc.na.nodep p4, r11, r8, r9, r10, c[0xc][0x34], array_cube, 0xf;",
     ),
     // TLD4.B: comp 1 (.g), offset mode 1 (.aoffi), evict 0.
     (
@@ -355,9 +357,9 @@ const FORM_CASES: [Case; 22] = [
     (
         0xf63,
         &[
-            (16, 1),
-            (24, 2),
-            (32, 3),
+            (16, 8),
+            (24, 9),
+            (32, 10),
             (40, 62),
             (61, 3),
             (64, 0xff),
@@ -366,24 +368,24 @@ const FORM_CASES: [Case; 22] = [
             (84, 1),
             (91, 1),
         ],
-        "tld4.r pt, rz, r1, r2, r3, ur62, cube, 0x1;",
+        "tld4.r pt, rz, r8, r9, r10, ur62, cube, 0x1;",
     ),
-    // TMML, constant buffer: index 3, words 0x20 (0x80), dim 1, .ndv 77, .nodep.
+    // TMML, constant buffer: index 3, words 0x20 (0x80), dim 1, mask 0xc, .ndv 77, .nodep.
     (
         0xb69,
         &[
-            (16, 1),
-            (24, 2),
-            (32, 3),
+            (16, 8),
+            (24, 9),
+            (32, 10),
             (40, 0x20),
             (54, 3),
             (61, 1),
-            (64, 4),
-            (72, 3),
+            (64, 11),
+            (72, 0xc),
             (77, 1),
             (90, 1),
         ],
-        "tmml.lod.ndv.nodep r4, r1, r2, r3, c[0x3][0x80], 2d, 0x3;",
+        "tmml.lod.ndv.nodep r11, r8, r9, r10, c[0x3][0x80], 2d, 0xc;",
     ),
     // TMML.B: dim 4 (array_1d).
     (
@@ -399,24 +401,24 @@ const FORM_CASES: [Case; 22] = [
         ],
         "tmml.b.lod rz, r5, r6, r7, array_1d, 0x1;",
     ),
-    // TXD, constant buffer: index 4, words 2 (8), dim 5, .aoffi 76, fault 6, evict 2.
+    // TXD, constant buffer: index 4, words 0x12 (0x48), dim 5, .aoffi 76, fault 6, evict 2.
     (
         0xb6c,
         &[
-            (16, 1),
-            (24, 2),
-            (32, 3),
-            (40, 2),
+            (16, 8),
+            (24, 9),
+            (32, 10),
+            (40, 0x12),
             (54, 4),
             (61, 5),
-            (64, 4),
+            (64, 11),
             (72, 0xf),
             (76, 1),
             (81, 6),
             (84, 2),
             (90, 1),
         ],
-        "txd.aoffi.el.nodep p6, r4, r1, r2, r3, c[0x4][0x8], array_2d, 0xf;",
+        "txd.aoffi.el.nodep p6, r11, r8, r9, r10, c[0x4][0x48], array_2d, 0xf;",
     ),
     // TXD.B: dim 1, fault PT, evict 1.
     (
@@ -438,15 +440,15 @@ const FORM_CASES: [Case; 22] = [
     (
         0xb6f,
         &[
-            (16, 1),
-            (24, 2),
+            (16, 8),
+            (24, 9),
             (40, 0x5a),
             (62, 2),
             (64, 0xff),
             (72, 7),
             (90, 1),
         ],
-        "txq.nodep rz, r1, r2, c[0x0][0x168], tex_header_sampler_pos, 0x7;",
+        "txq.nodep rz, r8, r9, c[0x0][0x168], tex_header_sampler_pos, 0x7;",
     ),
     // TXQ.B: query 1.
     (
@@ -454,120 +456,139 @@ const FORM_CASES: [Case; 22] = [
         &[(16, 3), (24, 4), (59, 1), (62, 1), (64, 5), (72, 1)],
         "txq.b r5, r3, r4, tex_header_texture_type, 0x1;",
     ),
-    // SULD.P: dst 1, coord 2, dim 3 (2d) at 61, handle 3 at 64, mask 0xf, order 7
+    // SULD.P: dst 8, coord 9, dim 3 (2d) at 61, handle 10 at 64, mask 0xf, order 7
     // (.strong.gpu) at 77, fault 0, evict 1.
     (
         0x998,
         &[
-            (16, 1),
-            (24, 2),
+            (16, 8),
+            (24, 9),
             (61, 3),
-            (64, 3),
+            (64, 10),
             (72, 0xf),
             (77, 7),
             (81, 0),
             (84, 1),
         ],
-        "suld.p.2d.strong.gpu p0, r1, [r2], r3, 0xf;",
+        "suld.p.2d.strong.gpu p0, r8, [r9], r10, 0xf;",
     ),
     // SULD.D: dim 5 (3d), type 6 (.b128) at 73, order 10 (.strong.sys), fault PT, evict 0.
     (
         0x99a,
         &[
-            (16, 4),
-            (24, 5),
+            (16, 8),
+            (24, 9),
             (61, 5),
-            (64, 6),
+            (64, 11),
             (73, 6),
             (77, 0xa),
             (81, 7),
             (84, 0),
         ],
-        "suld.d.3d.b128.strong.sys.ef pt, r4, [r5], r6;",
+        "suld.d.3d.b128.strong.sys.ef pt, r8, [r9], r11;",
     ),
-    // SUST.P: coord 1, data 2, dim 1 (1d_buffer), handle 3, mask 1, order 4 (.constant),
+    // SUST.P: coord 8, data 9, dim 1 (1d_buffer), handle 10, mask 1, order 4 (.constant),
     // evict 2.
     (
         0x99c,
         &[
-            (24, 1),
-            (32, 2),
+            (24, 8),
+            (32, 9),
             (61, 1),
-            (64, 3),
+            (64, 10),
             (72, 1),
             (77, 4),
             (84, 2),
         ],
-        "sust.p.1d_buffer.constant.el [r1], r2, r3, 0x1;",
+        "sust.p.1d_buffer.constant.el [r8], r9, r10, 0x1;",
     ),
-    // SUST.D: dim 2 (array_1d), type 3 (.i16), order 5 (.strong.cta), evict 5.
+    // SUST.D: dim 2 (array_1d), type 3 (.i16), order 5 (.strong.cta), evict 4 (.eu).
     (
         0x99e,
         &[
-            (24, 4),
-            (32, 5),
+            (24, 8),
+            (32, 9),
             (61, 2),
-            (64, 6),
+            (64, 10),
             (73, 3),
             (77, 5),
-            (84, 5),
+            (84, 4),
         ],
-        "sust.d.array_1d.i16.strong.cta.na [r4], r5, r6;",
+        "sust.d.array_1d.i16.strong.cta.eu [r8], r9, r10;",
     ),
-    // SUATOM: dst 1, coord 2, data 3, dim 4, handle 4, .ba 72, type 5 (.i64), order 0
+    // SUATOM: dst 9, coord 10, data 11, dim 4, handle 12, .ba 72, type 5 (.i64), order 0
     // (.weak), fault 1, evict 1, operation 8 (.exch) at 87.
     (
         0x394,
         &[
-            (16, 1),
-            (24, 2),
-            (32, 3),
+            (16, 9),
+            (24, 10),
+            (32, 11),
             (61, 4),
-            (64, 4),
+            (64, 12),
             (72, 1),
             (73, 5),
             (81, 1),
             (84, 1),
             (87, 8),
         ],
-        "suatom.p.array_2d.exch.i64.weak.ba p1, r1, [r2], r3, r4;",
+        "suatom.p.array_2d.exch.i64.weak.ba p1, r9, [r10], r11, r12;",
     ),
-    // SUATOM.CAS: type 2 (.u64), order 7, fault PT, evict 0.
+    // SUATOM.CAS: type 2 (.u64), order 7, fault 4, evict 0.
     (
         0x396,
         &[
-            (16, 5),
-            (24, 6),
-            (32, 7),
+            (16, 9),
+            (24, 10),
+            (32, 11),
             (61, 3),
-            (64, 8),
+            (64, 12),
             (73, 2),
             (77, 7),
-            (81, 7),
+            (81, 4),
         ],
-        "suatom.p.2d.cmpexch.packed.u64.strong.gpu.ef pt, r5, [r6], r7, r8;",
+        "suatom.p.2d.cmpexch.packed.u64.strong.gpu.ef p4, r9, [r10], r11, r12;",
     ),
-    // SURED: dst RZ (as NAK writes), dim 0, type 3 (.f32), order 10, evict 1, operation 7
-    // (.xor).
+    // SURED: dst RZ (as NAK writes), dim 0, type 3 (.f32), order 10, fault PT, evict 1,
+    // operation 6 (.or).
     (
         0x3a0,
         &[
             (16, 0xff),
-            (24, 9),
-            (32, 10),
-            (64, 11),
+            (24, 12),
+            (32, 13),
+            (64, 14),
             (73, 3),
             (77, 0xa),
             (81, 7),
             (84, 1),
-            (87, 7),
+            (87, 6),
         ],
-        "sured.p.1d.xor.f32.strong.sys pt, rz, [r9], r10, r11;",
+        "sured.p.1d.or.f32.strong.sys pt, rz, [r12], r13, r14;",
     ),
 ];
 
-/// One hand-built word per form of the group, every field at a distinct value, and its text
-/// (unconfirmed: the module docs say which parts `nvdisasm` has confirmed).
+/// Every word of [`FORM_CASES`] gives each field it sets above 1 a value no other field of the
+/// word has (`RZ`, 0xff, aside), so a read of one field where another belongs changes the text.
+#[test]
+fn form_cases_give_each_field_a_distinct_value() {
+    for (opcode, fields, _) in FORM_CASES {
+        for (i, &(bit, value)) in fields.iter().enumerate() {
+            if value <= 1 || value == u128::from(Gpr::RZ.index()) {
+                continue;
+            }
+            for &(other_bit, other) in &fields[i + 1..] {
+                assert_ne!(
+                    value, other,
+                    "{opcode:#x}: the fields at {bit} and {other_bit} share a value"
+                );
+            }
+        }
+    }
+}
+
+/// One hand-built word per form of the group ([`FORM_CASES`]), and its text (unconfirmed: the
+/// module docs say which parts `nvdisasm` has confirmed).
 #[test]
 fn hand_built_words_of_each_form_decode() {
     let cases = FORM_CASES;
@@ -1326,11 +1347,21 @@ fn values_the_surface_instructions_refuse() {
         assert!(decode(word(0x998, &[(72, mask)])).is_ok());
         assert!(decode(word(0x99c, &[(72, mask)])).is_ok());
     }
-    // SUST.D: the memory type.
-    assert_eq!(
-        decode(word(0x99e, &[(73, 7)])),
-        Err(unknown(0x99e, 73, 3, 7))
-    );
+    // SUST.D: the dimension, then the memory type, then the order, then the eviction
+    // priority, each alone and with the next one at once.
+    let sust = |fields: &[(u32, u128)]| decode(word(0x99e, fields));
+    assert_eq!(sust(&[(61, 6)]), Err(unknown(0x99e, 61, 3, 6)));
+    assert_eq!(sust(&[(73, 7)]), Err(unknown(0x99e, 73, 3, 7)));
+    assert_eq!(sust(&[(77, 1)]), Err(unknown(0x99e, 77, 4, 1)));
+    assert_eq!(sust(&[(84, 6)]), Err(unknown(0x99e, 84, 3, 6)));
+    assert_eq!(sust(&[(61, 6), (73, 7)]), Err(unknown(0x99e, 61, 3, 6)));
+    assert_eq!(sust(&[(73, 7), (77, 1)]), Err(unknown(0x99e, 73, 3, 7)));
+    assert_eq!(sust(&[(77, 1), (84, 6)]), Err(unknown(0x99e, 77, 4, 1)));
+    // SUST.P, which has no memory type: the dimension, then the order, then the eviction
+    // priority.
+    let sust_p = |fields: &[(u32, u128)]| decode(word(0x99c, fields));
+    assert_eq!(sust_p(&[(61, 6), (77, 1)]), Err(unknown(0x99c, 61, 3, 6)));
+    assert_eq!(sust_p(&[(77, 1), (84, 6)]), Err(unknown(0x99c, 77, 4, 1)));
     // SUATOM: the dimension, the type, the order, the eviction priority, then the operation.
     let suatom = |fields: &[(u32, u128)]| decode(word(0x394, fields));
     assert_eq!(suatom(&[(73, 7)]), Err(unknown(0x394, 73, 3, 7)));

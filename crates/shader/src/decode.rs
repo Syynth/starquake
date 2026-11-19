@@ -41,9 +41,10 @@
 //!    value names nothing (a vote or reduction operation past the defined ones: `op::control`;
 //!    a `MUFU` function or a comparison's combine operation past them: `op::float`; an
 //!    interpolation mode, pixel value or stage-buffer type past NAK's: `op::attribute`;
-//!    `ISETP`'s combining operation 3 and `PRMT`'s mode 7: `op::integer`; a dimension,
-//!    level-of-detail mode, eviction priority, memory type or order, atomic type or operation
-//!    past NAK's: `op::texture`);
+//!    `ISETP`'s combining operation 3 and `PRMT`'s mode 7: `op::integer`; the exact set the
+//!    texture group refuses, which includes memory orders in the holes between NAK's values as
+//!    well as past them, `TLD4`'s offset mode 3 and `TXQ`'s query 3, is listed in
+//!    `op::texture`'s module docs under "Values the decoder refuses");
 //! 5. every set bit was read, else [`DecodeError::UnknownBit`] naming the lowest unread one. A
 //!    form explains some bits only in some of its layouts or operations: in the constant-buffer
 //!    ALU forms a bound buffer reads its index (bits 54..59) and a bindless one its uniform

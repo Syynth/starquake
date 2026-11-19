@@ -461,15 +461,28 @@ encoded! {
     }
 }
 
-encoded! {
-    /// The scope of a strong memory access (NAK's `MemScope`, with its printer's text).
-    MemScope {
-        /// The workgroup.
-        Cta = 0 => ".cta",
-        /// The GPU.
-        Gpu = 1 => ".gpu",
-        /// The whole system.
-        System = 2 => ".sys",
+/// The scope of a strong memory access (NAK's `MemScope`, with its printer's text). It has no
+/// encoding of its own here: a surface access encodes it inside [`MemOrder::bits`]. NAK's
+/// stand-alone scope field (`OpMemBar`'s `set_field(76..79, ..)`: CTA 0, SM 1, GPU 2, system 3)
+/// is a different encoding, which slice 6e (MEMBAR) defines where it decodes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MemScope {
+    /// The workgroup.
+    Cta,
+    /// The GPU.
+    Gpu,
+    /// The whole system.
+    System,
+}
+
+impl Display for MemScope {
+    /// NAK's `MemScope` printer.
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Cta => ".cta",
+            Self::Gpu => ".gpu",
+            Self::System => ".sys",
+        })
     }
 }
 
