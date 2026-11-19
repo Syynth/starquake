@@ -130,7 +130,9 @@ fn to_test_block(builder: &mut Builder<'_>, empty: bool) -> Result<(), FlowError
     Ok(())
 }
 
-/// The value of predicate `cond`; the translators read a predicate source with it too.
+/// The value of predicate `cond`: `PT` as an immediate, else `GetPred` and, when negated,
+/// `LogicalNot`. Shared with the translators, which read guards and predicate sources the same
+/// way.
 pub(crate) fn read_pred(builder: &mut Builder<'_>, cond: PredSrc) -> Result<Operand, BuildError> {
     if cond.reg.is_true() {
         return Ok(Operand::Imm(Imm::U1(!cond.negated)));
