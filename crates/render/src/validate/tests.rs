@@ -3167,12 +3167,21 @@ fn pipeline_stages_are_checked_in_stage_order() {
 fn a_compute_pipeline_needs_a_live_compute_shader() {
     let desc = |index| ComputePipelineDesc { shader: sid(index) };
     assert_eq!(validate_compute_stage(&desc(5), stage_of), Ok(()));
-    assert_eq!(
-        validate_compute_stage(&desc(0), stage_of),
-        Err(RenderError::Invalid(
-            "a compute pipeline's shader is not a compute shader"
-        ))
-    );
+    // Every other stage, each refused with the exact error, so a check that only rules out one
+    // of them fails here.
+    for (index, stage) in STAGE_OF.iter().enumerate() {
+        if *stage == ShaderStage::Compute {
+            continue;
+        }
+        let index = u32::try_from(index).expect("a small index");
+        assert_eq!(
+            validate_compute_stage(&desc(index), stage_of),
+            Err(RenderError::Invalid(
+                "a compute pipeline's shader is not a compute shader"
+            )),
+            "{stage:?}"
+        );
+    }
     assert_eq!(
         validate_compute_stage(&desc(99), stage_of),
         Err(RenderError::Invalid(NO_SHADER))
