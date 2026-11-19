@@ -23,6 +23,12 @@ impl ReadbackIds {
         Self { next: 0 }
     }
 
+    /// An allocator that has already handed out `n` ids, for tests of the wrap.
+    #[cfg(test)]
+    pub(crate) const fn after(n: u64) -> Self {
+        Self { next: n }
+    }
+
     /// The next id: index `n mod 2^32`, generation `n / 2^32`, for the `n`th call (from 0).
     /// After `2^64` calls it keeps returning the last id, which no back thread lives to reach.
     pub fn allocate(&mut self) -> ReadbackId {
