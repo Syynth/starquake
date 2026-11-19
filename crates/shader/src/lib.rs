@@ -27,6 +27,11 @@
 //! branches with their [`decode::BranchOffset`], convergence barriers, calls and returns, and
 //! warp votes, shuffles, matches and reductions; `JMX` and `BPT` stay shells.
 //!
+//! Slice 6b decodes the 32-bit float and conversion group (`decode`'s `OpFAdd` to `OpF2FP`):
+//! arithmetic, minimum and maximum, comparisons, selects, special functions, quad swizzled adds
+//! and the conversions between float and integer types, with their rounding modes and
+//! flush-to-zero bits.
+//!
 //! Experiment E1, run before this slice, lives in `lower`'s tests and its results in the spec.
 
 #[cfg(feature = "test-support")]

@@ -95,7 +95,7 @@
 //! form 1 (NAK writes the swizzle only for an `F16` source; PR #4588 takes bit 60 only for a
 //! half source); `I2F`'s byte select (bits 60..62), of which an 8-bit source reads two bits, a
 //! 16-bit one bit 60 and a wider one none (PR #4588: `select < (32 >> (3 + src_size))`); and
-//! `F2FP`'s `.H1` (bit 72), read only with `.MERGE_C` (NAK: "MERGE_C only"). PR #4588's rows
+//! `F2FP`'s `.H1` (bit 72), read only with `.MERGE_C` (NAK: "`MERGE_C` only"). PR #4588's rows
 //! leave out `FMNMX`'s `.NAN` and `FSET`'s combine operation in form 6 (`0xc09`, `0xc0a`), so
 //! there they are unknown bits (step 2) and the assembler refuses them.
 
@@ -1386,8 +1386,8 @@ pub(crate) const I2F_SIGNED: Field = Field::bit(74);
 pub(crate) const I2F_SELECT: Field = Field::new(60, 2);
 
 /// The bits of `I2F`'s byte select a source of `src_type` reads: two for an 8-bit source (four
-/// bytes), one for a 16-bit one (two halves), none for a wider one (PR #4588: `select < (32U
-/// >> (3 + src_size))` parts, so log2 of that many bits).
+/// bytes), one for a 16-bit one (two halves), none for a wider one (PR #4588:
+/// `select < (32U >> (3 + src_size))` parts, so log2 of that many bits).
 pub(crate) const fn i2f_select(src_type: IntType) -> Field {
     let parts_log2 = match src_type.size {
         0 => 2,
@@ -1550,6 +1550,10 @@ const fn f2f(base: u16, form: AluForm) -> Form {
 
 /// `F2I dst, src`: a float rounded to an integer type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent one-bit field of the encoding, as in NAK's OpF2I"
+)]
 pub struct OpF2I {
     /// The destination.
     pub dst: Gpr,
@@ -1795,7 +1799,7 @@ pub(crate) const F2FP_OPCODE: u16 = 0x03e;
 /// `F2FP`'s third source, read with `.MERGE_C` (NAK: `Src::ZERO` as source 2, at 64..72; PR
 /// #4588: `Source(2, false)` when `merge`).
 pub(crate) const F2FP_C: Field = SRC2;
-/// `F2FP`'s `.H1`, "MERGE_C only" (NAK: `set_bit(72, false)`).
+/// `F2FP`'s `.H1`, "`MERGE_C` only" (NAK: `set_bit(72, false)`).
 pub(crate) const F2FP_H1: Field = Field::bit(72);
 /// `F2FP`'s `.MERGE_C` (NAK: `set_bit(78, false); // TODO: .MERGE_C`; PR #4588: `Take(78, 1)`).
 pub(crate) const F2FP_MERGE_C: Field = Field::bit(78);

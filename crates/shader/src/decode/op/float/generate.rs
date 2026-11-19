@@ -63,32 +63,49 @@ const fn is_reg(src: AluSrc) -> bool {
     matches!(src, AluSrc::Reg { .. })
 }
 
-/// Every operation of the group.
+/// Every operation of the group, one generator each.
 pub(super) fn all() -> Vec<BoxedStrategy<Op>> {
-    [arithmetic(), comparisons(), conversions()].concat()
+    vec![
+        ffma(),
+        fadd(),
+        fmul(),
+        mufu(),
+        fswzadd(),
+        fmnmx(),
+        fset(),
+        fsetp(),
+        fsel(),
+        frnd(),
+        f2f(),
+        f2i(),
+        i2f(),
+        i2fp(),
+        f2fp(),
+    ]
 }
 
-/// `FFMA`, `FADD`, `FMUL`, `MUFU` and `FSWZADD`.
-fn arithmetic() -> Vec<BoxedStrategy<Op>> {
+fn ffma() -> BoxedStrategy<Op> {
     let ffma_srcs = prop_oneof![
         (any_reg_src(), any_reg_src(), any_reg_src()).prop_map(|(a, b, c)| [a, b, c]),
         (any_reg_src(), any_wide_src(), any_reg_src()).prop_map(|(a, b, c)| [a, b, c]),
         (any_reg_src(), any_reg_src(), any_wide_src()).prop_map(|(a, b, c)| [a, b, c]),
     ];
-    let ffma = (any_gpr(), ffma_srcs, any::<[bool; 3]>(), any_rnd()).prop_map(
-        |(dst, srcs, flags, rnd)| {
-            let [saturate, ftz, dnz] = flags;
-            Op::FFma(OpFFma {
-                dst,
-                srcs,
-                saturate,
-                rnd,
-                ftz,
-                dnz,
-            })
-        },
-    );
-    let fadd = (
+    ((any_gpr(), ffma_srcs, any::<[bool; 3]>(), any_rnd()).prop_map(|(dst, srcs, flags, rnd)| {
+        let [saturate, ftz, dnz] = flags;
+        Op::FFma(OpFFma {
+            dst,
+            srcs,
+            saturate,
+            rnd,
+            ftz,
+            dnz,
+        })
+    }))
+    .boxed()
+}
+
+fn fadd() -> BoxedStrategy<Op> {
+    ((
         any_gpr(),
         any_reg_src(),
         any_src(),
@@ -105,8 +122,12 @@ fn arithmetic() -> Vec<BoxedStrategy<Op>> {
                 rnd,
                 ftz,
             })
-        });
-    let fmul = (
+        }))
+    .boxed()
+}
+
+fn fmul() -> BoxedStrategy<Op> {
+    ((
         any_gpr(),
         any_reg_src(),
         any_src(),
@@ -126,8 +147,12 @@ fn arithmetic() -> Vec<BoxedStrategy<Op>> {
                 dnz,
                 scale,
             })
-        });
-    let mufu = (
+        }))
+    .boxed()
+}
+
+fn mufu() -> BoxedStrategy<Op> {
+    ((
         any_gpr(),
         select(MuFuOp::ALL.to_vec()),
         any_src(),
@@ -141,8 +166,12 @@ fn arithmetic() -> Vec<BoxedStrategy<Op>> {
                 f16,
                 high: high && f16 && is_reg(src),
             })
-        });
-    let fswzadd = (
+        }))
+    .boxed()
+}
+
+fn fswzadd() -> BoxedStrategy<Op> {
+    ((
         any_gpr(),
         [any_gpr(), any_gpr()],
         [
@@ -163,19 +192,12 @@ fn arithmetic() -> Vec<BoxedStrategy<Op>> {
                 ftz,
                 ndv,
             })
-        });
-    vec![
-        ffma.boxed(),
-        fadd.boxed(),
-        fmul.boxed(),
-        mufu.boxed(),
-        fswzadd.boxed(),
-    ]
+        }))
+    .boxed()
 }
 
-/// `FMNMX`, `FSET`, `FSETP` and `FSEL`.
-fn comparisons() -> Vec<BoxedStrategy<Op>> {
-    let fmnmx = (
+fn fmnmx() -> BoxedStrategy<Op> {
+    ((
         any_gpr(),
         any_reg_src(),
         any_src(),
@@ -190,8 +212,12 @@ fn comparisons() -> Vec<BoxedStrategy<Op>> {
                 ftz,
                 nan: nan && !is_uniform(b),
             })
-        });
-    let fset = (
+        }))
+    .boxed()
+}
+
+fn fset() -> BoxedStrategy<Op> {
+    ((
         any_gpr(),
         select(FloatCmpOp::ALL.to_vec()),
         any_reg_src(),
@@ -213,8 +239,12 @@ fn comparisons() -> Vec<BoxedStrategy<Op>> {
                 accum,
                 ftz,
             })
-        });
-    let fsetp = (
+        }))
+    .boxed()
+}
+
+fn fsetp() -> BoxedStrategy<Op> {
+    ((
         [any_pred(), any_pred()],
         select(FloatCmpOp::ALL.to_vec()),
         select(PredSetOp::ALL.to_vec()),
@@ -232,22 +262,25 @@ fn comparisons() -> Vec<BoxedStrategy<Op>> {
                 accum,
                 ftz,
             })
-        });
+        }))
+    .boxed()
+}
+
+fn fsel() -> BoxedStrategy<Op> {
     let fsel_b =
         any_src().prop_filter("FSEL has no uniform-register form", |src| !is_uniform(*src));
-    let fsel = (any_gpr(), any_reg_src(), fsel_b, any_pred_src()).prop_map(|(dst, a, b, cond)| {
+    ((any_gpr(), any_reg_src(), fsel_b, any_pred_src()).prop_map(|(dst, a, b, cond)| {
         Op::FSel(OpFSel {
             dst,
             srcs: [a, b],
             cond,
         })
-    });
-    vec![fmnmx.boxed(), fset.boxed(), fsetp.boxed(), fsel.boxed()]
+    }))
+    .boxed()
 }
 
-/// `FRND`, `F2F`, `F2I`, `I2F`, `I2FP` and `F2FP`.
-fn conversions() -> Vec<BoxedStrategy<Op>> {
-    let frnd = (
+fn frnd() -> BoxedStrategy<Op> {
+    ((
         any_gpr(),
         any_src(),
         (any_float_type(), any_float_type()),
@@ -264,8 +297,12 @@ fn conversions() -> Vec<BoxedStrategy<Op>> {
                 ftz,
                 wide,
             })
-        });
-    let f2f = (
+        }))
+    .boxed()
+}
+
+fn f2f() -> BoxedStrategy<Op> {
+    ((
         any_gpr(),
         any_src(),
         (any_float_type(), any_float_type()),
@@ -282,8 +319,12 @@ fn conversions() -> Vec<BoxedStrategy<Op>> {
                 ftz,
                 wide,
             })
-        });
-    let f2i = (
+        }))
+    .boxed()
+}
+
+fn f2i() -> BoxedStrategy<Op> {
+    ((
         any_gpr(),
         any_src(),
         (any_int_type(), any_float_type()),
@@ -305,8 +346,12 @@ fn conversions() -> Vec<BoxedStrategy<Op>> {
                     wide,
                 })
             },
-        );
-    let i2f = (
+        ))
+    .boxed()
+}
+
+fn i2f() -> BoxedStrategy<Op> {
+    ((
         any_gpr(),
         any_plain_src(),
         (any_float_type(), any_int_type()),
@@ -329,8 +374,12 @@ fn conversions() -> Vec<BoxedStrategy<Op>> {
                 select: select & ((1 << width) - 1),
                 wide,
             })
-        });
-    let i2fp = (
+        }))
+    .boxed()
+}
+
+fn i2fp() -> BoxedStrategy<Op> {
+    ((
         any_gpr(),
         any_plain_src(),
         (any_float_type(), any_int_type()),
@@ -344,8 +393,12 @@ fn conversions() -> Vec<BoxedStrategy<Op>> {
                 src_type,
                 rnd,
             })
-        });
-    let f2fp = (
+        }))
+    .boxed()
+}
+
+fn f2fp() -> BoxedStrategy<Op> {
+    ((
         any_gpr(),
         any_gpr(),
         any_plain_src(),
@@ -362,13 +415,6 @@ fn conversions() -> Vec<BoxedStrategy<Op>> {
                 h1: h1 && merge_c,
                 rnd,
             })
-        });
-    vec![
-        frnd.boxed(),
-        f2f.boxed(),
-        f2i.boxed(),
-        i2f.boxed(),
-        i2fp.boxed(),
-        f2fp.boxed(),
-    ]
+        }))
+    .boxed()
 }

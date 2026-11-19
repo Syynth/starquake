@@ -13,16 +13,21 @@
 //! (`test_ldc`, `test_nanosleep`). Of the control group (`op::control`), `test_nop`,
 //! `test_redux`, `test_match` and `test_nanosleep` pin `nop`, every `redux` operation, `match`
 //! with and without its predicate and `.u64`, and `nanosleep` with each source kind and a hex
-//! immediate. **Everything else is a guess** in `nvdisasm`'s usual style that a developer with
-//! `nvdisasm` should check (spec, "`nvdisasm` cross-check"): `urz` and `upt`, the `.rm`/`.rp`
-//! rounding names (taken from NAK's own `FRndMode` printer), `.fmz` for the `dnz` bit, float
-//! immediates other than small integers, `-`/`|..|` source modifiers (on registers, uniform
-//! registers and constant buffers alike), the guard prefix `@p0 `/`@!p0 `, `MOV`'s hex immediate
-//! and lane mask, the `ALD`/`AST` operand syntax and width suffixes, `EXIT`'s modifiers and
-//! predicate, the special-register names, the text of every other control instruction (branch
-//! offsets in particular print as a signed byte displacement from the next instruction, where
-//! `nvdisasm` prints the absolute target: `op::control`, `BranchOffset`), and every shell's
-//! mnemonic.
+//! immediate. Of the float group (`op::float`), `test_float_ops`, `test_mufu` and `test_f2fp`
+//! pin `fadd`, `fmul`, `fmnmx`, `fset.bf`, `fsetp` (both destinations and the accumulator), the
+//! fourteen comparisons and three combine operations NAK names, `f2f`, `f2i`, `frnd` and `i2f`
+//! with the types NAK tests (`.u32`, `.f16`, `.f64`) and `.trunc`, every `mufu` function with
+//! `.f16`, and `f2fp.pack_ab`. **Everything else is a guess** in `nvdisasm`'s usual style that
+//! a developer with `nvdisasm` should check (spec, "`nvdisasm` cross-check"): `urz` and `upt`,
+//! the `.rm`/`.rp` rounding names (taken from NAK's own `FRndMode` printer), `.fmz` for the
+//! `dnz` bit, float immediates other than small integers, `-`/`|..|` source modifiers (on
+//! registers, uniform registers and constant buffers alike), the guard prefix `@p0 `/`@!p0 `,
+//! `MOV`'s hex immediate and lane mask, the `ALD`/`AST` operand syntax and width suffixes,
+//! `EXIT`'s modifiers and predicate, the special-register names, the text of every other control
+//! instruction (branch offsets in particular print as a signed byte displacement from the next
+//! instruction, where `nvdisasm` prints the absolute target: `op::control`, `BranchOffset`), the
+//! float group's text outside NAK's cases (each printer in `op::float` says which parts), and
+//! every shell's mnemonic.
 
 use std::fmt::{self, Display, Formatter};
 

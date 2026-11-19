@@ -48,28 +48,46 @@ const ONE: u128 = 0x3f80_0000;
 // ---------------------------------------------------------------------------------------------
 // NAK's expected text.
 
-/// NAK's `test_float_ops` cases for SM 8.6, ported (`nvdisasm_tests.rs` @ 52238762), except
-/// `FFMA`'s, which `ffma_text_matches_nak_nvdisasm_cases` ports: `FMNMX`, `FSET` and `FSETP`
-/// with each of NAK's fourteen comparisons and three combine operations, `F2F`, `F2I`, `FRND`
-/// and `I2F` with `.rz` and the default rounding, `FADD` and `FMUL` with `.ftz`, `.rz` and `.sat`
-/// on and off, each with the source pairs `r2, r3` and `r2, 2`. Each op is built as NAK's encoder
-/// fills it: the unread slot of `FADD` R0 in form 1 and `RZ` otherwise, `FMUL`'s `RZ` and scale
-/// 4, `FSETP`'s second destination `PT`, the 64-bit opcode exactly when a type is 64 bits.
+/// NAK's two-source pairs in `test_float_ops`: `r2, r3` and `r2, 2`, with the register NAK's
+/// encoder leaves in `FADD`'s unread slot for each (R0 in form 1, `RZ` in form 2).
+fn nak_two_src() -> [([AluSrc; 2], &'static str, Gpr); 2] {
+    [
+        (
+            [AluSrc::reg(Gpr::new(2)), AluSrc::reg(Gpr::new(3))],
+            "r2, r3",
+            Gpr::new(0),
+        ),
+        ([AluSrc::reg(Gpr::new(2)), imm(2.0)], "r2, 2", Gpr::RZ),
+    ]
+}
+
+/// `.ftz` off and on, as NAK's tests loop over it.
+const NAK_FTZ: [(bool, &str); 2] = [(false, ""), (true, ".ftz")];
+
+/// The rounding modes NAK's tests use, with their float and integer text.
+const NAK_RND: [(RoundMode, &str, &str); 2] = [
+    (RoundMode::NearestEven, "", ""),
+    (RoundMode::Zero, ".rz", ".trunc"),
+];
+
+/// Assembles, decodes and prints each op, checking it against its text; returns the count.
+fn check_all(cases: &[(Op, String)]) -> usize {
+    for (op, expected) in cases {
+        assert_eq!(round_text(Instr::new(*op)), *expected);
+    }
+    cases.len()
+}
+
+/// NAK's `test_float_ops` cases for SM 8.6, ported (`nvdisasm_tests.rs` @ 52238762): `FMNMX`,
+/// `FSET` and `FSETP` with each of NAK's fourteen comparisons and three combine operations,
+/// `.ftz` on and off, the source pairs `r2, r3` and `r2, 2`; `FSETP`'s second destination `PT`,
+/// as NAK's encoder writes it.
 #[test]
-fn float_ops_text_matches_nak_nvdisasm_cases() {
-    let r = Gpr::new;
+fn comparison_text_matches_nak_nvdisasm_cases() {
     let pred = |index| PredSrc {
         reg: p(index),
         negated: false,
     };
-    let two_src = [
-        (
-            [AluSrc::reg(r(2)), AluSrc::reg(r(3))],
-            "r2, r3",
-            Gpr::new(0),
-        ),
-        ([AluSrc::reg(r(2)), imm(2.0)], "r2, 2", Gpr::RZ),
-    ];
     let cmp_ops = [
         (FloatCmpOp::Eq, ".eq"),
         (FloatCmpOp::Ne, ".ne"),
@@ -91,27 +109,23 @@ fn float_ops_text_matches_nak_nvdisasm_cases() {
         (PredSetOp::Or, ".or"),
         (PredSetOp::Xor, ".xor"),
     ];
-    let mut checked = 0;
-    let mut check = |op: Op, expected: String| {
-        assert_eq!(round_text(Instr::new(op)), expected);
-        checked += 1;
-    };
-    for (ftz, ftz_str) in [(false, ""), (true, ".ftz")] {
-        for (srcs, srcs_str, _) in two_src {
-            check(
+    let mut cases = Vec::new();
+    for (ftz, ftz_str) in NAK_FTZ {
+        for (srcs, srcs_str, _) in nak_two_src() {
+            cases.push((
                 Op::FMnMx(OpFMnMx {
-                    dst: r(1),
+                    dst: Gpr::new(1),
                     srcs,
                     min: pred(4),
                     ftz,
                     nan: false,
                 }),
                 format!("fmnmx{ftz_str} r1, {srcs_str}, p4;"),
-            );
+            ));
             for (cmp, cmp_str) in cmp_ops {
-                check(
+                cases.push((
                     Op::FSet(OpFSet {
-                        dst: r(1),
+                        dst: Gpr::new(1),
                         cmp,
                         srcs,
                         set_op: PredSetOp::And,
@@ -119,9 +133,9 @@ fn float_ops_text_matches_nak_nvdisasm_cases() {
                         ftz,
                     }),
                     format!("fset.bf{cmp_str}{ftz_str}.and r1, {srcs_str}, pt;"),
-                );
+                ));
                 for (set_op, set_str) in set_ops {
-                    check(
+                    cases.push((
                         Op::FSetP(OpFSetP {
                             dst: p(2),
                             dst1: Pred::PT,
@@ -132,17 +146,28 @@ fn float_ops_text_matches_nak_nvdisasm_cases() {
                             ftz,
                         }),
                         format!("fsetp{cmp_str}{ftz_str}{set_str} p2, pt, {srcs_str}, p1;"),
-                    );
+                    ));
                 }
             }
         }
-        for (rnd, rnd_str, int_str) in [
-            (RoundMode::NearestEven, "", ""),
-            (RoundMode::Zero, ".rz", ".trunc"),
-        ] {
+    }
+    // FMNMX 4, FSET 56, FSETP 168.
+    assert_eq!(check_all(&cases), 4 + 56 + 168);
+}
+
+/// NAK's `test_float_ops` conversion cases for SM 8.6, ported: `F2F` and `F2I` from `f64` and
+/// `f16`, `FRND` in 64 and 32 bits, `I2F` to `f64` and `f16`, with `.rz` (`.trunc`) and the
+/// default rounding and `.ftz` on and off; the 64-bit opcode exactly when a type is 64 bits, as
+/// NAK's encoder picks it.
+#[test]
+fn conversion_text_matches_nak_nvdisasm_cases() {
+    let r = Gpr::new;
+    let mut cases = Vec::new();
+    for (ftz, ftz_str) in NAK_FTZ {
+        for (rnd, rnd_str, int_str) in NAK_RND {
             for (src_type, src_str) in [(FloatType::F64, ".f64"), (FloatType::F16, ".f16")] {
                 let wide = src_type == FloatType::F64;
-                check(
+                cases.push((
                     Op::F2F(OpF2F {
                         dst: r(1),
                         src: AluSrc::reg(r(2)),
@@ -153,8 +178,8 @@ fn float_ops_text_matches_nak_nvdisasm_cases() {
                         wide,
                     }),
                     format!("f2f{ftz_str}.f32{src_str}{rnd_str} r1, r2;"),
-                );
-                check(
+                ));
+                cases.push((
                     Op::F2I(OpF2I {
                         dst: r(1),
                         src: AluSrc::reg(r(2)),
@@ -167,34 +192,27 @@ fn float_ops_text_matches_nak_nvdisasm_cases() {
                         wide,
                     }),
                     format!("f2i{ftz_str}.u32{src_str}{int_str} r1, r2;"),
-                );
+                ));
             }
-            check(
-                Op::FRnd(OpFRnd {
-                    dst: r(2),
-                    src: AluSrc::reg(r(2)),
-                    dst_type: FloatType::F64,
-                    src_type: FloatType::F64,
-                    rnd,
-                    ftz,
-                    wide: true,
-                }),
-                format!("frnd{ftz_str}.f64{int_str} r2, r2;"),
-            );
-            check(
-                Op::FRnd(OpFRnd {
-                    dst: r(1),
-                    src: AluSrc::reg(r(2)),
-                    dst_type: FloatType::F32,
-                    src_type: FloatType::F32,
-                    rnd,
-                    ftz,
-                    wide: false,
-                }),
-                format!("frnd{ftz_str}{int_str} r1, r2;"),
-            );
+            for (ty, dst, type_str, dst_str, wide) in [
+                (FloatType::F64, 2, ".f64", "r2", true),
+                (FloatType::F32, 1, "", "r1", false),
+            ] {
+                cases.push((
+                    Op::FRnd(OpFRnd {
+                        dst: r(dst),
+                        src: AluSrc::reg(r(2)),
+                        dst_type: ty,
+                        src_type: ty,
+                        rnd,
+                        ftz,
+                        wide,
+                    }),
+                    format!("frnd{ftz_str}{type_str}{int_str} {dst_str}, r2;"),
+                ));
+            }
             for (dst_type, dst_str) in [(FloatType::F64, ".f64"), (FloatType::F16, ".f16")] {
-                check(
+                cases.push((
                     Op::I2F(OpI2F {
                         dst: r(1),
                         src: AluSrc::reg(r(2)),
@@ -205,13 +223,28 @@ fn float_ops_text_matches_nak_nvdisasm_cases() {
                         wide: dst_type == FloatType::F64,
                     }),
                     format!("i2f{dst_str}.u32{rnd_str} r1, r2;"),
-                );
+                ));
             }
+        }
+    }
+    // F2F, F2I, FRND and I2F 8 each.
+    assert_eq!(check_all(&cases), 4 * 8);
+}
+
+/// NAK's `test_float_ops` `FADD` and `FMUL` cases for SM 8.6, ported (`FFMA`'s are
+/// `ffma_text_matches_nak_nvdisasm_cases`): `.ftz`, `.rz` and `.sat` on and off with the source
+/// pairs `r2, r3` and `r2, 2`; the unread slot as NAK's encoder fills it (`FADD`'s R0 in form 1
+/// and `RZ` in form 2, `FMUL`'s `RZ`) and `FMUL`'s scale 4.
+#[test]
+fn fadd_and_fmul_text_matches_nak_nvdisasm_cases() {
+    let mut cases = Vec::new();
+    for (ftz, ftz_str) in NAK_FTZ {
+        for (rnd, rnd_str, _) in NAK_RND {
             for (saturate, sat_str) in [(false, ""), (true, ".sat")] {
-                for (srcs, srcs_str, unread) in two_src {
-                    check(
+                for (srcs, srcs_str, unread) in nak_two_src() {
+                    cases.push((
                         Op::FAdd(OpFAdd {
-                            dst: r(1),
+                            dst: Gpr::new(1),
                             srcs,
                             ignored: unread,
                             saturate,
@@ -219,10 +252,10 @@ fn float_ops_text_matches_nak_nvdisasm_cases() {
                             ftz,
                         }),
                         format!("fadd{ftz_str}{rnd_str}{sat_str} r1, {srcs_str};"),
-                    );
-                    check(
+                    ));
+                    cases.push((
                         Op::FMul(OpFMul {
-                            dst: r(1),
+                            dst: Gpr::new(1),
                             srcs,
                             ignored: Gpr::RZ,
                             saturate,
@@ -232,13 +265,13 @@ fn float_ops_text_matches_nak_nvdisasm_cases() {
                             scale: FMulScale::None,
                         }),
                         format!("fmul{ftz_str}{rnd_str}{sat_str} r1, {srcs_str};"),
-                    );
+                    ));
                 }
             }
         }
     }
-    // FMNMX 4, FSET 56, FSETP 168, F2F, F2I, FRND and I2F 8 each, FADD and FMUL 16 each.
-    assert_eq!(checked, 4 + 56 + 168 + 4 * 8 + 2 * 16);
+    // FADD and FMUL 16 each.
+    assert_eq!(check_all(&cases), 2 * 16);
 }
 
 /// NAK's `test_mufu` for SM 8.6, ported: every function in 32 and 16 bits (but `RCP64H` and
@@ -308,7 +341,15 @@ fn f2fp_text_matches_nak_nvdisasm_cases() {
 /// here.
 #[test]
 fn hand_built_words_of_each_form_decode() {
-    let cases = [arithmetic_words(), comparison_words(), conversion_words()].concat();
+    let cases = [
+        arithmetic_words(),
+        comparison_words(),
+        fsetp_and_fsel_words(),
+        conversion_words(),
+        f2i_words(),
+        int_conversion_words(),
+    ]
+    .concat();
     let mut opcodes: Vec<u16> = Vec::new();
     for (word, expected) in &cases {
         assert_eq!(text(*word), *expected, "{:#x}", word.bits());
@@ -482,6 +523,12 @@ fn comparison_words() -> Vec<(Instruction, &'static str)> {
             ),
             "fset.bf.nan.and r1, r2, ur4, pt;",
         ),
+    ]
+}
+
+/// Hand-built words of `FSETP` and `FSEL` (fields as for `comparison_words`).
+fn fsetp_and_fsel_words() -> Vec<(Instruction, &'static str)> {
+    vec![
         (
             word(
                 0x20b,
@@ -634,6 +681,12 @@ fn conversion_words() -> Vec<(Instruction, &'static str)> {
             "f2f.f32.f64 r1, ur2;",
         ),
         // F2I f32 to s32 (the default types), u16, s64 and from f64.
+    ]
+}
+
+/// Hand-built words of `F2I` (fields as for `conversion_words`).
+fn f2i_words() -> Vec<(Instruction, &'static str)> {
+    vec![
         (
             word(0x305, &[(16, 1), (32, 2), (72, 1), (75, 2), (84, 2)]),
             "f2i r1, r2;",
@@ -684,6 +737,12 @@ fn conversion_words() -> Vec<(Instruction, &'static str)> {
             "f2i.f64.floor r1, ur2;",
         ),
         // I2F s32 to f32 (the default types), from u32, to f16, and into f64.
+    ]
+}
+
+/// Hand-built words of `I2F`, `I2FP` and `F2FP` (fields as for `conversion_words`).
+fn int_conversion_words() -> Vec<(Instruction, &'static str)> {
+    vec![
         (
             word(0x306, &[(16, 1), (32, 2), (74, 1), (75, 2), (84, 2)]),
             "i2f r1, r2;",
@@ -771,216 +830,237 @@ fn conversion_words() -> Vec<(Instruction, &'static str)> {
     ]
 }
 
-/// Each modifier, flag and mode bit of each instruction set alone in a word the assembler did
-/// not make, against the same word without it.
-#[test]
-fn hand_built_words_pin_each_modifier_bit() {
-    let fadd = [(16, 1), (24, 2), (32, 3)];
-    let fmul = [(16, 1), (24, 2), (32, 3), (64, 0xff), (84, 4)];
-    let fmnmx = [(16, 1), (24, 2), (32, 3), (87, 7)];
-    let fset = [(16, 1), (24, 2), (32, 3), (76, 2), (87, 7)];
-    let fsetp = [(81, 0), (84, 7), (24, 2), (32, 3), (76, 2), (87, 7)];
-    let fsel = [(16, 1), (24, 2), (32, 3), (87, 7)];
-    let mufu = [(16, 1), (32, 2)];
-    let fswzadd = [(16, 1), (24, 2), (64, 3)];
-    let cvt = [(16, 1), (32, 2), (75, 2), (84, 2)];
-    let f2fp = [(16, 1), (24, 2), (32, 3), (64, 4)];
-    let with = |opcode, base: &[(u32, u128)], extra: &[(u32, u128)]| {
-        let fields: Vec<(u32, u128)> = base.iter().chain(extra).copied().collect();
-        word(opcode, &fields)
-    };
-    let cases = [
-        (with(0x221, &fadd, &[]), "fadd r1, r2, r3;"),
-        (with(0x221, &fadd, &[(72, 1)]), "fadd r1, -r2, r3;"),
-        (with(0x221, &fadd, &[(73, 1)]), "fadd r1, |r2|, r3;"),
-        (with(0x221, &fadd, &[(62, 1)]), "fadd r1, r2, |r3|;"),
-        (with(0x221, &fadd, &[(63, 1)]), "fadd r1, r2, -r3;"),
-        (with(0x221, &fadd, &[(77, 1)]), "fadd.sat r1, r2, r3;"),
-        (with(0x221, &fadd, &[(80, 1)]), "fadd.ftz r1, r2, r3;"),
-        (with(0x221, &fadd, &[(64, 7)]), "fadd r1, r2, r3;"),
-        (with(0x220, &fmul, &[]), "fmul r1, r2, r3;"),
-        (with(0x220, &fmul, &[(76, 1)]), "fmul.fmz r1, r2, r3;"),
-        (with(0x220, &fmul, &[(77, 1)]), "fmul.sat r1, r2, r3;"),
-        (with(0x220, &fmul, &[(80, 1)]), "fmul.ftz r1, r2, r3;"),
-        (with(0x220, &fmul, &[(72, 1)]), "fmul r1, -r2, r3;"),
-        (with(0x220, &fmul, &[(73, 1)]), "fmul r1, |r2|, r3;"),
-        (with(0x220, &fmul, &[(62, 1)]), "fmul r1, r2, |r3|;"),
-        (with(0x220, &fmul, &[(63, 1)]), "fmul r1, r2, -r3;"),
-        (with(0x209, &fmnmx, &[]), "fmnmx r1, r2, r3, pt;"),
-        (with(0x209, &fmnmx, &[(80, 1)]), "fmnmx.ftz r1, r2, r3, pt;"),
-        (with(0x209, &fmnmx, &[(81, 1)]), "fmnmx.nan r1, r2, r3, pt;"),
-        (with(0x209, &fmnmx, &[(90, 1)]), "fmnmx r1, r2, r3, !pt;"),
-        (with(0x209, &fmnmx, &[(72, 1)]), "fmnmx r1, -r2, r3, pt;"),
-        (with(0x209, &fmnmx, &[(62, 1)]), "fmnmx r1, r2, |r3|, pt;"),
-        (with(0x20a, &fset, &[]), "fset.bf.eq.and r1, r2, r3, pt;"),
-        (
-            with(0x20a, &fset, &[(80, 1)]),
-            "fset.bf.eq.ftz.and r1, r2, r3, pt;",
-        ),
-        (
-            with(0x20a, &fset, &[(74, 1)]),
-            "fset.bf.eq.or r1, r2, r3, pt;",
-        ),
-        (
-            with(0x20a, &fset, &[(75, 1)]),
-            "fset.bf.eq.xor r1, r2, r3, pt;",
-        ),
-        (
-            with(0x20a, &fset, &[(90, 1)]),
-            "fset.bf.eq.and r1, r2, r3, !pt;",
-        ),
-        (
-            with(0x20a, &fset, &[(73, 1)]),
-            "fset.bf.eq.and r1, |r2|, r3, pt;",
-        ),
-        (with(0x20b, &fsetp, &[]), "fsetp.eq.and p0, pt, r2, r3, pt;"),
-        (
-            with(0x20b, &fsetp, &[(80, 1)]),
-            "fsetp.eq.ftz.and p0, pt, r2, r3, pt;",
-        ),
-        (
-            with(0x20b, &fsetp, &[(74, 1)]),
-            "fsetp.eq.or p0, pt, r2, r3, pt;",
-        ),
-        (
-            with(0x20b, &fsetp, &[(75, 1)]),
-            "fsetp.eq.xor p0, pt, r2, r3, pt;",
-        ),
-        (
-            with(0x20b, &fsetp, &[(90, 1)]),
-            "fsetp.eq.and p0, pt, r2, r3, !pt;",
-        ),
-        (
-            with(0x20b, &fsetp, &[(63, 1)]),
-            "fsetp.eq.and p0, pt, r2, -r3, pt;",
-        ),
-        (with(0x208, &fsel, &[(72, 1)]), "fsel r1, -r2, r3, pt;"),
-        (with(0x208, &fsel, &[(73, 1)]), "fsel r1, |r2|, r3, pt;"),
-        (with(0x208, &fsel, &[(62, 1)]), "fsel r1, r2, |r3|, pt;"),
-        (with(0x208, &fsel, &[(63, 1)]), "fsel r1, r2, -r3, pt;"),
-        (with(0x208, &fsel, &[(90, 1)]), "fsel r1, r2, r3, !pt;"),
-        (with(0x308, &mufu, &[]), "mufu.cos r1, r2;"),
-        (with(0x308, &mufu, &[(73, 1)]), "mufu.cos.f16 r1, r2;"),
-        (
-            with(0x308, &mufu, &[(73, 1), (60, 1)]),
-            "mufu.cos.f16 r1, r2.h1;",
-        ),
-        (with(0x308, &mufu, &[(62, 1)]), "mufu.cos r1, |r2|;"),
-        (with(0x308, &mufu, &[(63, 1)]), "mufu.cos r1, -r2;"),
-        (
-            with(0x822, &fswzadd, &[]),
-            "fswzadd r1, r2, r3, [add, add, add, add];",
-        ),
-        (
-            with(0x822, &fswzadd, &[(77, 1)]),
-            "fswzadd.ndv r1, r2, r3, [add, add, add, add];",
-        ),
-        (
-            with(0x822, &fswzadd, &[(80, 1)]),
-            "fswzadd.ftz r1, r2, r3, [add, add, add, add];",
-        ),
-        (
-            with(0x822, &fswzadd, &[(38, 1)]),
-            "fswzadd r1, r2, r3, [sub, add, add, add];",
-        ),
-        (
-            with(0x822, &fswzadd, &[(32, 2)]),
-            "fswzadd r1, r2, r3, [add, add, add, subr];",
-        ),
-        (with(0x307, &cvt, &[(80, 1)]), "frnd.ftz r1, r2;"),
-        (with(0x307, &cvt, &[(62, 1)]), "frnd r1, |r2|;"),
-        (with(0x304, &cvt, &[(80, 1)]), "f2f.ftz.f32.f32 r1, r2;"),
-        (with(0x304, &cvt, &[(63, 1)]), "f2f.f32.f32 r1, -r2;"),
-        (with(0x305, &cvt, &[]), "f2i.u32 r1, r2;"),
-        (with(0x305, &cvt, &[(72, 1)]), "f2i r1, r2;"),
-        (with(0x305, &cvt, &[(77, 1)]), "f2i.u32.ntz r1, r2;"),
-        (with(0x305, &cvt, &[(80, 1)]), "f2i.ftz.u32 r1, r2;"),
-        (with(0x305, &cvt, &[(62, 1)]), "f2i.u32 r1, |r2|;"),
-        (with(0x306, &cvt, &[]), "i2f.u32 r1, r2;"),
-        (with(0x306, &cvt, &[(74, 1)]), "i2f r1, r2;"),
-        (with(0x245, &cvt, &[(74, 1)]), "i2fp.f32.s32 r1, r2;"),
-        (with(0x23e, &f2fp, &[]), "f2fp.pack_ab r1, r2, r3;"),
-        (
-            with(0x23e, &f2fp, &[(78, 1)]),
-            "f2fp.pack_ab.merge_c r1, r2, r3, r4;",
-        ),
-        (
-            with(0x23e, &f2fp, &[(78, 1), (72, 1)]),
-            "f2fp.pack_ab.merge_c.h1 r1, r2, r3, r4;",
-        ),
-        (
-            with(0x23e, &f2fp, &[(80, 1)]),
-            "f2fp.pack_ab.rp r1, r2, r3;",
-        ),
-    ];
-    for (word, expected) in cases {
-        assert_eq!(text(word), expected, "{:#x}", word.bits());
+/// Decodes `opcode` with the fields of `base` and each case's extra fields, checking the text.
+fn check_bits(opcode: u128, base: &[(u32, u128)], cases: &[(&[(u32, u128)], &str)]) {
+    for (extra, expected) in cases {
+        let fields: Vec<(u32, u128)> = base.iter().chain(extra.iter()).copied().collect();
+        let word = word(opcode, &fields);
+        assert_eq!(text(word), *expected, "{:#x}", word.bits());
     }
 }
 
+/// Each modifier, flag and mode bit of `FADD`, `FMUL`, `MUFU` and `FSWZADD` set alone in a word
+/// the assembler did not make, against the same word without it.
+#[test]
+fn hand_built_words_pin_each_arithmetic_modifier_bit() {
+    let fadd = [(16, 1), (24, 2), (32, 3)];
+    check_bits(
+        0x221,
+        &fadd,
+        &[
+            (&[], "fadd r1, r2, r3;"),
+            (&[(72, 1)], "fadd r1, -r2, r3;"),
+            (&[(73, 1)], "fadd r1, |r2|, r3;"),
+            (&[(62, 1)], "fadd r1, r2, |r3|;"),
+            (&[(63, 1)], "fadd r1, r2, -r3;"),
+            (&[(77, 1)], "fadd.sat r1, r2, r3;"),
+            (&[(80, 1)], "fadd.ftz r1, r2, r3;"),
+            (&[(64, 7)], "fadd r1, r2, r3;"),
+        ],
+    );
+    let fmul = [(16, 1), (24, 2), (32, 3), (64, 0xff), (84, 4)];
+    check_bits(
+        0x220,
+        &fmul,
+        &[
+            (&[], "fmul r1, r2, r3;"),
+            (&[(76, 1)], "fmul.fmz r1, r2, r3;"),
+            (&[(77, 1)], "fmul.sat r1, r2, r3;"),
+            (&[(80, 1)], "fmul.ftz r1, r2, r3;"),
+            (&[(72, 1)], "fmul r1, -r2, r3;"),
+            (&[(73, 1)], "fmul r1, |r2|, r3;"),
+            (&[(62, 1)], "fmul r1, r2, |r3|;"),
+            (&[(63, 1)], "fmul r1, r2, -r3;"),
+        ],
+    );
+    check_bits(
+        0x308,
+        &[(16, 1), (32, 2)],
+        &[
+            (&[], "mufu.cos r1, r2;"),
+            (&[(73, 1)], "mufu.cos.f16 r1, r2;"),
+            (&[(73, 1), (60, 1)], "mufu.cos.f16 r1, r2.h1;"),
+            (&[(62, 1)], "mufu.cos r1, |r2|;"),
+            (&[(63, 1)], "mufu.cos r1, -r2;"),
+        ],
+    );
+    check_bits(
+        0x822,
+        &[(16, 1), (24, 2), (64, 3)],
+        &[
+            (&[], "fswzadd r1, r2, r3, [add, add, add, add];"),
+            (&[(77, 1)], "fswzadd.ndv r1, r2, r3, [add, add, add, add];"),
+            (&[(80, 1)], "fswzadd.ftz r1, r2, r3, [add, add, add, add];"),
+            (&[(38, 1)], "fswzadd r1, r2, r3, [sub, add, add, add];"),
+            (&[(32, 2)], "fswzadd r1, r2, r3, [add, add, add, subr];"),
+        ],
+    );
+}
+
+/// Each modifier, flag and predicate bit of `FMNMX`, `FSET`, `FSETP` and `FSEL` set alone.
+#[test]
+fn hand_built_words_pin_each_comparison_modifier_bit() {
+    check_bits(
+        0x209,
+        &[(16, 1), (24, 2), (32, 3), (87, 7)],
+        &[
+            (&[], "fmnmx r1, r2, r3, pt;"),
+            (&[(80, 1)], "fmnmx.ftz r1, r2, r3, pt;"),
+            (&[(81, 1)], "fmnmx.nan r1, r2, r3, pt;"),
+            (&[(90, 1)], "fmnmx r1, r2, r3, !pt;"),
+            (&[(72, 1)], "fmnmx r1, -r2, r3, pt;"),
+            (&[(62, 1)], "fmnmx r1, r2, |r3|, pt;"),
+        ],
+    );
+    check_bits(
+        0x20a,
+        &[(16, 1), (24, 2), (32, 3), (76, 2), (87, 7)],
+        &[
+            (&[], "fset.bf.eq.and r1, r2, r3, pt;"),
+            (&[(80, 1)], "fset.bf.eq.ftz.and r1, r2, r3, pt;"),
+            (&[(74, 1)], "fset.bf.eq.or r1, r2, r3, pt;"),
+            (&[(75, 1)], "fset.bf.eq.xor r1, r2, r3, pt;"),
+            (&[(90, 1)], "fset.bf.eq.and r1, r2, r3, !pt;"),
+            (&[(73, 1)], "fset.bf.eq.and r1, |r2|, r3, pt;"),
+        ],
+    );
+    check_bits(
+        0x20b,
+        &[(81, 0), (84, 7), (24, 2), (32, 3), (76, 2), (87, 7)],
+        &[
+            (&[], "fsetp.eq.and p0, pt, r2, r3, pt;"),
+            (&[(80, 1)], "fsetp.eq.ftz.and p0, pt, r2, r3, pt;"),
+            (&[(74, 1)], "fsetp.eq.or p0, pt, r2, r3, pt;"),
+            (&[(75, 1)], "fsetp.eq.xor p0, pt, r2, r3, pt;"),
+            (&[(90, 1)], "fsetp.eq.and p0, pt, r2, r3, !pt;"),
+            (&[(63, 1)], "fsetp.eq.and p0, pt, r2, -r3, pt;"),
+        ],
+    );
+    check_bits(
+        0x208,
+        &[(16, 1), (24, 2), (32, 3), (87, 7)],
+        &[
+            (&[(72, 1)], "fsel r1, -r2, r3, pt;"),
+            (&[(73, 1)], "fsel r1, |r2|, r3, pt;"),
+            (&[(62, 1)], "fsel r1, r2, |r3|, pt;"),
+            (&[(63, 1)], "fsel r1, r2, -r3, pt;"),
+            (&[(90, 1)], "fsel r1, r2, r3, !pt;"),
+        ],
+    );
+}
+
+/// Each modifier and flag bit of the conversions set alone.
+#[test]
+fn hand_built_words_pin_each_conversion_modifier_bit() {
+    let cvt = [(16, 1), (32, 2), (75, 2), (84, 2)];
+    check_bits(
+        0x307,
+        &cvt,
+        &[
+            (&[(80, 1)], "frnd.ftz r1, r2;"),
+            (&[(62, 1)], "frnd r1, |r2|;"),
+        ],
+    );
+    check_bits(
+        0x304,
+        &cvt,
+        &[
+            (&[(80, 1)], "f2f.ftz.f32.f32 r1, r2;"),
+            (&[(63, 1)], "f2f.f32.f32 r1, -r2;"),
+        ],
+    );
+    check_bits(
+        0x305,
+        &cvt,
+        &[
+            (&[], "f2i.u32 r1, r2;"),
+            (&[(72, 1)], "f2i r1, r2;"),
+            (&[(77, 1)], "f2i.u32.ntz r1, r2;"),
+            (&[(80, 1)], "f2i.ftz.u32 r1, r2;"),
+            (&[(62, 1)], "f2i.u32 r1, |r2|;"),
+        ],
+    );
+    check_bits(
+        0x306,
+        &cvt,
+        &[(&[], "i2f.u32 r1, r2;"), (&[(74, 1)], "i2f r1, r2;")],
+    );
+    check_bits(0x245, &cvt, &[(&[(74, 1)], "i2fp.f32.s32 r1, r2;")]);
+    check_bits(
+        0x23e,
+        &[(16, 1), (24, 2), (32, 3), (64, 4)],
+        &[
+            (&[], "f2fp.pack_ab r1, r2, r3;"),
+            (&[(78, 1)], "f2fp.pack_ab.merge_c r1, r2, r3, r4;"),
+            (
+                &[(78, 1), (72, 1)],
+                "f2fp.pack_ab.merge_c.h1 r1, r2, r3, r4;",
+            ),
+            (&[(80, 1)], "f2fp.pack_ab.rp r1, r2, r3;"),
+        ],
+    );
+}
+
 /// Every rounding mode of every instruction that has one, in hand-built words: bits 78..80
-/// (79..81 for `F2FP`) set to 0 to 3.
+/// (79..81 for `F2FP`) set to 0 to 3, printed as a float rounding or, for `FRND` and `F2I`, an
+/// integer rounding.
 #[test]
 fn hand_built_words_pin_every_rounding_mode() {
-    let float_names = ["", ".rm", ".rp", ".rz"];
-    let int_names = ["", ".floor", ".ceil", ".trunc"];
-    for (mode, (float_name, int_name)) in (0..).zip(float_names.into_iter().zip(int_names)) {
+    let suffixes = [
+        ("", ""),
+        (".rm", ".floor"),
+        (".rp", ".ceil"),
+        (".rz", ".trunc"),
+    ];
+    for (mode, (fl, it)) in (0..).zip(suffixes) {
+        let at = |opcode, fields: &[(u32, u128)], start| {
+            let mut fields = fields.to_vec();
+            fields.push((start, mode));
+            text(word(opcode, &fields))
+        };
+        let ops = [(24, 2), (32, 3)];
+        let cvt = [(16, 1), (32, 2), (75, 2), (84, 2)];
         let cases = [
             (
-                word(0x221, &[(16, 1), (24, 2), (32, 3), (78, mode)]),
-                format!("fadd{float_name} r1, r2, r3;"),
+                at(0x221, &[(16, 1), (24, 2), (32, 3)], 78),
+                format!("fadd{fl} r1, r2, r3;"),
             ),
             (
-                word(
-                    0x220,
-                    &[(16, 1), (24, 2), (32, 3), (64, 0xff), (84, 4), (78, mode)],
-                ),
-                format!("fmul{float_name} r1, r2, r3;"),
+                at(0x220, &[(16, 1), ops[0], ops[1], (64, 0xff), (84, 4)], 78),
+                format!("fmul{fl} r1, r2, r3;"),
             ),
             (
-                word(0x223, &[(16, 1), (24, 2), (32, 3), (64, 4), (78, mode)]),
-                format!("ffma{float_name} r1, r2, r3, r4;"),
+                at(0x223, &[(16, 1), ops[0], ops[1], (64, 4)], 78),
+                format!("ffma{fl} r1, r2, r3, r4;"),
             ),
             (
-                word(0x822, &[(16, 1), (24, 2), (64, 3), (78, mode)]),
-                format!("fswzadd{float_name} r1, r2, r3, [add, add, add, add];"),
+                at(0x822, &[(16, 1), (24, 2), (64, 3)], 78),
+                format!("fswzadd{fl} r1, r2, r3, [add, add, add, add];"),
+            ),
+            (at(0x307, &cvt, 78), format!("frnd{it} r1, r2;")),
+            (
+                at(0x304, &[(16, 1), (32, 2), (75, 1), (84, 2)], 78),
+                format!("f2f.f16.f32{fl} r1, r2;"),
             ),
             (
-                word(0x307, &[(16, 1), (32, 2), (75, 2), (84, 2), (78, mode)]),
-                format!("frnd{int_name} r1, r2;"),
+                at(0x305, &[cvt[0], cvt[1], cvt[2], cvt[3], (72, 1)], 78),
+                format!("f2i{it} r1, r2;"),
             ),
             (
-                word(0x304, &[(16, 1), (32, 2), (75, 1), (84, 2), (78, mode)]),
-                format!("f2f.f16.f32{float_name} r1, r2;"),
+                at(0x306, &[cvt[0], cvt[1], cvt[2], cvt[3], (74, 1)], 78),
+                format!("i2f{fl} r1, r2;"),
             ),
             (
-                word(
-                    0x305,
-                    &[(16, 1), (32, 2), (72, 1), (75, 2), (84, 2), (78, mode)],
-                ),
-                format!("f2i{int_name} r1, r2;"),
+                at(0x245, &[cvt[0], cvt[1], cvt[2], cvt[3], (74, 1)], 78),
+                format!("i2fp.f32.s32{fl} r1, r2;"),
             ),
             (
-                word(
-                    0x306,
-                    &[(16, 1), (32, 2), (74, 1), (75, 2), (84, 2), (78, mode)],
-                ),
-                format!("i2f{float_name} r1, r2;"),
-            ),
-            (
-                word(
-                    0x245,
-                    &[(16, 1), (32, 2), (74, 1), (75, 2), (84, 2), (78, mode)],
-                ),
-                format!("i2fp.f32.s32{float_name} r1, r2;"),
-            ),
-            (
-                word(0x23e, &[(16, 1), (24, 2), (32, 3), (64, 0xff), (79, mode)]),
-                format!("f2fp.pack_ab{float_name} r1, r2, r3;"),
+                at(0x23e, &[(16, 1), ops[0], ops[1], (64, 0xff)], 79),
+                format!("f2fp.pack_ab{fl} r1, r2, r3;"),
             ),
         ];
-        for (word, expected) in cases {
-            assert_eq!(text(word), expected, "mode {mode}");
+        for (actual, expected) in cases {
+            assert_eq!(actual, expected, "mode {mode}");
         }
     }
 }
@@ -1025,7 +1105,7 @@ fn mufu_functions_and_refusals() {
 #[test]
 fn combine_operation_3_is_refused() {
     for opcode in [0x20a_u16, 0x80a, 0xa0a, 0x20b, 0x80b, 0xa0b, 0xc0b] {
-        let fixed = if opcode >> 9 == 6 { 1 } else { 0 };
+        let fixed = u128::from(opcode >> 9 == 6);
         let base = |set_op| word(u128::from(opcode), &[(74, set_op), (91, fixed), (87, 7)]);
         assert!(decode(base(2)).is_ok(), "{opcode:#x}");
         assert_eq!(
@@ -1512,7 +1592,7 @@ fn float_enumerations_match_the_references() {
 /// What the forms have no bits for is refused with the exact error, and the neighbouring
 /// encodable value is accepted.
 #[test]
-fn unencodable_float_ops_are_refused() {
+fn unencodable_comparisons_are_refused() {
     let r = Gpr::new;
     let ureg = AluSrc::UniformReg {
         reg: ur(1),
@@ -1559,7 +1639,7 @@ fn unencodable_float_ops_are_refused() {
         })
     );
     assert!(fset(ureg, PredSetOp::And).is_ok());
-    let fsel = |b| {
+    let select = |b| {
         assemble(&Instr::new(Op::FSel(OpFSel {
             dst: r(1),
             srcs: [AluSrc::reg(r(2)), b],
@@ -1567,13 +1647,20 @@ fn unencodable_float_ops_are_refused() {
         })))
     };
     assert_eq!(
-        fsel(ureg),
+        select(ureg),
         Err(EncodeError::NoBits {
             mnemonic: "fsel",
             what: "a uniform-register source"
         })
     );
-    assert!(fsel(imm(1.0)).is_ok());
+    assert!(select(imm(1.0)).is_ok());
+}
+
+/// A high half outside a 16-bit register in the narrow form is refused exactly, and a clear one
+/// leaves an immediate's bit 60 alone.
+#[test]
+fn unencodable_high_halves_are_refused() {
+    let r = Gpr::new;
     let mufu = |src, f16, high| {
         assemble(&Instr::new(Op::MuFu(OpMuFu {
             dst: r(1),
@@ -1616,6 +1703,13 @@ fn unencodable_float_ops_are_refused() {
             })
         );
     }
+}
+
+/// `I2F`'s byte select past its source's width or on an immediate, a modified integer source,
+/// and `F2FP`'s `.h1` without `.merge_c` or an immediate first source are refused exactly.
+#[test]
+fn unencodable_conversions_are_refused() {
+    let r = Gpr::new;
     let i2f = |src, src_type, select| {
         assemble(&Instr::new(Op::I2F(OpI2F {
             dst: r(1),
@@ -1627,20 +1721,20 @@ fn unencodable_float_ops_are_refused() {
             wide: false,
         })))
     };
-    let u8_type = IntType::new(0, false);
-    let u16_type = IntType::new(1, false);
-    assert!(i2f(AluSrc::reg(r(2)), u8_type, 3).is_ok());
+    let byte_type = IntType::new(0, false);
+    let half_type = IntType::new(1, false);
+    assert!(i2f(AluSrc::reg(r(2)), byte_type, 3).is_ok());
     assert_eq!(
-        i2f(AluSrc::reg(r(2)), u8_type, 4),
+        i2f(AluSrc::reg(r(2)), byte_type, 4),
         Err(EncodeError::TooWide {
             what: "byte select",
             value: 4,
             bits: 2
         })
     );
-    assert!(i2f(AluSrc::reg(r(2)), u16_type, 1).is_ok());
+    assert!(i2f(AluSrc::reg(r(2)), half_type, 1).is_ok());
     assert_eq!(
-        i2f(AluSrc::reg(r(2)), u16_type, 2),
+        i2f(AluSrc::reg(r(2)), half_type, 2),
         Err(EncodeError::TooWide {
             what: "byte select",
             value: 2,
@@ -1656,7 +1750,7 @@ fn unencodable_float_ops_are_refused() {
         })
     );
     assert_eq!(
-        i2f(AluSrc::Imm(1), u8_type, 1),
+        i2f(AluSrc::Imm(1), byte_type, 1),
         Err(EncodeError::NoBits {
             mnemonic: "i2f",
             what: "a byte select of an immediate"
@@ -1756,6 +1850,18 @@ fn unconfirmed_text_of_the_float_group() {
             }),
             "fswzadd.ftz.rz.ndv r0, r1, r2, [subr, mov2, add, sub];",
         ),
+    ];
+    for (op, expected) in cases {
+        assert_eq!(round_text(Instr::new(op)), expected);
+    }
+}
+
+/// More of the printer's guesses: the conversions, `F2FP`'s `.merge_c`, `FSEL` and `FSET`'s
+/// always-true comparison.
+#[test]
+fn unconfirmed_text_of_the_float_conversions() {
+    let r = Gpr::new;
+    let cases = [
         (
             Op::FRnd(OpFRnd {
                 dst: r(0),
