@@ -1,9 +1,10 @@
-//! Guest time: the kernel's one conversion from the environment's clock to guest counter ticks.
+//! Guest time: the kernel's one conversion from the environment's clock to guest counter ticks
+//! (and to the guest GPU's timer, below).
 //!
 //! Kernel spec, "Guest time": the kernel owns guest ticks. The environment's clock returns host
 //! nanoseconds ([`HostNanos`]), and the kernel converts a reading with the counter rate of the
 //! process it is for ([`CounterRate::ticks_at`]). Nothing else converts: other crates pass
-//! [`HostNanos`] in and get [`GuestTicks`] out.
+//! [`HostNanos`] in and get [`GuestTicks`] (or the GPU timer's [`GpuTicks`]) out.
 //!
 //! **One rate.** A process's counter runs at [`CounterRate::SWITCH_1`] or
 //! [`CounterRate::SWITCH_2`]. `starquake-core` hands the same rate to the loader's counter
@@ -27,6 +28,31 @@
 //! Divergence from PR #4588, pinned by `ticks_follow_the_process_rate_not_a_rescaled_base`: it
 //! counts at 19.2 MHz and rescales that count for a Switch 2 process (`GetGuestCounterTicks`),
 //! which rounds twice. Here a reading converts once, straight to the process's rate.
+//!
+//! **The GPU's timer.** The timestamp a 16-byte semaphore release writes is guest time too
+//! (gpu-protocol, "Fenced completion"; the owner's ruling of 2026-11-19, "Owner rulings on the
+//! wave 39 to 43 questions", row 29), counted by the guest GPU's timer at [`GPU_TIMER_HZ`]. The
+//! kernel converts that as well ([`gpu_ticks_at`]), with the same arithmetic and from the same
+//! zero as [`CounterRate::ticks_at`], into its own unit, [`GpuTicks`]; `starquake-core` hands
+//! the GPU a clock that reads it. Source: `Common::WallClock::GPUTickFreq`
+//! (`eden-nx2/src/common/cpu_features.h` @ 50fa86bb, "GM20B GPU Tick Frequency = 614.4 MHz"),
+//! the tick Eden-NX2's `GPU::GetTicks` (`eden-nx2/src/video_core/gpu.cpp`) gives the 16-byte
+//! report and release writes (`Maxwell3D::StampQueryResult` in
+//! `eden-nx2/src/video_core/engines/maxwell_3d.cpp`; the `pointer_timestamp` writes in
+//! `eden-nx2/src/video_core/query_cache/query_cache.h`).
+//!
+//! - **Guess**: 614.4 MHz is the Switch 1 GPU's (GM20B) rate. Both Switch 2 references keep it
+//!   unchanged (PR #4588's `eden-pr4588/src/common/cpu_features.h` has the same constant), and
+//!   no source says what the Switch 2 GPU's timer counts at. A trace of two 16-byte releases a
+//!   known guest time apart on hardware would confirm or replace it.
+//! - **Divergence** from Eden-NX2, pinned by `the_gpu_timer_counts_at_the_reference_rate`:
+//!   `GetTicks` divides the tick by `GpuClockMultiplier`, which is 256 under the default
+//!   `gpu_clock` setting, `GpuClock::Boost` (`eden-nx2/src/common/settings.h`, "fast_gpu_time",
+//!   a speed setting); here the timer counts at its full rate, as under `GpuClock::Normal`.
+//!   Eden-NX2's host-specific paths (`MultiplyHigh` with a fixed-point factor, in
+//!   `eden-nx2/src/common/cpu_features.cpp`) may round a reading differently from its generic
+//!   one (`GetUptime() * NsToGPUTickRatio::num / NsToGPUTickRatio::den`, rounded down), which is
+//!   the one followed here.
 
 use core::num::NonZeroU64;
 
@@ -82,9 +108,34 @@ impl CounterRate {
     /// rate it saturates at `u64::MAX` instead of wrapping.
     #[must_use]
     pub fn ticks_at(self, now: HostNanos) -> GuestTicks {
-        let ticks = u128::from(now.0) * u128::from(self.hz()) / u128::from(NANOS_PER_SECOND);
-        GuestTicks(u64::try_from(ticks).unwrap_or(u64::MAX))
+        GuestTicks(ticks_of(now, self.hz()))
     }
+}
+
+/// The rate of the guest GPU's timer, in hertz: 614.4 MHz, the unit of [`GpuTicks`]. See the
+/// module docs, "The GPU's timer", for the source and the guess.
+pub const GPU_TIMER_HZ: u64 = 614_400_000;
+
+/// A reading of the guest GPU's timer: ticks at [`GPU_TIMER_HZ`] since guest time's zero, the
+/// zero of the environment's clock (the zero of [`GuestTicks`] too, in another unit). It is the
+/// timestamp a 16-byte semaphore release writes after its payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GpuTicks(pub u64);
+
+/// The guest GPU's timer at a reading of the environment's clock: `now * GPU_TIMER_HZ / 10^9`,
+/// rounded down, by the arithmetic [`CounterRate::ticks_at`] uses. [`GPU_TIMER_HZ`] is below
+/// [`NANOS_PER_SECOND`], so every reading's quotient fits `u64`.
+#[must_use]
+pub fn gpu_ticks_at(now: HostNanos) -> GpuTicks {
+    GpuTicks(ticks_of(now, GPU_TIMER_HZ))
+}
+
+/// `now * hz / 10^9`, rounded down, formed in `u128` and saturating at `u64::MAX`: the one
+/// conversion from the environment's clock, shared by [`CounterRate::ticks_at`] and
+/// [`gpu_ticks_at`].
+fn ticks_of(now: HostNanos, hz: u64) -> u64 {
+    let ticks = u128::from(now.0) * u128::from(hz) / u128::from(NANOS_PER_SECOND);
+    u64::try_from(ticks).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -178,6 +229,47 @@ mod tests {
             GuestTicks(u64::MAX)
         );
         assert_eq!(double.ticks_at(HostNanos(u64::MAX)), GuestTicks(u64::MAX));
+    }
+
+    #[test]
+    fn the_gpu_timer_counts_at_the_reference_rate() {
+        // cpu_features.h: `GPUTickFreq = 614'400'000`. A second of guest time is that many
+        // ticks, not that many divided by Eden-NX2's default `GpuClock::Boost` multiplier, 256
+        // (module docs, "Divergence").
+        assert_eq!(GPU_TIMER_HZ, 614_400_000);
+        assert_eq!(
+            gpu_ticks_at(HostNanos(NANOS_PER_SECOND)),
+            GpuTicks(614_400_000)
+        );
+        assert_ne!(
+            gpu_ticks_at(HostNanos(NANOS_PER_SECOND)),
+            GpuTicks(614_400_000 / 256)
+        );
+    }
+
+    #[test]
+    fn the_gpu_timer_shares_guest_time_s_zero_and_rounds_down_at_a_tick() {
+        assert_eq!(gpu_ticks_at(HostNanos(0)), GpuTicks(0));
+        // The first reading that is a whole tick: one nanosecond earlier is still tick 0.
+        let first_whole_tick = NANOS_PER_SECOND.div_ceil(GPU_TIMER_HZ);
+        assert_eq!(gpu_ticks_at(HostNanos(first_whole_tick - 1)), GpuTicks(0));
+        assert_eq!(gpu_ticks_at(HostNanos(first_whole_tick)), GpuTicks(1));
+        // 1,000,000,007 ns is 614,400,004.3 ticks (614,400,000 + 7 * 0.6144), worked by hand.
+        assert_eq!(
+            gpu_ticks_at(HostNanos(1_000_000_007)),
+            GpuTicks(614_400_004)
+        );
+    }
+
+    #[test]
+    fn the_gpu_timer_converts_the_largest_reading_without_overflow() {
+        // As `the_largest_reading_converts_without_overflow`, at the GPU timer's rate, which is
+        // below a tick per nanosecond, so the quotient fits without saturating.
+        let seconds = u64::MAX / NANOS_PER_SECOND;
+        let rest = u64::MAX % NANOS_PER_SECOND;
+        let expected = seconds * GPU_TIMER_HZ + rest * GPU_TIMER_HZ / NANOS_PER_SECOND;
+        assert_eq!(gpu_ticks_at(HostNanos(u64::MAX)), GpuTicks(expected));
+        assert!(expected < u64::MAX);
     }
 
     #[test]

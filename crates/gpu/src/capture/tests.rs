@@ -9,6 +9,7 @@ mod golden;
 mod parse;
 mod replay;
 mod seams;
+mod timestamps;
 
 use starquake_memory::{PAGE_SIZE, PageRange};
 use starquake_render::command::Rect;
