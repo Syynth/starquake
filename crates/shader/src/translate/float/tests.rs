@@ -813,18 +813,18 @@ fn a_refusal_names_the_instruction() {
 /// Golden IR for the emulated conversions and the swizzled add.
 #[test]
 fn golden_emulated_conversions() {
-    let f2f_op = OpF2F {
+    let to_half = OpF2F {
         ftz: true,
         ..f2f(r(0), reg(1), RoundMode::Zero)
     };
-    let f2i_op = OpF2I {
+    let to_int = OpF2I {
         ftz: true,
         ..f2i(r(2), reg(3), int(1, true), RoundMode::NegInf)
     };
     let swizzle = fswzadd(r(4), r(5), r(6), FSWZADD_OPERATIONS[0].0);
     for (op, golden) in [
         (
-            Op::F2F(f2f_op),
+            Op::F2F(to_half),
             "block0:\n\
          \x20   %0: u32 = GetRegister r1\n\
          \x20   %1: f32 = BitCastF32U32 %0\n\
@@ -852,7 +852,7 @@ fn golden_emulated_conversions() {
          \x20   return\n",
         ),
         (
-            Op::F2I(f2i_op),
+            Op::F2I(to_int),
             "block0:\n\
          \x20   %0: u32 = GetRegister r3\n\
          \x20   %1: f32 = BitCastF32U32 %0\n\
