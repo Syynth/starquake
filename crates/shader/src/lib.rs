@@ -43,6 +43,7 @@ pub mod capture;
 pub mod decode;
 pub mod driver_constants;
 pub mod exchange;
+pub mod flow;
 #[cfg(test)]
 mod gpu_harness;
 pub mod host;
