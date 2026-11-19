@@ -47,8 +47,11 @@ pub struct BlockSource {
 /// [`IrBlocks::sources`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IrBlocks {
-    /// The function: every block terminated, the test blocks holding their tests and each
-    /// kill's `DemoteToHelperInvocation` (see the module docs).
+    /// The function. As [`FlowGraph::build_ir`] builds it, before [`IrBlocks::structure`]: a
+    /// control-flow graph with every block terminated, the test blocks holding their tests and
+    /// each kill's `DemoteToHelperInvocation` (see the module docs). After it, in
+    /// [`StructuredBlocks::blocks`](crate::structure::StructuredBlocks::blocks): the same blocks
+    /// and some new ones, structured, with no terminators ([`Terminator::None`]).
     pub function: Function,
     /// For each flow block in order, the IR block that holds its instructions: block `n` for
     /// flow block `n`. Test blocks hold no instructions of the program and are not listed.
