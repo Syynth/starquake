@@ -8,16 +8,21 @@
 //! submission's entries one by one, runs it, and when a submission's entries are all read, marks
 //! the end of the submission (the pusher keeps a method still owed words for the next one),
 //! pushes a `WaitForIdle` if the submission asked for one and has increments, and then its
-//! increments as `Syncpoint` entries for the channel's syncpoint (row 32; the spec, "Channels and
-//! submissions"). It stops when the queue is empty, the channel waits on something
-//! ([`Wait`]), or the quantum is used.
+//! increments as one `Syncpoint` entry for the channel's syncpoint that carries their count (row
+//! 32; the spec, "Channels and submissions"; decided by the owner, 2026-11-19). It stops when
+//! the queue is empty, the channel waits on something ([`Wait`]), or the quantum is used.
 //!
 //! - **The quantum** counts every command word the pusher executes
-//!   ([`crate::channel::Channel::words_read`]) and every increment pushed. A submission's
-//!   increments are a guest-chosen count (gsv passes up to `u32::MAX`), so they are pushed a
-//!   quantum at a time like words, and a channel with millions of them does not hold the others
-//!   back; the time they take in all still grows with the count (an owner question: a
-//!   `Syncpoint` entry with a count would make it constant).
+//!   ([`crate::channel::Channel::words_read`]) and one for the `Syncpoint` entry, whatever its
+//!   count. A submission's increments are a guest-chosen count (gsv passes up to `u32::MAX`);
+//!   one entry with the count keeps the front's cost the same for every count
+//!   (`u32_max_increments_go_out_as_one_entry_in_one_turn`). The entry is charged one unit like
+//!   a word, so a quantum used up by words leaves it for the channel's next turn
+//!   (`a_submission_that_uses_its_quantum_sends_its_increments_next_turn`), and it takes the
+//!   last unit of a quantum from the next submission
+//!   (`the_increments_entry_costs_one_unit_of_the_quantum`). A submission with no increments
+//!   sends no entry (`wait_for_idle_comes_before_the_increments_and_only_with_them`).
+//!   [`super::FrontCounters::increments`] counts the increments, not the entries.
 //! - **`WaitForIdle` comes only with increments, and only when the submission asks for it.**
 //!   Eden-NX2 pushes the wait for idle inside its increment command lists only
 //!   (`SubmitGPFIFOImpl`, `BuildIncrementWithWfiCommandList` and
@@ -136,7 +141,7 @@ struct Active {
     ended: bool,
     /// Whether a `WaitForIdle` is still to be pushed.
     wfi: bool,
-    /// Increments still to push.
+    /// Increments still to push, as one `Syncpoint` entry.
     increments: u32,
 }
 
@@ -472,16 +477,18 @@ impl Lane {
             active.wfi = false;
             cx.ring.send(RingEntry::WaitForIdle { channel });
         }
-        while active.increments > 0 {
+        if active.increments > 0 {
             if *budget == 0 {
                 return Ok(Step::Stop);
             }
+            let count = active.increments;
             cx.ring.send(RingEntry::Syncpoint {
                 id: self.config.syncpoint,
+                count,
             });
-            active.increments -= 1;
+            active.increments = 0;
             *budget -= 1;
-            cx.counters.increments = cx.counters.increments.saturating_add(1);
+            cx.counters.increments = cx.counters.increments.saturating_add(u64::from(count));
         }
         self.finished = active.seq;
         self.active = None;

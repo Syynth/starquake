@@ -1833,7 +1833,11 @@ fn deferred_instances_are_drawn_before_each_boundary() {
     let inline_word = write(cla140::CLASS, &cla140::LINE_COUNT, &[], 1);
     let boundaries: [(&str, String, String); 4] = [
         ("marker", String::new(), "marker token=0x7\n".to_owned()),
-        ("syncpoint", String::new(), "syncpoint id=5\n".to_owned()),
+        (
+            "syncpoint",
+            String::new(),
+            "syncpoint id=5 count=1\n".to_owned(),
+        ),
         ("dma", setup, launch),
         ("inline", String::new(), inline_word),
     ];
@@ -1865,7 +1869,11 @@ fn a_failed_deferred_draw_does_not_stop_the_entry_after_it() {
         format!("release channel=3 address={SEM:#x} payload=0x1 size=4 timestamp=no op=write\n");
     let (setup, launch) = dma_setup_and_launch(0x5);
     let entries: [(&str, String, String); 5] = [
-        ("syncpoint", String::new(), "syncpoint id=5\n".to_owned()),
+        (
+            "syncpoint",
+            String::new(),
+            "syncpoint id=5 count=1\n".to_owned(),
+        ),
         ("marker", String::new(), "marker token=0x7\n".to_owned()),
         ("release", String::new(), release),
         (

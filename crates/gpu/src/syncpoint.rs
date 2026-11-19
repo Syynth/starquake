@@ -176,7 +176,7 @@ const LOW_HALF: u64 = u32::MAX as u64;
 const WRAP: u64 = 1 << u32::BITS;
 
 /// The sign bit of a 32-bit difference (PR `IsSyncpointWaitSatisfied`'s `0x80000000U`).
-const SIGN_BIT: u32 = 1 << (u32::BITS - 1);
+pub(crate) const SIGN_BIT: u32 = 1 << (u32::BITS - 1);
 
 /// First bytes of every syncpoint snapshot.
 pub const SNAPSHOT_MAGIC: [u8; 4] = *b"SQSP";

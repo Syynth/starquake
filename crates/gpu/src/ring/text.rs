@@ -7,7 +7,7 @@
 //! run channel=1 class=0xc797 method=0x8e3 words=0x1,0x2
 //! release channel=1 address=0x1000 payload=0x5 size=4 timestamp=no op=write
 //! release channel=1 address=0x1000 payload=0x1 size=8 timestamp=yes op=add.unsigned
-//! syncpoint id=5
+//! syncpoint id=5 count=3
 //! wait-for-idle channel=1
 //! invalidate channel=1 what=l2-flush-dirty
 //! marker token=0x7
@@ -17,7 +17,7 @@
 //! ```
 //!
 //! [`RingEntry`]'s `Display` writes this form, with addresses, classes, methods, values, payloads,
-//! tokens and run words in hexadecimal and the rest in decimal; [`parse_entry`] reads it back and
+//! tokens and run words in hexadecimal and the rest (a syncpoint's count among them) in decimal; [`parse_entry`] reads it back and
 //! accepts every number in either base (`0x` marks hexadecimal). A run with no words is
 //! `words=`, and a run of more than [`MAX_RUN_WORDS`] words is an error
 //! ([`ParseError::RunTooLong`]), as it is for [`super::encode()`]. Blank lines are skipped by [`parse_text`].
@@ -225,7 +225,7 @@ impl fmt::Display for RingEntry<'_> {
                     ),
                 }
             }
-            Self::Syncpoint { id } => write!(f, " id={}", id.get()),
+            Self::Syncpoint { id, count } => write!(f, " id={} count={count}", id.get()),
             Self::WaitForIdle { channel } => write!(f, " channel={}", channel.0),
             Self::Invalidate { channel, what } => write!(
                 f,
@@ -483,7 +483,10 @@ pub fn parse_entry(line: &str) -> Result<RingEntry<'static>, ParseError> {
                 key: "id",
                 value: u64::from(value),
             })?;
-            RingEntry::Syncpoint { id }
+            RingEntry::Syncpoint {
+                id,
+                count: fields.number("count")?,
+            }
         }
         Kind::WaitForIdle => RingEntry::WaitForIdle {
             channel: ChannelId(fields.number("channel")?),

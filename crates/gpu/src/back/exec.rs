@@ -813,9 +813,12 @@ impl Executor {
                 });
                 self.then_deferred(own, deferred)
             }
-            RingEntry::Syncpoint { id } => {
+            RingEntry::Syncpoint { id, count } => {
                 let deferred = self.flush_deferred(None);
-                let own = self.attach(FencedAction::Increment(*id));
+                let own = self.attach(FencedAction::Increment {
+                    id: *id,
+                    count: *count,
+                });
                 self.then_deferred(own, deferred)
             }
             RingEntry::Marker { token } => {

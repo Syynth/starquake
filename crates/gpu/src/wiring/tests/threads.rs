@@ -10,8 +10,8 @@ use crate::channel::ChannelError;
 use crate::interface::CHANNEL_QUEUE_ENTRIES;
 use crate::memory::GpuFault;
 
-/// The homebrew-style stream of the end-to-end test: a release, two increments after it, a
-/// present and a barrier, each waited for before the next call so the flight recorder's text is
+/// The homebrew-style stream of the end-to-end test: a release, two increments after it (one
+/// `Syncpoint` entry with a count of 2), a present and a barrier, each waited for before the next call so the flight recorder's text is
 /// in one order.
 fn run_the_synthetic_stream(r: &Rig) -> ChannelId {
     r.syncpoints.watch(syncpoint());
@@ -42,13 +42,10 @@ fn a_synthetic_stream_produces_its_command_lists_and_completions_in_order() {
     let r = rig();
     run_the_synthetic_stream(&r);
     assert_eq!(r.word(SEM), 0x77);
+    // The two increments are one addition with one push of the final value.
     assert_eq!(
         r.pushed.all(),
         [
-            GpuCompletion::SyncpointChanged {
-                id: syncpoint(),
-                value: 1
-            },
             GpuCompletion::SyncpointChanged {
                 id: syncpoint(),
                 value: 2
@@ -79,20 +76,19 @@ fn gpu_txt_holds_the_runs_events_and_the_counters_count_it() {
     assert_eq!(counters.presents, 1);
     assert_eq!(counters.ordered, 1);
     assert_eq!(counters.entries_refused, 0);
-    // The release and both increments, and the barrier's marker.
-    assert_eq!(counters.fenced_actions, 4);
+    // The release, one action for both increments, and the barrier's marker.
+    assert_eq!(counters.fenced_actions, 3);
     assert_eq!(counters.lists_submitted, 1);
     let expected = format!(
         "0 address space {space} made\n\
          1 channel {channel} made in address space {space}, incrementing syncpoint {SYNCPOINT}\n\
          2 submission on channel {channel}: 1 entries, 2 increments: queued\n\
          3 performed 1 releases, 0 increments, 0 markers, no waiter latched\n\
-         4 performed 0 releases, 1 increments, 0 markers, no waiter latched\n\
-         5 performed 0 releases, 1 increments, 0 markers, no waiter latched\n\
-         6 {present}\n\
-         7 barrier, ticket 9\n\
-         8 pushed: ticket 9 done\n\
-         9 performed 0 releases, 0 increments, 1 markers, no waiter latched\n",
+         4 performed 0 releases, 2 increments, 0 markers, no waiter latched\n\
+         5 {present}\n\
+         6 barrier, ticket 9\n\
+         7 pushed: ticket 9 done\n\
+         8 performed 0 releases, 0 increments, 1 markers, no waiter latched\n",
         space = SPACE.0,
         channel = channel.0,
         present = RingEntry::Present(present_request()),
