@@ -525,6 +525,7 @@ fn graphics_info(topology: Topology, vertex: Vec<VertexStep>, extra: &[EntryInfo
         layout: LayoutInfo {
             groups: vec![group],
         },
+        flipped_viewport: false,
     }))
 }
 
@@ -1697,5 +1698,120 @@ fn dispatches_are_checked_and_close_the_pass() {
             resource: "indirect buffer",
             usage: "indirect"
         })
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Flipped viewports (`draw` module docs, "Flipped viewports").
+
+/// The world's graphics pipeline again, made with `EmulationFlags::FLIPPED_VIEWPORT`.
+fn flipped_pipeline(w: &mut World) -> PipelineId {
+    let eight = vec![VertexStep {
+        stride: 8,
+        last_stride: 8,
+        instance: false,
+    }];
+    let mut info = graphics_info(Topology::Triangles, eight, &[]);
+    if let PipelineInfo::Graphics(graphics) = &mut info {
+        graphics.flipped_viewport = true;
+    }
+    add_pipeline(&mut w.pipelines, info)
+}
+
+/// A viewport at `(x, y)` of `width` by `height`, with depths `near` and `far`.
+fn viewport(x: f32, y: f32, width: f32, height: f32, near: f32, far: f32) -> Viewport {
+    Viewport {
+        x,
+        y,
+        width,
+        height,
+        min_depth: near,
+        max_depth: far,
+    }
+}
+
+/// The step's viewport, or the refusal, of a draw with `pipeline` and `guest` as its first
+/// viewport.
+fn set_viewport(w: &World, pipeline: PipelineId, guest: Viewport) -> Result<Viewport, RenderError> {
+    let mut d = w.draw();
+    d.pipeline = pipeline;
+    d.dynamic.viewports = vec![guest];
+    let checked = w.check(vec![targets(w.target), Command::Draw(d)])?;
+    let steps: Vec<Viewport> = checked
+        .steps
+        .into_iter()
+        .filter_map(|s| match s {
+            Step::Draw(d) => Some(d.viewport),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(steps.len(), 1);
+    Ok(steps[0])
+}
+
+/// Each viewport sign and depth order, for a pipeline with the flag and one without: with it the
+/// step's viewport is the positive host one (the same rows, the depths in order), without it
+/// a flip is refused; what wgpu cannot set even after the flip is refused either way.
+#[test]
+fn a_flipped_viewport_is_set_positive_only_for_a_flipped_pipeline() {
+    let mut w = world();
+    let flipped = flipped_pipeline(&mut w);
+    let plain = w.graphics;
+    let refused = || Err(RenderError::Unsupported(VIEWPORT));
+    // (guest, the host viewport a flipped pipeline gets)
+    let accepted = [
+        (
+            viewport(0.0, 0.0, 8.0, 8.0, 0.0, 1.0),
+            viewport(0.0, 0.0, 8.0, 8.0, 0.0, 1.0),
+        ),
+        (
+            viewport(0.0, 8.0, 8.0, -8.0, 0.0, 1.0),
+            viewport(0.0, 0.0, 8.0, 8.0, 0.0, 1.0),
+        ),
+        (
+            viewport(1.0, 2.0, 4.0, 6.0, 0.75, 0.25),
+            viewport(1.0, 2.0, 4.0, 6.0, 0.25, 0.75),
+        ),
+        (
+            viewport(1.0, 7.0, 4.0, -6.0, 1.0, 0.0),
+            viewport(1.0, 1.0, 4.0, 6.0, 0.0, 1.0),
+        ),
+    ];
+    for (guest, host) in accepted {
+        assert_eq!(set_viewport(&w, flipped, guest), Ok(host), "{guest:?}");
+        let upright = guest == host;
+        let expected = if upright { Ok(guest) } else { refused() };
+        assert_eq!(set_viewport(&w, plain, guest), expected, "{guest:?}");
+    }
+    // Still refused with the flag: a negative width, a depth outside 0..=1 (the GPU crate
+    // clamps before this), and an extent that overflows to infinity.
+    for guest in [
+        viewport(8.0, 0.0, -8.0, 8.0, 0.0, 1.0),
+        viewport(0.0, 8.0, 8.0, -8.0, 0.0, 1.5),
+        viewport(0.0, 8.0, 8.0, -8.0, 1.0, -0.5),
+        viewport(0.0, -f32::MAX, 8.0, -f32::MAX, 0.0, 1.0),
+    ] {
+        assert_eq!(set_viewport(&w, flipped, guest), refused(), "{guest:?}");
+    }
+}
+
+/// The position bound applies to the flipped viewport: the host top `y + height` exactly at
+/// wgpu's `-2 * max_texture_dimension_2d` is set, half a pixel past it is refused, while the
+/// guest's own `y` is inside the bound in both.
+#[test]
+fn a_flipped_viewport_meets_the_position_bound_after_the_flip() {
+    let mut w = world();
+    let flipped = flipped_pipeline(&mut w);
+    let max = draw_limits(&test_caps()).max_texture_dimension_2d;
+    let range = f32::from(u16::try_from(max).expect("a small test limit")) * 2.0;
+    let at = viewport(0.0, -range + 8.0, 8.0, -8.0, 0.0, 1.0);
+    assert_eq!(
+        set_viewport(&w, flipped, at),
+        Ok(viewport(0.0, -range, 8.0, 8.0, 0.0, 1.0))
+    );
+    let past = viewport(0.0, -range + 7.5, 8.0, -8.0, 0.0, 1.0);
+    assert_eq!(
+        set_viewport(&w, flipped, past),
+        Err(RenderError::Unsupported(VIEWPORT))
     );
 }
