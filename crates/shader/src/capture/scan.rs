@@ -31,8 +31,8 @@ pub(crate) struct Scan {
     main_exited: bool,
 }
 
-/// The size of one instruction in bytes, as a signed number for target arithmetic.
-const INSTRUCTION_BYTES: i64 = 16;
+/// [`Instruction::SIZE`] as a signed number for target arithmetic.
+const INSTRUCTION_BYTES: i64 = Instruction::SIZE as i64;
 
 /// The instruction index a branch at `index` with byte displacement `displacement` reaches, or
 /// why it reaches none (`Observe`: `target = index * 16 + 16 + relative`, refused when
