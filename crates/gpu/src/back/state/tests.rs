@@ -990,6 +990,28 @@ fn stream_attribute_and_binding_accessors_are_bounded_at_their_exact_edge() {
         group.constant_buffer(CONSTANT_BUFFER_SLOTS).unwrap_err(),
         error
     );
+    // Past the last slot of a group that is not the last: the slot one past the end must not
+    // read the next group's slot 0, which holds a valid binding here.
+    put(
+        &mut mirror,
+        &BIND_GROUP_CONSTANT_BUFFER,
+        &[1],
+        bind_word(true, 0),
+    );
+    let view = mirror.three_d().unwrap();
+    assert!(
+        view.bind_group(1)
+            .unwrap()
+            .constant_buffer(0)
+            .unwrap()
+            .valid
+    );
+    let group = view.bind_group(0).unwrap();
+    assert!(!group.constant_buffer(last_slot).unwrap().valid);
+    assert_eq!(
+        group.constant_buffer(CONSTANT_BUFFER_SLOTS).unwrap_err(),
+        error
+    );
     let error = index_error(arrays::BIND_GROUP, BIND_GROUPS, BIND_GROUPS);
     assert_eq!(view.bind_group(BIND_GROUPS).unwrap_err(), error);
 }

@@ -243,6 +243,9 @@ impl Mirror {
         let Some(&last) = words.last() else {
             return Ok(());
         };
+        // Only a 3D mirror has bindings. The emptiness test is a shortcut, not a rule: without
+        // it, `bind` on another class finds no entry and changes nothing (an equivalent
+        // mutation, left unpinned).
         if !self.bindings.is_empty()
             && let Some(group) = BIND_SPAN.numbers().position(|number| number == method)
         {
