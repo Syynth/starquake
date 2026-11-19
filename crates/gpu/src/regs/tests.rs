@@ -368,14 +368,23 @@ fn replay_data_loads_take_the_written_words_and_state_takes_the_shadow_value() {
 #[test]
 fn replay_triggers_that_are_not_data_loads_take_the_shadow_value() {
     // Only the data loads are excepted: another trigger replays the shadow value, as
-    // Eden-NX2's `CallMethod` does for every method it reaches.
-    let mut file = shadowed(&[trigger()], REPLAY);
-    assert!(!file.is_state(trigger()));
-    assert_eq!(
-        send_run(&mut file, trigger(), &WORDS),
-        [run(trigger(), &[SHADOW_VALUE; 2])]
-    );
-    assert_eq!(file.get(trigger()), Some(SHADOW_VALUE));
+    // Eden-NX2's `CallMethod` does for every method it reaches, the inline index methods
+    // among them (its `CallMultiMethod` falls through to `CallMethod` for them in replay).
+    for method in [
+        trigger(),
+        clc797::DRAW_INLINE_INDEX.method(),
+        clc797::DRAW_INLINE_INDEX2X16.method(),
+        clc797::DRAW_INLINE_INDEX4X8.method(),
+    ] {
+        let mut file = shadowed(&[method], REPLAY);
+        assert!(!file.is_state(method), "{method:#x}");
+        assert_eq!(
+            send_run(&mut file, method, &WORDS),
+            [run(method, &[SHADOW_VALUE; 2])],
+            "{method:#x}"
+        );
+        assert_eq!(file.get(method), Some(SHADOW_VALUE), "{method:#x}");
+    }
 }
 
 #[test]
@@ -618,7 +627,7 @@ fn bind_pointer_advances_and_wraps() {
 
 #[test]
 fn instruction_upload_leaves_its_pointer_alone() {
-    // The spec's "macro upload pointer" stays in the macro host (module docs, "Divergences").
+    // The spec's "macro upload pointer" stays in the macro host (module docs, step 2).
     let ram = clc797::LOAD_MME_INSTRUCTION_RAM.method();
     let pointer = clc797::LOAD_MME_INSTRUCTION_RAM_POINTER.method();
     let mut file = three_d();

@@ -52,7 +52,8 @@ pub enum ShadowMode {
     TrackWithFilter,
     /// `METHOD_PASSTHROUGH`: the shadow file is left alone.
     Passthrough,
-    /// `METHOD_REPLAY`: the value written is the shadow file's, not the word sent.
+    /// `METHOD_REPLAY`: the value written is the shadow file's, not the word sent, except for
+    /// the class's data-load methods ([`ClassRules::data_loads`]), which take the word sent.
     Replay,
 }
 
