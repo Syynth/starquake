@@ -157,7 +157,11 @@ reach; this crate only performs them.
   for the channel's syncpoint that carries the count, so the back performs them after the host
   GPU has finished the submission's work. gsv passes a guest-chosen count (up to `u32::MAX`);
   one entry with a count keeps the front's cost the same whatever the count, where one entry per
-  increment would cost time linear in it (decided by the owner, 2026-11-19).
+  increment would cost time linear in it (decided by the owner, 2026-11-19). The back performs
+  the entry with `Syncpoints::increment_by`, which adds a count of 2^31 or more in steps of at
+  most 2^31 - 1, pushing one `SyncpointChanged` per step to a watched counter: gsv's completion
+  queue folds a change into a queued one of the same id by the 32-bit wrapping comparison, which
+  would read a value 2^31 or more ahead as behind and drop it (decided by the owner, 2026-11-19).
 - **A full queue.** A channel's queue holds at most 65,536 GP entries (decided by the owner,
   graphics-server decision 12; "Back-pressure" below). When a submission does not fit, `submit`
   returns `Submitted::Full` and queues nothing; gsv defers the guest's reply, and the front
@@ -554,6 +558,19 @@ clear is masked or scissored in a way a render-pass clear cannot express, as Ede
 `DrawManager::Clear` decides (`eden-nx2/src/video_core/engines/draw_manager.cpp`). Slice G24
 owns it (decided by the owner, 2026-11-19).
 
+Masked clears are the render backend's (decided by the owner, 2026-11-19). `ClearDesc` carries the
+colour channels and stencil bits a clear writes (render-backend, "Commands"), so a masked clear is
+a `Command::Clear` with its masks, and the backend draws a clear its host API cannot perform as one
+(a partial write mask, or a rectangle over a view it clears only whole). The GPU crate draws no
+clears of its own and no longer parses the render crate's `clear.wgsl` with naga. Two choices stay
+as G24 built them:
+
+- `SET_SURFACE_CLIP` is not read, so a clear is bounded by the render area and the scissor only,
+  where Eden-NX2 also bounds it by the surface clip: a listed divergence.
+- An integer target's clear value is `SET_COLOR_CLEAR_VALUE` converted by Eden's float formula;
+  Mesa suggests the registers hold the raw integer bits. A **guess** until a trace of a title
+  clearing an integer target settles it.
+
 Conditional rendering (`SET_RENDER_ENABLE_*`) is evaluated here from the
 query value in guest memory, after a catch-up when that value is still pending.
 
@@ -612,7 +629,11 @@ a listed divergence pinned by a test, until a trace settles it ("What to verify"
   guest memory at the constant buffer's address plus the upload offset, as Eden's
   `ProcessCBMultiData` does (`eden-nx2/src/video_core/engines/maxwell_3d.cpp`), and invalidates
   the range in the caches like an inline write. Slice G25 owns it (decided by the owner,
-  2026-11-19).
+  2026-11-19). A run that passes the constant buffer's size (`SET_CONSTANT_BUFFER_SELECTOR_A`'s
+  `SIZE`) writes its words that end within the size and refuses the rest, reporting the first
+  refused word (decided by the owner, 2026-11-19). Eden-NX2 checks only the run's start offset,
+  with an `ASSERT` that logs, and writes every word; refusing the words past the size is a listed
+  divergence, closer to Eden-NX2 than refusing the whole run.
 - **2D (`902D`).** Surface-to-surface blits with scaling and filtering become host blit commands
   when the caches hold either surface, and CPU copies through the layout crate otherwise. Eden's
   software blitter cost 3.6% of the GPU thread on small mip copies (row 137), so the host path is
@@ -663,6 +684,17 @@ safety-net recheck that finds `completed()` moved is logged as a warning and cou
 wake.
 
 Release writes happen on the back thread only, so their order is the ring's order.
+
+**Report semaphores** (decided by the owner, 2026-11-19). A 3D or compute
+`SET_REPORT_SEMAPHORE` release that reports no counter (operation `RELEASE`, report `NONE`) is an
+ordinary fenced release of its payload: 4 bytes, or 16 with the timestamp for the four-word
+structure (row 52's two shapes), attached after the work before it like a `Release` ring entry,
+as Eden-NX2 writes it (`Maxwell3D::ProcessQueryGet`, the `QueryType::Payload` case of
+`QueryCacheBase::CounterReport`). The native SDK ends its first queue flush with such a release
+and spins on the word, so a title cannot get past that flush without it (PR #451, which builds
+the 3D half). A counter report (occlusion counts, primitive counts and the like) writes nothing
+until a title needs one; then it writes Eden-NX2's stand-in of 1, as a listed divergence; host
+queries through the fenced completion path come after that ("Deferred, not ruled out").
 
 ## GPU memory access and cache coherence
 
@@ -939,6 +971,7 @@ pub struct Syncpoints { /* [AtomicU32; 192], max values, watched bitmap */ }
 impl Syncpoints {
     pub fn read(&self, id: SyncpointId) -> u32;
     pub fn increment(&self, id: SyncpointId) -> u32;   // pushes SyncpointChanged if watched
+    pub fn increment_by(&self, id: SyncpointId, count: u32) -> u32; // in steps of at most 2^31 - 1
     pub fn reached(&self, fence: Fence) -> bool;       // 32-bit wrapping comparison
 }
 
@@ -997,7 +1030,9 @@ on an acquire that only the acquire poll can find met, `is_idle` waits up to `ID
 core's idle lock, and answers busy if the host has not run the front thread by then. When the
 GPU answers busy, the parked core asks again when the GPU next reports quiet, up to a named
 retry count, so a question that lands in a busy moment is asked again and a stalled run is
-reported as a stall rather than reaching its timeout.
+reported as a stall rather than reaching its timeout. The count is `GPU_QUIET_RETRIES` = 8, a
+**guess**, and it bounds the questions of one park, not of one stall (as built; decided by the
+owner, 2026-11-19).
 
 What this spec assumes of gsv:
 
@@ -1128,7 +1163,7 @@ same time.
 | G16 | Buffer cache: guest range to host buffer, write-watch integration (dirty drain also calls the shader cache's `invalidate`), streamed ranges, eviction by budget | G7, #14's resource types | `eden/src/video_core/buffer_cache` (reference only); rows 120, 131, 139 | Fake memory, fake watch, recording backend: CPU write re-uploads once; an ordered unmap drops the range | C |
 | G17 | Texture cache: texture header decode, image identity by address and layout, uploads through G5, render targets, write-back on demand, swizzle in the view or in the variant key by `Caps::view_swizzle` | G5, G7, G10, #14's resource types | `eden/src/video_core/texture_cache` (reference only); rows 69, 87, 103 | Recording backend: same header twice is one image; CPU write invalidates; write-back matches G5 untile; a swizzled texture under a no-swizzle `Caps` gets an identity view | C |
 | G18 | `gpu::back::draw`: derive `DrawDesc` from 3D state; shader lookups (`ProgramMemory`, `EngineState`, `VariantKey` with `EmulationFlags` and swizzles copied in, driver constants, the wait-while-compiling setting); bindings; conditional render | G10, G16, G17, G23, #13's `lookup` types | `eden-nx2/src/video_core/engines/{maxwell_3d,draw_manager}.cpp` (reference) | Register scripts to golden draw descriptions (`insta`), with a fake shader cache returning fixed sets, pending tickets and rejections; every `EmulationFlags` field reaches the key | D |
-| G24 | `gpu::back` clears: `CLEAR_SURFACE` to `Command::Clear` of the bound targets (a render-pass clear), or a draw for a masked or scissored clear (decided by the owner, 2026-11-19) | G10, G17, G18, #14's `Clear` | `eden-nx2/src/video_core/engines/draw_manager.cpp` (`DrawManager::Clear`) | Register scripts to golden command lists (`insta`): a whole-target clear of colour, depth and stencil each, and a masked and a scissored clear that become draws | E |
+| G24 | `gpu::back` clears: `CLEAR_SURFACE` to `Command::Clear` of the bound targets (a render-pass clear), or a draw for a masked or scissored clear (decided by the owner, 2026-11-19). Masked clears then move to the render backend: a `Command::Clear` with its write masks ("Clears"; decided by the owner, 2026-11-19) | G10, G17, G18, #14's `Clear` | `eden-nx2/src/video_core/engines/draw_manager.cpp` (`DrawManager::Clear`) | Register scripts to golden command lists (`insta`): a whole-target clear of colour, depth and stencil each, and a masked and a scissored clear that become draws | E |
 | G19 | `gpu::back` executor: ring entries to engines, compute dispatch emission, present as `Command::Present` (no fence wait); the issuing channel on `Release` entries and on copy and QMD releases, with G4's ring (decided 2026-11-18) | G10, G11, G12, G15, G18 | none (new) | Ring text in, command list text out (`insta`) | E |
 | G25 | `LOAD_CONSTANT_BUFFER` data written to guest memory at the constant buffer's address plus the upload offset, with the range invalidated in the caches (decided by the owner, 2026-11-19) | G16, G19 | `eden-nx2/src/video_core/engines/maxwell_3d.cpp` (`ProcessCBMultiData`) | Fake memory: a run of words lands at the upload offset and advances it; a run split across ring entries lands in order; a cached buffer over the range is uploaded again | F |
 | G20 | Capture writer and reader (`SQGC`, including shader lookups with their answers in shader-pipeline slice 20's format), replay memory, `starquake gpu-replay` command, capture builder in `test-support` | G14, G19, shader-pipeline slice 20 | none (new) | Golden bytes for every record kind; a built capture replays to its expected outputs; a tampered read is reported as a divergence | F |
@@ -1353,9 +1388,10 @@ are in `docs/decision-log.md` (2026-11-12).
   `B197` table and its engine rules are additive (decision 7).
 - **Reading back GPU-written images on CPU reads** (decision 4, option c), through read traps on
   the write-tracking machinery.
-- **Queries** (occlusion counts, timestamps, pipeline statistics): report semaphores
-  (`SET_REPORT_SEMAPHORE_A`–`D`) first write the values the front can know (payloads, a
-  timestamp from guest time); host queries plug into the fenced completion path later.
+- **Counter queries** (occlusion counts, primitive counts, pipeline statistics). The report
+  semaphore's payload-only release is no longer deferred ("Releases and completion"); a counter
+  report writes nothing until a title needs one, then Eden-NX2's stand-in of 1, and host queries
+  plug into the fenced completion path after that (decided by the owner, 2026-11-19).
 - **Mesh and task programs** (rows 89, 97): they are bound through the ordinary program slots,
   so `DrawDesc` already carries them; the shader pipeline and render backend decide how to run
   them.
