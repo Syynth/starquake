@@ -1176,3 +1176,58 @@ fn eviction_destroys_after_the_last_list_that_used_the_entry() {
     assert_eq!(frames_then_one(&mut rig, EVICT_AFTER_FRAMES), 1);
     line_index(&rig.log(), &destroy_line(slice.buffer, used.get()));
 }
+
+#[test]
+fn a_new_cache_holds_nothing() {
+    let mut rig = Rig::new();
+    assert_eq!(rig.cache.bytes(), 0);
+    assert_eq!(rig.cache.len(), 0);
+    assert!(rig.cache.is_empty());
+    assert_eq!(rig.cache.entries().count(), 0);
+    assert!(rig.cache.entry(page(0)).is_none());
+    assert_eq!(rig.cache.end_frame(), 0);
+    assert_eq!(rig.sync(), []);
+    assert!(rig.log().is_empty());
+}
+
+#[test]
+fn turning_streamed_forgets_the_watches_it_waited_for() {
+    let mut rig = Rig::new();
+    rig.bind(page(0), 4 * PAGE_SIZE);
+    rig.enter();
+    rig.bind(page(0), 1);
+    for _ in 2..STREAMED_AFTER_FAULTS {
+        rig.cpu_write(page(0), &[1]);
+        rig.sync();
+        rig.enter();
+        rig.bind(page(0), 1);
+    }
+    // Page 1 is written and watched again, and that watch is not armed yet...
+    assert_eq!(rig.cpu_write(page(1), &[1]), 1);
+    rig.sync();
+    let entry = rig.entry(page(0));
+    assert_eq!(
+        (entry.faults, entry.streamed, entry.unarmed_bytes),
+        (STREAMED_AFTER_FAULTS - 1, false, PAGE_SIZE)
+    );
+    // ...when a write to page 2 reaches the threshold.
+    assert_eq!(rig.cpu_write(page(2), &[2]), 1);
+    rig.sync();
+    let entry = rig.entry(page(0));
+    assert_eq!((entry.streamed, entry.unarmed_bytes), (true, 0));
+}
+
+#[test]
+fn dropping_the_cache_destroys_a_buffer_its_open_list_had_dropped() {
+    let mut rig = Rig::new();
+    rig.bind(page(0), PAGE_SIZE);
+    let fence = rig.submit();
+    let doomed = rig.bind(page(8), PAGE_SIZE);
+    rig.cache
+        .apply_update(&VmUpdate::Unmap { range: pages(8, 1) });
+    let backend = Arc::clone(&rig.backend);
+    drop(rig);
+    let log: Vec<String> = backend.snapshot().lines().map(str::to_owned).collect();
+    line_index(&log, &destroy_line(doomed.buffer, fence.get()));
+    assert_eq!(backend.budget().used, 0);
+}

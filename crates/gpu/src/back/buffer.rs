@@ -46,9 +46,10 @@
 //!    drain call it, gpu-protocol "Learning of CPU writes");
 //! 2. marks the range's pages stale in every entry that holds them, so the next use uploads them
 //!    once;
-//! 3. counts a fault against each such entry, and either asks for the pages to be watched again
-//!    (a page faults once per tracking period, and tracking it again takes a new request) or,
-//!    at [`STREAMED_AFTER_FAULTS`], marks the entry *streamed* ("Streamed ranges").
+//! 3. for each such entry that is not streamed, counts a fault against it, and either asks for
+//!    the pages to be watched again (a page faults once per tracking period, and tracking it
+//!    again takes a new request) or, at [`STREAMED_AFTER_FAULTS`], marks the entry *streamed*
+//!    ("Streamed ranges"), forgetting the watches it was waiting for.
 //!
 //! **The first use after arming reads the pages once more.** A page read while its watch was
 //! not yet armed may have been written between that read and the arming, and that write is not
@@ -76,8 +77,8 @@
 //! finds it written (one per drain however many of its pages were written), and the count goes
 //! back to zero at a use that finds no write since the previous use. When the count reaches
 //! [`STREAMED_AFTER_FAULTS`], the entry is streamed: it asks for no more watches and uploads all
-//! of itself at every use. It stays streamed until it is dropped or joined (a join with a
-//! streamed entry is streamed). Watches already armed on its pages are not cancelled
+//! of itself at every use. It stays streamed until it is dropped, and an entry joined from it is
+//! streamed too (`tests::a_join_with_a_streamed_entry_is_streamed`). Watches already armed on its pages are not cancelled
 //! ([`WriteWatch`] has no cancel); their faults still reach the sink and are otherwise ignored.
 //! Pinned by `tests::a_range_turns_streamed_at_the_fault_threshold_not_before` and
 //! `tests::a_clean_use_resets_the_fault_count`.
@@ -256,8 +257,16 @@ pub const fn collection(bytes: u64, limits: EvictionLimits) -> Option<Collection
     }
 }
 
-/// Why [`BufferCache::bind`] refused. Checked in the order of the variants, and nothing changes
-/// on any of them: no entry, watch request, buffer or command is left behind.
+/// Why [`BufferCache::bind`] refused.
+///
+/// `Empty`, `OutOfRange`, `TooLarge` and `OverBudget` are checked in that order, before anything
+/// else (the last two only when the bind makes a new entry). Then a new entry's buffer is made
+/// (`Render`), and the uploads are prepared piece by piece in address order, each asking for its
+/// staging slice (`Render`) before reading its bytes (`Fault`), so the first piece that fails
+/// decides between the two. Pinned by `tests::checks_run_in_their_documented_order`.
+///
+/// Nothing changes on any of them: no entry, page state, watch request, live buffer or command is
+/// left behind (a buffer made for the bind is destroyed at once, being in no list).
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum BufferError {
     /// A binding of no bytes.

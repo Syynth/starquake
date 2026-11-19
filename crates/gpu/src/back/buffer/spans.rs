@@ -12,9 +12,9 @@ use std::collections::BTreeMap;
 
 /// A set of addresses as disjoint ranges that neither overlap nor touch, by start.
 ///
-/// The number of ranges is at most one more than the number of [`Spans::remove`] calls that
-/// split one, and never more than half the addresses the set could cover, so its size is bounded
-/// by the extent it lives in (one cache entry), not by how often it is changed.
+/// Ranges are separated by at least one address not in the set, so a set inside an extent of `n`
+/// addresses holds at most `n / 2 + 1` ranges: its size is bounded by the extent it lives in (one
+/// cache entry), not by how often it is changed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct Spans {
     /// End by start.
