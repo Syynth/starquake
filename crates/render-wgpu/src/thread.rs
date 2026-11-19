@@ -42,6 +42,12 @@
 //! are host memory the budget does not count, each within the widest and the tallest level the
 //! list clears in its format; wgpu releases them when the list's last submission finishes.
 //!
+//! Draws are encoded into a render pass the list keeps open from one draw to the next, and any
+//! other step closes it first, since wgpu takes no other command while a pass is open; a
+//! dispatch, and a draw's index rewrite, are compute passes of their own (`pass`, after
+//! `crate::draw`, "Render passes"). A list that rewrites indices has two buffers of its own for
+//! the rewrites' parameters and output, made when it is encoded and released with it.
+//!
 //! A present to a window that the frame queue keeps is blitted into the window's texture at
 //! its place in the list (`crate::window`, "The present blit"), and the window's texture is
 //! presented after the list's last submission. A present to the offscreen target encodes
@@ -68,10 +74,10 @@ use crate::convert::TextureSpec;
 use crate::draw::DrawLimits;
 use crate::draw::RewriteScratch;
 use crate::draw::rewrite::IndexRewrite;
-use pass::Recorder;
 use crate::plan::{ClearOps, ClearStep, Layers, ReadFrom, Rows, Step, TexelBox};
 use crate::present::frame_outcome;
 use crate::window::{Presenter, Target};
+use pass::Recorder;
 use starquake_render::command::PresentDesc;
 use starquake_render::{
     BufferId, FenceValue, Frame, FrameDump, FrameSink, PixelFormat, PresentFeedback,

@@ -90,7 +90,10 @@ fn the_parameter_block_matches_the_shaders_struct() {
     let naga::TypeInner::Struct { members, span } = &params.inner else {
         unreachable!("Params is a struct");
     };
-    assert!(u64::from(*span) <= PARAMS_SIZE, "the block holds the struct");
+    assert!(
+        u64::from(*span) <= PARAMS_SIZE,
+        "the block holds the struct"
+    );
     let offsets: Vec<(&str, usize)> = members
         .iter()
         .map(|m| {
@@ -207,9 +210,7 @@ fn the_rewrite_plan_for_every_topology_and_source() {
                 let expected = match (topology, index) {
                     (Topology::Quads, _) => rw(Mode::Quads, source, false),
                     (Topology::QuadStrip, _) => rw(Mode::QuadStrip, source, false),
-                    (Topology::TriangleFan | Topology::Polygon, _) => {
-                        rw(Mode::Fan, source, false)
-                    }
+                    (Topology::TriangleFan | Topology::Polygon, _) => rw(Mode::Fan, source, false),
                     (Topology::LineLoop, _) => rw(Mode::Loop, source, false),
                     (Topology::LineStrip | Topology::TriangleStrip, Some(U8 | U16)) => {
                         rw(Mode::List, source, restart)
@@ -281,7 +282,11 @@ fn workgroups_cover_the_count_up_to_the_limit() {
     assert_eq!(workgroups(WORKGROUP_SIZE, 100), 1);
     assert_eq!(workgroups(WORKGROUP_SIZE + 1, 100), 2);
     assert_eq!(workgroups(WORKGROUP_SIZE * 100, 100), 100);
-    assert_eq!(workgroups(WORKGROUP_SIZE * 100 + 1, 100), 100, "at the limit");
+    assert_eq!(
+        workgroups(WORKGROUP_SIZE * 100 + 1, 100),
+        100,
+        "at the limit"
+    );
     assert_eq!(workgroups(0, 100), 1, "never an empty dispatch");
 }
 
@@ -330,15 +335,16 @@ fn device(test: &str) -> Option<(wgpu::Device, wgpu::Queue)> {
         return None;
     }
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-    let Ok(Ok(adapter)) = crate::backend::block_on(
-        instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
-    ) else {
+    let Ok(Ok(adapter)) =
+        crate::backend::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+    else {
         eprintln!("skipping {test}: no GPU adapter on this host");
         return None;
     };
-    let opened = crate::backend::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-        .expect("the adapter answers")
-        .expect("the adapter opens a device");
+    let opened =
+        crate::backend::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+            .expect("the adapter answers")
+            .expect("the adapter opens a device");
     Some(opened)
 }
 

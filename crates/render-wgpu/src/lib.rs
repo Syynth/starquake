@@ -14,8 +14,9 @@
 //! clears and readbacks (mapped after the list completes); `destroy` deferred by fence value;
 //! fences from wgpu's completion reports; the render thread with its bounded queue; the
 //! offscreen present target, which counts presents and reads dumped frames back; and the
-//! completion wake. What it refuses until later slices, each with a named error: draws and
-//! dispatches (R7, [`plan::DRAWS_NOT_YET`]) and blits ([`plan::BLITS_NOT_YET`]).
+//! completion wake. What it refuses until a later slice, with a named error: blits
+//! ([`plan::BLITS_NOT_YET`]; no slice builds the host shaders' blit pipelines into this backend
+//! yet).
 //!
 //! Slice R6 adds shaders and pipelines, in [`pipeline`]: shaders kept as naga modules and handed
 //! to wgpu (`ShaderSource::Naga`) by the first pipeline build that needs them; bind group and
@@ -27,6 +28,17 @@
 //! device that cannot promise them, which is every Mac under wgpu (an owner question). No driver
 //! cache blob is made: wgpu's is Vulkan only and needs an `unsafe` call ([`pipeline`], "Not
 //! here").
+//!
+//! Slice R7 adds draws and dispatches, in [`draw`]: render passes opened lazily at the first draw
+//! after new targets and closed by any other command; bind groups from each draw's bindings,
+//! checked against its pipeline's layout; vertex and index buffers; the viewport, scissor, blend
+//! constant and stencil reference per draw; direct and indirect draws and dispatches; and the
+//! index rewrite, a WGSL compute pass ([`draw::rewrite`], after Eden's
+//! `vulkan_quad_indexed.comp`, validated with naga), for quads, quad strips, fans, polygons, line
+//! loops, 8-bit indices and 16-bit strip indices. A strip pipeline takes 32-bit indices (R6 left
+//! its index format unset, which wgpu refuses for every indexed strip draw;
+//! [`pipeline::state::STRIP_INDEX_FORMAT`]). wgpu checks a fragment output's type against an
+//! integer target, so typed outputs stay emulated (`draw`, "Typed outputs").
 //!
 //! Slice R8 adds window presentation (`window`, with its choices as pure functions in
 //! [`present`]): a wgpu surface made from the frontend's window, on the calling thread (on
@@ -74,12 +86,20 @@
 //!   has no format for ([`pipeline::state::VERTEX_FORMAT`]), a topology with adjacency
 //!   ([`pipeline::state::ADJACENCY`]), culling of both faces ([`pipeline::state::CULL_BOTH`]), a
 //!   target format with no wgpu form ([`pipeline::state::TARGET_FORMAT`]), or colour targets
-//!   without a fragment shader ([`pipeline::state::TARGETS_WITHOUT_FRAGMENT`]).
+//!   without a fragment shader ([`pipeline::state::TARGETS_WITHOUT_FRAGMENT`]);
+//! - from slice R7, draws and dispatches that break a rule wgpu applies as it encodes them, in
+//!   the order and with the names [`draw`] lists ("The checks"): targets wgpu cannot render into
+//!   together or that the pipeline was not made for, bindings that do not fit the pipeline's
+//!   layout (a binding array among them), counts past their buffers, viewports wgpu cannot set,
+//!   a resource written and otherwise used by one draw, an indirect draw that needs its indices
+//!   rewritten, and more indirect draws in one command than [`draw::MAX_INDIRECT_DRAWS`].
 //!
 //! The differential tests in `backend::tests` run the same lists on this backend and the
 //! recording backend (hand-built lists, and 40 lists drawn from a fixed seed, of uploads,
 //! copies, clears, readbacks and presents with frame dumps) and require identical bytes for
-//! every readback and frame the recording backend knows.
+//! every readback and frame the recording backend knows. The draw tests
+//! (`backend::tests::draws`) draw scenes whose pixels can be computed, axis-aligned rectangles
+//! on pixel edges in flat colours, and compare them exactly (decision 9).
 //!
 //! The pipeline tests (`pipeline::tests`) build hand-written WGSL modules, parsed into naga IR,
 //! into pipelines, among them a binding array; scripted compile delays (a pool that holds its

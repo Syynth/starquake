@@ -10,8 +10,8 @@
 //! the binding's dimension, samples, sample type, format and (for storage) one mip level
 //! ([`VIEW_KIND`]); a sampler compares exactly when the binding does ([`SAMPLER_KIND`]).
 
-use super::rules::{self, BufferKind, Subresources, Uses, VertexStep};
 use super::rewrite::{self, Rewrite, Source};
+use super::rules::{self, BufferKind, Subresources, Uses, VertexStep};
 use super::{
     Attachment, BINDING_ARRAY, BINDING_KIND, Bound, BoundGroup, DEPTH_STENCIL_VIEW, DispatchCall,
     DispatchStep, DrawCall, DrawLimits, DrawStep, EXTRA_BINDING, EntryInfo, GraphicsInfo,
@@ -112,52 +112,23 @@ impl ListDraws {
         };
         let mut uses = Uses::new();
         let resolved = resolve_bindings(tables, &draw.bindings)?;
-        for slice in &draw.vertex_buffers {
-            buffer_slice(tables, slice, BufferUsage::VERTEX, "vertex buffer", "vertex")?;
-        }
-        if let Some(index) = &draw.index_buffer {
-            buffer_slice(tables, &index.slice, BufferUsage::INDEX, "index buffer", "index")?;
-        }
-        if let DrawParams::Indirect { buffer, .. } = draw.params {
-            indirect_buffer(tables, buffer)?;
-        }
+        draw_buffers(tables, draw)?;
         let targets = self.targets.as_ref().ok_or(invalid(NO_TARGETS))?;
         let size = target_size(targets, info)?;
         attachment_uses(targets, &mut uses);
         let groups = bind(&info.layout, &resolved, limits, &mut uses)?;
-        if draw.vertex_buffers.len() < info.vertex.len() {
-            return Err(invalid(MISSING_VERTEX_BUFFER));
-        }
-        for slice in &draw.vertex_buffers {
-            if !slice.offset.is_multiple_of(wgpu::VERTEX_ALIGNMENT) {
-                return Err(invalid(VERTEX_OFFSET));
-            }
-            uses.buffer(slice.buffer, wgpu::BufferUses::VERTEX);
-        }
-        let index_format = match draw.params {
-            DrawParams::Indexed { .. } | DrawParams::Indirect { indexed: true, .. } => {
-                draw.index_buffer.map(|i| i.format)
-            }
-            DrawParams::Direct { .. } | DrawParams::Indirect { indexed: false, .. } => None,
-        };
-        let rewrite = rewrite::plan(info.topology, info.primitive_restart, index_format);
-        let index = match (rewrite, index_format, draw.index_buffer) {
-            (None, Some(format), Some(binding)) => {
-                let host = host_index_format(format);
-                if !binding.slice.offset.is_multiple_of(index_bytes(format)) {
-                    return Err(invalid(INDEX_OFFSET));
-                }
-                uses.buffer(binding.slice.buffer, wgpu::BufferUses::INDEX);
-                host.map(|h| (binding.slice, h))
-            }
-            _ => None,
-        };
-        let viewport = draw.dynamic.viewports.first().copied().ok_or(RenderError::OutOfRange {
-            what: "viewport count",
-            value: 0,
-            min: 1,
-            max: 1,
-        })?;
+        let (rewrite, index) = vertex_input(info, draw, &mut uses)?;
+        let viewport = draw
+            .dynamic
+            .viewports
+            .first()
+            .copied()
+            .ok_or(RenderError::OutOfRange {
+                what: "viewport count",
+                value: 0,
+                min: 1,
+                max: 1,
+            })?;
         rules::check_viewport(&viewport, limits.max_texture_dimension_2d)?;
         let scissor = rules::clamp_scissor(draw.dynamic.scissors.first(), size.0, size.1);
         let sizes: Vec<Option<u64>> = draw.vertex_buffers.iter().map(|s| Some(s.size)).collect();
@@ -299,8 +270,7 @@ impl ListDraws {
                             .and_then(|o| o.checked_add(binding.slice.offset))
                             .ok_or(invalid(INDEX_LIMIT))?;
                         let input = (binding.slice.buffer, start);
-                        let Some(placed) =
-                            self.place(rw, Some(input), 0, index_count, limits)?
+                        let Some(placed) = self.place(rw, Some(input), 0, index_count, limits)?
                         else {
                             return Ok(None);
                         };
@@ -430,6 +400,73 @@ impl ListDraws {
     }
 }
 
+/// Step 3 for a draw's vertex, index and indirect buffers: live, inside their buffers, with the
+/// usage their role needs.
+fn draw_buffers(tables: &Tables, draw: &DrawDesc) -> Result<(), RenderError> {
+    for slice in &draw.vertex_buffers {
+        buffer_slice(
+            tables,
+            slice,
+            BufferUsage::VERTEX,
+            "vertex buffer",
+            "vertex",
+        )?;
+    }
+    if let Some(index) = &draw.index_buffer {
+        buffer_slice(
+            tables,
+            &index.slice,
+            BufferUsage::INDEX,
+            "index buffer",
+            "index",
+        )?;
+    }
+    if let DrawParams::Indirect { buffer, .. } = draw.params {
+        indirect_buffer(tables, buffer)?;
+    }
+    Ok(())
+}
+
+/// The guest index buffer a draw binds directly, with its wgpu format.
+type DirectIndex = Option<(BufferSlice, wgpu::IndexFormat)>;
+
+/// Step 6: the vertex buffers the pipeline reads are bound, each from a word boundary; the
+/// draw's rewrite, if any; and the guest index buffer it binds directly, from a multiple of its
+/// index size. Adds their uses.
+fn vertex_input(
+    info: &GraphicsInfo,
+    draw: &DrawDesc,
+    uses: &mut Uses,
+) -> Result<(Option<Rewrite>, DirectIndex), RenderError> {
+    if draw.vertex_buffers.len() < info.vertex.len() {
+        return Err(invalid(MISSING_VERTEX_BUFFER));
+    }
+    for slice in &draw.vertex_buffers {
+        if !slice.offset.is_multiple_of(wgpu::VERTEX_ALIGNMENT) {
+            return Err(invalid(VERTEX_OFFSET));
+        }
+        uses.buffer(slice.buffer, wgpu::BufferUses::VERTEX);
+    }
+    let index_format = match draw.params {
+        DrawParams::Indexed { .. } | DrawParams::Indirect { indexed: true, .. } => {
+            draw.index_buffer.map(|i| i.format)
+        }
+        DrawParams::Direct { .. } | DrawParams::Indirect { indexed: false, .. } => None,
+    };
+    let rewrite = rewrite::plan(info.topology, info.primitive_restart, index_format);
+    let index = match (rewrite, index_format, draw.index_buffer) {
+        (None, Some(format), Some(binding)) => {
+            if !binding.slice.offset.is_multiple_of(index_bytes(format)) {
+                return Err(invalid(INDEX_OFFSET));
+            }
+            uses.buffer(binding.slice.buffer, wgpu::BufferUses::INDEX);
+            host_index_format(format).map(|h| (binding.slice, h))
+        }
+        _ => None,
+    };
+    Ok((rewrite, index))
+}
+
 /// `first..first + count`, when it stays within `limit` and a `u32`; else `why`.
 fn span(
     first: u32,
@@ -490,16 +527,17 @@ fn attachment(view: &ViewRec, tex: &TextureRec) -> Result<Attachment, RenderErro
 /// The attachments' one size, after checking that they have one size and one sample count and
 /// the formats and samples `info` was made for (`draw` module docs, step 4).
 fn target_size(targets: &Targets, info: &GraphicsInfo) -> Result<(u32, u32), RenderError> {
-    let mut all = targets.colors.iter().flatten().chain(&targets.depth_stencil);
+    let mut all = targets
+        .colors
+        .iter()
+        .flatten()
+        .chain(&targets.depth_stencil);
     let first = all.next().ok_or(invalid(NO_TARGETS))?;
     if all.any(|a| a.size != first.size || a.samples != first.samples) {
         return Err(RenderError::Unsupported(TARGETS_DIFFER));
     }
-    let colors: Vec<Option<wgpu::TextureFormat>> = targets
-        .colors
-        .iter()
-        .map(|a| a.map(|a| a.format))
-        .collect();
+    let colors: Vec<Option<wgpu::TextureFormat>> =
+        targets.colors.iter().map(|a| a.map(|a| a.format)).collect();
     let depth = targets.depth_stencil.map(|a| a.format);
     if colors != info.colors || depth != info.depth_stencil || first.samples != info.samples {
         return Err(invalid(TARGET_MISMATCH));
@@ -532,7 +570,10 @@ fn attachment_uses(targets: &Targets, uses: &mut Uses) {
 enum Live<'a> {
     Buffer(BufferSlice, &'a starquake_render::BufferDesc),
     View(ViewId, &'a ViewRec, &'a TextureRec),
-    Sampler(starquake_render::SamplerId, &'a starquake_render::SamplerDesc),
+    Sampler(
+        starquake_render::SamplerId,
+        &'a starquake_render::SamplerDesc,
+    ),
 }
 
 /// Each binding's resource, found live and with the usage a binding needs (the recording
@@ -623,7 +664,11 @@ fn bind(
         usize::try_from(group)
             .ok()
             .and_then(|g| layout.groups.get(g))
-            .is_some_and(|entries| entries.binary_search_by_key(&binding, |e| e.binding).is_ok())
+            .is_some_and(|entries| {
+                entries
+                    .binary_search_by_key(&binding, |e| e.binding)
+                    .is_ok()
+            })
     };
     if resolved.keys().any(|&(g, b)| !has(g, b)) {
         return Err(invalid(EXTRA_BINDING));
@@ -730,7 +775,11 @@ fn fit(
             if !fits {
                 return Err(invalid(VIEW_KIND));
             }
-            uses.texture(view.texture, &subresources(view, tex), wgpu::TextureUses::RESOURCE);
+            uses.texture(
+                view.texture,
+                &subresources(view, tex),
+                wgpu::TextureUses::RESOURCE,
+            );
             Ok(Bound::View(id))
         }
         (

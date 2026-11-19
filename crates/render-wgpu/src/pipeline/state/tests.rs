@@ -242,10 +242,22 @@ fn only_strip_pipelines_name_their_index_format() {
     let cases = [
         (Topology::Points, P::PointList, None),
         (Topology::Lines, P::LineList, None),
-        (Topology::LineLoop, P::LineStrip, Some(wgpu::IndexFormat::Uint32)),
-        (Topology::LineStrip, P::LineStrip, Some(wgpu::IndexFormat::Uint32)),
+        (
+            Topology::LineLoop,
+            P::LineStrip,
+            Some(wgpu::IndexFormat::Uint32),
+        ),
+        (
+            Topology::LineStrip,
+            P::LineStrip,
+            Some(wgpu::IndexFormat::Uint32),
+        ),
         (Topology::Triangles, P::TriangleList, None),
-        (Topology::TriangleStrip, P::TriangleStrip, Some(wgpu::IndexFormat::Uint32)),
+        (
+            Topology::TriangleStrip,
+            P::TriangleStrip,
+            Some(wgpu::IndexFormat::Uint32),
+        ),
         (Topology::TriangleFan, P::TriangleList, None),
         (Topology::Quads, P::TriangleList, None),
         (Topology::QuadStrip, P::TriangleList, None),

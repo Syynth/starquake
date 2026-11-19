@@ -6,13 +6,11 @@
 //! rewrite turns them into, drawn the same way.
 
 use super::*;
-use crate::draw::{
-    INDIRECT_REWRITE, NO_TARGETS, TARGET_MISMATCH, USAGE_CONFLICT, VIEWPORT,
-};
+use crate::draw::{INDIRECT_REWRITE, NO_TARGETS, TARGET_MISMATCH, USAGE_CONFLICT, VIEWPORT};
 use crate::fixtures::{graphics_desc, shader_desc, wgsl};
 use starquake_render::command::{
-    Binding, BindingResource, DrawDesc, DrawParams, DynamicValues, IndexBufferBinding,
-    IndexFormat, RenderTargets, Viewport,
+    Binding, BindingResource, DrawDesc, DrawParams, DynamicValues, IndexBufferBinding, IndexFormat,
+    RenderTargets, Viewport,
 };
 use starquake_render::pipeline::{
     DepthBias, Topology, VertexAttribute, VertexBufferLayout, VertexComponents, VertexKind,
@@ -52,6 +50,11 @@ const FLAT: &str = "
     @group(0) @binding(0) var<uniform> colour: vec4<f32>;
     @fragment fn main() -> @location(0) vec4<f32> { return colour; }";
 
+/// A small whole number as a float.
+fn float(v: u32) -> f32 {
+    f32::from(u16::try_from(v).expect("small"))
+}
+
 /// The colour of a pixel in a byte for each channel.
 fn bytes(colour: [f32; 4]) -> [u8; 4] {
     colour.map(|c| if c > 0.5 { 255 } else { 0 })
@@ -65,7 +68,7 @@ fn image(rects: &[(Rect4, [f32; 4])]) -> Vec<u8> {
     let mut out = Vec::new();
     for y in 0..SIDE {
         for x in 0..SIDE {
-            let (cx, cy) = (x as f32 + 0.5, y as f32 + 0.5);
+            let (cx, cy) = (float(x) + 0.5, float(y) + 0.5);
             let mut pixel = BLACK;
             for &((x0, y0, x1, y1), colour) in rects {
                 if cx > x0 && cx < x1 && cy > y0 && cy < y1 {
@@ -201,8 +204,8 @@ pub(super) fn dynamic() -> DynamicValues {
         viewports: vec![Viewport {
             x: 0.0,
             y: 0.0,
-            width: SIDE as f32,
-            height: SIDE as f32,
+            width: float(SIDE),
+            height: float(SIDE),
             min_depth: 0.0,
             max_depth: 1.0,
         }],
@@ -241,7 +244,9 @@ enum Feed {
 
 impl Scene {
     fn buffer(&self, usage: BufferUsage, bytes: &[u8]) -> (BufferId, Command) {
-        let size = u64::try_from(bytes.len()).expect("small").next_multiple_of(4);
+        let size = u64::try_from(bytes.len())
+            .expect("small")
+            .next_multiple_of(4);
         let id = self
             .gpu
             .create_buffer(&BufferDesc { size, usage })
@@ -356,10 +361,8 @@ impl Scene {
             }
             Feed::Indirect => {
                 let args = words(&[count, 1, 0, 0]);
-                let (args_buffer, up) = self.buffer(
-                    BufferUsage::INDIRECT.union(BufferUsage::COPY_DST),
-                    &args,
-                );
+                let (args_buffer, up) =
+                    self.buffer(BufferUsage::INDIRECT.union(BufferUsage::COPY_DST), &args);
                 list.push(up);
                 (
                     DrawParams::Indirect {
@@ -436,10 +439,7 @@ fn rectangles_draw_their_exact_pixels() {
             &Feed::Direct,
             GREEN,
         ));
-        assert_eq!(
-            s.pixels(draws),
-            image(&[(RECT, MAGENTA), (OTHER, GREEN)])
-        );
+        assert_eq!(s.pixels(draws), image(&[(RECT, MAGENTA), (OTHER, GREEN)]));
         assert_eq!(s.gpu.host_errors(), 0);
     });
 }
@@ -464,9 +464,9 @@ fn rewritten_topologies_draw_as_their_triangle_equivalents() {
         let (x0, y0, x1, y1) = RECT;
         let around = corners(RECT).to_vec();
         // A quad strip of two quads: pairs down the left and right edges, top, middle, bottom.
-        let ym = (y0 + y1) / 2.0;
+        let ym = f32::midpoint(y0, y1);
         let strip = vec![x0, y0, x1, y0, x0, ym, x1, ym, x0, y1, x1, y1];
-        let cases: [(Topology, &Vec<f32>, usize); 4] = [
+        let cases: [(Topology, &Vec<f32>, u32); 4] = [
             (Topology::Quads, &around, 4),
             (Topology::QuadStrip, &strip, 6),
             (Topology::TriangleFan, &around, 4),
@@ -475,9 +475,9 @@ fn rewritten_topologies_draw_as_their_triangle_equivalents() {
         for (topology, vertices, n) in cases {
             let feeds = [
                 Feed::Direct,
-                Feed::Indexed(IndexFormat::U8, (0..n).map(|i| i as u32).collect()),
-                Feed::Indexed(IndexFormat::U16, (0..n).map(|i| i as u32).collect()),
-                Feed::Indexed(IndexFormat::U32, (0..n).map(|i| i as u32).collect()),
+                Feed::Indexed(IndexFormat::U8, (0..n).collect()),
+                Feed::Indexed(IndexFormat::U16, (0..n).collect()),
+                Feed::Indexed(IndexFormat::U32, (0..n).collect()),
             ];
             for feed in feeds {
                 let draws = s.draw(topology, false, vertices, &feed, MAGENTA);
@@ -632,10 +632,7 @@ fn indirect_draws_match_direct_ones() {
             indexed: true,
         };
         draws.insert(0, up);
-        assert_eq!(
-            s.pixels(draws),
-            image(&[(RECT, MAGENTA), (OTHER, MAGENTA)])
-        );
+        assert_eq!(s.pixels(draws), image(&[(RECT, MAGENTA), (OTHER, MAGENTA)]));
         assert_eq!(s.gpu.host_errors(), 0);
     });
 }
@@ -723,7 +720,10 @@ fn an_integer_target_needs_a_typed_output() {
             d.targets.colors[0] = Some(PixelFormat::R32Uint);
             d
         };
-        let failed = s.gpu.create_graphics_pipeline(desc(untyped)).expect("accepted");
+        let failed = s
+            .gpu
+            .create_graphics_pipeline(desc(untyped))
+            .expect("accepted");
         assert!(matches!(
             s.gpu.draw_pipeline(failed),
             Ok(crate::DrawPipeline::Skipped(crate::SkipReason::Failed))
@@ -918,46 +918,16 @@ fn a_draw_of_a_compiling_pipeline_waits_or_is_skipped() {
 }
 
 /// A filtering sampler bound where the pipeline's build made the binding non-filtering (the
-/// shader samples an unfilterable texture through it) skips the draw and counts it.
+/// shader samples an unfilterable texture through it) skips the draw and counts it; a
+/// non-filtering sampler there draws (the texture is zeros, which the draw writes over the
+/// black clear).
 #[test]
 fn a_filtering_sampler_on_an_unfilterable_texture_skips_the_draw() {
     bounded(|| {
         let Some(mut s) = scene("filtering_skip") else {
             return;
         };
-        let fs = s
-            .gpu
-            .create_shader(shader_desc(
-                ShaderStage::Fragment,
-                "main",
-                wgsl(
-                    "@group(0) @binding(0) var t: texture_2d<f32>;
-                     @group(0) @binding(1) var s: sampler;
-                     @fragment fn main() -> @location(0) vec4<f32> {
-                         return textureSampleLevel(t, s, vec2(0.5), 0.0);
-                     }",
-                ),
-                ShaderInterface {
-                    resources: vec![
-                        ResourceBinding {
-                            group: 0,
-                            binding: 0,
-                            kind: ResourceKind::SampledTexture {
-                                dimension: ViewDimension::D2,
-                                sample: SampleKind::Float { filterable: false },
-                                multisampled: false,
-                            },
-                        },
-                        ResourceBinding {
-                            group: 0,
-                            binding: 1,
-                            kind: ResourceKind::Sampler { comparison: false },
-                        },
-                    ],
-                    ..ShaderInterface::default()
-                },
-            ))
-            .expect("fragment shader");
+        let fs = sampling_shader(&s.gpu, false);
         let pipeline = s.pipeline(positions(s.vs, fs, Topology::Triangles));
         let image_tex = s
             .gpu
@@ -977,36 +947,23 @@ fn a_filtering_sampler_on_an_unfilterable_texture_skips_the_draw() {
             .gpu
             .create_sampler(&crate::fixtures::sampler())
             .expect("sampler");
+        let nearest = s
+            .gpu
+            .create_sampler(&starquake_render::SamplerDesc {
+                mag_filter: FilterMode::Nearest,
+                min_filter: FilterMode::Nearest,
+                mip_filter: FilterMode::Nearest,
+                ..crate::fixtures::sampler()
+            })
+            .expect("sampler");
         let (vb, up) = s.buffer(VERTICES, &floats(&triangles(RECT)));
-        let draw = Command::Draw(DrawDesc {
-            pipeline,
-            bindings: vec![
-                Binding {
-                    group: 0,
-                    binding: 0,
-                    resource: BindingResource::View(image_view),
-                },
-                Binding {
-                    group: 0,
-                    binding: 1,
-                    resource: BindingResource::Sampler(linear),
-                },
-            ],
-            vertex_buffers: vec![BufferSlice {
-                buffer: vb,
-                offset: 0,
-                size: 48,
-            }],
-            index_buffer: None,
-            dynamic: dynamic(),
-            params: DrawParams::Direct {
-                vertex_count: 6,
-                instance_count: 1,
-                first_vertex: 0,
-                first_instance: 0,
-            },
-        });
-        assert_eq!(s.pixels(vec![up, draw]), image(&[]));
+        s.run(vec![up]);
+        let draw = sampled_draw(pipeline, image_view, linear, vb);
+        assert_eq!(s.pixels(vec![draw]), image(&[]), "skipped");
+        assert_eq!(s.gpu.encode_skips(), 1);
+        let draw = sampled_draw(pipeline, image_view, nearest, vb);
+        let zeros = [0.0; 4];
+        assert_eq!(s.pixels(vec![draw]), image(&[(RECT, zeros)]), "drawn");
         assert_eq!(s.gpu.encode_skips(), 1);
         assert_eq!(s.gpu.host_errors(), 0);
     });
@@ -1107,10 +1064,7 @@ fn a_conflicting_use_starts_a_new_pass() {
         };
         draw.vertex_buffers = vec![at(shared)];
         draws.extend(second);
-        assert_eq!(
-            s.pixels(draws),
-            image(&[(OTHER, GREEN), (RECT, MAGENTA)])
-        );
+        assert_eq!(s.pixels(draws), image(&[(OTHER, GREEN), (RECT, MAGENTA)]));
         assert_eq!(s.gpu.host_errors(), 0);
     });
 }
@@ -1141,7 +1095,7 @@ fn what_draws_refuse() {
             Err(RenderError::Invalid(NO_TARGETS))
         );
         let mut flipped = draw.clone();
-        flipped.dynamic.viewports[0].height = -(SIDE as f32);
+        flipped.dynamic.viewports[0].height = -float(SIDE);
         assert_eq!(
             submit(vec![s.targets(), Command::Draw(flipped)]),
             Err(RenderError::Unsupported(VIEWPORT))
@@ -1178,63 +1132,106 @@ fn what_draws_refuse() {
             submit(vec![s.targets(), Command::Draw(mismatched)]),
             Err(RenderError::Invalid(TARGET_MISMATCH))
         );
-        // The target sampled by the draw that renders into it.
+        assert_eq!(s.gpu.host_errors(), 0);
+    });
+}
+
+/// A draw that samples the target it renders into is refused: wgpu cannot use one subresource
+/// as an attachment and a texture in one pass.
+#[test]
+fn a_draw_that_samples_its_own_target_is_refused() {
+    bounded(|| {
+        let Some(s) = scene("feedback_refused") else {
+            return;
+        };
+        let fs = sampling_shader(&s.gpu, true);
+        let sampling = s.pipeline(positions(s.vs, fs, Topology::Triangles));
         let sampler = s
             .gpu
             .create_sampler(&crate::fixtures::sampler())
             .expect("sampler");
-        let fs = s
-            .gpu
-            .create_shader(shader_desc(
-                ShaderStage::Fragment,
-                "main",
-                wgsl(
-                    "@group(0) @binding(0) var t: texture_2d<f32>;
-                     @group(0) @binding(1) var s: sampler;
-                     @fragment fn main() -> @location(0) vec4<f32> {
-                         return textureSampleLevel(t, s, vec2(0.5), 0.0);
-                     }",
-                ),
-                ShaderInterface {
-                    resources: vec![
-                        ResourceBinding {
-                            group: 0,
-                            binding: 0,
-                            kind: ResourceKind::SampledTexture {
-                                dimension: ViewDimension::D2,
-                                sample: SampleKind::Float { filterable: true },
-                                multisampled: false,
-                            },
-                        },
-                        ResourceBinding {
-                            group: 0,
-                            binding: 1,
-                            kind: ResourceKind::Sampler { comparison: false },
-                        },
-                    ],
-                    ..ShaderInterface::default()
+        let (vb, up) = s.buffer(VERTICES, &floats(&triangles(RECT)));
+        s.run(vec![up]);
+        let draw = sampled_draw(sampling, s.view, sampler, vb);
+        assert_eq!(
+            s.gpu.submit(CommandList {
+                commands: vec![s.targets(), draw]
+            }),
+            Err(RenderError::Invalid(USAGE_CONFLICT))
+        );
+        assert_eq!(s.gpu.host_errors(), 0);
+    });
+}
+
+/// A fragment shader that samples the texture at (0, 0) through the sampler at (0, 1); the
+/// interface says the texture is filterable or not.
+fn sampling_shader(gpu: &WgpuBackend, filterable: bool) -> ShaderId {
+    gpu.create_shader(shader_desc(
+        ShaderStage::Fragment,
+        "main",
+        wgsl(
+            "@group(0) @binding(0) var t: texture_2d<f32>;
+             @group(0) @binding(1) var s: sampler;
+             @fragment fn main() -> @location(0) vec4<f32> {
+                 return textureSampleLevel(t, s, vec2(0.5), 0.0);
+             }",
+        ),
+        ShaderInterface {
+            resources: vec![
+                ResourceBinding {
+                    group: 0,
+                    binding: 0,
+                    kind: ResourceKind::SampledTexture {
+                        dimension: ViewDimension::D2,
+                        sample: SampleKind::Float { filterable },
+                        multisampled: false,
+                    },
                 },
-            ))
-            .expect("fragment shader");
-        let sampling = s.pipeline(positions(s.vs, fs, Topology::Triangles));
-        let mut feedback = draw;
-        feedback.pipeline = sampling;
-        feedback.bindings = vec![
+                ResourceBinding {
+                    group: 0,
+                    binding: 1,
+                    kind: ResourceKind::Sampler { comparison: false },
+                },
+            ],
+            ..ShaderInterface::default()
+        },
+    ))
+    .expect("fragment shader")
+}
+
+/// A draw of [`RECT`]'s triangles from `vertices` with a pipeline of [`sampling_shader`].
+fn sampled_draw(
+    pipeline: PipelineId,
+    view: ViewId,
+    sampler: starquake_render::SamplerId,
+    vertices: BufferId,
+) -> Command {
+    Command::Draw(DrawDesc {
+        pipeline,
+        bindings: vec![
             Binding {
                 group: 0,
                 binding: 0,
-                resource: BindingResource::View(s.view),
+                resource: BindingResource::View(view),
             },
             Binding {
                 group: 0,
                 binding: 1,
                 resource: BindingResource::Sampler(sampler),
             },
-        ];
-        assert_eq!(
-            submit(vec![s.targets(), Command::Draw(feedback)]),
-            Err(RenderError::Invalid(USAGE_CONFLICT))
-        );
-        assert_eq!(s.gpu.host_errors(), 0);
-    });
+        ],
+        vertex_buffers: vec![BufferSlice {
+            buffer: vertices,
+            offset: 0,
+            size: 48,
+        }],
+        index_buffer: None,
+        dynamic: dynamic(),
+        params: DrawParams::Direct {
+            vertex_count: 6,
+            instance_count: 1,
+            first_vertex: 0,
+            first_instance: 0,
+        },
+    })
 }

@@ -3,7 +3,7 @@
 //! wgpu-core 30.0.2 check it mirrors; where this is stricter, the `draw` module docs list it.
 
 use super::{
-    BUFFER_OFFSET, BUFFER_RANGE, BINDING_TOO_SMALL, INDIRECT_RANGE, INDIRECT_STRIDE, STORAGE_SIZE,
+    BINDING_TOO_SMALL, BUFFER_OFFSET, BUFFER_RANGE, INDIRECT_RANGE, INDIRECT_STRIDE, STORAGE_SIZE,
     VIEWPORT,
 };
 use starquake_render::command::{Rect, Viewport};
@@ -229,7 +229,6 @@ pub const fn filtering(
     matches!(mag, F::Linear) || matches!(min, F::Linear) || matches!(mip, F::Linear)
 }
 
-
 /// Part of a texture: mip levels and layers (a 3D texture's slices are all layer 0, as wgpu
 /// tracks them).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -322,9 +321,8 @@ impl Uses {
             self.textures.get(id).is_none_or(|ours| {
                 theirs.iter().all(|(&k, &usage)| {
                     let part = key_part(k);
-                    ours.iter().all(|(&o, &u)| {
-                        !key_part(o).meets(&part) || !invalid_texture(u | usage)
-                    })
+                    ours.iter()
+                        .all(|(&o, &u)| !key_part(o).meets(&part) || !invalid_texture(u | usage))
                 })
             })
         });

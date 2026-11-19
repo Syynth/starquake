@@ -71,8 +71,9 @@
 //! `Skip` a compiling pipeline's draw is skipped and counted, each draw once
 //! ([`PipelineCounts::skipped_while_compiling`]). A failed pipeline's draws are skipped under
 //! either setting, and counted once per pipeline, by the first draw that meets it
-//! ([`PipelineCounts::failed_pipelines`]), not per draw. Draws themselves arrive with slice R7,
-//! whose encoder calls it; until then the list check refuses them.
+//! ([`PipelineCounts::failed_pipelines`]), not per draw. The render thread makes this decision
+//! for every draw and dispatch it encodes (slice R7, `crate::draw`), with the pipeline the list
+//! check found for the draw's id; a dispatch's pipeline waits or is skipped the same way.
 //!
 //! # Not here
 //!
@@ -206,8 +207,8 @@ pub(crate) enum HostPipeline {
     Compute(wgpu::ComputePipeline, Arc<HostLayout>),
 }
 
-/// A pipeline a draw can use, from [`crate::WgpuBackend::draw_pipeline`], for the render
-/// thread's encoder (slice R7) to bind.
+/// A pipeline a draw can use, from [`crate::WgpuBackend::draw_pipeline`], with the bind group
+/// layouts the render thread makes each draw's bind groups against (slice R7).
 #[derive(Clone, Debug)]
 pub struct ReadyPipeline(pub(crate) HostPipeline);
 

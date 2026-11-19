@@ -203,7 +203,10 @@ impl Render {
         let colors: Vec<Option<(Attachment, wgpu::TextureView)>> = targets
             .colors
             .iter()
-            .map(|a| a.map(|a| view(&a).map(|v| (a, v))).map_or(Some(None), |v| v.map(Some)))
+            .map(|a| {
+                a.map(|a| view(&a).map(|v| (a, v)))
+                    .map_or(Some(None), |v| v.map(Some))
+            })
             .collect::<Option<_>>()?;
         let depth = match &targets.depth_stencil {
             Some(a) => Some((*a, view(a)?)),

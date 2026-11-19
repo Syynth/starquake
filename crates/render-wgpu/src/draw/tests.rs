@@ -3,8 +3,8 @@
 
 use super::rules::{
     BindingLimits, BufferKind, Subresources, Uses, VertexStep, check_buffer_binding,
-    check_indirect, check_viewport, clamp_scissor, filtering, indirect_draw_size,
-    sample_type_fits, vertex_limits, within,
+    check_indirect, check_viewport, clamp_scissor, filtering, indirect_draw_size, sample_type_fits,
+    vertex_limits, within,
 };
 use super::*;
 use crate::fixtures::{draw_limits, formats, sampler, test_caps, texture, view};
@@ -32,18 +32,44 @@ fn vertex_limits_follow_wgpu_cores_formula() {
         instance,
     };
     // (size - last) / stride + 1: 64 bytes of 8-byte elements whose last needs 8 bytes.
-    assert_eq!(vertex_limits(&[step(8, 8, false)], &[Some(64)]), (8, u64::MAX));
-    assert_eq!(vertex_limits(&[step(8, 8, false)], &[Some(63)]), (7, u64::MAX));
+    assert_eq!(
+        vertex_limits(&[step(8, 8, false)], &[Some(64)]),
+        (8, u64::MAX)
+    );
+    assert_eq!(
+        vertex_limits(&[step(8, 8, false)], &[Some(63)]),
+        (7, u64::MAX)
+    );
     // A last element wider than the stride needs its whole width.
-    assert_eq!(vertex_limits(&[step(8, 12, false)], &[Some(64)]), (7, u64::MAX));
+    assert_eq!(
+        vertex_limits(&[step(8, 12, false)], &[Some(64)]),
+        (7, u64::MAX)
+    );
     // Too short for one element: none.
-    assert_eq!(vertex_limits(&[step(8, 12, false)], &[Some(11)]), (0, u64::MAX));
-    assert_eq!(vertex_limits(&[step(8, 12, false)], &[Some(12)]), (1, u64::MAX));
+    assert_eq!(
+        vertex_limits(&[step(8, 12, false)], &[Some(11)]),
+        (0, u64::MAX)
+    );
+    assert_eq!(
+        vertex_limits(&[step(8, 12, false)], &[Some(12)]),
+        (1, u64::MAX)
+    );
     // A stride of 0 limits nothing once one element fits.
-    assert_eq!(vertex_limits(&[step(0, 4, false)], &[Some(4)]), (u64::MAX, u64::MAX));
-    assert_eq!(vertex_limits(&[step(0, 4, false)], &[Some(3)]), (0, u64::MAX));
+    assert_eq!(
+        vertex_limits(&[step(0, 4, false)], &[Some(4)]),
+        (u64::MAX, u64::MAX)
+    );
+    assert_eq!(
+        vertex_limits(&[step(0, 4, false)], &[Some(3)]),
+        (0, u64::MAX)
+    );
     // Instance buffers limit instances; the smallest of each kind wins.
-    let steps = [step(8, 8, false), step(4, 4, true), step(16, 8, false), step(4, 4, true)];
+    let steps = [
+        step(8, 8, false),
+        step(4, 4, true),
+        step(16, 8, false),
+        step(4, 4, true),
+    ];
     let sizes = [Some(64), Some(40), Some(72), Some(12)];
     assert_eq!(vertex_limits(&steps, &sizes), (5, 3));
     // A slot left unbound: both limits 0, as wgpu's.
@@ -133,7 +159,11 @@ fn indirect_parameters_stay_in_their_buffer() {
     assert_eq!(check_indirect(0, 16, 2, draw, 32), Ok(()));
     assert_eq!(check_indirect(0, 16, 2, draw, 31), range);
     assert_eq!(check_indirect(0, 12, 2, draw, 64), stride, "below the size");
-    assert_eq!(check_indirect(0, 18, 2, draw, 64), stride, "not whole words");
+    assert_eq!(
+        check_indirect(0, 18, 2, draw, 64),
+        stride,
+        "not whole words"
+    );
     assert_eq!(check_indirect(0, 20, 2, indexed, 40), Ok(()));
     assert_eq!(check_indirect(0, 16, 2, indexed, 64), stride);
     // One draw's stride is not read.
@@ -141,11 +171,16 @@ fn indirect_parameters_stay_in_their_buffer() {
     // Both faults: the offset is reported first.
     assert_eq!(check_indirect(2, 3, 2, draw, 64), range);
     let words = u64::MAX - 3;
-    assert_eq!(check_indirect(0, words, 3, draw, u64::MAX), range, "overflow");
+    assert_eq!(
+        check_indirect(0, words, 3, draw, u64::MAX),
+        range,
+        "overflow"
+    );
 }
 
 #[test]
 fn bound_buffers_are_checked_in_wgpus_order() {
+    use BufferKind::{Storage, Uniform};
     let limits = BindingLimits {
         uniform_alignment: 256,
         storage_alignment: 64,
@@ -153,22 +188,52 @@ fn bound_buffers_are_checked_in_wgpus_order() {
         max_storage: 2048,
     };
     let check = |kind, offset, size, min| check_buffer_binding(kind, offset, size, min, &limits);
-    use BufferKind::{Storage, Uniform};
     assert_eq!(check(Uniform, 256, 1024, 16), Ok(()));
-    assert_eq!(check(Uniform, 128, 16, 16), Err(RenderError::Invalid(BUFFER_OFFSET)));
+    assert_eq!(
+        check(Uniform, 128, 16, 16),
+        Err(RenderError::Invalid(BUFFER_OFFSET))
+    );
     assert_eq!(check(Storage, 128, 16, 16), Ok(()), "storage alignment");
-    assert_eq!(check(Storage, 32, 16, 16), Err(RenderError::Invalid(BUFFER_OFFSET)));
-    assert_eq!(check(Uniform, 0, 6, 0), Ok(()), "a uniform range of any size");
-    assert_eq!(check(Storage, 0, 6, 0), Err(RenderError::Invalid(STORAGE_SIZE)));
-    assert_eq!(check(Uniform, 0, 1025, 0), Err(RenderError::Unsupported(BUFFER_RANGE)));
+    assert_eq!(
+        check(Storage, 32, 16, 16),
+        Err(RenderError::Invalid(BUFFER_OFFSET))
+    );
+    assert_eq!(
+        check(Uniform, 0, 6, 0),
+        Ok(()),
+        "a uniform range of any size"
+    );
+    assert_eq!(
+        check(Storage, 0, 6, 0),
+        Err(RenderError::Invalid(STORAGE_SIZE))
+    );
+    assert_eq!(
+        check(Uniform, 0, 1025, 0),
+        Err(RenderError::Unsupported(BUFFER_RANGE))
+    );
     assert_eq!(check(Storage, 0, 2048, 0), Ok(()));
-    assert_eq!(check(Storage, 0, 2052, 0), Err(RenderError::Unsupported(BUFFER_RANGE)));
-    assert_eq!(check(Uniform, 0, 15, 16), Err(RenderError::Invalid(BINDING_TOO_SMALL)));
+    assert_eq!(
+        check(Storage, 0, 2052, 0),
+        Err(RenderError::Unsupported(BUFFER_RANGE))
+    );
+    assert_eq!(
+        check(Uniform, 0, 15, 16),
+        Err(RenderError::Invalid(BINDING_TOO_SMALL))
+    );
     assert_eq!(check(Uniform, 0, 16, 16), Ok(()));
     // Faults together: offset, then the storage size, then the limit, then the minimum.
-    assert_eq!(check(Storage, 1, 6, 0), Err(RenderError::Invalid(BUFFER_OFFSET)));
-    assert_eq!(check(Storage, 0, 2050, 0), Err(RenderError::Invalid(STORAGE_SIZE)));
-    assert_eq!(check(Uniform, 0, 1025, 2000), Err(RenderError::Unsupported(BUFFER_RANGE)));
+    assert_eq!(
+        check(Storage, 1, 6, 0),
+        Err(RenderError::Invalid(BUFFER_OFFSET))
+    );
+    assert_eq!(
+        check(Storage, 0, 2050, 0),
+        Err(RenderError::Invalid(STORAGE_SIZE))
+    );
+    assert_eq!(
+        check(Uniform, 0, 1025, 2000),
+        Err(RenderError::Unsupported(BUFFER_RANGE))
+    );
 }
 
 #[test]
@@ -184,8 +249,14 @@ fn sample_types_fit_as_wgpu_matches_them() {
     // wgpu-core's match, written out: (entry, view) pairs that fit.
     let fits = [
         (T::Float { filterable: true }, T::Float { filterable: true }),
-        (T::Float { filterable: false }, T::Float { filterable: true }),
-        (T::Float { filterable: false }, T::Float { filterable: false }),
+        (
+            T::Float { filterable: false },
+            T::Float { filterable: true },
+        ),
+        (
+            T::Float { filterable: false },
+            T::Float { filterable: false },
+        ),
         (T::Float { filterable: false }, T::Depth),
         (T::Depth, T::Depth),
         (T::Sint, T::Sint),
@@ -330,6 +401,13 @@ struct World {
 
 const RGBA: PixelFormat = PixelFormat::A8B8G8R8Unorm;
 
+/// A `SetRenderTargets` of `view` as colour target 0.
+fn targets(view: ViewId) -> Command {
+    let mut t = RenderTargets::default();
+    t.colors[0] = Some(view);
+    Command::SetRenderTargets(t)
+}
+
 fn add_buffer(tables: &mut plan::Tables, size: u64, usage: BufferUsage) -> BufferId {
     let (i, g) = tables
         .buffers
@@ -415,11 +493,49 @@ fn add_pipeline(pipelines: &mut Registry, info: PipelineInfo) -> PipelineId {
     PipelineId::new(i, g)
 }
 
+/// The world's pipelines (graphics, quads, strips, writer, compute, arrays; [`World`]'s docs).
+fn pipelines() -> (Registry, [PipelineId; 6]) {
+    let mut pipelines = Registry::default();
+    let eight = vec![VertexStep {
+        stride: 8,
+        last_stride: 8,
+        instance: false,
+    }];
+    let array = EntryInfo {
+        array: true,
+        ..entry(4, TEXTURE_ENTRY, 0)
+    };
+    let infos = [
+        graphics_info(Topology::Triangles, eight.clone(), &[]),
+        graphics_info(Topology::Quads, Vec::new(), &[]),
+        graphics_info(Topology::TriangleStrip, eight.clone(), &[]),
+        graphics_info(
+            Topology::Triangles,
+            eight.clone(),
+            &[entry(3, STORAGE_ENTRY, 4)],
+        ),
+        PipelineInfo::Compute(LayoutInfo {
+            groups: vec![vec![entry(0, STORAGE_ENTRY, 4)]],
+        }),
+        graphics_info(Topology::Triangles, eight, &[array]),
+    ];
+    let ids = infos.map(|info| add_pipeline(&mut pipelines, info));
+    (pipelines, ids)
+}
+
 fn world() -> World {
     let mut tables = plan::Tables::default();
     let rt = TextureUsage::RENDER_TARGET.union(TextureUsage::SAMPLED);
-    let target = add_view(&mut tables, texture(RGBA, 8, 8, rt), view(RGBA, ViewDimension::D2));
-    let small = add_view(&mut tables, texture(RGBA, 4, 4, rt), view(RGBA, ViewDimension::D2));
+    let target = add_view(
+        &mut tables,
+        texture(RGBA, 8, 8, rt),
+        view(RGBA, ViewDimension::D2),
+    );
+    let small = add_view(
+        &mut tables,
+        texture(RGBA, 4, 4, rt),
+        view(RGBA, ViewDimension::D2),
+    );
     let picture = add_view(
         &mut tables,
         texture(RGBA, 4, 4, TextureUsage::SAMPLED),
@@ -450,39 +566,7 @@ fn world() -> World {
         })
         .expect("room");
     let shadow = SamplerId::new(i, g);
-    let mut pipelines = Registry::default();
-    let eight = vec![VertexStep {
-        stride: 8,
-        last_stride: 8,
-        instance: false,
-    }];
-    let graphics = add_pipeline(
-        &mut pipelines,
-        graphics_info(Topology::Triangles, eight.clone(), &[]),
-    );
-    let quads = add_pipeline(&mut pipelines, graphics_info(Topology::Quads, Vec::new(), &[]));
-    let strips = add_pipeline(
-        &mut pipelines,
-        graphics_info(Topology::TriangleStrip, eight.clone(), &[]),
-    );
-    let writer = add_pipeline(
-        &mut pipelines,
-        graphics_info(Topology::Triangles, eight.clone(), &[entry(3, STORAGE_ENTRY, 4)]),
-    );
-    let compute = add_pipeline(
-        &mut pipelines,
-        PipelineInfo::Compute(LayoutInfo {
-            groups: vec![vec![entry(0, STORAGE_ENTRY, 4)]],
-        }),
-    );
-    let array = EntryInfo {
-        array: true,
-        ..entry(4, TEXTURE_ENTRY, 0)
-    };
-    let arrays = add_pipeline(
-        &mut pipelines,
-        graphics_info(Topology::Triangles, eight, &[array]),
-    );
+    let (pipelines, [graphics, quads, strips, writer, compute, arrays]) = pipelines();
     let integers = add_view(
         &mut tables,
         texture(PixelFormat::R32Uint, 4, 4, TextureUsage::SAMPLED),
@@ -577,13 +661,11 @@ impl World {
         }
     }
 
-    fn targets(&self, view: ViewId) -> Command {
-        let mut t = RenderTargets::default();
-        t.colors[0] = Some(view);
-        Command::SetRenderTargets(t)
-    }
-
-    fn check_with(&self, limits: &DrawLimits, commands: Vec<Command>) -> Result<Checked, RenderError> {
+    fn check_with(
+        &self,
+        limits: &DrawLimits,
+        commands: Vec<Command>,
+    ) -> Result<Checked, RenderError> {
         let caps = test_caps();
         let rules = Rules {
             caps: &caps,
@@ -604,8 +686,11 @@ impl World {
     }
 
     /// The error of the list `[targets, draw]` after `fault` changes them.
-    fn refusal(&self, fault: &dyn Fn(&Self, &mut Vec<Command>, &mut DrawDesc)) -> Option<RenderError> {
-        let mut before = vec![self.targets(self.target)];
+    fn refusal(
+        &self,
+        fault: &dyn Fn(&Self, &mut Vec<Command>, &mut DrawDesc),
+    ) -> Option<RenderError> {
+        let mut before = vec![targets(self.target)];
         let mut draw = self.draw();
         fault(self, &mut before, &mut draw);
         before.push(Command::Draw(draw));
@@ -694,10 +779,17 @@ fn faults() -> Vec<(&'static str, Fault, RenderError)> {
 #[test]
 fn checks_refuse_in_order() {
     let w = world();
-    assert!(w.check(vec![w.targets(w.target), Command::Draw(w.draw())]).is_ok());
+    assert!(
+        w.check(vec![targets(w.target), Command::Draw(w.draw())])
+            .is_ok()
+    );
     let faults = faults();
     for (name, fault, error) in &faults {
-        assert_eq!(w.refusal(&|w, b, d| fault(w, b, d)).as_ref(), Some(error), "{name}");
+        assert_eq!(
+            w.refusal(&|w, b, d| fault(w, b, d)).as_ref(),
+            Some(error),
+            "{name}"
+        );
     }
     for (i, (first, early, error)) in faults.iter().enumerate() {
         for (second, late, _) in &faults[i + 1..] {
@@ -705,12 +797,16 @@ fn checks_refuse_in_order() {
                 late(w, b, d);
                 early(w, b, d);
             };
-            assert_eq!(w.refusal(&both).as_ref(), Some(error), "{first} with {second}");
+            assert_eq!(
+                w.refusal(&both).as_ref(),
+                Some(error),
+                "{first} with {second}"
+            );
         }
     }
 }
 
-/// The refusals of steps 2 to 9 not in [`faults`], each alone with its exact error.
+/// The refusals of steps 2 to 5 not in [`faults`], each alone with its exact error.
 #[test]
 fn every_draw_refusal_names_its_rule() {
     let w = world();
@@ -723,7 +819,8 @@ fn every_draw_refusal_names_its_rule() {
         (
             "a stale sampler",
             |w, _, d| {
-                d.bindings[2].resource = BindingResource::Sampler(SamplerId::new(w.linear.index(), 9))
+                d.bindings[2].resource =
+                    BindingResource::Sampler(SamplerId::new(w.linear.index(), 9));
             },
             RenderError::Invalid(plan::NO_SAMPLER),
         ),
@@ -756,7 +853,10 @@ fn every_draw_refusal_names_its_rule() {
         ),
         (
             "a binding the layout lacks",
-            |w, _, d| d.bindings.push(binding(7, BindingResource::Sampler(w.linear))),
+            |w, _, d| {
+                d.bindings
+                    .push(binding(7, BindingResource::Sampler(w.linear)));
+            },
             RenderError::Invalid(EXTRA_BINDING),
         ),
         (
@@ -786,6 +886,32 @@ fn every_draw_refusal_names_its_rule() {
             |w, _, d| d.bindings[1].resource = BindingResource::View(w.picture_array),
             RenderError::Invalid(VIEW_KIND),
         ),
+        (
+            "a binding array in the layout",
+            |w, _, d| d.pipeline = w.arrays,
+            RenderError::Unsupported(BINDING_ARRAY),
+        ),
+        (
+            "unsigned integers for a float binding",
+            |w, _, d| d.bindings[1].resource = BindingResource::View(w.integers),
+            RenderError::Invalid(VIEW_KIND),
+        ),
+        (
+            "a view of depth and stencil",
+            |w, _, d| d.bindings[1].resource = BindingResource::View(w.depth_stencil),
+            RenderError::Unsupported(DEPTH_STENCIL_VIEW),
+        ),
+    ];
+    for (name, fault, error) in cases {
+        assert_eq!(w.refusal(&|w, b, d| fault(w, b, d)), Some(error), "{name}");
+    }
+}
+
+/// The refusals of steps 6 to 9 not in [`faults`], each alone with its exact error.
+#[test]
+fn every_count_and_use_refusal_names_its_rule() {
+    let w = world();
+    let cases: Vec<(&str, Fault, RenderError)> = vec![
         (
             "a vertex buffer off a word",
             |w, _, d| d.vertex_buffers[0] = buffer(w.storage, 2, 64),
@@ -867,37 +993,20 @@ fn every_draw_refusal_names_its_rule() {
             RenderError::Invalid(INDIRECT_RANGE),
         ),
         (
-            "a binding array in the layout",
-            |w, _, d| d.pipeline = w.arrays,
-            RenderError::Unsupported(BINDING_ARRAY),
-        ),
-        (
-            "unsigned integers for a float binding",
-            |w, _, d| d.bindings[1].resource = BindingResource::View(w.integers),
-            RenderError::Invalid(VIEW_KIND),
-        ),
-        (
-            "a view of depth and stencil",
-            |w, _, d| d.bindings[1].resource = BindingResource::View(w.depth_stencil),
-            RenderError::Unsupported(DEPTH_STENCIL_VIEW),
-        ),
-        (
             "a buffer written as storage and read as vertices by one draw",
             |w, _, d| {
                 d.pipeline = w.writer;
-                d.bindings
-                    .push(binding(3, BindingResource::Buffer(buffer(w.storage, 0, 64))));
+                d.bindings.push(binding(
+                    3,
+                    BindingResource::Buffer(buffer(w.storage, 0, 64)),
+                ));
                 d.vertex_buffers[0] = buffer(w.storage, 0, 64);
             },
             RenderError::Invalid(USAGE_CONFLICT),
         ),
     ];
     for (name, fault, error) in cases {
-        assert_eq!(
-            w.refusal(&|w, b, d| fault(w, b, d)),
-            Some(error),
-            "{name}"
-        );
+        assert_eq!(w.refusal(&|w, b, d| fault(w, b, d)), Some(error), "{name}");
     }
 }
 
@@ -913,14 +1022,17 @@ fn counts_are_checked_at_their_edges() {
             first_vertex,
             first_instance: 0,
         };
-        w.check(vec![w.targets(w.target), Command::Draw(d)]).err()
+        w.check(vec![targets(w.target), Command::Draw(d)]).err()
     };
     // 64 bytes of 8-byte vertices: 8.
     assert_eq!(direct(8, 0), None);
     assert_eq!(direct(9, 0), Some(RenderError::Invalid(VERTEX_LIMIT)));
     assert_eq!(direct(1, 7), None);
     assert_eq!(direct(1, 8), Some(RenderError::Invalid(VERTEX_LIMIT)));
-    assert_eq!(direct(u32::MAX, 1), Some(RenderError::Invalid(VERTEX_LIMIT)));
+    assert_eq!(
+        direct(u32::MAX, 1),
+        Some(RenderError::Invalid(VERTEX_LIMIT))
+    );
     let indexed = |count, first| {
         let mut d = w.draw();
         d.index_buffer = Some(IndexBufferBinding {
@@ -934,7 +1046,7 @@ fn counts_are_checked_at_their_edges() {
             base_vertex: 0,
             first_instance: 0,
         };
-        w.check(vec![w.targets(w.target), Command::Draw(d)]).err()
+        w.check(vec![targets(w.target), Command::Draw(d)]).err()
     };
     // 64 bytes of 32-bit indices: 16.
     assert_eq!(indexed(16, 0), None);
@@ -950,10 +1062,13 @@ fn counts_are_checked_at_their_edges() {
             stride: 0,
             indexed: false,
         };
-        w.check(vec![w.targets(w.target), Command::Draw(d)]).err()
+        w.check(vec![targets(w.target), Command::Draw(d)]).err()
     };
     assert_eq!(indirect(1), None);
-    assert_eq!(indirect(MAX_INDIRECT_DRAWS + 1), Some(RenderError::Unsupported(INDIRECT_DRAWS)));
+    assert_eq!(
+        indirect(MAX_INDIRECT_DRAWS + 1),
+        Some(RenderError::Unsupported(INDIRECT_DRAWS))
+    );
     // At the cap, the stride is the next check.
     assert_eq!(
         indirect(MAX_INDIRECT_DRAWS),
@@ -975,30 +1090,33 @@ fn draws_start_a_pass_only_when_they_must() {
         rect: None,
     });
     let fresh = |commands| -> Vec<bool> {
-        w.draw_steps(commands).iter().map(|d| d.fresh_pass).collect()
+        w.draw_steps(commands)
+            .iter()
+            .map(|d| d.fresh_pass)
+            .collect()
     };
     assert_eq!(
         fresh(vec![
-            w.targets(w.target),
+            targets(w.target),
             draw(),
             draw(),
             marker,
             draw(),
-            w.targets(w.target),
+            targets(w.target),
             draw(),
         ]),
         [true, false, false, false]
     );
     assert_eq!(
-        fresh(vec![w.targets(w.target), draw(), clear, draw()]),
+        fresh(vec![targets(w.target), draw(), clear, draw()]),
         [true, true]
     );
     assert_eq!(
         fresh(vec![
-            w.targets(w.target),
+            targets(w.target),
             draw(),
-            w.targets(w.small),
-            w.targets(w.target),
+            targets(w.small),
+            targets(w.target),
             draw()
         ]),
         [true, true]
@@ -1014,20 +1132,21 @@ fn draws_start_a_pass_only_when_they_must() {
         first_instance: 0,
     };
     assert_eq!(
-        fresh(vec![w.targets(w.target), draw(), Command::Draw(quad), draw()]),
+        fresh(vec![targets(w.target), draw(), Command::Draw(quad), draw()]),
         [true, true, false]
     );
     // The writer writes the storage buffer; a later draw reads it as vertices.
     let mut writes = w.draw();
     writes.pipeline = w.writer;
-    writes
-        .bindings
-        .push(binding(3, BindingResource::Buffer(buffer(w.storage, 0, 64))));
+    writes.bindings.push(binding(
+        3,
+        BindingResource::Buffer(buffer(w.storage, 0, 64)),
+    ));
     let mut reads = w.draw();
     reads.vertex_buffers = vec![buffer(w.storage, 0, 64)];
     assert_eq!(
         fresh(vec![
-            w.targets(w.target),
+            targets(w.target),
             Command::Draw(writes.clone()),
             Command::Draw(writes),
             Command::Draw(reads.clone()),
@@ -1051,7 +1170,7 @@ fn a_draw_becomes_this_step() {
     }];
     // Bindings in another order than the layout's.
     d.bindings.reverse();
-    let steps = w.draw_steps(vec![w.targets(w.target), Command::Draw(d.clone())]);
+    let steps = w.draw_steps(vec![targets(w.target), Command::Draw(d.clone())]);
     let expected = DrawStep {
         pipeline: w.graphics,
         cell: Arc::new(PipelineCell::new()),
@@ -1121,7 +1240,7 @@ fn rewrites_are_placed_in_the_lists_scratch() {
     };
     let checked = w
         .check(vec![
-            w.targets(w.target),
+            targets(w.target),
             Command::Draw(quad),
             Command::Draw(strip),
         ])
@@ -1217,23 +1336,34 @@ fn rewrites_are_bounded_by_the_device() {
     let mut limits = draw_limits(&test_caps());
     // Four quads: 24 indices, 96 bytes.
     limits.max_buffer_size = 96;
-    assert!(w.check_with(&limits, vec![w.targets(w.target), quad(16)]).is_ok());
+    assert!(
+        w.check_with(&limits, vec![targets(w.target), quad(16)])
+            .is_ok()
+    );
     limits.max_buffer_size = 95;
     assert_eq!(
-        w.check_with(&limits, vec![w.targets(w.target), quad(16)]).err(),
+        w.check_with(&limits, vec![targets(w.target), quad(16)])
+            .err(),
         Some(RenderError::Unsupported(SCRATCH))
     );
     let mut limits = draw_limits(&test_caps());
     limits.binding.max_storage = 92;
     assert_eq!(
-        w.check_with(&limits, vec![w.targets(w.target), quad(16)]).err(),
+        w.check_with(&limits, vec![targets(w.target), quad(16)])
+            .err(),
         Some(RenderError::Unsupported(REWRITE_SIZE))
     );
     limits.binding.max_storage = 96;
-    assert!(w.check_with(&limits, vec![w.targets(w.target), quad(16)]).is_ok());
+    assert!(
+        w.check_with(&limits, vec![targets(w.target), quad(16)])
+            .is_ok()
+    );
     // A quad draw of three vertices writes no index and draws nothing.
     assert_eq!(
-        w.check(vec![w.targets(w.target), quad(3)]).expect("accepted").steps.len(),
+        w.check(vec![targets(w.target), quad(3)])
+            .expect("accepted")
+            .steps
+            .len(),
         1,
         "only the targets"
     );
@@ -1247,14 +1377,17 @@ fn dispatches_are_checked_and_close_the_pass() {
     let dispatch = |pipeline, params| {
         Command::Dispatch(DispatchDesc {
             pipeline,
-            bindings: vec![binding(0, BindingResource::Buffer(buffer(w.storage, 0, 64)))],
+            bindings: vec![binding(
+                0,
+                BindingResource::Buffer(buffer(w.storage, 0, 64)),
+            )],
             params,
         })
     };
     let direct = DispatchParams::Direct { x: 1, y: 2, z: 3 };
     let checked = w
         .check(vec![
-            w.targets(w.target),
+            targets(w.target),
             Command::Draw(w.draw()),
             dispatch(w.compute, direct),
             Command::Draw(w.draw()),
@@ -1285,7 +1418,10 @@ fn dispatches_are_checked_and_close_the_pass() {
     // The storage buffer bound as the indirect buffer too: not an indirect buffer.
     let both = Command::Dispatch(DispatchDesc {
         pipeline: w.compute,
-        bindings: vec![binding(0, BindingResource::Buffer(buffer(w.storage, 0, 64)))],
+        bindings: vec![binding(
+            0,
+            BindingResource::Buffer(buffer(w.storage, 0, 64)),
+        )],
         params: DispatchParams::Indirect {
             buffer: w.storage,
             offset: 0,

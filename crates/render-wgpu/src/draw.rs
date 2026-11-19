@@ -50,8 +50,9 @@
 //!
 //! # The index rewrite
 //!
-//! wgpu has no quads, quad strips, triangle fans, polygons or line loops, no 8-bit indices, and
-//! restarts every indexed strip at the index format's restart value (render-backend, "Quads, line
+//! wgpu has no quads, quad strips, triangle fans, polygons or line loops and no 8-bit indices,
+//! a strip pipeline here takes 32-bit indices only (`crate::pipeline::state`, "Topology"), and
+//! the host restarts every indexed strip at the restart value (render-backend, "Quads, line
 //! loops" and "Primitive restart off"). A draw that needs one of those has its indices rewritten
 //! by a compute pass ([`rewrite`], after Eden's `vulkan_quad_indexed.comp`) into 32-bit indices
 //! of the topology its pipeline was built with (`crate::pipeline::state`): quads and quad strips
@@ -66,8 +67,9 @@
 //! # Typed outputs
 //!
 //! wgpu checks that a fragment shader's output type fits each colour target: a float output
-//! for an integer target fails the pipeline (wgpu-core 30.0.2, `validation.rs`,
-//! `check_texture_format` and the fragment output check in `Interface::check_stage`). So the
+//! for an integer target fails the pipeline (wgpu-core 30.0.2: `create_render_pipeline` in
+//! `src/device/resource.rs` checks each fragment output with `check_texture_format` from
+//! `src/validation.rs`, `ColorStateError::IncompatibleFormat`). So the
 //! typed-output emulation is needed under wgpu, as `emulation()` already says
 //! (`Features::UNTYPED_FRAGMENT_OUTPUTS` is never set, `crate::caps`); pinned by
 //! `backend::tests::draws::an_integer_target_needs_a_typed_output`.
@@ -105,10 +107,14 @@
 //! Where this backend refuses or draws differently from the recording backend or the guest,
 //! each with the test that pins it:
 //!
-//! - every refusal above that the recording backend does not make (steps 4 to 9, and the
-//!   pipeline's kind is checked by both): `backend::tests::draws::what_draws_refuse`;
+//! - every refusal of steps 4 to 9, which the recording backend does not make (steps 1 to 3
+//!   are its own checks): `draw::tests::checks_refuse_in_order` (one fault per step, and every
+//!   pair of steps at once), `draw::tests::every_draw_refusal_names_its_rule` and
+//!   `draw::tests::every_count_and_use_refusal_names_its_rule`, with a few end to end in
+//!   `backend::tests::draws::what_draws_refuse` and
+//!   `backend::tests::draws::a_draw_that_samples_its_own_target_is_refused`;
 //! - a binding array cannot be filled, since a draw's binding names one resource
-//!   ([`BINDING_ARRAY`]): `draw::tests::checks_refuse_in_order`;
+//!   ([`BINDING_ARRAY`]): `draw::tests::every_draw_refusal_names_its_rule`;
 //! - a sampled float texture whose format only an adapter-specific feature makes filterable is
 //!   refused for a filterable binding ([`rules::sample_type_fits`]):
 //!   `draw::tests::sample_types_fit_as_wgpu_matches_them`;
@@ -118,10 +124,11 @@
 //!   (`crate::pipeline::layout`, "Filtering samplers"): `backend::tests::draws::a_filtering_sampler_on_an_unfilterable_texture_skips_the_draw`;
 //! - the rewrite does not honour primitive restart inside a fan, polygon, quad strip or line
 //!   loop: the restart value is drawn as a vertex (Eden's quad rewrite ignores restart too):
-//!   `draw::rewrite::tests::topologies_rewrite_with_restart_off`;
-//! - a 32-bit index equal to `0xFFFFFFFF` in a strip whose pipeline does not restart still
-//!   restarts on Metal, which always restarts (no wider index exists to rewrite it into):
 //!   `draw::rewrite::tests::the_rewrite_plan_for_every_topology_and_source`;
+//! - a 32-bit index equal to `0xFFFFFFFF` in a strip whose pipeline does not restart still
+//!   restarts: a strip pipeline names 32-bit indices, which turns restart on under Vulkan, and
+//!   Metal always restarts (`crate::pipeline::state`, "Topology"); no wider index exists to
+//!   rewrite it into: `draw::rewrite::tests::the_rewrite_plan_for_every_topology_and_source`;
 //! - line width is ignored (wgpu draws one-pixel lines) and the dynamic depth bias and stencil
 //!   masks are the pipeline's (slice R6);
 //! - a layered target draws into its base layer, a 3D target into slice 0 (above).
@@ -197,8 +204,7 @@ pub const INDIRECT_STRIDE: &str =
 /// More indirect draws in one command than [`MAX_INDIRECT_DRAWS`].
 pub const INDIRECT_DRAWS: &str = "an indirect draw command draws more than the wgpu backend's cap";
 /// An indirect draw that needs its indices rewritten.
-pub const INDIRECT_REWRITE: &str =
-    "the wgpu backend cannot rewrite the indices of an indirect draw (quads, fans, line loops, \
+pub const INDIRECT_REWRITE: &str = "the wgpu backend cannot rewrite the indices of an indirect draw (quads, fans, line loops, \
      8-bit indices or restart off)";
 /// A rewrite whose input or output is larger than the device binds, or whose vertex numbers run
 /// past the largest index.

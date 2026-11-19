@@ -271,9 +271,7 @@ fn binding_facts(
         naga::AddressSpace::Uniform | naga::AddressSpace::Storage { .. }
     );
     let size = match (count, element) {
-        (ArrayCount::Single, Some(inner)) if buffer => {
-            Some(u64::from(inner.size(module.to_ctx())))
-        }
+        (ArrayCount::Single, Some(inner)) if buffer => Some(u64::from(inner.size(module.to_ctx()))),
         _ => None,
     };
     BindingFacts {
