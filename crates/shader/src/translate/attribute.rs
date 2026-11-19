@@ -38,8 +38,9 @@
 //! # Rejections
 //!
 //! Each of the PR's `Require` checks on these forms is kept with its constant as a named
-//! rejection, in the PR's order, and so is each `NotImplementedException` of Eden's for the two
-//! forms ported from it:
+//! rejection, in the PR's order, except two parts of `IPA`'s that the first divergence below
+//! replaces (the sample location, and the offset register under `.OFFSET`); so is each
+//! `NotImplementedException` of Eden's for the two forms ported from it:
 //!
 //! | Instruction | Check, in order | Rejection |
 //! |---|---|---|
@@ -68,6 +69,12 @@
 //! | `PIXLD` | `.MY_INDEX` translated from Eden's Maxwell `PIXLD` | No translator: rejected | `tests::pixld_my_index_reads_the_sample_id` |
 //! | `S2UR` under a guard | The guard reads a uniform predicate (`GetUniformPred`), as the PR's `classify.h` says of `S2UR` ("its guard predicate is a uniform predicate") | The same, through `UPred` | `super::tests::a_guarded_s2ur_reads_a_uniform_predicate` |
 //! | `S2UR` | Writes the uniform register class (`SetUniformRegister`) | Writes the uniform register packed into Maxwell's register file (`native.h`, `UniformLayout`) | `tests::s2r_and_s2ur_read_each_special_register` |
+//!
+//! The port follows the PR's native translator (`ops_attr.cpp`, `ops_misc.cpp`), not its
+//! Maxwell lowering (`lower_to_maxwell.h`), which refuses `IPA.CENTROID` (`case 0x326`: bits
+//! 76..80 must be 0 or 4) and `CS2R.32` (`case 0x805`: bit 80 must be set) where the native
+//! translator accepts both (`ipa_frequency_and_centroid_change_nothing`,
+//! `cs2r_reads_zero_into_one_or_two_registers`).
 //!
 //! Eden's Maxwell `S2R` reads more registers than the PR (the invocation id and info, the
 //! packed thread id, the thread-kill flag, the Y direction, and zero for every other one); they
