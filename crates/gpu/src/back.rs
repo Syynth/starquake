@@ -13,11 +13,15 @@
 //! - [`fence`]: fences and completion (slice G15): the open command list, fenced releases,
 //!   increments and markers performed after host completion, the acquire waiter table they
 //!   latch, and the back thread's wait on its ring and on completion.
+//! - [`pipeline`]: the pipeline-key cache (slice G23): pipeline state to host pipelines, keyed
+//!   only on what the device does not set per draw, and the list of keys seen for precompiling
+//!   on the next boot.
 //!
 //! Later slices add draws (G18) and the executor that feeds them all from the ring (G19).
 
 pub mod buffer;
 pub mod copy;
 pub mod fence;
+pub mod pipeline;
 pub mod qmd;
 pub mod state;
