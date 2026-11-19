@@ -4,9 +4,10 @@
 //! [`Draws`] serves one 3D mirror (one channel's 3D class). The executor (slice G19) applies each
 //! ring entry to the mirror and then hands every word written to a 3D method to
 //! [`Draws::method`]; a word that starts a draw ([`call`]'s methods) derives it and appends its
-//! commands to the open list. After each macro the executor calls [`Draws::flush`], where Eden
-//! draws deferred instances (`DrawDeferred`), and it hands each run of `LOAD_ROOT_TABLE` words to
-//! [`Draws::load_root_table`] before the selector write that follows the run.
+//! commands to the open list. Eden draws deferred instances (`DrawDeferred`) after each macro;
+//! the ring marks no macro's end, so the executor calls [`Draws::flush`] at the boundaries its
+//! module docs list ("Deferred instanced draws"). It hands each run of `LOAD_ROOT_TABLE` words
+//! to [`Draws::load_root_table`] before the selector write that follows the run.
 //!
 //! # A draw, step by step
 //!
@@ -112,7 +113,8 @@
 //! The inline index draws, `DRAW_ZERO_INDEX` and `DRAW_AUTO` ([`Skip::Unhandled`]), indirect
 //! draws (they reach the 3D class through macros), storage buffers and images (the seam's
 //! resource table has no such kind yet), the catch-up before reading a conditional-render value
-//! that a pending release will write, tessellation and geometry shaders in the pipeline (the
+//! that a pending release will write (the executor's, `back::exec`), tessellation and geometry
+//! shaders in the pipeline (the
 //! shader crate's `HostStage` has vertex and fragment only), and the storage-buffer fetch of
 //! attributes past the host's limit: with `ATTRIBUTE_FETCH` set every attribute is still in the
 //! vertex layout, which the backend refuses, so such a draw is skipped as a failed pipeline

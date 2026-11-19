@@ -44,6 +44,9 @@
 //! - a present ([`CloseReason::Present`]), a wait for idle ([`CloseReason::WaitForIdle`]) or a
 //!   `SET_REFERENCE` ([`CloseReason::SetReference`], decided by the owner on 2026-11-18): the
 //!   executor (slice G19) calls [`Fences::close`];
+//! - a catch-up ([`CloseReason::CatchUp`]): the executor must see the host GPU finish the open
+//!   list before it goes on, for a write-back's readbacks or a conditional-render report a
+//!   release will write ([`Fences::settle`], below);
 //! - a fenced release one of whose 32-bit words has an unlatched registered waiter of the
 //!   release's address space ([`CloseReason::Waiter`]): [`Fences::attach`] closes after
 //!   attaching it, so the parked channel is not left waiting on recording. An 8-byte release
@@ -52,8 +55,14 @@
 //! - [`CLOSE_AFTER`] (1 ms, a **guess**, so that a CPU spinning on a semaphore is not starved)
 //!   of recording ([`CloseReason::Elapsed`]): [`Fences::record`] measures from the open list's
 //!   first command, on [`FenceClock::elapsed`], and closes once a command is recorded at or past
-//!   it. Nothing closes an open list that stops receiving commands before then, except the other
-//!   triggers; the ring empties at the latest when recording stops.
+//!   it. [`Fences::record_list`] records a batch of commands (one draw's, say) and measures once
+//!   after the whole batch, so a batch is never split between two lists
+//!   (`seams::a_recorded_list_stays_in_one_list_and_closes_once_after_it`). Nothing closes an
+//!   open list that stops receiving commands before then, except the other triggers; the ring
+//!   empties at the latest when recording stops.
+//!
+//! [`Fences::newest_submitted`] gives the newest fence a list was submitted with, whichever
+//! trigger closed it: the executor tells the caches of it before their next use.
 //!
 //! A list with no commands is never submitted: [`Fences::close`] returns `Ok(None)`, and since
 //! actions join the open list only when it has commands, none is left behind.
@@ -84,11 +93,17 @@
 //!   [`FenceClock::gpu_timestamp`] at [`crate::sema::RELEASE_TIMESTAMP_OFFSET`], in one write.
 //! - **A reduction** ([`ReleaseOp::Reduce`]) reads the semaphore at the payload's width, applies
 //!   [`crate::sema::Reduction`] and writes the result back as a release of that value would.
-//! - Either then latches, for each 32-bit word the release wrote (one for a 4-byte release, two
-//!   for an 8-byte one, four for the 16-byte structure), every waiter of the release's address
-//!   space on that word's address that the word meets ([`WaiterTable::on_write`]);
-//!   [`Report::latched`] says whether one was. A waiter on the high word of an 8-byte release
-//!   is latched by that word (`a_wide_release_latches_a_waiter_on_its_high_word`).
+//! - Either then reads back the bytes it wrote, through the same memory, and latches, for each
+//!   32-bit word read back (one for a 4-byte release, two for an 8-byte one, four for the
+//!   16-byte structure), every waiter of the release's address space on that word's address that
+//!   the word meets ([`WaiterTable::on_write`]); [`Report::latched`] says whether one was. The
+//!   read-back is what a release to the syncpoint shim latches with: the counter's new value,
+//!   not the payload (`production::a_release_to_the_shim_latches_with_the_counter_it_reads_back`;
+//!   the wiring note on issue #330). When the read-back faults, the waiters are latched with the
+//!   bytes written, logged at warning level
+//!   (`seams::a_release_whose_read_back_faults_latches_with_the_bytes_written`). A waiter on the
+//!   high word of an 8-byte release is latched by that word
+//!   (`a_wide_release_latches_a_waiter_on_its_high_word`).
 //! - A release whose memory access fails ([`GpuFault`]) writes nothing that the memory refused,
 //!   latches nothing, and is logged at warning level and listed in [`Report::failed`]; the
 //!   actions after it are still performed.
@@ -97,9 +112,19 @@
 //! - **A marker** applies its [`OrderedUpdate`], if it has one: [`GpuVm::apply`], then
 //!   [`GpuCompletion::GpuOrdered`] with its ticket if it has one; its token goes in
 //!   [`Report::markers`] for the front. [`GpuVm::apply`] also frees a destroyed sparse region's
-//!   GPU-only storage (slice G22, its module docs' "The GPU-only store"). Not here yet: dropping
-//!   the range from the buffer and texture caches (G16, G17) and the shader cache's
-//!   `invalidate`; each joins this step when the executor (G19) wires it.
+//!   GPU-only storage (slice G22, its module docs' "The GPU-only store"). The update and its
+//!   address space are kept for [`Fences::take_applied`], from which the executor (slice G19)
+//!   drops the range from that space's buffer and texture caches and calls the shader cache's
+//!   `invalidate` (`seams::applied_updates_are_handed_over_in_order_with_their_space`).
+//!
+//! # The catch-up
+//!
+//! [`Fences::settle`] makes every fenced release of one address space that writes a byte of a
+//! range, and is not yet performed, visible: it closes the open list if that list holds one
+//! ([`CloseReason::CatchUp`]), waits for the newest list in flight that holds one
+//! ([`starquake_render::Backend::wait`], bounded by its caller's timeout), and runs completion.
+//! A wait that times out is [`FenceError::CatchUpTimedOut`], after completion has performed what
+//! did complete. Pinned in `fence/tests/seams.rs`.
 //!
 //! **The debugging switch.** Under [`Mode::AtRecord`] every action is performed when it is
 //! attached, whatever is recorded or in flight (the owner's ruling: "performing at record time is
@@ -177,14 +202,11 @@
 //! - Releases to the syncpoint shim (gpu-protocol, "Semaphore acquires") go through the
 //!   release's [`GpuMemory`] like any other; the production memory
 //!   ([`crate::memory::VmMemory`], slice G22), which is the one that translates addresses, turns
-//!   one into an increment of that syncpoint. Such a release still latches waiters with the
-//!   words it would have written (its payload, and the timestamp of a 16-byte one), not with the
-//!   counter's new value: an open item, which a read-back of the words through the memory after
-//!   the write would settle.
-//! - Releases name no address space, so each [`FencedAction::Release`] carries the memory it
-//!   writes and that memory's [`AsId`], chosen by the executor when it attaches the action
-//!   (whether the ring's `Release` should name its channel is the executor's, slice G19); the
-//!   waiter table's key is discussed in its own docs.
+//!   one into an increment of that syncpoint, and the read-back latches with the new counter
+//!   ("Completion" above).
+//! - Each [`FencedAction::Release`] carries the memory it writes and that memory's [`AsId`],
+//!   which the executor resolves from the issuing channel the ring's `Release` names (decided by
+//!   the owner on 2026-11-18); the waiter table's key is discussed in its own docs.
 //! - A syncpoint increment closes nothing: a channel waiting on a submission fence is a front
 //!   wait (slice G14, `crate::front`), not a waiter in the table, so the open list it waits on is
 //!   closed by the other triggers (the ring empties once the front has nothing to send; at the

@@ -891,6 +891,8 @@ fn an_entry_for_an_unknown_channel_is_the_exact_error() {
 fn an_unbound_class_after_an_unbind_is_refused() {
     let mut rig = Rig::new();
     rig.run("bind channel=3 subchannel=0 class=0xc797\nbind channel=3 subchannel=0 class=0\n");
+    // Class 0 leaves the subchannel unbound, not bound to class 0.
+    assert_eq!(rig.exec.bound(CHANNEL, Subchannel::new(0).unwrap()), None);
     let entry = parse_text("write channel=3 class=0xc797 method=0x45 value=0x1\n").unwrap();
     assert_eq!(
         rig.exec.apply(&entry[0]),
@@ -1605,7 +1607,7 @@ fn a_copy_reading_a_gpu_drawn_target_writes_it_back_first() {
         ]),
     );
     rig.run(&(draw_state() + &draw()));
-    let (_, events) = captured(|| rig.run(&copy));
+    let ((), events) = captured(|| rig.run(&copy));
     let counters = rig.exec.counters();
     assert_eq!(counters.write_backs, 1);
     // The recording backend cannot know the bytes a draw rendered: the write-back fails, is
@@ -1699,4 +1701,31 @@ fn a_pending_compute_program_follows_the_wait_setting() {
         assert_eq!(rig.exec.counters().dispatches_skipped, 1);
         assert_eq!(rig.word(SEM), 0x11, "{setting:?}");
     }
+}
+
+#[test]
+fn an_unmapped_buffer_is_destroyed_after_the_list_that_used_it() {
+    let mut rig = Rig::new();
+    let vm = Arc::new(GpuVm::new());
+    let range = PageRange::new(VERTICES, PAGE_SIZE).unwrap();
+    rig.ordered.insert(
+        MarkerToken(3),
+        OrderedUpdate {
+            change: Some(VmChange {
+                space: SPACE,
+                vm,
+                update: VmUpdate::Unmap { range },
+            }),
+            ticket: None,
+        },
+    );
+    // The vertex buffer (b0) is used by list 1; the unmap drops it after that list.
+    rig.run(&(draw_state() + &draw() + "wait-for-idle channel=3\nmarker token=0x3\n"));
+    // The marker waits on list 1, which the recording backend has finished.
+    rig.exec.complete();
+    let snapshot = rig.recording.as_ref().unwrap().snapshot();
+    assert!(
+        snapshot.contains("destroy b0 after fence 1: now"),
+        "{snapshot}"
+    );
 }

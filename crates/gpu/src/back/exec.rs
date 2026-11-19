@@ -41,7 +41,7 @@
 //! | `Syncpoint` | a fenced increment |
 //! | `Marker` | a fenced marker, with the ordered update the front filed under its token ([`OrderedTable::take`]) |
 //! | `WaitForIdle`, `SetReference` | the open list is closed ([`CloseReason::WaitForIdle`], [`CloseReason::SetReference`]) |
-//! | `Invalidate` | the CPU-write drain of the channel's address space (below) |
+//! | `Invalidate` | the CPU-write drain of the channel's address space (below; a divergence, under "Divergences") |
 //! | `Present` | a `Command::Present` of the texture cache's view, then the list is closed ([`CloseReason::Present`]) |
 //! | `CaptureControl` | counted ([`ExecCounters::captures`]); captures are slice G20's |
 //!
@@ -73,7 +73,7 @@
 //! is a `LAUNCH_DMA` or `PIXELS_FROM_MEMORY_SRC_Y0_INT`.
 //!
 //! Writes the back makes to guest memory go to every cache of the address space and the shader
-//! cache: a copy's destination and the inline writes (through [`CopySink::invalidate`]), the
+//! cache: a copy's destination and the inline writes (through [`CopySink::invalidate`](crate::back::copy::CopySink::invalidate)), the
 //! inline QMD's 256 bytes (the wiring note on issue #330: "invalidate the inline-QMD range in the
 //! back's caches"), and a write-back's ranges. An applied ordered update drops its range from
 //! that space's caches ([`BufferCache::apply_update`], [`TextureCache::apply_update`]) and goes
@@ -82,7 +82,7 @@
 //! # Copies of images the texture cache holds
 //!
 //! When a copy reads or partly overwrites memory the texture cache holds a GPU-modified image
-//! of ([`CopySink::make_current`], [`TextureCache::needs_write_back`]), the image is written
+//! of ([`CopySink::make_current`](crate::back::copy::CopySink::make_current), [`TextureCache::needs_write_back`]), the image is written
 //! back first: its readbacks are recorded, the open list is closed ([`CloseReason::CatchUp`]),
 //! the executor waits for it ([`Backend::wait`], at most [`ExecConfig::catch_up`]) and writes
 //! the readbacks to guest memory ([`TextureCache::finish_write_back`]); then the copy runs on the
@@ -126,10 +126,15 @@
 //! into a list closed by then, and nothing has used them since, so a fence at or after theirs
 //! keeps what they used alive long enough. Every use goes through this catch-up first: a draw,
 //! a dispatch (before each of a signal's dispatches, since a release between two can close the
-//! list for a waiter), a copy, a present and the drain
-//! (`tests::a_list_closed_between_two_draws_of_one_run_keeps_their_buffers_apart`). Two 3D
-//! engines drawing into one list each set their render targets: a draw path that did not make
-//! the last draw is told its targets are gone the same way.
+//! list for a waiter), a copy, a present, the drain and an applied update. Pinned for the caches
+//! by `tests::an_unmapped_buffer_is_destroyed_after_the_list_that_used_it` and for the draw
+//! path by `tests::a_list_closed_between_two_draws_of_one_run_sets_targets_again`; the catch-up
+//! between two dispatches of one signal has no test (a waiter would have to close the list
+//! between them). Two 3D engines drawing into one list each set their render targets: a draw
+//! path that did not make the last draw is told its targets are gone the same way
+//! (`tests::two_channels_drawing_into_one_list_each_set_their_targets`), and so is one drawing
+//! after a dispatch or present
+//! (`tests::a_dispatch_between_two_draws_makes_the_second_set_its_targets`).
 //!
 //! # Presents
 //!
@@ -137,10 +142,22 @@
 //! read through the space [`Executor::set_present_space`] names; the wiring (slice G21) sets the
 //! title's. A **guess**: one GPU address space per title. The image is a block-linear 2D image
 //! of the request's size and block height, in the texture cache as any sampled texture
-//! ([`present`]), so a frame the GPU rendered is found as the render target it was drawn into.
+//! (`present`), so a frame the GPU rendered is found as the render target it was drawn into.
 //! The frame number counts presents from 0. The command carries no fence wait (owner's
 //! decision of 2026-11-12, "Presents pace the game through a buffer queue"); it is ordered after
 //! every command before it by its place in the list, and the list is closed after it.
+//!
+//! # Divergences
+//!
+//! - **Every `Invalidate` entry drains CPU writes.** Eden-NX2 gathers the CPU's dirty memory
+//!   (`InvalidateGPUCache`) when `MEM_OP_B` is written (`puller.cpp`, the `MemOpB` case,
+//!   `eden-nx2/src/video_core/engines/puller.cpp` @ 50fa86bb), whatever the operation; the
+//!   front sends an `Invalidate` for each `MEM_OP_D`, which carries the operation, so the drain
+//!   here runs at `MEM_OP_D`, for every operation. Both run before the work that follows the
+//!   memory operation. `tests::an_invalidate_entry_drains_cpu_writes_to_the_shader_cache`.
+//! - **Deferred instanced draws** and **copies of images the texture cache holds**: above.
+//! - **A refused entry is logged at debug level**, not as an error: a guest can repeat one at
+//!   will; [`ExecCounters::failed`] counts them.
 //!
 //! # Not handled here
 //!
@@ -776,10 +793,14 @@ impl Executor {
         Ok(())
     }
 
-    /// Hands the updates the fence path applied to the caches: each drops its range.
+    /// Hands the updates the fence path applied to the caches: each drops its range, once the
+    /// space's caches know of the newest list, so what they drop is destroyed after the list
+    /// that last used it.
     fn after_fences(&mut self) {
+        let newest = self.fences.newest_submitted();
         for (space, update) in self.fences.take_applied() {
             if let Some(state) = self.spaces.get_mut(&space) {
+                catch_up_space(state, newest);
                 state.buffers.apply_update(&update);
                 state.textures.apply_update(&update);
             }
