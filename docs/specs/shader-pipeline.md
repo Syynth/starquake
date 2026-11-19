@@ -195,10 +195,10 @@ flowchart LR
     bytes["Program bytes<br/>(header + instructions)"] --> capture["Capture<br/>extent, hash"]
     capture --> decode["SM86 decoder<br/>words → Op"]
     decode --> flow["Flow analysis<br/>blocks, barriers, calls, BRX"]
-    flow --> build["IR build<br/>per-instruction translators"]
-    build --> struct["Structurizer<br/>goto elimination"]
-    struct --> ssa["SSA, constant propagation,<br/>dead code"]
-    ssa --> passes["Correctness passes<br/>cbufs, textures, I/O, globals"]
+    flow --> build["IR build<br/>translation driver and<br/>per-instruction translators"]
+    build --> ssa["SSA, constant propagation,<br/>dead code"]
+    ssa --> struct["Structurizer<br/>goto elimination"]
+    struct --> passes["Correctness passes<br/>cbufs, textures, I/O, globals"]
     passes --> lower["Lower to naga::Module"]
     lower --> valid["naga validation"]
     valid --> out["naga module + resource,<br/>input and output tables<br/>(wgpu takes the module)"]
@@ -303,9 +303,24 @@ analysis turns into plain edges first. Divergence (threads of a warp taking diff
 not modelled: host shaders run each invocation independently, and reconvergence points become
 the ends of structured regions.
 
-**Building the IR.** Flow analysis (slice 10) builds the IR's basic blocks from the flow graph,
-and the structurizer (slice 11) settles the structured IR that the translators fill (decided by
-the owner, 2026-11-18).
+Bounds and choices, as built in slice 11 (decided by the owner, 2026-11-19): the structurizer's
+work is bounded by `MAX_STRUCTURE_WORK` = 2^28 steps, a **guess** (about 55 GiB in the worst
+case); the IR's nesting is bounded by `ir::MAX_NESTING` = 256, which 257 chained branches reach;
+and a branch condition is kept in a goto variable of its own, set right after its block, where
+Eden reads the guest condition again where it is tested (a listed departure).
+
+**Building the IR.** Flow analysis (slice 10) builds the IR's basic blocks from the flow graph
+(decided by the owner, 2026-11-18). The translators fill those blocks, through the translation
+driver (slice 12i, "Instruction translation"), and SSA runs on that graph, before structuring; the
+structurizer (slice 11) then turns the filled graph into the structured IR (decided by the owner,
+2026-11-19, which replaces 2026-11-18's "the structured IR that the translators fill"): the SSA
+rewrite needs each block's predecessors, which a structured block, having no terminator, would have
+to take from the tree, and the structured form's scope rule leaves values that cross a body to the
+structurizer. So the order is flow analysis, translation, the SSA rewrite and the first passes
+(slice 8), then the structurizer (slice 11). Eden structures first
+(`frontend/maxwell/translate_program.cpp` @ cf654052 calls `BuildASL` before `SsaRewritePass`) and
+rewrites over the predecessors its structurizer records; starquake's order is a listed departure,
+in slice 8's module docs.
 
 ### The intermediate representation
 
@@ -320,7 +335,8 @@ The IR is designed for this crate and borrows Eden's operation set and pass sema
   does.
 - **After structuring:** a tree of structured statements over blocks.
 - **SSA:** register accesses are rewritten into SSA values with Eden's algorithm (Braun et al.,
-  `ir_opt/ssa_rewrite_pass.cpp`).
+  `ir_opt/ssa_rewrite_pass.cpp`), on the control-flow graph, before structuring; the rewrite
+  refuses a structured function (decided by the owner, 2026-11-19; "Building the IR").
 - **Types:** `U1` (predicate), `U32`, `U64`, `F16x2`, `F32`, `F64`, and small vectors for
   texture coordinates and results, as in Eden's `frontend/ir/type.h`.
 - **Operations:** arithmetic and conversions with explicit modifiers (saturate, flush-to-zero,
@@ -357,6 +373,36 @@ not be copied from Eden's Maxwell code:
 
 An instruction a translator does not handle produces a rejection naming it; there is no partial
 translation.
+
+**Guards** (decided by the owner, 2026-11-19). Every guarded instruction becomes a conditional
+block, pure ones included, as the first paragraph says; PR #4588 keeps a guarded pure
+instruction as a select (`guard_select`), and turning such blocks into selects is a later
+optimisation pass, not the translators' work. Flow analysis's own docs follow this (slice 10's
+"What a block holds"). A block whose guard flow analysis has already tested (`guard_tested`)
+holds one instruction, whose guard the translator ignores.
+
+**The translation driver** (slice 12i; decided by the owner, 2026-11-19). The group translators
+(12a to 12h) each translate one instruction. The driver is what runs them over a program: it
+walks the blocks flow analysis builds (`IrBlocks::sources`), decodes each flow block's
+instructions, and dispatches each to its group's translator, which inserts its IR before the
+block's terminator, honouring the block's `guard_tested`. It owns the helper that builds the
+conditional block for a guard and the reader that turns an instruction's source operands into IR
+values, which the group translators share rather than each keeping its own. It replaces slice 1's
+straight-line `translate()` and its `MOV` path, which until then is the production entry. A first
+frame needs it.
+
+**Where the references disagree, as built in the translators** (decided by the owner, 2026-11-19).
+Where PR #4588's native visitor and its lowering disagree (`SHFL` 0x989, `DEPBAR` scoreboard 0,
+`WARPSYNC`), the native visitor is followed. The IR interpreter's `INACTIVE_LANE_VALUE`
+(0xdeadbeef, what a shuffle from an inactive lane gives on its one-lane warp) is the interpreter's
+choice, since SPIR-V leaves that read undefined; it is not zero, so a translator that does not
+select it away changes a test's result. `F2I.FTZ` with a half operand does not emulate
+flush-to-zero, as PR #4588's `denorm_cares` decides, although decision 10 reads as emulating it on
+every float-to-integer conversion: a listed divergence, marked as a guess until a trace or
+`nvdisasm` check shows a title depends on it. `IPA.OFFSET` is carried in the IR
+(`InterpolateAtOffset`, lowered in slice 17), where PR #4588 rejects it. `AL2P` and `PIXLD` are
+translated from Eden's Maxwell translators, since PR #4588 has no translator for them. Each is
+listed in its translator's module docs and pinned by a test.
 
 ### Passes needed for correctness
 
@@ -397,7 +443,9 @@ In order (following Eden's order in `frontend/maxwell/translate_program.cpp`, li
    indexed accesses are bounds-checked. Slice 16 owns this pass (decided by the owner,
    2026-11-18).
 7. **Dead code elimination**, then **collect info**: the resource table, the interface, and the
-   host features the shader needs.
+   host features the shader needs. Dead code elimination is Eden's single walk in post order,
+   so dead phi cycles in loops survive it; a mark-and-sweep that removes them is not built (as
+   built in slice 8; decided by the owner, 2026-11-19).
 8. **Host lowering passes**, only where the target needs them: f64 to f32 on Metal, which has no
    64-bit float (Eden's `ir_opt/lower_fp64_to_fp32.cpp`; Metal fact from the Metal Shading
    Language specification, not re-checked for this draft), and f16 to f32 where the host lacks
@@ -771,27 +819,29 @@ One pull request each. "Offline" means testable with no game and no GPU. Slices 
 | 8 | SSA rewrite, identity removal, constant propagation, dead code elimination | 5, 7 | Eden `ir_opt/ssa_rewrite_pass.cpp`, `identity_removal_pass.cpp`, `constant_propagation_pass.cpp`, `dead_code_elimination_pass.cpp` | Golden IR; interpreter gives the same result before and after | C |
 | 9 | Questions and answers, variant key, driver-constants layout (types and the exchange loop) | 5 | New; Eden `environment.h`, `runtime_info.h` for content | Round-cap edges; deterministic key encoding (golden bytes) | C |
 | 10 | Flow analysis: blocks, both barrier models, calls, `BRX`; builds the IR's basic blocks from the flow graph | 3, 6h, 9 | PR `flow.cpp`, `flow.h` | Synthetic programs; the two models agree; linear-time test | D |
-| 11 | Structurizer; settles the structured IR the translators fill | 5, 7, 10 | Eden `structured_control_flow.cpp` | Golden IR; interpreter equivalence on generated control-flow graphs (proptest) | D |
+| 11 | Structurizer; turns the translated graph, after SSA, into the structured IR (translation, 12i, and SSA, 8, come before it; decided by the owner, 2026-11-19, where 2026-11-18 had the translators fill the structured IR) | 5, 7, 10 | Eden `structured_control_flow.cpp` | Golden IR; interpreter equivalence on generated control-flow graphs (proptest) | D |
 | 12a–12h | Instruction translators, one per decoder group 6a–6h (tensor excluded) | the matching 6x, 5, 7; 12h also 10 (its branches become flow-analysis edges) | PR `ops_*.cpp`; Eden `translate/impl/` | Interpreter cases per instruction, including PR #4588's cases where synthetic | D (parallel with each other) |
-| 13 | Constant-buffer and texture pass | 8, 9, 12e, 12f | Eden `ir_opt/texture_pass.cpp`, PR's version of it | Golden resource tables; untraceable handle rejected with the exact reason | E |
-| 14 | Global memory to storage buffers | 8, 12e | Eden `global_memory_to_storage_buffer_pass.cpp` | Golden IR; linear-time test | E |
-| 15 | Inputs and outputs, collect info | 2, 8, 12g | Eden `attribute.h`, `collect_shader_info_pass.cpp`, `exit_program.cpp` | Golden interface tables per stage | E |
+| 12i | **Translation driver.** Walks `IrBlocks::sources`, decodes each flow block's instructions and dispatches them to the group translators, inserting before each block's terminator and honouring `guard_tested`; owns the shared guard helper (a guarded instruction becomes a conditional block) and the shared source reader; retires slice 1's straight-line `translate()` and its `MOV` path ("Instruction translation"; decided by the owner, 2026-11-19) | 10, 12a–12h | PR `translate.cpp`, `visitor.cpp`; Eden `frontend/maxwell/translate/translate.cpp` | Programs from the test assembler with branches, loops and guarded instructions of every group, run in the interpreter against the expected machine; a guarded pure instruction becomes a conditional block; a `guard_tested` block's guard is not tested twice; a program with an instruction no group translates is rejected naming it | D (after 12a–12h) |
+| 13 | Constant-buffer and texture pass | 8, 9, 12e, 12f, 12i | Eden `ir_opt/texture_pass.cpp`, PR's version of it | Golden resource tables; untraceable handle rejected with the exact reason | E |
+| 14 | Global memory to storage buffers | 8, 12e, 12i | Eden `global_memory_to_storage_buffer_pass.cpp` | Golden IR; linear-time test | E |
+| 15 | Inputs and outputs, collect info | 2, 8, 12g, 12i | Eden `attribute.h`, `collect_shader_info_pass.cpp`, `exit_program.cpp` | Golden interface tables per stage | E |
 | 16 | Lowering to naga: arithmetic, control flow, compute entry points; the local and shared memory pass (pass 6) | 1, 8, 11 | New | naga validation on every test module | E |
-| 17 | Lowering to naga: graphics entry points, interface, resources (group and binding assignment), textures and swizzles from the variant key, driver constants; the sampler LOD bias applied in the shader, guest 1D arrays sampled as 2D textures of height 1, and the guest y-flip and depth remap in the vertex shader, for the render backend's R7 (decided by the owner, 2026-11-19) | 13, 15, 16 | New | Same, plus golden resource and interface tables for end-to-end fixtures; wgpu acceptance locally; the speed test ("The offline test harness") | F |
+| 17 | Lowering to naga: graphics entry points, interface, resources (group and binding assignment), textures and swizzles from the variant key, driver constants; the sampler LOD bias applied in the shader, guest 1D arrays sampled as 2D textures of height 1, and the guest y-flip and depth remap in the vertex shader, for the render backend's R7 (decided by the owner, 2026-11-19) | 12i, 13, 15, 16 | New | Same, plus golden resource and interface tables for end-to-end fixtures; wgpu acceptance locally; the speed test ("The offline test harness") | F |
 | 18 | Host lowering passes: f64 and f16 to f32, subgroup-size requirement | 7, 8, 16 | Eden `lower_fp64_to_fp32.cpp`, `lower_fp16_to_fp32.cpp` | Interpreter equivalence within stated precision | F |
 | 19 | Shader cache: three layers, invalidation, negative cache (a rejection names the failing program), tickets on an executor; adapts to the GPU crate's `ShaderLookup` seam, `wait(ticket)` included (decided by the owner, 2026-11-19) | 3, 9 (a fake translator before 17) | New; Eden-NX2 rows 90, 112 | Deterministic tests with a scripted executor; invalidation edges | D |
 | 20 | Shader capture format (the one format; `SQGC` embeds it) and `cargo xtask shader-replay` | 3, 9 | New | Golden bytes; replay of a synthetic capture | E |
 | 21 | Persistent cache entries: inputs only (program bytes, answers, variant key), serialise, version, load and retranslate on workers; defines `ShaderStamp`, the digest of an entry's key (decided by the owner, 2026-11-19) | 19, 20 | New | Golden bytes; a stale translator version is refused | after M3 |
 | 22 | Final-code emission for a direct backend: naga's SPIR-V or MSL writer with the `HostTarget`'s binding map and bounds-check policy | 17; a direct backend scheduled (render-backend, "Deferred") | New | SPIR-V read back and `spirv-val` where installed; MSL goldens and Apple's compiler on a Mac | when a direct backend is scheduled |
 
-The critical path to a first present is 1 → 4 → 6h → 10 → 11 → 16 → 17, with 5 → 7 ahead of 8,
-11 and every translator. Slice 17 also waits for 13 (after 8, 9 and 6e/6f → 12e/12f) and 15
-(after 2, 8 and 6g → 12g). A first present also needs the translators its programs use: 12a,
-12b, 12g and 12h (12h after 10). The shader cache (19, after 3 and 9) is on the path too, since
-the GPU crate looks programs up only through it (gpu-protocol G18). Waves C and D are where
-agents fan out: up to nine decoder slices and eight translator slices, limited by the three or
-four build agents a machine can run (`docs/roadmap.md`). The table and this sentence follow what
-the slices need (decided by the owner, 2026-11-18).
+The critical path to a first present is 1 → 4 → 6h → 10 → 11 → 16 → 17, with 5 → 7 ahead of 8, 11
+and every translator. Slice 17 also waits for 13 (after 8, 9 and 6e/6f → 12e/12f) and 15 (after 2,
+8 and 6g → 12g). A first present also needs the translators its programs use: 12a, 12b, 12g and 12h
+(12h after 10), and the translation driver that runs them, 12i (after 12a to 12h; decided by the
+owner, 2026-11-19). The shader cache (19, after 3 and 9) is on the path too, since the GPU crate
+looks programs up only through it (gpu-protocol G18). Waves C and D are where agents fan out: up to
+nine decoder slices and eight translator slices, limited by the three or four build agents a
+machine can run (`docs/roadmap.md`). The table and this sentence follow what the slices need
+(decided by the owner, 2026-11-18).
 
 ## What to verify before building
 
@@ -1030,6 +1080,10 @@ are in `docs/decision-log.md` (2026-11-12).
     them only on conversions (float to integer, float to half), where the effect is large and
     exact emulation is cheap; (b) emulate everywhere in software, which is slow and large.
     **Recommended: (a),** with the list in the module docs and a test pinning each listed case.
+
+    One conversion is excepted, as built in slice 12b (decided by the owner, 2026-11-19):
+    `F2I.FTZ` with a half operand does not flush, following PR #4588's `denorm_cares`; a listed
+    divergence and a guess ("Instruction translation", "Where the references disagree").
 
 11. **Decided by the owner, 2026-11-12:** after milestone 3, with the decoder reading their
     instructions from the start.
