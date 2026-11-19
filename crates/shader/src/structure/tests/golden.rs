@@ -275,36 +275,6 @@ fn the_work_of_each_golden_graph() {
     }
 }
 
-/// A goto lifted into a loop: block1, which nothing reaches, jumps back to block0 after it.
-const LIFTED: &str = "block0:
-    %0 = SetRegister r1, u32 1
-    return
-block1:
-    jump block0
-";
-
-#[test]
-fn the_work_of_each_golden_graph() {
-    // The exact work of each graph, as literals: `tests::limits::the_work_limit_at_its_edge`
-    // measures the work before it tests the limit, so it cannot see a loop that stops charging
-    // (the work would only shrink). Between them these graphs run every charged loop of the
-    // pass (the module docs, "Limits"): `level`, `directly_related`, `sibling_from_nephew`,
-    // `are_ordered` and `splice`, the `SanitizeNoBreaks` walk of a lift (LIFTED), the
-    // emission's statements and its condition walk. Each count was taken from this code; a
-    // change to one is explained in its pull request.
-    for (name, graph, work) in [
-        ("single", SINGLE, 14),
-        ("diamond", DIAMOND, 159),
-        ("irreducible", IRREDUCIBLE, 253),
-        ("nested_break", NESTED_BREAK, 322),
-        ("early_return", EARLY_RETURN, 220),
-        ("jump_table", JUMP_TABLE, 570),
-        ("lifted", LIFTED, 55),
-    ] {
-        assert_eq!(structured(graph).work, work, "the work of {name}");
-    }
-}
-
 /// Two overlapping loops, so a backward goto is eliminated as a loop after moving out of the
 /// loop a later goto made around it: block1 counts r1 and block2 counts r2, which jumps back
 /// to block1 while r2 is below r4; block3 counts r3 and jumps back to block2 while r3 is below
