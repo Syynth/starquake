@@ -124,7 +124,8 @@ impl CaptureWriter {
         let mut writer = Self {
             sink,
             limits,
-            size_limit,
+            // Set below, once the start is known to fit (`LimitTooSmall`, not `OverLimit`).
+            size_limit: u64::MAX,
             written: 0,
             order: Order::default(),
             sources: HashMap::new(),
@@ -144,6 +145,7 @@ impl CaptureWriter {
                 needed,
             });
         }
+        writer.size_limit = size_limit;
         writer.written = len64(header.len());
         writer.sink.write(header);
         writer.emit(RecordKind::Start, Facts::default(), prefix, body);
