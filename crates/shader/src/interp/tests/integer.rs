@@ -184,6 +184,10 @@ fn bit_field_insert_inside_and_past_bit_31() {
         0x1234
     );
     assert_eq!(
+        u32_op("BitFieldInsert u32 0x1234, u32 0xff, u32 33, u32 8"),
+        0x1234
+    );
+    assert_eq!(
         u32_op("BitFieldInsert u32 0x1234, u32 0xff, u32 4, u32 0"),
         0x1234
     );

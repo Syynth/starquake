@@ -65,7 +65,7 @@
 //!   so a test relying on one is wrong), then for bounds ([`InterpError::OutOfBounds`]). 8- and
 //!   16-bit loads zero- or sign-extend as their names say. The 32-bit integer atomics of the
 //!   global, storage and shared spaces return the old value; `Inc` and `Dec` wrap as Eden's
-//!   `CasLoop` helpers do (`spirv_emit_context.cpp`: increment gives 0 when `old >= value`,
+//!   `CasFunction` does (`spirv_emit_context.cpp`: increment gives 0 when `old >= value`,
 //!   decrement gives `value` when `old == 0 || old > value`).
 //! - **Composites, selects, bit casts and packing** (`emit_spirv_composite.cpp`,
 //!   `emit_spirv_select.cpp`, `emit_spirv_bitwise_conversion.cpp`): component 0 is the low
@@ -94,16 +94,42 @@
 //!   range it saturates and a NaN gives 0 (SPIR-V leaves both undefined). The 8- and 16-bit
 //!   integer sources take the low bits of their 32-bit argument, sign- or zero-extended (Eden's
 //!   `ExtractS8` and siblings); 16-bit integer results are sign- or zero-extended into 32 bits.
-//! - **Texture and image operations** run against a script: [`Machine::images`] lists the calls
-//!   a test expects, in order, each with its reply ([`ScriptedImage`]). A call that does not
-//!   match the next scripted one, or comes after the last, is an error, so tests stay pure.
+//! - **Texture and image operations** (every opcode whose flags are texture information) run
+//!   against a script: [`Machine::images`] lists the calls a test expects, in order, each with
+//!   its reply ([`ScriptedImage`]). A call after the last scripted one
+//!   ([`InterpError::ImageScriptEnded`]), a call that differs from the next one in its opcode,
+//!   texture information or argument values ([`InterpError::ImageMismatch`]), and then a reply
+//!   not of the opcode's result type ([`InterpError::ImageReply`]) are errors, checked in that
+//!   order, and a refused call leaves the script as it was. Tests stay pure.
 //! - **Warp operations**: only `LaneId` (from [`SystemValues`]); votes, shuffles, ballots and
 //!   derivatives need the rest of the warp and are not supported yet.
 //!
 //! An operation not listed (for example `PhiMove`, `Join`, the `Get*FromOp` pseudo-operations,
-//! `EmitVertex`, the float atomics, the warp operations other than `LaneId`) is
+//! `EmitVertex`, `EndPrimitive`, `InvocationInfo`, `RenderArea`, the `SR_WScaleFactor`
+//! values, the 64-bit and float atomics, the warp operations other than `LaneId`) is
 //! [`InterpError::Unsupported`], naming the opcode; translator slices add semantics as they
 //! need them.
+//!
+//! # Where the interpreter differs from its references
+//!
+//! Each is a choice for a test oracle, pinned by the named test in `tests`:
+//!
+//! - `FPClamp32` of a NaN gives the low bound; PR #4588's `EvaluateVertex` uses `std::clamp`,
+//!   which passes the NaN through (`float::clamp_and_saturate_take_a_nan_to_the_low_bound`).
+//! - A misaligned global, storage, shared or local access is [`InterpError::Misaligned`];
+//!   Eden's emitter divides the offset by the access size, which reads the aligned-down
+//!   address (`StorageIndex`, `emit_spirv_shared_memory.cpp`'s `Pointer`), and its shared
+//!   64- and 128-bit word path aligns only to 4 (`memory::global_alignment_then_bounds`,
+//!   `memory::shared_memory`). Constant buffers do align down, as Eden does.
+//! - An access outside the bytes a test gave is [`InterpError::OutOfBounds`], where a host
+//!   with robust buffer access returns zero (`memory::constant_buffer_bounds` and the other
+//!   memory tests).
+//! - An attribute or patch the test did not give is [`InterpError::MissingInput`]; Eden's
+//!   indexed load returns `0.0` for an attribute the program does not declare (`make_load`'s
+//!   default case) (`memory::attributes_by_word_and_vertex`).
+//! - Directed rounding on `FPAdd64`, `FPMul64` and `FPFma64` is
+//!   [`InterpError::DirectedRounding`] rather than modelled
+//!   (`float::double_precision_rounds_to_nearest_and_refuses_directed_rounding`).
 //!
 //! # Limits
 //!
@@ -306,7 +332,7 @@ pub enum InterpError {
         opcode: Opcode,
     },
     /// The run reached its step limit.
-    #[error("the run stopped at its limit of {limit} steps")]
+    #[error("the run stopped at its limit of {}", count(*limit, "step"))]
     StepLimit {
         /// The limit.
         limit: u64,
@@ -346,7 +372,10 @@ pub enum InterpError {
     #[error("control reached the unreachable point in {0}")]
     ReachedUnreachable(Site),
     /// A memory access is not aligned to its size.
-    #[error("{at}: a {size}-byte access to {space} at {offset:#x} is not aligned")]
+    #[error(
+        "{at}: an access of {} to {space} at {offset:#x} is not aligned",
+        count(*size, "byte")
+    )]
     Misaligned {
         /// The instruction.
         at: Value,
@@ -359,7 +388,9 @@ pub enum InterpError {
     },
     /// A memory access falls outside the bytes the machine holds.
     #[error(
-        "{at}: a {size}-byte access to {space} at {offset:#x} is outside the {len} bytes it holds"
+        "{at}: an access of {} to {space} at {offset:#x} is outside the {} it holds",
+        count(*size, "byte"),
+        count(*len, "byte")
     )]
     OutOfBounds {
         /// The instruction.
@@ -751,6 +782,15 @@ impl Run<'_> {
         {
             *slot = Some(val);
         }
+    }
+}
+
+/// `n` and `noun`, plural unless `n` is 1, for error words.
+fn count(n: u64, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
     }
 }
 

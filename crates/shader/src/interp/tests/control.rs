@@ -135,6 +135,22 @@ fn infinite_loops_end_at_the_limit() {
         run(empty_loop, &mut machine),
         Err(InterpError::StepLimit { limit: 10 })
     );
+    machine.step_limit = 1;
+    let error = run("block0:\n    jump block0\n", &mut machine)
+        .err()
+        .map(|e| e.to_string());
+    assert_eq!(
+        error.as_deref(),
+        Some("the run stopped at its limit of 1 step")
+    );
+    machine.step_limit = 0;
+    let error = run("block0:\n    return\n", &mut machine)
+        .err()
+        .map(|e| e.to_string());
+    assert_eq!(
+        error.as_deref(),
+        Some("the run stopped at its limit of 0 steps")
+    );
     // A function that takes no steps runs under a limit of zero.
     machine.step_limit = 0;
     assert_eq!(

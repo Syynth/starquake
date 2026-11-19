@@ -786,8 +786,9 @@ fn sign_bit(format: Format) -> u64 {
 }
 
 impl Run<'_> {
-    /// The arguments of `op`, whose id is `at`: each value read, and checked against the type
-    /// its slot needs (any type in an `opaque` slot).
+    /// The arguments of `op`, whose id is `at`: each value read. The verifier has checked each
+    /// value's type against its slot; the accessors check it again, and the type an `opaque`
+    /// slot needs, as they read it.
     fn args(&self, at: Value, op: &Operation) -> Result<Args, InterpError> {
         let here = Site::Inst(at);
         let mut slots = [Err(Type::Void); MAX_ARGS];
@@ -796,16 +797,7 @@ impl Run<'_> {
             *slot = self.operand(here, operand)?;
             *name = operand.imm();
         }
-        let args = Args { at, slots, names };
-        for (index, &wanted) in op.opcode.args().iter().enumerate() {
-            if let Some(Ok(value)) = args.slots.get(index)
-                && wanted != Type::Opaque
-                && value.ty() != wanted
-            {
-                return Err(args.mismatch(index, wanted, value.ty()));
-            }
-        }
-        Ok(args)
+        Ok(Args { at, slots, names })
     }
 
     /// Runs operation `op`, whose id is `at`, and returns its value (`None` for an operation

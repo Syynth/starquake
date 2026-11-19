@@ -61,6 +61,13 @@ fn addition_rounds_in_each_mode() {
     assert_eq!(add(ONE, tiny, "rp"), ONE);
     assert_eq!(add(ONE, tiny, "rz"), ONE_DOWN);
     assert_eq!(add(ONE, tiny, "rm"), ONE_DOWN);
+    // 1 + 2^-80 is not exact even in binary64: the lost bits still decide a directed mode.
+    let far = 0x1780_0000;
+    assert_eq!(add(ONE, far, "rn"), ONE);
+    assert_eq!(add(ONE, far, "rp"), ONE_UP);
+    assert_eq!(add(ONE, far, "rz"), ONE);
+    assert_eq!(add(ONE, far | SIGN, "rz"), ONE_DOWN);
+    assert_eq!(add(ONE, far | SIGN, "rp"), ONE);
 }
 
 #[test]
@@ -128,6 +135,32 @@ fn fused_multiply_add_rounds_once() {
         F32_NAN
     );
     assert_eq!(f32_op(&format!("FPFma32 f32 2.0, f32 3.0, {inf}")), INF);
+    // (1 + 2^-12)^2 + 2^-80 = 1 + 2^-11 + 2^-24 + 2^-80: the binary64 sum is the tie
+    // 1 + 2^-11 + 2^-24, and the lost 2^-80 breaks it upward (to even would go down).
+    let far = f32_imm(0x1780_0000);
+    let minus_far = f32_imm(0x9780_0000);
+    assert_eq!(f32_op(&format!("FPFma32 {a}, {a}, {far}")), 0x3f80_1001);
+    assert_eq!(
+        f32_op(&format!("FPFma32 {a}, {a}, {minus_far}")),
+        0x3f80_1000
+    );
+    // 1 * 1 + 2^-80: exactly representable in binary64 only as 1 plus a lost error.
+    assert_eq!(
+        f32_op(&format!("FPFma32 f32 1.0, f32 1.0, {far} {{rp}}")),
+        ONE_UP
+    );
+    assert_eq!(
+        f32_op(&format!("FPFma32 f32 1.0, f32 1.0, {far} {{rm}}")),
+        ONE
+    );
+    assert_eq!(
+        f32_op(&format!("FPFma32 f32 1.0, f32 1.0, {minus_far} {{rm}}")),
+        ONE_DOWN
+    );
+    assert_eq!(
+        f32_op(&format!("FPFma32 f32 1.0, f32 1.0, {minus_far} {{rp}}")),
+        ONE
+    );
 }
 
 #[test]

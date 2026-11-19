@@ -635,9 +635,7 @@ pub(super) fn compare(
     control: Control,
 ) -> bool {
     let (a, b) = (control.operand(format, a), control.operand(format, b));
-    if format.is_nan(a) || format.is_nan(b) {
-        return !ordered;
-    }
+    // Values compare unordered exactly when one is a NaN.
     let Some(order) = format.decode(a).partial_cmp(&format.decode(b)) else {
         return !ordered;
     };

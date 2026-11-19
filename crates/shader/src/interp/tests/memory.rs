@@ -68,7 +68,7 @@ fn constant_buffer_bounds() {
     );
     assert_eq!(
         eval_error_on("GetCbufU32 u32 1, u32 8", &mut machine),
-        "%0: a 4-byte access to constant buffer 1 at 0x8 is outside the 8 bytes it holds"
+        "%0: an access of 4 bytes to constant buffer 1 at 0x8 is outside the 8 bytes it holds"
     );
     assert_eq!(
         op_on(&mut machine, "GetCbufU32x2 u32 1, u32 4"),
@@ -76,15 +76,15 @@ fn constant_buffer_bounds() {
     );
     assert_eq!(
         eval_error_on("GetCbufU32x2 u32 1, u32 8", &mut machine),
-        "%0: a 8-byte access to constant buffer 1 at 0x8 is outside the 8 bytes it holds"
+        "%0: an access of 8 bytes to constant buffer 1 at 0x8 is outside the 8 bytes it holds"
     );
     assert_eq!(
         eval_error_on("GetCbufU32 u32 3, u32 0", &mut machine),
-        "%0: a 4-byte access to constant buffer 3 at 0x0 is outside the 0 bytes it holds"
+        "%0: an access of 4 bytes to constant buffer 3 at 0x0 is outside the 0 bytes it holds"
     );
     assert_eq!(
         eval_error_on("GetCbufU32 u32 1, u32 0xffffffff", &mut machine),
-        "%0: a 4-byte access to constant buffer 1 at 0xfffffffc is outside the 8 bytes it holds"
+        "%0: an access of 4 bytes to constant buffer 1 at 0xfffffffc is outside the 8 bytes it holds"
     );
 }
 
@@ -129,29 +129,29 @@ fn global_alignment_then_bounds() {
     let err = |op: &str, machine: &mut Machine| eval_error_on(op, machine);
     assert_eq!(
         err("LoadGlobal32 u64 0x1010", &mut machine),
-        "%0: a 4-byte access to global memory at 0x1010 is outside the 16 bytes it holds"
+        "%0: an access of 4 bytes to global memory at 0x1010 is outside the 16 bytes it holds"
     );
     assert_eq!(
         err("LoadGlobal32 u64 0xffc", &mut machine),
-        "%0: a 4-byte access to global memory at 0xffc is outside the 16 bytes it holds"
+        "%0: an access of 4 bytes to global memory at 0xffc is outside the 16 bytes it holds"
     );
     assert_eq!(
         err("LoadGlobal32 u64 0x1002", &mut machine),
-        "%0: a 4-byte access to global memory at 0x1002 is not aligned"
+        "%0: an access of 4 bytes to global memory at 0x1002 is not aligned"
     );
     // Both faults: the alignment check comes first.
     assert_eq!(
         err("LoadGlobal32 u64 0x2002", &mut machine),
-        "%0: a 4-byte access to global memory at 0x2002 is not aligned"
+        "%0: an access of 4 bytes to global memory at 0x2002 is not aligned"
     );
     assert_eq!(
         err("LoadGlobal128 u64 0x1008", &mut machine),
-        "%0: a 16-byte access to global memory at 0x1008 is not aligned"
+        "%0: an access of 16 bytes to global memory at 0x1008 is not aligned"
     );
     // An access whose end overflows the address space.
     assert_eq!(
         err("LoadGlobal64 u64 0xfffffffffffffff8", &mut machine),
-        "%0: a 8-byte access to global memory at 0xfffffffffffffff8 is outside the 16 bytes it holds"
+        "%0: an access of 8 bytes to global memory at 0xfffffffffffffff8 is outside the 16 bytes it holds"
     );
     machine.global.base = 0xffff_ffff_ffff_fff8;
     assert_eq!(
@@ -160,7 +160,7 @@ fn global_alignment_then_bounds() {
     );
     assert_eq!(
         err("LoadGlobal32 u64 0x0", &mut machine),
-        "%0: a 4-byte access to global memory at 0x0 is outside the 16 bytes it holds"
+        "%0: an access of 4 bytes to global memory at 0x0 is outside the 16 bytes it holds"
     );
 }
 
@@ -194,11 +194,11 @@ fn global_stores_write_only_their_bytes() {
     let before = machine.global.bytes.clone();
     assert_eq!(
         eval_error_on("WriteGlobal32 u64 0x100e, u32 0x0", &mut machine),
-        "%0: a 4-byte access to global memory at 0x100e is not aligned"
+        "%0: an access of 4 bytes to global memory at 0x100e is not aligned"
     );
     assert_eq!(
         eval_error_on("WriteGlobal32 u64 0x1010, u32 0x0", &mut machine),
-        "%0: a 4-byte access to global memory at 0x1010 is outside the 16 bytes it holds"
+        "%0: an access of 4 bytes to global memory at 0x1010 is outside the 16 bytes it holds"
     );
     assert_eq!(machine.global.bytes, before);
 }
@@ -233,15 +233,15 @@ fn storage_buffers_by_binding() {
     );
     assert_eq!(
         eval_error_on("LoadStorage128 u32 2, u32 0", &mut machine),
-        "%0: a 16-byte access to storage buffer 2 at 0x0 is outside the 8 bytes it holds"
+        "%0: an access of 16 bytes to storage buffer 2 at 0x0 is outside the 8 bytes it holds"
     );
     assert_eq!(
         eval_error_on("LoadStorage32 u32 3, u32 0", &mut machine),
-        "%0: a 4-byte access to storage buffer 3 at 0x0 is outside the 0 bytes it holds"
+        "%0: an access of 4 bytes to storage buffer 3 at 0x0 is outside the 0 bytes it holds"
     );
     assert_eq!(
         eval_error_on("WriteStorage32 u32 3, u32 0, u32 0x1", &mut machine),
-        "%0: a 4-byte access to storage buffer 3 at 0x0 is outside the 0 bytes it holds"
+        "%0: an access of 4 bytes to storage buffer 3 at 0x0 is outside the 0 bytes it holds"
     );
     let body = "    %0 = WriteStorageU8 u32 2, u32 1, u32 0xfff
     %1 = WriteStorage32 u32 2, u32 4, u32 0xdeadbeef
@@ -285,11 +285,11 @@ fn shared_memory() {
     }
     assert_eq!(
         eval_error_on("LoadSharedU32 u32 0x10", &mut machine),
-        "%0: a 4-byte access to shared memory at 0x10 is outside the 16 bytes it holds"
+        "%0: an access of 4 bytes to shared memory at 0x10 is outside the 16 bytes it holds"
     );
     assert_eq!(
         eval_error_on("LoadSharedU64 u32 0x4", &mut machine),
-        "%0: a 8-byte access to shared memory at 0x4 is not aligned"
+        "%0: an access of 8 bytes to shared memory at 0x4 is not aligned"
     );
     let body = "    %0 = WriteSharedU8 u32 0x0, u32 0x1ff
     %1 = WriteSharedU16 u32 0x2, u32 0x10203
@@ -311,17 +311,36 @@ fn shared_memory() {
 }
 
 #[test]
+fn error_words_count_bytes_in_the_singular_and_plural() {
+    let mut machine = Machine::new();
+    machine.shared = vec![0x80];
+    assert_eq!(
+        op_on(&mut machine, "LoadSharedS8 u32 0x0"),
+        Val::U32(0xffff_ff80)
+    );
+    assert_eq!(
+        eval_error_on("LoadSharedU8 u32 0x1", &mut machine),
+        "%0: an access of 1 byte to shared memory at 0x1 is outside the 1 byte it holds"
+    );
+    machine.shared.clear();
+    assert_eq!(
+        eval_error_on("LoadSharedU8 u32 0x0", &mut machine),
+        "%0: an access of 1 byte to shared memory at 0x0 is outside the 0 bytes it holds"
+    );
+}
+
+#[test]
 fn local_memory_by_word() {
     let mut machine = Machine::new();
     machine.local = vec![10, 20, 30];
     assert_eq!(op_on(&mut machine, "LoadLocal u32 2"), Val::U32(30));
     assert_eq!(
         eval_error_on("LoadLocal u32 3", &mut machine),
-        "%0: a 4-byte access to local memory at 0xc is outside the 12 bytes it holds"
+        "%0: an access of 4 bytes to local memory at 0xc is outside the 12 bytes it holds"
     );
     assert_eq!(
         eval_error_on("WriteLocal u32 0xffffffff, u32 1", &mut machine),
-        "%0: a 4-byte access to local memory at 0x3fffffffc is outside the 12 bytes it holds"
+        "%0: an access of 4 bytes to local memory at 0x3fffffffc is outside the 12 bytes it holds"
     );
     run(
         "block0:\n    %0 = WriteLocal u32 1, u32 99\n    return\n",
@@ -387,7 +406,7 @@ fn global_and_storage_atomics() {
     );
     assert_eq!(
         eval_error_on("GlobalAtomicExchange32 u64 0x1002, u32 0x1", &mut machine),
-        "%0: a 4-byte access to global memory at 0x1002 is not aligned"
+        "%0: an access of 4 bytes to global memory at 0x1002 is not aligned"
     );
     let mut machine = Machine::new();
     machine.storage.insert(5, vec![0, 0, 0, 0, 1, 0, 0, 0]);
@@ -404,7 +423,7 @@ fn global_and_storage_atomics() {
     );
     assert_eq!(
         eval_error_on("StorageAtomicIAdd32 u32 5, u32 8, u32 0x7", &mut machine),
-        "%0: a 4-byte access to storage buffer 5 at 0x8 is outside the 8 bytes it holds"
+        "%0: an access of 4 bytes to storage buffer 5 at 0x8 is outside the 8 bytes it holds"
     );
 }
 
