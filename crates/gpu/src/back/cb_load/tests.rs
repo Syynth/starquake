@@ -135,6 +135,11 @@ fn run(
     ConstantBufferLoad::new().method(mirror, load(3), words, memory, pending)
 }
 
+/// The pending ranges of one written piece.
+fn only(range: Range<u64>) -> Vec<Range<u64>> {
+    vec![range]
+}
+
 // ---------------------------------------------------------------------------------------------
 // Where the words land.
 
@@ -159,7 +164,7 @@ fn a_run_lands_at_the_selected_address_plus_the_offset_in_one_write() {
     assert_eq!(memory.word(start + 12), FILLED);
     // One write of the whole run, and its range pending.
     assert_eq!(memory.writes(), [(start, 12)]);
-    assert_eq!(pending.ranges(), [start..start + 12]);
+    assert_eq!(pending.ranges(), only(start..start + 12));
     // The mirror is not advanced: the front sends that.
     assert_eq!(
         m.value(clc797::LOAD_CONSTANT_BUFFER_OFFSET.method()),
@@ -298,7 +303,7 @@ fn a_run_whose_last_word_passes_the_size_writes_none_of_its_words() {
     assert_eq!(run(&m, &[1, 2], &memory, &mut pending), Ok(()));
     let at = BUFFER + u64::from(start);
     assert_eq!(memory.writes(), [(at, 8)]);
-    assert_eq!(pending.ranges(), [at..at + 8]);
+    assert_eq!(pending.ranges(), only(at..at + 8));
 }
 
 #[test]
@@ -419,7 +424,7 @@ fn a_fault_after_a_write_still_invalidates_it_and_stops_the_pieces_after_it() {
     assert_eq!(memory.writes(), [(high, 8)]);
     assert_eq!(memory.word(high), 0xb1);
     assert_eq!(memory.word(BUFFER), FILLED);
-    assert_eq!(pending.ranges(), [high..high + 8]);
+    assert_eq!(pending.ranges(), only(high..high + 8));
     // The second piece faults after writing: both are pending.
     let memory = Memory::failing(Some(1));
     let mut pending = PendingWrites::new();
@@ -445,7 +450,7 @@ fn a_piece_over_an_unmapped_page_is_the_exact_fault() {
         Err(ConstantBufferError::Fault(GpuFault::Unmapped { va: end }))
     );
     assert_eq!(memory.word(address), FILLED);
-    assert_eq!(pending.ranges(), [address..address + 8]);
+    assert_eq!(pending.ranges(), only(address..address + 8));
 }
 
 #[test]
@@ -469,7 +474,7 @@ fn a_buffer_at_address_zero_is_written_like_any_other() {
     let mut bytes = [0; 4];
     memory.read(0x10, &mut bytes).unwrap();
     assert_eq!(u32::from_le_bytes(bytes), 0x5555_aaaa);
-    assert_eq!(pending.ranges(), [0x10..0x14]);
+    assert_eq!(pending.ranges(), only(0x10..0x14));
 }
 
 #[test]
