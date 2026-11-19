@@ -47,7 +47,7 @@
 //!   known guest time apart on hardware would confirm or replace it.
 //! - **Divergence** from Eden-NX2, pinned by `the_gpu_timer_counts_at_the_reference_rate`:
 //!   `GetTicks` divides the tick by `GpuClockMultiplier`, which is 256 under the default
-//!   `gpu_clock` setting, `GpuClock::Boost` (`eden-nx2/src/common/settings.h`, "fast_gpu_time",
+//!   `gpu_clock` setting, `GpuClock::Boost` (`eden-nx2/src/common/settings.h`, `fast_gpu_time`,
 //!   a speed setting); here the timer counts at its full rate, as under `GpuClock::Normal`.
 //!   Eden-NX2's host-specific paths (`MultiplyHigh` with a fixed-point factor, in
 //!   `eden-nx2/src/common/cpu_features.cpp`) may round a reading differently from its generic
