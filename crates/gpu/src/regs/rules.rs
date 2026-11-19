@@ -22,6 +22,13 @@ pub const WORD_BYTES: u32 = u32::BITS / u8::BITS;
 /// the same 16 (`const_buffer.buffer` to `+ 15`, `eden-nx2/src/video_core/engines/maxwell_3d.cpp`).
 pub const LOAD_CONSTANT_BUFFER_COUNT: u32 = 16;
 
+/// `LOAD_CONSTANT_BUFFER(0..16)`: the 3D methods whose words are constant-buffer data. Eden-NX2
+/// hands a word or run to any of the sixteen to the same upload (`ProcessCBData` and
+/// `ProcessCBMultiData`, from the `const_buffer.buffer` to `+ 15` cases of `CallMethod` and
+/// `CallMultiMethod`, `eden-nx2/src/video_core/engines/maxwell_3d.cpp`).
+pub const CONSTANT_BUFFER_LOADS: MethodSpan =
+    MethodSpan::array(&clc797::LOAD_CONSTANT_BUFFER, LOAD_CONSTANT_BUFFER_COUNT);
+
 /// The value `SET_FALCON04` leaves in `SET_MME_SHADOW_SCRATCH(0)`: Eden's stub of firmware
 /// call 4 (`ProcessFirmwareCall4` in `eden-nx2/src/video_core/engines/maxwell_3d.cpp`, "stubbed
 /// by setting 0xd00 to 1"). **Guess**: the real call runs a firmware blob whose other effects
@@ -178,7 +185,7 @@ pub struct SideEffect {
 /// 2026-11-18), pinned by `instruction_upload_leaves_its_pointer_alone`.
 pub const SIDE_EFFECTS_3D: &[SideEffect] = &[
     SideEffect {
-        trigger: MethodSpan::array(&clc797::LOAD_CONSTANT_BUFFER, LOAD_CONSTANT_BUFFER_COUNT),
+        trigger: CONSTANT_BUFFER_LOADS,
         rule: SideEffectRule::Advance {
             register: clc797::LOAD_CONSTANT_BUFFER_OFFSET.method(),
             field: clc797::LOAD_CONSTANT_BUFFER_OFFSET_V,
@@ -237,7 +244,7 @@ pub const SIDE_EFFECTS_COMPUTE: &[SideEffect] = &[SideEffect {
 /// amount)` and `upload_state.ProcessData(base_start, amount)`. **Guess** until a trace shows
 /// replay mode during an upload; see "Divergences" in the `regs` module docs for the rest.
 pub const DATA_LOADS_3D: &[MethodSpan] = &[
-    MethodSpan::array(&clc797::LOAD_CONSTANT_BUFFER, LOAD_CONSTANT_BUFFER_COUNT),
+    CONSTANT_BUFFER_LOADS,
     MethodSpan::one(&clc797::LOAD_INLINE_DATA),
 ];
 
