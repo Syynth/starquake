@@ -1547,6 +1547,24 @@ fn an_entry_past_the_address_space_stops_the_channel() {
 }
 
 #[test]
+fn a_busy_channel_refuses_before_the_entry_is_checked() {
+    let past = entry_at(GP_ADDRESS_END - 4, 2);
+    let mut rig = make_rig();
+    let mut pb = PushBuffer::new();
+    pb.immediate(2, 0x100, 1).unwrap();
+    pb.immediate(2, 0x100, 2).unwrap();
+    rig.start(CMD, pb.words());
+    assert_eq!(
+        rig.channel.run(&rig.mem, &mut rig.sink, 1),
+        Ok(RunOutcome::QuantumUsed)
+    );
+    // Both faults at once: running, and an entry past the address space.
+    assert_eq!(rig.channel.start_entry(past), Err(StateError::Running));
+    assert_eq!(rig.channel.state(), ChannelState::Running);
+    assert_eq!(rig.run(), Ok(RunOutcome::EntryDone));
+}
+
+#[test]
 fn a_method_run_past_0xfff_stops_the_channel() {
     let max = m(METHOD_MAX);
     // (mode, method, count, past): the last method reached is exactly 0xfff, or one past it.

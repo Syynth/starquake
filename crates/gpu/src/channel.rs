@@ -135,10 +135,13 @@
 //! - **Binding reads `NVCLASS` (15:0) only.** Eden-NX2 masks to 16 bits only when nothing above
 //!   bit 20 is set (`Gf100BindValidMask`) (`bind_reads_nvclass_only`).
 //! - **An unreadable semaphore stops the channel** (decision 13 (c), unreadable memory).
-//!   Eden-NX2 reads it through its memory manager, which does not fail, and registers no waiter
+//!   Eden-NX2 reads it through `MemoryManager::Read`, which has no failure result, and registers
+//!   no waiter
 //!   (`an_unreadable_semaphore_stops_the_channel`).
 //! - **Errors are reported, not only logged**, and the structural ones stop the channel
-//!   (decision 13 (c)); Eden-NX2 logs and goes on.
+//!   (decision 13 (c)); Eden-NX2 logs and goes on
+//!   (`malformed_words_are_dropped_and_the_stream_goes_on`,
+//!   `an_unmapped_entry_stops_the_channel_for_good`).
 //!
 //! # Guesses
 //!
@@ -493,7 +496,8 @@ struct Current {
     offset: u32,
 }
 
-/// Words read ahead from the current entry, from entry offset `start`.
+/// Words read ahead from the current entry, from entry offset `start`. Emptied when the entry
+/// ends and after every acquire.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Chunk {
     start: u32,
@@ -609,7 +613,9 @@ impl Channel {
     ///
     /// An entry whose words run past [`GP_ADDRESS_END`] stops the channel
     /// ([`ChannelError::EntryPastAddressSpace`], a **guess**, module docs). A channel that is
-    /// running an entry, parked or stopped refuses with [`StateError`] and does not change.
+    /// running an entry, parked or stopped refuses with [`StateError`] and does not change; that
+    /// check comes first, so a busy channel given an impossible entry is not stopped
+    /// (`a_busy_channel_refuses_before_the_entry_is_checked`).
     pub fn start_entry(&mut self, entry: GpEntry) -> Result<(), StateError> {
         match self.state() {
             ChannelState::Idle => {}
@@ -628,8 +634,9 @@ impl Channel {
             self.stopped = Some(error);
             return Err(StateError::Stopped(error));
         }
+        // The chunk is already empty: every way to `Idle` (a fresh channel, `finish_entry`)
+        // leaves it so.
         self.current = Some(Current { entry, offset: 0 });
-        self.chunk.clear();
         Ok(())
     }
 
