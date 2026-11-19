@@ -723,19 +723,23 @@ fn hand_built_headers_of_each_interpolation_mode() {
     }
 }
 
-/// A hand-built pixel header writing target 0's red, all of target 1 and target 7's alpha
-/// (word 18 is bits 576..608), plus the sample mask and depth (bits 608, 609).
+/// A hand-built pixel header writing target 0's red, all of target 1, target 2's green only,
+/// target 3's blue only and target 7's alpha (word 18 is bits 576..608, four per target), plus
+/// the sample mask and depth (bits 608, 609). Green and blue apart pin the component order of
+/// `ComponentMask::bits`.
 #[test]
 fn hand_built_header_with_colour_targets() {
     let mut words = [0; HEADER_WORDS];
     words[0] = word0(2, 5);
-    words[18] = 0x8000_00f1;
+    words[18] = 0x8000_42f1;
     words[19] = 0b11;
     let header = parse(&words).unwrap();
     let io = pixel(&header);
     let mut expected = PixelIo::default();
     expected.targets[0] = mask(0b0001);
     expected.targets[1] = mask(0b1111);
+    expected.targets[2] = mask(0b0010);
+    expected.targets[3] = mask(0b0100);
     expected.targets[7] = mask(0b1000);
     expected.writes_sample_mask = true;
     expected.writes_depth = true;
@@ -743,7 +747,7 @@ fn hand_built_header_with_colour_targets() {
     assert_eq!(
         io.color_outputs(),
         ColorOutputs {
-            targets: [0x1, 0xf, 0, 0, 0, 0, 0, 0x8]
+            targets: [0x1, 0xf, 0x2, 0x4, 0, 0, 0, 0x8]
         }
     );
 }
@@ -788,6 +792,14 @@ fn local_memory_size_follows_eden() {
         ..Common::default()
     };
     assert_eq!(widest.local_memory_size(), 0xffff_ffff_ffff);
+    // The type does not hold the fields to their widths: a caller-built `Common` reaches 56
+    // bits (the docs of `local_memory_size`).
+    let caller_built = Common {
+        local_memory_low_size: u32::MAX,
+        local_memory_high_size: u32::MAX,
+        ..Common::default()
+    };
+    assert_eq!(caller_built.local_memory_size(), 0x00ff_ffff_ffff_ffff);
 }
 
 /// A hand-built geometry header: pass-through, the topology, vertex count and thread count, and
@@ -916,7 +928,9 @@ fn output_topology_is_checked_for_every_stage() {
     }
 }
 
-/// Each neighbouring pair of checks with both faults present: the earlier one is reported.
+/// Every pair of checks whose faults can occur together, with both faults present: the earlier
+/// one is reported. A mismatch needs a valid header type and shader type, so it has no case with
+/// either of their faults.
 #[test]
 fn the_checks_run_in_the_documented_order() {
     let bad_topology = 2 << 24;
@@ -927,8 +941,14 @@ fn the_checks_run_in_the_documented_order() {
     let cases = [
         // Version and header type both wrong.
         (3 << 5 | 1 << 10, 0, version_3),
+        // Version and shader type both wrong.
+        (1 | 3 << 5 | 6 << 10, 0, version_3),
+        // Version wrong and the header type not matching the shader type.
+        (2 | 3 << 5 | 1 << 10, 0, version_3),
         // Version and output topology both wrong.
         (1 | 3 << 5 | 1 << 10, bad_topology, version_3),
+        // Header type and output topology both wrong.
+        (word0(3, 1), bad_topology, HeaderError::SphType { value: 3 }),
         // Header type and shader type both wrong.
         (word0(3, 6), 0, HeaderError::SphType { value: 3 }),
         // Shader type and output topology both wrong.
@@ -1107,17 +1127,35 @@ fn a_field_may_cross_a_word_boundary() {
     assert_eq!(HeaderField::new(0, 32).ones(), u32::MAX);
 }
 
+/// The index of the word that holds `field`, which must not cross a word boundary.
+fn word_of(field: HeaderField) -> usize {
+    assert_eq!(field.start / 32, (field.start + field.width - 1) / 32);
+    usize::try_from(field.start / 32).unwrap()
+}
+
+/// `field`'s bits within its word.
+fn mask_in_word(field: HeaderField) -> u32 {
+    field.ones() << (field.start % 32)
+}
+
 /// Words with a valid header type, shader type and topology forced into arbitrary ones.
 fn valid_words() -> impl Strategy<Value = [u32; HEADER_WORDS]> {
+    let word0_fields = [SPH_TYPE, VERSION, SHADER_TYPE];
+    assert!(word0_fields.iter().all(|&field| word_of(field) == 0));
+    let word0_mask = word0_fields
+        .iter()
+        .fold(0, |mask, &field| mask | mask_in_word(field));
+    let topology_word = word_of(OUTPUT_TOPOLOGY);
     (
         any::<[u32; HEADER_WORDS]>(),
         0_usize..5,
         prop::sample::select(vec![0_u32, 1, 6, 7]),
     )
-        .prop_map(|(mut words, stage, topology)| {
+        .prop_map(move |(mut words, stage, topology)| {
             let (sph_type, shader_type) = [(1, 1), (1, 2), (1, 3), (1, 4), (2, 5)][stage];
-            words[0] = (words[0] & !0x3fff) | word0(sph_type, shader_type);
-            words[3] = (words[3] & !(0xf << 24)) | topology << 24;
+            words[0] = (words[0] & !word0_mask) | word0(sph_type, shader_type);
+            words[topology_word] = (words[topology_word] & !mask_in_word(OUTPUT_TOPOLOGY))
+                | topology << (OUTPUT_TOPOLOGY.start % 32);
             words
         })
 }

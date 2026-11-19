@@ -45,7 +45,12 @@
 //!
 //! Every other field takes any value its width holds: they are counts, masks, flags and
 //! interpolation modes (all four two-bit values are modes). The test
-//! `the_checks_run_in_the_documented_order` has each pair of faults present at once.
+//! `the_checks_run_in_the_documented_order` has both faults present at once, and expects the
+//! earlier one, for exactly these pairs: short and version; version and each of header type,
+//! shader type, mismatch and topology; header type and each of shader type and topology;
+//! shader type and topology; mismatch and topology. These are every pair that can occur
+//! together: a mismatch needs a valid header type and shader type, so it cannot share a header
+//! with either of their faults.
 //!
 //! # Bits not read
 //!
@@ -292,11 +297,14 @@ pub struct Common {
 
 impl Common {
     /// The local memory size in bytes, as Eden composes it: the low field plus the high field
-    /// shifted by 24 (`ProgramHeader::LocalMemorySize`). At most 48 bits. NAK's writer places
-    /// the high field at bit 32 instead (module docs, "Conflict"). PR #4588 adds
+    /// shifted by 24 (`ProgramHeader::LocalMemorySize`). For a `Common` that
+    /// [`ProgramHeader::from_words`] returned, both fields are at most 24 bits, so the size is
+    /// at most 48 bits; the type does not enforce the widths, and a caller-built `Common` with
+    /// wider fields gives up to 56 bits (which the test encoder refuses to write). NAK's writer
+    /// places the high field at bit 32 instead (module docs, "Conflict"). PR #4588 adds
     /// [`Self::local_memory_crs_size`] to it; that choice is the local memory pass's.
     pub fn local_memory_size(&self) -> u64 {
-        // Both fields are at most 24 bits, so this is at most 48 bits.
+        // Each field is a `u32`, so the result is below 2^56 whatever they hold.
         u64::from(self.local_memory_low_size) | u64::from(self.local_memory_high_size) << 24
     }
 }
@@ -473,8 +481,12 @@ pub enum Io {
     Pixel(Box<PixelIo>),
 }
 
-/// A parsed SPH v4 header. Every combination of field values is a header some program could
-/// carry; the header type and shader type fields are not stored, as [`Io`] determines both.
+/// A parsed SPH v4 header. In a header that [`Self::from_words`] returned, every field holds a
+/// value within its width, and every combination of such values is a header some program could
+/// carry. The fields are public and some are wider than the header's (for example
+/// `Common::sass_version` is a `u8` for a four-bit field), so a caller-built header can hold
+/// values no header has; the test encoder refuses those. The header type and shader type
+/// fields are not stored, as [`Io`] determines both.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ProgramHeader {
     /// The fields both layouts have.
