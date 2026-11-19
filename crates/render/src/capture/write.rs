@@ -353,7 +353,7 @@ pub(crate) fn prefix(kind: RecordKind, len: u32) -> Result<Vec<u8>, postcard::Er
 /// The room every record but `Limit` and `End` keeps for them: the longest `Limit` (the
 /// largest fence value) and `End`, each with its tag and length. It depends only on constants;
 /// a writer works it out once ([`CaptureWriter::with_limits`]), not per record.
-pub(crate) fn close_reserve() -> u64 {
+fn close_reserve() -> u64 {
     let framed = |record: &Record| {
         let mut body = Vec::new();
         let body_len = encode_body(record, &mut body).map_or(0, |()| body.len());

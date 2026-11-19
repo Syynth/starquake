@@ -357,6 +357,24 @@ fn a_destroys_fence_maps_to_the_latest_list_at_or_below_it() {
     assert_eq!(mapped, [0, 1, 1, 1, 2]);
 }
 
+/// Replays `bytes` with the reader's live bound at `live` on a [`Knob::Lagging`] spy; the report
+/// and the spy's log.
+fn replay_lagging(bytes: &[u8], live: u64, options: &ReplayOptions) -> (ReplayReport, Vec<String>) {
+    let limits = super::super::CaptureLimits {
+        live_resources: live,
+        ..super::super::CaptureLimits::SHIPPED
+    };
+    let spy = Spy::new(Knob::Lagging);
+    let len = u64::try_from(bytes.len()).expect("small");
+    let mut reader = CaptureReader::with_limits(bytes, len, limits).expect("header");
+    let report = replay(&mut reader, &spy, &Stub, &ReplayFrames::new(), options).expect("replays");
+    (report, spy.log())
+}
+
+fn words(events: &[&str]) -> Vec<String> {
+    events.iter().map(|&e| e.to_owned()).collect()
+}
+
 #[test]
 fn a_create_at_the_live_bound_waits_for_the_destroys_before_it() {
     // A list at fence 1, then samplers each destroyed after it. The fresh backend reaches a
@@ -372,21 +390,8 @@ fn a_create_at_the_live_bound_waits_for_the_destroys_before_it() {
         }
         b.finish().expect("end")
     };
-    let limits = super::super::CaptureLimits {
-        live_resources: 2,
-        ..super::super::CaptureLimits::SHIPPED
-    };
-    let replay_lagging = |bytes: &[u8]| {
-        let spy = Spy::new(Knob::Lagging);
-        let len = u64::try_from(bytes.len()).expect("small");
-        let mut reader = CaptureReader::with_limits(bytes, len, limits).expect("header");
-        let report =
-            replay(&mut reader, &spy, &Stub, &ReplayFrames::new(), &options()).expect("replays");
-        (report, spy.log())
-    };
-    let words = |events: &[&str]| -> Vec<String> { events.iter().map(|&e| e.to_owned()).collect() };
     // Two samplers held: the bound, and no wait before either create.
-    let (report, log) = replay_lagging(&pairs(2));
+    let (report, log) = replay_lagging(&pairs(2), 2, &options());
     assert_eq!((report.refused, report.differences), (0, 0));
     assert_eq!(
         log,
@@ -400,7 +405,7 @@ fn a_create_at_the_live_bound_waits_for_the_destroys_before_it() {
     );
     // The third create finds two held, still pending: replay waits for fence 1 first, which
     // forgets both, so the fourth create finds one and does not wait.
-    let (report, log) = replay_lagging(&pairs(4));
+    let (report, log) = replay_lagging(&pairs(4), 2, &options());
     assert_eq!((report.refused, report.differences), (0, 0));
     assert_eq!(
         log,
@@ -417,6 +422,31 @@ fn a_create_at_the_live_bound_waits_for_the_destroys_before_it() {
             "wait 1",
         ])
     );
+    // A buffer create is counted apart: two pending samplers do not make it wait.
+    let mut b = builder();
+    let buf = b.create_buffer(buffer_desc(4)).expect("buffer");
+    let fence = b.submit(&list(vec![upload(buf, &[1])])).expect("list");
+    for _ in 0..2 {
+        let sampler = b.create_sampler(super::sampler_desc()).expect("sampler");
+        b.destroy(ResourceId::Sampler(sampler), fence)
+            .expect("destroy");
+    }
+    b.create_buffer(buffer_desc(4)).expect("buffer");
+    let (_, log) = replay_lagging(&b.finish().expect("end"), 2, &options());
+    assert_eq!(
+        log,
+        words(&[
+            "sampler",
+            "destroy after 1",
+            "sampler",
+            "destroy after 1",
+            "wait 1",
+        ])
+    );
+}
+
+#[test]
+fn a_resource_destroyed_twice_is_forgotten_once() {
     // A second destroy of the same id while the first is pending is forwarded too (the fresh
     // backend refuses it as the captured one did), but the resource is forgotten once. Sampler
     // 0 is never destroyed and sampler 1 is destroyed twice; the third create waits for fence 1
@@ -436,7 +466,7 @@ fn a_create_at_the_live_bound_waits_for_the_destroys_before_it() {
     b.destroy(ResourceId::Sampler(third), second)
         .expect("destroy");
     b.create_sampler(super::sampler_desc()).expect("sampler 3");
-    let (_, log) = replay_lagging(&b.finish().expect("end"));
+    let (_, log) = replay_lagging(&b.finish().expect("end"), 2, &options());
     assert_eq!(
         log,
         words(&[
@@ -452,49 +482,24 @@ fn a_create_at_the_live_bound_waits_for_the_destroys_before_it() {
             "wait 2",
         ])
     );
-    // The wait forgets the destroyed ids before the create is charged: a buffer at the memory
-    // limit fits once the one destroyed before it is forgotten.
+}
+
+#[test]
+fn the_wait_at_the_live_bound_comes_before_the_memory_charge() {
+    // A buffer at the memory limit fits once the one destroyed before it is forgotten, which
+    // the wait at the live bound does before the create is charged.
     let mut b = builder();
     let first = b.create_buffer(buffer_desc(4)).expect("buffer");
     let fence = b.submit(&list(vec![upload(first, &[1])])).expect("list");
     b.destroy(ResourceId::Buffer(first), fence)
         .expect("destroy");
     b.create_buffer(buffer_desc(4)).expect("buffer");
-    let bytes = b.finish().expect("end");
-    let one = super::super::CaptureLimits {
-        live_resources: 1,
-        ..super::super::CaptureLimits::SHIPPED
-    };
-    let spy = Spy::new(Knob::Lagging);
-    let len = u64::try_from(bytes.len()).expect("small");
-    let mut reader = CaptureReader::with_limits(bytes.as_slice(), len, one).expect("header");
     let tight = ReplayOptions {
         memory_limit: Some(4),
         ..options()
     };
-    let report = replay(&mut reader, &spy, &Stub, &ReplayFrames::new(), &tight).expect("replays");
+    let (report, _) = replay_lagging(&b.finish().expect("end"), 1, &tight);
     assert_eq!((report.refused, report.differences), (0, 0));
-    // A buffer create is counted apart: two pending samplers do not make it wait.
-    let mut b = builder();
-    let buf = b.create_buffer(buffer_desc(4)).expect("buffer");
-    let fence = b.submit(&list(vec![upload(buf, &[1])])).expect("list");
-    for _ in 0..2 {
-        let sampler = b.create_sampler(super::sampler_desc()).expect("sampler");
-        b.destroy(ResourceId::Sampler(sampler), fence)
-            .expect("destroy");
-    }
-    b.create_buffer(buffer_desc(4)).expect("buffer");
-    let (_, log) = replay_lagging(&b.finish().expect("end"));
-    assert_eq!(
-        log,
-        words(&[
-            "sampler",
-            "destroy after 1",
-            "sampler",
-            "destroy after 1",
-            "wait 1",
-        ])
-    );
 }
 
 #[test]
