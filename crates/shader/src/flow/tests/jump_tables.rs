@@ -450,8 +450,15 @@ fn nested_tables_take_two_rounds() {
     // Instruction 11 lies past the extended capture: ignored.
     assert_eq!(targets, vec![(3, vec![5, 6]), (9, vec![10])]);
     assert_eq!(resolved.tables[1].words, vec![10 * size(), 11 * size()]);
+    let graph =
+        super::super::capture_flow_graph(&capture, &resolved.branch_tables()).expect("accepted");
     let code: Vec<Instruction> = capture.instructions().collect();
-    let graph = flow_graph(&code, &resolved.branch_tables()).expect("accepted");
+    assert_eq!(
+        flow_graph(&code, &resolved.branch_tables()).as_ref(),
+        Ok(&graph)
+    );
+    // The first BRX goes to 5 and 6, the second to 10.
+    assert_eq!(graph.blocks().len(), 4);
     graph
         .build_ir()
         .expect("IR")
