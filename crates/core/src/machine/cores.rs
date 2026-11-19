@@ -135,7 +135,10 @@ impl Parks {
         }
     }
 
-    /// Disarms core `index`, if it is the one armed.
+    /// Disarms core `index`, if it is the one armed. No test can tell this check from clearing
+    /// another core's arming: a core disarms at the end of its own park, when it is about to be
+    /// unparked, and an armed core told a signal while another is unparked asks nothing; or
+    /// after its own question, which moved the arming to it.
     fn disarm(&self, index: usize) {
         let mut armed = lock(&self.armed);
         if *armed == Some(index) {

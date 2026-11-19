@@ -387,3 +387,34 @@ fn the_arming_moves_to_the_core_that_asked_last() {
         });
     });
 }
+
+/// Arming forgets a signal told before it: a signal that came during a question which ended
+/// the park stalled is left over, and the core's next park, armed afresh, waits for a new one
+/// instead of asking again at once.
+#[test]
+fn a_signal_left_over_from_an_earlier_park_is_forgotten_when_armed() {
+    let cores: Cores<Counting> = Cores::new(2);
+    let answers = Answers::new(vec![Stall::OnlyTheGpu, Stall::Stalled]);
+    bounded(&cores, || {
+        std::thread::scope(|scope| {
+            let other = park_the_other_core(scope, &cores);
+            let first = cores.park(core(1), || {
+                cores.parks.front_quiet();
+                Stall::Stalled
+            });
+            assert_eq!(first, Parked::Stalled);
+            assert!(quiet_flag(&cores, 1), "the signal is left over");
+            let last = scope.spawn(|| cores.park(core(1), || answers.ask()));
+            wait_until("the next park asks and is armed", || {
+                answers.asked() == 1 && armed(&cores) == Some(1)
+            });
+            assert!(!quiet_flag(&cores, 1));
+            assert_eq!(answers.asked(), 1);
+            cores.parks.front_quiet();
+            assert_eq!(last.join().unwrap(), Parked::Stalled);
+            assert_eq!(answers.asked(), 2);
+            cores.stop();
+            assert_eq!(other.join().unwrap(), Parked::Stopped);
+        });
+    });
+}
