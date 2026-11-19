@@ -11,7 +11,7 @@
 //! | [`VariantKey::vertex_attributes`] | the component type of each vertex attribute | Eden `RuntimeInfo::generic_input_types` (`eden/src/shader_recompiler/runtime_info.h` @ cf654052), 32 entries (`Maxwell::NumVertexAttributes`, `eden/src/video_core/engines/maxwell_3d.h`) |
 //! | [`VariantKey::color_targets`] | the component type of each colour target | Eden `RuntimeInfo::color_output_types`, filled with `Float`, `SignedInt` or `UnsignedInt` only (`eden/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp`) |
 //! | [`VariantKey::dual_source_blend`] | whether dual-source blending is on | Eden `RuntimeInfo::dual_source_blend` |
-//! | [`VariantKey::next_stage_reads`] | which attribute words the next stage reads | spec, "interface matching"; see below |
+//! | [`VariantKey::next_stage_reads`] | which attribute words the fragment program reads, for the last stage before rasterisation | spec, "interface matching"; see "Which stage the mask describes, and who fills it" |
 //! | [`VariantKey::workgroup_size`], [`VariantKey::shared_memory_size`] | a compute program's workgroup and shared-memory size | spec, "Compute shaders"; Eden `Environment::WorkgroupSize`, `SharedMemorySize` (`environment.h`) |
 //! | [`VariantKey::emulation`] | the render backend's `EmulationFlags`, field by field | spec, "Pipeline-state specialisation"; review guide, M13 |
 //! | [`VariantKey::texture_swizzles`] | each texture binding's swizzle, when the host has no view swizzle | spec, the exception to decision 16; review guide, M11 |
@@ -25,7 +25,11 @@
 //!   this one covers the 256 words of the attribute space below
 //!   [`crate::translate::ATTRIBUTE_SPACE_END`], which hold every guest attribute
 //!   (`IR::Attribute::FrontFace` is word 255 in `eden/src/shader_recompiler/frontend/ir/attribute.h`);
-//!   Eden's 512-bit mask also has room for host-only values past them.
+//!   Eden's 512-bit mask also has room for host-only values past them. Eden builds its mask per
+//!   stage, from the previous program's translation info, not from registers
+//!   (`eden/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp` @ cf654052, `MakeRuntimeInfo`:
+//!   `info.previous_stage_stores = previous_program->info.stores`); "Which stage the mask
+//!   describes, and who fills it" below says what that means for this key.
 //! - Eden keeps the alpha-test function in `RuntimeInfo::alpha_test_func` and its reference
 //!   value beside it. The key holds the function as [`EmulationKey::alpha_test`], present
 //!   exactly when the render backend's `ALPHA_TEST` flag is set; the reference value is a
@@ -35,6 +39,41 @@
 //!   most [`MAX_TEXTURE_SWIZZLES`], that same number, and refuses more
 //!   ([`KeyError::TooManySwizzles`]) where Eden's fixed-capacity vector has no room. Pinned by
 //!   `tests::the_swizzle_cap_at_its_edge`.
+//!
+//! # Which stage the mask describes, and who fills it
+//!
+//! A key covers a whole set of stages: a lookup takes every [`crate::lookup::ProgramRequest`]
+//! of the set and one key. So [`VariantKey::next_stage_reads`], one mask, can describe the
+//! consumer of only one stage. As defined here, provisionally and pending the owner's answer
+//! below:
+//!
+//! - **Which stage**: the mask is the set of attribute words the fragment program reads, and it
+//!   specialises only the last stage before rasterisation (the one whose outputs the fragment
+//!   stage reads). Any other stage of the set that feeds another (a vertex stage feeding
+//!   tessellation or geometry) is not specialised on its consumer.
+//! - **Who fills it**: what a stage reads is a fact of that program's translation, not of any
+//!   register, so the GPU crate cannot build it from engine state, although the spec says the
+//!   back thread "builds the `VariantKey` from 3D engine state". Only the side that has
+//!   translated (or at least scanned) the fragment program can fill it: the shader cache
+//!   (slice 19), the way Eden's `MakeRuntimeInfo` fills `previous_stage_stores` from the
+//!   previous program's info.
+//!
+//! [`VariantKey::texture_swizzles`] has the same kind of gap. It is keyed by **binding order**:
+//! the order of the set's texture bindings as slice 17's lowering numbers them. That order is
+//! assigned during translation, so the GPU crate cannot know it before a set's first lookup.
+//!
+//! ## For the owner
+//!
+//! - **Which stage `next_stage_reads` describes, and who fills it.** With more than one stage
+//!   feeding another in a set, one mask cannot describe every consumer, and the GPU crate cannot
+//!   build it from engine state, which departs from the spec sentence quoted above. Choices
+//!   include a mask per feeding stage filled by the shader cache from the next program's
+//!   translation, or following Eden's previous-stage stores instead (the departure listed under
+//!   "Where this differs from Eden"). This slice adds no field.
+//! - **What the swizzle binding order is keyed by.** Binding order is known only after
+//!   translation, so the key cannot carry the swizzles on a set's first lookup. Keying each
+//!   swizzle by something the GPU crate knows beforehand (a stage and texture handle) would
+//!   change the field and the spec's "each texture binding's swizzle". This slice adds no field.
 //!
 //! # Encoding
 //!
@@ -263,6 +302,10 @@ impl Swizzle {
 
 /// The swizzle of each texture binding, in binding order, at most [`MAX_TEXTURE_SWIZZLES`].
 /// Empty when the render backend swizzles in the view (`Caps::view_swizzle`).
+///
+/// Binding order is the order of the set's texture bindings as slice 17's lowering numbers
+/// them, which is assigned during translation, so the GPU crate cannot know it before a set's
+/// first lookup (an owner question; see the module docs).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct TextureSwizzles(Vec<Swizzle>);
 
@@ -375,7 +418,10 @@ pub struct VariantKey {
     pub color_targets: [ColorType; COLOR_TARGETS],
     /// Whether dual-source blending is on.
     pub dual_source_blend: bool,
-    /// The attribute words the next stage reads.
+    /// The attribute words the fragment program reads, specialising the last stage before
+    /// rasterisation; filled by the side that has translated the fragment program, not from
+    /// engine state (provisional; see the module docs, "Which stage the mask describes, and who
+    /// fills it").
     pub next_stage_reads: AttributeMask,
     /// A compute program's workgroup size, x, y and z.
     pub workgroup_size: [u32; 3],
@@ -383,7 +429,8 @@ pub struct VariantKey {
     pub shared_memory_size: u32,
     /// The render backend's emulation flags.
     pub emulation: EmulationKey,
-    /// Each texture binding's swizzle, when the host has no view swizzle.
+    /// Each texture binding's swizzle, when the host has no view swizzle, in the binding order
+    /// slice 17's lowering assigns (an owner question; see the module docs).
     pub texture_swizzles: TextureSwizzles,
 }
 

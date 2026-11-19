@@ -258,6 +258,8 @@ fn questions_are_asked_in_first_ask_order_and_recorded_by_question() {
             (texture(9), Answer::TextureKind(Some(kind_for(9)))),
         ]
     );
+    assert_eq!(done.answers.len(), 3);
+    assert!(!done.answers.is_empty());
 }
 
 #[test]

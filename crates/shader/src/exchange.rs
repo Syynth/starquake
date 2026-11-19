@@ -3,9 +3,11 @@
 //! and answers"; port slice 9; owner's decision 5, the non-blocking question-and-answer lookup).
 //!
 //! Eden's `Environment` lets translation read live engine state whenever it likes
-//! (`eden/src/shader_recompiler/environment.h` @ cf654052: `ReadCbufValue`, `ReadTextureType`,
-//! `ReadTexturePixelFormat`, `IsTexturePixelFormatInteger`). Starquake replaces those reads with
-//! an explicit exchange, which is new (no reference has it):
+//! (`eden/src/shader_recompiler/environment.h` @ cf654052). Starquake asks for engine state
+//! through an explicit exchange instead, which is new (no reference has it), but the questions
+//! of this slice do not cover everything `Environment` reads: the table under "What stands in
+//! for each `Environment` member" gives the exact mapping, and what is not covered is listed
+//! there as owner questions. The exchange:
 //!
 //! 1. The program's side, a [`Questioner`], says which [`Question`]s it needs answered, given
 //!    the [`Answers`] so far.
@@ -37,6 +39,67 @@
 //! question once and does work in proportion to what the questioner returns. The translator
 //! that implements [`Questioner`] (flow analysis and the texture pass, slices 10 and 13) bounds
 //! it by the program it walks.
+//!
+//! # What stands in for each `Environment` member
+//!
+//! Every member of Eden's `Environment` (`eden/src/shader_recompiler/environment.h` @
+//! cf654052), with what starquake has in its place: a [`Question`], a field of the program
+//! request or the variant key ([`crate::lookup::ProgramRequest`], [`crate::variant::VariantKey`]),
+//! a driver constant ([`crate::driver_constants`]), or **not covered**.
+//!
+//! | `Environment` member | Starquake | Covered |
+//! |---|---|---|
+//! | `ReadInstruction` | the program's bytes, read through [`crate::lookup::ProgramMemory`] from [`crate::lookup::ProgramRequest::address`] | yes |
+//! | `ReadCbufValue` | [`Question::CbufWord`] | yes |
+//! | `ReadTextureType` | only whether the type is `Buffer`: [`TextureKind::buffer`] | **partly**; see below |
+//! | `ReadTexturePixelFormat` | [`TextureKind::format`], the header's format bits rather than Eden's converted `TexturePixelFormat` | yes |
+//! | `IsTexturePixelFormatInteger` | [`TextureKind::sampled`] (which also tells signed from unsigned) | yes |
+//! | `ReadViewportTransformState` | nothing | **no** |
+//! | `TextureBoundBuffer` | nothing | **no** |
+//! | `LocalMemorySize` | graphics: the program header, part of the program's bytes; compute: nothing | **graphics only** |
+//! | `SharedMemorySize` | [`crate::variant::VariantKey::shared_memory_size`] | yes |
+//! | `WorkgroupSize` | [`crate::variant::VariantKey::workgroup_size`] | yes |
+//! | `HasHLEMacroState`, `GetReplaceConstBuffer` | nothing | **no** |
+//! | `Dump` | nothing: a debug dump, not a translation input | not an input |
+//! | `SPH` | the program header, part of the program's bytes | yes |
+//! | `GpPassthroughMask` | nothing | **no** |
+//! | `ShaderStage` | [`crate::lookup::ProgramRequest::stage`] | yes |
+//! | `StartAddress` | [`crate::lookup::ProgramRequest::address`] (an absolute address, where Eden's is an offset from the program base) | yes |
+//! | `IsProprietaryDriver` | nothing (Eden derives it from `TextureBoundBuffer`, `texture_bound == 2`) | **no** |
+//! | `cbuf_word_cache`, `handle_cache`, `track_cache` | nothing: Eden's caches, not translation inputs | not an input |
+//!
+//! No driver constant stands in for an `Environment` member: the driver constants hold values
+//! Eden takes from `RuntimeInfo` and the draw, not from `Environment`. [`TextureKind::depth`] and
+//! [`TextureKind::multisampled`] have no `Environment` member either (Eden takes both from the
+//! instruction); they are in the answer because the spec lists them.
+//!
+//! ## For the owner: what the questions do not cover
+//!
+//! Each of these is read by Eden from `Environment` and has no question, key field or driver
+//! constant here. This slice adds no field for them; each needs the owner's call on whether it
+//! becomes a question, a key field or a driver constant.
+//!
+//! - **The texture type: dimension, array and rect.** Eden's texture pass reads
+//!   `ReadTextureType` to assign the type of `ImageQueryDimensions` (`TXQ`), and patches
+//!   `ImageSampleImplicitLod` when the bound type is `Color2DRect`
+//!   (`eden/src/shader_recompiler/ir_opt/texture_pass.cpp` @ cf654052). Only its third use, an
+//!   `ImageFetch` on a 1D texture becoming `Buffer`, is covered, by [`TextureKind::buffer`].
+//! - **`TextureBoundBuffer`**: the constant-buffer bank that bound texture handles are read from
+//!   (`bindless_texture_const_buffer_slot` for graphics, `tex_cb_index` for compute;
+//!   `eden/src/video_core/shader_environment.cpp`), used by the texture pass for the bank of
+//!   bound textures. `IsProprietaryDriver`, which Eden derives from it, goes with it.
+//! - **`ReadViewportTransformState`**: whether the viewport scale and offset are enabled
+//!   (`viewport_scale_offset_enabled`). It gates Eden-NX2's `PositionPass`
+//!   (`eden-nx2/src/shader_recompiler/ir_opt/position_pass.cpp` @ 50fa86bb), the row-65 path.
+//! - **Compute `LocalMemorySize`**: Eden takes it from the QMD (`local_pos_alloc +
+//!   local_crs_alloc`, `ComputeEnvironment`'s constructor in `shader_environment.cpp`), which is
+//!   not in a compute program's bytes. A graphics program's comes from its header.
+//! - **`HasHLEMacroState` and `GetReplaceConstBuffer`**: constant-buffer words that Eden's
+//!   high-level macro emulation replaces, folded by its constant propagation pass
+//!   (`eden/src/shader_recompiler/ir_opt/constant_propagation_pass.cpp`).
+//! - **`GpPassthroughMask`**: the geometry passthrough mask, which Eden reads from
+//!   `post_vtg_shader_attrib_skip_mask` (`shader_environment.cpp`) for a passthrough geometry
+//!   program (`eden/src/shader_recompiler/frontend/maxwell/translate_program.cpp`).
 
 use std::collections::{BTreeMap, BTreeSet};
 

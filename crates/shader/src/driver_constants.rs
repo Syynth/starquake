@@ -23,6 +23,24 @@
 //! it, or any value's type, means bumping [`DRIVER_CONSTANTS_VERSION`]. Pinned by
 //! `tests::golden_bytes` and `tests::offsets_are_the_tables`.
 //!
+//! # Where this differs from Eden
+//!
+//! Eden is cited above for two of the values, but Eden does not read either per draw: it bakes
+//! both into the compiled shader as constants from `RuntimeInfo`, so each distinct value is
+//! another pipeline. Starquake reads both from this block each draw, under owner's decision 16
+//! (numbers go in driver constants, not in the key).
+//!
+//! - **Alpha-test reference**: Eden compiles `RuntimeInfo::alpha_test_reference` in as a
+//!   constant (`eden/src/shader_recompiler/backend/spirv/emit_spirv_special.cpp` @ cf654052:
+//!   `ctx.Const(ctx.runtime_info.alpha_test_reference)`), set from the pipeline key's
+//!   `alpha_test_ref` (`vk_pipeline_cache.cpp`). Here it is [`DriverConstant::AlphaReference`],
+//!   at its offset in the block. Pinned by `tests::golden_bytes`.
+//! - **Viewport flip**: Eden's `EmitYDirection` returns
+//!   `ctx.Const(ctx.runtime_info.y_negate ? -1.0f : 1.0f)`, a constant compiled in from
+//!   `RuntimeInfo::y_negate`, set from the pipeline key's `y_negate` (`vk_pipeline_cache.cpp`).
+//!   Here it is [`DriverConstant::ViewportFlip`], at its offset in the block. Pinned by
+//!   `tests::golden_bytes`.
+//!
 //! Where the GPU crate takes each value from (the render area from the surface clip or colour
 //! target 0, as Eden-NX2's `vk_graphics_pipeline.cpp` does, and the base vertex and instance from
 //! the draw) is G18's to decide and cite; this module only says where each goes.
