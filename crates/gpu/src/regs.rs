@@ -8,8 +8,12 @@
 //! - `file` owns [`RegFile`] (one class on one channel), [`ShadowMode`], [`RegsError`] and
 //!   [`EntrySink`], where the surviving writes go.
 //! - `rules` owns [`ClassRules`]: per class, the file's size, the shadow RAM control, the
-//!   plain-state methods and the side-effect registers ([`SIDE_EFFECTS_3D`],
-//!   [`SIDE_EFFECTS_COMPUTE`]), for [`THREE_D`], [`COMPUTE`] and every [`OTHER`] class.
+//!   plain-state methods, the side-effect registers ([`SIDE_EFFECTS_3D`],
+//!   [`SIDE_EFFECTS_COMPUTE`]) and the reset values, for [`THREE_D`], [`COMPUTE`], [`TWO_D`] and
+//!   every [`OTHER`] class.
+//! - `defaults` owns [`RegisterDefault`] and the reset value lists ([`DEFAULTS_3D`],
+//!   [`DEFAULTS_2D`]), from Eden-NX2's engine constructors; [`ClassRules::initial_values`]
+//!   applies them (see "Starting values" below).
 //! - `state_3d` owns [`STATE_3D`], the hand-written table of the 3D class's plain-state methods,
 //!   keyed on the generated `clc797` constants (the generated tables do not say which methods
 //!   are plain state).
@@ -141,11 +145,22 @@
 //! the data loads as the exception), or extend the exception to every trigger? Pinned by
 //! `replay_triggers_that_are_not_data_loads_take_the_shadow_value`.
 //!
-//! Not here: register defaults (Eden's `InitializeRegisterDefaults` sets some 3D registers to
-//! non-zero values at boot; every file here starts from [`ClassRules::initial_values`], all
-//! zero, which the back's mirror starts from too), the macro calls themselves (G13,
-//! `crate::macros`), and counters of dropped writes.
+//! # Starting values
+//!
+//! A new file holds [`ClassRules::initial_values`]: zero, except for the class's reset values
+//! ([`ClassRules::defaults`]: [`DEFAULTS_3D`] from Eden-NX2's
+//! `Maxwell3D::InitializeRegisterDefaults`, [`DEFAULTS_2D`] from its `Fermi2D` constructor, and
+//! none for compute, DMA copy and inline-to-memory, whose constructors set no register). The 3D
+//! shadow file starts equal to the register file, as Eden's `shadow_state = regs` does, so the
+//! shadow RAM starts in [`ShadowMode::Track`] (no default touches the control). The back's
+//! mirror starts from the same values, so a write equal to a reset value is dropped on the front
+//! and the back already holds it. Pinned by `reset_values_are_the_references_written_out`,
+//! `front_shadow_and_mirror_start_from_the_same_values` and
+//! `a_write_equal_to_a_reset_value_is_dropped_and_zero_is_sent`.
+//!
+//! Not here: the macro calls themselves (G13, `crate::macros`), and counters of dropped writes.
 
+mod defaults;
 mod file;
 mod rules;
 mod state_3d;
@@ -153,11 +168,12 @@ mod state_3d;
 #[cfg(test)]
 mod tests;
 
+pub use defaults::{DEFAULTS_2D, DEFAULTS_3D, RegisterDefault};
 pub(crate) use file::Journal;
 pub use file::{EntrySink, RegFile, RegsError, ShadowMode};
 pub use rules::{
     COMPUTE, ClassRules, DATA_LOADS_3D, FALCON04_SCRATCH_VALUE, LOAD_CONSTANT_BUFFER_COUNT,
     MethodSpan, OTHER, SIDE_EFFECTS_3D, SIDE_EFFECTS_COMPUTE, SideEffect, SideEffectRule, THREE_D,
-    WORD_BYTES,
+    TWO_D, WORD_BYTES,
 };
 pub use state_3d::STATE_3D;
