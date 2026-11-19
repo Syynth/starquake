@@ -1211,6 +1211,8 @@ fn a_write_outside_the_file_fails_the_run_and_is_kept_over_a_later_error() {
         emit_imm(out_method(0), 1),
         emit_imm(call_method(Engine::ThreeD, 0), 2),
         emit_imm(out_method(1), 3),
+        // The first load takes the call's one parameter; the second underflows.
+        mov_reg(0, Reg::Load0),
         mov_reg(0, Reg::Load0),
     ]);
     rig.upload(&mut chan, Engine::ThreeD, 0, &program, 0);
@@ -2134,4 +2136,42 @@ fn the_journal_keeps_one_value_per_word() {
     file.undo(&mut journal);
     assert_eq!(snapshot(&file), snapshot(&RegFile::new(A, three_d())));
     assert_eq!(journal.len(), 0);
+}
+
+#[test]
+fn the_3d_and_compute_classes_collect_calls_separately() {
+    let mut rig = make_rig();
+    let mut chan = Chan::new(A);
+    rig.upload(&mut chan, Engine::ThreeD, 0, &echo(2), 0);
+    rig.upload(&mut chan, Engine::ThreeD, 0x10, &echo(1), 1);
+    rig.take();
+    // A 3D call is half collected when a compute call comes and goes.
+    let three_d = call_method(Engine::ThreeD, 0);
+    assert_eq!(
+        rig.word(&mut chan, Engine::ThreeD, three_d, 0x31, 1),
+        Ok(WordOutcome::Parameter)
+    );
+    let report = rig.call(&mut chan, Engine::Compute, 1, &[0x41]);
+    assert_eq!((report.engine, report.entry), (Engine::Compute, 1));
+    assert_eq!(chan.macros.collected(Engine::ThreeD), [0x31]);
+    assert_eq!(chan.macros.collected(Engine::Compute), []);
+    let outcome = rig
+        .word(&mut chan, Engine::ThreeD, three_d + 1, 0x32, 0)
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        WordOutcome::Call(CallReport {
+            engine: Engine::ThreeD,
+            entry: 0,
+            ..
+        })
+    ));
+    assert_eq!(
+        rig.take(),
+        [
+            write_entry(A, Engine::Compute, out_method(0), 0x41),
+            write_entry(A, Engine::ThreeD, out_method(0), 0x31),
+            write_entry(A, Engine::ThreeD, out_method(1), 0x32),
+        ]
+    );
 }

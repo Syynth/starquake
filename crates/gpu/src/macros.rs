@@ -96,6 +96,7 @@
 //! cannot be read, DMA reads past [`DMA_RUN_MAX_WORDS`], or more than [`MAX_RUN_WRITES`] writes.
 //! After the host's own failure the run is starved (no more loads; writes ignored) and ends on
 //! the interpreter's next error or its end; the host's failure is reported, as it came first.
+//! Starving only shortens the run: what it does after the failure is discarded either way.
 //! A failed call is logged once per code store and start (with its parameters), and
 //! [`CallResult::Failed`] says whether this was the first; all starts at or past
 //! [`CODE_INSTRUCTIONS`] count as one, so the record is bounded.
@@ -146,8 +147,9 @@
 //! - **A macro branching to before its start fails** (`BranchOutOfRange`): the interpreter
 //!   runs the store from the start as its own program, as Mesa's simulator runs one macro.
 //!   Eden-NX2 runs within the whole code RAM (`a_branch_before_the_start_fails`).
-//! - **Compute calls run on the front with the memo** and see their own writes, as 3D calls
-//!   do; Eden-NX2's split front runs compute macros only with its JIT (`FrontRunMacro`).
+//! - **Compute calls run through the interpreter and the memo on every host.** Eden-NX2's
+//!   split front runs them only with its x86-64 JIT and skips them elsewhere (`FrontRunMacro`'s
+//!   `#else`) (`compute_uses_the_3d_store_until_it_uploads` runs compute calls).
 //!
 //! # Departures from the approved spec (owner questions)
 //!
@@ -158,7 +160,7 @@
 //!   in `eden-pr4588/src/video_core/macro.h`), and leave method 0x45 as written. A Turing
 //!   instruction is three words, so no register value can hold the offset; this module keeps
 //!   it in the store, and the register file (slice G9) leaves 0x45 alone
-//!   (`the_upload_offset_lives_in_the_code_store`). Also in `docs/proposals.md`.
+//!   (`the_upload_offset_lives_in_the_code_store`).
 //! - **Two code stores per process.** The spec's "Macros" says: "The front holds the code and
 //!   the 3D and compute engines' start tables", and that Eden-NX2 "keeps one code store for all
 //!   of a process's channels (row 53); this design does the same". Eden-NX2's (and PR #4588's)
