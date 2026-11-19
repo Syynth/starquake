@@ -9,9 +9,12 @@ use thiserror::Error;
 use crate::decode::{DecodeError, Instr, Instruction, LengthError, decode};
 use crate::exchange::ExchangeError;
 use crate::host::HostShader;
+use crate::info::{InfoError, ShaderInfo, check_header, collect, translation_stage};
 use crate::ir::Function;
 use crate::lower::{LowerError, lower};
-use crate::translate::{Stage, TranslateError, translate};
+use crate::opt::{PassError, optimize};
+use crate::sph::{HeaderError, Io, ProgramHeader};
+use crate::translate::{GuestStage, Stage, TranslateError, translate, translate_with_header};
 
 /// Why a program was rejected.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -37,6 +40,16 @@ pub enum Rejection {
     /// inputs: questions and answers").
     #[error(transparent)]
     Questions(#[from] ExchangeError),
+    /// The shader program header in front of a graphics program does not parse (slice 2).
+    #[error(transparent)]
+    Header(#[from] HeaderError),
+    /// An IR pass failed (slice 8).
+    #[error(transparent)]
+    Pass(#[from] PassError),
+    /// Collect info refused the program, or its header does not suit its pipeline slot
+    /// (slice 15).
+    #[error(transparent)]
+    Info(#[from] InfoError),
 }
 
 /// Splits `code` into instructions and decodes each one.
@@ -57,6 +70,43 @@ pub fn program_ir(stage: Stage, code: &[u8]) -> Result<Function, Rejection> {
 /// instructions; the translator, more).
 pub fn translate_program(stage: Stage, code: &[u8]) -> Result<HostShader, Rejection> {
     Ok(lower(stage.stage, &program_ir(stage, code)?)?)
+}
+
+/// A graphics program translated to IR, with its header and what collect info found in it.
+#[derive(Clone, Debug)]
+pub struct GraphicsIr {
+    /// The program's header.
+    pub header: ProgramHeader,
+    /// The IR, after the slice 8 passes ([`optimize`]).
+    pub function: Function,
+    /// What collect info found ([`crate::info`]).
+    pub info: ShaderInfo,
+}
+
+/// Runs a graphics program bound to pipeline slot `slot` from its bytes (the header's first
+/// byte onwards) to IR and its info, stopping at the first failure, in this order: the header
+/// ([`ProgramHeader::from_program`], [`Rejection::Header`]); the header against the slot
+/// ([`check_header`], [`Rejection::Info`]; compute has no header, so a compute slot is refused
+/// here as [`InfoError::ComputeHeader`]); decoding the instructions after the header; the
+/// translator, given the header's colour outputs ([`translation_stage`]) and, for a pixel
+/// program, its input map ([`translate_with_header`]); the slice 8 passes ([`optimize`],
+/// [`Rejection::Pass`]); and collect info ([`collect`], [`Rejection::Info`]).
+pub fn graphics_program_ir(slot: GuestStage, program: &[u8]) -> Result<GraphicsIr, Rejection> {
+    let (header, code) = ProgramHeader::from_program(program)?;
+    check_header(slot, Some(&header))?;
+    let stage = translation_stage(slot, &header);
+    let instrs = decode_program(code)?;
+    let mut function = match &header.io {
+        Io::Pixel(io) => translate_with_header(stage, io, &instrs)?,
+        Io::Vtg(_) => translate(stage, &instrs)?,
+    };
+    optimize(&mut function)?;
+    let info = collect(slot, Some(&header), &function)?;
+    Ok(GraphicsIr {
+        header,
+        function,
+        info,
+    })
 }
 
 #[cfg(test)]

@@ -190,6 +190,13 @@ pub fn validation_flags() -> ValidationFlags {
 pub fn capabilities(requirements: Requirements) -> Capabilities {
     let mut caps = Capabilities::empty();
     caps.set(Capabilities::SUBGROUP, requirements.subgroup);
+    caps.set(Capabilities::SHADER_FLOAT16, requirements.f16);
+    caps.set(Capabilities::FLOAT64, requirements.f64);
+    caps.set(Capabilities::SHADER_INT64, requirements.i64);
+    caps.set(
+        Capabilities::SHADER_INT64_ATOMIC_ALL_OPS,
+        requirements.i64_atomics,
+    );
     caps
 }
 
@@ -320,6 +327,7 @@ pub fn lower(stage: GuestStage, function: &Function) -> Result<HostShader, Lower
     let interface = Interface::collect(stage, function)?;
     let requirements = Requirements {
         subgroup: interface.lane_id,
+        ..Requirements::default()
     };
 
     let mut module = Module::default();
