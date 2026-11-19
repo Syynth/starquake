@@ -20,7 +20,7 @@ use crate::decode::{
     CBufRef, GROUP_HOOKS, GROUPS, MovSrc, OPCODE, OpExit, OpMov, UniformReg, decode,
 };
 use crate::interp::Machine;
-use crate::ir::Value;
+use crate::ir::{Terminator, Value};
 use crate::testing::{any_pred_src, config};
 use crate::translate::{
     COLOR_TARGETS, ColorOutputs, GuestStage, Stage, TranslateError, Unsupported, translate,

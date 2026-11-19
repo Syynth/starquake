@@ -91,6 +91,7 @@ pub mod float;
 pub mod integer;
 #[cfg(test)]
 mod tests;
+pub mod texture;
 
 use std::fmt::{self, Display, Formatter};
 
@@ -410,6 +411,36 @@ fn register_run(first: Gpr, count: u32) -> Option<u32> {
 /// A 32-bit immediate operand.
 const fn imm32(bits: u32) -> Operand {
     Operand::Imm(Imm::U32(bits))
+}
+
+/// Appends `body` at the end of `builder`'s block under `guard`, for the groups whose guarded
+/// instructions become conditional blocks ([`float`], [`texture`]): unless `guard_tested` (the
+/// block already runs only where the guard holds, flow analysis's `guard_tested`) or the guard
+/// is `PT`, the block reads the guard and branches to a new block holding `body`'s IR or past
+/// it, and `builder` is left in the block after, where translation continues. `@!PT` makes a
+/// block that never runs.
+pub(crate) fn conditional_block<E: From<BuildError>>(
+    builder: &mut Builder<'_>,
+    guard: PredSrc,
+    guard_tested: bool,
+    body: impl FnOnce(&mut Builder<'_>) -> Result<(), E>,
+) -> Result<(), E> {
+    if guard_tested || guard.is_true() {
+        return body(builder);
+    }
+    let cond = crate::flow::read_pred(builder, guard)?;
+    let then = builder.add_block()?;
+    let after = builder.add_block()?;
+    builder.terminate(Terminator::Branch {
+        cond,
+        then,
+        otherwise: after,
+    })?;
+    builder.switch_to(then)?;
+    body(builder)?;
+    builder.terminate(Terminator::Jump(after))?;
+    builder.switch_to(after)?;
+    Ok(())
 }
 
 /// Whether an instruction under `guard` never runs: `@!PT` (PR #4588's `Guard::Never`,
