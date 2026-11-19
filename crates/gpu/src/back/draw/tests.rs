@@ -21,8 +21,12 @@ use starquake_render::{
 };
 use starquake_shader::asm::assemble_program;
 use starquake_shader::decode::{Instr, Op, OpExit, PredSrc};
-use starquake_shader::exchange::{SampledType, TextureFormat};
-use starquake_shader::host::HostShader;
+use starquake_shader::exchange::{
+    Answers, Question, Questioner, SampledType, TextureFormat, TextureKind, TextureUsage, exchange,
+};
+use starquake_shader::host::{
+    GuestSlot, HostBuiltIn, HostShader, InterfaceSlot, SlotBinding, SlotType,
+};
 use starquake_shader::lookup::{
     EngineState, GuestStage, ProgramMemory, ProgramRequest, Rejection, ShaderSet, Ticket, Unmapped,
     VariantKey,
@@ -30,7 +34,8 @@ use starquake_shader::lookup::{
 use starquake_shader::program::translate_program;
 use starquake_shader::translate::{ColorOutputs, Stage, TranslateError, Unsupported};
 use starquake_shader::variant::{
-    AttributeType, ColorType, CompareFunction as KeyCompare, EmulationKey, Swizzle, SwizzleSource,
+    AttributeMask, AttributeType, ColorType, CompareFunction as KeyCompare, EmulationKey,
+    FollowingStage, PreviousStores, Swizzle, SwizzleSource,
 };
 
 use super::call::{DrawCalls, Source, Started};
@@ -1893,7 +1898,9 @@ fn swizzles_reach_the_key_in_binding_order_only_without_view_swizzle() {
     );
     rig.draw();
     rig.draw();
-    assert_eq!(rig.shaders.seen.len(), 2);
+    // Three lookups: the first draw looks the set up again for the vertex stage's stores
+    // (`the_previous_stages_stores_reach_the_key`), not for swizzles.
+    assert_eq!(rig.shaders.seen.len(), 3);
     assert!(
         rig.shaders
             .seen
@@ -3878,4 +3885,394 @@ fn a_target_at_address_zero_is_made_like_any_other() {
         .unwrap();
     assert!(set.colors[0].is_some());
     assert!(set.depth_stencil.is_some());
+}
+
+// ---------------------------------------------------------------------------------------------
+// The previous stage's stores (owner's ruling 8 of 2026-11-19).
+
+/// A generic output slot `generic`, as the lowering declares it.
+fn generic_slot(generic: u8) -> InterfaceSlot {
+    InterfaceSlot {
+        binding: SlotBinding::Location(u32::from(generic)),
+        ty: SlotType::F32x4,
+        guest: GuestSlot::Generic(generic),
+    }
+}
+
+/// The exit-only vertex shader with the generic outputs `generics` added after its position.
+fn vertex_storing(generics: &[u8]) -> HostShader {
+    let mut shader = host_shader(GuestStage::Vertex);
+    shader
+        .outputs
+        .extend(generics.iter().copied().map(generic_slot));
+    shader
+}
+
+/// A ready set of `vertex` and the exit-only pixel shader, binding nothing.
+fn ready_with(vertex: HostShader, pixel: HostShader) -> SetLookup {
+    SetLookup::Ready(ReadySet {
+        shaders: Arc::new(ShaderSet {
+            stages: vec![vertex, pixel],
+        }),
+        stages: vec![
+            StageInfo {
+                stamp: VERTEX_STAMP,
+                resources: vec![],
+            },
+            StageInfo {
+                stamp: PIXEL_STAMP,
+                resources: vec![],
+            },
+        ],
+    })
+}
+
+/// The mask of the words `words`.
+fn words(words: &[u8]) -> AttributeMask {
+    words
+        .iter()
+        .copied()
+        .fold(AttributeMask::EMPTY, AttributeMask::with)
+}
+
+/// The previous stages' stores each lookup's key carried, for the pixel stage.
+fn pixel_stores(rig: &Rig) -> Vec<AttributeMask> {
+    rig.shaders
+        .seen
+        .iter()
+        .map(|s| s.key.previous_stage_stores.get(FollowingStage::Pixel))
+        .collect()
+}
+
+#[test]
+fn stored_words_are_whole_slots() {
+    let outputs = [
+        InterfaceSlot {
+            binding: SlotBinding::BuiltIn(HostBuiltIn::Position),
+            ty: SlotType::F32x4,
+            guest: GuestSlot::Position,
+        },
+        generic_slot(0),
+        generic_slot(31),
+        // Past the last generic: no words.
+        generic_slot(32),
+        generic_slot(u8::MAX),
+        // Not attribute words.
+        InterfaceSlot {
+            binding: SlotBinding::Location(1),
+            ty: SlotType::F32x4,
+            guest: GuestSlot::RenderTarget(1),
+        },
+        InterfaceSlot {
+            binding: SlotBinding::BuiltIn(HostBuiltIn::SubgroupInvocationId),
+            ty: SlotType::U32,
+            guest: GuestSlot::LaneId,
+        },
+    ];
+    // Eden's `attribute.h`, written out: PositionX..W = 28..31, Generic0X..W = 32..35,
+    // Generic31X..W = 156..159.
+    assert_eq!(
+        shaders::stored_words(&outputs),
+        words(&[28, 29, 30, 31, 32, 33, 34, 35, 156, 157, 158, 159])
+    );
+    // Each slot alone, so a slot that adds the wrong words fails on its own.
+    assert_eq!(
+        shaders::stored_words(&outputs[..1]),
+        words(&[28, 29, 30, 31])
+    );
+    assert_eq!(
+        shaders::stored_words(&[generic_slot(1)]),
+        words(&[36, 37, 38, 39])
+    );
+    for slot in &outputs[3..] {
+        assert_eq!(
+            shaders::stored_words(core::slice::from_ref(slot)),
+            AttributeMask::EMPTY,
+            "{slot:?}"
+        );
+    }
+    assert_eq!(shaders::stored_words(&[]), AttributeMask::EMPTY);
+    // The exit-only vertex shader stores its position only, and the pixel shader no attribute.
+    assert_eq!(
+        shaders::stored_words(&host_shader(GuestStage::Vertex).outputs),
+        words(&[28, 29, 30, 31])
+    );
+}
+
+#[test]
+fn previous_stage_stores_follow_the_request_order() {
+    let request = |stage| ProgramRequest {
+        stage,
+        address: VERTEX_PROGRAM,
+    };
+    // Distinct stores for every stage, and none known for geometry.
+    let stores_of = |stage| match stage {
+        GuestStage::VertexCullBeforeFetch => Some(words(&[1])),
+        GuestStage::Vertex => Some(words(&[2])),
+        GuestStage::TessellationInit => Some(words(&[3])),
+        GuestStage::Tessellation => Some(words(&[4])),
+        GuestStage::Geometry => None,
+        GuestStage::Pixel => Some(words(&[6])),
+        GuestStage::Compute => Some(words(&[7])),
+    };
+    let all = [
+        GuestStage::VertexCullBeforeFetch,
+        GuestStage::Vertex,
+        GuestStage::TessellationInit,
+        GuestStage::Tessellation,
+        GuestStage::Geometry,
+        GuestStage::Pixel,
+    ]
+    .map(request);
+    let stores = shaders::previous_stage_stores(&all, stores_of);
+    assert_eq!(
+        FollowingStage::ALL.map(|stage| stores.get(stage)),
+        [words(&[2]), words(&[3]), words(&[4]), AttributeMask::EMPTY]
+    );
+    // Vertex and pixel: the pixel stage gets the vertex stage's, the rest stay empty.
+    let pair = [GuestStage::Vertex, GuestStage::Pixel].map(request);
+    assert_eq!(
+        shaders::previous_stage_stores(&pair, stores_of),
+        PreviousStores::EMPTY.with(FollowingStage::Pixel, words(&[2]))
+    );
+    // With the vertex-cull program first, the vertex program's stores (not the cull
+    // program's) reach the pixel stage.
+    let culled = [
+        GuestStage::VertexCullBeforeFetch,
+        GuestStage::Vertex,
+        GuestStage::Pixel,
+    ]
+    .map(request);
+    assert_eq!(
+        shaders::previous_stage_stores(&culled, stores_of),
+        PreviousStores::EMPTY.with(FollowingStage::Pixel, words(&[2]))
+    );
+    // Geometry then pixel: geometry's stores are unknown, so the pixel stage's are empty, and
+    // geometry gets the vertex stage's.
+    let geometry = [GuestStage::Vertex, GuestStage::Geometry, GuestStage::Pixel].map(request);
+    assert_eq!(
+        shaders::previous_stage_stores(&geometry, stores_of),
+        PreviousStores::EMPTY.with(FollowingStage::Geometry, words(&[2]))
+    );
+    // A vertex stage alone, or nothing: no stores.
+    assert_eq!(
+        shaders::previous_stage_stores(&[request(GuestStage::Vertex)], stores_of),
+        PreviousStores::EMPTY
+    );
+    assert_eq!(
+        shaders::previous_stage_stores(&[], stores_of),
+        PreviousStores::EMPTY
+    );
+}
+
+/// The 32 bytes of the pixel stage's stores in an encoded key: after the version, 32 attribute
+/// types, 8 colour types, the dual-source switch and the three earlier stages' 32 bytes each.
+fn pixel_stores_bytes(key: &VariantKey) -> Vec<u8> {
+    let at = 1 + 32 + 8 + 1 + 3 * 32;
+    key.encode()[at..at + 32].to_vec()
+}
+
+#[test]
+fn the_previous_stages_stores_reach_the_key() {
+    // The vertex shader stores its position and generic 2.
+    let mut rig = Rig::new(ready_with(
+        vertex_storing(&[2]),
+        host_shader(GuestStage::Pixel),
+    ));
+    rig.basic();
+    // First draw: the set is unknown, so the first lookup has no stores, the second has them.
+    assert_eq!(rig.draw(), Outcome::Drawn);
+    let stored = words(&[28, 29, 30, 31, 40, 41, 42, 43]);
+    assert_eq!(pixel_stores(&rig), [AttributeMask::EMPTY, stored]);
+    // Golden: words 28 to 31 are lane 0 bits 28 to 31 (byte 3, high nibble), words 40 to 43
+    // lane 0 bits 40 to 43 (byte 5, low nibble).
+    let mut golden = [0u8; 32];
+    golden[3] = 0xf0;
+    golden[5] = 0x0f;
+    assert_eq!(pixel_stores_bytes(&rig.shaders.seen[1].key), golden);
+    assert_eq!(pixel_stores_bytes(&rig.shaders.seen[0].key), [0u8; 32]);
+    // Only the pixel stage is specialised: the other stages are not in the requests.
+    let key = &rig.shaders.seen[1].key;
+    for stage in [
+        FollowingStage::TessellationInit,
+        FollowingStage::Tessellation,
+        FollowingStage::Geometry,
+    ] {
+        assert_eq!(key.previous_stage_stores.get(stage), AttributeMask::EMPTY);
+    }
+    // The two keys differ in the stores only.
+    let mut first = rig.shaders.seen[0].key.clone();
+    first.previous_stage_stores = key.previous_stage_stores;
+    assert_eq!(&first, key);
+
+    // Second draw: one lookup, with the stores remembered.
+    assert_eq!(rig.draw(), Outcome::Drawn);
+    assert_eq!(pixel_stores(&rig)[2..], [stored]);
+    assert_eq!(rig.draws.counters().lookups, 3);
+
+    // The pixel shader's outputs change (not a stage anything follows): the same key, one
+    // lookup.
+    let mut pixel = host_shader(GuestStage::Pixel);
+    pixel.outputs.push(generic_slot(5));
+    rig.shaders.default = ready_with(vertex_storing(&[2]), pixel);
+    assert_eq!(rig.draw(), Outcome::Drawn);
+    assert_eq!(pixel_stores(&rig)[3..], [stored]);
+    assert_eq!(rig.shaders.seen[3].key, rig.shaders.seen[2].key);
+
+    // The vertex shader's stores change (its program was rewritten): the remembered stores
+    // give the first lookup, the new ones the second, and the key changes.
+    rig.shaders.default = ready_with(vertex_storing(&[0]), host_shader(GuestStage::Pixel));
+    assert_eq!(rig.draw(), Outcome::Drawn);
+    let restored = words(&[28, 29, 30, 31, 32, 33, 34, 35]);
+    assert_eq!(pixel_stores(&rig)[4..], [stored, restored]);
+    let mut golden = [0u8; 32];
+    golden[3] = 0xf0;
+    golden[4] = 0x0f;
+    assert_eq!(pixel_stores_bytes(&rig.shaders.seen[5].key), golden);
+    assert_ne!(rig.shaders.seen[5].key, rig.shaders.seen[2].key);
+    assert_eq!(rig.draws.counters().lookups, 6);
+}
+
+#[test]
+fn stores_are_not_learned_from_a_waited_set() {
+    let mut rig = Rig::new(SetLookup::Pending(Ticket::new(4)));
+    rig.shaders.waits.push_back(ready_with(
+        vertex_storing(&[2]),
+        host_shader(GuestStage::Pixel),
+    ));
+    rig.basic();
+    assert_eq!(rig.draw(), Outcome::Drawn);
+    assert_eq!(rig.shaders.waited, [Ticket::new(4)]);
+    // Drawn with the set the wait gave, looked up once with no stores.
+    assert_eq!(pixel_stores(&rig), [AttributeMask::EMPTY]);
+    // The next draw still starts from no stores.
+    rig.shaders.default = ready_with(vertex_storing(&[2]), host_shader(GuestStage::Pixel));
+    assert_eq!(rig.draw(), Outcome::Drawn);
+    assert_eq!(
+        pixel_stores(&rig)[1..],
+        [
+            AttributeMask::EMPTY,
+            words(&[28, 29, 30, 31, 40, 41, 42, 43])
+        ]
+    );
+}
+
+#[test]
+fn remembered_stores_are_capped() {
+    let mut rig = Rig::new(ready_with(
+        vertex_storing(&[2]),
+        host_shader(GuestStage::Pixel),
+    ));
+    rig.basic();
+    rig.draws.previous_stores_limit = 1;
+    let stored = words(&[28, 29, 30, 31, 40, 41, 42, 43]);
+    // The first set fills the table to its cap.
+    rig.draw();
+    rig.draw();
+    assert_eq!(rig.draws.counters().lookups, 3);
+    // Another set past the cap is not remembered: each draw looks it up twice.
+    rig.address(
+        &clc797::SET_PIPELINE_PROGRAM_ADDRESS_A,
+        &clc797::SET_PIPELINE_PROGRAM_ADDRESS_B,
+        &[5],
+        PIXEL_PROGRAM + 0x100,
+    );
+    rig.draw();
+    rig.draw();
+    assert_eq!(rig.draws.counters().lookups, 7);
+    assert_eq!(
+        pixel_stores(&rig)[3..],
+        [AttributeMask::EMPTY, stored, AttributeMask::EMPTY, stored]
+    );
+    // The set already remembered is still updated at the cap.
+    rig.address(
+        &clc797::SET_PIPELINE_PROGRAM_ADDRESS_A,
+        &clc797::SET_PIPELINE_PROGRAM_ADDRESS_B,
+        &[5],
+        PIXEL_PROGRAM,
+    );
+    rig.shaders.default = ready_with(vertex_storing(&[0]), host_shader(GuestStage::Pixel));
+    rig.draw();
+    rig.draw();
+    let restored = words(&[28, 29, 30, 31, 32, 33, 34, 35]);
+    assert_eq!(pixel_stores(&rig)[7..], [stored, restored, restored]);
+    assert_eq!(rig.draws.counters().lookups, 10);
+    assert_eq!(MAX_STORE_SETS, 4096);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The texture kind's usage (owner's ruling 7 of 2026-11-19), through the production engine
+// state.
+
+/// A program that asks about the bound handle once, with `usage`.
+struct AsksHandle(TextureUsage);
+
+impl Questioner for AsksHandle {
+    fn questions(&self, _answers: &Answers) -> Vec<Question> {
+        vec![Question::TextureKind {
+            handle: HEADER_INDEX,
+            usage: self.0,
+        }]
+    }
+}
+
+#[test]
+fn a_format_change_keeps_a_sampled_answer_through_engine_state() {
+    let mut rig = Rig::new(ready(vec![], vec![]));
+    rig.basic();
+    let header_at = HEADERS + u64::from(HEADER_INDEX) * shaders::HEADER_BYTES;
+    let unorm = texture_header(TEXTURE, swizzle_sources(tex::TEXHEAD_BL_X_SOURCE_IN_R));
+    // The same layout with signed normalised components: another format, the same kind
+    // (sampled as float, not depth, not multisampled, not a buffer).
+    let mut snorm = unorm;
+    for field in [
+        tex::TEXHEAD_BL_R_DATA_TYPE,
+        tex::TEXHEAD_BL_G_DATA_TYPE,
+        tex::TEXHEAD_BL_B_DATA_TYPE,
+        tex::TEXHEAD_BL_A_DATA_TYPE,
+    ] {
+        field
+            .insert(&mut snorm, tex::TEXHEAD_BL_R_DATA_TYPE_NUM_SNORM)
+            .unwrap();
+    }
+    assert_ne!(unorm[0], snorm[0]);
+    let roots = RootTables::new();
+    let exchanged = |rig: &Rig, words: &[u32; HEADER_WORDS], usage| {
+        rig.write_words(header_at, words);
+        let answers = StateAnswers {
+            mirror: &rig.mirror,
+            roots: &roots,
+            memory: &rig.mem,
+        };
+        exchange(GuestStage::Pixel, &AsksHandle(usage), &answers)
+            .unwrap()
+            .answers
+    };
+    let sampled = [
+        exchanged(&rig, &unorm, TextureUsage::Sampled),
+        exchanged(&rig, &snorm, TextureUsage::Sampled),
+    ];
+    assert_eq!(sampled[0], sampled[1]);
+    assert_eq!(
+        sampled[0].texture_kind(HEADER_INDEX, TextureUsage::Sampled),
+        Some(Some(TextureKind {
+            sampled: SampledType::Float,
+            depth: false,
+            multisampled: false,
+            buffer: false,
+            format: TextureFormat::UNREAD,
+        }))
+    );
+    let image = [
+        exchanged(&rig, &unorm, TextureUsage::Image),
+        exchanged(&rig, &snorm, TextureUsage::Image),
+    ];
+    assert_ne!(image[0], image[1]);
+    assert_eq!(
+        image[1]
+            .texture_kind(HEADER_INDEX, TextureUsage::Image)
+            .flatten()
+            .map(|kind| kind.format),
+        Some(TextureFormat::from_texhead_word0(snorm[0]))
+    );
 }
