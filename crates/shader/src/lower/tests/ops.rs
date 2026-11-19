@@ -9,19 +9,19 @@ use crate::ir::Builder;
 /// One case of the GPU comparison: a name and the instructions that compute a `u32`.
 type Case = (&'static str, fn(&mut Builder<'_>) -> Value);
 
-fn u(value: u32) -> Operand {
+pub(super) fn u(value: u32) -> Operand {
     Operand::Imm(Imm::U32(value))
 }
 
-fn f(value: f32) -> Operand {
+pub(super) fn f(value: f32) -> Operand {
     Operand::Imm(Imm::F32(value.to_bits()))
 }
 
-fn bit(value: bool) -> Operand {
+pub(super) fn bit(value: bool) -> Operand {
     Operand::Imm(Imm::U1(value))
 }
 
-fn op(builder: &mut Builder<'_>, opcode: Opcode, args: &[Operand]) -> Value {
+pub(super) fn op(builder: &mut Builder<'_>, opcode: Opcode, args: &[Operand]) -> Value {
     builder
         .op(opcode, args)
         .unwrap_or_else(|error| panic!("{opcode}: {error}"))

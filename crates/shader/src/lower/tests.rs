@@ -3,6 +3,7 @@
 
 mod compute;
 mod memory;
+mod opcodes;
 mod ops;
 mod run;
 mod structured;
