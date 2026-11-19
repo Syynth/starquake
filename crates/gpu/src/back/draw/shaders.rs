@@ -26,10 +26,12 @@
 //! # Answering
 //!
 //! [`GuestPrograms`] implements [`ProgramMemory`] over any [`GpuMemory`] (the production one is
-//! the address table, `GpuVm`, slice G22). [`ProgramMemory`] has one error, [`Unmapped`]; a
-//! [`GpuFault::Unmapped`] keeps its address, and the other two faults are reported as unmapped
-//! at the access's start ([`GpuFault::OutOfRange`]) or at the faulting piece
-//! ([`GpuFault::Guest`]), so translation sees the program end there.
+//! [`crate::memory::VmMemory`], over the address table `GpuVm`, slice G22). [`ProgramMemory`]
+//! has one error, [`Unmapped`]; a [`GpuFault::Unmapped`] keeps its address, and the other faults
+//! are reported as unmapped at the access's start ([`GpuFault::OutOfRange`]) or at the faulting
+//! piece ([`GpuFault::Guest`]), so translation sees the program end there.
+//! [`GpuFault::ShimWrite`] is a write fault and does not reach a read; it would be reported at
+//! its address too.
 //!
 //! [`StateAnswers`] implements [`EngineState`] from the 3D mirror, the root tables and guest
 //! memory, following Eden-NX2's `GraphicsEnvironment`
@@ -211,7 +213,8 @@ impl<M: GpuMemory + ?Sized> ProgramMemory for GuestPrograms<'_, M> {
             address: match fault {
                 GpuFault::Unmapped { va }
                 | GpuFault::OutOfRange { va, .. }
-                | GpuFault::Guest { va, .. } => va,
+                | GpuFault::Guest { va, .. }
+                | GpuFault::ShimWrite { va } => va,
             },
         })
     }

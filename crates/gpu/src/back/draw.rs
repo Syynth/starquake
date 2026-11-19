@@ -644,7 +644,7 @@ impl Draws {
             .reg(&clc797::SET_ALPHA_TEST, &[])?
             .field(clc797::SET_ALPHA_TEST_ENABLE)?
             != 0;
-        // The function is read only while the test is on: a register never written holds 0,
+        // The function is read only while the test is on: its reset value is 0,
         // which the header does not name.
         let alpha_func = if alpha_on {
             Some(fixed::compare(

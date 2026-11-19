@@ -46,8 +46,10 @@
 //! # Divergences from Eden
 //!
 //! - **A field is read only where it matters.** Eden reads every register as a number; here an
-//!   enum getter refuses a value the header does not name, and a register never written holds
-//!   0, which several of these fields do not name. So the depth function is read only while the
+//!   enum getter refuses a value the header does not name, and a field the guest leaves unset
+//!   while its feature is off may hold one (the reset values, `crate::regs::defaults`, leave the
+//!   logic and alpha functions at 0, which the header does not name). So the depth function is
+//!   read only while the
 //!   depth test is on, the stencil functions and operations only while the stencil test is on,
 //!   the cull face only while culling is on, the logic operation only while it is on, and a
 //!   target's equations only while its blend is on. Dual-source blending therefore looks at
@@ -848,8 +850,9 @@ const UNUSED_NUMERICAL_TYPE: &str = "UNUSED_ENUM_DO_NOT_USE_BECAUSE_IT_WILL_GO_A
 /// The vertex input part (module docs, "Sources").
 ///
 /// An attribute is in the layout when it is `ACTIVE` and its numerical type is not the unused
-/// value (Eden's `CastAttributeType` reads that value as disabled, and a register file that was
-/// never written holds it, with `ACTIVE` as 0). Each stream an attribute reads becomes one
+/// value (Eden's `CastAttributeType` reads that value as disabled; the reset values make every
+/// attribute `INACTIVE`, and a guest that makes one `ACTIVE` without a type leaves it 0). Each
+/// stream an attribute reads becomes one
 /// buffer, in stream order; a stream that no attribute reads is not bound. An attribute reading
 /// a stream that is not enabled is refused ([`DrawError::AttributeStream`]).
 ///
