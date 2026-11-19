@@ -124,7 +124,9 @@ const fn is_strip(topology: Topology) -> bool {
 /// as it is. In this order:
 ///
 /// 1. quads, quad strips, fans, polygons and line loops are rewritten from any source, with
-///    restart off (the restart value is drawn as a vertex: `draw` module docs, "Divergences");
+///    restart off (the restart value is drawn as a vertex, but for a line loop from 32-bit
+///    indices, whose `0xFFFFFFFF` the host still restarts at: `draw` module docs,
+///    "Divergences");
 /// 2. 8-bit indices (wgpu has none) are widened, with restart kept on a strip whose pipeline
 ///    restarts;
 /// 3. 16-bit indices of a strip are widened, since a strip pipeline takes 32-bit indices only

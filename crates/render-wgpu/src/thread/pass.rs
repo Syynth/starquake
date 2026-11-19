@@ -1,12 +1,17 @@
 //! Encoding draws and dispatches on the render thread (`crate::draw`): the render pass a list
 //! keeps open across its draws, each draw's bind groups, and the index rewrite.
 //!
-//! Everything that can fail for a draw is looked up first: its pipeline under the
-//! wait-while-compiling setting, its host objects, the samplers its built layout made
-//! non-filtering, its bind groups (made inside wgpu error scopes, so one wgpu refuses is caught
-//! here rather than breaking the list's encoder) and the rewrite's pipeline. A draw that fails
-//! any of them is skipped, and counted where `crate::draw` says; only then is the open pass
-//! closed for a rewrite, a pass opened, and the draw encoded.
+//! A draw the check marked as starting a new pass (`DrawStep::fresh_pass`: new targets, a
+//! rewrite or a conflicting use) closes the open pass first, before anything that can skip it:
+//! the check has already merged the next draws into the pass it started for this one, so a
+//! skipped draw must still end the pass before it (pinned by
+//! `backend::tests::draws::a_skipped_draw_still_ends_the_pass_before_it`). Then everything that
+//! can fail for the draw is looked up: its pipeline under the wait-while-compiling setting, its
+//! host objects, the samplers its built layout made non-filtering, its bind groups (made inside
+//! wgpu error scopes, so one wgpu refuses is caught here rather than breaking the list's
+//! encoder) and the rewrite's pipeline. A draw that fails any of them is skipped, and counted
+//! where `crate::draw` says; only then is the rewrite encoded, a pass opened if none is open,
+//! and the draw encoded.
 
 use super::Render;
 use crate::draw::rewrite::{IndexRewrite, Run};
@@ -242,14 +247,17 @@ impl Render {
         Some(pass.forget_lifetime())
     }
 
-    /// Encodes a draw (module docs): every lookup first, then the rewrite, the pass and the
-    /// draw.
+    /// Encodes a draw (module docs): the open pass closed when the draw starts a new one, every
+    /// lookup, then the rewrite, the pass and the draw.
     pub(super) fn draw(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         rec: &mut Recorder,
         step: DrawStep,
     ) {
+        if step.fresh_pass {
+            rec.close();
+        }
         let Some(ready) = self.ready(&step.cell) else {
             return;
         };
@@ -272,9 +280,6 @@ impl Render {
         let Ok(index) = self.draw_index(encoder, rec, &step) else {
             return;
         };
-        if step.fresh_pass {
-            rec.close();
-        }
         if rec.pass.is_none() {
             let Some(targets) = rec.targets.clone() else {
                 self.shared.host_error(&"a checked draw has no targets");

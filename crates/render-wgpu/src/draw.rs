@@ -84,12 +84,13 @@
 //! 3. every id names a live resource of its kind, and every buffer and texture has the usage
 //!    its role needs, as the recording backend checks them (`crate::plan` names the errors);
 //! 4. the targets: set, with at least one attachment ([`NO_TARGETS`]), of one size and one
-//!    sample count ([`TARGETS_DIFFER`]), and the formats and sample count the pipeline was made
-//!    for ([`TARGET_MISMATCH`]);
+//!    sample count ([`TARGETS_DIFFER`]), no two colour attachments in one mip level and layer
+//!    of a texture ([`ATTACHMENT_OVERLAP`]), and the formats and sample count the pipeline was
+//!    made for ([`TARGET_MISMATCH`]);
 //! 5. the bindings against the pipeline's layout ([`check`]'s order);
 //! 6. the vertex buffers: every one the pipeline reads is bound ([`MISSING_VERTEX_BUFFER`]),
-//!    each from a 4-byte boundary ([`VERTEX_OFFSET`]); the index buffer from a multiple of its
-//!    index size ([`INDEX_OFFSET`]);
+//!    each from a 4-byte boundary ([`VERTEX_OFFSET`]); an indexed draw's index buffer from a
+//!    multiple of its index size, whether it is bound directly or rewritten ([`INDEX_OFFSET`]);
 //! 7. the viewport ([`VIEWPORT`]);
 //! 8. the counts: an indirect draw's parameters ([`INDIRECT_REWRITE`], [`INDIRECT_DRAWS`],
 //!    [`INDIRECT_STRIDE`], [`INDIRECT_RANGE`]); a direct draw's vertices, instances and indices
@@ -122,9 +123,14 @@
 //!   unfilterable texture through it skips the draw at encode time and counts it
 //!   (`WgpuBackend::encode_skips`), since that is known only once the build has run
 //!   (`crate::pipeline::layout`, "Filtering samplers"): `backend::tests::draws::a_filtering_sampler_on_an_unfilterable_texture_skips_the_draw`;
-//! - the rewrite does not honour primitive restart inside a fan, polygon, quad strip or line
-//!   loop: the restart value is drawn as a vertex (Eden's quad rewrite ignores restart too):
-//!   `draw::rewrite::tests::the_rewrite_plan_for_every_topology_and_source`;
+//! - the rewrite does not honour primitive restart inside quads, a quad strip, a fan or a
+//!   polygon, nor inside a line loop from 8-bit or 16-bit indices: the restart value is drawn as
+//!   a vertex (Eden's quad rewrite ignores restart too):
+//!   `draw::rewrite::tests::the_rewrite_plan_for_every_topology_and_source`. The exception is a
+//!   line loop from 32-bit indices: its rewrite copies `0xFFFFFFFF` into a line strip whose
+//!   pipeline names 32-bit indices, so the host restarts there whatever the pipeline's restart
+//!   setting, as for the 32-bit strips below:
+//!   `draw::rewrite::tests::only_a_line_loop_from_32_bit_indices_restarts_after_the_rewrite`;
 //! - a 32-bit index equal to `0xFFFFFFFF` in a strip whose pipeline does not restart still
 //!   restarts: a strip pipeline names 32-bit indices, which turns restart on under Vulkan, and
 //!   Metal always restarts (`crate::pipeline::state`, "Topology"); no wider index exists to
@@ -153,6 +159,10 @@ pub const NO_TARGETS: &str = "a draw needs a render target: a wgpu render pass n
 /// Render targets of different sizes or sample counts.
 pub const TARGETS_DIFFER: &str =
     "a draw's render targets must share one size and one sample count under wgpu";
+/// Two colour targets that draw into one mip level of one layer of a texture (two views of
+/// one 3D texture always do: each draws into slice 0).
+pub const ATTACHMENT_OVERLAP: &str = "two of a draw's colour targets draw into one mip level and layer, which a wgpu render pass \
+     refuses";
 /// A pipeline made for other targets.
 pub const TARGET_MISMATCH: &str =
     "a draw's pipeline was made for other target formats or another sample count";
@@ -206,8 +216,8 @@ pub const INDIRECT_DRAWS: &str = "an indirect draw command draws more than the w
 /// An indirect draw that needs its indices rewritten.
 pub const INDIRECT_REWRITE: &str = "the wgpu backend cannot rewrite the indices of an indirect draw (quads, fans, line loops, \
      8-bit indices or restart off)";
-/// A rewrite whose input or output is larger than the device binds, or whose vertex numbers run
-/// past the largest index.
+/// A rewrite whose input or output is larger than the device binds, or whose output count does
+/// not fit a `u32`.
 pub const REWRITE_SIZE: &str = "a draw's index rewrite is larger than the device can bind";
 /// A list whose rewrites need more scratch than the largest buffer.
 pub const SCRATCH: &str = "a list's index rewrites need more than the largest buffer";

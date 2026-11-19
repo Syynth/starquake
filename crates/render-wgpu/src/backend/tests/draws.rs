@@ -969,6 +969,93 @@ fn a_filtering_sampler_on_an_unfilterable_texture_skips_the_draw() {
     });
 }
 
+/// A fragment shader of one flat colour, from the uniform buffer at (0, 0), that also binds a
+/// writable storage buffer at (0, 1).
+fn writer_shader(gpu: &WgpuBackend) -> ShaderId {
+    gpu.create_shader(shader_desc(
+        ShaderStage::Fragment,
+        "main",
+        wgsl(
+            "@group(0) @binding(0) var<uniform> colour: vec4<f32>;
+             @group(0) @binding(1) var<storage, read_write> scratch: array<u32>;
+             @fragment fn main() -> @location(0) vec4<f32> { return colour; }",
+        ),
+        ShaderInterface {
+            resources: vec![
+                ResourceBinding {
+                    group: 0,
+                    binding: 0,
+                    kind: ResourceKind::UniformBuffer,
+                },
+                ResourceBinding {
+                    group: 0,
+                    binding: 1,
+                    kind: ResourceKind::StorageBuffer { writable: true },
+                },
+            ],
+            ..ShaderInterface::default()
+        },
+    ))
+    .expect("fragment shader")
+}
+
+/// The first 48 bytes of `buffer`: two triangles of `vec2<f32>` positions.
+fn two_triangles(buffer: BufferId) -> BufferSlice {
+    BufferSlice {
+        buffer,
+        offset: 0,
+        size: 48,
+    }
+}
+
+/// A draw of the two triangles in `vertices` with a pipeline of [`writer_shader`], in the colour
+/// `colour` holds, binding `storage` as writable storage.
+fn writing_draw(
+    pipeline: PipelineId,
+    colour: BufferId,
+    storage: BufferId,
+    vertices: BufferId,
+) -> Command {
+    Command::Draw(DrawDesc {
+        pipeline,
+        bindings: vec![
+            Binding {
+                group: 0,
+                binding: 0,
+                resource: BindingResource::Buffer(BufferSlice {
+                    buffer: colour,
+                    offset: 0,
+                    size: 16,
+                }),
+            },
+            Binding {
+                group: 0,
+                binding: 1,
+                resource: BindingResource::Buffer(two_triangles(storage)),
+            },
+        ],
+        vertex_buffers: vec![two_triangles(vertices)],
+        index_buffer: None,
+        dynamic: dynamic(),
+        params: DrawParams::Direct {
+            vertex_count: 6,
+            instance_count: 1,
+            first_vertex: 0,
+            first_instance: 0,
+        },
+    })
+}
+
+/// A buffer of 48 bytes that draws read vertices from and bind as storage.
+fn shared_buffer(s: &Scene) -> BufferId {
+    s.gpu
+        .create_buffer(&BufferDesc {
+            size: 48,
+            usage: VERTICES.union(BufferUsage::STORAGE),
+        })
+        .expect("buffer")
+}
+
 /// A buffer one draw binds as writable storage and the next draws vertices from cannot share a
 /// render pass in wgpu; the second draw starts a new one, and both draw.
 #[test]
@@ -977,81 +1064,10 @@ fn a_conflicting_use_starts_a_new_pass() {
         let Some(mut s) = scene("conflict_new_pass") else {
             return;
         };
-        let fs = s
-            .gpu
-            .create_shader(shader_desc(
-                ShaderStage::Fragment,
-                "main",
-                wgsl(
-                    "@group(0) @binding(0) var<uniform> colour: vec4<f32>;
-                     @group(0) @binding(1) var<storage, read_write> scratch: array<u32>;
-                     @fragment fn main() -> @location(0) vec4<f32> { return colour; }",
-                ),
-                ShaderInterface {
-                    resources: vec![
-                        ResourceBinding {
-                            group: 0,
-                            binding: 0,
-                            kind: ResourceKind::UniformBuffer,
-                        },
-                        ResourceBinding {
-                            group: 0,
-                            binding: 1,
-                            kind: ResourceKind::StorageBuffer { writable: true },
-                        },
-                    ],
-                    ..ShaderInterface::default()
-                },
-            ))
-            .expect("fragment shader");
-        let writer = s.pipeline(positions(s.vs, fs, Topology::Triangles));
-        let shared = s
-            .gpu
-            .create_buffer(&BufferDesc {
-                size: 48,
-                usage: VERTICES.union(BufferUsage::STORAGE),
-            })
-            .expect("buffer");
+        let writer = s.pipeline(positions(s.vs, writer_shader(&s.gpu), Topology::Triangles));
+        let shared = shared_buffer(&s);
         let (colour, up_colour) = s.buffer(UNIFORMS, &floats(&GREEN));
         let (vb, up_vertices) = s.buffer(VERTICES, &floats(&triangles(OTHER)));
-        let mut draws = vec![
-            up_colour,
-            up_vertices,
-            upload(floats(&triangles(RECT)), slice(shared, 0, 48)),
-        ];
-        let at = |buffer| BufferSlice {
-            buffer,
-            offset: 0,
-            size: 48,
-        };
-        draws.push(Command::Draw(DrawDesc {
-            pipeline: writer,
-            bindings: vec![
-                Binding {
-                    group: 0,
-                    binding: 0,
-                    resource: BindingResource::Buffer(BufferSlice {
-                        buffer: colour,
-                        offset: 0,
-                        size: 16,
-                    }),
-                },
-                Binding {
-                    group: 0,
-                    binding: 1,
-                    resource: BindingResource::Buffer(at(shared)),
-                },
-            ],
-            vertex_buffers: vec![at(vb)],
-            index_buffer: None,
-            dynamic: dynamic(),
-            params: DrawParams::Direct {
-                vertex_count: 6,
-                instance_count: 1,
-                first_vertex: 0,
-                first_instance: 0,
-            },
-        }));
         let mut second = s.draw(
             Topology::Triangles,
             false,
@@ -1062,14 +1078,81 @@ fn a_conflicting_use_starts_a_new_pass() {
         let Some(Command::Draw(mut draw)) = second.pop() else {
             unreachable!("the last command is the draw");
         };
-        draw.vertex_buffers = vec![at(shared)];
+        draw.vertex_buffers = vec![two_triangles(shared)];
         // Every upload first, so nothing but the conflict separates the two draws.
-        let first = draws.split_off(draws.len() - 1);
         let mut list = second;
-        list.extend(draws);
-        list.extend(first);
-        list.push(Command::Draw(draw));
+        list.extend([
+            up_colour,
+            up_vertices,
+            upload(floats(&triangles(RECT)), slice(shared, 0, 48)),
+            writing_draw(writer, colour, shared, vb),
+            Command::Draw(draw),
+        ]);
         assert_eq!(s.pixels(list), image(&[(OTHER, GREEN), (RECT, MAGENTA)]));
+        assert_eq!(s.gpu.host_errors(), 0);
+    });
+}
+
+/// A draw the render thread skips still ends the pass before it when its check started a new
+/// one (`thread::pass`): draw A writes a buffer as storage; draw B reads it as vertices, so the
+/// check starts a pass for B, and is skipped for its filtering sampler; draw C reads it as
+/// vertices too and joins B's pass. Had B left A's pass open, C would be encoded into it, where
+/// wgpu refuses the conflict and loses the list.
+#[test]
+fn a_skipped_draw_still_ends_the_pass_before_it() {
+    bounded(|| {
+        let Some(mut s) = scene("skip_ends_pass") else {
+            return;
+        };
+        let writer = s.pipeline(positions(s.vs, writer_shader(&s.gpu), Topology::Triangles));
+        let fs = sampling_shader(&s.gpu, false);
+        let sampling = s.pipeline(positions(s.vs, fs, Topology::Triangles));
+        let image_tex = s
+            .gpu
+            .create_texture(&texture_desc(
+                TextureDimension::D2,
+                RGBA,
+                (4, 4, 1),
+                1,
+                TARGET,
+            ))
+            .expect("texture");
+        let image_view = s
+            .gpu
+            .create_view(image_tex, &whole_view(RGBA, ViewDimension::D2, (0, 1)))
+            .expect("view");
+        let linear = s
+            .gpu
+            .create_sampler(&crate::fixtures::sampler())
+            .expect("sampler");
+        let shared = shared_buffer(&s);
+        let (colour, up_colour) = s.buffer(UNIFORMS, &floats(&GREEN));
+        let (vb, up_vertices) = s.buffer(VERTICES, &floats(&triangles(OTHER)));
+        let mut third = s.draw(
+            Topology::Triangles,
+            false,
+            &triangles(RECT),
+            &Feed::Direct,
+            MAGENTA,
+        );
+        let Some(Command::Draw(mut c)) = third.pop() else {
+            unreachable!("the last command is the draw");
+        };
+        c.vertex_buffers = vec![two_triangles(shared)];
+        // Every upload in a list of its own, so nothing but the draws' uses ends a pass.
+        third.extend([
+            up_colour,
+            up_vertices,
+            upload(floats(&triangles(RECT)), slice(shared, 0, 48)),
+        ]);
+        s.run(third);
+        let list = vec![
+            writing_draw(writer, colour, shared, vb),
+            sampled_draw(sampling, image_view, linear, shared),
+            Command::Draw(c),
+        ];
+        assert_eq!(s.pixels(list), image(&[(OTHER, GREEN), (RECT, MAGENTA)]));
+        assert_eq!(s.gpu.encode_skips(), 1);
         assert_eq!(s.gpu.host_errors(), 0);
     });
 }

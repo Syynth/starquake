@@ -334,6 +334,40 @@ fn uses_follow_wgpus_one_exclusive_or_any_inclusive_rule() {
     let mut sample_same = Uses::new();
     sample_same.texture(t, &part(0, 1, 0, 1), wgpu::TextureUses::RESOURCE);
     assert!(!tex_pass.fits(&sample_same));
+
+    // A part that ends exactly where another starts meets nothing, whichever is added first and
+    // whether it is added (`texture`) or judged (`fits`): mips and layers both.
+    for (target, sampled) in [
+        (part(1, 2, 0, 1), part(0, 1, 0, 1)),
+        (part(0, 1, 0, 1), part(1, 2, 0, 1)),
+        (part(0, 1, 1, 2), part(0, 1, 0, 1)),
+        (part(0, 1, 0, 1), part(0, 1, 1, 2)),
+    ] {
+        for (first, first_use, second, second_use) in [
+            (
+                &target,
+                wgpu::TextureUses::COLOR_TARGET,
+                &sampled,
+                wgpu::TextureUses::RESOURCE,
+            ),
+            (
+                &sampled,
+                wgpu::TextureUses::RESOURCE,
+                &target,
+                wgpu::TextureUses::COLOR_TARGET,
+            ),
+        ] {
+            let mut both = Uses::new();
+            both.texture(t, first, first_use);
+            both.texture(t, second, second_use);
+            assert!(both.is_valid(), "{first:?} then {second:?}");
+            let mut pass = Uses::new();
+            pass.texture(t, first, first_use);
+            let mut next = Uses::new();
+            next.texture(t, second, second_use);
+            assert!(pass.fits(&next), "{second:?} joining {first:?}");
+        }
+    }
 }
 
 #[test]
@@ -433,6 +467,16 @@ fn add_view(tables: &mut plan::Tables, desc: starquake_render::TextureDesc, v: V
     let (i, g) = tables
         .views
         .insert(ViewRec { texture, desc: v })
+        .expect("room");
+    ViewId::new(i, g)
+}
+
+/// Another view, `desc`, of the texture `of` views.
+fn add_view_of(tables: &mut plan::Tables, of: ViewId, desc: ViewDesc) -> ViewId {
+    let texture = tables.view(of).expect("live").0.texture;
+    let (i, g) = tables
+        .views
+        .insert(ViewRec { texture, desc })
         .expect("room");
     ViewId::new(i, g)
 }
@@ -1031,15 +1075,171 @@ fn every_count_and_use_refusal_names_its_rule() {
             RenderError::Invalid(USAGE_CONFLICT),
         ),
     ];
-    for (name, fault, error) in cases {
+    for (name, fault, error) in cases.into_iter().chain(rewritten_index_faults()) {
         assert_eq!(w.refusal(&|w, b, d| fault(w, b, d)), Some(error), "{name}");
     }
+}
+
+/// Sets `d` to draw four indices of `format` from byte `offset` of `indices`.
+fn four_indices(d: &mut DrawDesc, indices: BufferId, offset: u64, format: IndexFormat) {
+    d.index_buffer = Some(IndexBufferBinding {
+        slice: buffer(indices, offset, 32),
+        format,
+    });
+    d.params = DrawParams::Indexed {
+        index_count: 4,
+        instance_count: 1,
+        first_index: 0,
+        base_vertex: 0,
+        first_instance: 0,
+    };
+}
+
+/// [`every_count_and_use_refusal_names_its_rule`]'s rewritten draws whose indices start off
+/// their size: quads from 16-bit and 32-bit indices, and a strip from 16-bit ones.
+fn rewritten_index_faults() -> Vec<(&'static str, Fault, RenderError)> {
+    vec![
+        (
+            "rewritten 16-bit quad indices off their size",
+            |w, _, d| {
+                d.pipeline = w.quads;
+                d.vertex_buffers.clear();
+                four_indices(d, w.indices, 1, IndexFormat::U16);
+            },
+            RenderError::Invalid(INDEX_OFFSET),
+        ),
+        (
+            "rewritten 32-bit quad indices off their size",
+            |w, _, d| {
+                d.pipeline = w.quads;
+                d.vertex_buffers.clear();
+                four_indices(d, w.indices, 2, IndexFormat::U32);
+            },
+            RenderError::Invalid(INDEX_OFFSET),
+        ),
+        (
+            "rewritten 16-bit strip indices off their size",
+            |w, _, d| {
+                d.pipeline = w.strips;
+                four_indices(d, w.indices, 1, IndexFormat::U16);
+            },
+            RenderError::Invalid(INDEX_OFFSET),
+        ),
+    ]
+}
+
+/// An index buffer starts on a multiple of its index size whether the draw binds it directly or
+/// rewrites it (`draw` module docs, step 6): each offset from 0 to two 32-bit indices, for every
+/// format, a pipeline that rewrites it and one that may not.
+#[test]
+fn index_buffers_start_on_a_multiple_of_their_index_size() {
+    let w = world();
+    let check = |pipeline, format, offset| {
+        let mut d = w.draw();
+        d.pipeline = pipeline;
+        four_indices(&mut d, w.indices, offset, format);
+        w.check(vec![targets(w.target), Command::Draw(d)]).err()
+    };
+    for pipeline in [w.graphics, w.quads, w.strips] {
+        for format in [IndexFormat::U8, IndexFormat::U16, IndexFormat::U32] {
+            let size = u64::from(rewrite::Source::of(Some(format)).index_bytes());
+            for offset in 0..=2 * u64::from(rewrite::Source::U32.index_bytes()) {
+                let expected =
+                    (!offset.is_multiple_of(size)).then_some(RenderError::Invalid(INDEX_OFFSET));
+                assert_eq!(
+                    check(pipeline, format, offset),
+                    expected,
+                    "{pipeline:?} {format:?} at {offset}"
+                );
+            }
+        }
+    }
+}
+
+/// Colour targets that share a texture's mip level and layer are refused, as wgpu-core 30.0.2
+/// refuses them when the pass opens (`check_attachment_overlap` in `RenderPassInfo::start`,
+/// `src/command/render.rs`); two layers of one texture, or two textures, are not. The check
+/// comes after the size check and before the pipeline's formats (step 4).
+#[test]
+fn colour_targets_must_not_overlap() {
+    let mut w = world();
+    let PipelineInfo::Graphics(mut two) = graphics_info(
+        Topology::Triangles,
+        vec![VertexStep {
+            stride: 8,
+            last_stride: 8,
+            instance: false,
+        }],
+        &[],
+    ) else {
+        unreachable!("a graphics pipeline");
+    };
+    two.colors = vec![Some(wgpu::TextureFormat::Rgba8Unorm); 2];
+    let two = add_pipeline(&mut w.pipelines, PipelineInfo::Graphics(two));
+    let rt = TextureUsage::RENDER_TARGET.union(TextureUsage::SAMPLED);
+    let again = add_view_of(&mut w.tables, w.target, view(RGBA, ViewDimension::D2));
+    let other = add_view(
+        &mut w.tables,
+        texture(RGBA, 8, 8, rt),
+        view(RGBA, ViewDimension::D2),
+    );
+    let mut layered = texture(RGBA, 8, 8, rt);
+    layered.size.depth_or_layers = 2;
+    let layer0 = add_view(&mut w.tables, layered, view(RGBA, ViewDimension::D2));
+    let layer1 = add_view_of(
+        &mut w.tables,
+        layer0,
+        ViewDesc {
+            base_layer: 1,
+            ..view(RGBA, ViewDimension::D2)
+        },
+    );
+    let check = |pipeline, colors: &[Option<ViewId>]| {
+        let mut t = RenderTargets::default();
+        for (slot, c) in t.colors.iter_mut().zip(colors) {
+            *slot = *c;
+        }
+        let mut d = w.draw();
+        d.pipeline = pipeline;
+        w.check(vec![Command::SetRenderTargets(t), Command::Draw(d)])
+            .err()
+    };
+    let overlap = Some(RenderError::Unsupported(ATTACHMENT_OVERLAP));
+    assert_eq!(check(two, &[Some(w.target), Some(w.target)]), overlap);
+    assert_eq!(check(two, &[Some(w.target), Some(again)]), overlap);
+    assert_eq!(check(two, &[Some(layer1), Some(layer1)]), overlap);
+    assert_eq!(check(two, &[Some(w.target), Some(other)]), None);
+    assert_eq!(check(two, &[Some(layer0), Some(layer1)]), None);
+    assert_eq!(check(two, &[Some(layer1), Some(layer0)]), None);
+    // With the pipeline's formats wrong too, the overlap is reported; with the sizes different
+    // too, the sizes are.
+    assert_eq!(
+        check(w.graphics, &[Some(w.target), Some(w.target)]),
+        overlap
+    );
+    assert_eq!(
+        check(two, &[Some(w.target), Some(w.target), Some(w.small)]),
+        Some(RenderError::Unsupported(TARGETS_DIFFER))
+    );
 }
 
 /// The edges of the counts: the last vertex and index that fit, and one past each.
 #[test]
 fn counts_are_checked_at_their_edges() {
-    let w = world();
+    let mut w = world();
+    let stepped = add_pipeline(
+        &mut w.pipelines,
+        graphics_info(
+            Topology::Triangles,
+            vec![VertexStep {
+                stride: 8,
+                last_stride: 8,
+                instance: true,
+            }],
+            &[],
+        ),
+    );
+    let w = w;
     let direct = |vertex_count, first_vertex| {
         let mut d = w.draw();
         d.params = DrawParams::Direct {
@@ -1079,6 +1279,28 @@ fn counts_are_checked_at_their_edges() {
     assert_eq!(indexed(17, 0), Some(RenderError::Invalid(INDEX_LIMIT)));
     assert_eq!(indexed(2, 14), None);
     assert_eq!(indexed(2, 15), Some(RenderError::Invalid(INDEX_LIMIT)));
+    // An indexed draw's instances against an instance-stepped buffer (which limits no vertex):
+    // 64 bytes of 8-byte instances, 8.
+    let per_instance = |count, first| {
+        let mut d = w.draw();
+        d.pipeline = stepped;
+        d.index_buffer = Some(IndexBufferBinding {
+            slice: buffer(w.indices, 0, 64),
+            format: IndexFormat::U32,
+        });
+        d.params = DrawParams::Indexed {
+            index_count: 3,
+            instance_count: count,
+            first_index: 0,
+            base_vertex: 0,
+            first_instance: first,
+        };
+        w.check(vec![targets(w.target), Command::Draw(d)]).err()
+    };
+    assert_eq!(per_instance(8, 0), None);
+    assert_eq!(per_instance(9, 0), Some(RenderError::Invalid(VERTEX_LIMIT)));
+    assert_eq!(per_instance(1, 7), None);
+    assert_eq!(per_instance(1, 8), Some(RenderError::Invalid(VERTEX_LIMIT)));
     let indirect = |draw_count| {
         let mut d = w.draw();
         d.params = DrawParams::Indirect {
@@ -1235,12 +1457,29 @@ fn a_draw_becomes_this_step() {
 }
 
 /// Rewrites are placed in the list's scratch at the device's alignments, the parameter blocks in
-/// one buffer and the outputs in another; a strip draw from 16-bit indices is widened.
+/// one buffer at the uniform alignment and the outputs in another at the storage alignment; a
+/// strip draw from 16-bit indices is widened. Run with the test device's limits and with
+/// uniform and storage alignments that differ either way, so swapping them fails.
 #[test]
 fn rewrites_are_placed_in_the_lists_scratch() {
+    let device = draw_limits(&test_caps());
+    let with = |uniform_alignment, storage_alignment| {
+        let mut limits = device;
+        limits.binding.uniform_alignment = uniform_alignment;
+        limits.binding.storage_alignment = storage_alignment;
+        limits
+    };
+    for limits in [device, with(256, 32), with(32, 256)] {
+        rewrites_are_placed_with(&limits);
+    }
+}
+
+/// [`rewrites_are_placed_in_the_lists_scratch`] under `limits`.
+fn rewrites_are_placed_with(limits: &DrawLimits) {
     let w = world();
-    let limits = draw_limits(&test_caps());
-    let uniform = u64::from(limits.binding.uniform_alignment);
+    // The second parameter block starts after the first at the uniform alignment.
+    let uniform =
+        rewrite::PARAMS_SIZE.next_multiple_of(u64::from(limits.binding.uniform_alignment));
     let storage = u64::from(limits.binding.storage_alignment);
     let mut quad = w.draw();
     quad.pipeline = w.quads;
@@ -1265,11 +1504,10 @@ fn rewrites_are_placed_in_the_lists_scratch() {
         first_instance: 0,
     };
     let checked = w
-        .check(vec![
-            targets(w.target),
-            Command::Draw(quad),
-            Command::Draw(strip),
-        ])
+        .check_with(
+            limits,
+            vec![targets(w.target), Command::Draw(quad), Command::Draw(strip)],
+        )
         .expect("accepted");
     let rewrites: Vec<(RewriteStep, DrawCall)> = checked
         .steps

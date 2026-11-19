@@ -13,13 +13,13 @@
 use super::rewrite::{self, Rewrite, Source};
 use super::rules::{self, BufferKind, Subresources, Uses, VertexStep};
 use super::{
-    Attachment, BINDING_ARRAY, BINDING_KIND, Bound, BoundGroup, DEPTH_STENCIL_VIEW, DispatchCall,
-    DispatchStep, DrawCall, DrawLimits, DrawStep, EXTRA_BINDING, EntryInfo, GraphicsInfo,
-    INDEX_LIMIT, INDEX_OFFSET, INDIRECT_DRAWS, INDIRECT_REWRITE, LayoutInfo, MAX_INDIRECT_DRAWS,
-    MISSING_BINDING, MISSING_VERTEX_BUFFER, NEEDS_COMPUTE, NEEDS_GRAPHICS, NO_TARGETS,
-    PipelineInfo, REWRITE_SIZE, RewriteScratch, RewriteStep, SAMPLER_KIND, SCRATCH,
-    TARGET_MISMATCH, TARGETS_DIFFER, Targets, USAGE_CONFLICT, VERTEX_LIMIT, VERTEX_OFFSET,
-    VIEW_KIND,
+    ATTACHMENT_OVERLAP, Attachment, BINDING_ARRAY, BINDING_KIND, Bound, BoundGroup,
+    DEPTH_STENCIL_VIEW, DispatchCall, DispatchStep, DrawCall, DrawLimits, DrawStep, EXTRA_BINDING,
+    EntryInfo, GraphicsInfo, INDEX_LIMIT, INDEX_OFFSET, INDIRECT_DRAWS, INDIRECT_REWRITE,
+    LayoutInfo, MAX_INDIRECT_DRAWS, MISSING_BINDING, MISSING_VERTEX_BUFFER, NEEDS_COMPUTE,
+    NEEDS_GRAPHICS, NO_TARGETS, PipelineInfo, REWRITE_SIZE, RewriteScratch, RewriteStep,
+    SAMPLER_KIND, SCRATCH, TARGET_MISMATCH, TARGETS_DIFFER, Targets, USAGE_CONFLICT, VERTEX_LIMIT,
+    VERTEX_OFFSET, VIEW_KIND,
 };
 use crate::convert::view_dimension;
 use crate::format::texture_format;
@@ -431,8 +431,10 @@ fn draw_buffers(tables: &Tables, draw: &DrawDesc) -> Result<(), RenderError> {
 type DirectIndex = Option<(BufferSlice, wgpu::IndexFormat)>;
 
 /// Step 6: the vertex buffers the pipeline reads are bound, each from a word boundary; the
-/// draw's rewrite, if any; and the guest index buffer it binds directly, from a multiple of its
-/// index size. Adds their uses.
+/// index buffer of an indexed draw from a multiple of its index size, whether the draw binds it
+/// directly or rewrites it (the rewrite reads an index from the 32-bit word it starts in, so an
+/// index that straddles two words would lose its high part); the draw's rewrite, if any; and the
+/// guest index buffer it binds directly. Adds the uses of the buffers the render pass reads.
 fn vertex_input(
     info: &GraphicsInfo,
     draw: &DrawDesc,
@@ -453,12 +455,14 @@ fn vertex_input(
         }
         DrawParams::Direct { .. } | DrawParams::Indirect { indexed: false, .. } => None,
     };
+    if let (Some(format), Some(binding)) = (index_format, draw.index_buffer)
+        && !binding.slice.offset.is_multiple_of(index_bytes(format))
+    {
+        return Err(invalid(INDEX_OFFSET));
+    }
     let rewrite = rewrite::plan(info.topology, info.primitive_restart, index_format);
     let index = match (rewrite, index_format, draw.index_buffer) {
         (None, Some(format), Some(binding)) => {
-            if !binding.slice.offset.is_multiple_of(index_bytes(format)) {
-                return Err(invalid(INDEX_OFFSET));
-            }
             uses.buffer(binding.slice.buffer, wgpu::BufferUses::INDEX);
             host_index_format(format).map(|h| (binding.slice, h))
         }
@@ -524,8 +528,9 @@ fn attachment(view: &ViewRec, tex: &TextureRec) -> Result<Attachment, RenderErro
     })
 }
 
-/// The attachments' one size, after checking that they have one size and one sample count and
-/// the formats and samples `info` was made for (`draw` module docs, step 4).
+/// The attachments' one size, after checking that they have one size and one sample count, that
+/// no two colour attachments draw into one mip level and layer, and the formats and samples
+/// `info` was made for (`draw` module docs, step 4).
 fn target_size(targets: &Targets, info: &GraphicsInfo) -> Result<(u32, u32), RenderError> {
     let mut all = targets
         .colors
@@ -535,6 +540,18 @@ fn target_size(targets: &Targets, info: &GraphicsInfo) -> Result<(u32, u32), Ren
     let first = all.next().ok_or(invalid(NO_TARGETS))?;
     if all.any(|a| a.size != first.size || a.samples != first.samples) {
         return Err(RenderError::Unsupported(TARGETS_DIFFER));
+    }
+    // wgpu-core 30.0.2 keys each colour attachment by texture, mip level and layer (a 3D
+    // texture's by its depth slice, 0 here) and refuses a repeat when the pass opens
+    // (`check_attachment_overlap` in `RenderPassInfo::start`, `src/command/render.rs`); it
+    // leaves the depth/stencil attachment out. Each pair is compared once: there are at most
+    // `GUEST_COLOR_TARGETS` colour attachments.
+    let key = |a: &Attachment| (a.texture, a.mip, a.layer);
+    let colors = targets.colors.iter().flatten();
+    for (i, a) in colors.clone().enumerate() {
+        if colors.clone().skip(i + 1).any(|b| key(b) == key(a)) {
+            return Err(RenderError::Unsupported(ATTACHMENT_OVERLAP));
+        }
     }
     let colors: Vec<Option<wgpu::TextureFormat>> =
         targets.colors.iter().map(|a| a.map(|a| a.format)).collect();

@@ -229,12 +229,55 @@ fn the_rewrite_plan_for_every_topology_and_source() {
         }
     }
     // The cases the divergences name, written out: restart off is not honoured for 32-bit
-    // strip indices, nor inside the rewritten topologies.
+    // strip indices, and restart on is not honoured inside the rewritten topologies (a line
+    // loop from 32-bit indices aside: `only_a_line_loop_from_32_bit_indices_restarts_after_the_rewrite`).
     assert_eq!(plan(Topology::TriangleStrip, false, Some(U32)), None);
     assert_eq!(
         plan(Topology::TriangleFan, true, Some(U16)),
         rw(Mode::Fan, Source::U16, false)
     );
+}
+
+/// The exception to the restart divergence (`draw` module docs, "Divergences"): of the rewritten
+/// topologies only a line loop becomes a host strip, whose pipeline names 32-bit indices, and
+/// only from 32-bit indices does its rewrite write [`RESTART`], with the plan's restart off; so
+/// only there does the host restart. The others become triangle lists, which never restart.
+#[test]
+fn only_a_line_loop_from_32_bit_indices_restarts_after_the_rewrite() {
+    use crate::pipeline::state::{STRIP_INDEX_FORMAT, topology};
+    use IndexFormat::{U8, U16, U32};
+    let rewritten = [
+        Topology::Quads,
+        Topology::QuadStrip,
+        Topology::TriangleFan,
+        Topology::Polygon,
+        Topology::LineLoop,
+    ];
+    for t in rewritten {
+        let host = topology(t).expect("a host topology");
+        assert_eq!(host.is_strip(), t == Topology::LineLoop, "{t:?}");
+    }
+    assert_eq!(
+        topology(Topology::LineLoop),
+        Some(wgpu::PrimitiveTopology::LineStrip)
+    );
+    assert_eq!(STRIP_INDEX_FORMAT, wgpu::IndexFormat::Uint32);
+    for restart in [false, true] {
+        for format in [U8, U16, U32] {
+            let rw = plan(Topology::LineLoop, restart, Some(format)).expect("rewritten");
+            assert!(!rw.restart, "{format:?}");
+            // Indices 1, the format's all-ones value, 2.
+            let size = usize::try_from(rw.source.index_bytes()).expect("small");
+            let mut input = vec![0; 3 * size];
+            input[0] = 1;
+            input[size..2 * size].fill(0xFF);
+            input[2 * size] = 2;
+            let out = model(rw, 3, 0, &input);
+            let all_ones = u32::MAX >> (32 - 8 * rw.source.index_bytes());
+            assert_eq!(out, [1, all_ones, 2, 1], "{format:?}");
+            assert_eq!(out.contains(&RESTART), format == U32, "{format:?}");
+        }
+    }
 }
 
 /// The output counts at each mode's edges, and where they stop fitting a `u32`.
