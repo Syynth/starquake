@@ -14,7 +14,7 @@ use starquake_render::recording::RecordingBackend;
 use starquake_shader::lookup::{EngineState, ProgramMemory, ProgramRequest, VariantKey};
 
 use super::*;
-use crate::hle::graphics::GpuParts;
+use crate::hle::graphics::{GpuParts, Idleness};
 
 /// How long any wait for the GPU's threads may take before the test fails.
 const PATIENCE: Duration = Duration::from_secs(20);
@@ -177,6 +177,44 @@ fn a_graphics_server_with_a_busy_gpu_is_not_idle() {
     assert!(graphics.shared().queue().is_empty());
     assert!(!gpu.is_idle());
     assert!(!graphics.is_idle());
+    // The busy answer is the GPU's alone; with something queued too, the server is busy for
+    // more than the GPU.
+    assert_eq!(graphics.idleness(), Idleness::GpuBusy);
+    graphics
+        .shared()
+        .queue()
+        .push(starquake_gsv::completion::Completion::Gpu(
+            starquake_gpu::interface::GpuCompletion::GpuOrdered {
+                ticket: starquake_gpu::interface::Ticket(0x93),
+            },
+        ));
+    assert_eq!(graphics.idleness(), Idleness::Busy);
+    assert!(!graphics.is_idle());
+}
+
+/// A running GPU that is idle leaves the server idle once its turn ends; with a completion
+/// queued the server reads busy, not `GpuBusy`, whatever the GPU answers. An idle GPU does read
+/// busy while a safety-net turn runs, so the server can read `GpuBusy` meanwhile: idle is
+/// waited for, not asserted once.
+#[test]
+fn a_graphics_server_over_an_idle_gpu_becomes_idle_and_a_queued_completion_reads_busy() {
+    let graphics = with_gpu();
+    wait_until("the server over a new GPU is idle", || {
+        graphics.idleness() == Idleness::Idle
+    });
+    graphics
+        .shared()
+        .queue()
+        .push(starquake_gsv::completion::Completion::Gpu(
+            starquake_gpu::interface::GpuCompletion::GpuOrdered {
+                ticket: starquake_gpu::interface::Ticket(0x94),
+            },
+        ));
+    // Whatever the GPU answers, the queue makes the server busy.
+    for _ in 0..20 {
+        assert_eq!(graphics.idleness(), Idleness::Busy);
+    }
+    graphics.gpu().unwrap().stop().unwrap();
 }
 
 #[test]

@@ -154,6 +154,7 @@ pub use poll::{
     Backoff, FrontClock, HostClock, IDLE_PARK, POLL_FIRST_SLEEP, POLL_LONGEST_SLEEP, POLL_SPINS,
 };
 pub use shared::{CreateError, FrontShared, fits};
+pub use shared::{QuietWake, QuietWakeTaken};
 pub use thread::{FrontThread, spawn, spawn_observed};
 
 use lane::{Lane, LaneCx, Wait};

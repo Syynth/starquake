@@ -385,3 +385,26 @@ fn is_idle_waits_for_a_drain_in_progress() {
     assert_eq!(answer.recv_timeout(Duration::from_secs(10)), Ok(true));
     thread.join().unwrap();
 }
+
+/// The graphics server's idleness from its two answers, every combination written out: a busy
+/// GPU alone is `GpuBusy`; anything else busy is `Busy`, whatever the GPU said.
+#[test]
+fn idleness_is_gpu_busy_only_when_the_gpu_alone_is_busy() {
+    assert_eq!(idleness(false, true), Idleness::Idle);
+    assert_eq!(idleness(true, true), Idleness::GpuBusy);
+    assert_eq!(idleness(false, false), Idleness::Busy);
+    assert_eq!(idleness(true, false), Idleness::Busy);
+}
+
+/// With the null front there is no GPU to answer busy: its server is idle or busy, never
+/// `GpuBusy`, and `is_idle` agrees with `idleness` on both.
+#[test]
+fn the_null_front_is_never_gpu_busy() {
+    let graphics = graphics(FrontMode::Live);
+    assert_eq!(graphics.idleness(), Idleness::Idle);
+    assert!(graphics.is_idle());
+    // The null front completes a barrier at once, into the queue.
+    graphics.front().barrier(Ticket(0x92));
+    assert_eq!(graphics.idleness(), Idleness::Busy);
+    assert!(!graphics.is_idle());
+}

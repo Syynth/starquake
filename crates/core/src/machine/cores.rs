@@ -6,22 +6,90 @@
 //! begun to wait is not lost. A core's interrupter is attached once its vCPU exists; an
 //! interrupt before that reaches nothing, which is harmless, because the core's first step is
 //! to ask the scheduler what to run.
+//!
+//! # Telling a stalled run
+//!
+//! The last core to park asks whether the run is stalled ([`Cores::park`]); the core loop's
+//! question ([`stall`]) asks the graphics server and then the kernel. The answer is one of
+//! [`Stall`]'s three:
+//!
+//! - **Stalled**: the park ends at once ([`Parked::Stalled`]) and the run stops as `WAITING`.
+//! - **Not stalled**: the core waits for a wake, with no timeout.
+//! - **Only the GPU**: the kernel says nothing could end a wait and the rest of the graphics
+//!   server is idle, but the GPU answered busy. An idle GPU reads busy during each turn its
+//!   front takes, the `IDLE_PARK` safety-net turns included, so a question that lands in one
+//!   would never be asked again (PR #422's review). The core then also waits for the GPU's next
+//!   quiet signal (`starquake_gpu::wiring::Gpu::set_quiet_wake`, which [`Cores::listen_to`]
+//!   wires) and asks again when it comes, up to [`GPU_QUIET_RETRIES`] times in one park; past
+//!   that it waits as for "not stalled" (gpu-protocol, "Idleness"; observability, "Stalls and
+//!   host timing"; decision log, 2026-11-19, ruling 37).
+//!
+//! The core arms itself for the quiet signal before it asks, so a signal that comes while the
+//! question is being asked is not lost
+//! (`a_quiet_signal_during_the_question_is_not_lost`). One signal is taken by one arming: the
+//! core asks once per signal. It asks again only while every core is still parked: a core that
+//! another core's wake has unparked meanwhile will park again and be the one that asks
+//! (`a_quiet_signal_while_another_core_runs_asks_nothing`). At most one core is armed, the last
+//! one to have asked: a later question by another core moves the arming to it.
+//!
+//! No clock is read for any of this: the wait for the quiet signal has no timeout, and the
+//! retry bound counts questions.
+//!
+//! Lock order: the idle count, then the kernel (the question) or the arming, then a core's park
+//! state. The GPU's front thread takes the arming, then a park state; the question waits on the
+//! GPU with only the idle count held.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use starquake_cpu::Interrupter;
+use starquake_gpu::front::{QuietWake, QuietWakeTaken};
 use starquake_kernel::sched::{CoreId, CoreSignals};
 
 use super::lock;
+use crate::hle::Graphics;
+use crate::hle::graphics::Idleness;
 
-/// One core's slot.
-struct Slot<I> {
-    /// The vCPU's interrupter, once the vCPU exists.
-    interrupter: Mutex<Option<I>>,
-    /// Whether a wake is waiting for the core.
-    woken: Mutex<bool>,
-    wake: Condvar,
+/// How many times one park of the last core asks again whether the run is stalled, each time
+/// after the GPU's next quiet signal, when the answers were busy only because of the GPU (module
+/// docs, "Telling a stalled run"). Starquake's own number, a **guess** (gpu-protocol asks only
+/// for "a named retry count"): an idle GPU reads busy for a few microseconds in each 100 ms
+/// safety-net turn, so a stalled run whose questions land in eight turns in a row is very
+/// unlikely, while a GPU that stays busy is asked no more than nine times per park. What would
+/// confirm or change it: a measurement of how often consecutive questions land in GPU turns (a
+/// scratch run with `IDLE_PARK` cut to 1 µs, as issue #436's reproduction does), or a trace of a
+/// long back list that no guest waits on, showing how many quiet signals pass before the GPU
+/// answers idle.
+pub(super) const GPU_QUIET_RETRIES: u32 = 8;
+
+/// What the last core to park was told (module docs, "Telling a stalled run").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Stall {
+    /// Nothing could ever wake a core.
+    Stalled,
+    /// Something can still wake a core.
+    NotStalled,
+    /// Stalled but for the GPU's busy answer: asked again at the GPU's next quiet signal.
+    OnlyTheGpu,
+}
+
+/// The core loop's question, from the graphics server's `graphics` answer and the kernel's
+/// (`kernel_stalled`, asked when the graphics server is idle or busy only because of the GPU,
+/// and not when anything else is busy). The kernel, and with it the kernel lock, is now also
+/// asked when the answer is [`Idleness::GpuBusy`]: before the GPU's answer was told apart, a
+/// busy GPU made the question "not stalled" without asking the kernel.
+#[must_use]
+pub(super) fn stall(graphics: Idleness, kernel_stalled: impl FnOnce() -> bool) -> Stall {
+    let stalled = match graphics {
+        Idleness::Busy => return Stall::NotStalled,
+        Idleness::Idle => Stall::Stalled,
+        Idleness::GpuBusy => Stall::OnlyTheGpu,
+    };
+    if kernel_stalled() {
+        stalled
+    } else {
+        Stall::NotStalled
+    }
 }
 
 /// How a park ended.
@@ -35,10 +103,82 @@ pub(super) enum Parked {
     Stalled,
 }
 
+/// What a parked core waits for.
+#[derive(Default)]
+struct ParkState {
+    /// A wake is waiting for the core.
+    woken: bool,
+    /// The GPU reported quiet while the core was armed for it.
+    quiet: bool,
+}
+
+/// One core's park.
+#[derive(Default)]
+struct ParkSlot {
+    state: Mutex<ParkState>,
+    wake: Condvar,
+}
+
+/// What a park waits on, shared with the GPU's front thread, which tells it the quiet signal.
+struct Parks {
+    slots: Vec<ParkSlot>,
+    stopped: AtomicBool,
+    /// The core armed for the GPU's next quiet signal, by index, if one is.
+    armed: Mutex<Option<usize>>,
+    /// How many more quiet signals must reach an armed core before a question that comes to
+    /// "stalled" reads as stalled; until then it reads busy only because of the GPU, as if the
+    /// GPU stayed in a turn until then: a test's way to make questions land in GPU turns.
+    #[cfg(test)]
+    busy_turns: std::sync::atomic::AtomicU32,
+}
+
+impl Parks {
+    /// Arms core `index` for the next quiet signal, forgetting any signal it was told before.
+    fn arm(&self, index: usize) {
+        let mut armed = lock(&self.armed);
+        *armed = Some(index);
+        if let Some(slot) = self.slots.get(index) {
+            lock(&slot.state).quiet = false;
+        }
+    }
+
+    /// Disarms core `index`, if it is the one armed. No test can tell this check from clearing
+    /// another core's arming: a core disarms at the end of its own park, when it is about to be
+    /// unparked, and an armed core told a signal while another is unparked asks nothing; or
+    /// after its own question, which moved the arming to it.
+    fn disarm(&self, index: usize) {
+        let mut armed = lock(&self.armed);
+        if *armed == Some(index) {
+            *armed = None;
+        }
+    }
+}
+
+impl QuietWake for Parks {
+    /// Tells the armed core, if any, and disarms it.
+    fn front_quiet(&self) {
+        let mut armed = lock(&self.armed);
+        let Some(index) = armed.take() else {
+            return;
+        };
+        // Under the arming's lock, which every write here takes.
+        #[cfg(test)]
+        self.busy_turns.store(
+            self.busy_turns.load(Ordering::SeqCst).saturating_sub(1),
+            Ordering::SeqCst,
+        );
+        if let Some(slot) = self.slots.get(index) {
+            lock(&slot.state).quiet = true;
+            slot.wake.notify_all();
+        }
+    }
+}
+
 /// Every core of a run.
 pub(super) struct Cores<I> {
-    slots: Vec<Slot<I>>,
-    stopped: AtomicBool,
+    /// Each core's vCPU interrupter, once the vCPU exists.
+    interrupters: Vec<Mutex<Option<I>>>,
+    parks: Arc<Parks>,
     /// How many cores are parked.
     idle: Mutex<usize>,
 }
@@ -47,40 +187,50 @@ impl<I: Interrupter> Cores<I> {
     /// `count` cores, none with a vCPU yet.
     pub(super) fn new(count: u8) -> Self {
         Self {
-            slots: (0..count)
-                .map(|_| Slot {
-                    interrupter: Mutex::new(None),
-                    woken: Mutex::new(false),
-                    wake: Condvar::new(),
-                })
-                .collect(),
-            stopped: AtomicBool::new(false),
+            interrupters: (0..count).map(|_| Mutex::new(None)).collect(),
+            parks: Arc::new(Parks {
+                slots: (0..count).map(|_| ParkSlot::default()).collect(),
+                stopped: AtomicBool::new(false),
+                armed: Mutex::new(None),
+                #[cfg(test)]
+                busy_turns: std::sync::atomic::AtomicU32::new(0),
+            }),
             idle: Mutex::new(0),
         }
     }
 
     /// How many cores there are.
     pub(super) fn count(&self) -> u8 {
-        u8::try_from(self.slots.len()).unwrap_or(u8::MAX)
+        u8::try_from(self.interrupters.len()).unwrap_or(u8::MAX)
     }
 
-    fn slot(&self, core: CoreId) -> Option<&Slot<I>> {
-        self.slots.get(usize::from(core.index()))
+    /// Gives `graphics`'s GPU, if it has one, the cores as its quiet wake (module docs,
+    /// "Telling a stalled run").
+    ///
+    /// # Errors
+    ///
+    /// [`QuietWakeTaken`] if the GPU already has a quiet wake; a run's GPU is made fresh for
+    /// the run, so it never has.
+    pub(super) fn listen_to(&self, graphics: &Graphics) -> Result<(), QuietWakeTaken> {
+        match graphics.gpu() {
+            Some(gpu) => gpu.set_quiet_wake(Arc::<Parks>::clone(&self.parks)),
+            None => Ok(()),
+        }
     }
 
     /// Gives `core` its vCPU's interrupter.
     pub(super) fn attach(&self, core: CoreId, interrupter: I) {
-        if let Some(slot) = self.slot(core) {
-            *lock(&slot.interrupter) = Some(interrupter);
+        if let Some(slot) = self.interrupters.get(usize::from(core.index())) {
+            *lock(slot) = Some(interrupter);
         }
     }
 
     /// Stops `core`'s vCPU, if it has one; its next run returns at once if it is not running.
     pub(super) fn interrupt(&self, core: CoreId) {
-        let Some(slot) = self.slot(core) else {
+        let Some(slot) = self.interrupters.get(usize::from(core.index())) else {
             return;
         };
-        if let Some(interrupter) = lock(&slot.interrupter).as_ref()
+        if let Some(interrupter) = lock(slot).as_ref()
             && let Err(error) = interrupter.interrupt()
         {
             tracing::error!(core = core.index(), %error, "a core could not be interrupted");
@@ -89,10 +239,10 @@ impl<I: Interrupter> Cores<I> {
 
     /// Ends `core`'s park, or the next one if it is not parked.
     pub(super) fn wake(&self, core: CoreId) {
-        let Some(slot) = self.slot(core) else {
+        let Some(slot) = self.parks.slots.get(usize::from(core.index())) else {
             return;
         };
-        *lock(&slot.woken) = true;
+        lock(&slot.state).woken = true;
         slot.wake.notify_all();
     }
 
@@ -100,14 +250,44 @@ impl<I: Interrupter> Cores<I> {
     /// steps every core on one thread does instead of parking.
     #[cfg(test)]
     pub(super) fn take_wake(&self, core: CoreId) -> bool {
-        self.slot(core)
-            .is_some_and(|slot| std::mem::take(&mut *lock(&slot.woken)))
+        self.parks
+            .slots
+            .get(usize::from(core.index()))
+            .is_some_and(|slot| std::mem::take(&mut lock(&slot.state).woken))
+    }
+
+    /// Makes questions that come to "stalled" read as busy only because of the GPU until `turns`
+    /// quiet signals have reached an armed core, as if the GPU stayed in a turn until each of
+    /// them: the question lands in a GPU turn, and the GPU is busy until the turn ends.
+    #[cfg(test)]
+    pub(super) fn read_gpu_busy(&self, turns: u32) {
+        self.parks.busy_turns.store(turns, Ordering::SeqCst);
+    }
+
+    /// How many of the quiet signals [`Cores::read_gpu_busy`] asked for have not yet reached an
+    /// armed core.
+    #[cfg(test)]
+    pub(super) fn busy_turns_left(&self) -> u32 {
+        self.parks.busy_turns.load(Ordering::SeqCst)
+    }
+
+    /// How many cores are parked, read under the idle count's lock: once it is every core, the
+    /// last one's question has been asked, since a park asks with that lock held.
+    #[cfg(test)]
+    pub(super) fn parked(&self) -> usize {
+        *lock(&self.idle)
+    }
+
+    /// The core armed for the GPU's next quiet signal, by index, if one is.
+    #[cfg(test)]
+    pub(super) fn armed(&self) -> Option<usize> {
+        *lock(&self.parks.armed)
     }
 
     /// Stops every core: each is interrupted and woken, and parks no more.
     pub(super) fn stop(&self) {
-        self.stopped.store(true, Ordering::SeqCst);
-        for index in 0..self.slots.len() {
+        self.parks.stopped.store(true, Ordering::SeqCst);
+        for index in 0..self.interrupters.len() {
             let Some(core) = u8::try_from(index).ok().and_then(CoreId::new) else {
                 continue;
             };
@@ -116,34 +296,92 @@ impl<I: Interrupter> Cores<I> {
         }
     }
 
-    /// Parks `core` until it is woken or the run stops. If it is the last core to park,
-    /// `stalled` is asked first whether anything could ever wake one, and the park ends at once
-    /// if nothing could. `stalled` takes the kernel lock; nothing takes this type's counts
-    /// under the kernel lock, so the order is always counts, then kernel.
-    pub(super) fn park(&self, core: CoreId, stalled: impl FnOnce() -> bool) -> Parked {
-        let Some(slot) = self.slot(core) else {
+    fn is_stopped(&self) -> bool {
+        self.parks.stopped.load(Ordering::SeqCst)
+    }
+
+    /// Asks `ask` as the last core to park, core `index`, with the idle count held: `None` if
+    /// the run is stalled, else whether the core waits for the GPU's next quiet signal. When
+    /// `retry`, the core is armed for that signal before it asks, and disarmed unless the
+    /// answer is [`Stall::OnlyTheGpu`].
+    fn question(&self, index: usize, retry: bool, ask: &mut impl FnMut() -> Stall) -> Option<bool> {
+        if retry {
+            self.parks.arm(index);
+        }
+        let answer = ask();
+        #[cfg(test)]
+        let answer = match answer {
+            Stall::Stalled if self.parks.busy_turns.load(Ordering::SeqCst) > 0 => Stall::OnlyTheGpu,
+            other => other,
+        };
+        let for_quiet = retry && answer == Stall::OnlyTheGpu;
+        if retry && !for_quiet {
+            self.parks.disarm(index);
+        }
+        (answer != Stall::Stalled).then_some(for_quiet)
+    }
+
+    /// Parks `core` until it is woken or the run stops. If it is the last core to park, `ask` is
+    /// asked first whether the run is stalled, and the park ends at once if it is; an answer
+    /// busy only because of the GPU is asked again at the GPU's next quiet signals, at most
+    /// [`GPU_QUIET_RETRIES`] times (module docs, "Telling a stalled run"). `ask` takes the
+    /// kernel lock; nothing takes this type's counts under the kernel lock, so the order is
+    /// always counts, then kernel.
+    pub(super) fn park(&self, core: CoreId, mut ask: impl FnMut() -> Stall) -> Parked {
+        let index = usize::from(core.index());
+        let Some(slot) = self.parks.slots.get(index) else {
             return Parked::Stopped;
         };
+        let cores = self.parks.slots.len();
+        let mut retries = GPU_QUIET_RETRIES;
+        let mut for_quiet = false;
         {
             let mut idle = lock(&self.idle);
             *idle = idle.saturating_add(1);
-            if *idle == self.slots.len() && stalled() {
-                *idle = idle.saturating_sub(1);
-                return Parked::Stalled;
+            if *idle == cores {
+                match self.question(index, retries > 0, &mut ask) {
+                    None => {
+                        *idle = idle.saturating_sub(1);
+                        return Parked::Stalled;
+                    }
+                    Some(armed) => for_quiet = armed,
+                }
             }
         }
-        let mut woken = lock(&slot.woken);
-        while !*woken && !self.stopped.load(Ordering::SeqCst) {
-            woken = slot
+        let mut state = lock(&slot.state);
+        while !state.woken && !self.is_stopped() {
+            if for_quiet && state.quiet {
+                state.quiet = false;
+                drop(state);
+                for_quiet = false;
+                retries = retries.saturating_sub(1);
+                let mut idle = lock(&self.idle);
+                if *idle == cores {
+                    match self.question(index, retries > 0, &mut ask) {
+                        None => {
+                            *idle = idle.saturating_sub(1);
+                            return Parked::Stalled;
+                        }
+                        Some(armed) => for_quiet = armed,
+                    }
+                }
+                drop(idle);
+                state = lock(&slot.state);
+                continue;
+            }
+            state = slot
                 .wake
-                .wait(woken)
+                .wait(state)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
-        *woken = false;
-        drop(woken);
+        state.woken = false;
+        drop(state);
+        // A signal told after this is told to no one; one told before it is forgotten here.
+        self.parks.disarm(index);
+        lock(&slot.state).quiet = false;
         let mut idle = lock(&self.idle);
         *idle = idle.saturating_sub(1);
-        if self.stopped.load(Ordering::SeqCst) {
+        if self.is_stopped() {
             Parked::Stopped
         } else {
             Parked::Woken
@@ -165,117 +403,4 @@ impl<I: Interrupter> CoreSignals for Signals<'_, I> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use starquake_cpu::Error;
-
-    use super::*;
-
-    /// Counts its interrupts.
-    #[derive(Clone, Default)]
-    struct Counting(Arc<Mutex<u32>>);
-
-    impl Interrupter for Counting {
-        fn interrupt(&self) -> Result<(), Error> {
-            *lock(&self.0) += 1;
-            Ok(())
-        }
-    }
-
-    fn core(index: u8) -> CoreId {
-        CoreId::new(index).unwrap()
-    }
-
-    /// Runs `body`, stopping `cores` if it has not finished within ten seconds, so that a park
-    /// that is never woken fails its test (it then ends [`Parked::Stopped`]) instead of hanging
-    /// the gate.
-    fn bounded<R>(cores: &Cores<Counting>, body: impl FnOnce() -> R) -> R {
-        let (done, finished) = std::sync::mpsc::channel::<()>();
-        std::thread::scope(|scope| {
-            scope.spawn(move || {
-                if finished.recv_timeout(Duration::from_secs(10)).is_err() {
-                    cores.stop();
-                }
-            });
-            let result = body();
-            assert!(
-                done.send(()).is_ok(),
-                "the watchdog fired: the test ran out of time"
-            );
-            result
-        })
-    }
-
-    #[test]
-    fn a_wake_before_the_park_is_not_lost() {
-        let cores: Cores<Counting> = Cores::new(2);
-        cores.wake(core(1));
-        assert_eq!(
-            bounded(&cores, || cores.park(core(1), || false)),
-            Parked::Woken
-        );
-    }
-
-    #[test]
-    fn a_park_waits_for_its_wake_from_another_thread() {
-        let cores: Cores<Counting> = Cores::new(2);
-        let parked = bounded(&cores, || {
-            std::thread::scope(|scope| {
-                let parked = scope.spawn(|| cores.park(core(0), || false));
-                // The parked thread is woken whatever this sleep finds.
-                std::thread::sleep(Duration::from_millis(20));
-                cores.wake(core(0));
-                parked.join().unwrap()
-            })
-        });
-        assert_eq!(parked, Parked::Woken);
-    }
-
-    #[test]
-    fn interrupts_reach_only_an_attached_vcpu_and_stopping_reaches_every_core() {
-        let cores: Cores<Counting> = Cores::new(3);
-        let count = Counting::default();
-        // Before its vCPU exists an interrupt reaches nothing.
-        cores.interrupt(core(1));
-        cores.attach(core(1), count.clone());
-        cores.interrupt(core(1));
-        assert_eq!(*lock(&count.0), 1);
-        cores.stop();
-        assert_eq!(*lock(&count.0), 2);
-        // A stopped run parks no more.
-        assert_eq!(cores.park(core(2), || false), Parked::Stopped);
-    }
-
-    #[test]
-    fn only_the_last_core_to_park_asks_whether_the_run_is_stalled() {
-        let cores: Cores<Counting> = Cores::new(2);
-        bounded(&cores, || {
-            std::thread::scope(|scope| {
-                let first = scope.spawn(|| cores.park(core(0), || unreachable!()));
-                // The second core is the last: it asks, and is told the run is stalled.
-                let mut asked = false;
-                // Bounded: the first core parks within this wait or the assertion below fails.
-                for _ in 0..200 {
-                    if *lock(&cores.idle) == 1 {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                assert_eq!(*lock(&cores.idle), 1);
-                let parked = cores.park(core(1), || {
-                    asked = true;
-                    true
-                });
-                assert_eq!(parked, Parked::Stalled);
-                assert!(asked);
-                // Not stalled: the last core parks like any other.
-                cores.wake(core(1));
-                assert_eq!(cores.park(core(1), || false), Parked::Woken);
-                cores.stop();
-                assert_eq!(first.join().unwrap(), Parked::Stopped);
-            });
-        });
-    }
-}
+mod tests;

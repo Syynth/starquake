@@ -41,6 +41,7 @@ use super::reads::WithTls;
 use super::*;
 
 mod frames;
+mod stall;
 mod vsync;
 
 /// Where in the thread-local page the port's name and the waited handle are.
