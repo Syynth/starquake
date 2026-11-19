@@ -106,6 +106,25 @@
 //!   [`GpuVm`] per address space (`GpuFront::create_address_space(space, vm: Arc<GpuVm>)` in the
 //!   spec's interface block). Not a behaviour a test can pin inside one table.
 //!
+//! # The GPU-only store
+//!
+//! Each table owns the host pages behind its `GpuOnly` targets, a
+//! [`GpuOnlyStore`](crate::memory::GpuOnlyStore) (gpu-protocol, "GPU-only memory"; slice G22),
+//! reached through [`GpuVm::gpu_only`]. [`GpuVm::apply`] of a
+//! [`VmUpdate::DestroySparseRegion`] frees every page of its region, after removing the range from
+//! the table and before moving the version, under the table's write lock: the spec's "a
+//! sparse-region destroy is an ordered update: the store frees the range only when it is
+//! applied". The production memory ([`crate::memory::VmMemory`]) writes a `GpuOnly` page only
+//! through [`GpuVm::write_gpu_only`], which translates the page afresh and writes it under the
+//! table's read lock, so no write that translated to a destroyed region can land after the free
+//! and allocate a page again. Reads take no table lock: a read racing a destroy sees the old
+//! bytes or zeros, and allocates nothing. The lock order is the table, then the store.
+//!
+//! The store frees by region, not by range: a region's pages are keyed by their offset into it,
+//! and a destroy ends the whole region. gsv must not hand a destroyed region's id to a new region
+//! before the destroy is reported done (`GpuCompletion::GpuOrdered`), or the destroy, applied
+//! later, frees the new region's pages too.
+//!
 //! # What is recorded and what is snapshotted
 //!
 //! Nothing here writes to the trace. Every change comes from a gsv request (recorded as IPC) or
@@ -115,7 +134,9 @@
 //!
 //! [`GpuVm::save`] writes the version and the mappings (graphics-server, "What is snapshotted":
 //! "address spaces, mappings, sparse regions"), and [`GpuVm::restore`] builds a table from them,
-//! checking them first. See "Snapshot format".
+//! checking them first. See "Snapshot format". The GPU-only store's contents are in neither (a
+//! GPU snapshot that reads them back is deferred, gpu-protocol "GPU-only memory"): a restored
+//! table starts with an empty store, so its `GpuOnly` pages read as zero.
 //!
 //! # Bounds
 //!
@@ -149,7 +170,7 @@ use starquake_memory::{MapError, PAGE_SIZE, PageRange};
 use thiserror::Error;
 
 use crate::interface::{Kind, RegionId, Target, VmUpdate};
-use crate::memory::Translate;
+use crate::memory::{GpuOnlyRangeError, GpuOnlyStore, Translate};
 
 #[cfg(test)]
 mod tests;
@@ -381,7 +402,8 @@ fn set_kind(table: &mut Table, range: PageRange, kind: Kind) -> u64 {
 }
 
 /// A GPU address space's translation table: GPU page ranges to a [`Target`] and a [`Kind`], with
-/// a version (module docs, "Rules").
+/// a version (module docs, "Rules"), and the host pages behind its `GpuOnly` targets (module docs,
+/// "The GPU-only store").
 ///
 /// Shared between gsv and the GPU threads behind an `Arc`. Every method takes `&self`; changes
 /// take a write lock and translations a read lock, held only for the table operation.
@@ -389,6 +411,17 @@ fn set_kind(table: &mut Table, range: PageRange, kind: Kind) -> u64 {
 pub struct GpuVm {
     table: RwLock<Table>,
     generation: AtomicU64,
+    gpu_only: GpuOnlyStore,
+}
+
+/// What [`GpuVm::write_gpu_only`] found when it translated the page afresh.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GpuOnlyWrite {
+    /// The page leads to GPU-only memory, and the bytes are in the store.
+    Written,
+    /// The page no longer leads to GPU-only memory (a change landed since the caller's
+    /// translation): nothing was written, and this is where it leads now, if anywhere.
+    Elsewhere(Option<Translation>),
 }
 
 impl GpuVm {
@@ -461,10 +494,56 @@ impl GpuVm {
             | VmUpdate::DestroyMemory { .. }
             | VmUpdate::DestroySparseRegion { .. } => trim(&mut table, range),
         };
+        // The store frees under the table's write lock, before the version moves (module docs,
+        // "The GPU-only store").
+        let freed = match *update {
+            VmUpdate::DestroySparseRegion { region, .. } => self.gpu_only.free_region(region),
+            VmUpdate::Unmap { .. }
+            | VmUpdate::ModifyKind { .. }
+            | VmUpdate::DestroyMemory { .. } => 0,
+        };
         self.bump();
         drop(table);
-        tracing::debug!(?update, pages, "GPU VM update applied");
+        tracing::debug!(?update, pages, freed, "GPU VM update applied");
         pages
+    }
+
+    /// The host pages behind this table's `GpuOnly` targets (module docs, "The GPU-only store").
+    pub fn gpu_only(&self) -> &GpuOnlyStore {
+        &self.gpu_only
+    }
+
+    /// Writes `data`, which lies within the page holding `va`, to the GPU-only memory that page
+    /// leads to, translating the page afresh under the table's read lock and writing the store
+    /// under it (module docs, "The GPU-only store").
+    ///
+    /// If the page no longer leads to GPU-only memory, nothing is written and the answer says
+    /// where it leads now. The only error is an offset whose end is past the 64-bit offsets,
+    /// which [`GpuVm::map`]'s target check rules out for a `data` within one page.
+    pub(crate) fn write_gpu_only(
+        &self,
+        va: u64,
+        data: &[u8],
+    ) -> Result<GpuOnlyWrite, GpuOnlyRangeError> {
+        let table = self.read();
+        let within = va % PAGE_SIZE;
+        let translation = translate_in(&table, va - within);
+        match translation.map(|t| t.target) {
+            Some(Target::GpuOnly { region, offset }) => {
+                // The access from the page's own offset: its bytes before `data`, then `data`.
+                let at = offset.checked_add(within).ok_or(GpuOnlyRangeError {
+                    region,
+                    offset,
+                    len: within.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX)),
+                })?;
+                self.gpu_only.write(region, at, data)?;
+                drop(table);
+                Ok(GpuOnlyWrite::Written)
+            }
+            Some(Target::Guest { .. } | Target::SyncpointShim) | None => {
+                Ok(GpuOnlyWrite::Elsewhere(translation))
+            }
+        }
     }
 
     /// Every mapping, in address order. Neighbouring mappings are not merged: a split leaves two.
@@ -520,6 +599,7 @@ impl GpuVm {
         Ok(Self {
             table: RwLock::new(table),
             generation: AtomicU64::new(state.generation),
+            gpu_only: GpuOnlyStore::new(),
         })
     }
 }
@@ -550,13 +630,17 @@ impl Translate for GpuVm {
     }
 
     fn translate_page(&self, page: u64) -> Option<Translation> {
-        let table = self.read();
-        let (&start, entry) = table.range(..=page).next_back()?;
-        (page < entry.end).then(|| Translation {
-            target: advance(entry.target, page - start),
-            kind: entry.kind,
-        })
+        translate_in(&self.read(), page)
     }
+}
+
+/// Where the page starting at `page` leads under `table`, if it is mapped.
+fn translate_in(table: &Table, page: u64) -> Option<Translation> {
+    let (&start, entry) = table.range(..=page).next_back()?;
+    (page < entry.end).then(|| Translation {
+        target: advance(entry.target, page - start),
+        kind: entry.kind,
+    })
 }
 
 /// The snapshot header.

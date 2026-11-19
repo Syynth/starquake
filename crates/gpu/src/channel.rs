@@ -213,7 +213,7 @@
 //!   loop's sink (slice G14, `crate::front`) turns it into [`RingEntry::SetReference`] (decided
 //!   by the owner on 2026-11-18: it stays a ring entry).
 //! - A release or acquire on the syncpoint shim page (spec, "Semaphore acquires") is resolved
-//!   by the production [`GpuMemory`] (slice G22), not here.
+//!   by the production [`GpuMemory`] ([`crate::memory::VmMemory`], slice G22), not here.
 
 mod host;
 
