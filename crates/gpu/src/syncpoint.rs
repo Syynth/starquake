@@ -20,12 +20,13 @@
 //! # Who calls what
 //!
 //! gsv allocates and frees ids, raises maxima to compute fences ([`Syncpoints::increment_max`]),
-//! and marks the ids someone waits on ([`Syncpoints::watch`]). The GPU's back thread (after host
-//! completion) and gsv's video worker call [`Syncpoints::increment`], which pushes
-//! [`GpuCompletion::SyncpointChanged`] to gsv's [`Completions`] only for a watched id;
-//! [`Syncpoints::increment_by`] does several at once with one push (the null GPU front of a run
-//! with no GPU back end, `starquake-core`'s graphics wiring, and its replay). Anyone
-//! reads ([`Syncpoints::read`], [`Syncpoints::reached`]).
+//! and marks the ids someone waits on ([`Syncpoints::watch`]). Incrementers call
+//! [`Syncpoints::increment`], which pushes [`GpuCompletion::SyncpointChanged`] to gsv's
+//! [`Completions`] only for a watched id, or [`Syncpoints::increment_by`], which does several at
+//! once with one push: the GPU's back thread (after host completion) adds a `Syncpoint` ring
+//! entry's whole count with it (`crate::back::fence`, "Waiters and a run of increments"), as do
+//! the null GPU front of a run with no GPU back end (`starquake-core`'s graphics wiring), its
+//! replay, and gsv's video worker. Anyone reads ([`Syncpoints::read`], [`Syncpoints::reached`]).
 //!
 //! Watching and incrementing race. Both sides use sequentially consistent operations in the
 //! same pattern (gsv: set the watched bit, then read the counter; the incrementer: add to the
@@ -176,7 +177,7 @@ const LOW_HALF: u64 = u32::MAX as u64;
 const WRAP: u64 = 1 << u32::BITS;
 
 /// The sign bit of a 32-bit difference (PR `IsSyncpointWaitSatisfied`'s `0x80000000U`).
-const SIGN_BIT: u32 = 1 << (u32::BITS - 1);
+pub(crate) const SIGN_BIT: u32 = 1 << (u32::BITS - 1);
 
 /// First bytes of every syncpoint snapshot.
 pub const SNAPSHOT_MAGIC: [u8; 4] = *b"SQSP";

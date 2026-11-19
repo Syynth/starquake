@@ -178,6 +178,14 @@
 //!   the builder can make yet attaches a release to a list with commands (a present closes its
 //!   own list, and a draw needs shaders), so removing the record from a capture changes nothing
 //!   a test sees; the record is written and fed back all the same.
+//! - **Ring records follow the ring's encoding.** A `ring` record hashes one entry's words
+//!   ([`entry_hash`]), so a change to the encoding changes the hashes. A `Syncpoint` entry
+//!   carries its count since issue #431 (one entry for all of a submission's increments, the
+//!   count in its header's high half), and the format's [`VERSION`] stays 1, as the issue
+//!   directs for a format no build has shipped. A capture made before the change whose ring
+//!   holds a syncpoint entry diverges at that entry's record; the hash a counted entry records
+//!   is pinned by `tests::replay::a_counted_syncpoint_entry_is_one_ring_record`. Once captures
+//!   ship, a change to the ring encoding bumps the version.
 //! - **Report records keep what the front keeps.** A `report` holds the markers and the two
 //!   flags [`crate::front::FrontShared`]'s wake reduces a back report to, not the counts or the
 //!   failed releases.

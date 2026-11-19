@@ -187,10 +187,16 @@ pub enum RingEntry<'a> {
         /// What to write.
         release: Release,
     },
-    /// A syncpoint increment.
+    /// `count` increments of one syncpoint, from a submission's fence: one entry whatever the
+    /// count, so a guest asking for `u32::MAX` increments costs the front one entry, not time
+    /// linear in the count (gpu-protocol, "Channels and submissions"; decided by the owner,
+    /// 2026-11-19). The back adds the count in one wrapping addition (`crate::back::fence`).
     Syncpoint {
         /// The syncpoint.
         id: SyncpointId,
+        /// How many increments, 0 to `u32::MAX`. The front never sends 0; an entry of 0 (from
+        /// a text or a capture) changes nothing.
+        count: u32,
     },
     /// Wait for idle.
     WaitForIdle {
@@ -260,7 +266,7 @@ impl RingEntry<'_> {
                 words: Cow::Owned(words.into_owned()),
             },
             Self::Release { channel, release } => RingEntry::Release { channel, release },
-            Self::Syncpoint { id } => RingEntry::Syncpoint { id },
+            Self::Syncpoint { id, count } => RingEntry::Syncpoint { id, count },
             Self::WaitForIdle { channel } => RingEntry::WaitForIdle { channel },
             Self::SetReference { channel, value } => RingEntry::SetReference { channel, value },
             Self::Invalidate { channel, what } => RingEntry::Invalidate { channel, what },
