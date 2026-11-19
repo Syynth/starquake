@@ -2,12 +2,11 @@
 //! (docs/specs/render-backend.md, "The trait").
 //!
 //! One implementation per host API (wgpu first, in `starquake-render-wgpu`), plus the recording
-//! backend (slice R1). `core` builds the backend with the shared compile pool and the GPU crate's
-//! wait-while-compiling setting, and hands the GPU crate an `Arc<dyn Backend>`; neither is a trait
-//! method.
-//!
-//! Open, shared with the GPU front/back protocol: how the back thread wakes when a submitted list
-//! completes (render-backend verification 10). No wake hook is defined here until it is settled.
+//! backend (slice R1). `core` builds the backend with the shared compile pool, the GPU crate's
+//! wait-while-compiling setting and the completion wake ([`crate::wake::CompletionWake`],
+//! decided by the owner on 2026-11-18), and hands the GPU crate an `Arc<dyn Backend>`; none is a
+//! trait method. A backend calls the wake after each advance of [`Backend::completed`]
+//! ([`crate::wake`] has the rules and the contract check).
 
 use crate::caps::Caps;
 use crate::command::{CommandList, StagingSlice};

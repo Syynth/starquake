@@ -40,6 +40,10 @@
 //!
 //! Slice R11 (its first part) adds host-level captures, in [`capture`]: the submitted lists
 //! and their staging bytes as a versioned file's bytes, and their replay on a backend.
+//!
+//! GPU slice G15 adds the completion wake, in [`wake`]: the [`CompletionWake`] each backend is
+//! built with and calls after each advance of [`Backend::completed`], and the contract check
+//! every backend's tests run against it.
 
 pub mod astc;
 pub mod backend;
@@ -59,6 +63,7 @@ pub mod recording;
 pub mod resource;
 pub mod shader;
 pub mod validate;
+pub mod wake;
 
 pub use backend::{
     Backend, MemoryBudget, PipelineStatus, PresentFeedback, PresentOutcome, PresentTarget,
@@ -81,3 +86,4 @@ pub use pipeline::{ComputePipelineDesc, EmulationFlags, GraphicsPipelineDesc};
 pub use recording::{FrameDump, RecordingBackend};
 pub use resource::{BufferDesc, BufferUsage, SamplerDesc, TextureDesc, TextureUsage, ViewDesc};
 pub use shader::{ResourceBinding, ShaderDesc, ShaderInterface, ShaderSource, ShaderStage};
+pub use wake::{CompletionWake, WakeContractError, WakeCounter, check_completion_wake};

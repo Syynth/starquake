@@ -582,3 +582,79 @@ fn a_texture_too_large_to_address_is_an_error_not_an_allocation() {
     // 2^48 texels of 16 bytes.
     assert_eq!(b.budget().used, 1 << 52);
 }
+
+/// A backend whose wake records what [`Backend::completed`] reports at the moment of the wake.
+/// The wake reads it through the backend, so a wake made while the state lock is held would
+/// deadlock; the caller bounds the run with a timeout.
+fn backend_that_reads_completed_in_its_wake() -> (
+    std::sync::Arc<RecordingBackend>,
+    std::sync::Arc<std::sync::Mutex<Vec<FenceValue>>>,
+) {
+    use crate::wake::CompletionWake;
+    use std::sync::{Arc, Mutex, OnceLock, Weak};
+    let slot: Arc<OnceLock<Weak<RecordingBackend>>> = Arc::new(OnceLock::new());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let wake = {
+        let slot = Arc::clone(&slot);
+        let seen = Arc::clone(&seen);
+        CompletionWake::new(move || {
+            if let Some(backend) = slot.get().and_then(Weak::upgrade) {
+                seen.lock().unwrap().push(backend.completed());
+            }
+        })
+    };
+    let backend = Arc::new(RecordingBackend::with_completion_wake(caps(), 0, wake));
+    slot.set(Arc::downgrade(&backend)).unwrap();
+    (backend, seen)
+}
+
+/// Runs `f` on another thread and fails if it takes longer than ten seconds (a wake made under
+/// the backend's lock deadlocks).
+fn bounded<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the run finished in time")
+}
+
+#[test]
+fn each_submit_wakes_once_after_the_new_value_is_stored() {
+    let seen = bounded(|| {
+        let (backend, seen) = backend_that_reads_completed_in_its_wake();
+        let first = backend.submit(CommandList::new()).expect("empty list");
+        let second = backend.submit(CommandList::new()).expect("empty list");
+        assert_eq!((first, second), (FenceValue::new(1), FenceValue::new(2)));
+        let seen = seen.lock().unwrap().clone();
+        seen
+    });
+    // One wake per completed list, each seeing its own list's value already stored.
+    assert_eq!(seen, vec![FenceValue::new(1), FenceValue::new(2)]);
+}
+
+#[test]
+fn a_refused_list_wakes_nothing() {
+    let seen = bounded(|| {
+        let (backend, seen) = backend_that_reads_completed_in_its_wake();
+        let mut list = CommandList::new();
+        list.push(Command::Readback {
+            from: CopyRegion::Buffer(BufferSlice {
+                buffer: BufferId::new(5, 5),
+                offset: 0,
+                size: 4,
+            }),
+            id: ReadbackId::new(1, 1),
+        });
+        assert_eq!(
+            backend.submit(list),
+            Err(crate::error::RenderError::Invalid("no live buffer has this id"))
+        );
+        assert_eq!(backend.completed(), FenceValue::ZERO);
+        // The next good list wakes as usual.
+        assert_eq!(backend.submit(CommandList::new()), Ok(FenceValue::new(1)));
+        let seen = seen.lock().unwrap().clone();
+        seen
+    });
+    assert_eq!(seen, vec![FenceValue::new(1)]);
+}
