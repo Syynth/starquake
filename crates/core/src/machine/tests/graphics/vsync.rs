@@ -9,6 +9,8 @@
 //! handle to the guest. Its request and reply are CMIF messages with no data, laid out by
 //! `starquake-ipc`'s builders (the server is the test's own; no protocol fact is involved).
 
+use std::collections::BTreeMap;
+
 use starquake_gsv::note::VSYNC_TICK;
 use starquake_gsv::shared::vsync::INTERVAL_NS;
 use starquake_ipc::ReplyBuilder;
@@ -76,6 +78,9 @@ const VSYNC: ServiceId = ServiceId(0x7E57);
 /// The environment's time the test server started the clock from.
 type Started = Arc<Mutex<Option<HostNanos>>>;
 
+/// The run's graphics server, for the guest to read the vsync clock from as it wakes.
+type Watched = Arc<Mutex<Option<Arc<Graphics>>>>;
+
 /// The test server (module docs).
 struct Listening {
     graphics: Arc<Graphics>,
@@ -123,8 +128,12 @@ impl SessionHandler for Listening {
 }
 
 /// A real run's services, and the test server beside them, over the run's graphics server.
-fn install_listening(started: Started) -> impl Fn(&Dispatcher, Given) -> Result<(), String> + Sync {
+fn install_listening(
+    started: Started,
+    watched: Watched,
+) -> impl Fn(&Dispatcher, Given) -> Result<(), String> + Sync {
     move |dispatcher: &Dispatcher, given: Given| {
+        *lock(&watched) = Some(Arc::clone(&given.graphics));
         let handler = Listening {
             graphics: Arc::clone(&given.graphics),
             env: Arc::clone(&given.env),
@@ -148,6 +157,8 @@ struct Ticks {
     asked: Option<Instant>,
     /// Each wait's result and when it ended.
     wakes: Vec<(u64, Instant)>,
+    /// At each wake, the vsync clock's tick count and its next deadline, read together.
+    clocks: Vec<(u64, Option<HostNanos>)>,
 }
 
 /// The real run's guest: connects to the test server, asks it for a listener's event, then
@@ -157,6 +168,7 @@ fn ticked_guest(
     base: u64,
     name: u64,
     seen: &Rc<RefCell<Ticks>>,
+    watched: &Watched,
 ) -> ScriptedVcpu {
     let handles = base + HANDLES_AT;
     let request = Arc::clone(tls);
@@ -197,10 +209,16 @@ fn ticked_guest(
         );
     for round in 0..ROUNDS {
         let woke = Rc::clone(seen);
+        let clock = Arc::clone(watched);
         guest = guest.then(
             move |regs| {
                 let mut seen = woke.borrow_mut();
                 seen.wakes.push((regs.x[0], Instant::now()));
+                if let Some(graphics) = &*lock(&clock) {
+                    let shared = graphics.shared().lock();
+                    let vsync = shared.vsync();
+                    seen.clocks.push((vsync.tick(), vsync.deadline()));
+                }
                 regs.x[0] = u64::from(seen.event);
             },
             svc(SvcId::ResetSignal),
@@ -223,41 +241,42 @@ fn ticked_guest(
     )
 }
 
-/// The `VsyncTick` notes of a run's flight recorder, in order: each one's time on the
-/// environment's clock, in nanoseconds (the event's guest time at the run's counter rate,
-/// rounded down by less than one counter tick).
-fn tick_times(report: &RunReport) -> Vec<u64> {
-    let hz = u128::from(timebase().rate().hz());
-    let dump = Dump::from_bytes(&report.events).unwrap();
-    dump.merged()
-        .into_iter()
-        .filter(|event| {
-            matches!(
-                event.kind,
-                EventKind::ServiceNote { service, code, .. }
-                    if service == crate::hle::GSV_ROOT && code == VSYNC_TICK
-            )
-        })
-        .map(|event| u64::try_from(u128::from(event.time.0) * 1_000_000_000 / hz).unwrap())
-        .collect()
-}
-
 /// In a real run the timer thread ticks the clock a listener started, on the real `Env` clock,
 /// and each tick's signal ends the guest's wait on the listener's event: every wait ends with
 /// success, never sooner after the request than its tick's deadline can come (the `j`-th wake
 /// at least `j` intervals after the request, since each deadline is at least one interval after
 /// the one before), and the run records a `VsyncTick` for every wake. Each recorded tick comes
-/// at or after its deadline (the deadlines followed from the start by NX2's rule, as the clock
-/// does), within one counter tick of rounding, and, by the median, less than half of
-/// [`PREEMPTION_INTERVAL_NS`] after it.
+/// at or after its deadline, within one counter tick of rounding, and, by the median, less than
+/// half of [`PREEMPTION_INTERVAL_NS`] after it.
+///
+/// Each tick's deadline is read, not rebuilt: the first is one interval after the start, and as
+/// the guest wakes from tick `n` it reads the clock's tick count and next deadline together
+/// (through the run's graphics server, which the test server hands over), which is tick
+/// `n + 1`'s. Rebuilding them by NX2's rule from the notes cannot be exact: a late turn restarts
+/// the clock from its own time, which no note records, and following the note's time instead
+/// once failed on CI (the next tick came 2.9 µs before the deadline so computed), while bounding
+/// the turn's time by the note's left every tick after a restart looking on time. Where the
+/// guest woke only after the next tick, so read no deadline for it, the bounds stand in: the
+/// earliest the deadline can be, for the never-early check, and the latest, for the lateness.
+/// Lateness is from the note's time plus one counter tick, so never less than the true one.
 ///
 /// The median is what fails if the timer thread did not sleep to the clock's deadline
 /// (`Graphics::deadline` without it): a tick then waits for the next preemption turn, up to
-/// [`PREEMPTION_INTERVAL_NS`] later (and the host's sleeps overshoot), so the median comes 5.6
-/// to 9.7 ms late, against 1 to 2.5 ms with it (seen over 10 and 30 runs of [`ROUNDS`] ticks on
-/// a macOS host). It times the timer thread's own tick, read from the recorded note, and not
-/// the guest's wake, which also waits for a second host thread (the core's) and was seen over
-/// 5 ms late, by the median, on a loaded host.
+/// [`PREEMPTION_INTERVAL_NS`] later, so the median comes 4.9 to 6.1 ms late (18 of 20 runs of
+/// [`ROUNDS`] ticks on an Apple Silicon Mac at or over the bound), against a median of 0.06 ms
+/// with it, 0.8 ms at worst (30 runs, with other builds loading the Mac). The bound is not
+/// tightened for now (`observability.md`, "Stalls and host timing"). It times the timer thread's
+/// own tick, read from the recorded note, and not the guest's wake, which also waits for a
+/// second host thread (the core's) and was seen over 5 ms late, by the median, on a loaded host.
+///
+/// It is also what fails where the host ends the timer thread's timed waits late on purpose
+/// (macOS timer coalescing; `machine/timer.rs`, "Sleeping to a deadline") and the thread asks
+/// for each sleep in one wait, as it did before it measured that lateness: CI's hosted macOS
+/// runners then saw medians of 14 to 44 ms and the latest tick 33 to 69 ms late (12 runs), and
+/// the Mac under `taskpolicy -c utility` failed 20 runs of 20; with the waits sized by the
+/// measured lateness, medians there were 0.2 to 0.65 ms (20 runs on an otherwise idle Mac). A
+/// timer thread starved by busier work at a higher priority is late all the same: under the
+/// clamp while other builds kept the Mac's load near 100, 29 runs of 30 failed.
 #[test]
 fn the_timer_thread_ticks_the_vsync_clock_and_wakes_a_listener_s_waiter() {
     let guest = Guest::new(&programs::hello().unwrap());
@@ -274,8 +293,9 @@ fn the_timer_thread_ticks_the_vsync_clock_and_wakes_a_listener_s_waiter() {
     };
     let seen = Rc::new(RefCell::new(Ticks::default()));
     let started: Started = Arc::default();
-    let mut main = ticked_guest(&tls, guest.tls, name, &seen);
-    let install = install_listening(Arc::clone(&started));
+    let watched: Watched = Arc::default();
+    let mut main = ticked_guest(&tls, guest.tls, name, &seen, &watched);
+    let install = install_listening(Arc::clone(&started), Arc::clone(&watched));
     let options = RunOptions {
         timeout: Some(RUN_LIMIT),
         command_line: Vec::new(),
@@ -309,24 +329,40 @@ fn the_timer_thread_ticks_the_vsync_clock_and_wakes_a_listener_s_waiter() {
         );
     }
 
-    let ticks = tick_times(&report);
+    // The deadline of each tick, by number, where the guest read it: the first from the start,
+    // and tick `n + 1`'s from the clock as tick `n` left it.
+    let mut deadlines = BTreeMap::new();
+    deadlines.insert(1, lock(&started).unwrap().0 + INTERVAL_NS);
+    for &(tick, deadline) in &seen.clocks {
+        if let Some(deadline) = deadline {
+            deadlines.insert(tick + 1, deadline.0);
+        }
+    }
+    let ticks = gsv_notes(&timed_events(&report), VSYNC_TICK);
     assert!(ticks.len() >= ROUNDS, "{ticks:?}");
-    let rounding = 1_000_000_000_u64.div_ceil(timebase().rate().hz());
-    let mut deadline = lock(&started).unwrap().0 + INTERVAL_NS;
+    let rounding = counter_tick();
+    let (mut earliest, mut latest) = (0, 0);
     let mut late = Vec::new();
-    for &tick in &ticks {
+    for (number, &(tick, at)) in (1..).zip(&ticks) {
+        assert_eq!(tick, number, "{ticks:?}");
+        if let Some(&deadline) = deadlines.get(&tick) {
+            (earliest, latest) = (deadline, deadline);
+        }
         assert!(
-            tick + rounding >= deadline,
-            "a tick at {tick} for {deadline}"
+            at + rounding >= earliest,
+            "tick {tick} at {at} for a deadline no earlier than {earliest}"
         );
-        late.push(Duration::from_nanos(tick.saturating_sub(deadline)));
-        // NX2 `PaceToVblank`, as the clock follows it.
-        let from = if tick > deadline + INTERVAL_NS {
-            tick
+        late.push(Duration::from_nanos((at + rounding).saturating_sub(latest)));
+        // A deadline the guest did not read (it woke after the next tick): NX2 `PaceToVblank`,
+        // as the clock follows it from the turn's own time, which is no earlier than the
+        // deadline and no later than the note's time. A turn can have restarted the clock from
+        // its time only if the note came more than an interval after the earliest deadline.
+        latest = if at > earliest + INTERVAL_NS {
+            latest.max(at)
         } else {
-            deadline
-        };
-        deadline = from + INTERVAL_NS;
+            latest
+        } + INTERVAL_NS;
+        earliest += INTERVAL_NS;
     }
     late.sort();
     let median = late[late.len() / 2];
