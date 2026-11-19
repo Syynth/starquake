@@ -35,6 +35,10 @@
 //! and the conversions between float and integer types, with their rounding modes and
 //! flush-to-zero bits.
 //!
+//! Slice 10 rebuilds a captured program's control flow ([`flow`]): it finds and resolves the
+//! jump tables of `BRX`, walks the program under both convergence-barrier models, splits it
+//! into blocks, inlines every call, and builds the IR's basic blocks from the flow graph.
+//!
 //! Experiment E1, run before this slice, lives in `lower`'s tests and its results in the spec.
 
 #[cfg(feature = "test-support")]

@@ -332,8 +332,10 @@ pub enum FlowError {
         /// The `BSYNC`.
         index: u32,
     },
-    /// Stack model: a `BSSY` of a barrier already on the stack, or a seventeenth ("native
-    /// nested reconvergence token").
+    /// Stack model: a `BSSY` of a barrier already on the stack ("native nested reconvergence
+    /// token"). The reference also refuses a seventeenth barrier on the stack, which this
+    /// check keeps; with sixteen barrier registers, a seventeenth always repeats one, so that
+    /// part never decides.
     #[error("the bssy at instruction {index} sets up a barrier already in use")]
     NestedBarrier {
         /// The `BSSY`.

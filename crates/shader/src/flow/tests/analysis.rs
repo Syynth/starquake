@@ -856,6 +856,61 @@ fn the_stack_model_refuses_a_barrier_set_twice() {
 }
 
 #[test]
+fn walk_constants_match_the_reference_literals() {
+    // `flow.cpp` @ e5fb3b97: `CallLinkRegister` (`back <= 6`), `ReturnRegisterCopiesLink`
+    // (`back <= 8`, `reg >= 250 || link >= 250`), `AnalyzeFlowImpl` (`count > 65536`).
+    assert_eq!(LINK_LOOKBACK, 6);
+    assert_eq!(RETURN_COPY_LOOKBACK, 8);
+    assert_eq!(RETURN_COPY_REGISTER_LIMIT, 250);
+    assert_eq!(MAX_PROGRAM, 65_536);
+    // This crate's guesses (no reference value), pinned so a change is deliberate.
+    assert_eq!(super::super::MAX_INLINE_DEPTH, 16);
+    assert_eq!(super::super::MAX_FLOW_BLOCKS, 262_144);
+}
+
+#[test]
+fn a_call_over_a_branch_with_a_return_address_is_a_call() {
+    // 0 MOV R10, 32; 1 @P0 CALL 3; 2 BRA 4; 3 RET R10; 4 EXIT: the shape of a skip call, but
+    // with the return address set up, so a call of the function at 3.
+    let code = [
+        mov_imm(10, 2 * size()),
+        call_word(1, 3, true, PredSrc::TRUE, p(0)),
+        bra_by(PredSrc::TRUE, PredSrc::TRUE, offset(2, 4)),
+        ret_word(3, 10),
+        word(exit()),
+    ];
+    let analysis = accepted(&code);
+    assert_eq!(analysis.callee(1), Some(1));
+    assert_eq!(analysis.function_entries(), &[0, 3]);
+}
+
+#[test]
+fn paths_waiting_at_one_instruction_merge_their_barriers() {
+    // 0 BSSY B0 -> 5; 1 @P0 BRA 4 (B0 at 5 waits at 4); 2 BSSY B0 -> 6; 3 BRA 4 (B0 at 6 waits
+    // at 4 too); 4 BSYNC B0. The two waiting paths merge before 4 is walked: B0 differs.
+    let code = Program::new()
+        .bssy(0, "five")
+        .bra(p(0), "sync")
+        .bssy(0, "six")
+        .bra(PredSrc::TRUE, "sync")
+        .label("sync")
+        .op(bsync(0))
+        .label("five")
+        .op(exit())
+        .label("six")
+        .op(exit())
+        .build();
+    assert_eq!(
+        analyze(&code, &tables(), BarrierModel::Registers),
+        Err(FlowError::TargetsDiffer { index: 4 })
+    );
+    assert_eq!(
+        analyze(&code, &tables(), BarrierModel::Stack),
+        Err(FlowError::NestedBarrier { index: 2 })
+    );
+}
+
+#[test]
 fn the_stack_model_holds_sixteen_barriers() {
     let build = |count: u8| {
         let mut program = Program::new();
