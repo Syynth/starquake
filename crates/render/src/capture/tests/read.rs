@@ -5,7 +5,7 @@ use super::super::{
     CaptureError, CaptureLimits, CaptureReader, Create, CreateShader, Created, Destroy, Limit,
     Record, RecordKind, ShaderCode, SourceRecord, Start, Submit, VERSION,
 };
-use super::{END, file, framed, prefix, read, read_with, start};
+use super::{END, file, framed, framed_any, prefix, read, read_with, start};
 use crate::command::CommandList;
 use crate::id::{BufferId, FenceValue, ResourceId, ShaderId, TextureId};
 use crate::resource::{BufferDesc, BufferUsage};
@@ -597,7 +597,7 @@ fn the_first_check_in_the_documented_order_is_reported() {
     f.extend(framed(RecordKind::Destroy.tag(), &[0x06, 0x01, 0x01, 0x01]));
     assert!(matches!(read(&f), Err(CaptureError::Decode { record: 0, .. })));
     // Field bounds, then the order checks: a long entry name on a shader naming no source.
-    let long_entry = framed_long(
+    let long_entry = framed_any(
         RecordKind::CreateShader.tag(),
         &body(&CreateShader {
             stage: ShaderStage::Vertex,
@@ -656,13 +656,6 @@ fn the_first_check_in_the_documented_order_is_reported() {
     );
 }
 
-/// A record with a two-byte length.
-fn framed_long(tag: u8, body_bytes: &[u8]) -> Vec<u8> {
-    let mut out = vec![tag];
-    out.extend(body(&u32::try_from(body_bytes.len()).expect("small")));
-    out.extend_from_slice(body_bytes);
-    out
-}
 
 #[test]
 fn a_submit_reads_its_list_then_its_result() {

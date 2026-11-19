@@ -174,7 +174,7 @@ fn blend_off() -> BlendState {
     }
 }
 
-fn golden_pipeline() -> GraphicsPipelineDesc {
+pub(super) fn golden_pipeline() -> GraphicsPipelineDesc {
     let mut blends = [blend_off(); 8];
     blends[0] = blend(true);
     blends[7] = blend(false);

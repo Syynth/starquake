@@ -6,6 +6,7 @@ mod golden;
 mod read;
 mod replay;
 mod roundtrip;
+mod writer;
 mod wrap;
 
 use super::{
@@ -104,6 +105,19 @@ pub(super) fn framed(tag: u8, body: &[u8]) -> Vec<u8> {
     let mut out = vec![tag, len];
     out.extend_from_slice(body);
     out
+}
+
+/// A record of any length: its tag, its length as postcard writes a `u32`, and its body.
+pub(super) fn framed_any(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    out.extend(length(u64::try_from(body.len()).expect("small")));
+    out.extend_from_slice(body);
+    out
+}
+
+/// A length as a record's varint.
+pub(super) fn length(len: u64) -> Vec<u8> {
+    postcard::to_allocvec(&u32::try_from(len).expect("a u32 length")).expect("encode")
 }
 
 /// The `End` record.
