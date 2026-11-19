@@ -480,6 +480,25 @@ Landed: #226's two missing tests (PR #317): host-I/O payload bytes count toward 
 | proposed | **The NPDM system-call mask check-and-log** (kernel spec, "System calls"): check whether process creation applies it; when #33 closed only the ACI0-against-ACID check was called, and it warned without refusing | #33 | area:kernel |
 | proposed | **`RemoteMemorySize` (META 0x10)** is parsed and exposed raw, and nothing uses it; no source yet says what it sizes | #33 | area:loader |
 
+### From wave 36 (ledger: #22)
+
+Landed, the first milestone 3 wave: G8 (the channel pusher, #319, PR #335), G9 (front register files and shadow RAM, #320, PR #338) and G12 (QMD 3.0 decoding, the PCAS scheduler and QMD releases, #323, PR #336). Wiring notes for the later slices are comments on #321, #324, #325 and #330.
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| proposed | **GPU register defaults:** Eden runs `InitializeRegisterDefaults` (non-zero 3D defaults: depth range, swizzles, blend, stencil and colour masks) and then copies them into the shadow file. The front file, the shadow file and the back mirror start zeroed here; they must start from the same values, or same-value dropping drops a write the back never saw. Nothing owns it; needed before G13 and G14 run real streams | #320 | area:gpu |
+| proposed | **GPU state snapshots:** save and restore the register and shadow files and the QMD table, with restore validation (the 4,096-entry cap, counter and deferred bounds). The spec puts this state in GPU snapshots; no slice covers it | #320, #323 | area:gpu |
+| proposed | **`SEND_SIGNALING_PCAS_B` (0xAF) and `SEND_PCAS_B` (0xAE):** Eden-NX2 treats 0xAF with SCHEDULE set as a scheduler signal, so a QMD scheduled that way would never run here. Settle with a trace | #323 | area:gpu |
+| proposed | **GPU front counters** for the observability summary: writes dropped as same-value, and other dropped writes | #320 | area:gpu |
+| proposed | **A macOS CI job that runs everything except the hypervisor tests.** A test that compared constants by address (`std::ptr::eq`) failed only in macOS's default incremental build, and PR CI passed because the macOS job is skipped | #320 | infra |
+| proposed | **Release forms still refused, as Eden-NX2 refuses them:** `STRUCTURE_SIZE` other than one word, `PAYLOAD64B`, `TRAP_TYPE`. A trace settles how they combine | #323 | area:gpu |
+| decided (decision log, 2026-11-18, "gpu-protocol errata from wave 36") | **`SET_REFERENCE` has no ring entry.** The spec's "Host methods" lists it as one; the ring sketch and G4's `RingEntry` have none. G8 hands it to `ChannelSink::set_reference`. A `RingEntry` variant, or a spec edit, before G14 and G19 wire it | #319 | gpu-protocol |
+| decided (decision log, 2026-11-18, "gpu-protocol errata from wave 36") | **Old-format method headers:** the spec's "The method stream" calls opcodes 0 and 2 subdevice-mask operations to skip; `clc76f.h` and G1's decoder read opcode 0 or 2 with tertiary opcode 0 as an old-format method header. G8 follows the header (decision 10); the spec sentence and facts table would be amended to match. An all-zero NOP word does nothing either way | #319 | gpu-protocol |
+| decided (decision log, 2026-11-18, "gpu-protocol errata from wave 36") | **The macro upload pointer is not a register side effect.** The spec lists it as one; both Switch 2 references leave `LOAD_MME_INSTRUCTION_RAM_POINTER` (0x45) as written and track a word offset (pointer times 3) in the macro engine, which no register can hold. #338 follows the references; G13 owns the offset | #320 | gpu-protocol |
+| decided (decision log, 2026-11-18, "gpu-protocol errata from wave 36") | **QMD word 4 bit 12** (method 0xCC) is `REQUIRE_SCHEDULING_PCAS` in `clc7c0qmd.h`; the spec says no header explains the condition. Cite the field in the spec | #323 | gpu-protocol |
+| decided (decision log, 2026-11-18, "gpu-protocol errata from wave 36") | **What a QMD request that fails at run time leaves behind.** #336 keeps the request's own change, as Eden-NX2 does, and documents the exact sets; the spec does not say | #323 | gpu-protocol |
+| decided (decision log, 2026-11-18, "gpu-protocol errata from wave 36") | **Replay of data-upload runs:** runs to data-upload methods send shadow values, where Eden-NX2's fast paths upload the raw words. A possible compatibility difference | #320 | gpu-protocol |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
@@ -707,3 +726,12 @@ passed to build agents as a provisional rule for the next wave.
 
 - A refusing size-bound test sets the limit at the exact edge (two records at twice the size less one), so an undercount of one byte flips the outcome.
 - Size accounting is tested with items of different sizes, pushed in one call and across several calls.
+
+### From wave 36 (ledger: #22)
+
+- Constants are compared by value, method number or name, never by address (`std::ptr::eq`): promoted constants get addresses that vary with codegen units and incremental builds.
+- The full gate is also run on the host platform's default dev profile (incremental, macOS), because Linux CI can pass tests that fail there.
+- Test counts in a PR body come from the tree (`nextest list`), with `proptest!` blocks counted apart from the properties in them.
+- Structurally invalid input (an unaligned address where alignment is documented) is refused at the API boundary with a named error, tested one step off the valid value.
+- Where a failure can come after a state change began, the docs list which failing paths leave state untouched and which keep their own change, and a test pins one of each.
+- Docs that claim reference or spec behaviour list every divergence (error reporting, check order, masked bits, read-back values), each with a named test; one that contradicts an approved spec sentence quotes it as an owner question in the module docs.

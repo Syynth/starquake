@@ -1966,3 +1966,145 @@ proptest! {
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Holding (the macro host's catch-up, slice G13)
+// ---------------------------------------------------------------------------------------------
+
+/// A sink that starts holding the channel once it has taken `hold_after` method words.
+struct HoldingSink {
+    inner: Sink,
+    hold_after: usize,
+    taken: usize,
+    held: bool,
+}
+
+impl HoldingSink {
+    fn new(hold_after: usize) -> Self {
+        Self {
+            inner: Sink::default(),
+            hold_after,
+            taken: 0,
+            held: false,
+        }
+    }
+}
+
+impl ChannelSink for HoldingSink {
+    fn entry(&mut self, entry: RingEntry<'static>) {
+        self.inner.entry(entry);
+    }
+    fn method(&mut self, word: EngineWord) {
+        self.inner.method(word);
+        self.taken += 1;
+        if self.taken == self.hold_after {
+            self.held = true;
+        }
+    }
+    fn set_reference(&mut self, value: u32) {
+        self.inner.set_reference(value);
+    }
+    fn note(&mut self, note: Note) {
+        self.inner.note(note);
+    }
+    fn holds(&self) -> bool {
+        self.held
+    }
+}
+
+#[test]
+fn a_held_channel_stops_after_the_word_and_reads_the_next_one_fresh() {
+    let mut rig = make_rig();
+    let mut pb = PushBuffer::new();
+    for value in 1..=3 {
+        pb.immediate(2, 0x100, value).unwrap();
+    }
+    rig.start(CMD, pb.words());
+    let mut sink = HoldingSink::new(1);
+    assert_eq!(
+        rig.channel.run(&rig.mem, &mut sink, u32::MAX),
+        Ok(RunOutcome::Held)
+    );
+    assert_eq!(sink.inner.0, [method_word(2, class_i2m(), 0x100, 1, 0)]);
+    assert_eq!(rig.channel.state(), ChannelState::Running);
+    // While held, a run reads nothing, even with the next word unmapped.
+    rig.mem
+        .unmap(PageRange::new(GPU_BASE, PAGES * PAGE_SIZE).unwrap())
+        .unwrap();
+    assert_eq!(
+        rig.channel.run(&rig.mem, &mut sink, u32::MAX),
+        Ok(RunOutcome::Held)
+    );
+    assert_eq!(sink.inner.0.len(), 1);
+    rig.mem
+        .map(
+            PageRange::new(GPU_BASE, PAGES * PAGE_SIZE).unwrap(),
+            CPU_BASE,
+        )
+        .unwrap();
+    // The second word is rewritten while held: the channel reads the new one.
+    let mut new = PushBuffer::new();
+    new.immediate(2, 0x300, 9).unwrap();
+    rig.write(word_va(CMD, 1), new.words());
+    sink.held = false;
+    assert_eq!(
+        rig.channel.run(&rig.mem, &mut sink, u32::MAX),
+        Ok(RunOutcome::EntryDone)
+    );
+    assert_eq!(
+        sink.inner.0,
+        [
+            method_word(2, class_i2m(), 0x100, 1, 0),
+            method_word(2, class_i2m(), 0x300, 9, 0),
+            method_word(2, class_i2m(), 0x100, 3, 0),
+        ]
+    );
+}
+
+#[test]
+fn a_hold_on_an_entrys_last_word_ends_the_entry_once_released() {
+    let mut rig = make_rig();
+    let mut pb = PushBuffer::new();
+    pb.immediate(2, 0x100, 1).unwrap();
+    rig.start(CMD, pb.words());
+    let mut sink = HoldingSink::new(1);
+    assert_eq!(
+        rig.channel.run(&rig.mem, &mut sink, u32::MAX),
+        Ok(RunOutcome::Held)
+    );
+    assert_eq!(rig.channel.state(), ChannelState::Running);
+    assert_eq!(
+        rig.channel.end_submission(&mut sink),
+        Err(StateError::Running)
+    );
+    sink.held = false;
+    assert_eq!(
+        rig.channel.run(&rig.mem, &mut sink, u32::MAX),
+        Ok(RunOutcome::EntryDone)
+    );
+    // An idle channel is idle, not held.
+    sink.held = true;
+    assert_eq!(
+        rig.channel.run(&rig.mem, &mut sink, u32::MAX),
+        Ok(RunOutcome::Idle)
+    );
+}
+
+#[test]
+fn a_parked_channel_reports_the_park_before_a_hold() {
+    let mut rig = make_rig();
+    rig.set_sem(0);
+    let mut pb = PushBuffer::new();
+    semaphored(&mut pb, 0, SEM, 1, acquire_op(AcquireOp::Equal));
+    rig.start(CMD, pb.words());
+    let mut sink = HoldingSink::new(usize::MAX);
+    assert!(matches!(
+        rig.channel.run(&rig.mem, &mut sink, u32::MAX),
+        Ok(RunOutcome::Parked(_))
+    ));
+    sink.held = true;
+    assert!(matches!(
+        rig.channel.run(&rig.mem, &mut sink, u32::MAX),
+        Ok(RunOutcome::Parked(_))
+    ));
+}
