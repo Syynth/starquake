@@ -889,9 +889,7 @@ fn every_draw_refusal_names_its_rule() {
         ),
         (
             "a binding left out",
-            |_, _, d| {
-                d.bindings.pop();
-            },
+            |_, _, d| d.bindings.truncate(2),
             RenderError::Invalid(MISSING_BINDING),
         ),
         (
