@@ -6,22 +6,22 @@ use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 
+use super::super::classify::{FORM_IMM, LDC_OPCODE, with_form};
 use super::super::jump_tables::{
     IMNMX_WORD2, LDC_WORD2, MAX_CLAMP, SHF_SCALE, SHF_WORD2, WORD1, WORD2, is_table_load,
     is_table_scale, table_clamp, tracked_brx,
 };
-use super::super::classify::{FORM_IMM, LDC_OPCODE, with_form};
 use super::super::{
     FlowError, JumpTable, JumpTableQuestions, MAX_TABLE_ENTRIES, find_jump_tables, flow_graph,
     resolve_jump_tables,
 };
-use super::{Item, Program, SIZE, exit, p, pure, r, to_start};
+use super::{Item, Program, exit, p, pure, r, size, to_start};
 use crate::asm::assemble;
 use crate::capture::{Capture, Extension, capture};
 use crate::decode::integer::SHF_TYPE;
 use crate::decode::{
-    BRX_OPCODE, BrxSrc, CBUF_INDEX, CBUF_OFFSET, Field, Gpr, IMNMX_OPCODE, Instr, Instruction,
-    Op, OpBrx, PredSrc, SHF_OPCODE, SRC2, UniformReg,
+    BRX_OPCODE, BrxSrc, CBUF_INDEX, CBUF_OFFSET, Field, Gpr, IMNMX_OPCODE, Instr, Instruction, Op,
+    OpBrx, PredSrc, SHF_OPCODE, SRC2, UniformReg,
 };
 use crate::exchange::{Answers, EngineState, Question, TextureKind, exchange};
 use crate::testing::config;
@@ -49,7 +49,12 @@ fn imnmx(dst: u8, src: u8, clamp: u32) -> Instruction {
 /// `SHF.L.U32 dst, src, 0x2, RZ`.
 fn shf(dst: u8, src: u8) -> Instruction {
     Instruction::from_bits(
-        REF_SHF | REF_ALWAYS | u128::from(dst) << 16 | u128::from(src) << 24 | 2 << 32 | 0x6ff << 64,
+        REF_SHF
+            | REF_ALWAYS
+            | u128::from(dst) << 16
+            | u128::from(src) << 24
+            | 2 << 32
+            | 0x6ff << 64,
     )
 }
 
@@ -149,19 +154,37 @@ fn each_condition_of_the_pattern_is_needed() {
     let cases: Vec<(&str, [Instruction; 3])> = vec![
         ("clamp guarded", [guarded(clamp), scale, load]),
         ("clamp signed", [toggle(clamp, 1 << 73), scale, load]),
-        ("clamp register form", [toggle(clamp, 0x817 ^ 0x217), scale, load]),
-        ("clamp writes another register", [imnmx(7, 3, 5), scale, load]),
+        (
+            "clamp register form",
+            [toggle(clamp, 0x817 ^ 0x217), scale, load],
+        ),
+        (
+            "clamp writes another register",
+            [imnmx(7, 3, 5), scale, load],
+        ),
         ("scale guarded", [clamp, guarded(scale), load]),
         ("scale by 3", [clamp, toggle(scale, 1 << 32), load]),
         ("scale signed type", [clamp, toggle(scale, 1 << 73), load]),
         ("scale reads another register", [clamp, shf(5, 7), load]),
         ("scale writes another register", [clamp, shf(7, 4), load]),
         ("load guarded", [clamp, scale, guarded(load)]),
-        ("load of another type", [clamp, scale, toggle(load, 1 << 76)]),
-        ("load with another bit", [clamp, scale, toggle(load, 1 << 32)]),
+        (
+            "load of another type",
+            [clamp, scale, toggle(load, 1 << 76)],
+        ),
+        (
+            "load with another bit",
+            [clamp, scale, toggle(load, 1 << 32)],
+        ),
         ("load offset not a word", [clamp, scale, ldc(6, 5, 2, 0x41)]),
-        ("load reads another register", [clamp, scale, ldc(6, 7, 2, 0x40)]),
-        ("load writes another register", [clamp, scale, ldc(7, 5, 2, 0x40)]),
+        (
+            "load reads another register",
+            [clamp, scale, ldc(6, 7, 2, 0x40)],
+        ),
+        (
+            "load writes another register",
+            [clamp, scale, ldc(7, 5, 2, 0x40)],
+        ),
         ("clamp after the scale", [scale, clamp, load]),
         ("scale after the load", [clamp, load, scale]),
     ];
@@ -266,10 +289,11 @@ fn backward(code: &[Instruction]) -> Vec<JumpTable> {
             continue;
         };
         let bounded = reg(code[scale], 24);
-        let Some(clamp) = (0..scale)
-            .rev()
-            .find_map(|i| (reg(code[i], 16) == bounded).then(|| table_clamp(code[i])).flatten())
-        else {
+        let Some(clamp) = (0..scale).rev().find_map(|i| {
+            (reg(code[i], 16) == bounded)
+                .then(|| table_clamp(code[i]))
+                .flatten()
+        }) else {
             continue;
         };
         tables.push(JumpTable {
@@ -393,10 +417,10 @@ fn nested() -> Vec<u8> {
 /// The words of both tables of [`nested`]: the first names 5 and 6, the second 10 and 11.
 fn nested_words() -> Words {
     Words::new(&[
-        ((2, 0x10), 5 * SIZE),
-        ((2, 0x14), 6 * SIZE),
-        ((3, 0x20), 10 * SIZE),
-        ((3, 0x24), 11 * SIZE),
+        ((2, 0x10), 5 * size()),
+        ((2, 0x14), 6 * size()),
+        ((3, 0x20), 10 * size()),
+        ((3, 0x24), 11 * size()),
     ])
 }
 
@@ -409,8 +433,7 @@ fn nested_tables_take_two_rounds() {
     let mut capture = capture(&bytes[..], GuestStage::Compute).expect("captured");
     assert_eq!(capture.instruction_count(), 5);
     let questioner = JumpTableQuestions::new(&capture, &bytes[..]);
-    let exchanged =
-        exchange(GuestStage::Compute, &questioner, &nested_words()).expect("exchanged");
+    let exchanged = exchange(GuestStage::Compute, &questioner, &nested_words()).expect("exchanged");
     assert_eq!(exchanged.rounds, 2);
     assert_eq!(exchanged.answers.len(), 4);
     let resolved =
@@ -426,10 +449,15 @@ fn nested_tables_take_two_rounds() {
         .collect();
     // Instruction 11 lies past the extended capture: ignored.
     assert_eq!(targets, vec![(3, vec![5, 6]), (9, vec![10])]);
-    assert_eq!(resolved.tables[1].words, vec![10 * SIZE, 11 * SIZE]);
+    assert_eq!(resolved.tables[1].words, vec![10 * size(), 11 * size()]);
     let code: Vec<Instruction> = capture.instructions().collect();
     let graph = flow_graph(&code, &resolved.branch_tables()).expect("accepted");
-    graph.build_ir().expect("IR").function.verify().expect("verified");
+    graph
+        .build_ir()
+        .expect("IR")
+        .function
+        .verify()
+        .expect("verified");
 }
 
 #[test]
@@ -529,12 +557,12 @@ fn a_graphics_table_counts_from_the_header_unless_a_value_is_below_it() {
     };
     // Values from the program's first byte: the header's size plus 16 per instruction.
     assert_eq!(
-        resolve([header + 4 * SIZE, header + 5 * SIZE, 0, 0, 0, 0]),
+        resolve([header + 4 * size(), header + 5 * size(), 0, 0, 0, 0]),
         (header, vec![4, 5])
     );
     // A value below the header's size counts from instruction 0 for every value.
     assert_eq!(
-        resolve([4 * SIZE, 5 * SIZE, 0, 0, 0, 0]),
+        resolve([4 * size(), 5 * size(), 0, 0, 0, 0]),
         (0, vec![4, 5])
     );
 }

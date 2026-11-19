@@ -26,7 +26,10 @@ pub(super) enum RawEnd {
         otherwise: u32,
     },
     /// `BRX`: (table value, block) pairs.
-    Indirect { src: BrxSrc, targets: Vec<(u32, u32)> },
+    Indirect {
+        src: BrxSrc,
+        targets: Vec<(u32, u32)>,
+    },
     /// The thread exits.
     Exit,
     /// Run function `callee`, then continue at `next`. `call` is the `CALL`'s index.
@@ -130,7 +133,10 @@ impl Builder<'_> {
 
     /// Fills block `id`.
     fn fill(&mut self, id: u32, block: RawBlock) {
-        if let Some(slot) = usize::try_from(id).ok().and_then(|slot| self.blocks.get_mut(slot)) {
+        if let Some(slot) = usize::try_from(id)
+            .ok()
+            .and_then(|slot| self.blocks.get_mut(slot))
+        {
             *slot = Some(block);
         }
     }
@@ -159,16 +165,6 @@ impl Builder<'_> {
                 .and_then(|slot| self.code.get(slot))
                 .ok_or(past_end)?;
             let info = classify(opcode_of(word));
-            // The walk decoded every reachable control instruction, so this cannot fail.
-            let op = if info.kind == OpKind::Plain {
-                None
-            } else {
-                Some(
-                    decode(word)
-                        .map_err(|error| FlowError::Decode { index, error })?
-                        .op,
-                )
-            };
             let mut kind = info.kind;
             if kind == OpKind::Call && self.analysis.callee(index).is_none() {
                 // A skip call: the walk took it as a branch (see `analysis::is_skip_call`).
@@ -190,57 +186,83 @@ impl Builder<'_> {
             if conditional {
                 return self.conditional(block, function, index, kind, guard, second);
             }
-            let end = match (kind, op) {
-                (OpKind::Exit, _) => Some((leader..next_index, RawEnd::Exit)),
-                (OpKind::Bra, Some(Op::Bra(bra))) => {
-                    let target = super::analysis::branch_target(index, bra.offset)?;
-                    Some(self.bra(function, leader, index, target, guard, second)?)
-                }
-                (OpKind::Bra, Some(Op::Call(call))) => {
-                    let target = super::analysis::branch_target(index, call.offset)?;
-                    Some(self.bra(function, leader, index, target, guard, second)?)
-                }
-                (OpKind::Bsync, _) => {
-                    let target = self
-                        .analysis
-                        .sync_target(index)
-                        .ok_or(FlowError::MissingBarrier { index })?;
-                    Some((leader..index, RawEnd::Jump(self.entry(target, index)?)))
-                }
-                (OpKind::Call, _) => {
-                    let callee = self
-                        .analysis
-                        .callee(index)
-                        .ok_or(FlowError::CallLinkage { index })?;
-                    let next = self.entry(next_index, index)?;
-                    Some((
-                        leader..index,
-                        RawEnd::Call {
-                            call: index,
-                            callee,
-                            next,
-                        },
-                    ))
-                }
-                (OpKind::Ret, _) => {
-                    let cond = if guard.is_true() {
-                        None
-                    } else {
-                        Some((guard, self.entry(next_index, index)?))
-                    };
-                    Some((leader..index, RawEnd::Return { ret: index, cond }))
-                }
-                (OpKind::Brx, Some(Op::Brx(brx))) => {
-                    Some((leader..next_index, self.brx(index, brx.src)?))
-                }
-                _ => None,
-            };
+            let end = self.end(function, leader, index, word, kind)?;
             if let Some((code, end)) = end {
                 self.fill(block, plain(code, end));
                 return Ok(());
             }
             index = next_index;
         }
+    }
+
+    /// How the block from `leader` ends at `word`, the instruction at `index` taken as `kind`,
+    /// if it ends there.
+    fn end(
+        &mut self,
+        function: u32,
+        leader: u32,
+        index: u32,
+        word: Instruction,
+        kind: OpKind,
+    ) -> Result<Option<(Range<u32>, RawEnd)>, FlowError> {
+        let next_index = index.saturating_add(1);
+        let guard = guard_of(word);
+        let second = second_of(word);
+        // The walk decoded every reachable control instruction, so this cannot fail.
+        let op = if kind == OpKind::Plain {
+            None
+        } else {
+            Some(
+                decode(word)
+                    .map_err(|error| FlowError::Decode { index, error })?
+                    .op,
+            )
+        };
+        Ok(match (kind, op) {
+            (OpKind::Exit, _) => Some((leader..next_index, RawEnd::Exit)),
+            (OpKind::Bra, Some(Op::Bra(bra))) => {
+                let target = super::analysis::branch_target(index, bra.offset)?;
+                Some(self.bra(function, leader, index, target, guard, second)?)
+            }
+            (OpKind::Bra, Some(Op::Call(call))) => {
+                let target = super::analysis::branch_target(index, call.offset)?;
+                Some(self.bra(function, leader, index, target, guard, second)?)
+            }
+            (OpKind::Bsync, _) => {
+                let target = self
+                    .analysis
+                    .sync_target(index)
+                    .ok_or(FlowError::MissingBarrier { index })?;
+                Some((leader..index, RawEnd::Jump(self.entry(target, index)?)))
+            }
+            (OpKind::Call, _) => {
+                let callee = self
+                    .analysis
+                    .callee(index)
+                    .ok_or(FlowError::CallLinkage { index })?;
+                let next = self.entry(next_index, index)?;
+                Some((
+                    leader..index,
+                    RawEnd::Call {
+                        call: index,
+                        callee,
+                        next,
+                    },
+                ))
+            }
+            (OpKind::Ret, _) => {
+                let cond = if guard.is_true() {
+                    None
+                } else {
+                    Some((guard, self.entry(next_index, index)?))
+                };
+                Some((leader..index, RawEnd::Return { ret: index, cond }))
+            }
+            (OpKind::Brx, Some(Op::Brx(brx))) => {
+                Some((leader..next_index, self.brx(index, brx.src)?))
+            }
+            _ => None,
+        })
     }
 
     /// The end of a block closed by a `BRA` at `index` to `target`: one test, or two in a row
@@ -282,8 +304,8 @@ impl Builder<'_> {
             .ok_or(FlowError::NoTarget { index })?;
         let mut targets = Vec::with_capacity(table.len());
         for &target in table {
-            let address = indirect_address(self.tables.base(), target)
-                .ok_or(FlowError::TargetOutside {
+            let address =
+                indirect_address(self.tables.base(), target).ok_or(FlowError::TargetOutside {
                     index,
                     target: i64::from(target),
                 })?;
@@ -385,7 +407,9 @@ impl Builder<'_> {
         }
         let mut position = vec![0; blocks.len()];
         for (id, &owner) in (0_u32..).zip(&self.function) {
-            let Some(list) = usize::try_from(owner).ok().and_then(|f| functions.get_mut(f))
+            let Some(list) = usize::try_from(owner)
+                .ok()
+                .and_then(|f| functions.get_mut(f))
             else {
                 continue;
             };

@@ -2,7 +2,7 @@
 //! their own after any instructions.
 
 use super::super::{BranchTables, FlowError, IrBlocks, flow_graph};
-use super::{Item, NEVER, Program, SIZE, bsync, exit, graph, not_p, p, pure, r};
+use super::{Item, NEVER, Program, bsync, exit, graph, not_p, p, pure, r, size};
 use crate::decode::{BrxSrc, Instruction, PredSrc, UniformReg};
 use crate::ir::{Block, BlockId, Imm, Inst, Opcode, Operand, Terminator, Value};
 
@@ -21,12 +21,16 @@ fn nth(ir: &IrBlocks, n: usize) -> (BlockId, &Block) {
     ir.function.blocks().nth(n).expect("a block")
 }
 
-/// The operation `value` names: its opcode and arguments.
-fn op(ir: &IrBlocks, value: Value) -> (Opcode, Vec<Operand>) {
-    match ir.function.inst(value).expect("an instruction") {
-        Inst::Op(op) => (op.opcode, op.args.clone()),
-        Inst::Phi(_) => panic!("a phi"),
-    }
+/// An operation: its opcode and arguments.
+type Operation = (Opcode, Vec<Operand>);
+
+/// The operation `value` names (never a phi: flow analysis makes none).
+fn op(ir: &IrBlocks, value: Value) -> Operation {
+    let op = match ir.function.inst(value).expect("an instruction") {
+        Inst::Op(op) => Some((op.opcode, op.args.clone())),
+        Inst::Phi(_) => None,
+    };
+    op.expect("an operation")
 }
 
 /// The if/else program of the graph tests.
@@ -57,7 +61,7 @@ fn each_flow_block_is_the_ir_block_of_its_index() {
     assert_eq!(ir.function.block_count(), 5);
     // No block of the program's own holds an instruction: the translators fill them.
     for n in 0..4 {
-        assert!(nth(&ir, n).1.insts.is_empty());
+        assert_eq!(nth(&ir, n).1.insts, Vec::<Value>::new());
     }
 }
 
@@ -141,7 +145,7 @@ fn a_test_of_not_pt_is_the_constant_false() {
         .build();
     let ir = ir_of(&code, &BranchTables::new(0));
     let block = nth(&ir, 0).1;
-    assert!(block.insts.is_empty());
+    assert_eq!(block.insts, Vec::<Value>::new());
     assert_eq!(
         block.terminator,
         Terminator::Branch {
@@ -167,7 +171,7 @@ fn jump_table(src: BrxSrc, base: u32) -> (Vec<Instruction>, BranchTables) {
 
 /// The register read and the (address, target block) of each comparison, in order, and the
 /// block the chain ends in.
-fn chain(ir: &IrBlocks, first: usize) -> (Option<(Opcode, Vec<Operand>)>, Vec<(u32, BlockId)>, Terminator) {
+fn chain(ir: &IrBlocks, first: usize) -> (Option<Operation>, Vec<(u32, BlockId)>, Terminator) {
     let mut block = nth(ir, first).1;
     let mut read = None;
     let mut targets = Vec::new();
@@ -175,16 +179,18 @@ fn chain(ir: &IrBlocks, first: usize) -> (Option<(Opcode, Vec<Operand>)>, Vec<(u
         for &value in &block.insts {
             let (opcode, args) = op(ir, value);
             if opcode == Opcode::IEqual {
-                let Operand::Imm(Imm::U32(address)) = args[1] else {
-                    panic!("an address")
+                let address = match args[1] {
+                    Operand::Imm(Imm::U32(address)) => Some(address),
+                    _ => None,
                 };
-                let Terminator::Branch {
-                    then, otherwise, ..
-                } = block.terminator
-                else {
-                    panic!("a branch")
+                let ends = match block.terminator {
+                    Terminator::Branch {
+                        then, otherwise, ..
+                    } => Some((then, otherwise)),
+                    _ => None,
                 };
-                targets.push((address, then));
+                let (then, otherwise) = ends.expect("a branch");
+                targets.push((address.expect("an address"), then));
                 block = ir.function.block(otherwise).expect("a block");
                 break;
             }
@@ -212,7 +218,10 @@ fn an_indirect_branch_compares_each_address() {
     );
     assert_eq!(
         targets,
-        vec![(base + 2 * SIZE, nth(&ir, 1).0), (base + 3 * SIZE, nth(&ir, 2).0)]
+        vec![
+            (base + 2 * size(), nth(&ir, 1).0),
+            (base + 3 * size(), nth(&ir, 2).0)
+        ]
     );
     assert_eq!(end, Terminator::Unreachable);
 }
@@ -225,8 +234,11 @@ fn indirect_addresses_use_the_table_base() {
     let ir = ir_of(&code, &tables);
     let (_, targets, _) = chain(&ir, 3);
     assert_eq!(
-        targets.iter().map(|&(address, _)| address).collect::<Vec<_>>(),
-        vec![2 * SIZE, 3 * SIZE]
+        targets
+            .iter()
+            .map(|&(address, _)| address)
+            .collect::<Vec<_>>(),
+        vec![2 * size(), 3 * size()]
     );
 }
 

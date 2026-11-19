@@ -5,8 +5,8 @@ use super::super::analysis::{LINK_LOOKBACK, RETURN_COPY_LOOKBACK, RETURN_COPY_RE
 use super::super::classify::WARP_WIDE_OPCODES;
 use super::super::{Analysis, BarrierModel, BranchTables, FlowError, MAX_PROGRAM, analyze};
 use super::{
-    Item, NEVER, Program, SIZE, bsync, exit, exit_if, kill, offset, p, pure, r, refusal,
-    side_effect, to_start,
+    Item, NEVER, Program, bsync, exit, exit_if, kill, offset, p, pure, r, refusal, side_effect,
+    size, to_start,
 };
 use crate::asm::assemble;
 use crate::decode::{
@@ -132,12 +132,18 @@ fn target_errors_name_their_reason() {
     let exit = word(exit());
     // One word past the next instruction: byte 16 + 4.
     assert_eq!(
-        refusal(&[bra_by(PredSrc::TRUE, PredSrc::TRUE, BranchOffset::from_words(1)), exit]),
+        refusal(&[
+            bra_by(PredSrc::TRUE, PredSrc::TRUE, BranchOffset::from_words(1)),
+            exit
+        ]),
         FlowError::MisalignedTarget { index: 0, byte: 20 }
     );
     // One instruction before instruction 0.
     assert_eq!(
-        refusal(&[bra_by(PredSrc::TRUE, PredSrc::TRUE, to_start(0).with_extra(-1)), exit]),
+        refusal(&[
+            bra_by(PredSrc::TRUE, PredSrc::TRUE, to_start(0).with_extra(-1)),
+            exit
+        ]),
         FlowError::TargetOutside {
             index: 0,
             target: -1
@@ -172,7 +178,7 @@ trait Extra {
 impl Extra for BranchOffset {
     fn with_extra(self, instructions: i64) -> BranchOffset {
         BranchOffset::from_words(
-            self.words() + instructions * i64::from(SIZE) / BranchOffset::WORD_BYTES,
+            self.words() + instructions * i64::from(size()) / BranchOffset::WORD_BYTES,
         )
     }
 }
@@ -211,7 +217,7 @@ fn a_path_running_off_the_end_is_refused() {
 fn code_reached_from_two_functions_is_refused() {
     // The function at 3 branches back into the program's EXIT at 2.
     let code = [
-        mov_imm(10, 2 * SIZE),
+        mov_imm(10, 2 * size()),
         call_word(1, 3, true, PredSrc::TRUE, PredSrc::TRUE),
         word(exit()),
         bra_by(PredSrc::TRUE, PredSrc::TRUE, offset(3, 2)),
@@ -273,8 +279,16 @@ fn an_exit_with_two_predicates_needs_a_free_next_instruction() {
     let analysis = accepted(&[two, word(pure(1)), word(exit())]);
     assert!(analysis.is_leader(0) && analysis.is_leader(1));
     // One predicate only, either one: accepted before a guarded side effect.
-    accepted(&[word(exit_if(p(0), PredSrc::TRUE)), side_effect(p(2)), word(exit())]);
-    accepted(&[word(exit_if(PredSrc::TRUE, p(1))), side_effect(p(2)), word(exit())]);
+    accepted(&[
+        word(exit_if(p(0), PredSrc::TRUE)),
+        side_effect(p(2)),
+        word(exit()),
+    ]);
+    accepted(&[
+        word(exit_if(PredSrc::TRUE, p(1))),
+        side_effect(p(2)),
+        word(exit()),
+    ]);
     // A special exit is reported before two predicates.
     let both = word(Instr {
         guard: p(0),
@@ -324,8 +338,15 @@ fn ret_word(index: u32, reg: u8) -> Instruction {
 #[test]
 fn calls_need_their_mode() {
     // 0: MOV R10; 1: CALL 3; 2: EXIT; 3: RET R10.
-    let program = |call: Instruction| [mov_imm(10, 2 * SIZE), call, word(exit()), ret_word(3, 10)];
-    let analysis = accepted(&program(call_word(1, 3, true, PredSrc::TRUE, PredSrc::TRUE)));
+    let program =
+        |call: Instruction| [mov_imm(10, 2 * size()), call, word(exit()), ret_word(3, 10)];
+    let analysis = accepted(&program(call_word(
+        1,
+        3,
+        true,
+        PredSrc::TRUE,
+        PredSrc::TRUE,
+    )));
     assert_eq!(analysis.function_entries(), &[0, 3]);
     assert_eq!(analysis.callee(1), Some(1));
     assert_eq!(analysis.function_of(3), Some(1));
@@ -334,13 +355,15 @@ fn calls_need_their_mode() {
         call_word(1, 3, false, PredSrc::TRUE, PredSrc::TRUE),
         call_word(1, 3, true, p(1), PredSrc::TRUE),
     ] {
-        assert_eq!(
-            refusal(&program(call)),
-            FlowError::CallMode { index: 1 }
-        );
+        assert_eq!(refusal(&program(call)), FlowError::CallMode { index: 1 });
     }
     // The mode is checked before the linkage: no `MOV` and a bad mode.
-    let code = [word(pure(1)), call_word(1, 3, false, PredSrc::TRUE, PredSrc::TRUE), word(exit()), ret_word(3, 10)];
+    let code = [
+        word(pure(1)),
+        call_word(1, 3, false, PredSrc::TRUE, PredSrc::TRUE),
+        word(exit()),
+        ret_word(3, 10),
+    ];
     assert_eq!(refusal(&code), FlowError::CallMode { index: 1 });
 }
 
@@ -354,12 +377,17 @@ fn calls_need_a_return_address_and_a_target() {
     );
     // A `MOV` of another address.
     assert_eq!(
-        refusal(&[mov_imm(10, 3 * SIZE), call, word(exit()), ret_word(3, 10)]),
+        refusal(&[mov_imm(10, 3 * size()), call, word(exit()), ret_word(3, 10)]),
         FlowError::CallLinkage { index: 1 }
     );
     // A target past the end.
     assert_eq!(
-        refusal(&[mov_imm(10, 2 * SIZE), call_word(1, 4, true, PredSrc::TRUE, PredSrc::TRUE), word(exit()), ret_word(3, 10)]),
+        refusal(&[
+            mov_imm(10, 2 * size()),
+            call_word(1, 4, true, PredSrc::TRUE, PredSrc::TRUE),
+            word(exit()),
+            ret_word(3, 10)
+        ]),
         FlowError::CallLinkage { index: 1 }
     );
 }
@@ -370,9 +398,15 @@ fn the_return_address_is_looked_for_at_most_six_back() {
     // MOV, five fillers, CALL: the MOV is six back.
     let build = |fill: usize| {
         let call = u32::try_from(fill + 1).expect("small");
-        let mut code = vec![mov_imm(10, (call + 1) * SIZE)];
+        let mut code = vec![mov_imm(10, (call + 1) * size())];
         code.extend(std::iter::repeat_n(word(pure(1)), fill));
-        code.push(call_word(call, call + 2, true, PredSrc::TRUE, PredSrc::TRUE));
+        code.push(call_word(
+            call,
+            call + 2,
+            true,
+            PredSrc::TRUE,
+            PredSrc::TRUE,
+        ));
         code.push(word(exit()));
         code.push(ret_word(call + 2, 10));
         (code, call)
@@ -383,7 +417,7 @@ fn the_return_address_is_looked_for_at_most_six_back() {
     assert_eq!(refusal(&code), FlowError::CallLinkage { index: call });
     // A control instruction in between stops the search.
     let code = [
-        mov_imm(10, 3 * SIZE),
+        mov_imm(10, 3 * size()),
         word(super::brk(0, PredSrc::TRUE)),
         call_word(2, 4, true, PredSrc::TRUE, PredSrc::TRUE),
         word(exit()),
@@ -392,7 +426,7 @@ fn the_return_address_is_looked_for_at_most_six_back() {
     // `BREAK` is a no-effect instruction to the walk: the search goes on past it.
     accepted(&code);
     let code = [
-        mov_imm(10, 4 * SIZE),
+        mov_imm(10, 4 * size()),
         word(exit_if(p(0), PredSrc::TRUE)),
         word(pure(1)),
         call_word(3, 5, true, PredSrc::TRUE, PredSrc::TRUE),
@@ -405,9 +439,14 @@ fn the_return_address_is_looked_for_at_most_six_back() {
 #[test]
 fn link_mov_must_decode() {
     let code = |link: Instruction| {
-        [link, call_word(1, 3, true, PredSrc::TRUE, PredSrc::TRUE), word(exit()), ret_word(3, 10)]
+        [
+            link,
+            call_word(1, 3, true, PredSrc::TRUE, PredSrc::TRUE),
+            word(exit()),
+            ret_word(3, 10),
+        ]
     };
-    let stray = with_bit(mov_imm(10, 2 * SIZE), 95);
+    let stray = with_bit(mov_imm(10, 2 * size()), 95);
     assert!(decode(stray).is_err());
     assert_eq!(refusal(&code(stray)), FlowError::CallLinkage { index: 1 });
     // A guarded MOV, or one of some lanes only, is not a return address either.
@@ -415,13 +454,13 @@ fn link_mov_must_decode() {
         guard: p(0),
         op: Op::Mov(OpMov {
             dst: r(10),
-            src: MovSrc::Imm(2 * SIZE),
+            src: MovSrc::Imm(2 * size()),
             quad_lanes: OpMov::ALL_LANES,
         }),
     });
     let lanes = word(Instr::new(Op::Mov(OpMov {
         dst: r(10),
-        src: MovSrc::Imm(2 * SIZE),
+        src: MovSrc::Imm(2 * size()),
         quad_lanes: 0x7,
     })));
     for link in [guarded, lanes] {
@@ -468,7 +507,14 @@ fn returns_need_their_linkage() {
         refusal(&[ret_word(0, 10)]),
         FlowError::ReturnLinkage { index: 0 }
     );
-    let program = |ret: Instruction| [mov_imm(10, 2 * SIZE), call_word(1, 3, true, PredSrc::TRUE, PredSrc::TRUE), word(exit()), ret];
+    let program = |ret: Instruction| {
+        [
+            mov_imm(10, 2 * size()),
+            call_word(1, 3, true, PredSrc::TRUE, PredSrc::TRUE),
+            word(exit()),
+            ret,
+        ]
+    };
     accepted(&program(ret_word(3, 10)));
     let bad = |src, offset, no_dec, cond| {
         word(Instr::new(Op::Ret(OpRet {
@@ -494,7 +540,11 @@ fn returns_need_their_linkage() {
 fn a_return_through_another_register_needs_a_copy_of_the_link() {
     // f: [fillers] MOV R11, R10; RET R11.
     let program = |copy: Option<Instruction>, gap: usize| {
-        let mut code = vec![mov_imm(10, 2 * SIZE), call_word(1, 3, true, PredSrc::TRUE, PredSrc::TRUE), word(exit())];
+        let mut code = vec![
+            mov_imm(10, 2 * size()),
+            call_word(1, 3, true, PredSrc::TRUE, PredSrc::TRUE),
+            word(exit()),
+        ];
         if let Some(copy) = copy {
             code.push(copy);
         }
@@ -523,7 +573,11 @@ fn a_return_through_another_register_needs_a_copy_of_the_link() {
     let (code, ret) = program(Some(copy(12, 11)), 0);
     assert_eq!(refusal(&code), FlowError::ReturnRegister { index: ret });
     // A later write of the register that is not the copy: refused.
-    let mut code = vec![mov_imm(10, 2 * SIZE), call_word(1, 3, true, PredSrc::TRUE, PredSrc::TRUE), word(exit())];
+    let mut code = vec![
+        mov_imm(10, 2 * size()),
+        call_word(1, 3, true, PredSrc::TRUE, PredSrc::TRUE),
+        word(exit()),
+    ];
     code.push(copy(10, 11));
     code.push(mov_imm(11, 0));
     code.push(ret_word(5, 11));
@@ -540,7 +594,7 @@ fn a_branch_into_the_copy_breaks_it() {
         quad_lanes: OpMov::ALL_LANES,
     })));
     let landing = [
-        mov_imm(10, 2 * SIZE),
+        mov_imm(10, 2 * size()),
         call_word(1, 3, true, PredSrc::TRUE, PredSrc::TRUE),
         word(exit()),
         bra_by(p(0), PredSrc::TRUE, offset(3, 5)),
@@ -550,7 +604,7 @@ fn a_branch_into_the_copy_breaks_it() {
     assert_eq!(refusal(&landing), FlowError::ReturnRegister { index: 5 });
     // The branch landing on the copy itself is outside the checked run: accepted.
     let before = [
-        mov_imm(10, 2 * SIZE),
+        mov_imm(10, 2 * size()),
         call_word(1, 3, true, PredSrc::TRUE, PredSrc::TRUE),
         word(exit()),
         bra_by(p(0), PredSrc::TRUE, offset(3, 4)),
@@ -569,7 +623,13 @@ fn return_registers_from_250_are_not_copies() {
             src: MovSrc::Reg(r(link)),
             quad_lanes: OpMov::ALL_LANES,
         })));
-        [mov_imm(link, 2 * SIZE), call_word(1, 3, true, PredSrc::TRUE, PredSrc::TRUE), word(exit()), copy, ret_word(4, reg)]
+        [
+            mov_imm(link, 2 * size()),
+            call_word(1, 3, true, PredSrc::TRUE, PredSrc::TRUE),
+            word(exit()),
+            copy,
+            ret_word(4, reg),
+        ]
     };
     accepted(&program(limit - 1, limit - 2));
     accepted(&program(limit - 2, limit - 1));
@@ -845,7 +905,12 @@ fn paths_that_set_a_barrier_differently_are_refused() {
 
 #[test]
 fn guarded_side_effects_split_and_pure_ones_do_not() {
-    let analysis = accepted(&[word(pure(1)), side_effect(p(0)), word(pure(2)), word(exit())]);
+    let analysis = accepted(&[
+        word(pure(1)),
+        side_effect(p(0)),
+        word(pure(2)),
+        word(exit()),
+    ]);
     assert!(analysis.is_leader(1) && analysis.is_leader(2));
     let guarded_pure = word(Instr {
         guard: p(0),
@@ -854,7 +919,12 @@ fn guarded_side_effects_split_and_pure_ones_do_not() {
     let analysis = accepted(&[word(pure(1)), guarded_pure, word(pure(2)), word(exit())]);
     assert!(!analysis.is_leader(1) && !analysis.is_leader(2));
     // A disabled side effect does not split either.
-    let analysis = accepted(&[word(pure(1)), side_effect(NEVER), word(pure(2)), word(exit())]);
+    let analysis = accepted(&[
+        word(pure(1)),
+        side_effect(NEVER),
+        word(pure(2)),
+        word(exit()),
+    ]);
     assert!(!analysis.is_leader(1) && !analysis.is_leader(2));
 }
 
@@ -899,7 +969,10 @@ fn nested_barriers_reconverge_at_their_own_points() {
         .op(exit())
         .clone();
     let analysis = accepted(&program.build());
-    assert_eq!(analysis.sync_target(program.at("skip")), Some(program.at("inner")));
+    assert_eq!(
+        analysis.sync_target(program.at("skip")),
+        Some(program.at("inner"))
+    );
     assert_eq!(analysis.sync_target(6), Some(program.at("outer")));
     assert!(analysis.is_leader(program.at("inner")) && analysis.is_leader(program.at("outer")));
 }
@@ -922,7 +995,10 @@ fn an_early_exit_from_a_region_abandons_the_inner_barrier() {
         .op(exit())
         .clone();
     let analysis = accepted(&program.build());
-    assert_eq!(analysis.sync_target(program.at("leave")), Some(program.at("outer")));
+    assert_eq!(
+        analysis.sync_target(program.at("leave")),
+        Some(program.at("outer"))
+    );
     assert_eq!(analysis.sync_target(4), Some(program.at("inner")));
 }
 
@@ -944,5 +1020,8 @@ fn a_loop_with_a_break_reaches_its_exit() {
         .clone();
     let analysis = accepted(&program.build());
     assert!(analysis.is_leader(program.at("head")));
-    assert_eq!(analysis.sync_target(program.at("out")), Some(program.at("after")));
+    assert_eq!(
+        analysis.sync_target(program.at("out")),
+        Some(program.at("after"))
+    );
 }

@@ -8,16 +8,16 @@
 //! `NeedsVirtualBlock`, `BranchTarget`, `GuardOf` and `SecondOf`. The checks run in the
 //! reference's order; the parent module's docs list where this walk differs.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use super::classify::{OpInfo, OpKind, classify, is_warp_wide};
 use super::{BarrierModel, BranchTables, FlowError, MAX_PROGRAM};
-use crate::decode::{
-    BraCond, BranchOffset, COND, COND_NOT, DST, GUARD, GUARD_NOT, Gpr, Instr, Instruction,
-    MovSrc, OPCODE, Op, OpBSSy, OpBSync, OpBra, OpBrx, OpCall, OpExit, OpMov, OpRet, Pred,
-    PredSrc, decode,
-};
 use crate::decode::{BRA_OPCODE, BRANCH_OFFSET, BSSY_OFFSET, BSSY_OPCODE, CALL_OPCODE};
+use crate::decode::{
+    BraCond, BranchOffset, COND, COND_NOT, DST, GUARD, GUARD_NOT, Gpr, Instr, Instruction, MovSrc,
+    OPCODE, Op, OpBSSy, OpBSync, OpBra, OpBrx, OpCall, OpExit, OpMov, OpRet, Pred, PredSrc, decode,
+};
 
 /// How many barrier registers there are, so how deep the stack model's stack may grow
 /// (`flow.cpp`: `stack.size() >= 16`; NAK: `RegFile::Bar` has 16 registers).
@@ -31,7 +31,10 @@ pub(crate) const RETURN_COPY_LOOKBACK: u32 = 8;
 /// (`if (reg >= 250 || link >= 250) return false;`; the reference does not say why).
 pub(crate) const RETURN_COPY_REGISTER_LIMIT: u8 = 250;
 /// [`Instruction::SIZE`] as an offset.
-const INSTRUCTION_BYTES: i64 = Instruction::SIZE as i64;
+fn instruction_bytes() -> i64 {
+    // Cannot fail: an instruction is 16 bytes.
+    i64::try_from(Instruction::SIZE).unwrap_or(i64::MAX)
+}
 
 /// The reconvergence point a barrier register holds: an instruction, or one that paths set
 /// differently (`CONFLICTING_TARGET`, `~0U` in the reference).
@@ -128,7 +131,9 @@ fn at<T>(items: &[T], index: u32) -> Option<&T> {
 
 /// Element `index` of `items`, to change it.
 fn at_mut<T>(items: &mut [T], index: u32) -> Option<&mut T> {
-    usize::try_from(index).ok().and_then(|slot| items.get_mut(slot))
+    usize::try_from(index)
+        .ok()
+        .and_then(|slot| items.get_mut(slot))
 }
 
 /// A predicate field as a source.
@@ -167,7 +172,7 @@ pub(crate) fn opcode_of(word: Instruction) -> u16 {
 pub(crate) fn target_byte(index: u32, offset: BranchOffset) -> Option<i64> {
     i64::from(index)
         .checked_add(1)?
-        .checked_mul(INSTRUCTION_BYTES)?
+        .checked_mul(instruction_bytes())?
         .checked_add(offset.bytes()?)
 }
 
@@ -179,10 +184,10 @@ pub(crate) fn branch_target(index: u32, offset: BranchOffset) -> Result<u32, Flo
         index,
         target: i64::MAX,
     })?;
-    if byte.rem_euclid(INSTRUCTION_BYTES) != 0 {
+    if byte.rem_euclid(instruction_bytes()) != 0 {
         return Err(FlowError::MisalignedTarget { index, byte });
     }
-    let target = byte.div_euclid(INSTRUCTION_BYTES);
+    let target = byte.div_euclid(instruction_bytes());
     u32::try_from(target).map_err(|_| FlowError::TargetOutside { index, target })
 }
 
@@ -284,7 +289,7 @@ fn last_index(code: &[Instruction]) -> u32 {
 /// unguarded `MOV Rn, (index + 1) * 16` of every lane at most [`LINK_LOOKBACK`] instructions
 /// before it, with only straight-line instructions in between (`CallLinkRegister`).
 fn call_link_register(code: &[Instruction], index: u32) -> Option<u8> {
-    let return_address = u32::try_from(INSTRUCTION_BYTES)
+    let return_address = u32::try_from(Instruction::SIZE)
         .ok()?
         .checked_mul(index.checked_add(1)?)?;
     for back in 1..=LINK_LOOKBACK.min(index) {
@@ -364,20 +369,22 @@ fn merge(a: &Barriers, b: &Barriers) -> Barriers {
                 merged.push(right);
                 j += 1;
             }
-            (Some(&left), Some(&right)) => {
-                if left.0 < right.0 {
+            (Some(&left), Some(&right)) => match left.0.cmp(&right.0) {
+                Ordering::Less => {
                     merged.push(left);
                     i += 1;
-                } else if right.0 < left.0 {
+                }
+                Ordering::Greater => {
                     merged.push(right);
                     j += 1;
-                } else {
+                }
+                Ordering::Equal => {
                     let target = if left.1 == right.1 { left.1 } else { None };
                     merged.push((left.0, target));
                     i += 1;
                     j += 1;
                 }
-            }
+            },
         }
     }
 }
@@ -505,7 +512,12 @@ impl Walk<'_> {
 
     /// Records the state arriving at `index`; returns whether the walk goes on from it (it does
     /// not when the state there already covers this one).
-    fn join(&mut self, index: u32, barriers: &mut Barriers, function: u32) -> Result<bool, FlowError> {
+    fn join(
+        &mut self,
+        index: u32,
+        barriers: &mut Barriers,
+        function: u32,
+    ) -> Result<bool, FlowError> {
         let owner = at(&self.result.function_of, index).copied().unwrap_or(0);
         let Some(slot) = at_mut(&mut self.seen, index) else {
             return Err(FlowError::RunsPastEnd {
@@ -783,16 +795,14 @@ impl Walk<'_> {
             });
         }
         match self.model {
-            BarrierModel::Registers => {
-                match barriers.binary_search_by_key(&id, |entry| entry.0) {
-                    Ok(slot) => {
-                        if let Some(entry) = barriers.get_mut(slot) {
-                            entry.1 = Some(target);
-                        }
+            BarrierModel::Registers => match barriers.binary_search_by_key(&id, |entry| entry.0) {
+                Ok(slot) => {
+                    if let Some(entry) = barriers.get_mut(slot) {
+                        entry.1 = Some(target);
                     }
-                    Err(slot) => barriers.insert(slot, (id, Some(target))),
                 }
-            }
+                Err(slot) => barriers.insert(slot, (id, Some(target))),
+            },
             BarrierModel::Stack => {
                 if barriers.len() >= BARRIERS || barriers.iter().any(|entry| entry.0 == id) {
                     return Err(FlowError::NestedBarrier { index });
@@ -895,7 +905,12 @@ impl Walk<'_> {
             }
         }
         for function in 1..functions {
-            let link = self.result.link_register.get(function).copied().unwrap_or(0);
+            let link = self
+                .result
+                .link_register
+                .get(function)
+                .copied()
+                .unwrap_or(0);
             for &(ret, reg) in self.returns.get(function).map_or(&[][..], Vec::as_slice) {
                 if reg != link && !self.copies_link(&targets, ret, reg, link) {
                     return Err(FlowError::ReturnRegister { index: ret });

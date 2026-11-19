@@ -1,7 +1,9 @@
 //! Linear time near the instruction cap (row 121): the walk's work against its documented
 //! bound, and the passes the reference does quadratically, run at the cap.
 
-use super::super::{BarrierModel, BranchTables, MAX_PROGRAM, analyze, find_jump_tables, flow_graph};
+use super::super::{
+    BarrierModel, BranchTables, MAX_PROGRAM, analyze, find_jump_tables, flow_graph,
+};
 use super::{Item, Program, bsync, exit, p, pure, r};
 use crate::asm::assemble;
 use crate::decode::{BrxSrc, Instr, Instruction, MovSrc, Op, OpMov};
@@ -49,7 +51,12 @@ fn the_walk_is_linear_near_the_cap() {
     // Every reachable instruction is applied at least once.
     assert!(registers.visits() >= count - 1);
     let graph = flow_graph(&code, &tables).expect("accepted");
-    graph.build_ir().expect("IR").function.verify().expect("verified");
+    graph
+        .build_ir()
+        .expect("IR")
+        .function
+        .verify()
+        .expect("verified");
 }
 
 #[test]
@@ -59,7 +66,9 @@ fn barrier_states_that_keep_changing_stay_within_the_bound() {
     // each time.
     let mut program = Program::new();
     for bar in (0_u8..16).rev() {
-        program.label(super::name(format!("set{bar}"))).bssy(bar, "end");
+        program
+            .label(super::name(format!("set{bar}")))
+            .bssy(bar, "end");
         if bar > 0 {
             program.bra(p(0), super::name(format!("set{}", bar - 1)));
         }
@@ -74,8 +83,8 @@ fn barrier_states_that_keep_changing_stay_within_the_bound() {
     let code = program.build();
     let count = u64::try_from(code.len()).expect("small");
     let tail = count - u64::from(tail_start);
-    let registers = analyze(&code, &BranchTables::new(0), BarrierModel::Registers)
-        .expect("accepted");
+    let registers =
+        analyze(&code, &BranchTables::new(0), BarrierModel::Registers).expect("accepted");
     assert!(registers.visits() >= 16 * tail);
     assert!(registers.visits() <= REGISTER_VISITS * count);
 }
@@ -109,10 +118,13 @@ fn many_returns_through_copies_are_checked_once() {
     })))
     .expect("encodable");
     for n in 0..functions {
-        program.label(super::name(format!("f{n}"))).word(copy).ret(11);
+        program
+            .label(super::name(format!("f{n}")))
+            .word(copy)
+            .ret(11);
     }
     let code = program.build();
-    let analysis = analyze(&code, &BranchTables::new(0), BarrierModel::Registers)
-        .expect("accepted");
+    let analysis =
+        analyze(&code, &BranchTables::new(0), BarrierModel::Registers).expect("accepted");
     assert_eq!(analysis.function_entries().len(), functions + 1);
 }

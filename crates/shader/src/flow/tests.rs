@@ -2,6 +2,7 @@
 //! checked against expected walks, block graphs and IR.
 
 mod analysis;
+mod classify;
 mod graph;
 mod inline;
 mod ir;
@@ -20,8 +21,8 @@ use crate::asm::assemble;
 use crate::decode::attribute::AST_OPCODE;
 use crate::decode::{
     Barrier, BraCond, BranchOffset, BrxSrc, GUARD, GUARD_NOT, Gpr, Instr, Instruction, MovSrc,
-    OPCODE, Op, OpBSSy, OpBSync, OpBra, OpBreak, OpBrx, OpCall, OpExit, OpKill, OpMov, OpRet,
-    Pred, PredSrc,
+    OPCODE, Op, OpBSSy, OpBSync, OpBra, OpBreak, OpBrx, OpCall, OpExit, OpKill, OpMov, OpRet, Pred,
+    PredSrc,
 };
 
 /// Predicate `n`.
@@ -57,7 +58,9 @@ pub(super) fn b(n: u8) -> Barrier {
 }
 
 /// [`Instruction::SIZE`] as a `u32`.
-pub(super) const SIZE: u32 = Instruction::SIZE as u32;
+pub(super) fn size() -> u32 {
+    u32::try_from(Instruction::SIZE).expect("16 bytes")
+}
 
 /// An instruction that is pure: a `MOV` of an immediate.
 pub(super) fn pure(dst: u8) -> Instr {
@@ -155,14 +158,14 @@ pub(super) struct Program {
 
 /// The offset from instruction `from`'s end to instruction `to`.
 pub(super) fn offset(from: u32, to: u32) -> BranchOffset {
-    let words = (i64::from(to) - i64::from(from) - 1) * i64::from(SIZE)
-        / BranchOffset::WORD_BYTES;
+    let words =
+        (i64::from(to) - i64::from(from) - 1) * i64::from(size()) / BranchOffset::WORD_BYTES;
     BranchOffset::from_words(words)
 }
 
 /// The offset from instruction `from`'s end back to instruction 0.
 pub(super) fn to_start(from: u32) -> BranchOffset {
-    BranchOffset::from_words(-(i64::from(from) + 1) * i64::from(SIZE) / BranchOffset::WORD_BYTES)
+    BranchOffset::from_words(-(i64::from(from) + 1) * i64::from(size()) / BranchOffset::WORD_BYTES)
 }
 
 impl Program {
@@ -181,7 +184,9 @@ impl Program {
     }
 
     pub(super) fn op(&mut self, instr: Instr) -> &mut Self {
-        self.item(Item::Word(assemble(&instr).expect("an encodable instruction")))
+        self.item(Item::Word(
+            assemble(&instr).expect("an encodable instruction"),
+        ))
     }
 
     pub(super) fn word(&mut self, word: Instruction) -> &mut Self {
@@ -190,7 +195,10 @@ impl Program {
 
     pub(super) fn label(&mut self, name: &'static str) -> &mut Self {
         let here = self.here();
-        assert!(self.labels.insert(name, here).is_none(), "label {name} twice");
+        assert!(
+            self.labels.insert(name, here).is_none(),
+            "label {name} twice"
+        );
         self
     }
 
@@ -259,7 +267,7 @@ impl Program {
             },
             Item::Link { dst } => Instr::new(Op::Mov(OpMov {
                 dst: r(dst),
-                src: MovSrc::Imm((index + 2) * SIZE),
+                src: MovSrc::Imm((index + 2) * size()),
                 quad_lanes: OpMov::ALL_LANES,
             })),
             Item::Ret { guard, reg } => Instr {

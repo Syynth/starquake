@@ -1,6 +1,8 @@
 //! Inlining: recursion through other functions, and the depth and size limits at their edges.
 
-use super::super::{BarrierModel, BranchTables, FlowError, MAX_FLOW_BLOCKS, MAX_INLINE_DEPTH, analyze};
+use super::super::{
+    BarrierModel, BranchTables, FlowError, MAX_FLOW_BLOCKS, MAX_INLINE_DEPTH, analyze,
+};
 use super::{Program, exit, graph, name, p, pure, side_effect};
 use crate::decode::{Instruction, PredSrc};
 

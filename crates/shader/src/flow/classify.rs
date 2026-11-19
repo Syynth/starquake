@@ -5,8 +5,9 @@
 //! e5fb3b97 (GPL-3.0-or-later, Copyright 2026 Eden Emulator Project), `Classify`, `FormOf` and
 //! `BaseOf`. Every opcode the decoder already names is imported from its group (`decode::op`);
 //! the ones it does not name yet (instructions of slices 6c, 6d, 6e and 6i, which have no decode
-//! form so far) are named here with the reference's comment. `tests::classify_matches_the_reference`
-//! pins every row against the reference's literals.
+//! form so far) are named here with the reference's comment.
+//! `tests::classify::classify_matches_the_reference` pins every row against the reference's
+//! literals.
 //!
 //! The one change: the uniform `BRA` (`0x547`) is a branch here. The reference has no row for it
 //! and so treats it as a straight-line instruction that ignores where it branches; flow analysis
@@ -14,15 +15,15 @@
 //! refuses a `0x947` with its `.U` bit set (`flow.cpp`, "native uniform branch").
 
 use crate::decode::{
-    ALD_OPCODE, ALU_FORM, BAR_OPCODE, BRA_OPCODE, BRA_UNIFORM_OPCODE, BREAK_OPCODE, BREV_OPCODE, BRX_OPCODE,
-    BRXU_OPCODE, BSSY_OPCODE, BSYNC_OPCODE, CALL_OPCODE, CS2R_OPCODE, DEPBAR_OPCODE, EXIT_OPCODE,
-    F2F_OPCODE, F2FP_OPCODE, F2I_OPCODE, FADD_OPCODE, FFMA_OPCODE, FLO_OPCODE, FMNMX_OPCODE,
-    FMUL_OPCODE, FRND_OPCODE, FSEL_OPCODE, FSET_OPCODE, FSETP_OPCODE, FSWZADD_OPCODE, I2F_OPCODE,
-    I2FP_OPCODE, IABS_OPCODE, IADD3_OPCODE, IMAD_HI_OPCODE, IMAD_OPCODE, IMAD_WIDE_OPCODE,
-    IMNMX_OPCODE, IPA_OPCODE, ISETP_OPCODE, KILL_OPCODE, LEA_OPCODE, LOP3_OPCODE, MOV_OPCODE,
-    MUFU_OPCODE, NOP_OPCODE, P2R_OPCODE, PLOP3_OPCODE, POPC_OPCODE, PRMT_OPCODE, R2P_OPCODE,
-    RET_OPCODE, S2R_OPCODE, S2UR_OPCODE, SEL_OPCODE, SGXT_OPCODE, SHF_OPCODE, VOTEU_OPCODE,
-    WARPSYNC_OPCODE,
+    ALD_OPCODE, ALU_FORM, BAR_OPCODE, BRA_OPCODE, BRA_UNIFORM_OPCODE, BREAK_OPCODE, BREV_OPCODE,
+    BRX_OPCODE, BRXU_OPCODE, BSSY_OPCODE, BSYNC_OPCODE, CALL_OPCODE, CS2R_OPCODE, DEPBAR_OPCODE,
+    EXIT_OPCODE, F2F_OPCODE, F2FP_OPCODE, F2I_OPCODE, FADD_OPCODE, FFMA_OPCODE, FLO_OPCODE,
+    FMNMX_OPCODE, FMUL_OPCODE, FRND_OPCODE, FSEL_OPCODE, FSET_OPCODE, FSETP_OPCODE, FSWZADD_OPCODE,
+    I2F_OPCODE, I2FP_OPCODE, IABS_OPCODE, IADD3_OPCODE, IMAD_HI_OPCODE, IMAD_OPCODE,
+    IMAD_WIDE_OPCODE, IMNMX_OPCODE, IPA_OPCODE, ISETP_OPCODE, KILL_OPCODE, LEA_OPCODE, LOP3_OPCODE,
+    MOV_OPCODE, MUFU_OPCODE, NOP_OPCODE, P2R_OPCODE, PLOP3_OPCODE, POPC_OPCODE, PRMT_OPCODE,
+    R2P_OPCODE, RET_OPCODE, S2R_OPCODE, S2UR_OPCODE, SEL_OPCODE, SGXT_OPCODE, SHF_OPCODE,
+    VOTEU_OPCODE, WARPSYNC_OPCODE,
 };
 
 /// The operand form of a register source (`classify.h`: "1 reg").
@@ -193,9 +194,10 @@ pub(crate) const fn classify(opcode: u16) -> OpInfo {
         | SEL_OPCODE | FSEL_OPCODE | FSETP_OPCODE | FSET_OPCODE | HMNMX2_BASE | ISETP_OPCODE
         | IADD3_OPCODE | LOP3_OPCODE | SHF_OPCODE | LEA_OPCODE | IMNMX_OPCODE | PRMT_OPCODE
         | HADD2_BASE | HFMA2_BASE | HMUL2_BASE | IMAD_OPCODE | IMAD_HI_OPCODE
-        | IMAD_WIDE_OPCODE | IABS_OPCODE | FLO_OPCODE | POPC_OPCODE | SGXT_OPCODE
-        | HSETP2_BASE | F2FP_OPCODE | F2I_OPCODE | I2F_OPCODE | I2FP_OPCODE | FRND_OPCODE
-        | F2F_OPCODE => OpInfo::PURE,
+        | IMAD_WIDE_OPCODE | IABS_OPCODE | FLO_OPCODE | POPC_OPCODE | SGXT_OPCODE | HSETP2_BASE
+        | F2FP_OPCODE | F2I_OPCODE | I2F_OPCODE | I2FP_OPCODE | FRND_OPCODE | F2F_OPCODE => {
+            OpInfo::PURE
+        }
         _ => OpInfo::PLAIN,
     }
 }

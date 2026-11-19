@@ -71,7 +71,9 @@ impl FlowGraph {
         for (source, flow) in sources.iter().zip(&self.blocks) {
             let mut builder = Builder::new(&mut function, source.block);
             match &flow.end {
-                BlockEnd::Jump(target) => builder.terminate(Terminator::Jump(ir_block(*target)?))?,
+                BlockEnd::Jump(target) => {
+                    builder.terminate(Terminator::Jump(ir_block(*target)?))?;
+                }
                 BlockEnd::Exit => builder.terminate(Terminator::Return)?,
                 BlockEnd::Branch {
                     cond,

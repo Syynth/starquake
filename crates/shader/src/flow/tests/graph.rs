@@ -3,8 +3,8 @@
 
 use super::super::{BranchTables, FlowGraph, flow_graph};
 use super::{
-    Item, NEVER, Program, SIZE, block, branch, bsync, exit, exit_if, graph, indirect, jump,
-    kill, not_p, offset, p, pure, r, side_effect, tested,
+    Item, NEVER, Program, block, branch, bsync, exit, exit_if, graph, indirect, jump, kill, not_p,
+    offset, p, pure, r, side_effect, size, tested,
 };
 use crate::asm::assemble;
 use crate::decode::{BrxSrc, Instr, Op, OpCall, PredSrc};
@@ -104,7 +104,11 @@ fn a_kill_gets_its_own_block() {
     let code = Program::new().op(kill(PredSrc::TRUE)).op(exit()).build();
     assert_eq!(
         checked(&code).blocks(),
-        &[block(0..0, jump(2)), block(1..2, Exit), tested(0..1, jump(1))]
+        &[
+            block(0..0, jump(2)),
+            block(1..2, Exit),
+            tested(0..1, jump(1))
+        ]
     );
 }
 
@@ -220,11 +224,22 @@ fn a_jump_table_branches_to_each_target() {
     let mut tables = BranchTables::new(base);
     tables.insert(1, vec![3, 2]);
     let graph = flow_graph(&code, &tables).expect("accepted");
-    graph.build_ir().expect("IR").function.verify().expect("verified");
+    graph
+        .build_ir()
+        .expect("IR")
+        .function
+        .verify()
+        .expect("verified");
     assert_eq!(
         graph.blocks(),
         &[
-            block(0..2, indirect(BrxSrc::Reg(r(2)), &[(base + 2 * SIZE, 1), (base + 3 * SIZE, 2)])),
+            block(
+                0..2,
+                indirect(
+                    BrxSrc::Reg(r(2)),
+                    &[(base + 2 * size(), 1), (base + 3 * size(), 2)]
+                )
+            ),
             block(2..3, Exit),
             block(3..4, Exit),
         ]

@@ -197,8 +197,7 @@ pub fn find_jump_tables(code: &[Instruction]) -> Vec<JumpTable> {
             .ok()
             .and_then(|index| tracked_brx(word, index))
         {
-            if let Some(table) = track(code, &before, last_load.get(src).copied().flatten(), slot)
-            {
+            if let Some(table) = track(code, &before, last_load.get(src).copied().flatten(), slot) {
                 tables.push(table);
             }
         } else if is_table_load(word) {

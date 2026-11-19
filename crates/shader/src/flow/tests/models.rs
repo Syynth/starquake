@@ -9,8 +9,7 @@ use super::super::{BarrierModel, BranchTables, analyze, flow_graph};
 use super::{bsync, exit, exit_if, offset, p, pure, side_effect, to_start};
 use crate::asm::assemble;
 use crate::decode::{
-    BraCond, BrxSrc, Instr, Instruction, Op, OpBSSy, OpBra, OpBreak, OpBrx,
-    OpCall, OpRet, PredSrc,
+    BraCond, BrxSrc, Instr, Instruction, Op, OpBSSy, OpBra, OpBreak, OpBrx, OpCall, OpRet, PredSrc,
 };
 use crate::testing::{any_form_word, config};
 
@@ -260,11 +259,13 @@ fn any_word() -> impl Strategy<Value = Word> {
         (any_pred(), -8_i8..8).prop_map(|(g, d)| Word::Call(g, d)),
         (any_pred(), 8_u8..12).prop_map(|(g, r)| Word::Ret(g, r)),
         (0_u8..4).prop_map(Word::Brx),
-        (8_u8..12, 0_u32..64).prop_map(|(d, v)| Word::Fixed(Instr::new(Op::Mov(crate::decode::OpMov {
-            dst: super::r(d),
-            src: crate::decode::MovSrc::Imm(v * 16),
-            quad_lanes: crate::decode::OpMov::ALL_LANES,
-        })))),
+        (8_u8..12, 0_u32..64).prop_map(|(d, v)| Word::Fixed(Instr::new(Op::Mov(
+            crate::decode::OpMov {
+                dst: super::r(d),
+                src: crate::decode::MovSrc::Imm(v * 16),
+                quad_lanes: crate::decode::OpMov::ALL_LANES,
+            }
+        )))),
         any_pred().prop_map(|g| Word::Fixed(exit_if(g, PredSrc::TRUE))),
         Just(Word::Fixed(exit())),
         any_pred().prop_map(|g| Word::Any(side_effect(g))),
