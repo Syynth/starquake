@@ -25,9 +25,9 @@ use crate::shader::{
     InterfaceVariable, Interpolation, ResourceBinding, ResourceKind, ScalarKind, ShaderInterface,
     ShaderRequirements, ShaderStage,
 };
-use std::num::NonZeroU32;
 use proptest::prelude::*;
 use proptest::test_runner::{Config, RngSeed};
+use std::num::NonZeroU32;
 
 /// One generated step: a kind and the numbers its record is made from.
 #[derive(Clone, Debug)]
@@ -248,9 +248,7 @@ fn kept(s: &Step, made: &mut Kept) -> Record {
                 resources: vec![ResourceBinding {
                     group: s.c,
                     binding: s.b,
-                    kind: ResourceKind::Sampler {
-                        comparison: s.made,
-                    },
+                    kind: ResourceKind::Sampler { comparison: s.made },
                     // `None` when `a % 64` is zero; the golden file holds both forms.
                     count: NonZeroU32::new(u32::try_from(s.a % 64).expect("small")),
                 }],
@@ -261,9 +259,7 @@ fn kept(s: &Step, made: &mut Kept) -> Record {
                     interpolation: Interpolation::Perspective,
                 }],
                 outputs: Vec::new(),
-                requirements: ShaderRequirements {
-                    subgroup: !s.made,
-                },
+                requirements: ShaderRequirements { subgroup: !s.made },
             },
             code: match (made.sources, s.a % 4) {
                 (n, 0) if n > 0 => ShaderCode::Origin {

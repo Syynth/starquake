@@ -345,21 +345,24 @@ fn golden_shaders() -> Vec<Record> {
             stage: ShaderStage::Geometry,
             entry: "vs".to_owned(),
             interface: ShaderInterface {
-                resources: vec![ResourceBinding {
-                    group: 25,
-                    binding: 26,
-                    kind: ResourceKind::SampledTexture {
-                        dimension: ViewDimension::D2Array,
-                        sample: SampleKind::Float { filterable: true },
-                        multisampled: true,
+                resources: vec![
+                    ResourceBinding {
+                        group: 25,
+                        binding: 26,
+                        kind: ResourceKind::SampledTexture {
+                            dimension: ViewDimension::D2Array,
+                            sample: SampleKind::Float { filterable: true },
+                            multisampled: true,
+                        },
+                        count: NonZeroU32::new(0x4E),
                     },
-                    count: NonZeroU32::new(0x4E),
-                }, ResourceBinding {
-                    group: 0x4F,
-                    binding: 0x50,
-                    kind: ResourceKind::Sampler { comparison: true },
-                    count: None,
-                }],
+                    ResourceBinding {
+                        group: 0x4F,
+                        binding: 0x50,
+                        kind: ResourceKind::Sampler { comparison: true },
+                        count: None,
+                    },
+                ],
                 inputs: vec![InterfaceVariable {
                     location: 27,
                     scalar: ScalarKind::Uint,

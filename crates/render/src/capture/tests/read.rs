@@ -345,12 +345,15 @@ fn a_zero_binding_array_count_does_not_decode() {
         )
     };
     let records = read(&file(&[&shader(1)])).expect("a count of one reads");
-    let Record::CreateShader(made) = &records[1] else {
-        panic!("not a shader: {:?}", records[1]);
+    let count = match &records[1] {
+        Record::CreateShader(made) => made.interface.resources.first().map(|r| r.count),
+        _ => None,
     };
     assert_eq!(
-        made.interface.resources[0].count,
-        std::num::NonZeroU32::new(1)
+        count,
+        Some(std::num::NonZeroU32::new(1)),
+        "{:?}",
+        records[1]
     );
     assert_eq!(
         read(&file(&[&shader(0)])),

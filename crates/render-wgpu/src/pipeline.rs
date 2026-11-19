@@ -61,9 +61,11 @@
 //! `ShaderInterface`, which carries the shader's requirements and each binding's array count, so
 //! the backend reads neither from the naga module (render-backend, "Shader emission"; decided by
 //! the owner, 2026-11-19, ruling 20). The module scan ([`scan`]) stays as a cross-check, run at
-//! step 5 by [`agreement`], because a wrong interface would otherwise reach wgpu (which refuses
-//! a layout whose array count is not the module's, with a message about wgpu's internals) or, for
-//! subgroups, skip the size check below on a device that cannot promise 32. For each interface
+//! step 5 by [`agreement`], because a wrong interface would otherwise pass unseen: wgpu-core
+//! 30.0.2 does not compare a binding array's size with its layout entry's `count`
+//! (`Interface::new` in `src/validation.rs` keeps only the array's base type), so a wrong count
+//! would reach the host driver, and an interface that leaves out subgroups would skip the size
+//! check below on a device that cannot promise 32. For each interface
 //! row whose group and binding the module binds, in table order, the module's binding-array size
 //! must be the row's count: a module array whose size is not a constant is refused with
 //! [`layout::UNSIZED_BINDING_ARRAY`] (an interface cannot describe one), and any other difference
@@ -78,7 +80,7 @@
 //!   operation alone, say, which the shader crate's flag also covers: it mirrors naga's
 //!   `Capabilities::SUBGROUP`) is honoured as declared. The backend is then stricter than the
 //!   scan alone was: such a pipeline is refused where the size of 32 is not met
-//!   (`tests::the_interface_and_module_must_agree`).
+//!   (`tests::the_interface_must_declare_the_subgroups_its_module_uses`).
 //! - **A module binding the interface does not list.** As before this slice, wgpu refuses the
 //!   pipeline's layout for it when it builds.
 //!
@@ -87,9 +89,8 @@
 //! #434 says to keep "the naga scan only as a cross-check in tests", while also asking that R6
 //! refuse "a pipeline whose interface and module disagree, with the exact error". Here layouts
 //! and requirements are built from the interface only, and the scan still reads both facts from
-//! the module at shader creation to run the cross-check on every pipeline, in production too:
-//! without it, an interface that leaves out `subgroup` would skip [`SUBGROUP_SIZE`] on a device
-//! that cannot promise 32. The alternative is to run the cross-check in tests only (or in debug
+//! the module at shader creation to run the cross-check on every pipeline, in production too,
+//! for the two reasons above. The alternative is to run the cross-check in tests only (or in debug
 //! builds) and trust the GPU crate's conversion.
 //!
 //! **Requirements.** A shader whose interface requires subgroups (the cross-check above holds

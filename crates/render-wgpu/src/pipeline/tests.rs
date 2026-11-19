@@ -1789,94 +1789,117 @@ fn requirements_come_after_the_ids_and_before_the_layout() {
     });
 }
 
-/// The cross-check of each interface against its module (module docs, "The interface and the
-/// module"), with no GPU: one case per rule, each refusal with its exact error, the accepted
-/// side of each beside it, and the two faults of one shader at once (the rows first).
+/// The cross-check of a fragment shader's `interface` against its module `source` (module docs,
+/// "The interface and the module"), with no GPU.
+fn agree(source: &str, interface: ShaderInterface) -> Result<(), RenderError> {
+    let rec = ShaderRec::new(shader_desc(
+        ShaderStage::Fragment,
+        "main",
+        wgsl(source),
+        interface,
+    ))
+    .expect("the shader is accepted");
+    check_interfaces([&rec])
+}
+
+/// [`BINDING_ARRAY`]'s rows, the texture array given a count of `n`.
+fn arrayed(n: u32) -> ShaderInterface {
+    let mut interface = rows(&[(0, texture(true)), (1, SAMPLER)]);
+    interface.resources[0].count = NonZeroU32::new(n);
+    interface
+}
+
+/// Binds a binding array whose size is not a constant at (0, 0).
+const RUNTIME_SIZED: &str = "
+    enable wgpu_binding_array;
+    struct B { d: array<u32> }
+    @group(0) @binding(0) var<storage> bufs: binding_array<B>;
+    @fragment fn main() -> @location(0) vec4<f32> {
+        return vec4(f32(arrayLength(&bufs[0].d)));
+    }";
+
+const READ_STORAGE: ResourceKind = ResourceKind::StorageBuffer { writable: false };
+
+/// Each row's count against the module's, with the exact error, the edge and both sides of it.
 #[test]
-fn the_interface_and_module_must_agree() {
-    let ok = Ok(());
-    let invalid = |m| Err(RenderError::Invalid(m));
-    let check = |source: &str, interface: ShaderInterface| {
-        let rec = ShaderRec::new(shader_desc(
-            ShaderStage::Fragment,
-            "main",
-            wgsl(source),
-            interface,
-        ))
-        .expect("the shader is accepted");
-        check_interfaces([&rec])
-    };
-    let arrayed = |n| {
-        let mut interface = rows(&[(0, texture(true)), (1, SAMPLER)]);
-        interface.resources[0].count = NonZeroU32::new(n);
-        interface
-    };
+fn the_interface_and_module_must_agree_on_array_counts() {
+    let mismatch = Err(RenderError::Invalid(ARRAY_COUNT_MISMATCH));
     // The module's array of 4 against the interface's counts: 4 (the edge), 3 and 5 on either
     // side, and a lone resource.
-    assert_eq!(check(BINDING_ARRAY, arrayed(4)), ok);
-    assert_eq!(check(BINDING_ARRAY, arrayed(3)), invalid(ARRAY_COUNT_MISMATCH));
-    assert_eq!(check(BINDING_ARRAY, arrayed(5)), invalid(ARRAY_COUNT_MISMATCH));
+    assert_eq!(agree(BINDING_ARRAY, arrayed(4)), Ok(()));
+    assert_eq!(agree(BINDING_ARRAY, arrayed(3)), mismatch);
+    assert_eq!(agree(BINDING_ARRAY, arrayed(5)), mismatch);
     assert_eq!(
-        check(BINDING_ARRAY, rows(&[(0, texture(true)), (1, SAMPLER)])),
-        invalid(ARRAY_COUNT_MISMATCH),
+        agree(BINDING_ARRAY, rows(&[(0, texture(true)), (1, SAMPLER)])),
+        mismatch,
         "an array the interface calls one resource"
     );
     // A lone resource the interface calls an array.
     let mut lone = rows(&[(0, UNIFORM), (1, texture(true)), (2, SAMPLER)]);
-    assert_eq!(check(FRAGMENT, lone.clone()), ok);
+    assert_eq!(agree(FRAGMENT, lone.clone()), Ok(()));
     lone.resources[1].count = NonZeroU32::new(2);
-    assert_eq!(check(FRAGMENT, lone), invalid(ARRAY_COUNT_MISMATCH));
+    assert_eq!(agree(FRAGMENT, lone), mismatch);
     // A row the module does not bind is not compared, count or none.
     let mut extra = rows(&[(0, UNIFORM), (1, texture(true)), (2, SAMPLER), (3, SAMPLER)]);
     extra.resources[3].count = NonZeroU32::new(2);
-    assert_eq!(check(FRAGMENT, extra), ok);
-    // A binding array whose size is not a constant: the interface cannot describe it.
-    let runtime_sized = "
-        enable wgpu_binding_array;
-        struct B { d: array<u32> }
-        @group(0) @binding(0) var<storage> bufs: binding_array<B>;
-        @fragment fn main() -> @location(0) vec4<f32> {
-            return vec4(f32(arrayLength(&bufs[0].d)));
-        }";
-    let storage = ResourceKind::StorageBuffer { writable: false };
+    assert_eq!(agree(FRAGMENT, extra), Ok(()));
+    // A binding array whose size is not a constant: no interface can describe it.
     for count in [None, NonZeroU32::new(1)] {
-        let mut i = rows(&[(0, storage)]);
+        let mut i = rows(&[(0, READ_STORAGE)]);
         i.resources[0].count = count;
         assert_eq!(
-            check(runtime_sized, i),
+            agree(RUNTIME_SIZED, i),
             Err(RenderError::Unsupported(UNSIZED_BINDING_ARRAY)),
             "{count:?}"
         );
     }
-    // Subgroups: a module that uses them must declare them; one that does not may.
-    assert_eq!(check(SUBGROUP_FRAGMENT, storage_out()), invalid(UNDECLARED_SUBGROUPS));
-    assert_eq!(check(SUBGROUP_FRAGMENT, subgroups(storage_out())), ok);
+}
+
+/// A module that uses subgroups must declare them; one that does not may, and a quad operation
+/// alone is no subgroup use to the scan, while a declared requirement is honoured as declared
+/// (module docs, "The interface and the module").
+#[test]
+fn the_interface_must_declare_the_subgroups_its_module_uses() {
+    assert_eq!(
+        agree(SUBGROUP_FRAGMENT, storage_out()),
+        Err(RenderError::Invalid(UNDECLARED_SUBGROUPS))
+    );
+    assert_eq!(agree(SUBGROUP_FRAGMENT, subgroups(storage_out())), Ok(()));
     let plain = rows(&[(0, UNIFORM), (1, texture(true)), (2, SAMPLER)]);
-    assert_eq!(check(FRAGMENT, subgroups(plain.clone())), ok);
-    assert_eq!(check(FRAGMENT, plain), ok);
-    // A quad operation alone is no subgroup use to the scan, so an interface without the
-    // requirement agrees; one with it is honoured as declared (module docs).
+    assert_eq!(agree(FRAGMENT, subgroups(plain.clone())), Ok(()));
+    assert_eq!(agree(FRAGMENT, plain), Ok(()));
     let quad = "
         @group(0) @binding(0) var<storage, read_write> out: array<u32>;
         @compute @workgroup_size(32) fn main(@builtin(local_invocation_index) l: u32) {
             out[l] = quadBroadcast(l, 1u);
         }";
     let quad_rec = |interface| {
-        ShaderRec::new(shader_desc(ShaderStage::Compute, "main", wgsl(quad), interface))
-            .expect("accepted")
+        ShaderRec::new(shader_desc(
+            ShaderStage::Compute,
+            "main",
+            wgsl(quad),
+            interface,
+        ))
+        .expect("accepted")
     };
     let undeclared = quad_rec(storage_out());
     let declared = quad_rec(subgroups(storage_out()));
-    assert_eq!(check_interfaces([&undeclared]), ok);
-    assert_eq!(check_interfaces([&declared]), ok);
+    assert_eq!(check_interfaces([&undeclared]), Ok(()));
+    assert_eq!(check_interfaces([&declared]), Ok(()));
     let unmet = verdict(false, true);
-    assert_eq!(check_requirements([&undeclared], unmet), ok);
+    assert_eq!(check_requirements([&undeclared], unmet), Ok(()));
     assert_eq!(
         check_requirements([&declared], unmet),
         Err(RenderError::Unsupported(SUBGROUP_SIZE)),
         "the declared requirement is honoured"
     );
-    // Both faults in one shader: a row's count, then subgroups.
+}
+
+/// Two faults in one shader: the rows come before the subgroups, and the rows are checked in
+/// table order (the first fault found is reported, either way round).
+#[test]
+fn a_shaders_rows_are_checked_in_table_order_before_its_subgroups() {
+    let mismatch = Err(RenderError::Invalid(ARRAY_COUNT_MISMATCH));
     let subgroup_array = "
         enable wgpu_binding_array;
         @group(0) @binding(0) var textures: binding_array<texture_2d<f32>, 4>;
@@ -1885,17 +1908,17 @@ fn the_interface_and_module_must_agree() {
             return textureSample(textures[lane % 4u], s, vec2(0.5));
         }";
     assert_eq!(
-        check(subgroup_array, rows(&[(0, texture(true)), (1, SAMPLER)])),
-        invalid(ARRAY_COUNT_MISMATCH),
+        agree(subgroup_array, rows(&[(0, texture(true)), (1, SAMPLER)])),
+        mismatch,
         "both faults: the rows first"
     );
     assert_eq!(
-        check(subgroup_array, arrayed(4)),
-        invalid(UNDECLARED_SUBGROUPS),
+        agree(subgroup_array, arrayed(4)),
+        Err(RenderError::Invalid(UNDECLARED_SUBGROUPS)),
         "the subgroups alone"
     );
-    assert_eq!(check(subgroup_array, subgroups(arrayed(4))), ok);
-    // Rows in table order: two mismatched rows, the unsized one first in the table, then last.
+    assert_eq!(agree(subgroup_array, subgroups(arrayed(4))), Ok(()));
+    // Two rows that disagree: the unsized one first in the table, then last.
     let two_faults = "
         enable wgpu_binding_array;
         struct B { d: array<u32> }
@@ -1904,14 +1927,14 @@ fn the_interface_and_module_must_agree() {
         @fragment fn main() -> @location(0) vec4<f32> {
             return vec4(f32(arrayLength(&bufs[0].d))) + textureLoad(textures[0], vec2(0), 0);
         }";
-    let forward = rows(&[(0, storage), (1, texture(true))]);
+    let forward = rows(&[(0, READ_STORAGE), (1, texture(true))]);
     let mut backward = forward.clone();
     backward.resources.reverse();
     assert_eq!(
-        check(two_faults, forward),
+        agree(two_faults, forward),
         Err(RenderError::Unsupported(UNSIZED_BINDING_ARRAY))
     );
-    assert_eq!(check(two_faults, backward), invalid(ARRAY_COUNT_MISMATCH));
+    assert_eq!(agree(two_faults, backward), mismatch);
 }
 
 /// Shaders are cross-checked in the order given (stage order for a pipeline): of two shaders
