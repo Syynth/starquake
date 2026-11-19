@@ -24,7 +24,7 @@ use crate::decode::memory::{
 use crate::decode::{
     AtomDst, AtomOp, CBUF_INDEX, CBUF_OFFSET, CBuf, DST, LdcMode, MemAddr, MemSpace, Named, OpAtom,
     OpAtomsPopc, OpCCtl, OpErrBar, OpLd, OpLdGsts, OpLdc, OpLdgDepBar, OpMemBar, OpSt, Pred,
-    PredSrc, UniformReg,
+    PredSrc,
 };
 
 /// Refuses `what` unless `absent`: the chosen form has no bits for it.

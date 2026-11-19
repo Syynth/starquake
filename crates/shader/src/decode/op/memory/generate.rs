@@ -218,14 +218,14 @@ fn atoms() -> BoxedStrategy<Op> {
         any_global(),
         Just(Pred::PT),
     );
-    let atomg = (
+    let global_atom = (
         reg_dst(),
         prop_oneof![any_addr(GLOBAL), any_addr(ATOMG_UNIFORM)],
         any_atom_op(false),
         any_global(),
         any_pred(),
     );
-    let atomg_cas = (
+    let global_cas = (
         reg_dst(),
         any_addr(GLOBAL),
         any_atom_op(true),
@@ -241,18 +241,12 @@ fn atoms() -> BoxedStrategy<Op> {
             Just(Pred::PT),
         )
     };
-    let atoms = shared(
+    let shared_atom = shared(
         prop_oneof![any_addr(AddrLayout::PLAIN), any_addr(ST_UNIFORM_PLAIN)].boxed(),
         false,
     );
-    let atoms_cas = shared(any_addr(AddrLayout::PLAIN), true);
-    let forms = prop_oneof![
-        red.prop_map(|(dst, addr, op, space, pred_dst)| (dst, addr, op, space, pred_dst)),
-        atomg,
-        atomg_cas,
-        atoms,
-        atoms_cas,
-    ];
+    let shared_cas = shared(any_addr(AddrLayout::PLAIN), true);
+    let forms = prop_oneof![red, global_atom, global_cas, shared_atom, shared_cas,];
     (forms, any_gpr(), select(AtomType::ALL))
         .prop_map(|((dst, addr, op, space, pred_dst), data, atom_type)| {
             Op::Atom(OpAtom {

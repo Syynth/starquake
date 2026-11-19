@@ -128,6 +128,7 @@
 #[cfg(test)]
 mod generate;
 
+use std::cmp::Ordering;
 use std::fmt::{self, Display, Formatter};
 
 use super::super::DecodeError;
@@ -535,12 +536,10 @@ fn stride(reader: &mut Reader) -> OffsetStride {
 /// Writes `value` as a signed hexadecimal offset after a `+`: `+0x12`, `+-0x1` (NAK's
 /// `test_ld_st_atom`), nothing for 0.
 fn offset_text(f: &mut Formatter<'_>, value: i64) -> fmt::Result {
-    if value == 0 {
-        Ok(())
-    } else if value < 0 {
-        write!(f, "+-{:#x}", value.unsigned_abs())
-    } else {
-        write!(f, "+{value:#x}")
+    match value.cmp(&0) {
+        Ordering::Equal => Ok(()),
+        Ordering::Less => write!(f, "+-{:#x}", value.unsigned_abs()),
+        Ordering::Greater => write!(f, "+{value:#x}"),
     }
 }
 
