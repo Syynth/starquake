@@ -941,6 +941,118 @@ fn state_methods_are_unique_and_engine_methods_in_the_file() {
     }
 }
 
+/// Mesa's `METHOD_ARRAY_SIZES` (`mesa-nouveau/src/nouveau/headers/class_parser.py`), as written
+/// there: a trailing `*` matches any rest of the name, and the first match wins
+/// (`method_array_size`, `glob_match`).
+const MESA_ARRAY_SIZES: &[(&str, u32)] = &[
+    ("BIND_GROUP_CONSTANT_BUFFER", 16),
+    ("CALL_MME_DATA", 256),
+    ("CALL_MME_MACRO", 256),
+    ("LOAD_CONSTANT_BUFFER", 16),
+    ("LOAD_INLINE_QMD_DATA", 64),
+    ("SET_ANTI_ALIAS_SAMPLE_POSITIONS", 4),
+    ("SET_BLEND", 8),
+    ("SET_BLEND_PER_TARGET_*", 8),
+    ("SET_COLOR_TARGET_*", 8),
+    ("SET_COLOR_COMPRESSION", 8),
+    ("SET_COLOR_CLEAR_VALUE", 4),
+    ("SET_CT_WRITE", 8),
+    ("SET_MME_SHADOW_SCRATCH", 256),
+    ("SET_MULTI_VIEW_RENDER_TARGET_ARRAY_INDEX_OFFSET", 4),
+    ("SET_PIPELINE_*", 6),
+    ("SET_ROOT_TABLE_VISIBILITY", 8),
+    ("SET_SCG_COMPUTE_SCHEDULING_PARAMETERS", 16),
+    ("SET_SCG_GRAPHICS_SCHEDULING_PARAMETERS", 16),
+    ("SET_SCISSOR_*", 16),
+    ("SET_SHADER_PERFORMANCE_SNAPSHOT_COUNTER_VALUE*", 8),
+    ("SET_SHADER_PERFORMANCE_COUNTER_VALUE*", 8),
+    ("SET_SHADER_PERFORMANCE_COUNTER_EVENT", 8),
+    ("SET_SHADER_PERFORMANCE_COUNTER_CONTROL_A", 8),
+    ("SET_SHADER_PERFORMANCE_COUNTER_CONTROL_B", 8),
+    ("SET_SHADING_RATE_INDEX_SURFACE_*", 1),
+    ("SET_SPARE_MULTI_VIEW_RENDER_TARGET_ARRAY_INDEX_OFFSET", 4),
+    ("SET_STREAM_OUT_BUFFER_*", 4),
+    ("SET_STREAM_OUT_CONTROL_*", 4),
+    ("SET_VARIABLE_PIXEL_RATE_SAMPLE_ORDER", 13),
+    ("SET_VARIABLE_PIXEL_RATE_SHADING_CONTROL*", 16),
+    ("SET_VARIABLE_PIXEL_RATE_SHADING_INDEX_TO_RATE*", 16),
+    ("SET_VIEWPORT_*", 16),
+    ("SET_VERTEX_ATTRIBUTE_*", 16),
+    ("SET_VERTEX_STREAM_*", 16),
+    ("SET_WINDOW_CLIP_*", 8),
+    ("SET_CLIP_ID_EXTENT_*", 4),
+];
+
+fn mesa_array_size(name: &str) -> Option<u32> {
+    MESA_ARRAY_SIZES.iter().find_map(|&(glob, size)| {
+        let matches = match glob.strip_suffix('*') {
+            Some(prefix) => name.starts_with(prefix),
+            None => name == glob,
+        };
+        matches.then_some(size)
+    })
+}
+
+/// The rule in the module docs of `state_3d`, applied to every method of `clc797.h`, gives
+/// exactly the table, with Mesa's lengths.
+#[test]
+fn state_table_is_the_documented_rule() {
+    const PLAIN: &[&str] = &[
+        "LOAD_CONSTANT_BUFFER_OFFSET",
+        "LOAD_MME_START_ADDRESS_RAM_POINTER",
+        "LINE_LENGTH_IN",
+        "LINE_COUNT",
+        "OFFSET_OUT_UPPER",
+        "OFFSET_OUT",
+        "PITCH_OUT",
+    ];
+    const EXCLUDED: &[&str] = &[
+        "SET_MME_SHADOW_RAM_CONTROL",
+        "SET_VERTEX_ARRAY_START",
+        "SET_INDEX_BUFFER_F",
+        "SET_PRIMITIVE_TOPOLOGY",
+        "SET_REPORT_SEMAPHORE_D",
+        "SET_RENDER_ENABLE_C",
+        "SET_ROOT_TABLE_SELECTOR",
+        "SET_OBJECT",
+        "SET_INSTRUMENTATION_METHOD_HEADER",
+        "SET_INSTRUMENTATION_METHOD_DATA",
+        "SET_MME_SWITCH_STATE",
+    ];
+    const EXCLUDED_PREFIXES: &[&str] = &[
+        "SET_FALCON",
+        "SET_RESERVED_SW_METHOD",
+        "SET_SPARE0",
+        "SET_SPARE_NOOP",
+        "SET_I2M_SPARE_NOOP",
+    ];
+    let mut expected = Vec::new();
+    for method in clc797::HEADER.methods {
+        let name = method.name;
+        let candidate = name.starts_with("SET_") || PLAIN.contains(&name);
+        let excluded = EXCLUDED.contains(&name)
+            || EXCLUDED_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix));
+        if !candidate || excluded {
+            continue;
+        }
+        let count = match method.strides {
+            [] => Some(1),
+            [_] => mesa_array_size(name),
+            _ => None,
+        };
+        if let Some(count) = count {
+            expected.push((name, count));
+        }
+    }
+    let table: Vec<_> = STATE_3D
+        .iter()
+        .map(|span| (span.method().name, span.count()))
+        .collect();
+    assert_eq!(table, expected);
+}
+
 #[test]
 fn no_state_array_runs_into_another_method() {
     let firsts: BTreeSet<u32> = clc797::HEADER.methods.iter().map(Method::method).collect();
