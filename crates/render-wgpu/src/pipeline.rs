@@ -30,14 +30,16 @@
 //! 3. the device is not lost;
 //! 4. each stage's shader is live and of its stage (`validate::validate_pipeline_stages`,
 //!    `validate::validate_compute_stage`);
-//! 5. the shaders' requirements ([`SUBGROUP_SIZE`], below);
+//! 5. the shaders' requirements: subgroups of 32 ([`SUBGROUP_SIZE`]), then subgroups in a vertex
+//!    shader ([`VERTEX_SUBGROUPS`]), both below;
 //! 6. the layouts ([`layout`]);
 //! 7. for a graphics pipeline, the fixed-function state ([`state`]).
 //!
 //! A compute pipeline has no description to check against `Caps` or fixed-function state, so
 //! steps 2 and 7 do not apply to it. The order is pinned by `tests::pipeline_checks_run_in_order`,
 //! `tests::nothing_is_created_once_the_device_is_lost` (step 3) and
-//! `tests::requirements_come_after_the_ids_and_before_the_layout` (step 5).
+//! `tests::requirements_come_after_the_ids_and_before_the_layout` (step 5, and the order of its two
+//! checks).
 //!
 //! Then the id is allocated, the pipeline's status is `Compiling`, and one job goes to the
 //! compile pool ([`CompilePool`]) before the call returns. wgpu's pipeline creation is
@@ -53,12 +55,36 @@
 //! subgroup to be 32 invocations wide, the guest's warp (shader-pipeline, "What the render
 //! backend (#14) gets": "It honours `requirements` (for example, a subgroup size of 32) or
 //! refuses the pipeline"). wgpu cannot ask for a subgroup size, so a pipeline with such a shader
-//! is refused unless the device has subgroups and reports a subgroup size range of exactly 32 to
-//! 32 ([`subgroups_honoured`]). wgpu's Metal backend reports 4 to 64 on every Mac (wgpu-hal
-//! 30.0.2, `src/metal/mod.rs`), so on the Mac every such pipeline is refused (an owner
-//! question). The other requirements (f16, i64 and the binding-array features) are wgpu's to
-//! check: it validates each module against the device's features, and a module that needs one
-//! the device lacks fails its pipeline.
+//! is refused unless the device has subgroups and either is an Apple GPU or reports a subgroup
+//! size range of exactly 32 to 32 ([`SubgroupSupport`], decided once when the backend opens and
+//! printed in the adapter report). wgpu's Metal backend reports 4 to 64 on every Mac, a
+//! hard-coded "typical" value rather than the device's (wgpu-hal 30.0.2, `src/metal/mod.rs`,
+//! `expose`), while Apple GPUs run 32-wide SIMD groups, so the backend treats the Apple GPU
+//! family as meeting the requirement (render-backend, "What a pipeline is made of"; decided by
+//! the owner, 2026-11-19). The family is read from wgpu's `AdapterInfo`: the Metal backend and a
+//! device name beginning "Apple " ([`apple_gpu_family`]; the name rule is partly a guess, said
+//! there). An Intel or AMD GPU in a Mac, and every adapter outside Metal, keep the range check;
+//! `tests::the_apple_family_meets_subgroup_size_32_and_others_keep_the_range_check` pins each
+//! case, and `tests::on_an_apple_gpu_subgroup_pipelines_are_ready` builds subgroup pipelines on
+//! an Apple GPU. The backend's verdict is computed once, when it opens, from the adapter's
+//! `AdapterInfo` and the device's features ([`SubgroupVerdict`], pinned by
+//! `tests::the_backend_verdict_reads_the_device_features`).
+//!
+//! A vertex shader that uses subgroups (by the same test, [`scan`]) also needs the device's
+//! `wgpu::Features::SUBGROUP_VERTEX`, which `SUBGROUP` does not imply: wgpu-hal 30.0.2's Metal
+//! backend offers `SUBGROUP` (with `SUBGROUP_BARRIER`) where the GPU has SIMD-scoped operations
+//! and never `SUBGROUP_VERTEX` (`src/metal/adapter.rs`, `features`), so such a pipeline would
+//! pass the size check there and then fail its build in wgpu. It is refused up front instead
+//! ([`VERTEX_SUBGROUPS`]), after the size check: a pipeline that fails both is refused with
+//! [`SUBGROUP_SIZE`]. A compute or fragment shader needs only `SUBGROUP`. Pinned by
+//! `tests::vertex_subgroups_need_the_vertex_feature` (the pure rule) and
+//! `tests::a_vertex_subgroup_pipeline_follows_the_device` (on the host's GPU). A vertex shader
+//! whose only subgroup use is one [`scan`] does not count (a quad operation or a subgroup
+//! barrier, which naga allows only in other stages) is left to wgpu.
+//!
+//! The other requirements (f16, i64 and the binding-array features) are wgpu's to check: it
+//! validates each module against the device's features, and a module that needs one the device
+//! lacks fails its pipeline.
 //!
 //! # Draws: wait or skip
 //!
@@ -116,6 +142,9 @@ pub const NO_ENTRY_POINT: &str = "the shader's module has no entry point of its 
 /// A shader that needs subgroups of 32 on a device that cannot promise them.
 pub const SUBGROUP_SIZE: &str =
     "the device cannot promise the subgroup size of 32 a shader of this pipeline needs";
+/// A vertex shader that uses subgroups on a device without subgroups in vertex shaders
+/// (`wgpu::Features::SUBGROUP_VERTEX`; module docs, "Requirements").
+pub const VERTEX_SUBGROUPS: &str = "the device has no subgroup operations in vertex shaders, which this pipeline's vertex shader uses";
 /// A pipeline asked of a backend built without a compile pool.
 pub const NO_COMPILE_POOL: &str =
     "the wgpu backend was built without a compile pool and cannot build pipelines";
@@ -149,12 +178,103 @@ pub const MAX_SHADER_NESTING: usize = 256;
 /// naga 30.0.1 can express": subgroup operations need "a subgroup size of 32").
 pub const GUEST_SUBGROUP_SIZE: u32 = 32;
 
-/// Whether a device with `features` and a subgroup size range of `min` to `max` runs every
-/// subgroup at [`GUEST_SUBGROUP_SIZE`] (module docs, "Requirements").
-pub const fn subgroups_honoured(features: wgpu::Features, min: u32, max: u32) -> bool {
-    features.contains(wgpu::Features::SUBGROUP)
-        && min == GUEST_SUBGROUP_SIZE
-        && max == GUEST_SUBGROUP_SIZE
+/// How the Metal device name of an Apple GPU begins, as wgpu reports it in
+/// `AdapterInfo::name` (module docs, "Requirements"). wgpu-hal 30.0.2's Metal backend sets the
+/// name from `MTLDevice::name` and leaves `vendor`, `device` and `driver` at
+/// `AdapterInfo::new`'s zeros and empty strings (`src/metal/mod.rs`, `expose`; wgpu-types 30.0.2,
+/// `src/adapter.rs`), so the name is the only field that tells an Apple GPU from an Intel or AMD
+/// GPU in a Mac. Measured: "Apple M2" on an M2 Mac. That every Apple GPU's Metal name begins so
+/// ("Apple M1 Max", "Apple A14 GPU") and that no Intel or AMD GPU's does is a guess; reports from
+/// other Apple-silicon and Intel Macs would confirm it.
+pub const APPLE_GPU_NAME_PREFIX: &str = "Apple ";
+
+/// Whether `info` describes an Apple GPU under wgpu's Metal backend: the backend is Metal and the
+/// name begins with [`APPLE_GPU_NAME_PREFIX`] (case and the space included). An Apple GPU reached
+/// through another backend (MoltenVK, a Linux Vulkan driver) is not counted: Vulkan reports the
+/// device's own subgroup size range, and the range check applies to it.
+pub fn apple_gpu_family(info: &wgpu::AdapterInfo) -> bool {
+    info.backend == wgpu::Backend::Metal && info.name.starts_with(APPLE_GPU_NAME_PREFIX)
+}
+
+/// Whether a device meets "subgroup size 32", and why (module docs, "Requirements"). The adapter
+/// report prints it (`crate::AdapterReport`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SubgroupSupport {
+    /// The device lacks `wgpu::Features::SUBGROUP`: not met.
+    NoSubgroups,
+    /// An Apple GPU under Metal ([`apple_gpu_family`]), whose SIMD groups are 32 wide
+    /// (shader-pipeline, "Compute shaders"; decided by the owner, 2026-11-19): met, whatever
+    /// range wgpu reports.
+    AppleFamily,
+    /// The device reports a subgroup size range of exactly [`GUEST_SUBGROUP_SIZE`] to
+    /// [`GUEST_SUBGROUP_SIZE`]: met.
+    Fixed32,
+    /// Any other range: not met, since wgpu cannot ask for a size.
+    Range {
+        /// `AdapterInfo::subgroup_min_size`.
+        min: u32,
+        /// `AdapterInfo::subgroup_max_size`.
+        max: u32,
+    },
+}
+
+impl SubgroupSupport {
+    /// The verdict for an adapter described by `info` whose device has `features`. The checks
+    /// run in this order and the first that decides wins: the subgroup feature, the Apple family,
+    /// then the range.
+    pub fn of(info: &wgpu::AdapterInfo, features: wgpu::Features) -> Self {
+        let (min, max) = (info.subgroup_min_size, info.subgroup_max_size);
+        if !features.contains(wgpu::Features::SUBGROUP) {
+            Self::NoSubgroups
+        } else if apple_gpu_family(info) {
+            Self::AppleFamily
+        } else if min == GUEST_SUBGROUP_SIZE && max == GUEST_SUBGROUP_SIZE {
+            Self::Fixed32
+        } else {
+            Self::Range { min, max }
+        }
+    }
+
+    /// Whether pipelines whose shaders use subgroups are accepted.
+    pub const fn honoured(self) -> bool {
+        matches!(self, Self::AppleFamily | Self::Fixed32)
+    }
+}
+
+impl fmt::Display for SubgroupSupport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoSubgroups => f.write_str("no (the device has no subgroups)"),
+            Self::AppleFamily => f.write_str("yes (Apple GPU family, 32-wide SIMD groups)"),
+            Self::Fixed32 => write!(
+                f,
+                "yes (the reported range is {GUEST_SUBGROUP_SIZE} to {GUEST_SUBGROUP_SIZE})"
+            ),
+            Self::Range { min, max } => write!(f, "no (the reported range is {min} to {max})"),
+        }
+    }
+}
+
+/// What the backend decides about subgroups when it opens (module docs, "Requirements"): whether
+/// the device meets "subgroup size 32", and whether it runs subgroup operations in vertex
+/// shaders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SubgroupVerdict {
+    /// Whether the device meets "subgroup size 32", and why.
+    pub(crate) support: SubgroupSupport,
+    /// Whether the device has `wgpu::Features::SUBGROUP_VERTEX`.
+    pub(crate) vertex: bool,
+}
+
+impl SubgroupVerdict {
+    /// The verdict for an adapter described by `info` whose device has `device_features` (the
+    /// device's, not the adapter's: the backend decides from what it was given).
+    pub(crate) fn of(info: &wgpu::AdapterInfo, device_features: wgpu::Features) -> Self {
+        Self {
+            support: SubgroupSupport::of(info, device_features),
+            vertex: device_features.contains(wgpu::Features::SUBGROUP_VERTEX),
+        }
+    }
 }
 
 /// Why a draw was not drawn.
@@ -594,15 +714,24 @@ impl fmt::Debug for Compile {
     }
 }
 
-/// Refuses `shaders` that need subgroups of 32 when the device cannot promise them.
+/// Refuses `shaders` that need subgroups of 32 when the device cannot promise them
+/// ([`SUBGROUP_SIZE`]), then a vertex shader that uses subgroups when the device has none in
+/// vertex shaders ([`VERTEX_SUBGROUPS`]); module docs, "Requirements".
 pub(crate) fn check_requirements<'a>(
     shaders: impl IntoIterator<Item = &'a ShaderRec>,
-    subgroups: bool,
+    subgroups: SubgroupVerdict,
 ) -> Result<(), RenderError> {
-    if subgroups || !shaders.into_iter().any(ShaderRec::uses_subgroups) {
-        Ok(())
-    } else {
+    let (mut any, mut vertex) = (false, false);
+    for shader in shaders.into_iter().filter(|s| s.uses_subgroups()) {
+        any = true;
+        vertex |= shader.stage == ShaderStage::Vertex;
+    }
+    if any && !subgroups.support.honoured() {
         Err(RenderError::Unsupported(SUBGROUP_SIZE))
+    } else if vertex && !subgroups.vertex {
+        Err(RenderError::Unsupported(VERTEX_SUBGROUPS))
+    } else {
+        Ok(())
     }
 }
 

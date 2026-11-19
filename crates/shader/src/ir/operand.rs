@@ -20,6 +20,16 @@ pub struct Attribute(pub u16);
 
 /// Bytes per attribute word.
 pub const ATTRIBUTE_WORD_BYTES: u32 = 4;
+/// Words per attribute: X, Y, Z and W (`attribute.h`: `PositionX = 28` to `PositionW = 31`;
+/// `GenericAttributeIndex`: `/ 4u`).
+pub const ATTRIBUTE_COMPONENTS: u16 = 4;
+/// The attribute word of the position's X (`attribute.h`: `PositionX = 28`).
+pub const POSITION_X: u16 = 28;
+/// The attribute word of the position's W, its last component (`attribute.h`: `PositionW =
+/// 31`).
+pub const POSITION_W: u16 = POSITION_X + (ATTRIBUTE_COMPONENTS - 1);
+/// The attribute word of generic 0's X (`attribute.h`: `Generic0X = 32`).
+pub const GENERIC_0_X: u16 = 32;
 
 impl Display for Attribute {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
