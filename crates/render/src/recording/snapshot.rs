@@ -401,6 +401,9 @@ pub(super) fn render(log: &[Event]) -> String {
             Event::Target(PresentTarget::Offscreen) => {
                 lines.push("present target offscreen".to_owned());
             }
+            Event::Target(PresentTarget::Window(_)) => {
+                lines.push("present target window".to_owned());
+            }
         }
     }
     let mut out = String::new();

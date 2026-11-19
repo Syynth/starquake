@@ -46,8 +46,9 @@
 //! # Lost device
 //!
 //! When wgpu reports the device lost (or the render thread stops by a panic), the `create_*`
-//! calls for buffers, textures, views and samplers, `submit`, and a `wait` for a value not yet
-//! reached return [`RenderError::DeviceLost`]; a `submit` waiting for room and every `wait`
+//! calls for buffers, textures, views and samplers, `submit`, `set_present_target` (after a
+//! window's surface is made, which a lost device does not stop), and a `wait` for a value not
+//! yet reached return [`RenderError::DeviceLost`]; a `submit` waiting for room and every `wait`
 //! stop waiting; and the wake is called so the back thread looks. The run ends there
 //! (render-backend, "Errors and untrusted input": exit code 2, which `core` maps). Lists still
 //! queued or in flight never complete.
@@ -64,7 +65,17 @@
 //! The backend's results depend on the trait calls, the adapter and the [`WgpuConfig`] only: it
 //! reads no environment variable (wgpu's `from_env` instance options are not used) and no file
 //! (render-backend, "Render capture v2", "What R5 and R6 must do now"). Present feedback carries
-//! host time, which is never guest-visible.
+//! host time, which is never guest-visible; so does whether a frame presented to a window was
+//! shown or dropped, which depends on how far behind the render thread is when it takes the list
+//! (`State::queued_presents`, `crate::present::frame_outcome`) and on what the window answers.
+//!
+//! # Present targets
+//!
+//! `set_present_target` makes a window's surface on the calling thread before anything is
+//! queued (`crate::window`), so a refused target changes nothing; an accepted one is queued
+//! behind the lists already submitted and applies to the lists after it. `submit` adds each
+//! list's presents to `State::queued_presents`, and the render thread takes them off when it
+//! takes the list (or clears them with the queue when the device is lost).
 //!
 //! # What the trait cannot report
 //!
@@ -81,6 +92,7 @@ use crate::convert::{TextureSpec, buffer_usages, sampler_descriptor, view_descri
 use crate::plan::{self, Tables, TextureRec, ViewRec};
 use crate::rules;
 use crate::thread::{self, Create, ListWork, Message};
+use crate::window::{self, Target};
 use starquake_render::validate;
 use starquake_render::{
     Backend, BufferDesc, BufferId, Caps, CommandList, CompletionWake, ComputePipelineDesc,
@@ -106,6 +118,11 @@ pub const SHADERS_NOT_YET: &str =
 /// A pipeline asked for before pipelines exist (slice R6).
 pub const PIPELINES_NOT_YET: &str =
     "the wgpu backend cannot build pipelines yet (pipelines arrive with slice R6)";
+
+/// A present target of a kind this backend does not know. Unreachable while `PresentTarget` has
+/// only the window and offscreen kinds, which this backend takes; the match needs the arm because
+/// the enum is non-exhaustive (a later exported-image kind would reach it).
+const UNKNOWN_TARGET: &str = "the wgpu backend presents to a window or offscreen only";
 
 /// How long [`WgpuBackend::new`] waits for wgpu to find an adapter or open a device. Native
 /// wgpu answers at once; the bound only keeps a broken driver from hanging the caller.
@@ -256,6 +273,9 @@ pub(crate) struct State {
     pub(crate) sink: Option<Arc<dyn FrameSink>>,
     /// Presents of finished lists.
     pub(crate) presents: u64,
+    /// Presents in the lists queued and not yet taken by the render thread, for the frame queue
+    /// (`crate::present::frame_outcome`).
+    pub(crate) queued_presents: u64,
     /// Destroys refused.
     pub(crate) refused_destroys: u64,
     /// The device was lost (or the render thread stopped).
@@ -365,6 +385,10 @@ pub struct WgpuBackend {
     depth_copies: bool,
     config: WgpuConfig,
     report: AdapterReport,
+    /// The instance and adapter the device came from, which a window's surface is made with
+    /// (`crate::window`).
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
 }
@@ -429,6 +453,8 @@ impl WgpuBackend {
             depth_copies: downlevel.contains(wgpu::DownlevelFlags::DEPTH_TEXTURE_AND_BUFFER_COPIES),
             config,
             report,
+            instance,
+            adapter,
             shared,
             thread: Some(thread),
         })
@@ -493,6 +519,19 @@ impl WgpuBackend {
     #[cfg(test)]
     pub(crate) fn scratch_textures(&self) -> u64 {
         self.shared.scratch_textures.load(Ordering::Relaxed)
+    }
+
+    /// Sends shown frames to the live texture `id` as if it were a window's (`crate::window`,
+    /// `Target::Texture`), and returns what the stand-in will count.
+    #[cfg(test)]
+    pub(crate) fn set_test_target(&self, id: TextureId) -> Arc<window::TestWindow> {
+        let counts = Arc::new(window::TestWindow::default());
+        let state = self.shared.state();
+        self.queue(
+            state,
+            Message::Target(Target::Texture(id, Arc::clone(&counts))),
+        );
+        counts
     }
 
     /// Makes the render thread lose the device, as a driver failure would.
@@ -698,12 +737,21 @@ impl Backend for WgpuBackend {
         state.reserved.extend(checked.readbacks.iter().copied());
         state.submitted = fence;
         let sink = state.sink.clone();
+        let presents = checked
+            .steps
+            .iter()
+            .filter(|s| matches!(s, plan::Step::Present { .. }))
+            .count();
+        let presents = u64::try_from(presents).unwrap_or(u64::MAX);
+        state.queued_presents = state.queued_presents.saturating_add(presents);
         self.queue(
             state,
             Message::List(ListWork {
                 fence,
                 steps: checked.steps,
                 sink,
+                presents,
+                newer_queued: false,
             }),
         );
         Ok(fence)
@@ -736,15 +784,23 @@ impl Backend for WgpuBackend {
         Some(readback)
     }
 
-    /// Accepts the offscreen target, the only one before slice R8.
+    /// Sets where the presents of lists submitted from now on go. A window's surface is made
+    /// here, on the calling thread, which on macOS must be the main thread (`crate::window`,
+    /// with the errors in their order); a refused call changes nothing.
     fn set_present_target(&self, target: PresentTarget) -> Result<(), RenderError> {
-        match target {
-            PresentTarget::Offscreen => Ok(()),
-            // `PresentTarget` is non-exhaustive: windows arrive with slice R8.
-            _ => Err(RenderError::Unsupported(
-                "the wgpu backend presents offscreen only until slice R8",
-            )),
-        }
+        let target = match target {
+            PresentTarget::Offscreen => Target::Offscreen,
+            PresentTarget::Window(handles) => Target::Window(window::make_surface(
+                &self.instance,
+                &self.adapter,
+                &handles,
+            )?),
+            // `PresentTarget` is non-exhaustive: a later kind (an exported image) is not ours yet.
+            _ => return Err(RenderError::Unsupported(UNKNOWN_TARGET)),
+        };
+        let state = self.live_state()?;
+        self.queue(state, Message::Target(target));
+        Ok(())
     }
 
     fn take_present_feedback(&self) -> Vec<PresentFeedback> {

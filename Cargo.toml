@@ -45,7 +45,17 @@ ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
 # PNG encoding of frame dumps in the render crate (docs/specs/render-backend.md, "Frame dumps and
 # headless runs"). Pure Rust, as are its dependencies (crc32fast, fdeflate, flate2 on miniz_oxide).
 png = "0.18.1"
+# The main-thread check before the wgpu backend makes a window's surface on macOS
+# (crates/render-wgpu, slice R8): wgpu panics when a window's Metal layer is attached off the main
+# thread, and `objc2::MainThreadMarker::new()` asks without unsafe code. Already in the tree, at
+# this version, through wgpu's Metal backend.
+objc2 = "0.6.5"
 postcard = { version = "1.1.3", default-features = false, features = ["alloc"] }
+# The window handles of a present target (docs/specs/render-backend.md, "Present targets": the
+# frontend's `raw-window-handle` 0.6.2 display and window handles; slice R8). Only the traits,
+# without `std`; `alloc` gives `Arc<dyn ..>` the traits, so the frontend's window can be shared.
+# Already in the tree, at this version, through wgpu.
+raw-window-handle = { version = "0.6.2", default-features = false, features = ["alloc"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"

@@ -1909,3 +1909,5 @@ fn pending_ids_of_different_kinds_or_generations_differ() {
     }
     assert!(pending.contains(&PendingId(ResourceId::Buffer(BufferId::new(1, 2)))));
 }
+
+mod window;

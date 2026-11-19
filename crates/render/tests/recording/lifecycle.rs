@@ -349,6 +349,35 @@ fn present_target_is_offscreen() {
     assert_eq!(b.set_present_target(PresentTarget::Offscreen), Ok(()));
 }
 
+/// The recording backend models no window: it takes a window target, records it in the
+/// snapshot, and presents as before.
+#[test]
+fn a_window_target_is_recorded() {
+    use starquake_render::window::raw_window_handle::{
+        DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, WindowHandle,
+    };
+    use starquake_render::{WindowHandles, WindowSize};
+    struct NoWindow;
+    impl HasWindowHandle for NoWindow {
+        fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+            Err(HandleError::Unavailable)
+        }
+    }
+    impl HasDisplayHandle for NoWindow {
+        fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
+            Err(HandleError::Unavailable)
+        }
+    }
+    let b = backend();
+    let window = WindowHandles::new(Arc::new(NoWindow), WindowSize::new(4, 3));
+    assert_eq!(b.set_present_target(PresentTarget::Window(window)), Ok(()));
+    assert_eq!(b.set_present_target(PresentTarget::Offscreen), Ok(()));
+    assert_eq!(
+        b.snapshot(),
+        "present target window\npresent target offscreen\n"
+    );
+}
+
 /// The snapshot of one small run, pinned with `insta`. A change to it must be explained in the
 /// PR that makes it (decision log, 2026-11-11: snapshot changes are read).
 #[test]
