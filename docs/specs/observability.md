@@ -198,7 +198,9 @@ waits and nothing left can end the wait stops as an emulator error (2) rather th
 timeout (`architecture.md`, provisional parts). With a GPU, the last core to park asks the GPU
 whether it is idle; when the GPU answers busy, the parked core asks again when the GPU next
 reports quiet, up to a named retry count, so a question that lands in a busy moment is not lost
-(`gpu-protocol.md`, "Idleness"). The host timer thread, which holds the guest's deadlines
+(`gpu-protocol.md`, "Idleness"). The count is `GPU_QUIET_RETRIES` = 8, a **guess**, and it bounds
+the questions of one park, not of one stall: a core that wakes and parks again starts a new count
+(as built; decided by the owner, 2026-11-19). The host timer thread, which holds the guest's deadlines
 (`execution-model.md`, "Timers"), sleeps in pieces sized by the measured lateness of its waits,
 since macOS ends timed waits late at low priority, and one precise wait would need `unsafe`
 outside `cpu`. The test of a held page request answered at its bound times the timer thread's

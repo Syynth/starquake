@@ -110,8 +110,10 @@ mod tests;
 
 use thiserror::Error;
 
+// `AluForm` is used by the translator; `Slot` and `Source` only by tests and the assembler.
+pub(crate) use alu::AluForm;
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) use alu::{AluForm, Slot, Source};
+pub(crate) use alu::{Slot, Source};
 pub(crate) use fields::*;
 #[cfg(test)]
 pub(crate) use form::{Form, GROUP_HOOKS, GROUPS, ReferenceRow};

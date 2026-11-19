@@ -249,7 +249,8 @@ pub(crate) struct TexOpcodes {
 }
 
 impl TexOpcodes {
-    /// The opcode of the form for `tex`, if the instruction has one.
+    /// The opcode of the form for `tex`, if the instruction has one (used by the assembler).
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) const fn of(self, tex: TexRef) -> Option<u16> {
         match tex {
             TexRef::CBuf(_) => Some(self.cbuf),
