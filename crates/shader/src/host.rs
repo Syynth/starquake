@@ -86,7 +86,8 @@ pub struct InterfaceSlot {
 
 /// Device features a shader needs beyond the baseline.
 ///
-/// Slice 1 fills `subgroup` from what it lowers; slice 15's collect info
+/// The lowering ([`crate::lower`]) fills `subgroup`, `f16` and `i64` from what it lowers;
+/// slice 15's collect info
 /// ([`crate::info::ShaderInfo::requirements`]) fills every field from the IR, before the host
 /// lowering passes of slice 18 remove what the host lacks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -171,6 +172,10 @@ impl HostCaps {
 
 impl Requirements {
     /// The first feature, in [`Feature`] order, that this needs and `caps` lacks.
+    ///
+    /// [`Self::f64`] and [`Self::i64_atomics`] are not checked: [`HostCaps`] has no field for
+    /// them, and the lowering refuses every 64-bit float and 64-bit atomic operation, so a
+    /// shader it lowers never needs them.
     pub const fn missing(self, caps: HostCaps) -> Option<Feature> {
         if self.f16 && !caps.f16 {
             Some(Feature::Float16)
