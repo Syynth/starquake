@@ -12,6 +12,7 @@ pub mod fifo;
 pub mod interface;
 pub mod memory;
 pub mod mme;
+pub mod regs;
 pub mod ring;
 pub mod sema;
 pub mod syncpoint;
