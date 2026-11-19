@@ -187,7 +187,14 @@ fn front_records_of_the_driver() {
                 wfi: false,
             },
         },
-        &[vec![0x11], u32le(0x52), vec![0], u32le(0x72), vec![0], u32le(0)],
+        &[
+            vec![0x11],
+            u32le(0x52),
+            vec![0],
+            u32le(0x72),
+            vec![0],
+            u32le(0),
+        ],
     );
     let r = range(0x1000, 0x3000);
     let rb = [u64le(0x1000), u64le(0x3000)].concat();
@@ -197,7 +204,14 @@ fn front_records_of_the_driver() {
             update: VmUpdate::Unmap { range: r },
             ticket: Some(Ticket(0xa1)),
         },
-        &[vec![0x12], u32le(0x23), vec![0], rb.clone(), vec![1], u64le(0xa1)],
+        &[
+            vec![0x12],
+            u32le(0x23),
+            vec![0],
+            rb.clone(),
+            vec![1],
+            u64le(0xa1),
+        ],
     );
     front(
         FrontRecord::Update {
@@ -216,7 +230,14 @@ fn front_records_of_the_driver() {
             update: VmUpdate::DestroyMemory { range: r },
             ticket: Some(Ticket(0xa2)),
         },
-        &[vec![0x12], u32le(0x25), vec![2], rb.clone(), vec![1], u64le(0xa2)],
+        &[
+            vec![0x12],
+            u32le(0x25),
+            vec![2],
+            rb.clone(),
+            vec![1],
+            u64le(0xa2),
+        ],
     );
     front(
         FrontRecord::Update {
@@ -227,7 +248,15 @@ fn front_records_of_the_driver() {
             },
             ticket: Some(Ticket(0xa3)),
         },
-        &[vec![0x12], u32le(0x26), vec![3], rb, u32le(0xc1), vec![1], u64le(0xa3)],
+        &[
+            vec![0x12],
+            u32le(0x26),
+            vec![3],
+            rb,
+            u32le(0xc1),
+            vec![1],
+            u64le(0xa3),
+        ],
     );
     front(
         FrontRecord::Barrier {
@@ -330,7 +359,13 @@ fn accesses() -> Vec<(Access, Vec<u8>)> {
                 len: 0x10,
                 result: Ok(ContentHash::new(HASH_A)),
             },
-            [head(0x30, 0x61, 0x7172), u64le(0x10), vec![0], hash_bytes(HASH_A)].concat(),
+            [
+                head(0x30, 0x61, 0x7172),
+                u64le(0x10),
+                vec![0],
+                hash_bytes(HASH_A),
+            ]
+            .concat(),
         ),
         (
             Access::Read {
@@ -339,7 +374,13 @@ fn accesses() -> Vec<(Access, Vec<u8>)> {
                 len: 0x20,
                 result: Err(GpuFault::Unmapped { va: 0x8182 }),
             },
-            [head(0x30, 0x62, 0x7273), u64le(0x20), vec![1, 0], u64le(0x8182)].concat(),
+            [
+                head(0x30, 0x62, 0x7273),
+                u64le(0x20),
+                vec![1, 0],
+                u64le(0x8182),
+            ]
+            .concat(),
         ),
         (
             Access::Read {
@@ -395,7 +436,13 @@ fn accesses() -> Vec<(Access, Vec<u8>)> {
                 data: ContentHash::new(HASH_C),
                 result: Err(GpuFault::ShimWrite { va: 0x8586 }),
             },
-            [head(0x31, 0x66, 0x7677), hash_bytes(HASH_C), vec![1, 3], u64le(0x8586)].concat(),
+            [
+                head(0x31, 0x66, 0x7677),
+                hash_bytes(HASH_C),
+                vec![1, 3],
+                u64le(0x8586),
+            ]
+            .concat(),
         ),
         (
             Access::GpuOnly {
@@ -439,9 +486,7 @@ fn back_records() {
         &[vec![0x23], u64le(0x0203_0405)],
     );
     back(
-        BackRecord::Timestamp {
-            value: 0x0304_0506,
-        },
+        BackRecord::Timestamp { value: 0x0304_0506 },
         &[vec![0x24], u64le(0x0304_0506)],
     );
     let ops = [

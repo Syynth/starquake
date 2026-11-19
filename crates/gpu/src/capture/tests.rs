@@ -4,6 +4,7 @@
 //! `seams` the recording and replay seams one call at a time; `replay` whole captures made by
 //! the builder from hand-written streams, replayed, and tampered with.
 
+mod drive;
 mod golden;
 mod parse;
 mod replay;
@@ -59,13 +60,13 @@ fn config() -> BuilderConfig {
 
 /// A builder with [`SPACE`] mapped and no channel.
 fn builder() -> CaptureBuilder {
-    let mut builder = CaptureBuilder::new(
-        config(),
-        Box::new(PendingShaders),
-    )
-    .unwrap();
+    let mut builder = CaptureBuilder::new(config(), Box::new(PendingShaders)).unwrap();
     builder
-        .address_space(SPACE, PageRange::new(GPU_BASE, PAGES * PAGE_SIZE).unwrap(), CPU_BASE)
+        .address_space(
+            SPACE,
+            PageRange::new(GPU_BASE, PAGES * PAGE_SIZE).unwrap(),
+            CPU_BASE,
+        )
         .unwrap();
     builder
 }

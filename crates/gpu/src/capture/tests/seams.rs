@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use starquake_memory::{FlatMemory, Fault};
+use starquake_memory::{Fault, FlatMemory};
 use starquake_shader::exchange::TextureKind;
 use starquake_shader::lookup::{
     EngineState, GuestStage, ProgramMemory, ProgramRequest, Ticket, Unmapped, VariantKey,
@@ -93,8 +93,14 @@ fn recording_memory_records_each_call_with_its_answer_in_its_threads_log() {
             }),
         ]
     );
-    assert_eq!(recorded.blobs.get(ContentHash::of(&[2, 3, 4])), Some(&[2, 3, 4][..]));
-    assert_eq!(recorded.blobs.get(ContentHash::of(&[9, 8])), Some(&[9, 8][..]));
+    assert_eq!(
+        recorded.blobs.get(ContentHash::of(&[2, 3, 4])),
+        Some(&[2, 3, 4][..])
+    );
+    assert_eq!(
+        recorded.blobs.get(ContentHash::of(&[9, 8])),
+        Some(&[9, 8][..])
+    );
     assert_eq!(recorded.blobs.len(), 2);
 }
 
@@ -195,10 +201,7 @@ fn replay_memory_answers_reads_writes_and_queries_in_order() {
 #[test]
 fn replay_memory_diverges_on_each_difference() {
     let record = read(SPACE, 0x1000, &[5, 6]);
-    let found = format!(
-        "a read of 2 bytes at 0x1000 in address space {}",
-        SPACE.0
-    );
+    let found = format!("a read of 2 bytes at 0x1000 in address space {}", SPACE.0);
     let cases: [(AsId, u64, usize, String); 3] = [
         (
             AsId(0x22),
@@ -210,13 +213,19 @@ fn replay_memory_diverges_on_each_difference() {
             SPACE,
             0x1004,
             2,
-            format!("the GPU read 2 bytes at 0x1004 in address space {}", SPACE.0),
+            format!(
+                "the GPU read 2 bytes at 0x1004 in address space {}",
+                SPACE.0
+            ),
         ),
         (
             SPACE,
             0x1000,
             3,
-            format!("the GPU read 3 bytes at 0x1000 in address space {}", SPACE.0),
+            format!(
+                "the GPU read 3 bytes at 0x1000 in address space {}",
+                SPACE.0
+            ),
         ),
     ];
     for (space, va, len, made) in cases {
@@ -281,10 +290,7 @@ fn replay_memory_diverges_on_each_difference() {
             thread: Thread::Front,
             record: 0,
             found: "the end of the log".to_owned(),
-            made: format!(
-                "the GPU asked address space {} for its generation",
-                SPACE.0
-            ),
+            made: format!("the GPU asked address space {} for its generation", SPACE.0),
         })
     );
 }
@@ -411,7 +417,9 @@ fn a_pending_answer_is_fed_back_past_the_reads_the_cache_made() {
     ]);
     let mut shaders = back.shaders();
     assert!(matches!(lookup(&mut shaders), SetLookup::Pending(t) if t == Ticket::new(0x31)));
-    assert!(matches!(shaders.wait(Ticket::new(0x31)), SetLookup::Pending(t) if t == Ticket::new(0x31)));
+    assert!(
+        matches!(shaders.wait(Ticket::new(0x31)), SetLookup::Pending(t) if t == Ticket::new(0x31))
+    );
     back.check().unwrap();
     assert_eq!(back.next(), 4);
 }

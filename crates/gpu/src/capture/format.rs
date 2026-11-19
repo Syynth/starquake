@@ -1121,10 +1121,13 @@ impl<'a> In<'a> {
                 what,
             });
         };
-        let taken = self.bytes.get(self.at..end).ok_or(CaptureError::Truncated {
-            offset: self.bytes.len(),
-            what,
-        })?;
+        let taken = self
+            .bytes
+            .get(self.at..end)
+            .ok_or(CaptureError::Truncated {
+                offset: self.bytes.len(),
+                what,
+            })?;
         self.at = end;
         Ok(taken)
     }
@@ -1200,14 +1203,19 @@ impl<'a> In<'a> {
                 ticket: self.u64("a shader answer")?,
             }),
             sub::REJECTED => Ok(ShaderAnswer::Rejected),
-            _ => Err(bad(at, "a shader answer's kind is not one this build knows")),
+            _ => Err(bad(
+                at,
+                "a shader answer's kind is not one this build knows",
+            )),
         }
     }
 
     fn header(&mut self) -> Result<Header, CaptureError> {
         let magic = self.array::<4>("the magic")?;
         if magic != MAGIC {
-            return Err(CaptureError::BadMagic { found: Found(magic) });
+            return Err(CaptureError::BadMagic {
+                found: Found(magic),
+            });
         }
         let version = self.u32("the version")?;
         if version != VERSION {

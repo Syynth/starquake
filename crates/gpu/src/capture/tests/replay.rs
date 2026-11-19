@@ -31,7 +31,10 @@ fn a_built_capture_replays_to_its_expected_outputs() {
     insta::assert_snapshot!("release_and_present_render", output.render);
     assert_eq!(
         writes_text(&output.writes),
-        format!("back space {} wrote 4 bytes at {SEM:#x}: 01 00 00 00\n", SPACE.0)
+        format!(
+            "back space {} wrote 4 bytes at {SEM:#x}: 01 00 00 00\n",
+            SPACE.0
+        )
     );
 }
 
@@ -58,7 +61,10 @@ fn a_gated_command_buffer_written_after_submission_replays() {
     let later = releases(SEM2, 7);
     builder.cpu_write(SPACE, CMD, &bytes(&gate)).unwrap();
     // The second entry's words are not written yet: the CPU writes them after the submission.
-    let submission = plain(vec![raw_entry(CMD, gate.len()), raw_entry(CMD2, later.len())]);
+    let submission = plain(vec![
+        raw_entry(CMD, gate.len()),
+        raw_entry(CMD2, later.len()),
+    ]);
     builder.submit(channel, submission).unwrap();
     builder.run().unwrap();
     builder.cpu_write(SPACE, CMD2, &bytes(&later)).unwrap();
@@ -66,12 +72,19 @@ fn a_gated_command_buffer_written_after_submission_replays() {
     builder.run().unwrap();
     let mut word = [0; 4];
     builder.cpu_read(SPACE, SEM2, &mut word).unwrap();
-    assert_eq!(u32::from_le_bytes(word), 7, "the gated buffer ran when the capture was made");
+    assert_eq!(
+        u32::from_le_bytes(word),
+        7,
+        "the gated buffer ran when the capture was made"
+    );
     let capture = Capture::parse(&builder.finish().unwrap().to_bytes().unwrap()).unwrap();
     let output = replay(&capture, ReplayOptions::default()).unwrap();
     assert_eq!(
         writes_text(&output.writes),
-        format!("back space {} wrote 4 bytes at {SEM2:#x}: 07 00 00 00\n", SPACE.0)
+        format!(
+            "back space {} wrote 4 bytes at {SEM2:#x}: 07 00 00 00\n",
+            SPACE.0
+        )
     );
 }
 
@@ -245,6 +258,51 @@ fn a_ring_hash_the_capture_lacks_is_a_length_difference() {
             replayed: rings,
         }
     );
+    // With an entry that differs too, the difference is reported first.
+    let ring_index = capture
+        .outputs
+        .iter()
+        .position(|output| matches!(output, Output::Ring { .. }))
+        .unwrap();
+    capture.outputs[ring_index] = Output::Ring {
+        hash: super::super::ContentHash::of(b"another entry"),
+    };
+    assert_eq!(
+        replay(&capture, ReplayOptions::default()).unwrap_err(),
+        ReplayError::RingDiffers { index: 0 }
+    );
+    // And a capture with one ring hash more than the front pushes.
+    let mut longer = release_and_present();
+    longer.outputs.insert(
+        0,
+        Output::Ring {
+            hash: super::super::ContentHash::of(b"x"),
+        },
+    );
+    let mut longer_ok = release_and_present();
+    let extra = longer_ok
+        .outputs
+        .iter()
+        .find(|output| matches!(output, Output::Ring { .. }))
+        .copied()
+        .unwrap();
+    let at = longer_ok
+        .outputs
+        .iter()
+        .rposition(|output| matches!(output, Output::Ring { .. }))
+        .unwrap();
+    longer_ok.outputs.insert(at + 1, extra);
+    assert_eq!(
+        replay(&longer_ok, ReplayOptions::default()).unwrap_err(),
+        ReplayError::RingLength {
+            captured: rings + 1,
+            replayed: rings,
+        }
+    );
+    assert_eq!(
+        replay(&longer, ReplayOptions::default()).unwrap_err(),
+        ReplayError::RingDiffers { index: 0 }
+    );
 }
 
 #[test]
@@ -306,7 +364,11 @@ fn a_release_that_latches_a_parked_acquire_reaches_the_front_as_a_latch() {
     builder.cpu_read(SPACE, SEM2, &mut word).unwrap();
     assert_eq!(u32::from_le_bytes(word), 9, "the parked channel ran on");
     let capture = builder.finish().unwrap();
-    assert!(capture.front.contains(&FrontRecord::Latch { channel: waiting }));
+    assert!(
+        capture
+            .front
+            .contains(&FrontRecord::Latch { channel: waiting })
+    );
     assert!(
         capture
             .back

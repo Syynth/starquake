@@ -107,8 +107,7 @@ impl BuilderConfig {
     /// wait setting and fenced releases.
     pub fn synthetic(build_id: &str, guest_base: u64, guest_size: usize) -> Self {
         use starquake_render::caps::{
-            DynamicState, Features, FormatFeatures, FormatTable, Limits, SampleCounts,
-            StageSupport,
+            DynamicState, Features, FormatFeatures, FormatTable, Limits, SampleCounts, StageSupport,
         };
         let size = u64::try_from(guest_size).unwrap_or(u64::MAX);
         Self {
@@ -449,11 +448,7 @@ impl CaptureBuilder {
             return Err(BuildError::DuplicateSpace(space));
         }
         let vm = Arc::new(GpuVm::new());
-        vm.map(
-            gpu,
-            Target::Guest { cpu_va },
-            crate::interface::Kind(0),
-        )?;
+        vm.map(gpu, Target::Guest { cpu_va }, crate::interface::Kind(0))?;
         let front_memory = VmMemory::new(
             Arc::clone(&vm),
             Arc::clone(&self.guest),
@@ -632,8 +627,7 @@ impl CaptureBuilder {
             self.recorder.front(report);
         }
         let now = self.view();
-        for ((index, &value), &seen) in now.values.iter().enumerate().zip(&self.front_view.values)
-        {
+        for ((index, &value), &seen) in now.values.iter().enumerate().zip(&self.front_view.values) {
             if value != seen
                 && let Some(id) = u8::try_from(index).ok().and_then(SyncpointId::new)
             {

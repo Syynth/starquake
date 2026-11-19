@@ -24,9 +24,7 @@ use crate::back::exec::{ExecConfig, ExecError, Executor};
 use crate::back::fence::{
     CloseReason, FenceClock, FenceEnv, Fences, FrontWake, Report, WaiterTable,
 };
-use crate::front::{
-    Front, FrontClock, FrontDeps, FrontError, FrontShared, OrderedTable,
-};
+use crate::front::{Front, FrontClock, FrontDeps, FrontError, FrontShared, OrderedTable};
 use crate::interface::{AsId, ChannelId, Completions, Submitted};
 use crate::memory::{GpuFault, GpuMemory};
 use crate::ring::{RING_WORDS, RingEntry, ring};
@@ -192,7 +190,10 @@ trait Logged {
 fn describe_access(access: &Access) -> String {
     match *access {
         Access::Read { space, va, len, .. } => {
-            format!("a read of {len} bytes at {va:#x} in address space {}", space.0)
+            format!(
+                "a read of {len} bytes at {va:#x} in address space {}",
+                space.0
+            )
         }
         Access::Write {
             space, va, data, ..
@@ -296,7 +297,11 @@ impl<R: Logged> Cursor<R> {
 
     /// The next record if `wanted` accepts it (and steps past it); otherwise records the
     /// divergence, described by `made`.
-    fn take<T>(&mut self, made: impl FnOnce() -> String, wanted: impl FnOnce(&R) -> Option<T>) -> Option<T> {
+    fn take<T>(
+        &mut self,
+        made: impl FnOnce() -> String,
+        wanted: impl FnOnce(&R) -> Option<T>,
+    ) -> Option<T> {
         if self.failure.is_some() {
             return None;
         }
@@ -340,7 +345,12 @@ impl<R: Logged + Send> GpuMemory for ReplayMemory<R> {
     fn read(&self, va: u64, buf: &mut [u8]) -> Result<(), GpuFault> {
         let space = self.space;
         let len = u64::try_from(buf.len()).unwrap_or(u64::MAX);
-        let made = || format!("the GPU read {len} bytes at {va:#x} in address space {}", space.0);
+        let made = || {
+            format!(
+                "the GPU read {len} bytes at {va:#x} in address space {}",
+                space.0
+            )
+        };
         let result = lock(&self.cursor).take(made, |record| match record.access() {
             Some(&Access::Read {
                 space: s,
@@ -668,7 +678,11 @@ struct FrontRun {
 
 impl FrontReplay {
     /// A fresh front over the restored state, with the header's spaces and channels made.
-    fn new(capture: &Capture, restored: &Restored, blobs: &Arc<Blobs>) -> Result<Self, ReplayError> {
+    fn new(
+        capture: &Capture,
+        restored: &Restored,
+        blobs: &Arc<Blobs>,
+    ) -> Result<Self, ReplayError> {
         let cursor: Shared<FrontRecord> = Arc::new(Mutex::new(Cursor::new(
             Thread::Front,
             capture.front.clone(),
@@ -697,12 +711,13 @@ impl FrontReplay {
             shared.create_address_space(*space, Arc::clone(vm), memory);
         }
         for channel in &capture.header.channels {
-            let made = shared
-                .create_channel(channel.config)
-                .map_err(|_| ReplayError::ChannelId {
-                    expected: channel.id,
-                    made: ChannelId(u32::MAX),
-                })?;
+            let made =
+                shared
+                    .create_channel(channel.config)
+                    .map_err(|_| ReplayError::ChannelId {
+                        expected: channel.id,
+                        made: ChannelId(u32::MAX),
+                    })?;
             if made != channel.id {
                 return Err(ReplayError::ChannelId {
                     expected: channel.id,
@@ -880,10 +895,8 @@ impl BackReplay {
             .and_then(|bytes| {
                 postcard::from_bytes(bytes).map_err(|error| ReplayError::Caps(error.to_string()))
             })?;
-        let cursor: Shared<BackRecord> = Arc::new(Mutex::new(Cursor::new(
-            Thread::Back,
-            capture.back.clone(),
-        )));
+        let cursor: Shared<BackRecord> =
+            Arc::new(Mutex::new(Cursor::new(Thread::Back, capture.back.clone())));
         let backend = Arc::new(RecordingBackend::new(caps, capture.header.memory_allowed));
         let waiters = Arc::new(WaiterTable::new());
         let fences = Fences::new(

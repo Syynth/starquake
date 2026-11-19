@@ -48,7 +48,10 @@ fn header_len(capture: &Capture) -> usize {
 #[test]
 fn a_minimal_capture_reads_back() {
     let capture = minimal();
-    assert_eq!(Capture::parse(&capture.to_bytes().unwrap()).unwrap(), capture);
+    assert_eq!(
+        Capture::parse(&capture.to_bytes().unwrap()).unwrap(),
+        capture
+    );
 }
 
 #[test]
@@ -76,7 +79,10 @@ fn the_version_is_checked_before_the_body() {
     // A body that would not read either: its build id is past the limit.
     file[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
     let error = Capture::parse(&file).unwrap_err();
-    assert_eq!(error, CaptureError::UnsupportedVersion { found: VERSION + 1 });
+    assert_eq!(
+        error,
+        CaptureError::UnsupportedVersion { found: VERSION + 1 }
+    );
     assert_eq!(
         error.to_string(),
         "the capture is format version 2; this build reads version 1 only"
@@ -360,14 +366,23 @@ fn each_bad_field_value_is_refused_where_it_is() {
         ),
         // An unmap of half a page.
         (
-            [vec![0x12, 1, 0, 0, 0, 0], 0x1000u64.to_le_bytes().to_vec(), 0x800u64.to_le_bytes().to_vec()].concat(),
+            [
+                vec![0x12, 1, 0, 0, 0, 0],
+                0x1000u64.to_le_bytes().to_vec(),
+                0x800u64.to_le_bytes().to_vec(),
+            ]
+            .concat(),
             6,
             "a page range is not whole pages",
         ),
         // An update of kind 4.
         (vec![0x12, 1, 0, 0, 0, 4], 5, "an update's kind is unknown"),
         // A submission whose wait flag is 2.
-        (vec![0x11, 1, 0, 0, 0, 2], 5, "a presence flag is neither 0 nor 1"),
+        (
+            vec![0x11, 1, 0, 0, 0, 2],
+            5,
+            "a presence flag is neither 0 nor 1",
+        ),
         // A read whose outcome is 2.
         (
             [vec![0x30, 1, 0, 0, 0], vec![0; 16], vec![2]].concat(),
@@ -475,10 +490,12 @@ fn the_blob_table_is_in_order_hashes_match_and_every_named_blob_is_there() {
     capture.blobs.insert(b"second blob");
     let file = capture.to_bytes().unwrap();
     let table = blob_table(&capture);
-    let first_len = 16 + 8 + usize::try_from(u64::from_le_bytes(
-        file[table + 4 + 16..table + 4 + 24].try_into().unwrap(),
-    ))
-    .unwrap();
+    let first_len = 16
+        + 8
+        + usize::try_from(u64::from_le_bytes(
+            file[table + 4 + 16..table + 4 + 24].try_into().unwrap(),
+        ))
+        .unwrap();
     let rest_start = table + 4;
     let first = file[rest_start..rest_start + first_len].to_vec();
     let second_end = file.len() - 4;
@@ -586,7 +603,7 @@ fn an_unknown_output_is_refused() {
     );
 }
 
-fn config() -> Config {
+fn proptest_config() -> Config {
     Config {
         cases: 256,
         rng_seed: RngSeed::Fixed(0x5351_4743),
@@ -599,7 +616,12 @@ fn config() -> Config {
 fn front_record() -> impl Strategy<Value = FrontRecord> {
     prop_oneof![
         Just(FrontRecord::Turn),
-        (any::<u32>(), prop::collection::vec(any::<u64>(), 0..4), any::<u32>(), any::<bool>())
+        (
+            any::<u32>(),
+            prop::collection::vec(any::<u64>(), 0..4),
+            any::<u32>(),
+            any::<bool>()
+        )
             .prop_map(|(channel, entries, increments, wfi)| FrontRecord::Submit {
                 channel: ChannelId(channel),
                 submission: Submission {
@@ -609,13 +631,16 @@ fn front_record() -> impl Strategy<Value = FrontRecord> {
                     wfi,
                 },
             }),
-        (prop::collection::vec(any::<u64>(), 0..4), any::<bool>(), any::<bool>()).prop_map(
-            |(markers, released, incremented)| FrontRecord::Report {
+        (
+            prop::collection::vec(any::<u64>(), 0..4),
+            any::<bool>(),
+            any::<bool>()
+        )
+            .prop_map(|(markers, released, incremented)| FrontRecord::Report {
                 markers: markers.into_iter().map(crate::ring::MarkerToken).collect(),
                 released,
                 incremented,
-            }
-        ),
+            }),
         (0..SYNCPOINT_COUNT, any::<u32>()).prop_map(|(id, value)| FrontRecord::Syncpoint {
             id: SyncpointId::new(u8::try_from(id).unwrap()).unwrap(),
             value,
@@ -650,7 +675,7 @@ fn back_record() -> impl Strategy<Value = BackRecord> {
 }
 
 proptest! {
-    #![proptest_config(config())]
+    #![proptest_config(proptest_config())]
 
     #[test]
     fn generated_captures_read_back_as_written(

@@ -48,9 +48,15 @@ fn capture_file(scratch: &Scratch) -> PathBuf {
     )
     .unwrap();
     builder
-        .address_space(SPACE, PageRange::new(GPU_BASE, 4 * PAGE_SIZE).unwrap(), CPU_BASE)
+        .address_space(
+            SPACE,
+            PageRange::new(GPU_BASE, 4 * PAGE_SIZE).unwrap(),
+            CPU_BASE,
+        )
         .unwrap();
-    let channel = builder.channel(SPACE, SyncpointId::new(2).unwrap()).unwrap();
+    let channel = builder
+        .channel(SPACE, SyncpointId::new(2).unwrap())
+        .unwrap();
     let op = sema::encode_semaphored(&HostSemaphore::Release {
         form: ReleaseForm {
             size: PayloadSize::Four,

@@ -26,7 +26,11 @@ pub fn writes_text(writes: &[ReplayedWrite]) -> String {
         if write.data.len() > WRITE_BYTES_SHOWN {
             let _ = write!(text, "hash {}", ContentHash::of(&write.data));
         } else {
-            let hex: Vec<String> = write.data.iter().map(|byte| format!("{byte:02x}")).collect();
+            let hex: Vec<String> = write
+                .data
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
             text.push_str(&hex.join(" "));
         }
         if let Err(fault) = write.result {

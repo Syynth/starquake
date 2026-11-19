@@ -9,8 +9,7 @@ use starquake_gpu::capture::{Capture, FrontRecord, ReplayError};
 use starquake_gpu::classes::clc76f;
 use starquake_gpu::fifo::{GpEntry, MethodMode, PushBuffer, Sync};
 use starquake_gpu::interface::{
-    AsId, DisplayId, GpfifoEntry, ImageDesc, LayerId, PresentRequest, Rect, Submission,
-    SyncpointId,
+    AsId, DisplayId, GpfifoEntry, ImageDesc, LayerId, PresentRequest, Rect, Submission, SyncpointId,
 };
 use starquake_gpu::sema::{self, HostSemaphore, PayloadSize, ReleaseForm};
 use starquake_memory::{PAGE_SIZE, PageRange};
@@ -29,7 +28,10 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new(test: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("starquake-gpu-replay-{}-{test}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "starquake-gpu-replay-{}-{test}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         Self(dir)
@@ -57,9 +59,15 @@ fn capture(payload: u32) -> Capture {
     )
     .unwrap();
     builder
-        .address_space(SPACE, PageRange::new(GPU_BASE, PAGES * PAGE_SIZE).unwrap(), CPU_BASE)
+        .address_space(
+            SPACE,
+            PageRange::new(GPU_BASE, PAGES * PAGE_SIZE).unwrap(),
+            CPU_BASE,
+        )
         .unwrap();
-    let channel = builder.channel(SPACE, SyncpointId::new(1).unwrap()).unwrap();
+    let channel = builder
+        .channel(SPACE, SyncpointId::new(1).unwrap())
+        .unwrap();
     let op = sema::encode_semaphored(&HostSemaphore::Release {
         form: ReleaseForm {
             size: PayloadSize::Four,
@@ -139,12 +147,13 @@ fn a_capture_replays_and_prints_the_dump_asked_for() {
     let path = scratch.file("one.sqgc", &capture(0x2a).to_bytes().unwrap());
     let summary = "replayed the whole capture: 2 ring entries, 1 presents; the ring and the \
                    render stream match the capture\n";
-    assert_eq!(gpu_replay(&args(path.clone(), None, None)).unwrap(), summary);
+    assert_eq!(
+        gpu_replay(&args(path.clone(), None, None)).unwrap(),
+        summary
+    );
     assert_eq!(
         gpu_replay(&args(path.clone(), None, Some(Dump::Writes))).unwrap(),
-        format!(
-            "{summary}back space 33 wrote 4 bytes at {SEM:#x}: 2a 00 00 00\n"
-        )
+        format!("{summary}back space 33 wrote 4 bytes at {SEM:#x}: 2a 00 00 00\n")
     );
     let ring = gpu_replay(&args(path.clone(), None, Some(Dump::Ring))).unwrap();
     assert_eq!(
@@ -181,11 +190,10 @@ fn each_failure_is_an_emulator_error_in_plain_words() {
     let missing = scratch.0.join("missing.sqgc");
     let error = gpu_replay(&args(missing.clone(), None, None)).unwrap_err();
     assert!(matches!(error, GpuReplayError::Read { .. }));
-    assert!(
-        error
-            .to_string()
-            .starts_with(&format!("the capture {} could not be read: ", missing.display()))
-    );
+    assert!(error.to_string().starts_with(&format!(
+        "the capture {} could not be read: ",
+        missing.display()
+    )));
     assert_eq!(error.exit_code(), exit_code::EMULATOR_ERROR);
 
     let junk = scratch.file("junk.sqgc", b"JUNKJUNK");
@@ -223,11 +231,9 @@ fn each_failure_is_an_emulator_error_in_plain_words() {
         error,
         GpuReplayError::Replay(ReplayError::Diverged(_))
     ));
-    assert!(
-        error
-            .to_string()
-            .starts_with(&format!("the replay diverged at front log record {index}: "))
-    );
+    assert!(error.to_string().starts_with(&format!(
+        "the replay diverged at front log record {index}: "
+    )));
     assert_eq!(error.exit_code(), exit_code::EMULATOR_ERROR);
 }
 

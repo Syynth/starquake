@@ -130,9 +130,7 @@ pub fn render_output(output: &ReplayOutput, args: &GpuReplayArgs) -> String {
         && !output.stopped_early
         && output.presents < until
     {
-        text.push_str(&format!(
-            "the capture ended before present {until}\n"
-        ));
+        text.push_str(&format!("the capture ended before present {until}\n"));
     }
     match args.dump {
         Some(Dump::Ring) => text.push_str(&write_text(&output.ring)),

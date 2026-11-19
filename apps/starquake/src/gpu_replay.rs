@@ -165,7 +165,10 @@ mod tests {
     #[test]
     fn a_present_count_is_a_whole_number_from_one() {
         assert_eq!(
-            parse(&args(&["a", "--until", "present=1"])).unwrap().unwrap().until_present,
+            parse(&args(&["a", "--until", "present=1"]))
+                .unwrap()
+                .unwrap()
+                .until_present,
             Some(1)
         );
         assert_eq!(
