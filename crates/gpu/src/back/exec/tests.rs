@@ -37,6 +37,8 @@ use crate::syncpoint::Syncpoints;
 use crate::test_log::{at, captured};
 use crate::vm::GpuVm;
 
+mod cb_load;
+
 // ---------------------------------------------------------------------------------------------
 // The rig.
 
