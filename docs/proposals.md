@@ -486,7 +486,7 @@ Landed, the first milestone 3 wave: G8 (the channel pusher, #319, PR #335), G9 (
 
 | Status | Proposal | Why | Suggested |
 |---|---|---|---|
-| proposed | **GPU register defaults:** Eden runs `InitializeRegisterDefaults` (non-zero 3D defaults: depth range, swizzles, blend, stencil and colour masks) and then copies them into the shadow file. The front file, the shadow file and the back mirror start zeroed here; they must start from the same values, or same-value dropping drops a write the back never saw. Nothing owns it; needed before G13 and G14 run real streams | #320 | area:gpu |
+| done (#392, PR #399) | **GPU register defaults:** Eden runs `InitializeRegisterDefaults` (non-zero 3D defaults: depth range, swizzles, blend, stencil and colour masks) and then copies them into the shadow file. The front file, the shadow file and the back mirror start zeroed here; they must start from the same values, or same-value dropping drops a write the back never saw. Nothing owns it; needed before G13 and G14 run real streams | #320 | area:gpu |
 | proposed | **GPU state snapshots:** save and restore the register and shadow files and the QMD table, with restore validation (the 4,096-entry cap, counter and deferred bounds). The spec puts this state in GPU snapshots; no slice covers it | #320, #323 | area:gpu |
 | proposed | **`SEND_SIGNALING_PCAS_B` (0xAF) and `SEND_PCAS_B` (0xAE):** Eden-NX2 treats 0xAF with SCHEDULE set as a scheduler signal, so a QMD scheduled that way would never run here. Settle with a trace | #323 | area:gpu |
 | proposed | **GPU front counters** for the observability summary: writes dropped as same-value, and other dropped writes | #320 | area:gpu |
@@ -505,8 +505,8 @@ Landed: G13 (the front macro host, #324, PR #340) and G11 (DMA copy, inline-to-m
 
 | Status | Proposal | Why | Suggested |
 |---|---|---|---|
-| proposed | **Engine register reset values:** seed Eden's `InitializeRegisterDefaults` (and Fermi2D's depth of 1, already exported as `twod::BLIT_RESET_REGISTERS`) through G10's `ClassRules::initial_values`, which seeds the front file, the shadow file and the back mirror from one place. Wave 36's row; G14 and G19 need it before real streams | #321, #322 | area:gpu |
-| proposed | **`MME_DMA_READ` (0x157) into data RAM** at `SET_MME_DATA_RAM_ADDRESS`: Eden-NX2 performs it, G13 does not (row 58 names only the FIFO form). The memo must not store such calls, since they change data RAM without a barrier | #324 | area:gpu |
+| done (#392, PR #399) | **Engine register reset values:** seed Eden's `InitializeRegisterDefaults` (and Fermi2D's depth of 1, already exported as `twod::BLIT_RESET_REGISTERS`) through G10's `ClassRules::initial_values`, which seeds the front file, the shadow file and the back mirror from one place. Wave 36's row; G14 and G19 need it before real streams | #321, #322 | area:gpu |
+| done (#393, PR #400) | **`MME_DMA_READ` (0x157) into data RAM** at `SET_MME_DATA_RAM_ADDRESS`: Eden-NX2 performs it, G13 does not (row 58 names only the FIFO form). The memo must not store such calls, since they change data RAM without a barrier | #324 | area:gpu |
 | proposed | **The 2D format converter:** port `eden-nx2/src/video_core/engines/sw_blitter/converter.cpp` (about 1,200 lines). Blits between formats (`BlitConversion`) and bilinear filtering of formats other than the two 8888 ones (`BlitFilter`) are refused today | #322 | area:gpu |
 | proposed | **GPU counters for MME DMA reads, catch-ups and reruns**, folded into wave 36's front counters row; verification item 3 cannot be read from a run today | #324 | area:gpu |
 | proposed | **Macro store tests:** the cross-channel rewrite counter and `forget_channel` for the compute store and start entries; the memo stores a call whose write left the register file (arena space only) | #324 | area:gpu |
@@ -567,6 +567,33 @@ Landed: G14 (the front loop, #325, PR #394), G17 (the texture cache, #328, PR #3
 | awaiting the owner | **Pipeline-key cache choices:** `MAX_PIPELINES` = 65,536 (a guess, stricter than both references, which have no cap); a key is recorded when the backend accepts the pipeline, not after its build succeeds, because builds finish asynchronously | #334 | gpu-protocol |
 | awaiting the owner | **`TextureKind` has no usage field,** so its answer always carries the header's format bits and a shader that only samples is retranslated when the format changes but the kind does not. Add a usage field to the question | #348 | shader-pipeline |
 | awaiting the owner | **Interface specialisation:** the spec specialises a stage on what the next stage reads; Eden specialises on what the previous stage stores (`MakeRuntimeInfo`), and the GPU crate cannot build the next stage's reads from engine state. Slice 9 follows the spec provisionally | #348 | shader-pipeline |
+
+### From wave 40 (ledger: #22)
+
+Landed: G18 (from 3D state to a draw, #329, PR #404), G22 (production GPU memory and the GPU-only store, #333, PR #401), engine register reset values (#392, PR #399), `MME_DMA_READ` and the 256-entry start table (#393, PR #400), R5 (the wgpu backend core, `starquake-render-wgpu`, #382, PR #403) and shader slice 2 (the SPH v4 header, #349, PR #402). G19's blockers are all cleared; wiring notes for G19 and G21 are comments on #330 and #332.
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| awaiting the owner | **`CLEAR_SURFACE` has no slice.** The render backend has `Command::Clear`, but gpu-protocol's slice table gives no slice the 3D clear method (Eden's `DrawManager::Clear`: a render-pass clear, or a draw for masked or scissored clears). A first present needs it. Recommendation: add a slice G24 after G18 and file it | #329 | gpu-protocol |
+| proposed | **Draw-path completeness:** the viewport-transform-enable path; the per-stage input filter (attributes the vertex program does not load are still in the layout; Eden leaves them out); `ATTRIBUTE_FETCH` (skipped, with no slice for the storage-buffer path); `DrawTexture`; inline-index, zero-index, auto and indirect draws (skipped and counted); storage buffers and images in the resource table; tessellation and geometry stages. The first two are likely needed by milestone 3, the rest when a title needs them | #329 | area:gpu |
+| proposed | **G18's guesses:** per-slot interpolation (flat for integers, perspective for floats); the constants buffer's 256-byte alignment (`Caps` names no uniform offset alignment); the alpha and logic-op functions reset to 0, which the header does not name, so they are read only while their test is on | #329 | area:gpu |
+| awaiting the owner | **Rejected shaders are logged once per set, not once per program** as the spec says, because the shader cache's rejection does not say which program failed. Either the rejection names the program or the spec says "per set" | #329 | gpu-protocol, shader-pipeline |
+| awaiting the owner | **The slice-19 seam:** slice 9's `Lookup::Ready` carries only the shader set, but the draw path also needs each shader's resource table, a per-shader `ShaderStamp` and a `wait(ticket)` the spec implies but never names. G18's `ShaderLookup`/`SetLookup` seam carries all three; slice 19 adapts to it | #329 | shader-pipeline |
+| awaiting the owner | **Swizzle binding order:** a lookup needs the bound textures' swizzles, which depend on the set. Provisionally two lookups: first with the swizzles the same requests bound last time, then again if they differ | #329 | gpu-protocol |
+| proposed | **G22 follow-ups:** the buffer and texture caches still request write watches at GPU ranges (`GpuMemory` needs a call returning a range's CPU pages, and the watch test should flip); the GPU-only store has no host cap (bounded only by the sparse regions gsv accounts for); no model-based test of `GpuOnlyStore`; store counters are not in `summary.json` (graphics-server verification item 6 wants them) | #333 | area:gpu |
+| awaiting the owner | **`GpuMemory::generation`** is taken from the VM's `Translate::generation`, the unvetted proposal from the review notes on #197 | #333 | gpu-protocol |
+| proposed | **Release latching:** `back::fence` latches waiters with a release's payload words rather than the incremented counter value; read the words back through memory after the write (noted on #330) | #333 | area:gpu |
+| proposed | **Region id reuse:** gsv must not reuse a destroyed sparse region's id before `GpuOrdered` for that destroy, or the late free also frees the new region's pages (noted on #332) | #333 | area:gsv |
+| awaiting the owner | **`MME_DMA_READ` (0x157) in the spec:** gpu-protocol's "Macros" section names only the FIFO form (0x158). PR #400 performs 0x157 at the write, as Eden-NX2 does, and the memo stores no call (3D or compute) that writes it. The compute class's MME DMA methods are register writes only, following Eden-NX2's compute front; a trace of a compute macro would decide. Add a sentence for each | #393 | gpu-protocol |
+| proposed | **Stencil mask reset values** are 0xFFFFFFFF, as Eden writes them, while `clc797.h`'s field is 7:0 (decision 10: values follow Eden-NX2). A trace of a fresh channel's register reads would settle it | #392 | area:gpu |
+| awaiting the owner | **Local memory size:** Eden computes `low \| high << 24`; NAK stores bits 32..55 in the high field. PR #402 follows Eden. Verification E3 with a large-local-memory shader would settle it. The CRS size (which PR #4588 adds) is exposed raw for slice 16 to decide | #349 | shader-pipeline |
+| awaiting the owner | **A compute program's header:** the spec says a compute program has no header, but PR #4588's native compute path starts at `sizeof(sph)` (0x50). Check in E3 and in slice 3 | #349 | shader-pipeline |
+| proposed | **Slice 15 wiring:** `program::translate_program` still takes the stage and colour outputs by hand; slice 15 should call `ProgramHeader::from_program`, check the header's stage against the pipeline slot, and build `ColorOutputs` from the header | #349 | area:shader |
+| proposed | **Render backend gaps for R6 and R7:** vertex divisors; null view and sampler bindings; a scratch path for copies within one resource (wgpu refuses them even when regions do not overlap); depth and stencil through buffers, which the D24S8 to D32FS8 conversion needs; unaligned buffer ranges (wgpu needs 4-byte alignment); `max_viewports` below 16; non-finite dynamic state; a shared list resolver for the recording and wgpu backends, which both resolve ids and apply the readback and render-target rules | #382, #329 | area:render |
+| awaiting the owner | **Render backend choices R5 made:** sampler LOD bias is dropped (it probably belongs in the shader, R7), anisotropy is 1 when any filter is nearest, negative LOD clamps are raised to 0; guest 1D arrays have no wgpu equivalent (2D textures of height 1 is a shader-side decision); the stencil aspect of `D32_FLOAT_S8_UINT` is not copied because copy commands carry no aspect | #382 | render-backend |
+| awaiting the owner | **render-backend errata from R5:** the spec pins wgpu 30.0.1, the workspace uses 30.0.2; wgpu refuses depth clear values outside 0..=1, and compressed formats cannot be cleared, settling two guesses in `view_ops` | #382 | render-backend |
+| proposed | **Report upstream:** wgpu-hal 30.0.2's Metal encoder turns a missing `bytes_per_row` into 0 | #382 | owner |
+| proposed | **Chore:** `crates/gpu/src/macros/tests.rs` keeps its own tracing capture; switch it to `crate::test_log` | #329 | area:gpu |
 
 ## House-rule candidates
 
@@ -835,3 +862,12 @@ passed to build agents as a provisional rule for the next wave.
 - Per-item lookups on hot paths are indexed, never a scan of the whole container.
 - PR bodies and docs make no "all", "every" or "row for row" claim that was not checked literally.
 - Published history is never rewritten: no rebase, squash, amend or force-push of a pushed branch.
+
+### From wave 40 (ledger: #22)
+
+- When mirroring a reference state machine, every register the reference reads on that path is implemented or listed as not read, with a divergence test.
+- Ids, banks and indices from guest state are bounded above as well as below, with a named error and a test on both sides of each edge.
+- One hostile value (a non-finite float, an oversized count, a host-limit mismatch) fails one item, never a whole submission.
+- Every resource a layer creates is destroyed on drop and counted in the budget; per-operation scratch is reused.
+- No allocation or linear scan per draw or call on hot paths, with a test that per-call cost does not grow.
+- A claim that a rule matches a host API or reference cites the exact check in its source.
