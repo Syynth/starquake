@@ -91,6 +91,10 @@ pub enum RenderError {
     /// A flag set has bits that name no flag.
     #[error(transparent)]
     UnknownFlags(#[from] UnknownFlags),
+    /// The backend cannot carry out something valid: its host API lacks it, or the slice that
+    /// adds it has not landed. The text says what.
+    #[error("{0}")]
+    Unsupported(&'static str),
     /// The host device was lost; the one error that ends the run.
     #[error("the host device was lost")]
     DeviceLost,

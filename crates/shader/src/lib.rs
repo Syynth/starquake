@@ -19,6 +19,10 @@
 //! versioned encoding, the [`driver_constants`] layout, and the [`lookup`] request and result
 //! types (the shader cache that uses them is slice 19).
 //!
+//! Slice 2 parses the shader program header in front of every graphics program ([`sph`]): the
+//! stage, the attributes and system values read and written, the pixel interpolation modes, the
+//! colour targets and the local memory size.
+//!
 //! Experiment E1, run before this slice, lives in `lower`'s tests and its results in the spec.
 
 #[cfg(feature = "test-support")]
@@ -33,6 +37,7 @@ pub mod ir;
 pub mod lookup;
 pub mod lower;
 pub mod program;
+pub mod sph;
 #[cfg(test)]
 mod testing;
 pub mod translate;

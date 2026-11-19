@@ -1,4 +1,6 @@
-//! A generational slot table: the recording backend's store for each kind of resource.
+//! A generational slot table: each backend's store for each kind of resource (the recording
+//! backend's here, and the wgpu backend's in `starquake-render-wgpu`), re-exported as
+//! [`crate::Slots`].
 //!
 //! An id is a slot index and the generation the slot had when the id was handed out
 //! (docs/specs/render-backend.md, "Handles, lifetimes and fences"). Freeing a slot moves its
@@ -16,9 +18,9 @@ struct Slot<T> {
     value: Option<T>,
 }
 
-/// Values of one kind, addressed by `(index, generation)`.
+/// Values of one kind, addressed by `(index, generation)` (module docs).
 #[derive(Debug)]
-pub(super) struct Slots<T> {
+pub struct Slots<T> {
     slots: Vec<Slot<T>>,
     /// Free slot indices, reused from the end.
     free: Vec<u32>,
@@ -35,7 +37,7 @@ impl<T> Default for Slots<T> {
 
 impl<T> Slots<T> {
     /// Stores `value` and returns its `(index, generation)`.
-    pub(super) fn insert(&mut self, value: T) -> Result<(u32, u32), RenderError> {
+    pub fn insert(&mut self, value: T) -> Result<(u32, u32), RenderError> {
         if let Some(index) = self.free.pop()
             && let Some(slot) = usize::try_from(index)
                 .ok()
@@ -60,12 +62,12 @@ impl<T> Slots<T> {
     }
 
     /// The live value at `(index, generation)`.
-    pub(super) fn get(&self, index: u32, generation: u32) -> Option<&T> {
+    pub fn get(&self, index: u32, generation: u32) -> Option<&T> {
         self.slot(index, generation)?.value.as_ref()
     }
 
     /// The live value at `(index, generation)`, to change.
-    pub(super) fn get_mut(&mut self, index: u32, generation: u32) -> Option<&mut T> {
+    pub fn get_mut(&mut self, index: u32, generation: u32) -> Option<&mut T> {
         let slot = self.slots.get_mut(usize::try_from(index).ok()?)?;
         if slot.generation == generation {
             slot.value.as_mut()
@@ -75,7 +77,7 @@ impl<T> Slots<T> {
     }
 
     /// Takes the live value at `(index, generation)` out and frees its slot.
-    pub(super) fn remove(&mut self, index: u32, generation: u32) -> Option<T> {
+    pub fn remove(&mut self, index: u32, generation: u32) -> Option<T> {
         let slot = self.slots.get_mut(usize::try_from(index).ok()?)?;
         if slot.generation != generation {
             return None;
@@ -89,7 +91,7 @@ impl<T> Slots<T> {
     }
 
     /// Live values with their `(index, generation)`, in index order.
-    pub(super) fn iter(&self) -> impl Iterator<Item = (u32, u32, &T)> {
+    pub fn iter(&self) -> impl Iterator<Item = (u32, u32, &T)> {
         self.slots.iter().zip(0_u32..).filter_map(|(slot, index)| {
             slot.value
                 .as_ref()

@@ -79,7 +79,7 @@
 //! present as shown at host time zero: there is no display and no clock.
 
 mod plan;
-mod slots;
+pub(crate) mod slots;
 mod snapshot;
 mod store;
 mod texel;
