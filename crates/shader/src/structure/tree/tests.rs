@@ -263,3 +263,20 @@ fn broken_invariants_are_errors() {
         Err(StructureError::Internal(Invariant::Parents))
     );
 }
+
+#[test]
+fn the_sizes_the_memory_bound_counts() {
+    // The byte counts of the module docs' memory bound (parent module docs, "Limits"), on the
+    // 64-bit hosts starquake runs on: a statement, a condition, and what one emitted IR
+    // instruction can add (the instruction, two argument operands, its value in a block's
+    // list, a new glue block, the node that places it and one more node).
+    use crate::ir::{Block, Inst, Node, Operand, Value};
+    use std::mem::size_of;
+    assert_eq!(size_of::<Stmt>(), 104);
+    assert_eq!(size_of::<Kind>(), 24);
+    assert_eq!(size_of::<Expr>(), 24);
+    let instruction = size_of::<Inst>() + 2 * size_of::<Operand>() + size_of::<Value>();
+    assert_eq!(instruction, 40 + 32 + 4);
+    let unit = instruction + size_of::<Block>() + 2 * size_of::<Node>();
+    assert_eq!(unit, 220);
+}

@@ -114,9 +114,28 @@
 //! statement or condition made, each step up from a statement to its parent, each statement
 //! stepped over or moved to a new parent, each statement emitted and each step of evaluating a
 //! condition. A run that would go past its limit stops with [`StructureError::WorkLimit`], so a
-//! run of exactly the limit finishes (`tests::limits::the_work_limit_at_its_edge`); every loop
-//! of the pass walks the tree and is charged to this budget. [`MAX_STRUCTURE_WORK`] is the
-//! production limit. The tree may nest at most [`MAX_NESTING`] levels
+//! run of exactly the limit finishes (`tests::limits::the_work_limit_at_its_edge`). Every loop
+//! of the pass that walks the tree is charged to this budget: in the goto pass `level`,
+//! `directly_related`, `sibling_from_nephew`, `are_ordered`, `splice` and the
+//! `SanitizeNoBreaks` walk of `lift`, and in the emission its statement list and its condition
+//! walk; `tests::golden::the_work_of_each_golden_graph` pins the exact work of graphs that run
+//! each of them, and fails when any one of these charges, or the ones for making a statement or
+//! a condition and for removing a goto that is right before its label, is dropped.
+//! [`MAX_STRUCTURE_WORK`] is the production limit.
+//!
+//! **Memory.** The budget also bounds what the pass allocates, beyond the input and the
+//! layout (one entry per block of the input): each unit makes at most one statement (a
+//! 104-byte arena entry on a 64-bit host: a 24-byte kind and five 16-byte links), one condition
+//! (24 bytes), or, in the emission, at most one IR instruction (a 40-byte `Inst`, at most two
+//! 16-byte argument operands and its 4-byte `Value` in its block's list), one new glue block
+//! (a 48-byte `Block` and the 48-byte `Node` that places it) and one more 48-byte `Node`: at
+//! most 220 bytes a unit before allocator overhead, and the vectors that hold them can have up
+//! to twice that capacity as they grow (`tree::tests::the_sizes_the_memory_bound_counts`). The
+//! condition walk's own stacks are bounded by the condition it walks and freed after it. So a
+//! run of [`MAX_STRUCTURE_WORK`] units can make a hostile input allocate up to about 55 GiB
+//! (2^28 × 220 bytes), or twice that in capacity: far more than a host has, so the limit as it
+//! stands bounds time, not memory (an owner question, with the limit's own: lower it, or
+//! charge allocations against a byte budget). The tree may nest at most [`MAX_NESTING`] levels
 //! ([`StructureError::TooDeep`], `tests::limits::nesting_at_its_edge`), the verifier's bound,
 //! which also bounds the emission's recursion. Eden has neither limit. A chain of 257
 //! conditional branches to one block already nests 256 levels deep, so whether real programs
@@ -158,7 +177,9 @@ use crate::ir::{
 /// analysis's `MAX_FLOW_BLOCKS`). A run of diamonds takes the same work for each diamond
 /// (`tests::limits::work_grows_linearly_with_a_run_of_diamonds`; 145 units each when this
 /// was written), so the limit allows about 1.8 million of them; graphs that nest deeply cost
-/// more per block.
+/// more per block. It also bounds memory, at up to 220 bytes a unit, so about 55 GiB (twice
+/// that in vector capacity) for a hostile input (the module docs, "Limits"): too much for a
+/// host, which is part of the owner question.
 pub const MAX_STRUCTURE_WORK: u64 = 1 << 28;
 
 /// Why a function cannot be structured.

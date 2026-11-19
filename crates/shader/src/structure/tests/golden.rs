@@ -244,3 +244,117 @@ fn a_switch_like_jump_table() {
         assert_eq!(after.regs[1], r1);
     }
 }
+
+/// A goto lifted into a loop: block1, which nothing reaches, jumps back to block0 after it.
+const LIFTED: &str = "block0:
+    %0 = SetRegister r1, u32 1
+    return
+block1:
+    jump block0
+";
+
+#[test]
+fn the_work_of_each_golden_graph() {
+    // The exact work of each graph, as literals: `tests::limits::the_work_limit_at_its_edge`
+    // measures the work before it tests the limit, so it cannot see a loop that stops charging
+    // (the work would only shrink). Between them these graphs run every charged loop of the
+    // pass (the module docs, "Limits"): `level`, `directly_related`, `sibling_from_nephew`,
+    // `are_ordered` and `splice`, the `SanitizeNoBreaks` walk of a lift (LIFTED), the
+    // emission's statements and its condition walk. Each count was taken from this code; a
+    // change to one is explained in its pull request.
+    for (name, graph, work) in [
+        ("single", SINGLE, 14),
+        ("diamond", DIAMOND, 159),
+        ("irreducible", IRREDUCIBLE, 253),
+        ("nested_break", NESTED_BREAK, 322),
+        ("early_return", EARLY_RETURN, 220),
+        ("jump_table", JUMP_TABLE, 570),
+        ("lifted", LIFTED, 55),
+    ] {
+        assert_eq!(structured(graph).work, work, "the work of {name}");
+    }
+}
+
+/// A goto lifted into a loop: block1, which nothing reaches, jumps back to block0 after it.
+const LIFTED: &str = "block0:
+    %0 = SetRegister r1, u32 1
+    return
+block1:
+    jump block0
+";
+
+#[test]
+fn the_work_of_each_golden_graph() {
+    // The exact work of each graph, as literals: `tests::limits::the_work_limit_at_its_edge`
+    // measures the work before it tests the limit, so it cannot see a loop that stops charging
+    // (the work would only shrink). Between them these graphs run every charged loop of the
+    // pass (the module docs, "Limits"): `level`, `directly_related`, `sibling_from_nephew`,
+    // `are_ordered` and `splice`, the `SanitizeNoBreaks` walk of a lift (LIFTED), the
+    // emission's statements and its condition walk. Each count was taken from this code; a
+    // change to one is explained in its pull request.
+    for (name, graph, work) in [
+        ("single", SINGLE, 14),
+        ("diamond", DIAMOND, 159),
+        ("irreducible", IRREDUCIBLE, 253),
+        ("nested_break", NESTED_BREAK, 322),
+        ("early_return", EARLY_RETURN, 220),
+        ("jump_table", JUMP_TABLE, 570),
+        ("lifted", LIFTED, 55),
+    ] {
+        assert_eq!(structured(graph).work, work, "the work of {name}");
+    }
+}
+
+/// Two overlapping loops, so a backward goto is eliminated as a loop after moving out of the
+/// loop a later goto made around it: block1 counts r1 and block2 counts r2, which jumps back
+/// to block1 while r2 is below r4; block3 counts r3 and jumps back to block2 while r3 is below
+/// r5; block4 returns.
+const OVERLAPPING_LOOPS: &str = "block0:
+    jump block1
+block1:
+    %0 = GetRegister r1
+    %1 = IAdd32 %0, u32 1
+    %2 = SetRegister r1, %1
+    jump block2
+block2:
+    %3 = GetRegister r2
+    %4 = IAdd32 %3, u32 1
+    %5 = SetRegister r2, %4
+    %6 = GetRegister r4
+    %7 = ULessThan %4, %6
+    branch %7, block1, block3
+block3:
+    %8 = GetRegister r3
+    %9 = IAdd32 %8, u32 1
+    %10 = SetRegister r3, %9
+    %11 = GetRegister r5
+    %12 = ULessThan %9, %11
+    branch %12, block2, block4
+block4:
+    return
+";
+
+#[test]
+fn overlapping_loops_repeat() {
+    let tree = check(
+        OVERLAPPING_LOOPS,
+        include_str!("golden/overlapping_loops.txt"),
+    );
+    let graph = parse(OVERLAPPING_LOOPS);
+    // (r4, r5) and the counts (r1, r2, r3) they lead to: each back edge taken never, once,
+    // and several times. block2 repeats block1 until r2 reaches r4; each pass through block3
+    // below r5 runs block2 again, which counts r2 past r4 at once.
+    for (r4, r5, counts) in [
+        (0, 0, (1, 1, 1)),
+        (2, 0, (2, 2, 1)),
+        (0, 2, (1, 2, 2)),
+        (3, 3, (3, 5, 3)),
+    ] {
+        let mut machine = Machine::new();
+        machine.regs[4] = r4;
+        machine.regs[5] = r5;
+        let (ending, after) = same_run(&graph, &tree, &machine);
+        assert_eq!(ending, Ending::Returned);
+        assert_eq!((after.regs[1], after.regs[2], after.regs[3]), counts);
+    }
+}
