@@ -26,6 +26,9 @@ thiserror.workspace = true
 tracing.workspace = true
 # The content hash of a GPU capture's blobs and ring entries (slice G20, `capture`).
 twox-hash.workspace = true
+# The WGSL front end, to make the render crate's clear shader into the naga module a masked
+# clear draws with (slice G24, `back::draw::clear`).
+naga = { workspace = true, features = ["wgsl-in"] }
 
 [dev-dependencies]
 proptest.workspace = true

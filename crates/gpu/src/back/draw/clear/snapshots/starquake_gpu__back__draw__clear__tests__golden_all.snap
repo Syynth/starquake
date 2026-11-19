@@ -1,0 +1,12 @@
+---
+source: crates/gpu/src/back/draw/clear/tests.rs
+expression: rig.submit()
+---
+create t0: texture D2 A8B8G8R8_UNORM 8x6x1, 1 mips, 1 samples, usage SAMPLED|RENDER_TARGET|COPY_SRC|COPY_DST
+create v0: view of t0 as A8B8G8R8_UNORM D2, mips 0+1, layers 0+1, swizzle RGBA
+create t1: texture D2 D32_FLOAT_S8_UINT 8x6x1, 1 mips, 1 samples, usage SAMPLED|RENDER_TARGET|COPY_SRC|COPY_DST
+create v1: view of t1 as D32_FLOAT_S8_UINT D2, mips 0+1, layers 0+1, swizzle RGBA
+submit fence 1:
+  upload 192 bytes fnv1a 0xab0c262759a1d225 to t0 mip 0 at (0,0,0) size 8x6x1
+  clear v0 to float [0.0, 1.0, 0.5, 0.125] in the whole view
+  clear v1 to depth 0.25 stencil 129 in the whole view
