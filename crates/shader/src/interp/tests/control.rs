@@ -181,6 +181,9 @@ structure:
 ";
     assert_eq!(with_p0(text, true), (1, 0));
     assert_eq!(with_p0(text, false), (0, 2));
+    // Steps: block0's two operations, each `if` condition, and the one body that runs.
+    let mut machine = Machine::new();
+    assert_eq!(run(text, &mut machine).map(|f| f.steps), Ok(2 + 1 + 1 + 1));
 }
 
 #[test]
@@ -231,8 +234,11 @@ structure:
 #[test]
 fn break_and_return_leave_through_an_if() {
     let mut machine = Machine::new();
-    run(&exit_from_if("break u1 true"), &mut machine).expect("runs");
+    let finished = run(&exit_from_if("break u1 true"), &mut machine).expect("runs");
     assert_eq!(&machine.regs[..3], [3, 2, 7]);
+    // block0; two passes of block1 (4), the if, block2 (1) and the repeat; a third pass of
+    // block1, the if and the break; block3.
+    assert_eq!(finished.steps, 1 + 2 * (4 + 1 + 1 + 1) + (4 + 1 + 1) + 1);
     let mut machine = Machine::new();
     run(&exit_from_if("return"), &mut machine).expect("runs");
     assert_eq!(&machine.regs[..3], [3, 2, 0]);
