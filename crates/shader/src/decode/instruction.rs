@@ -111,6 +111,16 @@ impl Instruction {
         self.field(field) != 0
     }
 
+    /// Reads `field` as a two's-complement number of its width; a field wider than 64 bits
+    /// keeps its low 64 bits, and a width of 0 reads 0.
+    pub fn signed(self, field: Field) -> i64 {
+        let raw = self.field(field);
+        let unused = 64_u32.saturating_sub(field.width);
+        // Shift the sign bit to bit 63 and back, arithmetically.
+        let value = raw.checked_shl(unused).unwrap_or(0).cast_signed();
+        value.checked_shr(unused).unwrap_or(0)
+    }
+
     /// This instruction with `field` set to the low bits of `value` (higher bits of `value` are
     /// dropped).
     #[must_use]
