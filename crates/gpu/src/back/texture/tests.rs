@@ -587,7 +587,11 @@ fn a_3d_image_uploads_slice_by_slice() {
 
 #[test]
 fn a_pitch_image_uploads_its_rows() {
-    let mut rig = Rig::new();
+    // Three rows a piece, so the pieces after the first start at a row other than 0.
+    let mut rig = Rig::with(
+        caps(3 * 400, false, FormatTable::uniform(FormatFeatures::ALL)),
+        LARGE_BUDGET,
+    );
     let pitch = 512;
     let h = decode(
         Build::new()
@@ -614,6 +618,11 @@ fn a_pitch_image_uploads_its_rows() {
             .set(tex::TEXHEAD_PITCH_HEIGHT_MINUS_ONE, 9),
     );
     let view = rig.texture(&h).unwrap();
+    let pieces: Vec<(u32, u32)> = uploads(&rig.list.commands)
+        .iter()
+        .map(|u| (u.2.1, u.3.1))
+        .collect();
+    assert_eq!(pieces, [(0, 3), (3, 3), (6, 3), (9, 1)]);
     let host = rig.host_bytes(region(view.texture, 0, 0, (100, 10, 1)));
     let mut expected = Vec::new();
     for y in 0..10u64 {
@@ -732,9 +741,7 @@ fn an_image_turns_streamed_at_the_fault_threshold_not_before() {
     let t = settle(&mut rig, page(0));
     for n in 1..STREAMED_AFTER_FAULTS {
         // Two ranges of one image in one drain count one fault.
-        rig.cpu_write(page(0), &[1]);
-        rig.cpu_write(page(1), &[1]);
-        rig.drain();
+        rig.cache.cpu_writes(&[pages(0, 1), pages(1, 1)]);
         assert_eq!(rig.entry(t).faults, n);
         assert_eq!(rig.entry(t).watch, Watch::Unarmed, "{n}");
         rig.enter();
@@ -768,6 +775,12 @@ fn a_back_thread_write_makes_overlapping_images_stale() {
     let mut rig = Rig::new();
     let a = settle(&mut rig, page(0));
     let b = settle(&mut rig, page(IMAGE_PAGES));
+    // A range ending exactly at the second image's start.
+    rig.cache.invalidate(page(0)..page(IMAGE_PAGES));
+    assert!(rig.entry(a).stale);
+    assert!(!rig.entry(b).stale, "starts exactly at the range's end");
+    rig.texture(&header(page(0))).unwrap();
+    assert!(!rig.entry(a).stale);
     rig.cache
         .invalidate(page(IMAGE_PAGES)..page(IMAGE_PAGES) + 1);
     assert!(!rig.entry(a).stale, "ends exactly at the range's start");
@@ -1133,9 +1146,10 @@ fn a_depth_image_of_the_guessed_gob_is_made_without_contents() {
         rig.entry(view.texture).source,
         Source::Unconvertible(Unconvertible::Gob(starquake_layout::GobType::FermiZs))
     );
-    // A CPU write to it changes nothing it holds.
-    rig.cpu_write(page(0), &[1]);
-    rig.drain();
+    // It is not watched, and a write to its memory changes nothing it holds.
+    assert!(!rig.watch.has_requests());
+    rig.cache.cpu_writes(&[pages(0, 1)]);
+    assert!(rig.entry(view.texture).stale);
     rig.texture(&h).unwrap();
     assert!(!rig.entry(view.texture).stale);
     assert_eq!(uploads(&rig.list.commands), Vec::<Upload>::new());
@@ -1224,14 +1238,16 @@ fn each_distinct_view_is_made_once_up_to_the_cap() {
     };
     // The headers' swizzles are distinct for i below 36, except the two ones.
     let mut views = Vec::new();
+    // Bounded by the headers there are, so a broken cache fails rather than hangs.
     let mut i = 0;
-    while views.len() < MAX_VIEWS_PER_IMAGE {
+    while views.len() < MAX_VIEWS_PER_IMAGE && i < 36 {
         let v = rig.texture(&with(i)).unwrap();
         if !views.contains(&v.view) {
             views.push(v.view);
         }
         i += 1;
     }
+    assert_eq!(views.len(), MAX_VIEWS_PER_IMAGE);
     let t = rig.cache.entries().next().unwrap().texture;
     assert_eq!(rig.entry(t).views, MAX_VIEWS_PER_IMAGE);
     // A view it has is found again; one more is refused, and nothing changes.
@@ -1734,6 +1750,70 @@ fn checks_run_in_their_documented_order() {
         Err(TextureError::StagingTooSmall { .. })
     ));
     assert!(rig.cache.is_empty() && tight.cache.is_empty());
+}
+
+#[test]
+fn a_held_image_runs_its_checks_in_their_documented_order() {
+    let mut formats = FormatTable::uniform(FormatFeatures::ALL);
+    formats.set(
+        PixelFormat::A8B8G8R8Unorm,
+        FormatFeatures::SAMPLE.union(FormatFeatures::COPY),
+    );
+    let mut rig = Rig::with(caps(1 << 20, true, formats), LARGE_BUDGET);
+    let t = rig.texture(&header(page(0))).unwrap().texture;
+    // Fill the image's views up to the cap, each with its own swizzle.
+    let sources = [
+        tex::TEXHEAD_BL_X_SOURCE_IN_ZERO,
+        tex::TEXHEAD_BL_X_SOURCE_IN_R,
+        tex::TEXHEAD_BL_X_SOURCE_IN_G,
+        tex::TEXHEAD_BL_X_SOURCE_IN_B,
+        tex::TEXHEAD_BL_X_SOURCE_IN_A,
+        tex::TEXHEAD_BL_X_SOURCE_IN_ONE_INT,
+    ];
+    let with = |i: usize| {
+        decode(
+            bl_header(page(0))
+                .set(tex::TEXHEAD_BL_X_SOURCE, sources[i % 6])
+                .set(tex::TEXHEAD_BL_Y_SOURCE, sources[i / 6 % 6]),
+        )
+    };
+    let mut i = 0;
+    while rig.entry(t).views < MAX_VIEWS_PER_IMAGE && i < 36 {
+        rig.texture(&with(i)).unwrap();
+        i += 1;
+    }
+    assert_eq!(rig.entry(t).views, MAX_VIEWS_PER_IMAGE);
+    let new_view = (i..36)
+        .map(with)
+        .find(|h| h.view.swizzle != with(0).view.swizzle && rig.texture(h).is_err())
+        .unwrap();
+    // Stale, its memory unmapped, at the view cap, and not renderable, all at once.
+    rig.cache.invalidate(page(0)..page(1));
+    rig.mem.unmap(pages(0, 1)).unwrap();
+    let list = rig.list.commands.len();
+    assert_eq!(
+        rig.target(&header(page(0)).image),
+        Err(TextureError::NotRenderable {
+            format: PixelFormat::A8B8G8R8Unorm
+        })
+    );
+    // The upload's fault before the view cap.
+    assert_eq!(
+        rig.texture(&new_view),
+        Err(TextureError::Fault(GpuFault::Unmapped { va: page(0) }))
+    );
+    // With the memory back, the view cap.
+    rig.mem.map(pages(0, 1), page(0)).unwrap();
+    assert_eq!(
+        rig.texture(&new_view),
+        Err(TextureError::TooManyViews {
+            max: MAX_VIEWS_PER_IMAGE
+        })
+    );
+    // Nothing changed on any of them.
+    assert_eq!(rig.list.commands.len(), list);
+    assert!(rig.entry(t).stale);
+    assert_eq!(rig.entry(t).views, MAX_VIEWS_PER_IMAGE);
 }
 
 #[test]

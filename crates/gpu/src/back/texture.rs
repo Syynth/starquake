@@ -189,9 +189,11 @@
 //!   `tests::a_gpu_modified_image_is_never_collected`.
 //! - **Huge images (row 87).** Eden-NX2 makes an image over 2^28 texels sparse with no memory and
 //!   never uploads it. Here an image larger than the budget allows, or than the device's limits,
-//!   is an error ([`TextureError::OverBudget`] or [`TextureError::Render`]); a header whose layout
-//!   overflows is [`TextureError::Layout`]. Pinned by
-//!   `tests::hostile_headers_are_errors_not_panics`.
+//!   is an error ([`TextureError::OverBudget`] or [`TextureError::Render`]); a description the
+//!   layout crate refuses is [`TextureError::Layout`]. Pinned by
+//!   `tests::hostile_headers_are_errors_not_panics` (the budget) and
+//!   `tests::headers_past_the_device_or_the_layout_are_errors` (the device and the layout), and
+//!   for any decodable header by `tests::any_decoded_header_is_made_or_refused`.
 //! - **Views per image (guess).** [`MAX_VIEWS_PER_IMAGE`] bounds what a guest can make the host
 //!   allocate per image; no reference has such a cap.
 //! - **Format fallbacks.** The texture is made in the guest's format; choosing a host stand-in
@@ -261,11 +263,13 @@ pub enum Unconvertible {
 ///
 /// For a new image the checks run in this order: `Layout` (the layout crate lays the image out),
 /// `OutOfRange`, `NotRenderable` (render targets), `OverBudget`, then the backend makes the
-/// texture (`Render`) and the upload is prepared level by level and layer by layer, each piece
-/// asking for its staging slice (`StagingTooSmall` when one row does not fit, else `Render`)
-/// after reading its level's bytes (`Fault`). For an image already held, `NotRenderable`, then
-/// the upload if one is due; then the view (`TooManyViews`, `Render`). Pinned by
-/// `tests::checks_run_in_their_documented_order`.
+/// texture (`Render`), the upload is prepared level by level (for each level, `StagingTooSmall`
+/// when one packed row does not fit a staging slice; then for each layer its guest bytes are read,
+/// `Fault`, and each piece asks for its staging slice, `Render`), and last the view is made
+/// (`Render`). For an image already held: `NotRenderable`, then the upload if one is due (as
+/// above), then a new view (`TooManyViews`, `Render`). Pinned by
+/// `tests::checks_run_in_their_documented_order` and
+/// `tests::a_held_image_runs_its_checks_in_their_documented_order`.
 ///
 /// Nothing changes on any of them: no image, watch request, live texture or view, page state or
 /// command is left behind (a texture made for the use is destroyed at once, being in no list),
@@ -511,16 +515,21 @@ impl Image {
         self.layout.size_b()
     }
 
-    /// Whether a use now uploads it.
-    fn needs_upload(&self, armed_now: bool) -> bool {
+    /// Whether a use now uploads it. An image stays [`Watch::Unarmed`] until the end of the
+    /// use that first sees its watch armed, so that use uploads too (module docs, "Learning of
+    /// CPU writes").
+    fn needs_upload(&self) -> bool {
         if self.source != Source::Guest {
             return false;
         }
         self.stale
             || self.watch == Watch::Streamed
-            || (!self.gpu_modified && (self.watch == Watch::Unarmed || armed_now))
+            || (!self.gpu_modified && self.watch == Watch::Unarmed)
     }
 
+    /// Whether the image's bytes share an address with `range`. Its only caller,
+    /// [`TextureCache::overlapping`], already leaves out images starting at or past the range's
+    /// end, so the first comparison is a second guard (`<=` there is an equivalent mutation).
     fn overlaps(&self, range: &Range<u64>) -> bool {
         self.info.address < range.end && range.start < self.pages_end()
     }
@@ -768,7 +777,7 @@ impl TextureCache {
         // Asked before the guest bytes are read, so a read after `true` comes after the
         // protection took effect.
         let armed_now = image.pending.is_some_and(|t| self.watch.armed(t));
-        let upload = image.needs_upload(armed_now);
+        let upload = image.needs_upload();
         let mut commands = Vec::new();
         if upload {
             self.stage(mem, &image.info, &image.layout, texture, &mut commands)?;
@@ -904,6 +913,7 @@ impl TextureCache {
             .bytes
             .saturating_add(self.doomed_bytes)
             .saturating_add(size);
+        // Only skips the walk: the loop below stops at the same edge (an equivalent mutation).
         if bytes <= allowed {
             return Ok(Vec::new());
         }

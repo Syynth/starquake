@@ -65,7 +65,7 @@
 //!   unchecked) (`each_refusal_reports_its_own_error`).
 //! - **Swizzle.** `IN_ONE_INT` and `IN_ONE_FLOAT` both become [`SwizzleSource::One`]: the render
 //!   crate's swizzle has one constant one, which a view or shader reads in the view's own numeric
-//!   type (`both_ones_become_one`).
+//!   type (`both_ones_become_one_and_each_source_maps`).
 //! - **Not read.** `TILE_WIDTH_IN_GOBS` (sparse tile spacing), `GOB3D`, `GOB_DEPTH_OFFSET`,
 //!   `PACK_COMPONENTS`, `DEPTH_TEXTURE`, `NORMALIZED_COORDS`, the sampling hints (`LOD_*`,
 //!   `ANISO_*`, `TRILIN_OPT`, `MIP_LOD_BIAS`, `MIN_LOD_CLAMP`, `SECTOR_PROMOTION`,
