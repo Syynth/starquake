@@ -70,7 +70,8 @@
 //! | `BAR` form `0x31d` | Unknown opcode: NAK's encoding of it is commented out and PR #4588's translator accepts only `0xb1d` (`visitor.cpp`, case `0xb1d`) | `control_rows_left_undecoded_are_unknown_opcodes` |
 //! | Bits 87..90 and 91 of the uniform `BRA`, bit 91 of `BRXU` | Required set (see above); the table marks them known only | `control_fixed_bits_are_required` |
 //!
-//! Every other control form's mask is its row's exactly (`decode::tests::masks_match_the_reference_table`).
+//! Every other control form's mask is its row's exactly
+//! (`decode::tests::masks_match_the_reference_table`).
 //!
 //! # Values the decoder refuses
 //!
