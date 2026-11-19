@@ -3,7 +3,7 @@
 //! and a `BRXU` jump table, each run in the interpreter against the graph with the source
 //! blocks filled as a translator would fill them, after structuring.
 
-use super::super::{BranchTables, IrBlocks, flow_graph};
+use super::super::{BlockIndex, BlockSource, BranchTables, IrBlocks, flow_graph};
 use super::{Item, Program, exit, kill, p, pure, side_effect};
 use crate::asm::assemble;
 use crate::decode::{BrxSrc, Gpr, Instruction, UniformReg};
@@ -232,5 +232,98 @@ fn an_indirect_branch_is_structured() {
         assert_eq!(ended, ending);
         assert_eq!(after.regs[usize::from(PATH)], path);
         assert_eq!(after.indirect_branch, address);
+    }
+}
+
+#[test]
+fn the_entry_comes_first_when_the_sources_leave_it_out() {
+    // The if/else program with flow block 0's source taken out: block 0 is still the entry,
+    // and the tree must start there, not at the first block a source names.
+    let code = if_else();
+    let tables = BranchTables::new(0);
+    let mut ir = flow_graph(&code, &tables)
+        .expect("accepted")
+        .build_ir()
+        .expect("IR");
+    let entry = ir.sources.remove(0);
+    assert_eq!(entry.block, ir.function.entry());
+    let structured = ir
+        .clone()
+        .structure(MAX_STRUCTURE_WORK)
+        .expect("structures");
+    // Block 0 jumps to its test block (4), which no source names, so the chain places it next.
+    assert_eq!(layout(&ir, &structured), vec![0, 4, 1, 2, 3]);
+    let mut graph = ir.function.clone();
+    fill(&mut graph, &ir, &code, &tables);
+    let mut tree = structured.blocks.function.clone();
+    fill(&mut tree, &ir, &code, &tables);
+    // Block 0 is not filled now: the path holds block 1 (2) or block 2 (3), then block 3 (4).
+    for (p0, path) in [(false, 2 * 31 + 4), (true, 3 * 31 + 4)] {
+        let mut machine = Machine::new();
+        machine.preds[0] = p0;
+        let (ending, after) = same_run(&graph, &tree, &machine);
+        assert_eq!(ending, Ending::Returned);
+        assert_eq!(after.regs[usize::from(PATH)], path);
+    }
+}
+
+/// A graph whose blocks 1 to 3 no source names and no chain from a source reaches: block 0
+/// branches on p0 to block 1 (`then`, which starts no chain) or block 4 (`otherwise`, attached
+/// to block 0); block 1 jumps over block 2, which nothing reaches, to block 3.
+const LEFTOVERS: &str = "block0:
+    %0 = GetPred p0
+    branch %0, block1, block4
+block1:
+    %1 = SetRegister r1, u32 1
+    jump block3
+block2:
+    %2 = SetRegister r2, u32 2
+    return
+block3:
+    %3 = SetRegister r3, u32 3
+    return
+block4:
+    %4 = SetRegister r4, u32 4
+    return
+";
+
+#[test]
+fn blocks_no_chain_reaches_follow_in_arena_order() {
+    let function = Function::parse(LEFTOVERS).expect("parses");
+    let blocks: Vec<BlockId> = function.blocks().map(|(id, _)| id).collect();
+    let source = |block: BlockId| BlockSource {
+        block,
+        flow: BlockIndex(0),
+    };
+    // Only block 0 is a source. Block 1 is not, so it starts no chain of its own: block 3,
+    // its jump's target, keeps its arena place after block 2.
+    let only_entry = IrBlocks {
+        function: function.clone(),
+        sources: vec![source(blocks[0])],
+    };
+    // The same, with block 0 named twice and a block the function does not have.
+    let mut stray = Function::parse(LEFTOVERS).expect("parses");
+    let mut missing = blocks[0];
+    for _ in 0..=blocks.len() {
+        missing = stray.add_block().expect("a block");
+    }
+    let odd = IrBlocks {
+        function: function.clone(),
+        sources: vec![source(blocks[0]), source(missing), source(blocks[0])],
+    };
+    for ir in [only_entry, odd] {
+        let structured = ir
+            .clone()
+            .structure(MAX_STRUCTURE_WORK)
+            .expect("structures");
+        assert_eq!(layout(&ir, &structured), vec![0, 4, 1, 2, 3]);
+        for p0 in [false, true] {
+            let mut machine = Machine::new();
+            machine.preds[0] = p0;
+            let (ending, after) = same_run(&function, &structured.blocks.function, &machine);
+            assert_eq!(ending, Ending::Returned);
+            let expected = if p0 { [1, 0, 3, 0] } else { [0, 0, 0, 4] };
+            assert_eq!(after.regs[1..=4], expected);
+        }
     }
 }

@@ -92,14 +92,21 @@
 //! # Layout
 //!
 //! [`structure`] lays the blocks out in arena order. [`IrBlocks::structure`] lays out the
-//! source blocks in arena order and places each block that no source names (a test block, an
-//! indirect branch's comparison block or a kill's demote block, which flow analysis makes after
-//! all the source blocks) right after the block whose jump, or whose branch's `otherwise`,
-//! leads to it, following such chains: that is where Eden's statement list has the test, the
-//! comparisons and the demote, among the flow block's own statements. A block no source names
-//! that no chain reaches is placed after the rest, in arena order. Goto elimination only wraps
-//! runs of statements, never reorders them, so the tree runs through the blocks in layout
-//! order (`flow::tests::structure::each_test_block_follows_its_block`).
+//! function's entry first, whether or not a source names it, so the tree starts where the graph
+//! does (`flow::tests::structure::the_entry_comes_first_when_the_sources_leave_it_out`); then
+//! the source blocks in arena order. After each of these it places each block that no source
+//! names (a test block, an indirect branch's comparison block or a kill's demote block, which
+//! flow analysis makes after all the source blocks) right after the block whose jump, or whose
+//! branch's `otherwise`, leads to it, following such chains: that is where Eden's statement
+//! list has the test, the comparisons and the demote, among the flow block's own statements.
+//! Only the entry and the source blocks start chains. A block no source names that no chain
+//! reaches is placed after the rest, in arena order
+//! (`flow::tests::structure::blocks_no_chain_reaches_follow_in_arena_order`). The sources are
+//! not checked: one naming a block the function does not have is ignored, and one naming a
+//! block twice counts once; whatever they name, each block is placed exactly once, the entry
+//! first. Goto elimination only wraps runs of statements, never reorders them, so the tree runs
+//! through the blocks in layout order
+//! (`flow::tests::structure::each_test_block_follows_its_block`).
 //!
 //! # Limits
 //!
@@ -278,12 +285,15 @@ fn source_layout(function: &Function, sources: &[BlockSource]) -> Vec<BlockId> {
             order.push(block);
         }
     };
-    for (block, _) in function.blocks() {
-        let is_source_block = slot(block)
+    // The entry first, wherever the sources put it, then the source blocks in arena order.
+    let sources_in_order = function.blocks().map(|(block, _)| block).filter(|&block| {
+        slot(block)
             .and_then(|slot| is_source.get(slot))
             .copied()
-            .unwrap_or(false);
-        if !is_source_block {
+            .unwrap_or(false)
+    });
+    for block in std::iter::once(function.entry()).chain(sources_in_order) {
+        if slot(block).is_none_or(|slot| placed.get(slot).copied().unwrap_or(true)) {
             continue;
         }
         place(block, &mut placed, &mut order);
