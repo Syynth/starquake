@@ -605,9 +605,11 @@ fn nothing_is_visible_before_its_list_completes() {
     let marker = FencedAction::Marker {
         token: MarkerToken(7),
         ordered: Some(OrderedUpdate {
-            vm: Arc::clone(&vm),
-            update: Some(VmUpdate::Unmap {
-                range: PageRange::new(vm_base, PAGE_SIZE).unwrap(),
+            change: Some(VmChange {
+                vm: Arc::clone(&vm),
+                update: VmUpdate::Unmap {
+                    range: PageRange::new(vm_base, PAGE_SIZE).unwrap(),
+                },
             }),
             ticket: Some(Ticket(9)),
         }),
@@ -1441,9 +1443,11 @@ fn an_ordered_update_is_applied_before_its_report() {
     let marker = FencedAction::Marker {
         token: MarkerToken(1),
         ordered: Some(OrderedUpdate {
-            vm: Arc::clone(&vm),
-            update: Some(VmUpdate::DestroyMemory {
-                range: PageRange::new(GPU_BASE, PAGE_SIZE).unwrap(),
+            change: Some(VmChange {
+                vm: Arc::clone(&vm),
+                update: VmUpdate::DestroyMemory {
+                    range: PageRange::new(GPU_BASE, PAGE_SIZE).unwrap(),
+                },
             }),
             ticket: Some(Ticket(4)),
         }),
@@ -1476,8 +1480,7 @@ fn markers_report_their_token_and_only_what_they_carry() {
         (
             MarkerToken(2),
             Some(OrderedUpdate {
-                vm: Arc::clone(&vm),
-                update: None,
+                change: None,
                 ticket: Some(Ticket(20)),
             }),
             vec![GpuCompletion::GpuOrdered { ticket: Ticket(20) }],
@@ -1487,8 +1490,10 @@ fn markers_report_their_token_and_only_what_they_carry() {
         (
             MarkerToken(3),
             Some(OrderedUpdate {
-                vm: Arc::clone(&vm),
-                update: Some(unmap),
+                change: Some(VmChange {
+                    vm: Arc::clone(&vm),
+                    update: unmap,
+                }),
                 ticket: None,
             }),
             vec![GpuCompletion::GpuOrdered { ticket: Ticket(20) }],
@@ -1764,12 +1769,14 @@ fn eight(address: u64, payload: u64) -> Release {
     }
 }
 
-/// The report of an action performed at once.
-fn performed(attached: Result<Attached, FenceError>) -> Report {
-    match attached {
-        Ok(Attached::Performed(report)) => report,
-        other => panic!("not performed at once: {other:?}"),
-    }
+/// What attaching one release with nothing recorded or in flight answers: performed at once,
+/// with whether it latched a waiter.
+fn performed(latched: bool) -> Result<Attached, FenceError> {
+    Ok(Attached::Performed(Report {
+        released: 1,
+        latched,
+        ..Report::default()
+    }))
 }
 
 #[test]
@@ -1781,8 +1788,10 @@ fn a_wide_release_latches_a_waiter_on_its_high_word() {
     r.waiters.register(waiter_on(1, SPACE, SEM, 0x5566_7788));
     r.waiters.register(waiter_on(2, SPACE, SEM + 4, 0x1122_3344));
     r.waiters.register(waiter_on(3, SPACE, SEM + 8, 0x5566_7788));
-    let report = performed(r.fences.attach(r.action(eight(SEM, 0x1122_3344_5566_7788))));
-    assert!(report.latched);
+    assert_eq!(
+        r.fences.attach(r.action(eight(SEM, 0x1122_3344_5566_7788))),
+        performed(true)
+    );
     assert!(r.waiters.is_latched(ChannelId(1)));
     assert!(r.waiters.is_latched(ChannelId(2)));
     assert!(!r.waiters.is_latched(ChannelId(3)));
@@ -1791,8 +1800,10 @@ fn a_wide_release_latches_a_waiter_on_its_high_word() {
     // whatever the payload's high half.
     let mut r = rig();
     r.waiters.register(waiter_on(4, SPACE, SEM + 4, 0x1122_3344));
-    let report = performed(r.fences.attach(r.action(four(SEM, 0x1122_3344_5566_7788))));
-    assert!(!report.latched);
+    assert_eq!(
+        r.fences.attach(r.action(four(SEM, 0x1122_3344_5566_7788))),
+        performed(false)
+    );
     assert!(!r.waiters.is_latched(ChannelId(4)));
 
     // The 16-byte structure covers four words: the timestamp's halves at SEM + 8 and SEM + 12.
@@ -1809,8 +1820,7 @@ fn a_wide_release_latches_a_waiter_on_its_high_word() {
         },
         ..four(SEM, 1)
     };
-    let report = performed(r.fences.attach(r.action(release)));
-    assert!(report.latched);
+    assert_eq!(r.fences.attach(r.action(release)), performed(true));
     assert!(r.waiters.is_latched(ChannelId(5)));
     assert!(r.waiters.is_latched(ChannelId(6)));
 }

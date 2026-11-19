@@ -220,16 +220,24 @@ pub trait FrontWake: Send + Sync {
 }
 
 /// An ordered update or barrier to apply when its marker is performed ("Ordered address-table
-/// updates and barriers", step 4).
+/// updates and barriers", step 4). The front loop (slice G14) makes them, and keeps them by
+/// marker token for the executor in [`crate::front::OrderedTable`].
 #[derive(Clone)]
 pub struct OrderedUpdate {
-    /// The address table the update applies to.
-    pub vm: Arc<GpuVm>,
-    /// The update; `None` for a barrier.
-    pub update: Option<VmUpdate>,
+    /// The change to an address table; `None` for a barrier, which names none.
+    pub change: Option<VmChange>,
     /// The ticket reported as [`GpuCompletion::GpuOrdered`] once applied; `None` when gsv asked
     /// for no report.
     pub ticket: Option<Ticket>,
+}
+
+/// One update of one address table.
+#[derive(Clone)]
+pub struct VmChange {
+    /// The address table the update applies to.
+    pub vm: Arc<GpuVm>,
+    /// The update.
+    pub update: VmUpdate,
 }
 
 /// An action performed only after the host GPU has finished the work recorded before it.
@@ -774,8 +782,8 @@ impl Fences {
             }
             FencedAction::Marker { token, ordered } => {
                 if let Some(ordered) = ordered {
-                    if let Some(update) = ordered.update {
-                        ordered.vm.apply(&update);
+                    if let Some(change) = ordered.change {
+                        change.vm.apply(&change.update);
                     }
                     if let Some(ticket) = ordered.ticket {
                         self.env

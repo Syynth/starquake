@@ -713,6 +713,13 @@ impl MacroChannel {
         self.waiting.is_some()
     }
 
+    /// The engine (3D or compute) of the call waiting for a catch-up, if one waits: the class
+    /// whose register file [`ProcessMacros::resume`] takes (the front loop, slice G14, picks it
+    /// with this).
+    pub fn waiting_engine(&self) -> Option<Engine> {
+        self.waiting.as_ref().map(|waiting| waiting.engine)
+    }
+
     /// Whether the channel's compute class uses its own code store and start table.
     pub const fn compute_uploaded(&self) -> bool {
         self.compute_uploaded
