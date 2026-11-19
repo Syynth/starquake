@@ -20,7 +20,10 @@
 //!
 //! A list's fence value is its place in submit order. The render thread asks wgpu to report when
 //! the submission holding the list has finished (`Queue::on_submitted_work_done`, the owner's
-//! decision of 2026-11-12), copies out the list's readbacks, and then, under the lock, stores
+//! decision of 2026-11-12). Each readback buffer is mapped (`Buffer::map_async`) right after the
+//! list's last submit, and wgpu completes the mapping only once that submission has finished,
+//! so the bytes are read after the list completes ("Buffers and uploads"). The thread copies
+//! out the list's readbacks, and then, under the lock, stores
 //! the readbacks, the present feedback and the new [`Backend::completed`] value together, and
 //! frees the destroys that value lets go. Only after the lock is released does it call the
 //! [`CompletionWake`], once for all the lists that finished together, and then hand dumped
@@ -39,10 +42,19 @@
 //!
 //! # Lost device
 //!
-//! When wgpu reports the device lost (or the render thread stops by a panic), every later call
-//! that can fail returns [`RenderError::DeviceLost`], waiters stop waiting, and the wake is
-//! called so the back thread looks; the run ends there (render-backend, "Errors and untrusted
-//! input": exit code 2, which `core` maps). Lists still queued or in flight never complete.
+//! When wgpu reports the device lost (or the render thread stops by a panic), the `create_*`
+//! calls for buffers, textures, views and samplers, `submit`, and a `wait` for a value not yet
+//! reached return [`RenderError::DeviceLost`]; a `submit` waiting for room and every `wait`
+//! stop waiting; and the wake is called so the back thread looks. The run ends there
+//! (render-backend, "Errors and untrusted input": exit code 2, which `core` maps). Lists still
+//! queued or in flight never complete.
+//!
+//! # No hidden inputs
+//!
+//! The backend's results depend on the trait calls, the adapter and the [`WgpuConfig`] only: it
+//! reads no environment variable (wgpu's `from_env` instance options are not used) and no file
+//! (render-backend, "Render capture v2", "What R5 and R6 must do now"). Present feedback carries
+//! host time, which is never guest-visible.
 //!
 //! # What the trait cannot report
 //!

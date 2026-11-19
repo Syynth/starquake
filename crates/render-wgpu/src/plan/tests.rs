@@ -572,7 +572,16 @@ fn readback_ids_are_used_once() {
         id: ReadbackId::new(9, 0),
     };
     assert_eq!(
-        run(&w, vec![read_depth]).err(),
+        run(&w, vec![read_depth.clone()]).err(),
+        Some(RenderError::Unsupported(rules::DEPTH_BUFFER_COPY))
+    );
+    // Both faults: the wgpu rule (3) comes before the readback id rule (4).
+    let taken = BTreeSet::from([ReadbackId::new(9, 0)]);
+    let list = CommandList {
+        commands: vec![read_depth],
+    };
+    assert_eq!(
+        check(&w.tables, &test_caps(), &taken, list).err(),
         Some(RenderError::Unsupported(rules::DEPTH_BUFFER_COPY))
     );
 }

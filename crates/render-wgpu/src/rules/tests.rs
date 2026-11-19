@@ -186,6 +186,24 @@ fn compressed_sizes_round_up_to_whole_blocks_within_the_limit() {
         Ok((5, 9)),
         "uncompressed: unchanged"
     );
+    // 8x8 blocks divide the limit: rounding up to exactly the limit fits, one block more not.
+    assert_eq!(
+        limit % 8,
+        0,
+        "the edge case below needs a limit of whole 8x8 blocks"
+    );
+    assert_eq!(
+        at(PixelFormat::Astc2d8x8Unorm, limit - 7, 8),
+        Ok((limit, 8))
+    );
+    assert_eq!(
+        at(PixelFormat::Astc2d8x8Unorm, 8, limit - 7),
+        Ok((8, limit))
+    );
+    assert_eq!(
+        at(PixelFormat::Astc2d8x8Unorm, limit + 1, 8),
+        Err(refused(PADDED_SIZE))
+    );
     // 12x12 blocks: the last multiple of 12 within the limit fits, one texel more does not.
     let last = limit - limit % 12;
     assert_eq!(at(PixelFormat::Astc2d12x12Unorm, last, 12), Ok((last, 12)));

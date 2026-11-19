@@ -3,10 +3,10 @@
 //! lifetimes and fences": a stale or foreign id is an error when the list is encoded).
 //!
 //! The check runs on the submitting thread, under the backend's lock, before the list is queued,
-//! so every refusal is the `Err` of `submit` and nothing is queued, fenced or reserved (the
-//! render thread meets no error the check did not; a render capture sees every refusal where
-//! the trait reports it, render-backend "What R5 and R6 must do now"). For each command, in list
-//! order, the first error of:
+//! so every refusal is the `Err` of `submit` and nothing is queued, fenced or reserved (a
+//! render capture sees every refusal where the trait reports it, render-backend "What R5 and R6
+//! must do now"). Commands are checked in list order, and the first error is returned. Within a
+//! command the checks run in this order:
 //!
 //! 1. its ids name live resources of their kind (a view's texture too);
 //! 2. the shared checks of `starquake_render::validate` (bounds, usages, formats, overlaps);
@@ -15,6 +15,10 @@
 //!    applies the same ones): a readback id is not already waiting to be taken or in flight,
 //!    and is not used twice in the list; colour target views store colour and depth/stencil
 //!    target views do not, both from textures with the render-target usage.
+//!
+//! One exception: `SetRenderTargets` checks its target count (2) before its ids (1), as the
+//! recording backend does. Errors wgpu would report later on the render thread are what rule 3
+//! exists to prevent; the backend counts any that still occur (`WgpuBackend::host_errors`).
 //!
 //! Blits, draws and dispatches are refused with [`BLITS_NOT_YET`] and [`DRAWS_NOT_YET`]: the
 //! wgpu backend has no pipelines until slices R6 and R7 (the present blit is R8's).
@@ -337,9 +341,6 @@ pub fn check(
             Command::Readback { from, id } => {
                 let resolved = resolve(tables, &from)?;
                 validate::validate_readback(resolved)?;
-                if taken.contains(&id) || !used.insert(id) {
-                    return Err(RenderError::Invalid(READBACK_TAKEN));
-                }
                 let from = match resolved {
                     Resolved::Buffer { slice, .. } => ReadFrom::Buffer {
                         buffer: slice.buffer,
@@ -352,6 +353,9 @@ pub fn check(
                         ReadFrom::Texture { at, rows }
                     }
                 };
+                if taken.contains(&id) || !used.insert(id) {
+                    return Err(RenderError::Invalid(READBACK_TAKEN));
+                }
                 out.readbacks.push(id);
                 Step::Readback { id, from }
             }

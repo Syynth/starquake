@@ -1015,6 +1015,18 @@ fn destroys_wait_for_their_fence() {
             gpu.take_readback(ReadbackId::new(5, 0)),
             Some(Readback::Bytes(vec![9; 8]))
         );
+        // A fence equal to the completed value has passed: freed at once.
+        let third = gpu
+            .create_buffer(&BufferDesc {
+                size: 8,
+                usage: COPY,
+            })
+            .expect("buffer");
+        gpu.destroy(ResourceId::Buffer(third), gpu.completed());
+        assert_eq!(
+            gpu.submit(read(7, third)),
+            Err(RenderError::Invalid(NO_BUFFER))
+        );
         // Ids that name nothing live are refused and counted.
         gpu.destroy(ResourceId::Buffer(other), FenceValue::ZERO);
         gpu.destroy(ResourceId::Shader(ShaderId::new(0, 0)), FenceValue::ZERO);
@@ -1257,5 +1269,62 @@ fn dropping_the_backend_with_lists_in_flight_returns() {
             gpu.submit(CommandList::new()).expect("empty list");
         }
         drop(gpu);
+    });
+}
+
+#[test]
+fn readback_ids_are_reserved_until_taken() {
+    bounded(|| {
+        let Some(gpu) = backend("readback_ids") else {
+            return;
+        };
+        let buf = gpu
+            .create_buffer(&BufferDesc {
+                size: 16,
+                usage: COPY,
+            })
+            .expect("buffer");
+        let read = |id| Command::Readback {
+            from: slice(buf, 4, 8),
+            id: ReadbackId::new(id, 0),
+        };
+        let one = |c| CommandList { commands: vec![c] };
+        let taken = Err(RenderError::Invalid(crate::plan::READBACK_TAKEN));
+        // A refused list reserves nothing: its readback id stays free.
+        let blit = Command::Blit(BlitDesc {
+            src: ViewId::new(0, 0),
+            src_rect: Rect::default(),
+            dst: ViewId::new(0, 0),
+            dst_rect: Rect::default(),
+            filter: FilterMode::Nearest,
+        });
+        let refused = CommandList {
+            commands: vec![read(1), blit],
+        };
+        assert!(gpu.submit(refused).is_err());
+        // In flight, then waiting to be taken: refused both times.
+        let fence = gpu.submit(one(read(1))).expect("free");
+        assert_eq!(gpu.submit(one(read(1))), taken);
+        finish(&gpu, fence);
+        assert_eq!(gpu.submit(one(read(1))), taken);
+        assert_eq!(
+            gpu.take_readback(ReadbackId::new(1, 0)),
+            Some(Readback::Bytes(vec![0; 8]))
+        );
+        assert_eq!(gpu.take_readback(ReadbackId::new(1, 0)), None, "taken once");
+        // Taken: free again.
+        let fence = gpu.submit(one(read(1))).expect("free again");
+        assert_eq!(
+            fence,
+            FenceValue::new(2),
+            "the refused lists took no fence value"
+        );
+        finish(&gpu, fence);
+        // A value past every list never arrives.
+        assert_eq!(
+            gpu.wait(FenceValue::new(3), Duration::from_millis(20)),
+            Ok(WaitOutcome::TimedOut)
+        );
+        assert_eq!(gpu.host_errors(), 0);
     });
 }

@@ -47,7 +47,7 @@ use starquake_render::{
 use wgpu::{TextureFormatFeatureFlags, TextureUsages};
 
 /// wgpu's alignment for buffer copies and buffer writes, in bytes (`wgpu::COPY_BUFFER_ALIGNMENT`).
-pub(crate) const COPY_BUFFER_ALIGNMENT: u64 = wgpu::COPY_BUFFER_ALIGNMENT;
+pub const COPY_BUFFER_ALIGNMENT: u64 = wgpu::COPY_BUFFER_ALIGNMENT;
 
 /// The most anisotropy wgpu-core passes on to a sampler (module docs).
 pub const WGPU_MAX_ANISOTROPY: u32 = 16;
