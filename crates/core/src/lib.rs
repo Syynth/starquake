@@ -46,6 +46,7 @@ pub mod artifacts;
 )]
 mod clock;
 pub mod crash;
+pub mod frames;
 pub mod gpu_replay;
 pub mod hle;
 pub mod host_log;

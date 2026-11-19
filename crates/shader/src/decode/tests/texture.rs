@@ -472,7 +472,7 @@ const FORM_CASES: [Case; 22] = [
         ],
         "suld.p.2d.strong.gpu p0, r8, [r9], r10, 0xf;",
     ),
-    // SULD.D: dim 5 (3d), type 6 (.b128) at 73, order 10 (.strong.sys), fault PT, evict 0.
+    // SULD.D: dim 5 (3d), type 6 (.128) at 73, order 10 (.strong.sys), fault PT, evict 0.
     (
         0x99a,
         &[
@@ -485,7 +485,7 @@ const FORM_CASES: [Case; 22] = [
             (81, 7),
             (84, 0),
         ],
-        "suld.d.3d.b128.strong.sys.ef pt, r8, [r9], r11;",
+        "suld.d.3d.128.strong.sys.ef pt, r8, [r9], r11;",
     ),
     // SUST.P: coord 8, data 9, dim 1 (1d_buffer), handle 10, mask 1, order 4 (.constant),
     // evict 2.
@@ -502,7 +502,7 @@ const FORM_CASES: [Case; 22] = [
         ],
         "sust.p.1d_buffer.constant.el [r8], r9, r10, 0x1;",
     ),
-    // SUST.D: dim 2 (array_1d), type 3 (.i16), order 5 (.strong.cta), evict 4 (.eu).
+    // SUST.D: dim 2 (array_1d), type 3 (.s16), order 5 (.strong.sm), evict 4 (.eu).
     (
         0x99e,
         &[
@@ -514,10 +514,10 @@ const FORM_CASES: [Case; 22] = [
             (77, 5),
             (84, 4),
         ],
-        "sust.d.array_1d.i16.strong.cta.eu [r8], r9, r10;",
+        "sust.d.array_1d.s16.strong.sm.eu [r8], r9, r10;",
     ),
-    // SUATOM: dst 9, coord 10, data 11, dim 4, handle 12, .ba 72, type 5 (.i64), order 0
-    // (.weak), fault 1, evict 1, operation 8 (.exch) at 87.
+    // SUATOM: dst 9, coord 10, data 11, dim 4, handle 12, .ba 72, type 5 (.s64), order 0
+    // (weak, printed as nothing), fault 1, evict 1, operation 8 (.exch) at 87.
     (
         0x394,
         &[
@@ -532,9 +532,9 @@ const FORM_CASES: [Case; 22] = [
             (84, 1),
             (87, 8),
         ],
-        "suatom.p.array_2d.exch.i64.weak.ba p1, r9, [r10], r11, r12;",
+        "suatom.p.array_2d.exch.s64.ba p1, r9, [r10], r11, r12;",
     ),
-    // SUATOM.CAS: type 2 (.u64), order 7, fault 4, evict 0.
+    // SUATOM.CAS: type 2 (.64), order 7, fault 4, evict 0.
     (
         0x396,
         &[
@@ -547,9 +547,9 @@ const FORM_CASES: [Case; 22] = [
             (77, 7),
             (81, 4),
         ],
-        "suatom.p.2d.cmpexch.packed.u64.strong.gpu.ef p4, r9, [r10], r11, r12;",
+        "suatom.p.2d.cas.64.strong.gpu.ef p4, r9, [r10], r11, r12;",
     ),
-    // SURED: dst RZ (as NAK writes), dim 0, type 3 (.f32), order 10, fault PT, evict 1,
+    // SURED: dst RZ (as NAK writes), dim 0, type 3 (.f32.ftz.rn), order 10, fault PT, evict 1,
     // operation 6 (.or).
     (
         0x3a0,
@@ -564,7 +564,7 @@ const FORM_CASES: [Case; 22] = [
             (84, 1),
             (87, 6),
         ],
-        "sured.p.1d.or.f32.strong.sys pt, rz, [r12], r13, r14;",
+        "sured.p.1d.or.f32.ftz.rn.strong.sys pt, rz, [r12], r13, r14;",
     ),
 ];
 
@@ -886,19 +886,19 @@ const MODIFIER_CASES: &[ModifierCase] = &[
         0x394,
         SUATOM_PLAIN,
         (0, 0),
-        "suatom.p.1d.add.u32.weak pt, r1, [r2], r3, r4;",
+        "suatom.p.1d.add pt, r1, [r2], r3, r4;",
     ),
     (
         0x394,
         SUATOM_PLAIN,
         (72, 1),
-        "suatom.p.1d.add.u32.weak.ba pt, r1, [r2], r3, r4;",
+        "suatom.p.1d.add.ba pt, r1, [r2], r3, r4;",
     ),
     (
         0x3a0,
         SUATOM_PLAIN,
         (72, 1),
-        "sured.p.1d.add.u32.weak.ba pt, r1, [r2], r3, r4;",
+        "sured.p.1d.add.ba pt, r1, [r2], r3, r4;",
     ),
 ];
 
@@ -946,11 +946,11 @@ fn hand_built_words_pin_each_register_field() {
         text(word(0x394, &all))
     };
     let suatom_cases = [
-        ((16, 9), "suatom.p.1d.add.u32.weak p0, r9, [r0], r0, r0;"),
-        ((24, 9), "suatom.p.1d.add.u32.weak p0, r0, [r9], r0, r0;"),
-        ((32, 9), "suatom.p.1d.add.u32.weak p0, r0, [r0], r9, r0;"),
-        ((64, 9), "suatom.p.1d.add.u32.weak p0, r0, [r0], r0, r9;"),
-        ((81, 2), "suatom.p.1d.add.u32.weak p2, r0, [r0], r0, r0;"),
+        ((16, 9), "suatom.p.1d.add p0, r9, [r0], r0, r0;"),
+        ((24, 9), "suatom.p.1d.add p0, r0, [r9], r0, r0;"),
+        ((32, 9), "suatom.p.1d.add p0, r0, [r0], r9, r0;"),
+        ((64, 9), "suatom.p.1d.add p0, r0, [r0], r0, r9;"),
+        ((81, 2), "suatom.p.1d.add p2, r0, [r0], r0, r0;"),
     ];
     for (field, expected) in suatom_cases {
         assert_eq!(suatom(&[field]), expected, "{field:?}");
@@ -1000,10 +1000,7 @@ fn every_dimension_decodes() {
     for (bits, dim, name) in image_dims {
         let word = word(0x99a, &[(61, bits), (81, 7), (84, 1)]);
         assert_eq!(image_dim(word), Some(dim));
-        assert_eq!(
-            text(word),
-            format!("suld.d.{name}.u8.weak pt, r0, [r0], r0;")
-        );
+        assert_eq!(text(word), format!("suld.d.{name}.u8 pt, r0, [r0], r0;"));
     }
 }
 
@@ -1078,22 +1075,22 @@ fn every_surface_type_order_and_operation_decodes() {
     };
     for (bits, mem_type) in [
         (0, ".u8"),
-        (1, ".i8"),
+        (1, ".s8"),
         (2, ".u16"),
-        (3, ".i16"),
-        (4, ".b32"),
-        (5, ".b64"),
-        (6, ".b128"),
+        (3, ".s16"),
+        (4, ""),
+        (5, ".64"),
+        (6, ".128"),
     ] {
         assert_eq!(
             suld(&[(73, bits)]),
-            format!("suld.d.1d{mem_type}.weak pt, r0, [r0], r0;")
+            format!("suld.d.1d{mem_type} pt, r0, [r0], r0;")
         );
     }
     for (bits, order) in [
-        (0x0, ".weak"),
+        (0x0, ""),
         (0x4, ".constant"),
-        (0x5, ".strong.cta"),
+        (0x5, ".strong.sm"),
         (0x7, ".strong.gpu"),
         (0xa, ".strong.sys"),
     ] {
@@ -1107,17 +1104,17 @@ fn every_surface_type_order_and_operation_decodes() {
         text(word(opcode, &all))
     };
     for (bits, atom_type) in [
-        (0, ".u32"),
-        (1, ".i32"),
-        (2, ".u64"),
-        (3, ".f32"),
-        (4, ".f16v2"),
-        (5, ".i64"),
-        (6, ".f64"),
+        (0, ""),
+        (1, ".s32"),
+        (2, ".64"),
+        (3, ".f32.ftz.rn"),
+        (4, ".f16x2.rn"),
+        (5, ".s64"),
+        (6, ".f64.rn"),
     ] {
         assert_eq!(
             suatom(0x394, &[(73, bits)]),
-            format!("suatom.p.1d.add{atom_type}.weak pt, r0, [r0], r0, r0;")
+            format!("suatom.p.1d.add{atom_type} pt, r0, [r0], r0, r0;")
         );
     }
     let ops = [
@@ -1134,13 +1131,13 @@ fn every_surface_type_order_and_operation_decodes() {
     for (bits, op) in ops {
         assert_eq!(
             suatom(0x394, &[(87, bits)]),
-            format!("suatom.p.1d{op}.u32.weak pt, r0, [r0], r0, r0;")
+            format!("suatom.p.1d{op} pt, r0, [r0], r0, r0;")
         );
         // `SURED`'s three bits hold the reductions, 0 to 7.
         if bits < 8 {
             assert_eq!(
                 suatom(0x3a0, &[(87, bits)]),
-                format!("sured.p.1d{op}.u32.weak pt, r0, [r0], r0, r0;")
+                format!("sured.p.1d{op} pt, r0, [r0], r0, r0;")
             );
         }
     }
@@ -1700,7 +1697,7 @@ fn unencodable_texture_instructions_are_errors() {
         })))
     };
     assert_eq!(
-        suatom(AtomOp::CmpExch(AtomCmpSrc::Separate), false),
+        suatom(AtomOp::CmpExch(AtomCmpSrc::Separate { cmpr: r(5) }), false),
         Err(EncodeError::NoBits {
             mnemonic: "suatom",
             what: "a separate compare source"
@@ -1904,12 +1901,10 @@ fn encodings_match_the_references() {
         (MemOrder::Strong(MemScope::Gpu), 0x7),
         (MemOrder::Strong(MemScope::System), 0xa),
     ];
-    assert_eq!(
-        MemOrder::ALL.map(MemOrder::bits),
-        orders.map(|(_, bits)| bits)
-    );
+    assert_eq!(MemOrder::ALL.len(), orders.len());
     for (order, literal) in orders {
         assert_eq!(order.bits(), literal);
+        assert!(MemOrder::ALL.contains(&order));
     }
 }
 

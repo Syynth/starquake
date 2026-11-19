@@ -219,6 +219,7 @@ fn a_timed_out_run_reports_where_its_thread_spins() {
         romfs: None,
         rtc: RtcAtBoot::eden_default(),
         environment: crate::EnvSource::Live,
+        until_frames: None,
     };
     let vcpu = ScriptedVcpu::new().then_spin();
     let interrupters = Interrupters::default();

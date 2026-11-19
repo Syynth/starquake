@@ -32,6 +32,10 @@ starquake-cpu = { workspace = true, features = ["test-support"] }
 starquake-kernel = { workspace = true, features = ["test-support"] }
 starquake-testkit.workspace = true
 insta.workspace = true
+# Decodes the frame dumps a run writes, in the `frames` module's tests.
+png.workspace = true
+# Lays out the block-linear image the frame-dump tests present.
+starquake-layout.workspace = true
 # Builds the synthetic NUP titles that the `title` module's tests load.
 starquake-loader = { workspace = true, features = ["test-support"] }
 # The capture builder, for the `gpu_replay` module's tests.

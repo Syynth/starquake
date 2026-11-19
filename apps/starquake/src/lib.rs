@@ -9,7 +9,8 @@
 //! read as an NRO. A title that cannot be loaded is an emulator error, like an NRO that cannot.
 //!
 //! ```text
-//! starquake run <program> [--until timeout=<n>s] [--artifacts <folder>] [--date <seconds>]
+//! starquake run <program> [--until timeout=<n>s | frames=<n>] [--artifacts <folder>]
+//!                          [--date <seconds>]
 //! starquake inspect <title.nup>
 //! starquake verify <title.nup>
 //! starquake gpu-replay <capture> [--until present=<n>] [--dump ring|render|writes]
@@ -19,7 +20,8 @@
 //! are 0 (replayed to its stop condition) and 2 (anything else).
 //!
 //! The process exit code says how the run ended (`starquake_core::exit_code`): 0 the program
-//! exited, 1 the guest crashed, 2 an emulator error, 3 the timeout passed. A command line this
+//! exited or presented the frames `--until frames=<n>` asked for, 1 the guest crashed, 2 an
+//! emulator error, 3 the timeout passed. A command line this
 //! tool can't parse, a program file it can't read and an artifacts folder it can't write are
 //! emulator errors too: the contract has no other code for them.
 //!
@@ -38,10 +40,20 @@
 //! (`starquake_services::time::LAST_RTC_AT_BOOT`), so a guest that first asks `time:u` for its
 //! clocks' memory later than that is answered `OVERFLOW` and cannot set its clocks up.
 //!
-//! PROVISIONAL (walking skeleton, #74). Of the contract's flags only `--until timeout=<n>s` and
-//! `--artifacts` exist; `--script`, `--clock`, `--seed`, `--record`, `--snapshot-every` and the
-//! other `--until` conditions are refused by name, so a script that uses one finds out. The stop
-//! condition of a run is the guest calling `ExitProcess`.
+//! `--until` takes one condition ([`parse_until`]): `timeout=<n>s`, or `frames=<n>`, which stops
+//! the run once `<n>` frames (1 or more) have been presented, with exit code 0. A frame is a
+//! present the graphics server hands the GPU, one for each frame its vsync tick latches
+//! (`starquake_core::hle::Graphics::frames`); `summary.json`'s `frames` counts the same, so a run
+//! that stops at `frames=<n>` says `<n>` there. A present with a fence the GPU reaches is latched
+//! only once the host GPU has completed that work, so the guest time at which such a run stops
+//! depends on host timing; for presents with no fence it does not
+//! (`starquake_core::hle::graphics`, "Frames").
+//!
+//! PROVISIONAL (walking skeleton, #74). Of the contract's flags only `--until` and `--artifacts`
+//! exist; `--script`, `--clock`, `--seed`, `--record`, `--snapshot-every` and the `trace=`
+//! condition of `--until` are refused by name, so a script that uses one finds out. The stop
+//! condition of a run is the guest calling `ExitProcess`, or the frames `--until frames=<n>`
+//! asks for.
 //!
 //! `inspect` and `verify` have exit codes of their own ([`title::exit`]): 0 done and intact, 1
 //! the title is damaged or part of it could not be parsed, 2 the file could not be read or the
@@ -58,6 +70,7 @@
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read, Seek, Write};
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -75,8 +88,8 @@ pub mod title;
 
 /// What `starquake` prints for `--help`, and after a command line it can't parse.
 pub const USAGE: &str = "\
-usage: starquake run <program> [--until timeout=<n>s] [--artifacts <folder>]
-                     [--date <seconds>]
+usage: starquake run <program> [--until timeout=<n>s | frames=<n>]
+                     [--artifacts <folder>] [--date <seconds>]
        starquake inspect <title.nup>
        starquake verify <title.nup>
        starquake gpu-replay <capture> [--until present=<n>]
@@ -84,14 +97,16 @@ usage: starquake run <program> [--until timeout=<n>s] [--artifacts <folder>]
 
 run: runs a program, an NRO or a NUP title (the ExeFS of its newest update,
 or of its base), and writes what it did to an artifacts folder:
-summary.json, trace.txt, events.bin and guest_log.txt, plus crash.json and
-crash.txt when the guest crashed. Without --artifacts the folder is made under
-the system's temporary folder and its path is printed. Without --until the
-program runs until it exits or crashes, however long that takes. The guest's
+summary.json, trace.txt, events.bin, guest_log.txt, gpu.txt and frames/, plus
+crash.json and crash.txt when the guest crashed. Without --artifacts the folder
+is made under the system's temporary folder and its path is printed. Without
+--until the program runs until it exits or crashes, however long that takes;
+--until frames=<n> stops it once it has presented <n> frames. The guest's
 date is the host's, read once as the run starts, unless --date pins one:
 whole seconds since 1970-01-01T00:00:00 UTC, from -9223372036 to 9223372036,
 as in --date 1672531200. summary.json says which date the run used.
-exit codes: 0 the program exited, 1 the guest crashed, 2 emulator error, 3 timeout
+exit codes: 0 the program exited or presented its frames, 1 the guest crashed,
+2 emulator error, 3 timeout
 
 inspect: prints what a NUP title holds: its packages, the ExeFS of its newest
 update (or its base), a summary of its main.npdm and its modules' headers.
@@ -124,6 +139,8 @@ pub struct RunArgs {
     pub program: PathBuf,
     /// `--until timeout=<n>s`.
     pub timeout: Option<Duration>,
+    /// `--until frames=<n>`.
+    pub frames: Option<NonZeroU64>,
     /// `--artifacts <folder>`.
     pub artifacts: Option<PathBuf>,
     /// `--date <seconds>`: the date the run pins. `None`: the host's.
@@ -187,8 +204,14 @@ pub enum UsageError {
     #[error("`--artifacts` needs a folder; it was given an empty path")]
     EmptyArtifacts,
     /// `--until` with a condition that is not built yet.
-    #[error("`--until {0}` is not supported yet; only `timeout=<n>s` is")]
+    #[error("`--until {0}` is not supported yet; only `timeout=<n>s` and `frames=<n>` are")]
     UnsupportedCondition(String),
+    /// `--until frames=` with something other than a whole number of frames from 1.
+    #[error(
+        "`--until {0}` is not a frame count: write a whole number of frames from 1, as in \
+         `frames=600`"
+    )]
+    BadFrames(String),
     /// `--until timeout=` with something other than a whole number of seconds.
     #[error("`--until {0}` is not a timeout: write a whole number of seconds, as in `timeout=60s`")]
     BadTimeout(String),
@@ -209,8 +232,26 @@ fn text(arg: &OsString) -> String {
     arg.to_string_lossy().into_owned()
 }
 
-/// Parses `timeout=<n>s`.
-fn parse_until(condition: &str) -> Result<Duration, UsageError> {
+/// What `--until` stops a run at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Until {
+    /// `timeout=<n>s`: after this long.
+    Timeout(Duration),
+    /// `frames=<n>`: once this many frames have been presented (module docs).
+    Frames(NonZeroU64),
+}
+
+/// Parses `--until`'s condition: `timeout=<n>s`, whole seconds from 0, or `frames=<n>`, whole
+/// frames from 1. Each is ASCII digits only (no sign, no space) and must fit a `u64`.
+pub fn parse_until(condition: &str) -> Result<Until, UsageError> {
+    if let Some(frames) = condition.strip_prefix("frames=") {
+        return Some(frames)
+            .filter(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|digits| digits.parse().ok())
+            .and_then(NonZeroU64::new)
+            .map(Until::Frames)
+            .ok_or_else(|| UsageError::BadFrames(condition.to_owned()));
+    }
     let Some(seconds) = condition.strip_prefix("timeout=") else {
         return Err(UsageError::UnsupportedCondition(condition.to_owned()));
     };
@@ -218,7 +259,7 @@ fn parse_until(condition: &str) -> Result<Duration, UsageError> {
         .strip_suffix('s')
         .filter(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
         .and_then(|digits| digits.parse().ok())
-        .map(Duration::from_secs)
+        .map(|seconds| Until::Timeout(Duration::from_secs(seconds)))
         .ok_or_else(|| UsageError::BadTimeout(condition.to_owned()))
 }
 
@@ -256,7 +297,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, UsageError> {
         other => return Err(UsageError::UnknownCommand(other.to_owned())),
     }
 
-    let (mut program, mut timeout, mut artifacts, mut date) = (None, None, None, None);
+    let (mut program, mut until, mut artifacts, mut date) = (None, None, None, None);
     let mut rest = rest.iter();
     while let Some(arg) = rest.next() {
         let shown = text(arg);
@@ -273,7 +314,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, UsageError> {
             "--help" | "-h" => return Ok(Command::Help),
             "--until" => {
                 let condition = text(&value("--until")?);
-                if timeout.replace(parse_until(&condition)?).is_some() {
+                if until.replace(parse_until(&condition)?).is_some() {
                     return Err(UsageError::Repeated("--until"));
                 }
             }
@@ -308,7 +349,14 @@ pub fn parse(args: &[OsString]) -> Result<Command, UsageError> {
     }
     Ok(Command::Run(RunArgs {
         program: program.ok_or(UsageError::MissingProgram)?,
-        timeout,
+        timeout: match until {
+            Some(Until::Timeout(timeout)) => Some(timeout),
+            _ => None,
+        },
+        frames: match until {
+            Some(Until::Frames(frames)) => Some(frames),
+            _ => None,
+        },
         artifacts,
         date,
     }))
@@ -359,6 +407,10 @@ fn default_artifacts_folder() -> PathBuf {
 fn describe(report: &RunReport) -> String {
     match &report.exit {
         ExitReason::ProcessExited => "the program exited".to_owned(),
+        ExitReason::FramesReached => format!(
+            "the program presented the {} frames it was to stop at",
+            report.graphics.frames
+        ),
         ExitReason::Timeout => "the timeout passed".to_owned(),
         ExitReason::EmulatorError(message) => format!("emulator error: {message}"),
         ExitReason::GuestCrashed(crash) => format!(
@@ -438,6 +490,7 @@ fn run_options(args: &RunArgs, command_line: Vec<String>, romfs: Option<RomFs>) 
         romfs,
         rtc: rtc_at_boot(args.date),
         environment: starquake_core::EnvSource::Live,
+        until_frames: args.frames,
     }
 }
 
@@ -578,6 +631,7 @@ mod tests {
         Command::Run(RunArgs {
             program: PathBuf::from(program),
             timeout: timeout.map(Duration::from_secs),
+            frames: None,
             artifacts: artifacts.map(PathBuf::from),
             date: date.map(UnixSeconds),
         })
@@ -805,8 +859,12 @@ mod tests {
                 UsageError::BadDate(String::new()),
             ),
             (
-                &["run", "a.nro", "--until", "frames=600"],
-                UsageError::UnsupportedCondition("frames=600".into()),
+                &["run", "a.nro", "--until", "trace=svc"],
+                UsageError::UnsupportedCondition("trace=svc".into()),
+            ),
+            (
+                &["run", "a.nro", "--until", "frames=0"],
+                UsageError::BadFrames("frames=0".into()),
             ),
             // An empty folder would put the artifacts in the current directory.
             (
@@ -829,10 +887,13 @@ mod tests {
 
     #[test]
     fn a_timeout_is_a_whole_number_of_seconds_with_its_unit() {
-        assert_eq!(parse_until("timeout=60s"), Ok(Duration::from_secs(60)));
+        assert_eq!(
+            parse_until("timeout=60s"),
+            Ok(Until::Timeout(Duration::from_secs(60)))
+        );
         assert_eq!(
             parse_until(&format!("timeout={}s", u64::MAX)),
-            Ok(Duration::from_secs(u64::MAX))
+            Ok(Until::Timeout(Duration::from_secs(u64::MAX)))
         );
         for bad in [
             "timeout=",
@@ -852,6 +913,140 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn a_frame_count_is_a_whole_number_of_frames_from_one() {
+        let frames = |n: u64| Ok(Until::Frames(NonZeroU64::new(n).unwrap()));
+        // The first count allowed, and the last.
+        assert_eq!(parse_until("frames=1"), frames(1));
+        assert_eq!(parse_until("frames=600"), frames(600));
+        assert_eq!(parse_until("frames=007"), frames(7));
+        assert_eq!(
+            parse_until(&format!("frames={}", u64::MAX)),
+            frames(u64::MAX)
+        );
+        for bad in [
+            // One below the first.
+            "frames=0",
+            "frames=000",
+            "frames=",
+            "frames=-1",
+            "frames=+1",
+            "frames= 1",
+            "frames=1 ",
+            "frames=1.5",
+            "frames=1f",
+            "frames=0x10",
+            // One more than fits.
+            "frames=18446744073709551616",
+        ] {
+            assert_eq!(
+                parse_until(bad),
+                Err(UsageError::BadFrames(bad.to_owned())),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            UsageError::BadFrames("frames=0".into()).to_string(),
+            "`--until frames=0` is not a frame count: write a whole number of frames from 1, as \
+             in `frames=600`"
+        );
+        assert_eq!(
+            UsageError::UnsupportedCondition("trace=svc".into()).to_string(),
+            "`--until trace=svc` is not supported yet; only `timeout=<n>s` and `frames=<n>` are"
+        );
+        // A prefix is not a condition.
+        for other in ["frame=1", "Frames=1", "frames", "timeout", "60s"] {
+            assert_eq!(
+                parse_until(other),
+                Err(UsageError::UnsupportedCondition(other.to_owned())),
+                "{other}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_run_takes_a_frame_count_in_either_form_and_asks_the_run_for_it() {
+        let frames = |n: u64, artifacts: Option<&str>| {
+            Command::Run(RunArgs {
+                program: PathBuf::from("a.nro"),
+                timeout: None,
+                frames: NonZeroU64::new(n),
+                artifacts: artifacts.map(PathBuf::from),
+                date: None,
+            })
+        };
+        let cases = [
+            (
+                &["run", "a.nro", "--until", "frames=3"][..],
+                frames(3, None),
+            ),
+            (&["run", "--until=frames=4", "a.nro"], frames(4, None)),
+            (
+                &["run", "--artifacts", "out", "--until", "frames=5", "a.nro"],
+                frames(5, Some("out")),
+            ),
+        ];
+        for (words, expected) in cases {
+            assert_eq!(parse(&args(words)), Ok(expected), "{words:?}");
+        }
+        // The run is asked for exactly that, and no timeout; a timeout asks for no frame count.
+        let Ok(Command::Run(counted)) = parse(&args(&["run", "a.nro", "--until", "frames=9"]))
+        else {
+            unreachable!("not a run");
+        };
+        let options = run_options(&counted, Vec::new(), None);
+        assert_eq!(options.until_frames, NonZeroU64::new(9));
+        assert_eq!(options.timeout, None);
+        let Ok(Command::Run(timed)) = parse(&args(&["run", "a.nro", "--until", "timeout=9s"]))
+        else {
+            unreachable!("not a run");
+        };
+        let options = run_options(&timed, Vec::new(), None);
+        assert_eq!(options.until_frames, None);
+        assert_eq!(options.timeout, Some(Duration::from_secs(9)));
+        let Ok(Command::Run(plain)) = parse(&args(&["run", "a.nro"])) else {
+            unreachable!("not a run");
+        };
+        let options = run_options(&plain, Vec::new(), None);
+        assert_eq!((options.until_frames, options.timeout), (None, None));
+        // One condition only, whichever two are given, in either order and form.
+        for words in [
+            &[
+                "run",
+                "a.nro",
+                "--until",
+                "frames=1",
+                "--until",
+                "timeout=1s",
+            ][..],
+            &["run", "a.nro", "--until=timeout=1s", "--until=frames=2"],
+            &["run", "a.nro", "--until=frames=1", "--until=frames=1"],
+        ] {
+            assert_eq!(
+                parse(&args(words)),
+                Err(UsageError::Repeated("--until")),
+                "{words:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_run_that_presented_its_frames_says_so_with_exit_code_0() {
+        let report = RunReport {
+            exit: ExitReason::FramesReached,
+            graphics: starquake_core::report::GraphicsReport {
+                frames: 3,
+                ..Default::default()
+            },
+            ..RunReport::emulator_error(String::new(), Duration::ZERO)
+        };
+        assert_eq!(
+            describe(&report),
+            "the program presented the 3 frames it was to stop at"
+        );
+        assert_eq!(report.exit_code(), exit_code::STOP_CONDITION);
     }
 
     #[test]

@@ -73,12 +73,24 @@
 //! turn ends the run (`crate::hle::graphics`, "The timer thread's turn"), with the words
 //! [`GRAPHICS_ENV_FAILED`] and the failure's.
 //!
+//! A turn that hands the GPU front the last frame the run allows
+//! ([`RunOptions::until_frames`](crate::report::RunOptions), `crate::hle::Graphics::frame_limit_reached`)
+//! ends the run as `Ending::FramesReached`, before the reschedule
+//! (`a_run_stops_at_exactly_its_frame_limit`, in `machine/tests/graphics/frames.rs`).
+//!
 //! A listener starts the vsync clock with its deadline one interval (16,666,666 ns) out, more
 //! than [`PREEMPTION_INTERVAL_NS`], so a sleep that began before the start ends before the
 //! deadline and the next one is bounded by it; no ring is needed for a start
 //! (`a_waiting_vsync_clock_reads_nothing_and_a_due_one_ticks` checks the two intervals). A tick made by
 //! this thread reaches a waiting guest
 //! (`the_timer_thread_ticks_the_vsync_clock_and_wakes_a_listener_s_waiter`).
+//!
+//! # The GPU
+//!
+//! Each turn, after the graphics server's, asks whether the run's GPU threads still run
+//! (`machine/gpu.rs`, "During the run"), and ends the run as an emulator error if one has ended
+//! (`a_dead_gpu_thread_ends_the_run`, in `machine/tests/graphics/frames.rs`). A run with the null front
+//! has no GPU threads and asks nothing.
 
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -187,6 +199,7 @@ fn turns<V: Vcpu, C: HostClock + Clone>(machine: &Machine<'_, V, C>) -> Result<(
         }
         deliver(machine)?;
         graphics(machine)?;
+        super::gpu::check_running(&machine.graphics)?;
         let woken = machine.dispatcher.take_woken();
         if !woken.is_empty() {
             tracing::trace!(count = woken.len(), "guest threads woken");
@@ -297,6 +310,9 @@ pub(super) fn graphics<V: Vcpu, C: HostClock + Clone>(
     let turned = host.finish();
     machine.env.keep();
     turned.map_err(failed)?;
+    if machine.graphics.frame_limit_reached() {
+        return Err(Ending::FramesReached);
+    }
     machine
         .dispatcher
         .reschedule(&mut machine.signals())

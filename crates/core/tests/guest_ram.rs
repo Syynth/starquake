@@ -70,6 +70,7 @@ mod support {
             romfs: None,
             rtc: starquake_core::RtcAtBoot::eden_default(),
             environment: starquake_core::EnvSource::Live,
+            until_frames: None,
         }))
     }
 

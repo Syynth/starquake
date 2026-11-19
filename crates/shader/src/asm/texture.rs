@@ -270,7 +270,7 @@ impl Encode for OpSuAtom {
         let mnemonic = Self::MNEMONIC;
         match (self.atom_op, self.reduce) {
             (AtomOp::CmpExch(AtomCmpSrc::Packed), false) => writer.opcode(SUATOM_CAS_OPCODE),
-            (AtomOp::CmpExch(AtomCmpSrc::Separate), _) => {
+            (AtomOp::CmpExch(AtomCmpSrc::Separate { .. }), _) => {
                 return Err(EncodeError::NoBits {
                     mnemonic,
                     what: "a separate compare source",
