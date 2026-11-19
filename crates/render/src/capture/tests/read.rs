@@ -659,6 +659,11 @@ fn the_first_check_in_the_documented_order_is_reported() {
             ..
         })
     ));
+}
+
+/// The order checks, in their documented order, each pair with both faults present.
+#[test]
+fn the_order_checks_come_in_their_documented_order() {
     // Start first, then Start once, then Limit, then the kind's own check.
     let mut f = header();
     f.extend(made(0));
