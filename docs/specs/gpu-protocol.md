@@ -534,10 +534,15 @@ Completions are batched: one wake for all actions of all lists completed at that
 the owner's decision: "several are batched into one completion check"). Performing these at
 record time instead is kept only as a debugging switch.
 
-**Open, shared with render-backend (#14):** how the back thread sleeps until its ring has entries
-*or* `completed()` moves. The render backend's `completed()` and `wait()` alone cannot wake it;
-a wake hook the back thread installs on the backend is one way (review guide, M14). Slice G15
-needs the answer; it is item 13 under "What to verify before building".
+**How the back thread sleeps** (decided by the owner, 2026-11-18; render-backend, "The completion
+wake"). The back thread sleeps on the ring's wake-up, which both the front's publish and the
+render backend's completion wake ring, so it wakes for ring entries or for a completed list.
+Before it sleeps it marks itself waiting and looks once more at the ring and at `completed()`, as
+the ring's consumer already does for entries, so a wake that arrives between that last look and
+the sleep is not lost. Slice G15 adds the consumer-side handle that wakes the back thread without
+an entry, which `core` turns into the backend's `CompletionWake`. A wake-up by the ring's 100 ms
+safety-net recheck that finds `completed()` moved is logged as a warning and counted as a lost
+wake.
 
 Release writes happen on the back thread only, so their order is the ring's order.
 
@@ -947,7 +952,7 @@ same time.
 | G12 | `gpu::back::qmd`: QMD 3.0 decode, PCAS scheduler, release slots, dependent QMDs | G2, G3 | `native_qmd.h`, `kepler_compute.cpp` (`ProcessNativeMethod`, `DispatchNativeCompute`) | Golden QMD words from header bit positions; the cross-channel decrement-before-schedule case (row 84); rejected QMD still releases (row 61); every limit as an error | B |
 | G13 | Front macro host: uploads, start tables, calls across entries, per-channel data RAM, buffered writes, MME DMA reads with catch-up, memo hook | G6, G8, G9 | `maxwell_3d.cpp` (`ProcessMacro`, `CallMacroMethod`), `kepler_compute.cpp`, row 58 | Recorded-call style tests with a fake back; a DMA read that forces a catch-up commits nothing on the first run | C |
 | G14 | `gpu::front`: the front loop, channel scheduling, bounded submission queues (`Full`, `GpuQueueRoom`), waiter table, parking and wake-ups, acquire poll with back-off, submission fence waits and appended increments, ordered updates and barriers (recorded per-channel positions, the marker) | G4, G8, G9, G13 | `gpu_split.cpp`, `nx2.h` (`Nx2SemaphoreWaiters`); row 32, row 68 | Scripted multi-channel scenarios with a fake back and fake clock: a parked channel does not block another; latching an equal-acquire whose value moves on (row 70); an unmap is not reported done while an earlier submission on another channel is unread; a submission that would take a queue past 65,536 entries returns `Full` and one that fills it exactly does not | D |
-| G15 | `gpu::back::fence`: open command list, fenced actions per `FenceValue`, empty-fence skip, completion batching, release writes, latching, `Syncpoints` increments after host completion, applying ordered updates on their marker, the record-time debugging switch | G2, G4, G7, #14's `CommandList`, `FenceValue` and `completed()`; the completion wake (open, M14) | Rows 123, 124; `kepler_compute.cpp` (release callbacks) | Recording backend completing late: no release, increment or ordered-update report is visible before its list completes; actions still FIFO; empty fences skipped; a watched increment pushes `SyncpointChanged` | C |
+| G15 | `gpu::back::fence`: open command list, fenced actions per `FenceValue`, empty-fence skip, completion batching, release writes, latching, `Syncpoints` increments after host completion, applying ordered updates on their marker, the record-time debugging switch | G2, G4, G7, #14's `CommandList`, `FenceValue` and `completed()`; the completion wake (decided 2026-11-18; G15 adds the ring's wake handle) | Rows 123, 124; `kepler_compute.cpp` (release callbacks) | Recording backend completing late: no release, increment or ordered-update report is visible before its list completes; actions still FIFO; empty fences skipped; a watched increment pushes `SyncpointChanged` | C |
 | G16 | Buffer cache: guest range to host buffer, write-watch integration (dirty drain also calls the shader cache's `invalidate`), streamed ranges, eviction by budget | G7, #14's resource types | `eden/src/video_core/buffer_cache` (reference only); rows 120, 131, 139 | Fake memory, fake watch, recording backend: CPU write re-uploads once; an ordered unmap drops the range | C |
 | G17 | Texture cache: texture header decode, image identity by address and layout, uploads through G5, render targets, write-back on demand, swizzle in the view or in the variant key by `Caps::view_swizzle` | G5, G7, G10, #14's resource types | `eden/src/video_core/texture_cache` (reference only); rows 69, 87, 103 | Recording backend: same header twice is one image; CPU write invalidates; write-back matches G5 untile; a swizzled texture under a no-swizzle `Caps` gets an identity view | C |
 | G18 | `gpu::back::draw`: derive `DrawDesc` from 3D state; shader lookups (`ProgramMemory`, `EngineState`, `VariantKey` with `EmulationFlags` and swizzles copied in, driver constants, the wait-while-compiling setting); bindings; conditional render | G10, G16, G17, G23, #13's `lookup` types | `eden-nx2/src/video_core/engines/{maxwell_3d,draw_manager}.cpp` (reference) | Register scripts to golden draw descriptions (`insta`), with a fake shader cache returning fixed sets, pending tickets and rejections; every `EmulationFlags` field reaches the key | D |
@@ -967,8 +972,8 @@ Notes on scheduling:
   should go to one agent in sequence, as the working mode prefers for foundations.
 - G15, G16, G17, G18 and G23 depend on the render backend's and shader pipeline's types, which
   were approved with this spec; they wait only for the slices that build those types
-  (render-backend R0, shader-pipeline slice 9). G15 also waits on the completion wake (open,
-  shared with render-backend; verification 13).
+  (render-backend R0, shader-pipeline slice 9). The completion wake G15 needs
+  was decided on 2026-11-18 ("Releases and completion").
 - The kernel half of `WriteWatch` (applying protections, recording faults) is a kernel slice,
   not listed here.
 
@@ -1010,10 +1015,8 @@ titles stay local; what they settle is written down as facts with the trace desc
     deadlock with that unmap, and what the console does; (b) whether any title depends on work
     queued after a kind change seeing the new kind before the update applies. A trace of an
     unmap issued while a channel waits settles (a). Changes G14.
-13. **The completion wake-up** (review guide, M14): how the back thread sleeps until its ring has
-    entries or a submitted list completes. A wake hook the back thread installs on the render
-    backend, called by the render thread when the completed value moves, is the leading
-    candidate. Settled with render-backend before G15 and R5.
+13. **The completion wake-up:** decided by the owner, 2026-11-18 ("Releases and completion";
+    render-backend, "The completion wake").
 
 ## Decisions for the owner
 

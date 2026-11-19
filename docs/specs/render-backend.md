@@ -161,14 +161,26 @@ pub trait Backend: Send + Sync {
 `dyn Backend` costs one indirect call per resource creation and per submitted list, not per
 draw, so the back thread is not generic over the backend.
 
-`core` constructs each backend with the shared compile pool and with the GPU crate's
-wait-while-compiling setting (below); neither is a trait method.
+`core` constructs each backend with the shared compile pool, the GPU crate's
+wait-while-compiling setting (below) and the completion wake (next); none is a trait method.
 
-**Open, shared with gpu-protocol (#12):** the GPU back thread sleeps until its ring has entries
-*or* a submitted list has completed, because releases and syncpoint increments wait on
-completion. `completed()` and `wait()` alone cannot wake it. One way is a wake hook the back thread
-installs on the backend, called by the render thread when the completed value moves; neither
-spec has settled it (review guide, M14). It is an open item, verification 10.
+**The completion wake** (decided by the owner, 2026-11-18, decision 14; review guide, M14). The
+GPU back thread must wake when its ring has entries *or* a submitted list has completed, because
+releases and syncpoint increments wait on completion, and `completed()` and `wait()` alone cannot
+wake it. So `core` hands each backend, at construction, a `CompletionWake`: a named, cloneable
+`Send + Sync` handle defined in this crate (a function to call, nothing more), which the GPU
+crate makes from its ring's consumer side (gpu-protocol, "Releases and completion"). The backend:
+
+- calls it each time the value `completed()` reports advances, after storing the new value, so
+  a back thread it wakes reads that value or a later one;
+- may call it more often (a spurious wake costs the back thread one look), and calls it once for
+  several lists that complete together;
+- never blocks in it, and never calls it while holding a lock the back thread can take.
+
+The recording backend calls it from `submit`, where its lists complete. A wake that is lost (a
+backend that forgets to call it) costs at most the ring's 100 ms safety-net recheck: the back
+thread logs and counts a recheck that finds `completed()` moved as a lost wake, and a contract
+test in this crate, run against every backend, checks that a wake follows every advance.
 
 ### Commands
 
@@ -692,7 +704,7 @@ then it is local-only, like the hypervisor tests (decision 9).
 | R2 | Format fallback choice and `emulation()` as pure functions | R0 | Eden's MoltenVK paths cited above; `vulkan_device.cpp` format checks; decision 1's wgpu table | No GPU: synthetic capability tables, every combination, including a wgpu-shaped table | B |
 | R3 | CPU ASTC decoder | R0 | `eden/src/video_core/textures/astc.cpp` | No GPU: blocks encoded by hand from the ASTC specification, checked against an independent decoder as a dev-dependency (`astc-decode` 0.3.1, guess: suitability to check) | B |
 | R4 | Host shaders: WGSL sources and their naga validation; the present blit and clear shaders | R0 | `eden/src/video_core/host_shaders/vulkan_present.*`, `full_screen_triangle.vert` | No GPU: every host shader parses and validates with naga | B |
-| R5 | wgpu backend core (`starquake-render-wgpu`): instance, adapter and device choice, `Caps` from the adapter's features and limits, resources, staging through `write_buffer`/`write_texture`, uploads, copies, clears, readbacks, fences from wgpu's completion reports, the render thread, `Offscreen` target, the completion wake (once settled with #12) | R0, R1 | wgpu 30.0.1 (crates.io); `eden/src/video_core/renderer_vulkan/vk_scheduler.*`, `vk_staging_buffer_pool.*` for the shape of a render thread and staging | Needs a GPU: the same lists run on the recording backend and on wgpu give bit-identical readbacks | C |
+| R5 | wgpu backend core (`starquake-render-wgpu`): instance, adapter and device choice, `Caps` from the adapter's features and limits, resources, staging through `write_buffer`/`write_texture`, uploads, copies, clears, readbacks, fences from wgpu's completion reports, the render thread, `Offscreen` target, the completion wake ("The completion wake"), called from the render thread after it stores each new completed value | R0, R1 | wgpu 30.0.1 (crates.io); `eden/src/video_core/renderer_vulkan/vk_scheduler.*`, `vk_staging_buffer_pool.*` for the shape of a render thread and staging | Needs a GPU: the same lists run on the recording backend and on wgpu give bit-identical readbacks | C |
 | R6 | Pipelines: shader modules from naga modules, bind group and pipeline layouts from `ShaderInterface`, graphics and compute pipeline creation on the compile pool, wait and skip per the GPU crate's setting, failed-pipeline cache, driver cache blob where wgpu offers one | R4, R5 | `renderer_vulkan/vk_pipeline_cache.*`, `vk_graphics_pipeline.*`, `fixed_pipeline_state.*` (policy only) | Needs a GPU: hand-built naga test modules; scripted compile delays exercise both policies | D |
 | R7 | Draws and dispatches: render targets and lazy passes, bind groups, vertex and index buffers, dynamic state, direct and indirect draws, quad and line-loop index rewrite, typed outputs | R6 | `renderer_vulkan/vk_rasterizer.*`, `vk_render_pass_cache.*`, `vk_update_descriptor.*` (policy only) | Needs a GPU: synthetic scenes with exactly computable pixels (axis-aligned rectangles covering whole pixels, flat colours) | E |
 | R8 | Window presentation: wgpu surface from window handles, present modes, resize, newest-frame-wins queue, `PresentFeedback`; the present-then-write ordering test ("Submit") | R4, R5 | `renderer_vulkan/vk_swapchain.*`, `vk_present_manager.*`, `vk_blit_screen.*` (policy only) | Mode choice and the frame queue are pure functions, tested with no GPU; the ordering test needs a GPU; the window path is checked by hand on a Mac and a Linux desktop | D (with R6) |
@@ -749,10 +761,8 @@ In order of how much each could change the design:
    use and limits, if anything. Until known, `budget()` reports a configured limit.
 9. **The present-then-write ordering under wgpu** ("Submit"), which the graphics server's buffer
    release relies on. Slice R8's test; listed here because a failure changes #11's release rule.
-10. **The completion wake-up** (review guide, M14; "The trait"): how the GPU back thread sleeps
-    until its ring has entries or a submitted list completes. A wake hook the back thread
-    installs, called by the render thread when the completed value moves, is the leading
-    candidate. Settled with gpu-protocol (its verification 13) before R5 and G15.
+10. **The completion wake-up:** decided by the owner, 2026-11-18 (decision 14, "The completion
+    wake"). R5 implements it for wgpu.
 11. **Whether surface creation needs `unsafe`:** whether wgpu 30 can create a surface from the
     frontend's raw window handles through its safe API, or only through its unsafe constructor.
     If only the latter, `starquake-render-wgpu` opts in at crate level for that one call ("Where
@@ -975,6 +985,20 @@ are in `docs/decision-log.md` (2026-11-12).
     depend on the answer. With wgpu first, sharing one wgpu device with GPUI on Linux becomes
     conceivable, but only if both use the same wgpu major version (gpui-pre-wgpu used 29.0.4,
     this backend 30); not a reason to decide now.
+
+14. **Decided by the owner, 2026-11-18:** the completion wake is given to each backend at
+    construction ("The completion wake"; gpu-protocol, "Releases and completion").
+
+    **How the GPU back thread wakes on completion.** Options: (a) a wake each backend calls when
+    `completed()` advances, which rings the ring's existing wake-up, so the back thread sleeps on
+    one thing; (b) a separate fencing thread blocked in `wait()` that performs releases, as
+    Eden's Vulkan fence manager does (`fence_manager.h`, `ReleaseThreadFunc`; Eden-NX2 keeps it
+    and batches up to 64 fences); (c) the back thread polls `completed()` on a short timer while
+    lists are in flight. **Chosen: (a).** It keeps every write the guest sees on the back thread,
+    in ring order, and reacts at once when the GPU finishes. A lost wake is bounded by the ring's
+    100 ms recheck, then detected and caught by a test. (b) carries the same obligation inside
+    `wait()` and splits release writes across two threads; (c) adds delay to every semaphore the
+    guest waits on.
 
 ## Deferred, not ruled out
 
