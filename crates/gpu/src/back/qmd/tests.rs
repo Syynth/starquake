@@ -455,6 +455,20 @@ fn constants_match_the_references_written_out() {
         (4 * 32 + 14, 4 * 32 + 29)
     );
     assert_eq!(q::QMDV03_00_REQUIRE_SCHEDULING_PCAS.low(), 4 * 32 + 12);
+    // `NVC7C0_QMDV03_00_REQUIRE_SCHEDULING_PCAS` is `MW(140:140)`, `_FALSE` 0 and `_TRUE` 1
+    // (`clc7c0qmd.h` lines 504 to 506); `NVC7C0_LOAD_INLINE_QMD_DATA(i)` is `(0x0320+(i)*4)`
+    // (`clc7c0.h`), so word 4 is method 0xCC, the `native_registers[0xcc]` of
+    // `kepler_compute.cpp`.
+    assert_eq!(
+        (
+            q::QMDV03_00_REQUIRE_SCHEDULING_PCAS.low(),
+            q::QMDV03_00_REQUIRE_SCHEDULING_PCAS.high()
+        ),
+        (140, 140)
+    );
+    assert_eq!(q::QMDV03_00_REQUIRE_SCHEDULING_PCAS_FALSE, 0);
+    assert_eq!(q::QMDV03_00_REQUIRE_SCHEDULING_PCAS_TRUE, 1);
+    assert_eq!(LOAD_INLINE_QMD_DATA.method_at(&[4]), Some(0xcc));
 }
 
 #[test]
@@ -1912,26 +1926,35 @@ fn an_inline_qmd_requiring_a_pcas_is_written_but_not_scheduled_without_send_pcas
 }
 
 #[test]
-fn divergence_inline_qmd_without_require_scheduling_pcas_is_scheduled() {
-    for send_pcas in [false, true] {
-        let mem = memory();
-        let a = qmd_at(9);
-        let spec = Spec {
-            require_scheduling_pcas: false,
-            ..Spec::new(0xa000)
-        };
-        let control = if send_pcas { SEND_PCAS } else { 0 };
-        let regs = inline_registers(a, control, &spec);
-        let mut table = QmdTable::new();
-        let mut sink = Recorder::default();
-        table
-            .compute_method(LAST_INLINE_QMD_METHOD, &regs, &mem, &mut sink)
-            .unwrap();
-        assert_eq!(
-            sink.completions(),
-            [(a, Outcome::Dispatched)],
-            "send_pcas {send_pcas}"
-        );
+fn an_inline_qmd_is_scheduled_when_send_pcas_is_set_or_require_scheduling_pcas_is_clear() {
+    // `kepler_compute.cpp`'s `(control & (1U << 24)) || !(native_registers[0xcc] & (1U << 12))`,
+    // where method 0xCC bit 12 is the inline QMD's `REQUIRE_SCHEDULING_PCAS` (QMD bit 140): both
+    // values of each bit. Every other control bit is set, so only SEND_PCAS_ENABLE counts.
+    for require_scheduling_pcas in [false, true] {
+        for send_pcas in [false, true] {
+            let mem = memory();
+            let a = qmd_at(9);
+            let spec = Spec {
+                require_scheduling_pcas,
+                ..Spec::new(0xa000)
+            };
+            let control = if send_pcas { u32::MAX } else { !SEND_PCAS };
+            let regs = inline_registers(a, control, &spec);
+            let mut table = QmdTable::new();
+            let mut sink = Recorder::default();
+            table
+                .compute_method(LAST_INLINE_QMD_METHOD, &regs, &mem, &mut sink)
+                .unwrap();
+            let case = format!("send_pcas {send_pcas}, require {require_scheduling_pcas}");
+            assert_eq!(read_u32(&mem, a + 18 * 4), encode(&spec)[18], "{case}");
+            if send_pcas || !require_scheduling_pcas {
+                assert_eq!(sink.completions(), [(a, Outcome::Dispatched)], "{case}");
+                assert_eq!(table.len(), 1, "{case}");
+            } else {
+                assert_eq!(sink.events, NOTHING, "{case}");
+                assert_eq!(table.len(), 0, "{case}");
+            }
+        }
     }
 }
 
