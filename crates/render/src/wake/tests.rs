@@ -265,6 +265,30 @@ fn the_counter_waits_for_a_count_strictly_beyond_the_one_seen() {
 }
 
 #[test]
+fn the_counter_waits_while_the_count_is_the_one_seen() {
+    // One wake already counted; a thread waits for a count beyond it, and a second wake comes
+    // later. The waiting thread must still be waiting then, not have given up because the
+    // count equalled the one it saw. (Whether the thread reached its wait before the second
+    // wake depends on scheduling; the outcome for a correct counter does not.)
+    let wakes = Arc::new(WakeCounter::new());
+    let wake = wakes.completion_wake();
+    wake.wake();
+    let ready = Arc::new(std::sync::Barrier::new(2));
+    let waiter = {
+        let wakes = Arc::clone(&wakes);
+        let ready = Arc::clone(&ready);
+        std::thread::spawn(move || {
+            ready.wait();
+            wakes.wait_beyond(1, PATIENCE)
+        })
+    };
+    ready.wait();
+    std::thread::sleep(Duration::from_millis(50));
+    wake.wake();
+    assert!(waiter.join().unwrap());
+}
+
+#[test]
 fn the_counter_wakes_a_thread_that_waits_for_it() {
     let wakes = Arc::new(WakeCounter::new());
     let waiter = {

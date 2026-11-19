@@ -42,6 +42,9 @@ fn a_write_that_meets_the_condition_latches_and_a_later_write_does_not_unlatch()
     // latch of it is not reported.
     assert!(!table.on_write(ADDRESS, 0x5310));
     assert!(table.is_latched(ChannelId(3)));
+    // The value comes round again: the waiter is already latched, so nothing new is.
+    assert!(!table.on_write(ADDRESS, 0x5293));
+    assert!(table.is_latched(ChannelId(3)));
 }
 
 #[test]

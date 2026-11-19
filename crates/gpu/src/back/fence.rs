@@ -102,20 +102,20 @@
 //!
 //! [`Fences::wait`] is the back thread's wait for its next piece of work (gpu-protocol, "How the
 //! back thread sleeps"; decided by the owner on 2026-11-18). It returns the next ring entry if
-//! one is there; otherwise it closes the open list (the ring is empty), performs what has
-//! completed, and, if nothing had, sleeps on the ring's wake-up
-//! ([`crate::ring::Consumer::pop_or_wake`]), which the front's publish and the render backend's
-//! completion wake both ring (`core` builds the backend with
-//! [`crate::ring::ConsumerWake::completion_wake`]). Its last look before the sleep asks whether
-//! `completed()` has passed the oldest list in flight; the ring's module docs say why a
-//! completion that lands after that look is not lost. A sleep that reaches the ring's 100 ms
+//! one is there; otherwise it closes the open list (the ring is empty) and waits on the ring's
+//! wake-up ([`crate::ring::Consumer::pop_or_wake`]), which the front's publish and the render
+//! backend's completion wake both ring (`core` builds the backend with
+//! [`crate::ring::ConsumerWake::completion_wake`]). The ring asks it, before it spins and again
+//! as its last look before the sleep, whether `completed()` has passed the oldest list in
+//! flight, and returns at once when it has; the ring's module docs say why a completion that
+//! lands after that last look is not lost. Whatever ends the wait other than an entry or the
+//! timeout, [`Fences::wait`] then performs what has completed and returns it. A sleep that reaches the ring's 100 ms
 //! safety net and finds `completed()` moved since the last completion check is a lost wake: it is
 //! logged at warning level, counted in [`FenceCounters::lost_wakes`], and the completed work is
 //! performed. A wake that arrives just as the safety net runs out is returned as a wake, not
 //! counted. A wake for a completion that an earlier [`Fences::complete`] already performed is
 //! left on the ring, and makes the next wait return an empty [`Woke::Completed`] at once (a
-//! spurious wake costs one look; pinned by
-//! `the_recording_backends_wake_reaches_the_back_threads_ring`).
+//! spurious wake costs one look; pinned by `a_wake_for_work_already_performed_costs_one_look`).
 //!
 //! # Divergences from Eden-NX2
 //!
@@ -594,10 +594,6 @@ impl Fences {
             return Ok(Woke::Entry(entry));
         }
         self.close(CloseReason::RingEmpty)?;
-        let report = self.complete();
-        if !report.is_empty() {
-            return Ok(Woke::Completed(report));
-        }
         let backend = &self.backend;
         let oldest = self.in_flight.front().map(|list| list.fence);
         let idle = || oldest.is_none_or(|fence| backend.completed() < fence);

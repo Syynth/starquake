@@ -566,13 +566,15 @@ fn an_entry_comes_before_a_wake_and_a_wake_before_idle() {
 #[test]
 fn a_caller_with_work_is_woken_at_once() {
     let (_producer, mut consumer) = ring(8).unwrap();
-    let mut calls = 0;
+    let shared = Arc::clone(&consumer.shared);
+    let mut asked_while_waiting = Vec::new();
     let popped = consumer.pop_or_wake(FOREVER, || {
-        calls += 1;
+        asked_while_waiting.push(shared.consumer_waiting.load(Ordering::SeqCst));
         false
     });
-    // At its first look, before any spinning.
-    assert_eq!((popped, calls), (Ok(Popped::Woken), 1));
+    // Asked once, at the first look, before the consumer spun out and marked itself waiting.
+    assert_eq!(popped, Ok(Popped::Woken));
+    assert_eq!(asked_while_waiting, vec![false]);
 }
 
 #[test]

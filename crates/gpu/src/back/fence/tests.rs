@@ -1095,8 +1095,8 @@ fn each_release_form_writes_exactly_its_bytes() {
     };
     cases.push((
         add8,
-        Some(0xffff_ffff_u64.to_le_bytes().to_vec()),
-        [&0x1_0000_0000_u64.to_le_bytes()[..], &[FILL; 8]].concat(),
+        Some(0x1_ffff_ffff_u64.to_le_bytes().to_vec()),
+        [&0x2_0000_0000_u64.to_le_bytes()[..], &[FILL; 8]].concat(),
     ));
     // A reduction with a timestamp (a guess): the reduced value in the 16-byte structure.
     let add_ts = Release {
@@ -1521,13 +1521,25 @@ fn a_recheck_that_finds_nothing_moved_counts_no_lost_wake() {
 #[test]
 fn completed_work_found_before_the_sleep_is_performed_without_sleeping() {
     let (_producer, mut consumer) = ring(64).unwrap();
+    // The rig's backend has no wake, so only the look at `completed()` can end this wait.
     let mut r = rig();
     let fence = r.list_with_release(SEM, 0x7a);
     r.backend.finish(fence);
-    assert_eq!(
-        r.fences.wait(&mut consumer, FOREVER),
-        Ok(Woke::Completed(released(1)))
-    );
+    let woke = within(move || r.fences.wait(&mut consumer, FOREVER));
+    assert_eq!(woke, Ok(Woke::Completed(released(1))));
+}
+
+#[test]
+fn a_wake_for_work_already_performed_costs_one_look() {
+    let (_producer, mut consumer) = ring(64).unwrap();
+    let backend = Arc::new(LateBackend::new(consumer.waker().completion_wake()));
+    let mut r = rig_on(Arc::clone(&backend), Mode::Fenced);
+    let fence = r.list_with_release(SEM, 0x7c);
+    backend.finish(fence);
+    // Performed by a direct completion check; the wake stays on the ring.
+    assert_eq!(r.fences.complete(), released(1));
+    let woke = within(move || r.fences.wait(&mut consumer, FOREVER));
+    assert_eq!(woke, Ok(Woke::Completed(Report::default())));
 }
 
 #[test]
@@ -1544,8 +1556,10 @@ fn a_gone_front_is_an_error_from_wait() {
 #[test]
 fn the_recording_backends_wake_reaches_the_back_threads_ring() {
     // The production arrangement: the recording backend built with the ring's completion wake.
-    // It completes each list inside `submit`, so its wake rings the ring from the back thread's
-    // own close; the next wait finds the wake and returns at once instead of sleeping.
+    // First the back thread's own list goes through it and its release is performed. Then,
+    // with nothing in flight (so the back thread's look at `completed()` sees no work), another
+    // thread's list completes inside `submit` just before the back thread sleeps: only the
+    // recording backend's wake can end that sleep before the short timeout.
     for wakes in [true, false] {
         let (_producer, mut consumer) = ring(64).unwrap();
         let wake = if wakes {
@@ -1563,19 +1577,29 @@ fn the_recording_backends_wake_reaches_the_back_threads_ring() {
         fences.record(command(1)).unwrap();
         let action = late.action(four(SEM, 0x7b));
         assert_eq!(fences.attach(action), Ok(Attached::Open));
-        let (first, second) = within(move || {
+        let first = within(move || {
             let first = fences.wait(&mut consumer, FOREVER);
-            let second = fences.wait(&mut consumer, Duration::from_millis(20));
-            (first, second)
+            (first, fences, consumer)
         });
+        let (first, mut fences, mut consumer) = first;
         assert_eq!(first, Ok(Woke::Completed(released(1))), "wakes: {wakes}");
         assert_eq!(word(&late.mem, SEM), 0x7b);
+        assert_eq!(backend.completed(), FenceValue::new(1));
+
+        let mut other = Some(Arc::clone(&backend));
+        consumer.set_after_last_look(Box::new(move || {
+            if let Some(backend) = other.take() {
+                backend.submit(CommandList::new()).unwrap();
+            }
+        }));
+        let second = within(move || fences.wait(&mut consumer, Duration::from_millis(50)));
         let expected = if wakes {
             Woke::Completed(Report::default())
         } else {
             Woke::TimedOut
         };
         assert_eq!(second, Ok(expected), "wakes: {wakes}");
+        assert_eq!(backend.completed(), FenceValue::new(2));
     }
 }
 
