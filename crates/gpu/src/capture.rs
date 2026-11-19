@@ -137,10 +137,45 @@
 //!   contract has no switch for a GPU capture today ("neither capture has a switch"), and the
 //!   threaded wiring (`crate::wiring`) would need the recording seams on its two threads and a
 //!   starting-state snapshot.
+//! - **More in the header and the starting state than the spec lists.** The spec's header is
+//!   the magic, version, build id and channel list; this one also holds what a replay needs to
+//!   rebuild the GPU the capture ran on (the render `Caps` and budget, the wait setting, the
+//!   fence mode, the address spaces), and the starting state holds the address tables and the
+//!   syncpoints, which the spec's list leaves out but every replayed access depends on.
 //! - **A faulted read's bytes.** A read that faulted may have filled part of its buffer; the
 //!   capture keeps only the fault, and a replay gives zeros.
 //! - **Unrecorded outputs.** Completions pushed to gsv and shader-cache invalidations are not
-//!   recorded or compared.
+//!   recorded or compared. The back's reports are not compared with the front log's either:
+//!   the front was fed the recorded ones before the back ran.
+//! - **The `waiters` record is not observed by any test.** The back reads the table when a
+//!   fenced release lands on an open list holding commands (it closes the list on a waiter) and
+//!   when a release latches (the report's flag, which a replay does not compare). No fixture
+//!   the builder can make yet attaches a release to a list with commands (a present closes its
+//!   own list, and a draw needs shaders), so removing the record from a capture changes nothing
+//!   a test sees; the record is written and fed back all the same.
+//! - **Report records keep what the front keeps.** A `report` holds the markers and the two
+//!   flags [`crate::front::FrontShared`]'s wake reduces a back report to, not the counts or the
+//!   failed releases.
+//!
+//! # Exit codes and the command
+//!
+//! `starquake gpu-replay` (in `starquake_core::gpu_replay` and the frontend) exits 0 when the
+//! replay reached its stop condition and 2 for an unreadable or malformed capture and for a
+//! divergence, as a replay that disagrees stops as an emulator error (decision log,
+//! 2026-11-17). A capture with fewer presents than `--until present=N` asks for is replayed to
+//! its end with exit code 0, and the output says so: **owner question**, whether that should be
+//! a failure instead.
+//!
+//! # Checks, in order, and the tests that pin them
+//!
+//! - Header: magic, then version (`tests::parse::the_magic_is_checked_before_the_version`,
+//!   `the_version_is_checked_before_the_body`).
+//! - Replay: the starting state, then the front log, then the ring (a differing entry before a
+//!   different length, `tests::replay::a_ring_hash_the_capture_lacks_is_a_length_difference`),
+//!   then the back log, then the render stream
+//!   (`tests::replay::a_render_stream_that_differs_is_reported_after_a_whole_replay`).
+//! - The builder is deterministic: the same calls give the same bytes
+//!   (`tests::replay::a_replay_is_the_same_twice_and_the_builder_is_the_same_twice`).
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod builder;

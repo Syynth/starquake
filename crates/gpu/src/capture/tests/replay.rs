@@ -428,3 +428,39 @@ fn a_fence_wait_reads_the_syncpoint_value_the_back_left() {
         .retain(|record| !matches!(record, FrontRecord::Syncpoint { .. }));
     assert!(replay(&unset, ReplayOptions::default()).is_err());
 }
+
+/// A `SYNC_WAIT` entry waits until the back reports the work before it performed: the front
+/// learns that only from the back's report.
+#[test]
+fn a_sync_wait_entry_goes_on_when_the_recorded_report_reaches_the_front() {
+    let mut builder = builder();
+    let channel = channel(&mut builder);
+    let first = releases(SEM, 1);
+    let second = releases(SEM2, 2);
+    builder.cpu_write(SPACE, CMD, &bytes(&first)).unwrap();
+    builder.cpu_write(SPACE, CMD2, &bytes(&second)).unwrap();
+    let waits = GpEntry {
+        address: CMD2,
+        length: u32::try_from(second.len()).unwrap(),
+        sync: Sync::Wait,
+        ..GpEntry::default()
+    };
+    let submission = plain(vec![
+        raw_entry(CMD, first.len()),
+        GpfifoEntry(waits.to_raw().unwrap()),
+    ]);
+    builder.submit(channel, submission).unwrap();
+    builder.run().unwrap();
+    let capture = builder.finish().unwrap();
+    assert!(capture.front.iter().any(
+        |record| matches!(record, FrontRecord::Report { markers, .. } if !markers.is_empty())
+    ));
+    let output = replay(&capture, ReplayOptions::default()).unwrap();
+    assert_eq!(output.writes.len(), 2, "both releases ran");
+
+    let mut unreported = capture;
+    unreported
+        .front
+        .retain(|record| !matches!(record, FrontRecord::Report { .. }));
+    assert!(replay(&unreported, ReplayOptions::default()).is_err());
+}

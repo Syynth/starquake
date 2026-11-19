@@ -44,7 +44,7 @@
 //! | `WaitForIdle`, `SetReference` | the open list is closed ([`CloseReason::WaitForIdle`], [`CloseReason::SetReference`]) |
 //! | `Invalidate` | the CPU-write drain of the channel's address space (below; a divergence, under "Divergences") |
 //! | `Present` | a `Command::Present` of the texture cache's view, then the list is closed ([`CloseReason::Present`]) |
-//! | `CaptureControl` | counted ([`ExecCounters::captures`]); captures are slice G20's |
+//! | `CaptureControl` | counted ([`ExecCounters::captures`]); nothing starts or stops a capture on it yet (`crate::capture`, "Not built, and departures") |
 //!
 //! A `Write` or `Run` for a class bound on none of the channel's subchannels is
 //! [`ExecError::Unbound`], and one for a channel never added is [`ExecError::UnknownChannel`];
@@ -331,7 +331,7 @@ pub struct ExecCounters {
     pub failed: u64,
     /// Words written to a class with no engine here.
     pub unhandled_words: u64,
-    /// `CaptureControl` entries, which slice G20 handles.
+    /// `CaptureControl` entries; no capture starts or stops on them yet (`crate::capture`).
     pub captures: u64,
     /// Presents recorded.
     pub presents: u64,
