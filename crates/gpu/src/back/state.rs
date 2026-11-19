@@ -66,9 +66,9 @@
 //! A new mirror holds the class's starting values, [`crate::regs::ClassRules::initial_values`],
 //! the one place both the front's register file (and its shadow file) and the mirror start from,
 //! so the front never drops a same-value write the back has not seen
-//! (`a_new_mirror_starts_from_the_same_values_as_the_front_file`). They are all zero today:
-//! Eden's non-zero 3D register defaults (`InitializeRegisterDefaults`) are not seeded yet, and
-//! seeding them there changes both sides at once. Every group the class's table names starts
+//! (`a_new_mirror_starts_from_the_same_values_as_the_front_file`): zero but for the class's
+//! reset values ([`crate::regs::ClassRules::defaults`], Eden's non-zero 3D register defaults
+//! from `InitializeRegisterDefaults` and the 2D depths). Every group the class's table names starts
 //! dirty, as Eden's 3D engine starts with every dirty flag set (`dirty.flags.flip()` in
 //! `Maxwell3D`'s constructor, `eden-nx2/src/video_core/engines/maxwell_3d.cpp`), so the first
 //! draw derives everything. No constant buffer is bound.
