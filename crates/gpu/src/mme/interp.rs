@@ -5,10 +5,17 @@
 //! @ 50fa86bb (GPL-3.0-or-later). Where the two disagree this follows Mesa, which was checked
 //! against hardware, except where noted:
 //!
-//! - `LOOP` with a count of zero runs the body once (`MAX2(1, x) - 1` extra passes); Eden-NX2
-//!   skips the body, citing macros the native SDK emits around FIFO reads. Mesa's hardware tests
-//!   cannot tell the two apart (their loop body adds the count), so this is an open question
-//!   for a real title.
+//! - **`LOOP` with a count of zero skips its body**, as Eden-NX2 does (`macro_turing.h`,
+//!   `Execute`, case 23: `if (x == 0) { next_pc = pc + imm; break; }`, "The native SDK emits
+//!   zero-count loops around FIFO reads"): execution goes on at the instruction after the body,
+//!   and the rest of the `LOOP` instruction itself still runs. Mesa's simulator runs the body
+//!   once (`MAX2(1, x) - 1` extra passes), and its hardware tests cannot tell the two apart
+//!   (their loop body adds the count). A real title settled it: its macros read a count, loop
+//!   that many times over parameter loads, and are called with a count of 0 and no words for
+//!   the body, so a body run once reads past the call's parameters
+//!   (`a_zero_count_loop_loads_none_of_its_bodys_parameters`). The loop checks come first, as
+//!   in Eden-NX2: a zero-count `LOOP` inside a loop, or with a length below 2, is still an
+//!   error.
 //! - The second ALU slot sees the first slot's register write; Eden-NX2 reads both slots'
 //!   operands before committing either. Programs from the Mesa builder never depend on the
 //!   difference (`mme_tu104_alus_have_dependency` keeps dependent ALU ops in separate instructions).
@@ -16,7 +23,7 @@
 //!   cancels a pending end".
 //! - `STATE` masks the method index to 14 bits (`(uint16_t)(x + y) * 4` stored in a 16-bit
 //!   method address); Eden-NX2 masks to 16 bits.
-//! - One exception, where this follows Eden-NX2: Mesa asserts that ALU slots 0 and 1 are not both
+//! - A second exception, where this follows Eden-NX2: Mesa asserts that ALU slots 0 and 1 are not both
 //!   `STATE` (`mme_tu104_sim_core`: "No idea why the HW has this rule but it does"), which makes
 //!   it a hardware rule. Eden-NX2 allows it and so does this interpreter: both slots read state,
 //!   in slot order, and nothing is reported (pinned by `both_alu_slots_may_be_state`).
@@ -493,10 +500,16 @@ impl<R: RamAccess, H: MacroHost> Machine<'_, R, H> {
                 if imm < 2 {
                     return Err(MacroError::InvalidLoop { pc, length: imm });
                 }
-                // Mesa: a count of zero still runs the body once (see the module docs).
-                self.loop_count = x.max(1) - 1;
-                self.loop_start = pc;
-                self.loop_end = pc + usize::from(imm) - 1;
+                let length = usize::from(imm);
+                if x == 0 {
+                    // Eden-NX2: a count of zero skips the body (see the module docs). A target
+                    // past the program is found by the next step.
+                    self.next_ip = pc + length;
+                } else {
+                    self.loop_count = x - 1;
+                    self.loop_start = pc;
+                    self.loop_end = pc + length - 1;
+                }
             }
             AluOp::Jal => {
                 // Mesa asserts bit 15 is set ("no idea what bit 15 does"); it is ignored here.

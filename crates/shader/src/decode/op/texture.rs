@@ -19,8 +19,9 @@
 //! `Require(Take(91, 1) == 1, "native bindless texture handle")`); and the `.F16` bit 79 of
 //! `TEX` and `TLD` ("bit 79 selects half precision results", "bit 79: half precision results
 //! (.F16)"), which NAK's `OpTld` encoder names only in a comment ("bits 79..81: .F16"), and the
-//! `.CL` bit 77 of `TLD.UR` (`Require(Take(77, 2) == 0, "native texel fetch multisample or
-//! clamp")`), which NAK's `OpTld` also names only in a comment ("bit 77: .CL").
+//! `.CL` bit 77 of `TLD` (`Require(Take(77, 2) == 0, "native texel fetch multisample or
+//! clamp")`), which NAK's `OpTld` also names only in a comment ("bit 77: .CL", below SM 12.0).
+//! NAK writes neither bit: each is a guess about the hardware until the `nvdisasm` check.
 //!
 //! The memory ordering, eviction priority, memory type and atomic types and operations the
 //! surface instructions carry ([`MemOrder`], [`MemEvictionPriority`], [`MemType`],
@@ -67,18 +68,30 @@
 //! |---|---|---|
 //! | Bit 89 of `TLD4.UR` (`0xf63`) | Rejected: neither reference names it (NAK's component field is bits 87..89, `set_field(87..89, self.comp)`), and PR #4588's lowering refuses a word with it set (`lower_to_maxwell.h`, `case 0xf63`: `insn.Bits(89, 2) != 0` fails "native uniform gather mode") | `decode::tests::texture::tld4_ur_rejects_bit_89` |
 //! | `SULD` `0xb97`, `SUST` `0xb9b` and `SUATOM` `0x593`, surface forms with a constant-buffer handle | Unknown opcodes: no reference gives their full layout (NAK encodes none of them; PR #4588's translator reads them, `ops_texture.cpp`, but the slice's scope is NAK's forms and the `.UR` forms) | `decode::tests::texture::surface_rows_left_undecoded_are_unknown_opcodes` |
+//! | Bit 79 (`.F16`) of `TEX.B` (`0x361`) | Decoded as [`OpTex::f16`]: the form adds the bit, which PR #4588's translator reads in every `TEX` form it accepts, `0x361` included (`Visitor::TEX`: `register_handle = op == 0x361`, then `half = Take(79, 1) != 0`); its row for `0x361` leaves it out | `decode::tests::texture::f16_and_clamp_in_every_form_that_names_them`, `decode::tests::framework::added_bits_decode_print_and_round_trip` |
+//! | Bit 79 (`.F16`) of `TLD.B` (`0x367`) | Decoded as [`OpTld::f16`]: the form adds the bit, which NAK's `OpTld` encoder names for every handle in a comment ("bits 79..81: .F16"); PR #4588's row for `0x367` leaves it out, and its translator does not accept `0x367` (`Visitor::TLD` requires bit 59 clear outside `0xf66`) | as above |
+//! | Bit 80 of `TEX` and `TLD` (all six forms), inside NAK's `OpTld` comment "bits 79..81: .F16" | Not added: it stays unknown ([`DecodeError::UnknownBit`]). NAK's range is half-open, so it spans bits 79 and 80, but NAK writes neither bit and gives no meaning to a two-bit value; PR #4588 reads `.F16` as one bit (`Take(79, 1)` in `Visitor::TEX` and `Visitor::TLD`) and no row of its table has bit 80 in these forms. Taking bit 80 would invent a field; an `nvdisasm` check would settle it | `decode::tests::texture::f16_is_bit_79_alone_and_bit_80_stays_unknown` |
+//! | Bit 77 (`.CL`) of `TLD` (`0xb66`) and `TLD.B` (`0x367`) | Decoded as [`OpTld::clamp`]: the forms add the bit, which NAK's `OpTld` encoder names for every handle in a comment ("bit 77: .CL", below SM 12.0); PR #4588's rows leave it out but for `0xf66`, though its translator names it in every form it accepts (`Require(Take(77, 2) == 0, "native texel fetch multisample or clamp")`) | as above |
 //!
-//! Every other form's mask is its row's exactly (`decode::tests::masks_match_the_reference_table`).
-//! The rows themselves differ between forms of one instruction: the `.F16` bit 79 is known in
-//! the constant-buffer and `.UR` rows of `TEX` and `TLD` but not in their `.B` rows, and `TLD`'s
-//! `.CL` bit 77 only in its `.UR` row. A form cannot know a bit its row does not, so those bits
-//! are rejected in the forms whose rows leave them out (pinned by
-//! `decode::tests::texture::f16_and_clamp_only_where_the_rows_have_them`), and the test
-//! assembler refuses an op that sets them with such a handle
-//! (`encoder_refuses_f16_and_clamp_where_the_forms_lack_them`). Whether the hardware has them
-//! in the `.B` forms is an open question for the owner: the framework can only drop a row's
-//! bits, not add bits a row leaves out (lead's note on #356), so these forms cannot decode them
-//! even if `nvdisasm` shows they exist.
+//! Every other form's mask is its row's exactly, and the rows above that decode a bit differ
+//! from their forms by exactly the bits listed (bit 80 adds nothing: form and row agree that it
+//! is unknown; `decode::tests::masks_match_the_reference_table`;
+//! `decode::tests::framework::added_bits_are_the_listed_cases` lists every added bit and the
+//! reference that names it). The rows themselves differ between forms of one instruction (bit
+//! 79 is in the constant-buffer and `.UR` rows of `TEX` and `TLD` only, bit 77 in `TLD`'s `.UR`
+//! row only: `decode::tests::texture::rows_leave_out_the_added_texture_bits`); the forms add the
+//! bits so that every form of an instruction decodes the same flags.
+//!
+//! **Not added: `.F16` in `TLD4`.** Wave 42's note on #356 and #430's scope list bit 79 of the
+//! `TLD4` forms as a bit one reference names and the other leaves out, but neither reference
+//! names a `.F16` for `TLD4` on SM 7.0 and later: NAK's `OpTld4` has no such field or comment
+//! (its encoder comments only "bit 77: .CL", which falls inside `TLD4`'s offset mode, bits
+//! 76..78), every PR #4588 `TLD4` row leaves bit 79 out, `Visitor::TLD4` does not take it, and
+//! its lowering refuses a word with any of bits 76..80 set in `0xb63` and `0xf63`
+//! (`insn.Bits(76, 5)`). Adding it would invent a protocol fact, so bit 79 stays unknown in all
+//! three `TLD4` forms (pinned by `f16_and_clamp_in_every_form_that_names_them`). **Owner
+//! question**: whether to add it from another source (an `nvdisasm` run, or Maxwell's
+//! `TLD4.F16`, a different encoding).
 //!
 //! # Values the decoder refuses
 //!
@@ -117,7 +130,10 @@ use super::control::PRED_DST;
 pub use super::memory::{AtomCmpSrc, AtomOp, AtomType, MemEvictionPriority, MemOrder, MemType};
 use super::{Named, Op, memory, shells};
 #[cfg(test)]
-use {super::super::form::ReferenceRow, proptest::strategy::BoxedStrategy};
+use {
+    super::super::form::{Namer, ReferenceRow},
+    proptest::strategy::BoxedStrategy,
+};
 
 // ---------------------------------------------------------------------------------------------
 // Fields every texture instruction shares.
@@ -164,13 +180,17 @@ pub(crate) const TEX_OFFSET: Field = Field::bit(76);
 pub(crate) const TEX_NDV: Field = Field::bit(77);
 /// The depth-compare (`.DC`) bit of `TEX` and `TLD4` (`set_bit(78, self.z_cmpr)`).
 pub(crate) const TEX_DC: Field = Field::bit(78);
-/// The `.F16` bit of `TEX` and `TLD` in their constant-buffer and `.UR` forms (PR #4588,
-/// `ops_texture.cpp`: "bit 79 selects half precision results"; NAK's `OpTld` encoder: "bits
-/// 79..81: .F16", a comment). From PR #4588 alone: needs an `nvdisasm` check.
+/// The `.F16` bit of `TEX` and `TLD`, in every form (PR #4588, `ops_texture.cpp`: "bit 79
+/// selects half precision results"; NAK's `OpTld` encoder: "bits 79..81: .F16", a comment;
+/// module docs). Not written by NAK: needs an `nvdisasm` check. One bit, as PR #4588 reads it
+/// (`Take(79, 1)`): NAK's comment spans bits 79 and 80 (a half-open range), but neither
+/// reference reads, writes or names a meaning for bit 80, so bit 80 stays unknown (module
+/// docs, "Divergences from PR #4588's table";
+/// `decode::tests::texture::f16_is_bit_79_alone_and_bit_80_stays_unknown`).
 pub(crate) const TEX_F16: Field = Field::bit(79);
-/// The `.CL` bit of `TLD.UR` (NAK's `OpTld` encoder: "bit 77: .CL", a comment; PR #4588:
-/// `Require(Take(77, 2) == 0, "native texel fetch multisample or clamp")`). From PR #4588
-/// alone.
+/// The `.CL` bit of `TLD`, in every form (NAK's `OpTld` encoder: "bit 77: .CL", a comment;
+/// PR #4588: `Require(Take(77, 2) == 0, "native texel fetch multisample or clamp")`). Not
+/// written by NAK: needs an `nvdisasm` check.
 pub(crate) const TLD_CLAMP: Field = Field::bit(77);
 /// `TLD`'s multisample (`.MS`) bit below SM 12.0 (`set_bit(78, self.is_ms)`).
 pub(crate) const TLD_MS: Field = Field::bit(78);
@@ -526,51 +546,6 @@ impl Handle {
             Self::Uniform => TEX_UNIFORM.mask(),
         }
     }
-
-    /// The kind of `tex`.
-    const fn of(tex: TexRef) -> Self {
-        match tex {
-            TexRef::CBuf(_) => Self::CBuf,
-            TexRef::Bindless => Self::Bindless,
-            TexRef::Uniform(_) => Self::Uniform,
-        }
-    }
-
-    /// Whether `TEX`'s and `TLD`'s forms with this handle have the `.F16` bit: their rows mark
-    /// bit 79 known in the constant-buffer and `.UR` forms only (module docs).
-    const fn f16(self) -> bool {
-        !matches!(self, Self::Bindless)
-    }
-
-    /// Whether `TLD`'s form with this handle has the `.CL` bit: its `.UR` row alone marks bit
-    /// 77 known.
-    const fn clamp(self) -> bool {
-        matches!(self, Self::Uniform)
-    }
-
-    /// The bits `TEX`'s form with this handle has besides [`TEX_FIELDS`]: `.F16` where it has
-    /// it.
-    const fn tex_extra(self) -> u128 {
-        if self.f16() { TEX_F16.mask() } else { 0 }
-    }
-
-    /// The bits `TLD`'s form with this handle has besides [`TLD_FIELDS`]: `.F16` and `.CL`
-    /// where it has them.
-    const fn tld_extra(self) -> u128 {
-        let clamp = if self.clamp() { TLD_CLAMP.mask() } else { 0 };
-        self.tex_extra() | clamp
-    }
-}
-
-/// Whether `TEX` and `TLD` have the `.F16` bit with a `tex` handle ([`Handle::f16`]); the
-/// decoder reads it, and the test assembler writes it, only then.
-pub(crate) const fn has_f16(tex: TexRef) -> bool {
-    Handle::of(tex).f16()
-}
-
-/// Whether `TLD` has the `.CL` bit with a `tex` handle ([`Handle::clamp`]).
-pub(crate) const fn has_clamp(tex: TexRef) -> bool {
-    Handle::of(tex).clamp()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -731,7 +706,7 @@ pub struct OpTex {
     pub z_cmpr: bool,
     /// `.AOFFI`: add an immediate offset from the sources.
     pub offset: bool,
-    /// `.F16`: half-precision results (not in the `.B` form: module docs).
+    /// `.F16`: half-precision results (module docs).
     pub f16: bool,
     /// The eviction priority.
     pub eviction: MemEvictionPriority,
@@ -789,7 +764,7 @@ fn decode_tex(reader: &mut Reader, kind: Handle) -> Result<Op, DecodeError> {
         ndv: reader.flag(TEX_NDV),
         z_cmpr: reader.flag(TEX_DC),
         offset: reader.flag(TEX_OFFSET),
-        f16: has_f16(tex) && reader.flag(TEX_F16),
+        f16: reader.flag(TEX_F16),
         eviction,
         nodep: reader.flag(TEX_NODEP),
         channel_mask: read_mask(reader),
@@ -819,14 +794,14 @@ pub struct OpTld {
     pub dim: TexDim,
     /// `.MS`: a multisampled texture.
     pub is_ms: bool,
-    /// `.CL`: a level-of-detail clamp (the `.UR` form only: module docs).
+    /// `.CL`: a level-of-detail clamp (module docs).
     pub clamp: bool,
     /// The level-of-detail mode (NAK encodes only [`TexLodMode::Zero`] and
     /// [`TexLodMode::Lod`]).
     pub lod_mode: TexLodMode,
     /// `.AOFFI`.
     pub offset: bool,
-    /// `.F16` (not in the `.B` form).
+    /// `.F16` (module docs).
     pub f16: bool,
     /// The eviction priority.
     pub eviction: MemEvictionPriority,
@@ -880,10 +855,10 @@ fn decode_tld(reader: &mut Reader, kind: Handle) -> Result<Op, DecodeError> {
         srcs: read_srcs(reader),
         dim,
         is_ms: reader.flag(TLD_MS),
-        clamp: has_clamp(tex) && reader.flag(TLD_CLAMP),
+        clamp: reader.flag(TLD_CLAMP),
         lod_mode,
         offset: reader.flag(TEX_OFFSET),
-        f16: has_f16(tex) && reader.flag(TEX_F16),
+        f16: reader.flag(TEX_F16),
         eviction,
         nodep: reader.flag(TEX_NODEP),
         channel_mask: read_mask(reader),
@@ -1430,11 +1405,12 @@ fn decode_suatom(reader: &mut Reader) -> Result<Op, DecodeError> {
 // ---------------------------------------------------------------------------------------------
 // The form table.
 
-/// The fields of `TEX`'s forms besides the handle.
+/// The fields of `TEX`'s forms besides the handle, `.F16` included in every form (module docs).
 const TEX_FIELDS: u128 = mask_of(&[
     DST,
     REG_A,
     REG_B,
+    TEX_F16,
     TEX_SCALAR,
     TEX_DIM,
     TEX_DST2,
@@ -1447,8 +1423,11 @@ const TEX_FIELDS: u128 = mask_of(&[
     TEX_LOD,
     TEX_NODEP,
 ]);
-/// The fields of `TLD`'s forms besides the handle, `.F16` and `.CL`.
+/// The fields of `TLD`'s forms besides the handle, `.F16` and `.CL` included in every form
+/// (module docs).
 const TLD_FIELDS: u128 = mask_of(&[
+    TEX_F16,
+    TLD_CLAMP,
     DST,
     REG_A,
     REG_B,
@@ -1518,12 +1497,12 @@ const fn tex_form(opcode: u16, kind: Handle, fields: u128, decode: DecodeFn) -> 
 
 /// `TEX`'s form with a `kind` handle.
 const fn tex(opcode: u16, kind: Handle, decode: DecodeFn) -> Form {
-    tex_form(opcode, kind, TEX_FIELDS | kind.tex_extra(), decode)
+    tex_form(opcode, kind, TEX_FIELDS, decode)
 }
 
 /// `TLD`'s form with a `kind` handle.
 const fn tld(opcode: u16, kind: Handle, decode: DecodeFn) -> Form {
-    tex_form(opcode, kind, TLD_FIELDS | kind.tld_extra(), decode)
+    tex_form(opcode, kind, TLD_FIELDS, decode)
 }
 
 /// The texture and surface group's forms.
@@ -1625,11 +1604,14 @@ pub(crate) const TLD4_UR_DROPPED: u128 = 1 << 89;
 pub(crate) const REFERENCE_ROWS: &[ReferenceRow] = &[
     ReferenceRow::new(0xb60, [0xffff_ffff, 0xf7ff_ffff, 0x07fe_ffff, 0xffff_fe00]),
     ReferenceRow::new(0x361, [0xffff_ffff, 0xf800_00ff, 0x07fe_7fff, 0xffff_fe00])
+        .adding(TEX_F16.mask(), Namer::Pr4588Translator)
         .fixing(TEX_BINDLESS.mask()),
     ReferenceRow::new(0xf60, [0xffff_ffff, 0xf000_3fff, 0x0ffe_ffff, 0xffff_fe00])
         .fixing(TEX_UNIFORM.mask()),
-    ReferenceRow::new(0xb66, [0xffff_ffff, 0xf7ff_ffff, 0x07fe_dfff, 0xffff_fe00]),
+    ReferenceRow::new(0xb66, [0xffff_ffff, 0xf7ff_ffff, 0x07fe_dfff, 0xffff_fe00])
+        .adding(TLD_CLAMP.mask(), Namer::NakComment),
     ReferenceRow::new(0x367, [0xffff_ffff, 0xf800_00ff, 0x07fe_5fff, 0xffff_fe00])
+        .adding(TEX_F16.mask() | TLD_CLAMP.mask(), Namer::NakComment)
         .fixing(TEX_BINDLESS.mask()),
     ReferenceRow::new(0xf66, [0xffff_ffff, 0xf000_3fff, 0x0ffe_ffff, 0xffff_fe00])
         .fixing(TEX_UNIFORM.mask()),

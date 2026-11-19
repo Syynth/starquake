@@ -1,11 +1,13 @@
 //! Idleness with a channel parked on an acquire (the wiring's module docs, "Idleness"): on the
-//! production front clock, and on one held still so that no poll runs until the test moves it.
+//! production front clock, and on one held still so that, once the poll's spins are over, no
+//! poll runs until the test moves it.
 
 use std::sync::atomic::AtomicU64;
 
 use starquake_render::FenceValue;
 
 use super::*;
+use crate::front::POLL_SPINS;
 
 /// A front clock that moves only when told. While it watches a front, it notes at each reading
 /// whether that front was quiet: the front reads its clock only inside a turn.
@@ -42,8 +44,19 @@ impl FrontClock for StillClock {
 /// rule is caught on at least one of them.
 const ASKS: usize = 20;
 
+/// The polls the front had finished at the end of its last turn, as it published them.
+fn polls(r: &Rig) -> u64 {
+    r.gpu.status.published().counters.polls
+}
+
 /// Makes `SPACE` and a channel, submits a stream that waits for `SEM` to hold 1 (it holds 0)
-/// and then releases 2 at `SEM2`, and waits until the channel is parked and the front quiet.
+/// and then releases 2 at `SEM2`, and waits until the channel is parked, the poll's spins are
+/// over and the front quiet.
+///
+/// The first [`POLL_SPINS`] polls after the park are due as soon as they are scheduled
+/// ([`crate::front::Backoff::next_sleep`] returns zero for them), so they run on a still clock
+/// too, each in an idle turn that marks the front quiet. Only the polls after them wait for the
+/// clock to move: a test that holds the clock still has no poll to fear only from then on.
 fn park_a_channel(r: &Rig) {
     r.space();
     let channel = r.channel();
@@ -51,10 +64,16 @@ fn park_a_channel(r: &Rig) {
         channel,
         plain(vec![r.entry(CMD, &acquires_then_releases(SEM, 1, SEM2, 2))]),
     );
-    wait_until("the channel parks and the front ends a turn idle", || {
-        let published = r.gpu.status.published();
-        published.counters.parks == 1 && published.waiting && r.gpu.shared.is_quiet()
-    });
+    wait_until(
+        "the channel parks, the poll's spins end and the front ends a turn idle",
+        || {
+            let published = r.gpu.status.published();
+            published.counters.parks == 1
+                && published.waiting
+                && published.counters.polls >= u64::from(POLL_SPINS)
+                && r.gpu.shared.is_quiet()
+        },
+    );
 }
 
 #[test]
@@ -64,12 +83,10 @@ fn a_turn_the_poll_starts_is_busy() {
     let clock = Arc::new(StillClock::default());
     let r = rig_with(false, Arc::<StillClock>::clone(&clock));
     park_a_channel(&r);
-    let polls = r.gpu.status.published().counters.polls;
+    assert_eq!(polls(&r), u64::from(POLL_SPINS), "only the spins polled");
     clock.watch(Some(Arc::clone(&r.gpu.shared)));
     clock.advance(POLL_LONGEST_SLEEP);
-    wait_until("a poll runs", || {
-        r.gpu.status.published().counters.polls > polls
-    });
+    wait_until("a poll runs", || polls(&r) > u64::from(POLL_SPINS));
     clock.watch(None);
     let seen = clock.quiet_seen.lock().unwrap().clone();
     assert_ne!(seen.len(), 0, "the clock was read in a turn");
@@ -89,7 +106,13 @@ fn a_released_acquire_is_busy_until_a_poll_has_looked() {
     for _ in 0..ASKS {
         assert!(!r.gpu.is_idle(), "no poll has looked since the CPU's write");
     }
-    assert_eq!(r.word(SEM2), 0);
+    assert_eq!(
+        polls(&r),
+        u64::from(POLL_SPINS),
+        "no poll ran after the spins"
+    );
+    assert!(r.gpu.status.published().waiting, "the channel still waits");
+    assert_eq!(r.word(SEM2), 0, "the acquire still waits");
     clock.advance(POLL_LONGEST_SLEEP);
     wait_until("the channel resumes and releases", || r.word(SEM2) == 2);
     wait_until("the GPU is idle", || r.gpu.is_idle());

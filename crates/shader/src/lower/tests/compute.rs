@@ -214,7 +214,12 @@ fn a_feature_the_target_lacks_is_refused() {
                 let shader = result.expect("the target has every feature needed");
                 assert_eq!(
                     shader.requirements,
-                    Requirements { subgroup, f16, i64 },
+                    Requirements {
+                        subgroup,
+                        f16,
+                        i64,
+                        ..Requirements::default()
+                    },
                     "{caps:?}"
                 );
             }
