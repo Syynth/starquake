@@ -80,8 +80,11 @@ pub const WGPU_VIEWPORTS: u32 = 1;
 
 /// The optional wgpu features the backend uses when the adapter has them: the texture
 /// compression families, 16-bit normalised formats, `D32_FLOAT_S8_UINT`, compressed 3D
-/// textures, the adapter's own format support (not only WebGPU's guaranteed set), and the
-/// features [`caps`] reports.
+/// textures, the adapter's own format support (not only WebGPU's guaranteed set), the
+/// features [`caps`] reports, and the shader features guest shaders may need (slice R6):
+/// subgroups, f16 and i64 arithmetic, and binding arrays of textures with non-uniform indexing
+/// (`docs/specs/shader-pipeline.md`, the E1 table). wgpu validates each module against the
+/// device's features, so a shader that needs one the device lacks fails its pipeline.
 pub const WANTED_FEATURES: wgpu::Features = wgpu::Features::TEXTURE_COMPRESSION_BC
     .union(wgpu::Features::TEXTURE_COMPRESSION_BC_SLICED_3D)
     .union(wgpu::Features::TEXTURE_COMPRESSION_ETC2)
@@ -94,7 +97,12 @@ pub const WANTED_FEATURES: wgpu::Features = wgpu::Features::TEXTURE_COMPRESSION_
     .union(wgpu::Features::POLYGON_MODE_LINE)
     .union(wgpu::Features::POLYGON_MODE_POINT)
     .union(wgpu::Features::DEPTH_CLIP_CONTROL)
-    .union(wgpu::Features::DUAL_SOURCE_BLENDING);
+    .union(wgpu::Features::DUAL_SOURCE_BLENDING)
+    .union(wgpu::Features::SUBGROUP)
+    .union(wgpu::Features::SHADER_F16)
+    .union(wgpu::Features::SHADER_INT64)
+    .union(wgpu::Features::TEXTURE_BINDING_ARRAY)
+    .union(wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING);
 
 /// The features to ask the device for: those of [`WANTED_FEATURES`] the adapter has.
 pub fn device_features(adapter: wgpu::Features) -> wgpu::Features {

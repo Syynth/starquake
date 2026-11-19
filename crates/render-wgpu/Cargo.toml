@@ -11,7 +11,15 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+# naga's WGSL front end parses the present blit's WGSL (R4's `present.wgsl`) into the module the
+# blit's shader is made from (slice R8): the workspace's wgpu has no WGSL front end of its own.
+naga = { workspace = true, features = ["wgsl-in"] }
 starquake-render.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 wgpu.workspace = true
+
+# The main-thread check before a window's surface is made (src/window.rs, slice R8).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+
