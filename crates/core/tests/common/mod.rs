@@ -21,6 +21,7 @@ pub fn run(file: &[u8], timeout: Duration) -> Option<RunReport> {
         romfs: None,
         rtc: starquake_core::RtcAtBoot::eden_default(),
         environment: starquake_core::EnvSource::Live,
+        until_frames: None,
     };
     match System::new(file) {
         Ok(system) => Some(system.run(&options)),

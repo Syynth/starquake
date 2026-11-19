@@ -133,7 +133,8 @@ impl Invalidation {
 
 /// Starts or stops a GPU capture at this point in the stream. **Guess** at the commands: the
 /// spec names the entry (`CaptureControl(CaptureCommand)`) and leaves its content to the capture
-/// slice (G20).
+/// slice (G20), which records captures only from its builder so far (`crate::capture`), so
+/// nothing acts on these yet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CaptureCommand {
     /// Start recording.

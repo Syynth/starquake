@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use starquake_core::artifacts::{
-    CRASH_JSON_FILE, CRASH_TEXT_FILE, EVENTS_FILE, GUEST_LOG_FILE, LOG_FILE, SUMMARY_FILE,
-    TRACE_FILE,
+    CRASH_JSON_FILE, CRASH_TEXT_FILE, EVENTS_FILE, FRAMES_FOLDER, GPU_FILE, GUEST_LOG_FILE,
+    LOG_FILE, SUMMARY_FILE, TRACE_FILE,
 };
 use starquake_core::crash::Location;
 use starquake_core::report::{ThreadPc, ThreadPcState};
@@ -118,8 +118,10 @@ mod support {
 use support::{can_run_guests, clean_report, files, json, program, run, scratch, starquake, text};
 
 /// The files every run leaves, crashed or not.
-const ALWAYS: [&str; 5] = [
+const ALWAYS: [&str; 7] = [
     EVENTS_FILE,
+    FRAMES_FOLDER,
+    GPU_FILE,
     GUEST_LOG_FILE,
     LOG_FILE,
     SUMMARY_FILE,
@@ -169,12 +171,13 @@ fn a_file_that_is_not_an_nro_is_an_emulator_error() {
 fn a_command_line_that_cannot_be_parsed_runs_nothing() {
     let folder = scratch("usage");
     let hello = program(&folder, "hello.nro", &programs::hello().unwrap());
-    let (ran, artifacts) = run(&hello, &["--until", "frames=10"]);
+    let (ran, artifacts) = run(&hello, &["--until", "frames=0"]);
     assert_eq!(ran.code, exit_code::EMULATOR_ERROR);
     assert_eq!(ran.stdout, "");
     assert!(
         ran.stderr.starts_with(
-            "starquake: `--until frames=10` is not supported yet; only `timeout=<n>s` is\n"
+            "starquake: `--until frames=0` is not a frame count: write a whole number of frames \
+             from 1, as in `frames=600`\n"
         ),
         "{}",
         ran.stderr
@@ -347,6 +350,14 @@ fn hello_exits_with_code_0_and_leaves_its_output_and_trace() {
     assert_eq!(summary["system_calls"]["OutputDebugString"], 2);
     assert_eq!(summary["system_calls"]["ExitProcess"], 1);
     assert_eq!(summary["guest_log_lines"], 2);
+    // A real run has the GPU (`starquake_core`'s `machine/gpu.rs`): its counters are in the
+    // summary, all zero for a program that never touches it, and its flight recorder is empty.
+    let counters = summary["gpu"].as_object().unwrap();
+    assert!(!counters.is_empty());
+    assert!(counters.values().all(|count| count == 0), "{counters:?}");
+    assert_eq!(text(&artifacts, GPU_FILE), "");
+    assert_eq!(summary["frames"], 0);
+    assert_eq!(files(&artifacts.join(FRAMES_FOLDER)), Vec::<String>::new());
     // The date the run pinned, and that it was pinned.
     let [_, seconds] = common::pinned_date();
     assert_eq!(

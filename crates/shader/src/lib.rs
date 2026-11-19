@@ -41,6 +41,10 @@
 //! (`TMML`, per-texel gather offsets, the fault predicate of `.SPARSE` results, the
 //! minimum-LOD clamp).
 //!
+//! Slice 10 rebuilds a captured program's control flow ([`flow`]): it finds and resolves the
+//! jump tables of `BRX`, walks the program under both convergence-barrier models, splits it
+//! into blocks, inlines every call, and builds the IR's basic blocks from the flow graph.
+//!
 //! Experiment E1, run before this slice, lives in `lower`'s tests and its results in the spec.
 
 #[cfg(feature = "test-support")]
@@ -49,6 +53,7 @@ pub mod capture;
 pub mod decode;
 pub mod driver_constants;
 pub mod exchange;
+pub mod flow;
 #[cfg(test)]
 mod gpu_harness;
 pub mod host;

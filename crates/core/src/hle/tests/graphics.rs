@@ -34,7 +34,7 @@ use super::*;
 use crate::hle::graphics::KernelHost;
 
 mod gpu;
-mod present;
+pub(crate) mod present;
 mod video;
 mod vsync;
 

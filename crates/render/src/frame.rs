@@ -7,8 +7,8 @@
 //! transform travels with the frame for whoever wants the picture the right way up.
 //!
 //! This crate does no file I/O: [`Frame::png`] and [`encode_png`] return the file's bytes, and
-//! the app writes them where the observability spec says (`frames/`); that wiring is its own
-//! slice.
+//! `core` writes them where the observability spec says (`frames/`; `starquake_core::frames`,
+//! slice R9's second part).
 //!
 //! # Pixels a backend does not know
 //!

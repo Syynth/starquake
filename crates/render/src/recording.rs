@@ -71,6 +71,27 @@
 //! (render-backend, "The completion wake"). A refused list completes nothing and wakes nothing.
 //! [`RecordingBackend::new`] gives it [`CompletionWake::none`].
 //!
+//! **The call log.** [`RecordingBackend::new`] and [`RecordingBackend::with_completion_wake`]
+//! keep every call for [`RecordingBackend::snapshot`] and [`RecordingBackend::lists`] (every
+//! resource created and destroyed, every present target set, and each submitted list whole, its
+//! staging bytes included) and one [`PresentFeedback`] for each present until
+//! [`Backend::take_present_feedback`] takes it. A backend from
+//! [`RecordingBackend::without_call_log`] keeps neither: its snapshot is empty, `lists` returns
+//! nothing, `take_present_feedback` returns nothing, and a submitted list is dropped once it has
+//! been applied. Everything else is the same: it models every resource's bytes, frees destroyed
+//! resources, completes fences, keeps readbacks until they are taken and hands dumped frames to
+//! its sink (or keeps them for [`RecordingBackend::take_frame_dumps`] when it has none). What it
+//! holds then grows only with the live resources and with the readbacks and dumped frames not
+//! yet taken, not with the number of calls. It is for a run that keeps the backend for its whole
+//! length and reads none of the log (`starquake-core`'s run wiring).
+//!
+//! **Divergence from the spec.** render-backend, "The recording backend", says: "It keeps every
+//! submitted list and every resource description, and renders them as a text snapshot (`insta`)
+//! for tests on the gpu side". A backend from [`RecordingBackend::without_call_log`] does not:
+//! the same section's "`null` backend for runs that need no pixels" cannot keep every list of a
+//! run with no bound. Whether the spec should say so is an owner question. Pinned by
+//! `a_backend_without_a_call_log_keeps_no_call_and_no_feedback`.
+//!
 //! **Other behaviour.** Pipelines are ready at once unless a test scripts their status
 //! ([`RecordingBackend::script_pipeline`]). `destroy` frees a resource at once when its fence
 //! value has passed and otherwise after the submit that reaches it; until then the id stays
@@ -236,6 +257,8 @@ struct State {
     /// Whether a thread is emptying `outbox` (`RecordingBackend::deliver`).
     delivering: bool,
     refused_destroys: u64,
+    /// Whether calls are kept in `log` and presents in `feedback` (module docs, "The call log").
+    unlogged: bool,
     log: Vec<Event>,
 }
 
@@ -266,6 +289,13 @@ fn level_shape(desc: &TextureDesc, mip: u32) -> Result<LevelShape, RenderError> 
 }
 
 impl State {
+    /// Keeps `event` in the log, unless the backend keeps none (module docs, "The call log").
+    fn record(&mut self, event: Event) {
+        if !self.unlogged {
+            self.log.push(event);
+        }
+    }
+
     fn texture(&self, id: TextureId) -> Result<&TextureRec, RenderError> {
         self.textures
             .get(id.index(), id.generation())
@@ -314,7 +344,7 @@ impl State {
             ResourceId::Pipeline(i) => self.pipelines.remove(i.index(), i.generation()).is_some(),
         };
         if freed {
-            self.log.push(Event::Freed(id));
+            self.record(Event::Freed(id));
         }
     }
 
@@ -428,11 +458,13 @@ impl State {
                         pixels,
                     });
                 }
-                self.feedback.push(PresentFeedback {
-                    frame: desc.frame,
-                    outcome: PresentOutcome::Shown,
-                    host_time: Duration::ZERO,
-                });
+                if !self.unlogged {
+                    self.feedback.push(PresentFeedback {
+                        frame: desc.frame,
+                        outcome: PresentOutcome::Shown,
+                        host_time: Duration::ZERO,
+                    });
+                }
                 Ok(())
             }
         }
@@ -476,10 +508,25 @@ impl RecordingBackend {
     /// A recording backend as [`RecordingBackend::new`] makes, which calls `wake` once from
     /// every `submit` that completes a list (module docs, "The completion wake").
     pub fn with_completion_wake(caps: Caps, memory_allowed: u64, wake: CompletionWake) -> Self {
+        Self::with_state(caps, memory_allowed, wake, State::default())
+    }
+
+    /// A recording backend as [`RecordingBackend::with_completion_wake`] makes, which keeps no
+    /// call log and no present feedback (module docs, "The call log"): its snapshot stays empty,
+    /// and [`RecordingBackend::lists`] and [`Backend::take_present_feedback`] return nothing.
+    pub fn without_call_log(caps: Caps, memory_allowed: u64, wake: CompletionWake) -> Self {
+        let state = State {
+            unlogged: true,
+            ..State::default()
+        };
+        Self::with_state(caps, memory_allowed, wake, state)
+    }
+
+    fn with_state(caps: Caps, memory_allowed: u64, wake: CompletionWake, state: State) -> Self {
         Self {
             caps,
             memory_allowed,
-            state: Mutex::new(State::default()),
+            state: Mutex::new(state),
             completed_moved: Condvar::new(),
             wake,
         }
@@ -621,7 +668,7 @@ impl Backend for RecordingBackend {
             store: Store::new(len),
         })?;
         let id = BufferId::new(index, generation);
-        state.log.push(Event::Created(
+        state.record(Event::Created(
             ResourceId::Buffer(id),
             snapshot::buffer(desc),
         ));
@@ -638,7 +685,7 @@ impl Backend for RecordingBackend {
             bytes,
         })?;
         let id = TextureId::new(index, generation);
-        state.log.push(Event::Created(
+        state.record(Event::Created(
             ResourceId::Texture(id),
             snapshot::texture(desc),
         ));
@@ -654,7 +701,7 @@ impl Backend for RecordingBackend {
             desc: *desc,
         })?;
         let id = ViewId::new(index, generation);
-        state.log.push(Event::Created(
+        state.record(Event::Created(
             ResourceId::View(id),
             snapshot::view(texture, desc),
         ));
@@ -666,7 +713,7 @@ impl Backend for RecordingBackend {
         let mut state = self.state();
         let (index, generation) = state.samplers.insert(*desc)?;
         let id = SamplerId::new(index, generation);
-        state.log.push(Event::Created(
+        state.record(Event::Created(
             ResourceId::Sampler(id),
             snapshot::sampler(desc),
         ));
@@ -679,7 +726,7 @@ impl Backend for RecordingBackend {
         let mut state = self.state();
         let (index, generation) = state.shaders.insert(desc)?;
         let id = ShaderId::new(index, generation);
-        state.log.push(Event::Created(ResourceId::Shader(id), line));
+        state.record(Event::Created(ResourceId::Shader(id), line));
         Ok(id)
     }
 
@@ -695,7 +742,7 @@ impl Backend for RecordingBackend {
                 state.pending.push((resource, after));
                 DestroyOutcome::Pending
             };
-        state.log.push(Event::Destroy {
+        state.record(Event::Destroy {
             id: resource,
             after,
             outcome,
@@ -718,9 +765,7 @@ impl Backend for RecordingBackend {
             script: VecDeque::new(),
         })?;
         let id = PipelineId::new(index, generation);
-        state
-            .log
-            .push(Event::Created(ResourceId::Pipeline(id), line));
+        state.record(Event::Created(ResourceId::Pipeline(id), line));
         Ok(id)
     }
 
@@ -735,7 +780,7 @@ impl Backend for RecordingBackend {
             script: VecDeque::new(),
         })?;
         let id = PipelineId::new(index, generation);
-        state.log.push(Event::Created(
+        state.record(Event::Created(
             ResourceId::Pipeline(id),
             snapshot::compute_pipeline(desc),
         ));
@@ -777,7 +822,7 @@ impl Backend for RecordingBackend {
             state.apply(op)?;
         }
         state.completed = fence;
-        state.log.push(Event::Submitted(fence, list));
+        state.record(Event::Submitted(fence, list));
         state.free_passed();
         if let Some(sink) = &state.sink {
             // This list's frames go to the sink instead of waiting to be taken.
@@ -819,7 +864,7 @@ impl Backend for RecordingBackend {
     }
 
     fn set_present_target(&self, target: PresentTarget) -> Result<(), RenderError> {
-        self.state().log.push(Event::Target(target));
+        self.state().record(Event::Target(target));
         Ok(())
     }
 

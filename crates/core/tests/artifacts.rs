@@ -6,10 +6,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use starquake_core::artifacts::{
-    self, ArtifactError, CRASH_JSON_FILE, CRASH_TEXT_FILE, EVENTS_FILE, GUEST_LOG_FILE, LOG_FILE,
-    SUMMARY_FILE, TRACE_FILE,
+    self, ArtifactError, CRASH_JSON_FILE, CRASH_TEXT_FILE, EVENTS_FILE, FRAMES_FOLDER, GPU_FILE,
+    GUEST_LOG_FILE, LOG_FILE, SUMMARY_FILE, TRACE_FILE,
 };
 use starquake_core::crash::{CrashReport, Exception, Module};
+use starquake_core::frames::{DumpedFrames, FrameFile, frame_file_name};
+use starquake_core::report::GraphicsReport;
 use starquake_core::services_report::ServicesReport;
 use starquake_core::{ExitReason, Mapping, RunReport};
 use starquake_cpu::GuestRegs;
@@ -83,6 +85,7 @@ mod support {
             date: None,
             environment: Vec::new(),
             environment_dropped: 0,
+            graphics: GraphicsReport::default(),
         }
     }
 
@@ -138,6 +141,8 @@ fn a_clean_run_writes_the_summary_trace_events_and_guest_log_and_no_crash_report
         files(&folder),
         [
             EVENTS_FILE,
+            FRAMES_FOLDER,
+            GPU_FILE,
             GUEST_LOG_FILE,
             LOG_FILE,
             SUMMARY_FILE,
@@ -167,6 +172,148 @@ fn a_clean_run_writes_the_summary_trace_events_and_guest_log_and_no_crash_report
     );
     assert_eq!(summary["host_log_lines"], 1);
     assert_eq!(summary["host_log_lines_dropped"], 0);
+    // A run with no GPU: an empty `gpu.txt`, an empty `frames/` and `null` counters.
+    assert_eq!(read(&folder, GPU_FILE), b"");
+    assert_eq!(files(&folder.join(FRAMES_FOLDER)), Vec::<String>::new());
+    assert_eq!(summary["gpu"], serde_json::Value::Null);
+    assert_eq!(summary["frames"], 0);
+}
+
+/// A run whose GPU presented frames: its flight recorder in `gpu.txt`, each kept frame in
+/// `frames/` under its number, and the counts in the summary.
+fn with_frames() -> RunReport {
+    RunReport {
+        graphics: GraphicsReport {
+            frames: 5,
+            dumps: DumpedFrames {
+                files: vec![
+                    FrameFile {
+                        frame: 3,
+                        png: b"third".to_vec(),
+                    },
+                    FrameFile {
+                        frame: 4,
+                        png: b"fourth".to_vec(),
+                    },
+                ],
+                unknown: 1,
+                dropped: 2,
+            },
+            gpu: Some(starquake_gpu::wiring::GpuCounters {
+                presents: 5,
+                ..Default::default()
+            }),
+            gpu_recorder: "0 address space 1 made\n".to_owned(),
+        },
+        ..clean()
+    }
+}
+
+#[test]
+fn a_run_with_a_gpu_writes_its_recorder_and_its_frames() {
+    let folder = folder("frames");
+    let report = with_frames();
+    artifacts::write(&folder, &report).unwrap();
+    assert_eq!(read(&folder, GPU_FILE), b"0 address space 1 made\n");
+    let frames = folder.join(FRAMES_FOLDER);
+    assert_eq!(files(&frames), ["000003.png", "000004.png"]);
+    assert_eq!(read(&frames, &frame_file_name(3)), b"third");
+    assert_eq!(read(&frames, &frame_file_name(4)), b"fourth");
+    let summary = json(&folder, SUMMARY_FILE);
+    assert_eq!(summary["frames"], 5);
+    assert_eq!(summary["frames_dumped"], 2);
+    assert_eq!(summary["frames_unknown"], 1);
+    assert_eq!(summary["frames_dropped"], 2);
+    assert_eq!(summary["gpu"]["presents"], 5);
+}
+
+#[test]
+fn a_later_run_removes_the_frames_an_earlier_one_left_and_nothing_else() {
+    let folder = folder("frames_reused");
+    let frames = folder.join(FRAMES_FOLDER);
+    std::fs::create_dir_all(&frames).unwrap();
+    // An earlier run's frames, and files that are not frame files.
+    for name in [
+        "000001.png",
+        "000003.png",
+        "1.png",
+        "notes.txt",
+        "000002.png.bak",
+    ] {
+        std::fs::write(frames.join(name), b"old").unwrap();
+    }
+    artifacts::write(&folder, &with_frames()).unwrap();
+    assert_eq!(
+        files(&frames),
+        [
+            "000002.png.bak",
+            "000003.png",
+            "000004.png",
+            "1.png",
+            "notes.txt"
+        ]
+    );
+    // The frame of the same number is this run's.
+    assert_eq!(read(&frames, "000003.png"), b"third");
+    // A run with no frames empties the folder of frame files.
+    artifacts::write(&folder, &clean()).unwrap();
+    assert_eq!(files(&frames), ["000002.png.bak", "1.png", "notes.txt"]);
+    assert_eq!(read(&folder, GPU_FILE), b"");
+}
+
+/// A folder in `frames/` with a frame file's name is not an earlier run's frame: the sweep
+/// leaves it alone instead of failing the write, and a crashed run still gets its crash report.
+#[test]
+fn a_folder_with_a_frame_files_name_is_left_alone() {
+    let folder = folder("frames_folder_named_like_a_frame");
+    let frames = folder.join(FRAMES_FOLDER);
+    let named = frames.join(frame_file_name(1));
+    std::fs::create_dir_all(&named).unwrap();
+    let report = RunReport {
+        graphics: with_frames().graphics,
+        ..crashed()
+    };
+    artifacts::write(&folder, &report).unwrap();
+    assert_eq!(files(&frames), ["000001.png", "000003.png", "000004.png"]);
+    assert!(named.is_dir());
+    assert_eq!(read(&frames, &frame_file_name(3)), b"third");
+    assert!(folder.join(CRASH_JSON_FILE).is_file());
+    assert!(folder.join(CRASH_TEXT_FILE).is_file());
+}
+
+/// A frame this run writes whose name a folder holds fails the write, naming the file; the crash
+/// report is written before the frames, so the crashed run keeps it.
+#[test]
+fn a_frame_that_cannot_be_written_still_leaves_the_crash_report() {
+    let folder = folder("frames_name_taken");
+    let frames = folder.join(FRAMES_FOLDER);
+    let taken = frames.join(frame_file_name(3));
+    std::fs::create_dir_all(&taken).unwrap();
+    let report = RunReport {
+        graphics: with_frames().graphics,
+        ..crashed()
+    };
+    match artifacts::write(&folder, &report) {
+        Err(ArtifactError::Io { path, .. }) => assert_eq!(path, taken),
+        other => unreachable!("expected an I/O error naming the frame file, got {other:?}"),
+    }
+    assert!(folder.join(CRASH_JSON_FILE).is_file());
+    assert_eq!(
+        read(&folder, CRASH_TEXT_FILE),
+        crashed().crash().unwrap().to_text().into_bytes()
+    );
+}
+
+#[test]
+fn a_frames_folder_that_cannot_be_made_is_an_error_naming_it() {
+    let folder = folder("frames_blocked");
+    std::fs::create_dir_all(&folder).unwrap();
+    let blocked = folder.join(FRAMES_FOLDER);
+    std::fs::write(&blocked, b"").unwrap();
+    match artifacts::write(&folder, &with_frames()) {
+        Err(ArtifactError::Io { path, .. }) => assert_eq!(path, blocked),
+        other => unreachable!("expected an I/O error naming the frames folder, got {other:?}"),
+    }
 }
 
 #[test]
@@ -234,6 +381,8 @@ fn a_crash_adds_the_crash_report_as_data_and_as_text() {
             CRASH_JSON_FILE,
             CRASH_TEXT_FILE,
             EVENTS_FILE,
+            FRAMES_FOLDER,
+            GPU_FILE,
             GUEST_LOG_FILE,
             LOG_FILE,
             SUMMARY_FILE,
@@ -264,6 +413,8 @@ fn a_later_run_in_the_same_folder_leaves_no_stale_crash_report() {
         files(&folder),
         [
             EVENTS_FILE,
+            FRAMES_FOLDER,
+            GPU_FILE,
             GUEST_LOG_FILE,
             LOG_FILE,
             SUMMARY_FILE,
