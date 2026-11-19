@@ -533,6 +533,78 @@ fn a_rectangle_of_a_layer_is_shown() {
     });
 }
 
+/// A compressed image is shown when its rectangle starts on a block, and dropped, with no
+/// error from wgpu, when it starts inside one (`present::starts_on_block`).
+#[test]
+fn a_compressed_present_inside_a_block_is_dropped() {
+    bounded(|| {
+        let Some(gpu) = backend("compressed_present") else {
+            return;
+        };
+        let bc = gpu
+            .create_texture(&texture_desc(
+                TextureDimension::D2,
+                PixelFormat::Bc1RgbaUnorm,
+                (8, 8, 1),
+                1,
+                COPIES,
+            ))
+            .expect("BC1 texture");
+        let view = gpu
+            .create_view(
+                bc,
+                &whole_view(PixelFormat::Bc1RgbaUnorm, ViewDimension::D2, (0, 1)),
+            )
+            .expect("view");
+        let target = gpu
+            .create_texture(&texture_desc(
+                TextureDimension::D2,
+                RGBA,
+                (4, 4, 1),
+                1,
+                TARGET,
+            ))
+            .expect("target");
+        gpu.set_test_target(target);
+        let present = |frame, x| {
+            Command::Present(PresentDesc {
+                view,
+                src_rect: Rect {
+                    x,
+                    y: 4,
+                    width: 3,
+                    height: 4,
+                },
+                transform: PresentTransform::Identity,
+                frame,
+                dump: false,
+            })
+        };
+        for (frame, x, outcome) in [
+            (1, 4, PresentOutcome::Shown),
+            (2, 1, PresentOutcome::Dropped),
+            (3, 0, PresentOutcome::Shown),
+        ] {
+            let fence = gpu
+                .submit(CommandList {
+                    commands: vec![
+                        upload(pattern(32, 3), region(bc, 0, (0, 0, 0), (8, 8, 1))),
+                        present(frame, x),
+                    ],
+                })
+                .expect("accepted");
+            finish(&gpu, fence);
+            let got: Vec<_> = gpu
+                .take_present_feedback()
+                .iter()
+                .map(|f| (f.frame, f.outcome))
+                .collect();
+            assert_eq!(got, vec![(frame, outcome)], "x = {x}");
+        }
+        assert_eq!(gpu.host_errors(), 0);
+    });
+}
+
 /// Once the device is lost, a present target is refused like every other call that would queue
 /// work; a window that cannot be made is refused for that reason first.
 #[test]

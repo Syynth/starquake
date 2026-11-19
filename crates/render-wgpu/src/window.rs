@@ -307,6 +307,10 @@ impl Presenter {
         format: wgpu::TextureFormat,
         dst: &wgpu::Texture,
     ) -> Result<(), Dropped> {
+        let origin = (at.origin.x, at.origin.y);
+        if !present::starts_on_block(origin, format.block_dimensions()) {
+            return Err("the presented rectangle does not start on a compressed block");
+        }
         let shown = shown_size(desc.src_rect, desc.transform);
         let target = (dst.width(), dst.height());
         let screen: ScreenRect = fit(shown, target).ok_or("the image or the window is empty")?;

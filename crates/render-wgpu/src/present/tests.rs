@@ -470,6 +470,32 @@ fn the_action_for_every_acquire_answer() {
 }
 
 #[test]
+fn a_copy_starts_on_a_block_at_each_edge() {
+    // Uncompressed: every origin.
+    assert!(starts_on_block((0, 0), (1, 1)));
+    assert!(starts_on_block((3, 7), (1, 1)));
+    // 4x4 blocks: each axis on its own, one below, at and one above a block edge.
+    for (origin, expected) in [
+        ((0, 0), true),
+        ((4, 8), true),
+        ((3, 0), false),
+        ((5, 0), false),
+        ((0, 3), false),
+        ((0, 5), false),
+        ((4, 3), false),
+        ((3, 4), false),
+    ] {
+        assert_eq!(starts_on_block(origin, (4, 4)), expected, "{origin:?}");
+    }
+    // Blocks that are not square (ASTC 8x5): the axes are not swapped.
+    assert!(starts_on_block((8, 5), (8, 5)));
+    assert!(!starts_on_block((5, 8), (8, 5)));
+    // No zero-sized block is a block.
+    assert!(!starts_on_block((0, 0), (0, 4)));
+    assert!(!starts_on_block((0, 0), (4, 0)));
+}
+
+#[test]
 fn a_surface_off_the_main_thread_only_where_it_may_be() {
     assert!(may_make_surface(false, false));
     assert!(may_make_surface(false, true));

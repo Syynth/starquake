@@ -361,6 +361,16 @@ pub fn acquire_action(acquired: Acquired, retried: bool) -> AcquireAction {
     }
 }
 
+/// Whether a rectangle at `origin` starts on a block of a format whose blocks are `block`
+/// texels: the window blit copies from there in whole blocks, and wgpu refuses a copy of a
+/// compressed format that starts inside a block (`wgpu-core` 30.0.2, `command/transfer.rs`,
+/// `UnalignedCopyOriginX` and `UnalignedCopyOriginY`). The shared present checks allow such a
+/// rectangle, so a present of one to a window is dropped (`crate::window`). A zero block side
+/// (no format has one) counts as unaligned.
+pub fn starts_on_block(origin: (u32, u32), block: (u32, u32)) -> bool {
+    origin.0.checked_rem(block.0) == Some(0) && origin.1.checked_rem(block.1) == Some(0)
+}
+
 /// Whether a window surface may be made on this thread: always, except where the platform
 /// attaches the window's layer, which must happen on the main thread (macOS; wgpu panics
 /// otherwise, `wgpu-30.0.2/src/api/surface.rs`, `SurfaceTarget`).
