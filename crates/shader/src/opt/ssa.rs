@@ -57,12 +57,13 @@
 //!   two mean the same; the verifier here checks dominance on the operand as written
 //!   (`tests::ssa::a_trivial_join_takes_the_resolved_value`).
 //! - **Placement.** Phis created here come first in their block, in creation order (Eden
-//!   prepends each, so its order is the reverse); then the `Undef`s created for trivial phis;
-//!   then the trivial phis, now `Identity` operations, in removal order, each with its
-//!   argument resolved through any chain of removed phis to the value it stands for (Eden
-//!   reinserts each after the phis, newest first, and keeps the chain). Resolving keeps every
-//!   use after its definition in a block, which the verifier checks and Eden's order does not
-//!   guarantee.
+//!   prepends each, so its order is the reverse), then the block's own phis; then the
+//!   `Undef`s created for trivial phis; then the trivial phis, now `Identity` operations, in
+//!   removal order (Eden reinserts each right after the phis, so newest first). None of them
+//!   names another of the same block: a block holds at most one phi per variable at a time,
+//!   and a trivial phi's resolved value is never a phi of its own variable in its own block
+//!   (that operand is skipped as a self-reference), so the order only has to put the `Undef`s
+//!   first (`tests::ssa::an_entry_phi_with_no_predecessors_is_left_alone`).
 //! - **Structured functions** are refused ([`PassError::Structured`]). Eden runs the rewrite
 //!   after structuring, on predecessors its structurizer records; in this IR a structured
 //!   block has no terminator, so its predecessors would have to come from the tree, and the
@@ -579,20 +580,8 @@ impl Ssa<'_> {
             let (own_phis, list) = list.split_at(leading);
             insts.extend_from_slice(own_phis);
             insts.extend_from_slice(undefs);
-            for &value in removed {
-                self.work.step();
-                let target = match self.function.inst(value) {
-                    Some(Inst::Op(op)) => op.args.first().copied(),
-                    _ => None,
-                };
-                if let Some(target) = target {
-                    let resolved = resolve(self.function, target);
-                    if let Some(inst) = self.function.inst_mut(value) {
-                        *inst = identity_of(resolved);
-                    }
-                }
-                insts.push(value);
-            }
+            insts.extend_from_slice(removed);
+            self.work.step();
             insts.extend(list);
             if let Some(block) = self.function.block_mut(id) {
                 block.insts = insts;
