@@ -82,6 +82,16 @@
 //! - **A module binding the interface does not list.** As before this slice, wgpu refuses the
 //!   pipeline's layout for it when it builds.
 //!
+//! **An owner question.** The spec says the interface "carries the shader's requirements and
+//! each binding's array count, so the backend reads neither from the naga module", and issue
+//! #434 says to keep "the naga scan only as a cross-check in tests", while also asking that R6
+//! refuse "a pipeline whose interface and module disagree, with the exact error". Here layouts
+//! and requirements are built from the interface only, and the scan still reads both facts from
+//! the module at shader creation to run the cross-check on every pipeline, in production too:
+//! without it, an interface that leaves out `subgroup` would skip [`SUBGROUP_SIZE`] on a device
+//! that cannot promise 32. The alternative is to run the cross-check in tests only (or in debug
+//! builds) and trust the GPU crate's conversion.
+//!
 //! **Requirements.** A shader whose interface requires subgroups (the cross-check above holds
 //! every module that uses subgroup operations or built-ins to declaring it) needs every
 //! subgroup to be 32 invocations wide, the guest's warp (shader-pipeline, "What the render

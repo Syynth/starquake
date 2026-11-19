@@ -1976,6 +1976,18 @@ fn the_interface_check_comes_after_the_ids_and_before_the_requirements() {
             Err(RenderError::Unsupported(SUBGROUP_SIZE)),
             "the declared requirement, refused for the size"
         );
+        // Both faults: a declared requirement the device cannot meet, and an array count the
+        // module does not have. The interface is reported.
+        let both = fragment(
+            &gpu,
+            BINDING_ARRAY,
+            subgroups(rows(&[(0, texture(true)), (1, SAMPLER)])),
+        );
+        assert_eq!(
+            gpu.create_graphics_pipeline(graphics_desc(bare, Some(both))),
+            Err(RenderError::Invalid(ARRAY_COUNT_MISMATCH)),
+            "both faults: the interface first"
+        );
         let cs = gpu
             .create_shader(shader_desc(
                 ShaderStage::Compute,
@@ -1988,6 +2000,26 @@ fn the_interface_check_comes_after_the_ids_and_before_the_requirements() {
             gpu.create_compute_pipeline(ComputePipelineDesc { shader: cs }),
             Err(RenderError::Invalid(UNDECLARED_SUBGROUPS)),
             "a compute pipeline too"
+        );
+        let both = gpu
+            .create_shader(shader_desc(
+                ShaderStage::Compute,
+                "main",
+                wgsl(
+                    "enable wgpu_binding_array;
+                     @group(0) @binding(0) var textures: binding_array<texture_2d<f32>, 4>;
+                     @compute @workgroup_size(32) fn main() {
+                         let b = subgroupBallot(true);
+                         let d = textureDimensions(textures[0]);
+                     }",
+                ),
+                subgroups(rows(&[(0, texture(true))])),
+            ))
+            .expect("the shader itself is accepted");
+        assert_eq!(
+            gpu.create_compute_pipeline(ComputePipelineDesc { shader: both }),
+            Err(RenderError::Invalid(ARRAY_COUNT_MISMATCH)),
+            "a compute pipeline with both faults: the interface first"
         );
     });
 }
