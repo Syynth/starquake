@@ -5,7 +5,7 @@ use proptest::prelude::*;
 use proptest::strategy::BoxedStrategy;
 
 use super::*;
-use crate::testing::{any_cbuf, any_gpr, any_pred_src, any_uniform_reg};
+use crate::testing::{any_gpr, any_pred, any_pred_src, any_uniform_reg, any_unmodified_src};
 
 /// Any offset `field` can hold.
 fn any_offset(field: Field) -> impl Strategy<Value = BranchOffset> {
@@ -17,31 +17,9 @@ fn any_barrier() -> impl Strategy<Value = Barrier> {
     (0..Barrier::COUNT).prop_map(|index| Barrier::new(index).unwrap_or(Barrier(0)))
 }
 
-fn any_pred() -> impl Strategy<Value = Pred> {
-    (0..=Pred::PT.index()).prop_map(|index| Pred::new(index).unwrap_or(Pred::PT))
-}
-
 fn any_uniform_pred() -> impl Strategy<Value = UniformPred> {
     (0..=UniformPred::UPT.index())
         .prop_map(|index| UniformPred::new(index).unwrap_or(UniformPred::UPT))
-}
-
-/// An unmodified source of forms 1, 4, 5 and 6.
-fn any_source() -> impl Strategy<Value = AluSrc> {
-    prop_oneof![
-        any_gpr().prop_map(AluSrc::reg),
-        any::<u32>().prop_map(AluSrc::Imm),
-        any_cbuf().prop_map(|cbuf| AluSrc::CBuf {
-            cbuf,
-            abs: false,
-            neg: false
-        }),
-        any_uniform_reg().prop_map(|reg| AluSrc::UniformReg {
-            reg,
-            abs: false,
-            neg: false
-        }),
-    ]
 }
 
 /// A `SHFL` operand: a register, or an immediate of `imm`'s width.
@@ -171,7 +149,7 @@ pub(super) fn barriers() -> Vec<BoxedStrategy<Op>> {
 
 /// `WARPSYNC`, `VOTE`, `SHFL`, `MATCH`, `REDUX` and `NANOSLEEP`.
 pub(super) fn warp() -> Vec<BoxedStrategy<Op>> {
-    let warpsync = (any_source(), any_pred_src())
+    let warpsync = (any_unmodified_src(), any_pred_src())
         .prop_map(|(mask, cond)| Op::WarpSync(OpWarpSync { mask, cond }));
     let vote_dst = prop_oneof![
         (any_gpr(), any_pred()).prop_map(|(ballot, vote)| VoteDst::Reg { ballot, vote }),
@@ -229,7 +207,7 @@ pub(super) fn warp() -> Vec<BoxedStrategy<Op>> {
     ];
     let redux = (redux_op, any_uniform_reg(), any_gpr())
         .prop_map(|(op, dst, src)| Op::Redux(OpRedux { op, dst, src }));
-    let nanosleep = (any_source(), any::<[bool; 3]>(), any_pred_src()).prop_map(
+    let nanosleep = (any_unmodified_src(), any::<[bool; 3]>(), any_pred_src()).prop_map(
         |(time, [clear, warp, rand], cond)| {
             Op::Nanosleep(OpNanosleep {
                 time,

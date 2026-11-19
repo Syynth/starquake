@@ -45,7 +45,7 @@ use thiserror::Error;
 
 use crate::decode::{
     AluSrc, Gpr, Instr, MovSrc, Op, OpALd, OpASt, OpExit, OpFFma, OpMov, OpS2R, RoundMode,
-    SpecialReg,
+    S2RDst, SpecialReg,
 };
 use crate::ir::{
     Attribute, BuildError, Builder, Flags, FmzMode, FpControl, FpRounding, Function, Imm, Opcode,
@@ -488,17 +488,21 @@ impl Translator<'_> {
         Ok(())
     }
 
+    /// `S2R` to a per-thread register; the uniform form, `S2UR`, is not handled yet.
     fn s2r(&mut self, op: OpS2R) -> Result<(), Failure> {
+        let S2RDst::Reg(dst) = op.dst else {
+            return Err(Failure::Unsupported(Unsupported::Instruction("s2ur")));
+        };
         require(
             op.sr == SpecialReg::LANE_ID,
             Unsupported::SpecialRegister(op.sr),
         )?;
         // A write to `RZ` is dropped, so the lane id is not read and needs no capability.
-        if op.dst.is_zero() {
+        if dst.is_zero() {
             return Ok(());
         }
         let value = self.op(Opcode::LaneId, &[])?;
-        self.set(op.dst, value.into())
+        self.set(dst, value.into())
     }
 
     /// `EXIT`: for a pixel program, the registers hold the colour outputs, four per target in

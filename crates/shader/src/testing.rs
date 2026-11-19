@@ -6,7 +6,7 @@ use proptest::strategy::Union;
 use proptest::test_runner::{Config, RngSeed};
 
 use crate::decode::{
-    AluSrc, CBuf, CBufRef, GROUP_HOOKS, GROUPS, Gpr, Instr, Instruction, OPCODE, Pred, PredSrc,
+    AluSrc, CBuf, CBufRef, Form, GROUP_HOOKS, GROUPS, Gpr, Instr, Instruction, OPCODE, Pred, PredSrc,
     UniformReg,
 };
 
@@ -32,10 +32,16 @@ pub(crate) fn forms() -> Vec<(u16, u128, u128)> {
 /// A word of one of the [`forms`]: its opcode and fixed bits, random bits wherever the form
 /// has fields. The decoder may still reject it in a field's other layout (see `decode`, step 5).
 pub(crate) fn any_form_word() -> impl Strategy<Value = Instruction> {
-    let forms = forms();
+    any_word_of(GROUPS.concat())
+}
+
+/// A word of one of `forms`, made as [`any_form_word`] makes one: for one group's tests.
+pub(crate) fn any_word_of(forms: impl Into<Vec<Form>>) -> impl Strategy<Value = Instruction> {
+    let forms: Vec<Form> = forms.into();
     (0..forms.len(), any::<u128>()).prop_map(move |(index, noise)| {
-        let (opcode, known, fixed) = forms[index];
-        Instruction::from_bits((noise & known) | fixed).with_field(OPCODE, u64::from(opcode))
+        let form = forms[index];
+        Instruction::from_bits((noise & form.known) | form.fixed)
+            .with_field(OPCODE, u64::from(form.opcode))
     })
 }
 
@@ -53,6 +59,11 @@ pub(crate) fn any_pred_src() -> impl Strategy<Value = PredSrc> {
         reg: Pred::new(reg).unwrap_or(Pred::PT),
         negated,
     })
+}
+
+/// Any predicate register, `PT` included.
+pub(crate) fn any_pred() -> impl Strategy<Value = Pred> {
+    (0..=Pred::PT.index()).prop_map(|index| Pred::new(index).unwrap_or(Pred::PT))
 }
 
 /// Any encodable constant-buffer reference: a bound buffer 0 to 31 or a bindless one.
@@ -84,6 +95,25 @@ pub(crate) fn any_wide_src() -> impl Strategy<Value = AluSrc> {
         }),
         (any_uniform_reg(), any::<bool>(), any::<bool>())
             .prop_map(|(reg, abs, neg)| AluSrc::UniformReg { reg, abs, neg }),
+    ]
+}
+
+/// An unmodified source of the ALU forms that put source 1 in the wide slot (1, 4, 5 and 6):
+/// a register, an immediate, a constant buffer or a uniform register.
+pub(crate) fn any_unmodified_src() -> impl Strategy<Value = AluSrc> {
+    prop_oneof![
+        any_gpr().prop_map(AluSrc::reg),
+        any::<u32>().prop_map(AluSrc::Imm),
+        any_cbuf().prop_map(|cbuf| AluSrc::CBuf {
+            cbuf,
+            abs: false,
+            neg: false
+        }),
+        any_uniform_reg().prop_map(|reg| AluSrc::UniformReg {
+            reg,
+            abs: false,
+            neg: false
+        }),
     ]
 }
 

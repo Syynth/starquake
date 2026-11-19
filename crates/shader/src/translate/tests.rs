@@ -4,7 +4,7 @@
 use proptest::prelude::*;
 
 use super::*;
-use crate::decode::{OpExit, Pred, PredSrc, RoundMode};
+use crate::decode::{OpExit, Pred, PredSrc, RoundMode, UniformReg};
 use crate::testing::{any_instr, config};
 
 fn r(index: u8) -> Gpr {
@@ -182,7 +182,12 @@ fn a_vertex_exit_writes_nothing() {
 
 #[test]
 fn s2r_lane_id() {
-    let s2r = |sr| Instr::new(Op::S2R(OpS2R { dst: r(5), sr }));
+    let s2r = |sr| {
+        Instr::new(Op::S2R(OpS2R {
+            dst: S2RDst::Reg(r(5)),
+            sr,
+        }))
+    };
     let ir = translate(
         pixel([0; COLOR_TARGETS]),
         &[s2r(SpecialReg::LANE_ID), exit()],
@@ -203,7 +208,12 @@ fn s2r_lane_id() {
 /// register is still checked.
 #[test]
 fn s2r_to_rz_reads_nothing() {
-    let s2r = |sr| Instr::new(Op::S2R(OpS2R { dst: Gpr::RZ, sr }));
+    let s2r = |sr| {
+        Instr::new(Op::S2R(OpS2R {
+            dst: S2RDst::Reg(Gpr::RZ),
+            sr,
+        }))
+    };
     for stage in [VERTEX, pixel([0; COLOR_TARGETS])] {
         let ir = translate(stage, &[s2r(SpecialReg::LANE_ID), exit()]).expect("translates");
         assert_eq!(ir.to_string(), "block0:\n    return\n");
@@ -213,6 +223,20 @@ fn s2r_to_rz_reads_nothing() {
         one(tid),
         unsupported(tid, Unsupported::SpecialRegister(SpecialReg::TID_X))
     );
+}
+
+/// `S2UR`, `S2R` to a uniform register, is not handled yet, whatever its special register: the
+/// destination is checked before the register.
+#[test]
+fn s2ur_is_unsupported() {
+    let ur1 = UniformReg::new(1).expect("a uniform register");
+    for sr in [SpecialReg::LANE_ID, SpecialReg::TID_X] {
+        let s2ur = Instr::new(Op::S2R(OpS2R {
+            dst: S2RDst::Uniform(ur1),
+            sr,
+        }));
+        assert_eq!(one(s2ur), unsupported(s2ur, Unsupported::Instruction("s2ur")));
+    }
 }
 
 /// A guard on a real predicate, plain or negated, needs flow analysis (a listed divergence: the
