@@ -226,7 +226,8 @@ fn s2r_to_rz_reads_nothing() {
 }
 
 /// `S2UR`, `S2R` to a uniform register, is not handled yet, whatever its special register: the
-/// destination is checked before the register.
+/// destination is checked before the register, and the rejection names `"s2ur"`, not `s2r` (a
+/// listed divergence: PR #4588 writes the uniform register through `Visitor::S2R`).
 #[test]
 fn s2ur_is_unsupported() {
     let ur1 = UniformReg::new(1).expect("a uniform register");

@@ -558,8 +558,11 @@ pub struct SpecialReg(pub u8);
 /// @ cf654052). `None` where Eden's enumerator is a bare number (`SR12`). The numbering is
 /// Maxwell's. NAK's SM 7.0 and later numbering (`nak_private.h`, `enum nak_sv`) agrees with it
 /// at every index NAK names (0, 2, 3, 15, 16, 17, 19, 28, 29, 32 to 35, 37 to 39, 56 to 60, 80
-/// and 81) and PR #4588 reads 0, 33 to 39 and 56 to 60 by it (`ops_misc.cpp`, `S2R`); that SM86
-/// keeps Eden's numbers at the other indices is a guess `nvdisasm` would confirm.
+/// and 81). PR #4588 reads exactly 0, 30, 31, 33 to 35, 37 to 39 and 56 to 60 by it
+/// (`ops_misc.cpp`, `S2R`); of these, 30 and 31 (`SR_WSCALEFACTOR_XY` and `_Z`) are not in NAK,
+/// and the PR marks their numbering as an assumption too ("assumed from the Maxwell/Volta
+/// register numbering, not in NAK"). That SM86 keeps Eden's numbers at the other indices is a
+/// guess `nvdisasm` would confirm.
 const SPECIAL_REG_NAMES: [Option<&str>; 100] = [
     Some("sr_laneid"),
     Some("sr_clock"),

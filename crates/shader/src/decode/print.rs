@@ -13,9 +13,11 @@
 //! (`test_ldc`, `test_nanosleep`). Of the control group (`op::control`), `test_nop`,
 //! `test_redux`, `test_match` and `test_nanosleep` pin `nop`, every `redux` operation, `match`
 //! with and without its predicate and `.u64`, and `nanosleep` with each source kind and a hex
-//! immediate. Of the attribute group (`op::attribute`), `test_isberd` and `test_isbewr` pin
-//! `isberd` and `isbewr` with every output, access, skew and memory-type modifier, in that
-//! order, and the `[r2]`/`[r2+0x42]` address.
+//! immediate. Of the attribute group (`op::attribute`), `test_isberd` pins `isberd` with every
+//! output, access, skew and memory-type modifier, in that order, and the `[r2]`/`[r2+0x42]`
+//! address; `test_isbewr` pins `isbewr` only with `.o` set and the map and `.attr` access types,
+//! with every skew and memory-type modifier and both addresses, so `isbewr` without `.o` is a
+//! guess.
 //! **Everything else is a guess** in `nvdisasm`'s usual style that a developer with
 //! `nvdisasm` should check (spec, "`nvdisasm` cross-check"): `urz` and `upt`, the `.rm`/`.rp`
 //! rounding names (taken from NAK's own `FRndMode` printer), `.fmz` for the `dnz` bit, float
