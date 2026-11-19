@@ -32,7 +32,7 @@ starquake-trace = { path = "crates/trace" }
 lz4_flex = "0.14.0"
 # Shader IR: the shader crate hands out a validated naga module (docs/specs/shader-pipeline.md,
 # "The backend through naga") and the render crate's `ShaderSource::Naga` carries it
-# (docs/specs/render-backend.md, "Where the backend sits"). Pinned exactly to the naga wgpu 30.0.1
+# (docs/specs/render-backend.md, "Where the backend sits"). Pinned exactly to the naga wgpu 30.0.x
 # uses, so the shader, gpu and render crates share one naga with wgpu (owner's decision of
 # 2026-11-12); upgrade it together with wgpu. No features here: the render crate only names the
 # module types.
@@ -58,10 +58,13 @@ tracing = "0.1.44"
 astc-decode = "0.3.1"
 insta = "1.49.0"
 proptest = "1.12.0"
-# Creates the shader crate's naga modules on a real device: experiment E1 and the wgpu acceptance
-# tests (docs/specs/shader-pipeline.md, "What to verify before building"). Takes a naga module
-# directly (`naga-ir`); Metal on macOS, Vulkan elsewhere. Pinned with naga.
-wgpu = { version = "=30.0.1", default-features = false, features = ["std", "metal", "vulkan", "naga-ir"] }
+# The wgpu render backend (crates/render-wgpu, docs/specs/render-backend.md, slice R5), and the
+# shader crate's device tests (experiment E1 and the wgpu acceptance tests,
+# docs/specs/shader-pipeline.md, "What to verify before building"). Takes a naga module directly
+# (`naga-ir`); Metal on macOS, Vulkan elsewhere. 30.0.2 rather than the spec's 30.0.1: the patch
+# release fixes a use-after-free when a mapped buffer is destroyed (the backend's readbacks map
+# buffers) and still takes naga 30.0.x, so the naga pin above is unchanged. Pinned with naga.
+wgpu = { version = "=30.0.2", default-features = false, features = ["std", "metal", "vulkan", "naga-ir"] }
 
 # Cargo's own unused-dependency lints (new in Rust 1.100) cannot say why a dependency is declared
 # ahead of the task that uses it. The gate's unused-dependency check is the authority instead:

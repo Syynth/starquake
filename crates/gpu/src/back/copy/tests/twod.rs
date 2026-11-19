@@ -3,8 +3,8 @@
 
 use super::super::surface::CopySide;
 use super::super::{
-    BILINEAR_FORMATS, BLIT_REGISTERS_NEEDED, BLIT_RESET_REGISTERS, CopyError, MAX_COPY_BYTES,
-    PendingWrites, blit_method, bytes_per_pixel,
+    BILINEAR_FORMATS, BLIT_REGISTERS_NEEDED, CopyError, MAX_COPY_BYTES, PendingWrites, blit_method,
+    bytes_per_pixel,
 };
 use super::*;
 use crate::classes::cl902d as d;
@@ -1302,22 +1302,7 @@ fn point_sampling_clamps_to_the_last_source_pixel() {
     );
 }
 
-// --- Register reset values ---
-
-/// `BLIT_RESET_REGISTERS` against Eden-NX2's `Fermi2D` constructor (`regs.src.depth = 1;
-/// regs.dst.depth = 1;`), with the byte addresses written out from `cl902d.h`
-/// (`NV902D_SET_SRC_DEPTH` 0x023c, `NV902D_SET_DST_DEPTH` 0x020c).
-#[test]
-fn blit_reset_registers_match_the_constructor_written_out() {
-    let written: Vec<(&str, u32, u32)> = BLIT_RESET_REGISTERS
-        .iter()
-        .map(|(method, value)| (method.name, method.byte_address, *value))
-        .collect();
-    assert_eq!(
-        written,
-        vec![("SET_SRC_DEPTH", 0x023c, 1), ("SET_DST_DEPTH", 0x020c, 1)]
-    );
-}
+// --- Register reset values (the values themselves: `regs::tests`) ---
 
 /// A block-linear to block-linear blit for the depth tests.
 fn depth_blit() -> Blit {
@@ -1383,12 +1368,17 @@ fn a_block_linear_side_of_depth_zero_is_refused() {
             error: out
         })
     );
-    // The reset values make the same blit work.
+    // The depths a new `902D` mirror holds (the class's reset values, `regs::DEFAULTS_2D`) make
+    // the same blit work.
+    let mirror = crate::back::state::Mirror::new(
+        crate::interface::ChannelId(3),
+        crate::ring::ClassId(d::CLASS),
+    );
     assert_eq!(
         run_with(&blit, &|r| {
             r.set(d::SET_SRC_DEPTH, 0).set(d::SET_DST_DEPTH, 0);
-            for (method, value) in BLIT_RESET_REGISTERS {
-                r.set(method, value);
+            for method in [d::SET_SRC_DEPTH, d::SET_DST_DEPTH] {
+                r.set(method, mirror.value(method.method()).unwrap());
             }
         }),
         Ok(())

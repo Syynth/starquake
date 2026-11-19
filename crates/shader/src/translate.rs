@@ -100,9 +100,10 @@ pub const COLOR_TARGETS: usize = 8;
 /// The bits of a [`ColorOutputs`] target entry that name components; higher bits are ignored.
 pub const COMPONENT_MASK: u8 = 0xf;
 
-/// Which components of each colour target a pixel program writes: a stand-in for the output
-/// map of the program's header (the SPH's `omap`), which slice 2 parses. Bit `c` of
-/// `targets[t]` means component `c` of target `t`; bits above [`COMPONENT_MASK`] are ignored.
+/// Which components of each colour target a pixel program writes: the output map of the
+/// program's header (the SPH's `omap`), as [`crate::sph::PixelIo::color_outputs`] reads it from
+/// a parsed header. Bit `c` of `targets[t]` means component `c` of target `t`; bits above
+/// [`COMPONENT_MASK`] are ignored.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ColorOutputs {
     /// Four bits per target.

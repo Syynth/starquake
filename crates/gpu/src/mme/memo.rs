@@ -16,6 +16,11 @@
 //!
 //! - read a register ([`MacroHost::state`]): [`NotMemoised::RegisterRead`];
 //! - ran a load barrier ([`MacroHost::barrier`]): [`NotMemoised::Barrier`];
+//! - made a method write that the host says loaded data RAM ([`MacroHost::data_ram_load`]
+//!   returned `Some`, with or without words; the front macro host does so for every
+//!   `MME_DMA_READ` write, 3D or compute, `crate::macros`): [`NotMemoised::DataRamLoad`]. Such a write changes
+//!   data RAM from guest memory, which neither the key nor the guard covers, and without a
+//!   barrier, so the barrier rule does not catch it;
 //! - asked the host for a word after its parameters were used up (words a DMA read appended):
 //!   [`NotMemoised::LoadPastParameters`];
 //! - read a data RAM word it had itself written earlier in the call (Eden-NX2's
@@ -47,10 +52,13 @@
 //! Each is pinned by a test in `memo/tests.rs`:
 //!
 //! - **Any load barrier disqualifies a call.** Eden-NX2 disqualifies a call that wrote one of the
-//!   MME DMA read methods (3D 0x157, `MME_DMA_READ`, and 0x158, `MME_DMA_READ_FIFOED`), so a
-//!   barrier without a DMA read is still remembered there. This memo sits in front of the
-//!   interpreter, not the 3D engine, and cannot tell what a host did at a barrier
-//!   (`a_barrier_disqualifies_a_call_even_without_a_dma_read`).
+//!   MME DMA read methods (3D 0x157, `MME_DMA_READ`, and 0x158, `MME_DMA_READ_FIFOED`;
+//!   `read_memory` in `MacroEngine::Execute`), so a barrier without a DMA read is still
+//!   remembered there, and a call that wrote 0x158 without a barrier is not. This memo sits in
+//!   front of the interpreter, not the 3D engine, and cannot tell what a host did at a barrier
+//!   (`a_barrier_disqualifies_a_call_even_without_a_dma_read`). For 0x157 it agrees with
+//!   Eden-NX2 through the host's [`MacroHost::data_ram_load`]
+//!   (`a_data_ram_load_disqualifies_a_call_and_is_never_replayed`).
 //! - **A record longer than the arena is not stored.** Eden-NX2 appends it anyway and lets the
 //!   arena grow past its limit (`a_record_longer_than_the_arena_is_not_stored`).
 //! - **Compaction keeps records in arena order.** Eden-NX2 copies them in its map's iteration
@@ -64,7 +72,7 @@ use std::ops::Range;
 
 use super::inst::Instruction;
 use super::interp::{
-    DATA_RAM_WORDS, DataRam, MacroError, MacroHost, RamAccess, StepLimit, run_with,
+    DATA_RAM_WORDS, DataRam, DataRamLoad, MacroError, MacroHost, RamAccess, StepLimit, run_with,
 };
 
 /// The most words the memo's arena holds before it compacts (Eden-NX2's `MaxArenaWords`,
@@ -89,6 +97,9 @@ pub enum NotMemoised {
     RegisterRead,
     /// It ran a load barrier, where a host may perform MME DMA reads.
     Barrier,
+    /// A method write it made loaded data RAM ([`MacroHost::data_ram_load`]): an MME DMA read
+    /// into data RAM.
+    DataRamLoad,
     /// It loaded a word beyond its parameters.
     LoadPastParameters,
     /// It read a data RAM word it had written itself.
@@ -247,6 +258,15 @@ impl<H: MacroHost> MacroHost for Recorder<'_, H> {
     fn barrier(&mut self) {
         note(self.reason, NotMemoised::Barrier);
         self.host.barrier();
+    }
+
+    fn data_ram_load(&mut self) -> Option<DataRamLoad<'_>> {
+        let reason = self.reason;
+        let load = self.host.data_ram_load();
+        if load.is_some() {
+            note(reason, NotMemoised::DataRamLoad);
+        }
+        load
     }
 }
 

@@ -1,11 +1,17 @@
 //! How the GPU reads and writes memory (gpu-protocol spec, "Reading and writing guest memory",
-//! slice G7): the [`GpuMemory`] trait, the [`Translate`] seam an address table offers, and the
-//! per-thread [`TranslationCache`] keyed by the table's version.
+//! slice G7, and "GPU-only memory", slice G22): the [`GpuMemory`] trait, the [`Translate`] seam
+//! an address table offers, the per-thread [`TranslationCache`] keyed by the table's version, the
+//! production memory [`VmMemory`] and the [`GpuOnlyStore`] behind sparse regions.
 //!
-//! - [`GpuMemory`] is the GPU's access trait. Its production implementation (over `GpuVm` and
-//!   `GuestMemory`, slice G22) and the capture-replay one (slice G20) come later; with the
-//!   `test-support` feature this module exports [`TestGpuMemory`], which maps page ranges of a
-//!   GPU address space onto a [`starquake_memory::GuestMemory`].
+//! - [`GpuMemory`] is the GPU's access trait. Its production implementation is [`VmMemory`]
+//!   (slice G22): it translates through an address space's [`crate::vm::GpuVm`] and resolves
+//!   each `Target` (guest memory, the GPU-only store, the syncpoint shim). The capture-replay
+//!   implementation (slice G20) comes later; with the `test-support` feature this module exports
+//!   [`TestGpuMemory`], which maps page ranges of a GPU address space onto a
+//!   [`starquake_memory::GuestMemory`].
+//! - [`GpuOnlyStore`] holds the host pages behind `GpuOnly` targets: allocated on the first
+//!   write, zero where never written, freed by an applied sparse-region destroy, and charged to
+//!   nothing of the title's.
 //! - [`Translate`] is what an address table offers a cache: a version ("generation") that every
 //!   map, ordered update or kind change moves, and the translation of one page. The production
 //!   table, [`crate::vm::GpuVm`] (graphics-server slice 6), implements it.
@@ -39,8 +45,10 @@
 //! cache's and empties it on a difference).
 
 mod cache;
+mod gpu_only;
 #[cfg(any(test, feature = "test-support"))]
 mod test_memory;
+mod vm_memory;
 
 #[cfg(test)]
 mod tests;
@@ -48,8 +56,10 @@ mod tests;
 use starquake_memory::{Fault, PAGE_SIZE};
 
 pub use cache::{TRANSLATION_CACHE_SLOTS, TranslationCache};
+pub use gpu_only::{GpuOnlyRangeError, GpuOnlyStore};
 #[cfg(any(test, feature = "test-support"))]
 pub use test_memory::TestGpuMemory;
+pub use vm_memory::{SHIM_STRIDE, VmMemory};
 
 /// Why a GPU access failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -76,6 +86,17 @@ pub enum GpuFault {
         /// The guest memory's fault, at the CPU address the GPU address translated to.
         fault: Fault,
     },
+    /// A write reaches the syncpoint shim but is not a release to one syncpoint: it does not lie
+    /// wholly within the shim page, or does not start on a syncpoint's word ([`VmMemory`]'s
+    /// "The syncpoint shim").
+    #[error(
+        "GPU address {va:#x} is in the syncpoint shim, which takes only a write that starts on one \
+         syncpoint's word and stays in the shim page"
+    )]
+    ShimWrite {
+        /// The GPU address of the first byte of the write that lies in the shim.
+        va: u64,
+    },
 }
 
 /// Byte-level access to one GPU address space, by copy.
@@ -90,6 +111,17 @@ pub trait GpuMemory: Send + Sync {
     /// The address table's version: moved by every map, ordered update or kind change, so a
     /// thread's caches know to drop what they derived from the old table.
     fn generation(&self) -> u64;
+    /// Whether every page of the `len` bytes at `va` leads to GPU-only memory (a sparse region's
+    /// `GpuOnly` pages), so a render target there stays a host-only texture (gpu-protocol,
+    /// "GPU-only memory"). False for an empty range, a range whose end is past the 64-bit space,
+    /// and a range any page of which is unmapped or leads elsewhere.
+    ///
+    /// The default answers false: a memory with no GPU-only pages ([`TestGpuMemory`]) has
+    /// nothing to report. [`VmMemory`] answers from its table.
+    fn is_gpu_only(&self, va: u64, len: u64) -> bool {
+        let _ = (va, len);
+        false
+    }
 }
 
 /// What an address table offers a [`TranslationCache`].
@@ -120,9 +152,8 @@ pub(crate) const fn page_of(va: u64) -> u64 {
 /// iteration for size 0). Otherwise the access's end, `va + len`, must be representable, or the
 /// error is [`GpuFault::OutOfRange`].
 ///
-/// Only [`TestGpuMemory`] walks accesses so far; the production memory (slice G22) will share it,
-/// and the `cfg` goes then.
-#[cfg(any(test, feature = "test-support"))]
+/// [`TestGpuMemory`], [`VmMemory`] and [`GpuOnlyStore`] (over a region's offsets) all walk their
+/// accesses with it.
 pub(crate) fn page_pieces(
     va: u64,
     len: usize,

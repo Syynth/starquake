@@ -512,3 +512,10 @@ fn staging_slice_accessors() {
     assert_eq!(s.bytes(), &[0, 0, 9, 0]);
     assert!(StagingSlice::from_bytes(Vec::new()).is_empty());
 }
+
+#[test]
+fn a_staging_slice_hands_its_bytes_over() {
+    let mut slice = StagingSlice::from_bytes(vec![0; 3]);
+    slice.bytes_mut().copy_from_slice(&[7, 8, 9]);
+    assert_eq!(slice.into_bytes(), vec![7, 8, 9]);
+}

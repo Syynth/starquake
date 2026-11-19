@@ -13,6 +13,8 @@ use crate::fifo::METHOD_ADDRESS;
 use crate::interface::ChannelId;
 use crate::ring::{ClassId, MAX_RUN_WORDS, RingEntry};
 
+mod defaults;
+
 /// Not channel 0, so a hard-coded channel fails.
 const CHANNEL: ChannelId = ChannelId(7);
 const THREE_D_CLASS: ClassId = ClassId(clc797::CLASS);
@@ -117,18 +119,21 @@ fn snapshot(file: &RegFile) -> (Vec<Option<u32>>, Vec<Option<u32>>) {
 // ---------------------------------------------------------------------------------------------
 
 #[test]
-fn new_three_d_file_starts_zeroed_tracking_and_dropping() {
+fn new_three_d_file_starts_from_its_reset_values_tracking_and_dropping() {
     let file = three_d();
     assert_eq!(file.channel(), CHANNEL);
     assert_eq!(file.class(), THREE_D_CLASS);
     assert_eq!(file.rules(), &THREE_D);
-    // Eden's `shadow_state` starts zeroed, and mode 0 is METHOD_TRACK.
+    // Eden's `shadow_state` starts as a copy of the registers, whose shadow control is 0, and
+    // mode 0 is METHOD_TRACK.
     assert_eq!(file.shadow_mode(), Some(ShadowMode::Track));
     assert!(file.drop_same_values());
     let registers = THREE_D.registers();
+    let initial = THREE_D.initial_values();
     for method in 0..registers {
-        assert_eq!(file.get(method), Some(0), "register {method:#x}");
-        assert_eq!(file.shadow(method), Some(0), "shadow {method:#x}");
+        let value = initial[method as usize];
+        assert_eq!(file.get(method), Some(value), "register {method:#x}");
+        assert_eq!(file.shadow(method), Some(value), "shadow {method:#x}");
     }
     assert_eq!(file.get(registers), None);
     assert_eq!(file.shadow(registers), None);
@@ -150,7 +155,8 @@ fn new_compute_file_has_registers_but_no_shadow_ram() {
 fn rules_are_picked_by_class_id() {
     assert_eq!(ClassRules::for_class(THREE_D_CLASS), &THREE_D);
     assert_eq!(ClassRules::for_class(COMPUTE_CLASS), &COMPUTE);
-    for class in [clc7b5::CLASS, cla140::CLASS, cl902d::CLASS, 0, u32::MAX] {
+    assert_eq!(ClassRules::for_class(ClassId(cl902d::CLASS)), &TWO_D);
+    for class in [clc7b5::CLASS, cla140::CLASS, 0, u32::MAX] {
         assert_eq!(ClassRules::for_class(ClassId(class)), &OTHER, "{class:#x}");
     }
 }

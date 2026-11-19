@@ -166,9 +166,10 @@ impl Journal {
 }
 
 impl RegFile {
-    /// A file of the class's starting values ([`ClassRules::initial_values`], all zero today),
-    /// with a shadow file holding the same values (so the shadow RAM starts in
-    /// [`ShadowMode::Track`], as Eden's zero-initialised `shadow_state` does), for class `class`
+    /// A file of the class's starting values ([`ClassRules::initial_values`]: zero but for the
+    /// class's reset values), with a shadow file holding the same values (as Eden's
+    /// `shadow_state = regs` copies them; no reset value touches the shadow control, so the
+    /// shadow RAM starts in [`ShadowMode::Track`]), for class `class`
     /// on channel `channel`, with the rules [`ClassRules::for_class`] picks and same-value
     /// dropping on.
     pub fn new(channel: ChannelId, class: ClassId) -> Self {

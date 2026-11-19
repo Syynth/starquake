@@ -56,12 +56,14 @@
 //! # Register reset values
 //!
 //! Eden-NX2's `Fermi2D` constructor sets `SET_SRC_DEPTH` and `SET_DST_DEPTH` to 1 before the guest
-//! writes anything ([`BLIT_RESET_REGISTERS`]); the channel's register mirror (G10, G19) must
-//! apply them when it binds the class. This module reads the depth as the mirror stores it: a
+//! writes anything; they are the 2D class's reset values ([`crate::regs::DEFAULTS_2D`]), which
+//! [`crate::regs::ClassRules::initial_values`] seeds into the front's register file and the
+//! back's mirror alike. This module reads the depth as the mirror stores it: a
 //! depth of 0 on a block-linear side is [`CopyError::Layout`] with
 //! [`starquake_layout::LayoutError::RegionOutOfBounds`] on that side (its last line is in a
 //! slice at or past the depth), and a pitch side never reads its depth. Pinned by
-//! `a_block_linear_side_of_depth_zero_is_refused`.
+//! `a_block_linear_side_of_depth_zero_is_refused` (which also runs the blit from a new `902D`
+//! mirror's depths).
 //!
 //! # Overlapping source and destination
 //!
@@ -119,16 +121,6 @@ use super::{CopyError, CopySink, PendingWrites, Registers, check_size, registers
 use crate::classes::Method;
 use crate::classes::cl902d as d;
 use crate::memory::GpuMemory;
-
-/// The registers the channel's `902D` register mirror must hold when the class is bound, before
-/// the guest writes any: `SET_SRC_DEPTH` and `SET_DST_DEPTH` are 1, as Eden-NX2's `Fermi2D`
-/// constructor sets them (`regs.src.depth = 1; regs.dst.depth = 1;` in
-/// `eden-nx2/src/video_core/engines/fermi_2d.cpp` @ 50fa86bb, "Nvidia's OpenGL driver seems to
-/// assume these values"); every other register starts at 0. Applying them is the mirror's job
-/// (slices G10 and G19): [`blit_method`] reads the depth as stored, so a mirror that starts at 0
-/// refuses every block-linear blit from a title that never writes the depth (module docs).
-/// Pinned by `tests::twod::blit_reset_registers_match_the_constructor_written_out`.
-pub const BLIT_RESET_REGISTERS: [(Method, u32); 2] = [(d::SET_SRC_DEPTH, 1), (d::SET_DST_DEPTH, 1)];
 
 /// The register file must reach every method a blit reads.
 pub const BLIT_REGISTERS_NEEDED: usize = registers_needed(&[

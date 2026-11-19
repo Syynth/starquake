@@ -27,7 +27,7 @@ use crate::back::buffer::{EVICT_AFTER_FRAMES, STREAMED_AFTER_FAULTS};
 use crate::back::readback::ReadbackIds;
 use crate::classes::MwField;
 use crate::classes::clc797tex as tex;
-use crate::interface::{Kind, RegionId, VmUpdate};
+use crate::interface::{Kind, RegionId, Target, VmUpdate};
 use crate::memory::{GpuFault, GpuMemory, TestGpuMemory};
 
 /// Where the test memory starts, at the same GPU and CPU address (row 30).
@@ -491,6 +491,89 @@ fn a_sampled_texture_at_an_unmapped_address_is_an_error() {
     // A render target there with only part of its memory unmapped is host-only too.
     let rt = rig.target(&header(page(40)).image).unwrap();
     assert_eq!(rig.entry(rt.texture).source, Source::HostOnly);
+}
+
+/// A `Completions` that drops what is pushed: nothing in these tests watches a syncpoint.
+struct NoCompletions;
+
+impl crate::interface::Completions for NoCompletions {
+    fn push(&self, _completion: crate::interface::GpuCompletion) {}
+}
+
+#[test]
+fn a_render_target_in_gpu_only_memory_is_host_only() {
+    use crate::memory::VmMemory;
+    use crate::syncpoint::Syncpoints;
+    use crate::vm::GpuVm;
+
+    let mut rig = Rig::new();
+    // Pages 40 and 41 GPU-only; page 44 GPU-only and page 45 guest memory; pages 48 and 49
+    // GPU-only, for a sampled texture.
+    let vm = Arc::new(GpuVm::new());
+    let gpu_only = |first, count, region| {
+        vm.map(
+            pages(first, count),
+            Target::GpuOnly {
+                region: RegionId(region),
+                offset: 0,
+            },
+            Kind(0),
+        )
+        .unwrap();
+    };
+    gpu_only(40, IMAGE_PAGES, 1);
+    gpu_only(44, 1, 2);
+    vm.map(pages(45, 1), Target::Guest { cpu_va: page(45) }, Kind(0))
+        .unwrap();
+    gpu_only(48, IMAGE_PAGES, 3);
+    let size = usize::try_from(PAGES * PAGE_SIZE).unwrap();
+    let mem = VmMemory::new(
+        Arc::clone(&vm),
+        Arc::new(FlatMemory::new(BASE, size)),
+        Arc::new(Syncpoints::new(Arc::new(NoCompletions))),
+    );
+
+    let info = header(page(40)).image;
+    let target = rig.cache.render_target(&mem, &info, &mut rig.list).unwrap();
+    let entry = rig.entry(target.texture);
+    assert_eq!(entry.source, Source::HostOnly);
+    assert_eq!(entry.watch, Watch::Unwatched);
+    assert_eq!(uploads(&rig.list.commands), Vec::<Upload>::new());
+    assert!(!rig.watch.has_requests());
+    // Never written back, and nothing read or allocated in the store.
+    assert!(!rig.cache.needs_write_back(page(40)..page(42)));
+    let wb = rig
+        .cache
+        .begin_write_back(page(40)..page(42), &mut rig.ids, &mut rig.list);
+    assert!(wb.is_empty());
+    assert_eq!(wb.skipped(), [(target.texture, Skip::HostOnly)]);
+    assert_eq!(vm.gpu_only().resident_pages(), 0);
+
+    // Half GPU-only, half guest memory: an ordinary image, uploaded and watched.
+    let half = rig
+        .cache
+        .render_target(&mem, &header(page(44)).image, &mut rig.list)
+        .unwrap();
+    assert_eq!(rig.entry(half.texture).source, Source::Guest);
+    assert!(rig.watch.has_requests());
+
+    // A sampled texture in GPU-only memory is read from the store (zero where never written).
+    let before = rig.list.commands.len();
+    let sampled = rig
+        .cache
+        .texture(&mem, &header(page(48)), &mut rig.list)
+        .unwrap();
+    assert_eq!(rig.entry(sampled.texture).source, Source::Guest);
+    assert_eq!(
+        uploads(&rig.list.commands[before..]),
+        [(
+            sampled.texture,
+            0,
+            (0, 0, 0),
+            (WIDTH, HEIGHT, 1),
+            IMAGE_BYTES
+        )]
+    );
 }
 
 // --- Uploads ---
