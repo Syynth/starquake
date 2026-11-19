@@ -63,8 +63,9 @@
 
 use crate::plan::TexelBox;
 use crate::present::{
-    self, AcquireAction, Acquired, Crop, ScreenRect, alpha_mode, blit_params, fit, present_mode,
-    shown_size, surface_format, surface_size, view_formats, write_format,
+    self, AcquireAction, Acquired, Crop, FRAME_LATENCY, SURFACE_UNSUPPORTED, ScreenRect,
+    SurfaceChoice, blit_params, fit, shown_size, surface_choice, surface_size, view_formats,
+    write_format,
 };
 use starquake_render::command::PresentDesc;
 use starquake_render::host_shaders::present as shader;
@@ -77,9 +78,6 @@ pub const NOT_MAIN_THREAD: &str =
     "a window's surface must be made on the main thread on macOS (set the present target there)";
 /// wgpu could not make a surface from the window's handles.
 pub const NO_SURFACE: &str = "a surface could not be made from the window's handles";
-/// The adapter cannot present to the window, or the surface lists no format, present mode or
-/// alpha mode the backend uses ([`crate::present`]).
-pub const SURFACE_UNSUPPORTED: &str = "the GPU adapter cannot present to this window";
 
 /// Whether this platform makes window surfaces on the main thread only (module docs).
 const NEEDS_MAIN_THREAD: bool = cfg!(target_os = "macos");
@@ -100,9 +98,7 @@ fn on_main_thread() -> bool {
 #[derive(Debug)]
 pub struct WindowSurface {
     surface: wgpu::Surface<'static>,
-    format: wgpu::TextureFormat,
-    present_mode: wgpu::PresentMode,
-    alpha_mode: wgpu::CompositeAlphaMode,
+    choice: SurfaceChoice,
     size: WindowSize,
 }
 
@@ -124,27 +120,14 @@ pub fn make_surface(
             tracing::warn!("wgpu could not make a surface for the window: {error}");
             RenderError::Unsupported(NO_SURFACE)
         })?;
-    let unsupported = RenderError::Unsupported(SURFACE_UNSUPPORTED);
     if !adapter.is_surface_supported(&surface) {
-        return Err(unsupported);
+        return Err(RenderError::Unsupported(SURFACE_UNSUPPORTED));
     }
-    let caps = surface.get_capabilities(adapter);
-    let (Some(format), Some(present_mode), Some(alpha_mode)) = (
-        surface_format(&caps.formats),
-        present_mode(&caps.present_modes),
-        alpha_mode(&caps.alpha_modes),
-    ) else {
-        return Err(unsupported);
-    };
-    if !caps.usages.contains(wgpu::TextureUsages::RENDER_ATTACHMENT) {
-        return Err(unsupported);
-    }
-    tracing::info!("presenting to a window as {format:?}, {present_mode:?}, {alpha_mode:?}");
+    let choice = surface_choice(&surface.get_capabilities(adapter))?;
+    tracing::info!("presenting to a window with {choice:?}");
     Ok(WindowSurface {
         surface,
-        format,
-        present_mode,
-        alpha_mode,
+        choice,
         size: handles.size().clone(),
     })
 }
@@ -437,23 +420,17 @@ fn configure(device: &wgpu::Device, window: &WindowSurface, size: (u32, u32)) {
         device,
         &wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: window.format,
+            format: window.choice.format,
             color_space: wgpu::SurfaceColorSpace::Auto,
             width: size.0,
             height: size.1,
-            present_mode: window.present_mode,
+            present_mode: window.choice.present_mode,
             desired_maximum_frame_latency: FRAME_LATENCY,
-            alpha_mode: window.alpha_mode,
-            view_formats: view_formats(window.format),
+            alpha_mode: window.choice.alpha_mode,
+            view_formats: view_formats(window.choice.format),
         },
     );
 }
-
-/// The surface's frame latency hint: wgpu's default (`Surface::get_default_config`). A guess,
-/// to measure: wgpu notes that under mailbox on Metal and Vulkan, 2 limits the frame rate to
-/// twice the display's (`wgpu-types-30.0.2/src/surface.rs`, `desired_maximum_frame_latency`),
-/// which is more than the guest's 60 Hz on any display.
-pub const FRAME_LATENCY: u32 = 2;
 
 /// The backend's sampled copy for a present of `at` read as `format`, made again when the format
 /// or size changed.

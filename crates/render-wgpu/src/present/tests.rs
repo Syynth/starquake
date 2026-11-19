@@ -118,6 +118,59 @@ fn the_alpha_mode_for_every_set_of_modes() {
     assert_eq!(alpha_mode(&[Alpha::PreMultiplied, Alpha::Auto]), None);
 }
 
+fn capabilities(
+    formats: &[F],
+    modes: &[Mode],
+    alphas: &[Alpha],
+    usages: wgpu::TextureUsages,
+) -> wgpu::SurfaceCapabilities {
+    wgpu::SurfaceCapabilities {
+        formats: formats.to_vec(),
+        format_capabilities: Vec::new(),
+        present_modes: modes.to_vec(),
+        alpha_modes: alphas.to_vec(),
+        usages,
+    }
+}
+
+#[test]
+fn a_surface_is_refused_when_any_choice_has_nothing_to_choose() {
+    let target = wgpu::TextureUsages::RENDER_ATTACHMENT;
+    let formats = [F::Rgba16Float, F::Bgra8Unorm];
+    let modes = [Mode::Fifo, Mode::Immediate];
+    let alphas = [Alpha::Inherit, Alpha::PreMultiplied];
+    assert_eq!(
+        surface_choice(&capabilities(&formats, &modes, &alphas, target)),
+        Ok(SurfaceChoice {
+            format: F::Bgra8Unorm,
+            present_mode: Mode::Immediate,
+            alpha_mode: Alpha::Inherit,
+        })
+    );
+    let refused = Err(RenderError::Unsupported(SURFACE_UNSUPPORTED));
+    // Each list empty or unusable on its own, and the usage missing on its own.
+    for caps in [
+        capabilities(&[], &modes, &alphas, target),
+        capabilities(&formats, &[Mode::FifoRelaxed], &alphas, target),
+        capabilities(&formats, &modes, &[Alpha::PostMultiplied], target),
+        capabilities(&formats, &modes, &alphas, wgpu::TextureUsages::COPY_SRC),
+        wgpu::SurfaceCapabilities::default(),
+    ] {
+        assert_eq!(surface_choice(&caps), refused, "{caps:?}");
+    }
+    // Written out: the message the frontend sees.
+    assert_eq!(
+        RenderError::Unsupported(SURFACE_UNSUPPORTED).to_string(),
+        "the GPU adapter cannot present to this window"
+    );
+}
+
+#[test]
+fn the_frame_latency_is_wgpus_default() {
+    // Written out: wgpu's `Surface::get_default_config` asks for 2.
+    assert_eq!(FRAME_LATENCY, 2);
+}
+
 #[test]
 fn view_and_write_formats_follow_the_presented_views_srgb() {
     assert_eq!(view_formats(F::Bgra8Unorm), vec![F::Bgra8UnormSrgb]);

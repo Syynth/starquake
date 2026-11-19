@@ -57,12 +57,12 @@
 //! window", not "seen".
 
 use crate::plan::TexelBox;
-use starquake_render::PresentOutcome;
 use starquake_render::command::{PresentTransform, Rect};
 use starquake_render::host_shaders::present::{
     MATRIX_OFFSET, PARAMS_SIZE, VERTEX_COUNT, VERTEX_POSITION_OFFSET, VERTEX_STRIDE,
     VERTEX_TEX_COORD_OFFSET, VERTICES_OFFSET,
 };
+use starquake_render::{PresentOutcome, RenderError};
 
 /// Bytes in the present blit's parameter block (`host_shaders::present::PARAMS_SIZE`).
 pub const PARAMS_LEN: usize = PARAMS_SIZE as usize;
@@ -99,6 +99,42 @@ pub fn alpha_mode(supported: &[wgpu::CompositeAlphaMode]) -> Option<wgpu::Compos
     .into_iter()
     .find(|mode| supported.contains(mode))
 }
+
+/// The adapter cannot present to the window, or the surface lists no format, present mode or
+/// alpha mode the backend uses, or cannot be rendered to ([`surface_choice`]).
+pub const SURFACE_UNSUPPORTED: &str = "the GPU adapter cannot present to this window";
+
+/// How a window's surface is configured, chosen from what it lists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SurfaceChoice {
+    /// [`surface_format`]'s choice.
+    pub format: wgpu::TextureFormat,
+    /// [`present_mode`]'s choice.
+    pub present_mode: wgpu::PresentMode,
+    /// [`alpha_mode`]'s choice.
+    pub alpha_mode: wgpu::CompositeAlphaMode,
+}
+
+/// The configuration for a surface whose capabilities are `caps`: refused with
+/// [`SURFACE_UNSUPPORTED`] when any of the three choices has nothing to choose from, or the
+/// surface cannot be a render attachment (wgpu says it always can; a guard, as for FIFO).
+pub fn surface_choice(caps: &wgpu::SurfaceCapabilities) -> Result<SurfaceChoice, RenderError> {
+    let refused = RenderError::Unsupported(SURFACE_UNSUPPORTED);
+    if !caps.usages.contains(wgpu::TextureUsages::RENDER_ATTACHMENT) {
+        return Err(refused);
+    }
+    Ok(SurfaceChoice {
+        format: surface_format(&caps.formats).ok_or(refused.clone())?,
+        present_mode: present_mode(&caps.present_modes).ok_or(refused.clone())?,
+        alpha_mode: alpha_mode(&caps.alpha_modes).ok_or(refused)?,
+    })
+}
+
+/// The surface's frame latency hint: wgpu's default (`Surface::get_default_config`). A guess,
+/// to measure: wgpu notes that under mailbox on Metal and Vulkan, 2 limits the frame rate to
+/// twice the display's (`wgpu-types-30.0.2/src/surface.rs`, `desired_maximum_frame_latency`),
+/// which is more than the guest's 60 Hz on any display.
+pub const FRAME_LATENCY: u32 = 2;
 
 /// The formats views of a target in `format` may take besides `format` itself: its sRGB
 /// counterpart, when it has one. The blit writes through the counterpart when the presented

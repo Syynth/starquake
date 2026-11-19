@@ -119,8 +119,10 @@ pub const SHADERS_NOT_YET: &str =
 pub const PIPELINES_NOT_YET: &str =
     "the wgpu backend cannot build pipelines yet (pipelines arrive with slice R6)";
 
-/// A present target of a kind this backend does not know (`PresentTarget` is non-exhaustive).
-pub const UNKNOWN_TARGET: &str = "the wgpu backend presents to a window or offscreen only";
+/// A present target of a kind this backend does not know. Unreachable while `PresentTarget` has
+/// only the window and offscreen kinds, which this backend takes; the match needs the arm because
+/// the enum is non-exhaustive (a later exported-image kind would reach it).
+const UNKNOWN_TARGET: &str = "the wgpu backend presents to a window or offscreen only";
 
 /// How long [`WgpuBackend::new`] waits for wgpu to find an adapter or open a device. Native
 /// wgpu answers at once; the bound only keeps a broken driver from hanging the caller.
