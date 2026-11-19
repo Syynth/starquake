@@ -169,35 +169,61 @@ fn jump_table(src: BrxSrc, base: u32) -> (Vec<Instruction>, BranchTables) {
     (code, tables)
 }
 
-/// The register read and the (address, target block) of each comparison, in order, and the
-/// block the chain ends in.
-fn chain(ir: &IrBlocks, first: usize) -> (Option<Operation>, Vec<(u32, BlockId)>, Terminator) {
+/// What the indirect branch variable is set to (the operation that reads the register, or
+/// the immediate it is set to), the (address, target block) of each comparison, in order, and
+/// the block the chain ends in. Every comparison reads the variable again in its own block, so
+/// no value crosses blocks.
+fn chain(
+    ir: &IrBlocks,
+    first: usize,
+) -> (Result<Operation, Operand>, Vec<(u32, BlockId)>, Terminator) {
     let mut block = nth(ir, first).1;
-    let mut read = None;
+    let mut set = None;
     let mut targets = Vec::new();
     loop {
+        let mut variable = None;
         for &value in &block.insts {
             let (opcode, args) = op(ir, value);
-            if opcode == Opcode::IEqual {
-                let address = match args[1] {
-                    Operand::Imm(Imm::U32(address)) => Some(address),
-                    _ => None,
-                };
-                let ends = match block.terminator {
-                    Terminator::Branch {
-                        then, otherwise, ..
-                    } => Some((then, otherwise)),
-                    _ => None,
-                };
-                let (then, otherwise) = ends.expect("a branch");
-                targets.push((address.expect("an address"), then));
-                block = ir.function.block(otherwise).expect("a block");
-                break;
+            match opcode {
+                Opcode::SetIndirectBranchVariable => {
+                    assert!(
+                        set.is_none(),
+                        "the variable is set once, in the first block"
+                    );
+                    set = Some(match args[0] {
+                        Operand::Value(read) => {
+                            assert!(block.insts.contains(&read), "read in the same block");
+                            Ok(op(ir, read))
+                        }
+                        imm @ Operand::Imm(_) => Err(imm),
+                    });
+                }
+                Opcode::GetIndirectBranchVariable => variable = Some(value),
+                Opcode::IEqual => {
+                    assert_eq!(
+                        args[0],
+                        Operand::Value(variable.expect("the variable read in this block"))
+                    );
+                    let address = match args[1] {
+                        Operand::Imm(Imm::U32(address)) => Some(address),
+                        _ => None,
+                    };
+                    let ends = match block.terminator {
+                        Terminator::Branch {
+                            then, otherwise, ..
+                        } => Some((then, otherwise)),
+                        _ => None,
+                    };
+                    let (then, otherwise) = ends.expect("a branch");
+                    targets.push((address.expect("an address"), then));
+                    block = ir.function.block(otherwise).expect("a block");
+                    break;
+                }
+                _ => {}
             }
-            read = Some((opcode, args));
         }
         if block.insts.is_empty() {
-            return (read, targets, block.terminator);
+            return (set.expect("the variable is set"), targets, block.terminator);
         }
     }
 }
@@ -214,7 +240,7 @@ fn an_indirect_branch_compares_each_address() {
     let (read, targets, end) = chain(&ir, 3);
     assert_eq!(
         read,
-        Some((Opcode::GetRegister, vec![Operand::Imm(Imm::Reg(r(2)))]))
+        Ok((Opcode::GetRegister, vec![Operand::Imm(Imm::Reg(r(2)))]))
     );
     assert_eq!(
         targets,
@@ -246,17 +272,15 @@ fn indirect_addresses_use_the_table_base() {
 fn indirect_registers_rz_and_uniform() {
     let (code, tables) = jump_table(BrxSrc::Reg(crate::decode::Gpr::RZ), 0);
     let ir = ir_of(&code, &tables);
-    let first = nth(&ir, 3).1;
-    let (opcode, args) = op(&ir, first.insts[0]);
-    assert_eq!(opcode, Opcode::IEqual);
-    assert_eq!(args[0], Operand::Imm(Imm::U32(0)));
+    let (set, _, _) = chain(&ir, 3);
+    assert_eq!(set, Err(Operand::Imm(Imm::U32(0))));
     let ur5 = UniformReg::new(5).expect("ur5");
     let (code, tables) = jump_table(BrxSrc::UniformReg(ur5), 0);
     let ir = ir_of(&code, &tables);
     let (read, _, _) = chain(&ir, 3);
     assert_eq!(
         read,
-        Some((
+        Ok((
             Opcode::GetUniformRegister,
             vec![Operand::Imm(Imm::UniformReg(ur5))]
         ))

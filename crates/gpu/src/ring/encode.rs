@@ -17,7 +17,7 @@
 //! | 2 write | method 23:8 | value | channel (low), class (high) |
 //! | 3 run | method 23:8 | word count | channel (low), class (high); the words, two per word, first in the low half |
 //! | 4 release | reduce 8, eight bytes 9, timestamp 10, reduction 14:12, format 17:16 | channel | address; payload |
-//! | 5 syncpoint | id 15:8 | 0 | |
+//! | 5 syncpoint | id 15:8 | count | |
 //! | 6 wait for idle | | channel | |
 //! | 7 invalidate | `MEM_OP_D` operation 12:8 | channel | |
 //! | 8 marker | | 0 | token |
@@ -351,10 +351,10 @@ pub fn encode(entry: &RingEntry<'_>, out: &mut Vec<u64>) -> Result<(), EncodeErr
             }
             out.extend([word(low, channel.0), release.address, release.payload]);
         }
-        RingEntry::Syncpoint { id } => {
+        RingEntry::Syncpoint { id, count } => {
             out.push(word(
                 SYNCPOINT_ID.insert_truncated(head, u32::from(id.get())),
-                0,
+                *count,
             ));
         }
         RingEntry::WaitForIdle { channel } => out.push(word(head, channel.0)),
@@ -546,13 +546,15 @@ impl Encoded<'_> {
 
     fn syncpoint(&self) -> Result<RingEntry<'static>, DecodeError> {
         self.check_low(&[SYNCPOINT_ID])?;
-        self.check_high_zero(0)?;
         let value = SYNCPOINT_ID.get(self.low);
         let id = u8::try_from(value)
             .ok()
             .and_then(SyncpointId::new)
             .ok_or(DecodeError::Syncpoint { value })?;
-        Ok(RingEntry::Syncpoint { id })
+        Ok(RingEntry::Syncpoint {
+            id,
+            count: self.high,
+        })
     }
 
     fn invalidate(&self) -> Result<RingEntry<'static>, DecodeError> {

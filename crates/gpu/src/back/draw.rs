@@ -7,7 +7,9 @@
 //! commands to the open list. Eden draws deferred instances (`DrawDeferred`) after each macro;
 //! the ring marks no macro's end, so the executor calls [`Draws::flush`] at the boundaries its
 //! module docs list ("Deferred instanced draws"). It hands each run of `LOAD_ROOT_TABLE` words
-//! to [`Draws::load_root_table`] before the selector write that follows the run.
+//! to [`Draws::load_root_table`] before the selector write that follows the run. A word written
+//! to `CLEAR_SURFACE` is a clear ([`clear`], slice G24), which shares the draw path's render
+//! targets, conditional render answer and host-object lifetime.
 //!
 //! # A draw, step by step
 //!
@@ -121,6 +123,7 @@
 //! (`tests::every_emulation_flag_reaches_the_key_through_a_draw`).
 
 pub mod call;
+pub mod clear;
 pub mod conditional;
 pub mod fixed;
 pub mod root;
@@ -207,6 +210,20 @@ pub enum Outcome {
     Drawn,
     /// The draw was skipped.
     Skipped(Skip),
+    /// A `CLEAR_SURFACE` word was handled ([`clear`]): what became of each part.
+    Cleared(clear::Cleared),
+}
+
+impl Outcome {
+    /// Whether a draw was appended, which sets render targets: a draw, or a clear drawn
+    /// ([`clear::Cleared::drew`]).
+    pub fn drew(&self) -> bool {
+        match self {
+            Self::Drawn => true,
+            Self::Skipped(_) => false,
+            Self::Cleared(cleared) => cleared.drew(),
+        }
+    }
 }
 
 /// Counts of what the draw path did, for counters and tests.
@@ -405,6 +422,13 @@ pub enum DrawError {
     /// A state the code rules out was reached (a bug, reported rather than a panic).
     #[error("internal error: {0}")]
     Internal(&'static str),
+    /// A masked clear needs a new pipeline and the draw-based clear holds its cap
+    /// ([`clear::MAX_CLEAR_PIPELINES`]).
+    #[error("the clear pipeline table is full ({limit} pipelines)")]
+    ClearPipelinesFull {
+        /// Its cap.
+        limit: usize,
+    },
 }
 
 /// What a draw needs besides its own state: guest memory, the caches, the shader cache and the
@@ -441,6 +465,8 @@ pub struct Draws {
     uploaded: Option<(u64, [u8; DRIVER_CONSTANTS_SIZE])>,
     last_targets: Option<RenderTargets>,
     last_fence: FenceValue,
+    /// The clear path ([`clear`]).
+    clears: clear::Clears,
     /// Whether draws render (Eden's `execute_on`, true until `SET_RENDER_ENABLE_C` says
     /// otherwise).
     execute: bool,
@@ -468,6 +494,7 @@ impl Draws {
         Self {
             host_shaders: HostShaders::new(Arc::clone(&backend)),
             samplers: Samplers::new(Arc::clone(&backend)),
+            clears: clear::Clears::new(Arc::clone(&backend)),
             backend,
             setting,
             calls: DrawCalls::new(),
@@ -493,6 +520,16 @@ impl Draws {
     /// What the draw path has done so far.
     pub fn counters(&self) -> DrawCounters {
         self.counters
+    }
+
+    /// What clears have done so far ([`clear`]).
+    pub fn clear_counters(&self) -> clear::ClearCounters {
+        self.clears.counters()
+    }
+
+    /// The pipelines the draw-based clear holds ([`clear`]).
+    pub fn clear_pipelines(&self) -> usize {
+        self.clears.pipelines()
     }
 
     /// How many times each fixed-function part was derived, in [`fixed::Part::ALL`] order.
@@ -539,6 +576,12 @@ impl Draws {
             self.execute = conditional::render_enabled(mirror, ctx.memory)?;
             return Ok(None);
         }
+        if method == clc797::CLEAR_SURFACE.method() {
+            return self
+                .clears
+                .clear(ctx, mirror, value, self.execute, &mut self.last_targets)
+                .map(|cleared| Some(Outcome::Cleared(cleared)));
+        }
         match self.calls.method(mirror, method, value)? {
             Started::Nothing => Ok(None),
             Started::Unhandled(name) => {
@@ -583,6 +626,8 @@ impl Draws {
         let bump = |n: &mut u64| *n = n.saturating_add(1);
         match result {
             Ok(Outcome::Drawn) => bump(&mut c.drawn),
+            // `draw` never clears.
+            Ok(Outcome::Cleared(_)) => {}
             Ok(Outcome::Skipped(skip)) => match skip {
                 Skip::RenderDisabled => bump(&mut c.render_disabled),
                 Skip::Unhandled(_) => bump(&mut c.unhandled),
@@ -1084,6 +1129,7 @@ impl Drop for Draws {
         }
         self.samplers.destroy_all(self.last_fence);
         self.host_shaders.destroy_all(self.last_fence);
+        self.clears.destroy_all(self.last_fence);
     }
 }
 

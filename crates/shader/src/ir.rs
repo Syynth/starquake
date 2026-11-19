@@ -15,7 +15,8 @@
 //! - **Operations** ([`Opcode`]) are Eden's table (`opcodes.inc`), with the differences listed
 //!   in the `opcode` module: `Phi` is its own kind of instruction ([`Inst::Phi`]), three
 //!   rescaling-only opcodes are left out, and the uniform register class is added
-//!   ([`Opcode::GetUniformRegister`] and its siblings, [`UniformReg`], [`UniformPred`]).
+//!   ([`Opcode::GetUniformRegister`] and its siblings, [`UniformReg`], [`UniformPred`]), as is
+//!   interpolation at an offset ([`Opcode::InterpolateAtOffset`]).
 //! - **Operands** ([`Operand`]) are values or immediates ([`Imm`]), as Eden's `IR::Value` is an
 //!   instruction or an immediate. Types ([`Type`]) are Eden's, plus the uniform name types.
 //! - **Modifiers** ([`Flags`]) are typed: floating-point controls or texture information, as the
@@ -102,7 +103,10 @@ pub use modifiers::{
     TextureInfo, TextureType,
 };
 pub use opcode::{FlagsKind, Opcode};
-pub use operand::{ATTRIBUTE_WORD_BYTES, Attribute, Imm, Operand, Patch, UniformPred, UniformReg};
+pub use operand::{
+    ATTRIBUTE_COMPONENTS, ATTRIBUTE_WORD_BYTES, Attribute, GENERIC_0_X, Imm, Operand, POSITION_W,
+    POSITION_X, Patch, UniformPred, UniformReg,
+};
 pub use parse::{ParseError, ParseErrorKind};
 pub use types::Type;
 pub use verify::{Site, VerifyError};

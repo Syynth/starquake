@@ -31,7 +31,8 @@
 //! 5. **The IR's blocks** ([`FlowGraph::build_ir`]): one IR block per flow block, which the
 //!    translators fill from its instructions ([`IrBlocks::sources`]), and the tests that end
 //!    the blocks. Building the structured IR the translators fill is slice 11's (owner's
-//!    decision, 2026-11-18: "the IR build step in slices 10 (blocks) and 11").
+//!    decision, 2026-11-18: "the IR build step in slices 10 (blocks) and 11"):
+//!    [`IrBlocks::structure`] (`crate::structure`) keeps the sources.
 //!
 //! # Sources
 //!
@@ -55,8 +56,10 @@
 //! `BMOV` is a plain instruction). An instruction whose guard is `!PT` never runs and is
 //! skipped. When [`FlowBlock::guard_tested`] is set the block holds one instruction whose
 //! guard the graph has already tested, so the translator ignores that guard; any other
-//! guarded instruction in a block is a pure one, whose guard the translator keeps as a select
-//! (`classify.h`, `pure`).
+//! guarded instruction in a block is a pure one (`classify.h`, `pure`). Its translator keeps
+//! the guard as a select, except for the float and conversion group, which
+//! [`crate::translate::float`] makes a conditional block of its own (spec, "Instruction
+//! translation"; that module's "Guards").
 //!
 //! A `KILL` gets a conditional block of its own that holds it and ends in [`BlockEnd::Kill`]:
 //! the discard is that end, not the instruction, as in PR #4588, where the block's end class
@@ -136,6 +139,7 @@ use std::ops::Range;
 use thiserror::Error;
 
 pub use analysis::{Analysis, analyze};
+pub(crate) use classify::{OpInfo, classify};
 pub(crate) use ir_build::read_pred;
 pub use ir_build::{BlockSource, IrBlocks};
 pub use jump_tables::{

@@ -6,7 +6,15 @@
 //! 3D), the vertex attribute limit, `D32_FLOAT_S8_UINT`, clip distances, dual-source blending,
 //! subgroups, 16-bit and 64-bit shader types, binding arrays with non-uniform indexing and mesh
 //! shaders; and the limits `Caps` takes.
+//!
+//! It also records what decides whether the device meets "subgroup size 32"
+//! (`crate::pipeline`, "Requirements"): the backend and name (the Apple GPU family), the
+//! subgroup size range wgpu reports, and the verdict. The verdict here is read from the
+//! adapter's features; the backend decides from the device's, which keep `SUBGROUP` whenever
+//! the adapter offers it (`crate::caps::device_features`), so the two agree
+//! (`pipeline::tests::a_subgroup_pipeline_follows_the_device` checks it on the host's adapter).
 
+use crate::pipeline::{SubgroupSupport, apple_gpu_family};
 use std::fmt;
 
 /// One adapter's answers to verification 1, as plain lines.
@@ -47,6 +55,15 @@ impl AdapterReport {
             ("clip distances", has(F::CLIP_DISTANCES)),
             ("dual-source blending", has(F::DUAL_SOURCE_BLENDING)),
             ("subgroups", has(F::SUBGROUP)),
+            (
+                "subgroup size range",
+                format!("{} to {}", info.subgroup_min_size, info.subgroup_max_size),
+            ),
+            ("Apple GPU family", yes_no(apple_gpu_family(info))),
+            (
+                "subgroups of 32",
+                SubgroupSupport::of(info, features).to_string(),
+            ),
             ("f16 in shaders", has(F::SHADER_F16)),
             ("f64 in shaders", has(F::SHADER_F64)),
             ("i64 in shaders", has(F::SHADER_INT64)),
@@ -170,9 +187,64 @@ mod tests {
             "f16 in shaders: yes\n",
             "f64 in shaders: no\n",
             "max vertex attributes: 31\n",
+            "subgroup size range: 4 to 64\n",
+            "Apple GPU family: no\n",
+            "subgroups of 32: no (the device has no subgroups)\n",
         ] {
             assert!(text.contains(line), "{line:?} in {text}");
         }
         assert_eq!(report.lines().len(), text.lines().count());
+    }
+
+    /// The facts that decide "subgroup size 32" are recorded, with the verdict: the backend and
+    /// name that make the Apple family, the reported range (min before max), and the subgroup
+    /// feature.
+    #[test]
+    fn the_report_records_what_decides_the_subgroup_size() {
+        let info = |backend, name: &str, min, max| wgpu::AdapterInfo {
+            name: name.into(),
+            subgroup_min_size: min,
+            subgroup_max_size: max,
+            ..wgpu::AdapterInfo::new(wgpu::DeviceType::IntegratedGpu, backend)
+        };
+        let s = wgpu::Features::SUBGROUP;
+        let limits = wgpu::Limits::default();
+        for (info, features, lines) in [
+            (
+                info(wgpu::Backend::Metal, "Apple M2", 4, 64),
+                s,
+                [
+                    "backend: Metal\n",
+                    "subgroup size range: 4 to 64\n",
+                    "Apple GPU family: yes\n",
+                    "subgroups of 32: yes (Apple GPU family, 32-wide SIMD groups)\n",
+                ],
+            ),
+            (
+                info(wgpu::Backend::Metal, "AMD Radeon Pro 5500M", 8, 16),
+                s,
+                [
+                    "backend: Metal\n",
+                    "subgroup size range: 8 to 16\n",
+                    "Apple GPU family: no\n",
+                    "subgroups of 32: no (the reported range is 8 to 16)\n",
+                ],
+            ),
+            (
+                info(wgpu::Backend::Vulkan, "Apple M2", 32, 32),
+                s,
+                [
+                    "backend: Vulkan\n",
+                    "subgroup size range: 32 to 32\n",
+                    "Apple GPU family: no\n",
+                    "subgroups of 32: yes (the reported range is 32 to 32)\n",
+                ],
+            ),
+        ] {
+            let text = AdapterReport::new(&info, features, &limits).to_string();
+            for line in lines {
+                assert!(text.contains(line), "{line:?} in {text}");
+            }
+        }
     }
 }

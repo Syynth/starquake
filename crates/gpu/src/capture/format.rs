@@ -30,7 +30,9 @@ pub const MAGIC: [u8; 4] = *b"SQGC";
 
 /// The format version this build writes and reads. Bump it whenever a record's layout changes,
 /// or the layout of a blob it stores in someone else's format (the render `Caps` as `postcard`
-/// writes them, the address-table and syncpoint snapshots) changes.
+/// writes them, the address-table and syncpoint snapshots) changes, or the ring encoding a
+/// `ring` record hashes changes. Not bumped for the `Syncpoint` entry's count (issue #431),
+/// since no build has shipped a capture (module docs, "Not built, and departures").
 pub const VERSION: u32 = 1;
 
 /// The longest build id a header holds, in bytes.

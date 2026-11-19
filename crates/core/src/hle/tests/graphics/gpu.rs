@@ -126,8 +126,8 @@ fn a_run_with_the_gpu_completes_what_waits_on_it() {
     });
     assert_eq!(graphics.shared().syncpoints().read(done.syncpoint), 2);
     assert!(matches!(turns[1].as_slice(), [Note::GpuOrderedDone { .. }]));
-    // The GPU did the work: its front took the submission and pushed both increments, and its
-    // back performed them.
+    // The GPU did the work: its front took the submission and pushed both increments (one
+    // entry with a count of 2), and its back performed them.
     let counters = gpu.counters();
     assert_eq!(counters.submissions, 1);
     assert_eq!(counters.increments, 2);
@@ -144,17 +144,17 @@ fn a_run_with_the_gpu_completes_what_waits_on_it() {
         "0 address space 1 made\n",
         &channel_made,
         "2 submission on channel 0: 0 entries, 2 increments, wait for idle: queued\n",
-        "3 performed 0 releases, 1 increments, 0 markers, no waiter latched\n",
-        "4 performed 0 releases, 1 increments, 0 markers, no waiter latched\n",
-        "5 address space 2 made\n",
+        // Both increments are one `Syncpoint` entry, performed as one action.
+        "3 performed 0 releases, 2 increments, 0 markers, no waiter latched\n",
+        "4 address space 2 made\n",
         &format!(
-            "6 ordered update of address space 2: sparse region destroy of {REGION_SIZE:#x} bytes \
+            "5 ordered update of address space 2: sparse region destroy of {REGION_SIZE:#x} bytes \
              at {REGION:#x} (region 1), no ticket\n"
         ),
-        &format!("7 barrier, ticket {}\n", ticket.0),
-        "8 performed 0 releases, 0 increments, 1 markers, no waiter latched\n",
-        &format!("9 pushed: ticket {} done\n", ticket.0),
-        "10 performed 0 releases, 0 increments, 1 markers, no waiter latched\n",
+        &format!("6 barrier, ticket {}\n", ticket.0),
+        "7 performed 0 releases, 0 increments, 1 markers, no waiter latched\n",
+        &format!("8 pushed: ticket {} done\n", ticket.0),
+        "9 performed 0 releases, 0 increments, 1 markers, no waiter latched\n",
     ]
     .concat();
     assert_eq!(gpu.flight_recorder(), expected);

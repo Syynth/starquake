@@ -43,7 +43,9 @@
 //!   been proved to read the aligned offset"). `GetAttribute`, `GetAttributeU32` and
 //!   `GetAttributeIndexed` read [`Machine::attributes`] (an absent one is
 //!   [`InterpError::MissingInput`]; the indexed form names the word `offset >> 2`, as Eden's
-//!   `make_load` does), and the set forms write [`Machine::outputs`]. `GetPatch` and `SetPatch`
+//!   `make_load` does), and the set forms write [`Machine::outputs`]. `InterpolateAtOffset`, a
+//!   starquake opcode, reads [`Machine::interpolated`] by word and offset bits (an absent one
+//!   is [`InterpError::MissingInput`]). `GetPatch` and `SetPatch`
 //!   share [`Machine::patches`] (Eden reads a control program's output patch and an evaluation
 //!   program's input patch; one map serves both). `SetFragColor`, `SetFragDepth` and
 //!   `SetSampleMask` write their fields. System values come from [`SystemValues`];
@@ -101,8 +103,13 @@
 //!   texture information or argument values ([`InterpError::ImageMismatch`]), and then a reply
 //!   not of the opcode's result type ([`InterpError::ImageReply`]) are errors, checked in that
 //!   order, and a refused call leaves the script as it was. Tests stay pure.
-//! - **Warp operations** (`emit_spirv_warp.cpp`): `LaneId` (from [`SystemValues`]), and the
-//!   votes, `SubgroupBallot`, the four shuffles, `QuadBroadcast`, `QuadSwap` and
+//! - **Warp operations** (`emit_spirv_warp.cpp`): `LaneId` (from [`SystemValues`]); the lane
+//!   masks `SubgroupEqMask`, `SubgroupLtMask`, `SubgroupLeMask`, `SubgroupGtMask` and
+//!   `SubgroupGeMask` computed from it for a warp of 32 lanes: bit `n` is set when lane `n` is
+//!   equal to, below, at or below, above, or at or above the lane id (`LoadMask` loads the
+//!   first word of SPIR-V's `SubgroupEqMask` and its siblings); a lane id of 32 or more is
+//!   above every lane of the word, so the equal mask is 0 and the below masks are all ones;
+//!   and the votes, `SubgroupBallot`, the four shuffles, `QuadBroadcast`, `QuadSwap` and
 //!   `GetInBoundsFromOp` of a shuffle on a warp whose **only active lane is this invocation**
 //!   (`exec`'s `warp` module, added by slice 12h): a vote gives its argument (`VoteEqual`
 //!   gives true), a ballot gives this lane's bit or zero, and a shuffle computes its source
@@ -110,15 +117,19 @@
 //!   out of range or is this lane, and [`INACTIVE_LANE_VALUE`] when it is another lane (SPIR-V
 //!   leaves a read of an inactive invocation undefined; translators read every lane and
 //!   select the active ones, as PR #4588's `REDUX` does). A lane id of [`WARP_SIZE`] or more
-//!   is [`InterpError::LaneOutsideWarp`] for the ballot, the shuffles and the quad operations. Results that need several active lanes are checked
-//!   as golden IR by the translators' tests. Derivatives and the lane masks are not
-//!   supported.
+//!   is [`InterpError::LaneOutsideWarp`] for the ballot, the shuffles and the quad operations
+//!   (not for the lane masks). Results that need several active lanes are checked as golden
+//!   IR by the translators' tests. Derivatives are not supported.
+//! - **`FSwizzleAdd`**, which reads only the lane id: Eden's `EmitFSwizzleAdd`
+//!   (`emit_spirv_warp.cpp`) multiplies each operand by a constant its table picks with the
+//!   lane's two bits of the swizzle, at `(lane_id & 3) * 2`, and adds the products, the
+//!   operation's controls applying to all three steps (added for the float translator, slice
+//!   12b).
 //!
 //! An operation not listed (for example `PhiMove`, `Join`, the `Get*FromOp` pseudo-operations
 //! other than `GetInBoundsFromOp` of a shuffle, `EmitVertex`, `EndPrimitive`,
-//! `InvocationInfo`, `RenderArea`, the `SR_WScaleFactor` values, the 64-bit and float atomics,
-//! the lane masks `SubgroupEqMask` to `SubgroupGeMask`, `FSwizzleAdd` and the derivatives) is
-//! [`InterpError::Unsupported`], naming the opcode; translator slices add semantics as they
+//! `InvocationInfo`, `RenderArea`, the `SR_WScaleFactor` values, the 64-bit and float atomics
+//! and the derivatives) is [`InterpError::Unsupported`], naming the opcode; translator slices add semantics as they
 //! need them.
 //!
 //! # Where the interpreter differs from its references
@@ -317,6 +328,13 @@ pub enum Input {
     },
     /// A patch word.
     Patch(Patch),
+    /// An input attribute word interpolated at an offset.
+    Interpolated {
+        /// The attribute word.
+        attribute: Attribute,
+        /// The offset's bits.
+        offset: u32,
+    },
 }
 
 impl std::fmt::Display for Input {
@@ -324,6 +342,9 @@ impl std::fmt::Display for Input {
         match self {
             Self::Attribute { attribute, vertex } => {
                 write!(f, "attribute {attribute} of vertex {vertex}")
+            }
+            Self::Interpolated { attribute, offset } => {
+                write!(f, "attribute {attribute} at offset {offset:#x}")
             }
             Self::Patch(patch) => write!(f, "{patch}"),
         }
@@ -513,6 +534,10 @@ pub struct Machine {
     pub cbufs: BTreeMap<u32, Vec<u8>>,
     /// Input attribute words, by word and vertex, as their bits.
     pub attributes: BTreeMap<(Attribute, u32), u32>,
+    /// Input attribute words interpolated at an offset, by word and the offset's bits, as their
+    /// bits: what `InterpolateAtOffset` reads (one invocation cannot interpolate, so a test
+    /// gives the result).
+    pub interpolated: BTreeMap<(Attribute, u32), u32>,
     /// Output attribute words, by word and vertex, as their bits.
     pub outputs: BTreeMap<(Attribute, u32), u32>,
     /// Patch words, as their bits (read and written; see the module docs).
@@ -553,6 +578,7 @@ impl Default for Machine {
             indirect_branch: 0,
             cbufs: BTreeMap::new(),
             attributes: BTreeMap::new(),
+            interpolated: BTreeMap::new(),
             outputs: BTreeMap::new(),
             patches: BTreeMap::new(),
             frag_colors: BTreeMap::new(),

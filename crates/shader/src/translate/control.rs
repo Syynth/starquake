@@ -289,6 +289,8 @@ pub fn translate_control(
             stage,
             color_outputs: ColorOutputs::default(),
         },
+        header: None,
+        select: None,
     };
     match t.control(instr, guard_tested) {
         Ok(()) => {}
