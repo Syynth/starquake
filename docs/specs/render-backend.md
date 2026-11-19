@@ -561,7 +561,8 @@ The observability spec's `frames/` folder and `--until frames=N` need pixels wit
 `PresentDesc` has a `dump` flag; for a dumped frame the render thread reads back the presented
 view at the guest's own resolution (not the window's, so dumps don't depend on window size) and
 hands an RGBA8 image to a `FrameSink` the app installs. The app writes the PNG (the `png` crate,
-0.18.1, pure Rust); the render crate does no file I/O.
+0.18.1, pure Rust); the render crate does no file I/O. How `core` asks the GPU crate to set the
+`dump` flag is decided in R9's second part (decided by the owner, 2026-11-18).
 
 ## The recording backend
 
@@ -652,7 +653,8 @@ Offered to #12: the trait, every description type, `Caps` (including `view_swizz
 per-format capabilities, the format fallback choice, `emulation()`, the recording backend with
 its snapshot format, and fences.
 
-Open with #12: how the back thread wakes when a list completes (see "The trait").
+Settled with #12: how the back thread wakes when a list completes ("The completion wake",
+decision 14).
 
 Threads and memory: the back thread owns the command list it is filling and the staging slices it
 has taken; once submitted, both belong to the backend. The render thread belongs to the backend;
@@ -708,14 +710,16 @@ then it is local-only, like the hypervisor tests (decision 9).
 | R6 | Pipelines: shader modules from naga modules, bind group and pipeline layouts from `ShaderInterface`, graphics and compute pipeline creation on the compile pool, wait and skip per the GPU crate's setting, failed-pipeline cache, driver cache blob where wgpu offers one | R4, R5 | `renderer_vulkan/vk_pipeline_cache.*`, `vk_graphics_pipeline.*`, `fixed_pipeline_state.*` (policy only) | Needs a GPU: hand-built naga test modules; scripted compile delays exercise both policies | D |
 | R7 | Draws and dispatches: render targets and lazy passes, bind groups, vertex and index buffers, dynamic state, direct and indirect draws, quad and line-loop index rewrite, typed outputs | R6 | `renderer_vulkan/vk_rasterizer.*`, `vk_render_pass_cache.*`, `vk_update_descriptor.*` (policy only) | Needs a GPU: synthetic scenes with exactly computable pixels (axis-aligned rectangles covering whole pixels, flat colours) | E |
 | R8 | Window presentation: wgpu surface from window handles, present modes, resize, newest-frame-wins queue, `PresentFeedback`; the present-then-write ordering test ("Submit") | R4, R5 | `renderer_vulkan/vk_swapchain.*`, `vk_present_manager.*`, `vk_blit_screen.*` (policy only) | Mode choice and the frame queue are pure functions, tested with no GPU; the ordering test needs a GPU; the window path is checked by hand on a Mac and a Linux desktop | D (with R6) |
-| R9 | Frame dumps: `dump` flag, `FrameSink`, PNG writing and `frames/` in the app, `--until frames=N` | R1 (pixels from R5) | observability spec, "Headless runs" | No GPU: a present of an uploaded image through the recording backend gives a known PNG | C (with R5) |
+| R9 | Frame dumps: `dump` flag, `FrameSink`, PNG writing and `frames/` in the app, `--until frames=N`. The second part (R9b: `frames/` and `--until frames=N` in `core`) runs on G21's recording-backend wiring in `core`, not R12's, and decides the `dump` flag's path from `core` to the GPU crate (decided by the owner, 2026-11-18) | R1 (pixels from R5); R9b also gpu-protocol G21 | observability spec, "Headless runs" | No GPU: a present of an uploaded image through the recording backend gives a known PNG | C (with R5) |
 | R10 | GPU ASTC decode (WGSL compute) for devices without native ASTC | R3, R4, R5 | `eden/src/video_core/host_shaders/astc_decoder.comp` | Needs a GPU, with native ASTC switched off in `Caps` on the Mac: bit-identical to the CPU decoder on the same blocks | D |
-| R11 | Host-level capture and replay: write submitted lists and their staging bytes to a file; `starquake render-replay <capture> --png <dir>` on any backend (renamed from `gpu-replay`, which is gpu-protocol's command; review guide, M15) | R1, R5 | none (new) | No GPU for the format (golden bytes, version refused on mismatch); replay on the recording backend in the gate | D |
-| R12 | `starquake-core` wiring: backend choice by `cfg` and features, the shared compile pool for shader translation and pipelines (review guide, M16), the CLI's `--window` (decision 11) | R5, R8, R9 | none | Runs the recording backend end to end in the gate | F |
+| R11 | Host-level capture and replay: write submitted lists and their staging bytes to a file; `starquake render-replay <capture> --png <dir>` on any backend (renamed from `gpu-replay`, which is gpu-protocol's command; review guide, M15). The second part (replay on a fresh backend) needs the self-contained capture format v2 (creation calls and a serialisable shader description), which the lead drafts as a design PR for the owner; R5 does not wait for it (decided by the owner, 2026-11-18) | R1, R5; the second part also the capture v2 design | none (new) | No GPU for the format (golden bytes, version refused on mismatch); replay on the recording backend in the gate | D |
+| R12 | `starquake-core` wiring: backend choice by `cfg` and features, the shared compile pool for shader translation and pipelines (review guide, M16), the CLI's `--window` (decision 11) | R5, R8, R9b | none | Runs the recording backend end to end in the gate | F |
 
 Group A lands first. Group B is four slices in parallel. R5 and R9 can run together (C); R6, R8,
-R10 and R11 can run together after R5 (D). R7 follows R6. Up to four build agents fit the
-machine limits in `roadmap.md`.
+R10 and R11 can run together after R5 (D). R7 follows R6. R9b waits for G21 rather than R12, so
+R12 can follow it. R11's second part waits for the capture v2 design PR; nothing else does
+(decided by the owner, 2026-11-18). Up to four build agents fit the machine limits in
+`roadmap.md`.
 
 Later slices, in order of expected need: queries and conditional rendering; BC recompression of
 ASTC; GPU detiling; a direct Vulkan backend (when decision 1's trigger is met: `ash` or

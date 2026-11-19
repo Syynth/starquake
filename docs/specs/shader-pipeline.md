@@ -268,6 +268,10 @@ analysis turns into plain edges first. Divergence (threads of a warp taking diff
 not modelled: host shaders run each invocation independently, and reconvergence points become
 the ends of structured regions.
 
+**Building the IR.** Flow analysis (slice 10) builds the IR's basic blocks from the flow graph,
+and the structurizer (slice 11) settles the structured IR that the translators fill (decided by
+the owner, 2026-11-18).
+
 ### The intermediate representation
 
 The IR is designed for this crate and borrows Eden's operation set and pass semantics
@@ -353,7 +357,8 @@ In order (following Eden's order in `frontend/maxwell/translate_program.cpp`, li
    and the attribute parts of `ir_opt/collect_shader_info_pass.cpp`, with the SPH v4 layout.
 6. **Local and shared memory.** Local memory becomes a private array sized from the SPH
    (graphics) or the QMD (compute); shared memory a workgroup array sized from the QMD. All
-   indexed accesses are bounds-checked.
+   indexed accesses are bounds-checked. Slice 16 owns this pass (decided by the owner,
+   2026-11-18).
 7. **Dead code elimination**, then **collect info**: the resource table, the interface, and the
    host features the shader needs.
 8. **Host lowering passes**, only where the target needs them: f64 to f32 on Metal, which has no
@@ -532,8 +537,8 @@ Everything here runs in CI with no game, no GPU and no `nvdisasm`.
 | Decoder round trip | Test assembler (ported encoder) → decoder → assembler gives the same word, for generated `Op` values (proptest, fixed seed) | Every gate |
 | Strict decoding | For each form, flipping any bit outside its mask makes the decoder reject the word | Every gate |
 | Decoder robustness | Arbitrary 128-bit words never panic | Every gate; also a fuzz target |
-| `nvdisasm` cross-check | A developer with `nvdisasm` runs `cargo xtask shader-nvdisasm`, which disassembles every committed fixture word one instruction at a time (row 88: one bad word stops `nvdisasm`) and rewrites the expected-text files; the diff is reviewed and committed with the tool version recorded | By hand, when encodings change |
-| Translator semantics | An IR interpreter executes the translated IR for one instruction (or a short sequence) on given register, predicate and constant-buffer values; results are compared with values derived from the instruction's documented behaviour. PR #4588's tests do the same against Eden's IR (`tests/video_core/native_shader.cpp`, 271 test cases, its `EvaluateVertex`) and are ported as cases | Every gate |
+| `nvdisasm` cross-check | A developer with `nvdisasm` runs `cargo xtask shader-nvdisasm`, which disassembles every committed fixture word one instruction at a time (row 88: one bad word stops `nvdisasm`) and rewrites the expected-text files; the diff is reviewed and committed with the tool version recorded. Slice 4 builds the command as a follow-up tool (decided by the owner, 2026-11-18) | By hand, when encodings change |
+| Translator semantics | An IR interpreter executes the translated IR for one instruction (or a short sequence) on given register, predicate and constant-buffer values; results are compared with values derived from the instruction's documented behaviour. PR #4588's tests do the same against Eden's IR (`src/tests/video_core/native_shader.cpp`, 271 test cases, its `EvaluateVertex`) and are ported as cases | Every gate |
 | Flow and structuring | Synthetic programs from the test assembler (nested barriers, early exits, calls, jump tables, loops with breaks), checked against golden IR text and by running them in the interpreter | Every gate |
 | Passes | Hand-written IR in, golden IR out (insta snapshots, each change explained in its PR as `specs/testing.md` requires) | Every gate |
 | Module validity | Every module the lowering produces in any test passes `naga` validation, with the flags this crate uses and, once E1 says what they are, the flags wgpu uses | Every gate |
@@ -541,12 +546,14 @@ Everything here runs in CI with no game, no GPU and no `nvdisasm`.
 | wgpu acceptance | The end-to-end modules are created as shader modules and pipelines on a wgpu device | Locally on a Mac (wgpu on Metal); in Linux CI on lavapipe if the render backend's lavapipe experiment passes (its decision 9), else locally only, like the hypervisor tier |
 | Final code (later, slice 22) | For a direct backend: emitted SPIR-V read back with naga's SPIR-V frontend and checked with `spirv-val` where installed; MSL compiled with Apple's `metal` compiler on a Mac; MSL goldens | When a direct backend is scheduled |
 | Title coverage | `cargo xtask shader-replay <folder>` re-translates local shader captures (program bytes plus answers, recorded from a title run) and prints a histogram of rejections by instruction, like Eden-NX2's offline lowering test (row 54) | Locally only; captures never committed |
-| Speed | A large synthetic program translates within a fixed bound | Every gate |
+| Speed | A large synthetic program translates within a fixed bound; slice 17 adds it (decided by the owner, 2026-11-18) | Every gate |
 
 Committed fixtures are synthetic: built by the test assembler from `Op` values, or hand-written
 IR. Hex words copied out of PR #4588's tests are used only where their origin is synthetic;
 where a word may come from a game's shader, the case is rebuilt with the test assembler instead.
-The shader capture format (local only) has a golden-bytes test of its own and a version.
+There is one shader capture format (local only): slice 20 defines it, `cargo xtask
+shader-replay` reads it, and the GPU capture (`SQGC`, gpu-protocol G20) embeds it for its shader
+lookups (decided by the owner, 2026-11-18). It has a golden-bytes test of its own and a version.
 
 ## Interfaces to neighbouring designs
 
@@ -613,7 +620,8 @@ Assumed of #12 (gpu-protocol now assumes the same; review guide, M9):
   names.
 - It completes rejected compute dispatches and fires their releases (row 61).
 - Its GPU capture (`SQGC`, gpu-protocol "Capture and replay") records shader lookups with the
-  answers given, so `cargo xtask shader-replay` can retranslate offline (review guide, M15).
+  answers given, embedded in slice 20's shader capture format, so `cargo xtask shader-replay`
+  can retranslate offline (review guide, M15; decided by the owner, 2026-11-18).
 
 ### What the render backend (#14) gets, through the GPU crate
 
@@ -686,38 +694,42 @@ One pull request each. "Offline" means testable with no game and no GPU. Slices 
 | 1 | **Walking skeleton.** `Instruction`, bit reader, a decoder for six forms (`MOV`, `FFMA`, `ALD`, `AST`, `EXIT`, `S2R`), linear flow only, a minimal IR, lowering to a validated naga module with its tables for a synthetic vertex/pixel pair. Proves the pieces fit before anything is widened | naga experiment E1 | NAK `sm70_encode.rs`, PR `ops_attr.cpp`, `ops_float.cpp` | Expected text for the six forms; naga validation; golden tables; the pair accepted by wgpu (locally on a Mac) | A (alone, one agent) |
 | 2 | SPH v4 header parser | 1 | `clc797sph.h`, NAK `sph.rs`, Eden `program_header.h` | Golden bytes covering every field with distinct values | B |
 | 3 | Program capture: extent rules, cap, content hash | 1 | PR `program_capture.h` | Synthetic programs at and past each rule; proptest no-panic; the cap at its edge | B |
-| 4 | Decoder framework: form table with known-bit masks, operand types (GPR, UR, P, UP, cbuf, immediates), the full `Op` enum shell, printer, test assembler framework | 1 | NAK `ir.rs` (op shapes), `sm70_encode.rs` (helpers), PR `isa.h` | Round trip and strictness on the framework's own forms | B |
+| 4 | Decoder framework: form table with known-bit masks, operand types (GPR, UR, P, UP, cbuf, immediates), the full `Op` enum shell, printer, test assembler framework; `cargo xtask shader-nvdisasm` ("The offline test harness") as a follow-up tool once the printer exists | 1 | NAK `ir.rs` (op shapes), `sm70_encode.rs` (helpers), PR `isa.h` | Round trip and strictness on the framework's own forms | B |
 | 5 | IR core: arenas, types, operations, builder, text printer and parser, verifier | 1 | Eden `frontend/ir/` | Parse–print round trip; verifier rejects each malformed case | B |
 | 6a | Decoder: integer ALU (`IADD3`, `IMAD`, `IMAD.WIDE`, `LOP3`, `SHF`, `LEA`, `ISETP`, `IMNMX`, `PRMT`, `POPC`, `FLO`, `BREV`, `SGXT`, `BMSK`, `IABS`, `IDP4`, `MOV`, `SEL`, `PLOP3`, `P2R`, `R2P`) | 4 | NAK `sm70_encode.rs`; PR table for `P2R`/`R2P` | Expected text, round trip, strictness, no-panic | C |
 | 6b | Decoder: 32-bit float and conversions (`FADD`, `FMUL`, `FFMA`, `FMNMX`, `FSET`, `FSETP`, `FSEL`, `MUFU`, `FSWZADD`, `FRND`, `F2F`, `F2I`, `I2F`, `I2FP`, `F2FP`) | 4 | NAK; PR table | Same | C |
 | 6c | Decoder: half and double (`HADD2`, `HFMA2`, `HMUL2`, `HSET2`, `HSETP2`, `HMNMX2`, `DADD`, `DMUL`, `DFMA`, `DSETP`) | 4 | NAK | Same | C |
-| 6d | Decoder: uniform datapath (`R2UR`, `UMOV`, `ULDC`, `ULDC.64`, uniform forms of the ALU operations, `UP2UR`, `UPLOP3`) | 4 | NAK (uniform register file forms), PR table | Same | C |
+| 6d | Decoder: uniform datapath (`R2UR`, `UMOV`, `ULDC`, `ULDC.64`, uniform forms of the ALU operations, `UP2UR`, `UPLOP3`) | 4, 6a, 6b, 6e (the forms whose uniform variants it decodes) | NAK (uniform register file forms), PR table | Same | C |
 | 6e | Decoder: memory (`LD`/`ST` in every space, `LDG`, `STG`, `LDS`, `STS`, `LDL`, `STL`, `LDC`, `ATOM`, `ATOMS`, `ATOMG`, `RED`, `CCTL`, `MEMBAR`, `LDGSTS`, `LDGDEPBAR`) | 4 | NAK; PR table | Same | C |
 | 6f | Decoder: texture and surface (`TEX`, `TLD`, `TLD4`, `TMML`, `TXD`, `TXQ`, `SULD`, `SUST`, `SUATOM`, `SURED`, the `.UR` forms) | 4 | NAK; PR table | Same | C |
 | 6g | Decoder: attributes and system values (`ALD`, `AST`, `IPA`, `AL2P`, `S2R`, `CS2R`, `PIXLD`, `OUT`, `ISBERD`, `ISBEWR`, `LDTRAM`) | 4 | NAK | Same | C |
 | 6h | Decoder: control and warp (`BRA`, `BRX`, `JMX`, `CALL`, `RET`, `EXIT`, `KILL`, `BSSY`, `BSYNC`, `BREAK`, `BMOV`, `WARPSYNC`, `BAR`, `VOTE`, `SHFL`, `MATCH`, `REDUX`, `NOP`, `DEPBAR`, `NANOSLEEP`, `BPT`) | 4 | NAK; PR table and `flow.cpp` for `CALL`, `RET`, `BRX` | Same | C |
 | 6i | Decoder: tensor (`HMMA`, `IMMA`, `LDSM`, `MOVM`), decode only | 4 | NAK | Same | C |
 | 7 | IR interpreter (test oracle) | 5 | New | Hand-written IR with known results | C |
-| 8 | SSA rewrite, identity removal, constant propagation, dead code elimination | 5 | Eden `ir_opt/ssa_rewrite_pass.cpp`, `identity_removal_pass.cpp`, `constant_propagation_pass.cpp`, `dead_code_elimination_pass.cpp` | Golden IR; interpreter gives the same result before and after | C |
+| 8 | SSA rewrite, identity removal, constant propagation, dead code elimination | 5, 7 | Eden `ir_opt/ssa_rewrite_pass.cpp`, `identity_removal_pass.cpp`, `constant_propagation_pass.cpp`, `dead_code_elimination_pass.cpp` | Golden IR; interpreter gives the same result before and after | C |
 | 9 | Questions and answers, variant key, driver-constants layout (types and the exchange loop) | 5 | New; Eden `environment.h`, `runtime_info.h` for content | Round-cap edges; deterministic key encoding (golden bytes) | C |
-| 10 | Flow analysis: blocks, both barrier models, calls, `BRX` | 3, 6h, 9 | PR `flow.cpp`, `flow.h` | Synthetic programs; the two models agree; linear-time test | D |
-| 11 | Structurizer | 5, 10 | Eden `structured_control_flow.cpp` | Golden IR; interpreter equivalence on generated control-flow graphs (proptest) | D |
-| 12a–12h | Instruction translators, one per decoder group 6a–6h (tensor excluded) | the matching 6x, 5, 7 | PR `ops_*.cpp`; Eden `translate/impl/` | Interpreter cases per instruction, including PR #4588's cases where synthetic | D (parallel with each other) |
+| 10 | Flow analysis: blocks, both barrier models, calls, `BRX`; builds the IR's basic blocks from the flow graph | 3, 6h, 9 | PR `flow.cpp`, `flow.h` | Synthetic programs; the two models agree; linear-time test | D |
+| 11 | Structurizer; settles the structured IR the translators fill | 5, 7, 10 | Eden `structured_control_flow.cpp` | Golden IR; interpreter equivalence on generated control-flow graphs (proptest) | D |
+| 12a–12h | Instruction translators, one per decoder group 6a–6h (tensor excluded) | the matching 6x, 5, 7; 12h also 10 (its branches become flow-analysis edges) | PR `ops_*.cpp`; Eden `translate/impl/` | Interpreter cases per instruction, including PR #4588's cases where synthetic | D (parallel with each other) |
 | 13 | Constant-buffer and texture pass | 8, 9, 12e, 12f | Eden `ir_opt/texture_pass.cpp`, PR's version of it | Golden resource tables; untraceable handle rejected with the exact reason | E |
 | 14 | Global memory to storage buffers | 8, 12e | Eden `global_memory_to_storage_buffer_pass.cpp` | Golden IR; linear-time test | E |
 | 15 | Inputs and outputs, collect info | 2, 8, 12g | Eden `attribute.h`, `collect_shader_info_pass.cpp`, `exit_program.cpp` | Golden interface tables per stage | E |
-| 16 | Lowering to naga: arithmetic, control flow, compute entry points | 1, 11, 8 | New | naga validation on every test module | E |
-| 17 | Lowering to naga: graphics entry points, interface, resources (group and binding assignment), textures and swizzles from the variant key, driver constants | 13, 15, 16 | New | Same, plus golden resource and interface tables for end-to-end fixtures; wgpu acceptance locally | F |
-| 18 | Host lowering passes: f64 and f16 to f32, subgroup-size requirement | 8, 16 | Eden `lower_fp64_to_fp32.cpp`, `lower_fp16_to_fp32.cpp` | Interpreter equivalence within stated precision | F |
+| 16 | Lowering to naga: arithmetic, control flow, compute entry points; the local and shared memory pass (pass 6) | 1, 8, 11 | New | naga validation on every test module | E |
+| 17 | Lowering to naga: graphics entry points, interface, resources (group and binding assignment), textures and swizzles from the variant key, driver constants | 13, 15, 16 | New | Same, plus golden resource and interface tables for end-to-end fixtures; wgpu acceptance locally; the speed test ("The offline test harness") | F |
+| 18 | Host lowering passes: f64 and f16 to f32, subgroup-size requirement | 7, 8, 16 | Eden `lower_fp64_to_fp32.cpp`, `lower_fp16_to_fp32.cpp` | Interpreter equivalence within stated precision | F |
 | 19 | Shader cache: three layers, invalidation, negative cache, tickets on an executor | 3, 9 (a fake translator before 17) | New; Eden-NX2 rows 90, 112 | Deterministic tests with a scripted executor; invalidation edges | D |
-| 20 | Shader capture format and `cargo xtask shader-replay` | 3, 9 | New | Golden bytes; replay of a synthetic capture | E |
+| 20 | Shader capture format (the one format; `SQGC` embeds it) and `cargo xtask shader-replay` | 3, 9 | New | Golden bytes; replay of a synthetic capture | E |
 | 21 | Persistent cache entries: inputs only (program bytes, answers, variant key), serialise, version, load and retranslate on workers | 19, 20 | New | Golden bytes; a stale translator version is refused | after M3 |
 | 22 | Final-code emission for a direct backend: naga's SPIR-V or MSL writer with the `HostTarget`'s binding map and bounds-check policy | 17; a direct backend scheduled (render-backend, "Deferred") | New | SPIR-V read back and `spirv-val` where installed; MSL goldens and Apple's compiler on a Mac | when a direct backend is scheduled |
 
-The critical path to a first present is 1 → 4 → 6a/6b/6g/6h → 10 → 11 → 12 (the same groups) →
-13, 15 → 16 → 17. Waves C and D are where agents fan out: up to nine decoder slices and eight
-translator slices, limited by the three or four build agents a machine can run
-(`docs/roadmap.md`).
+The critical path to a first present is 1 → 4 → 6h → 10 → 11 → 16 → 17, with 5 → 7 ahead of 8,
+11 and every translator. Slice 17 also waits for 13 (after 8, 9 and 6e/6f → 12e/12f) and 15
+(after 2, 8 and 6g → 12g). A first present also needs the translators its programs use: 12a,
+12b, 12g and 12h (12h after 10). The shader cache (19, after 3 and 9) is on the path too, since
+the GPU crate looks programs up only through it (gpu-protocol G18). Waves C and D are where
+agents fan out: up to nine decoder slices and eight translator slices, limited by the three or
+four build agents a machine can run (`docs/roadmap.md`). The table and this sentence follow what
+the slices need (decided by the owner, 2026-11-18).
 
 ## What to verify before building
 

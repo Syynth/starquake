@@ -88,7 +88,7 @@ states exactly what this spec assumes of each and what it offers them.
 | A method's data may continue in the next GP entry of the channel, whatever that entry's address or level; parking split methods by resume address (row 56) was replaced by this | Row 73; `dma_pusher.cpp` @ `50fa86bb`, where parking is behind an opt-in variable |
 | NVN2 binds `C797`, `C7C0`, `C7B5` and class 0 (unbind); it uses subchannel 2 as inline-to-memory without binding it | Rows 31, 49; `puller.cpp` (`ProcessBindMethod`) |
 | 3D macros are called at methods 0xE00 and up (`CALL_MME_MACRO(j)` at byte 0x3800 + 8j); a call runs when its last data word arrives | `classes/clc797.h`; `eden-nx2/src/video_core/engines/maxwell_3d.cpp` (`ProcessMacro`) |
-| The compute class also runs macros at 0xE00 and up, sharing its channel's data RAM with the 3D class; Mesa's `clc7c0.h` does not list these methods | `eden-nx2/src/video_core/engines/kepler_compute.cpp` (line 133), `control/channel_state.cpp` (`SetNativeDataRam`) |
+| The compute class also runs macros at 0xE00 and up (`CALL_MME_MACRO(j)` at byte 0x3800 + 8j), sharing its channel's data RAM with the 3D class | `classes/clc7c0.h` (`NVC7C0_CALL_MME_MACRO`; decided by the owner, 2026-11-18); `eden-nx2/src/video_core/engines/kepler_compute.cpp` (line 133), `control/channel_state.cpp` (`SetNativeDataRam`) |
 | Macro data RAM is per channel | Row 84 |
 | MME DMA reads: 3D methods 0x154/0x155 (`SET_MME_MEM_ADDRESS_A/B`, byte 0x550/0x554) and 0x158 (`MME_DMA_READ_FIFOED`, byte 0x560) feed the load FIFO after a load barrier | Row 58; `classes/clc797.h` |
 | `SET_MME_SHADOW_RAM_CONTROL` is method 0x49 (byte 0x124), modes track, track with filter, passthrough, replay | `classes/clc797.h`; row 144 |
@@ -306,9 +306,10 @@ authoritative copy (decision 1). For each incoming engine write the front:
    modes the value is also stored in the shadow file; in replay mode the value written is the
    shadow file's (behaviour from `maxwell_3d.cpp`, `ProcessShadowRam`, row 144). Data-load
    methods (constant-buffer loads and inline-to-memory data) take the written words even in
-   replay mode; only state methods take the shadow value, as Eden-NX2's run path does
-   (`CallMultiMethod` applies the rule to a run's last word only). **Guess** until a trace shows
-   replay mode during an upload (decided by the owner, 2026-11-18).
+   replay mode, as Eden-NX2's run path does (`CallMultiMethod` applies the rule to a run's last
+   word only); every method except data loads takes the shadow value, triggers included, as
+   Eden-NX2's `CallMethod` applies `ProcessShadowRam` to every method. **Guess** until a trace
+   shows replay mode during an upload (decided by the owner, 2026-11-18).
 2. Applies the register's own side effects that change other registers. These are computed here
    and sent as ordinary writes, so the back never changes a register on its own: the constant
    buffer upload offset that advances with each `LOAD_CONSTANT_BUFFER` word, the macro bind
@@ -329,10 +330,19 @@ inline indices, inline QMD data) go into one ring entry with their words, not on
 ### Macros
 
 Macro code and start addresses are uploaded with the `LOAD_MME_*` methods (0x45–0x48). The
-front holds the code and the 3D and compute engines' start tables; data RAM is per channel (row
-84) and shared by that channel's 3D and compute classes. Eden-NX2 keeps one code store for all
-of a process's channels (row 53); this design does the same, and records uploads per channel so
-the choice can be checked (decision 11).
+front holds two code stores per process, each with its own start table and each shared by all of
+the process's channels (row 53): one for the 3D class and one for the compute class. A channel's
+compute class uses the 3D store until it writes 0x45 or 0x47, and the compute store from then
+on, as both Switch 2 references do (`NativeMacroContext`, `eden-nx2/src/video_core/macro.h`;
+`native_compute_uploaded` in `engines/kepler_compute.cpp`). This refines decision 11's "one
+store per process" (decided by the owner, 2026-11-18). Data RAM is per channel (row 84) and
+shared by that channel's 3D and compute classes. Uploads are recorded per channel so the sharing
+can be checked (decision 11).
+
+Each start table holds 256 entries, the count of `CALL_MME_MACRO(j)` elements in `clc797.h` and
+`clc7c0.h`. Eden-NX2's tables hold 0x80 and wrap a larger index onto them, so its calls j and
+j + 0x80 share an entry. 256 is a **guess** until a trace shows a title calling past 0x80
+(decided by the owner, 2026-11-18).
 
 A call runs the existing interpreter (`crates/gpu/src/mme/interp.rs`) with the front as its
 `MacroHost`:
@@ -347,13 +357,20 @@ A call runs the existing interpreter (`crates/gpu/src/mme/interp.rs`) with the f
 **A run's writes are buffered and committed only when it finishes.** That gives three things:
 the memo can store them; a run that fails (`MacroError`) commits nothing and is reported once per
 macro with its parameters; and a run that needs a catch-up can be retried. The step limit stays
-`StepLimit::DEFAULT`.
+`StepLimit::DEFAULT`. A run fails as well past 2^18 method writes, or once its DMA reads have
+fetched 0x1000 words in all. Eden-NX2 bounds neither; both are **guesses** at bounds no real
+macro reaches, to bound what a hostile one can make the front hold, and a trace of the largest
+real call confirms them (decided by the owner, 2026-11-18).
 
 **MME DMA reads** read guest memory the GPU may have written (query counters, row 58; indirect
 arguments, row 120). When a run reaches a barrier with a DMA read pending and the back has
 unperformed writes in the ring, the run is abandoned with nothing committed, the channel parks
 at the macro call ("catch-up"), and the back reports when everything sent before it is performed.
-The call is then run again. If the back has nothing pending, the read happens at once.
+The call is then run again from the start it was called with, recorded at the call, reading the
+code as it is at the rerun: if another channel rewrote that code in between, the rerun runs the
+new code. Eden-NX2 runs the call at once, on the code as it was at the call; this is a listed
+divergence, pinned in G13's tests (decided by the owner, 2026-11-18). If the back has nothing
+pending, the read happens at once.
 
 **The memo** (port of `eden-nx2/src/video_core/macro_memo.h`) sits in front of the interpreter.
 A call qualifies when it read only its parameters and data RAM words: no register reads, no DMA
@@ -389,7 +406,7 @@ enum RingEntry<'a> {
     Bind { channel: ChannelId, subchannel: u8, class: ClassId },
     Write { channel: ChannelId, class: ClassId, method: u16, value: u32 },
     Run { channel: ChannelId, class: ClassId, method: u16, words: &'a [u32] },
-    Release(Release),                 // semaphore release or reduction, from any engine
+    Release { channel: ChannelId, release: Release }, // release or reduction, from any engine
     Syncpoint { id: SyncpointId },    // increment, from a submission's fence or the shim
     WaitForIdle { channel: ChannelId },
     SetReference { channel: ChannelId, value: u32 }, // the back closes its open list; no action
@@ -402,6 +419,10 @@ enum RingEntry<'a> {
 
 struct Release { address: u64, payload: u64, size: ReleaseSize, op: ReleaseOp, timestamp: bool }
 ```
+
+A release names the channel that issued it, so the back resolves which address space's
+`GpuMemory` it writes; the releases the copy engines and QMDs hand the fence path carry it too.
+G19 owns this, with G4's ring (decided by the owner, 2026-11-18).
 
 There are no closures in the ring (Eden-NX2's ring carries function pointers,
 `eden-nx2/src/video_core/gpu_split.h`): plain data can be captured, printed and replayed.
@@ -441,16 +462,20 @@ own semaphores.
 ### Mirrors and dirty flags
 
 The back keeps, per channel and class, a mirror of the register file, written only by ring
-`Write` and `Run` entries, and a dirty bit set over **state groups**. A generated table maps each
-method to its groups (viewports, scissors, blend per target, colour target j, depth target,
-vertex stream j, vertex attributes, index buffer, constant buffer bindings per stage, texture
-header and sampler pools, program addresses per stage, rasterizer state, depth and stencil
-state, and so on). This is Eden's dirty-flag model (`eden/src/video_core/dirty_flags.h`), with
-groups named after Mesa's methods. A write marks its groups; deriving a draw clears them.
+`Write` and `Run` entries, and a dirty bit set over **state groups**. A table per class (3D and
+compute) maps each method to its groups (viewports, scissors, blend per target, colour target
+j, depth target, vertex stream j, vertex attributes, index buffer, constant buffer bindings per
+stage, texture header and sampler pools, program addresses per stage, rasterizer state, depth
+and stencil state, and so on). This is Eden's dirty-flag model
+(`eden/src/video_core/dirty_flags.h`), with groups named after Mesa's methods. A write marks its
+groups; deriving a draw clears them.
 
-Typed accessors read fields out of the mirror (`state.viewport(i).scale_x()`); they are
-generated from the same tables (decision 6) and do bounds and enum checks, returning `Err` for
-values the class header does not define.
+Typed accessors read fields out of the mirror (`state.viewport(i).scale_x()`) and do bounds and
+enum checks, returning `Err` for values the class header does not define. The group tables and
+the accessors are hand-written, keyed on the constants `cargo xtask gen-classes` generates,
+because Mesa's headers carry no group information; a test checks that each table entry names a
+generated method. This is an accepted departure from decision 6's "generated" (decided by the
+owner, 2026-11-18).
 
 ### 3D: from state to a draw
 
@@ -459,8 +484,10 @@ A draw method (`DRAW_VERTEX_ARRAY_BEGIN_END_A/B`, `DRAW_INDEX_BUFFER_BEGIN_END_A
 
 1. For each dirty group, re-derive its part of the draw description and keep it. Clean groups
    reuse the previous part, so a draw that changed one constant buffer binding rebuilds only that.
-2. Resolve programs: for each enabled stage, the program address (`SET_PROGRAM_REGION` plus
-   `SET_PIPELINE_PROGRAM_ADDRESS(j)`) goes into a `ProgramRequest`, and the back builds the
+2. Resolve programs: for each enabled stage, the pipeline's own program address goes into a
+   `ProgramRequest`: `SET_PIPELINE_PROGRAM_ADDRESS_A(j)` bits 7:0 are its upper bits and `_B(j)`
+   its lower 32 (bytes 0x2014 + 64j and 0x2018 + 64j, `classes/clc797.h`; Ampere has no
+   `SET_PROGRAM_REGION` base; decided by the owner, 2026-11-18). The back builds the
    `VariantKey` (engine state, plus the render backend's `EmulationFlags` and, when
    `Caps::view_swizzle` is false, each texture binding's swizzle). `ShaderCache::lookup` never
    blocks (see #13 below): `Ready` gives a `ShaderSet`; `Pending(Ticket)` follows this crate's
@@ -470,7 +497,11 @@ A draw method (`DRAW_VERTEX_ARRAY_BEGIN_END_A/B`, `DRAW_INDEX_BUFFER_BEGIN_END_A
 3. Resolve resources: constant buffers from `BIND_GROUP_CONSTANT_BUFFER(j)` (and root tables for
    banks 24–31), textures and samplers from the header and sampler pools by handle, vertex and
    index buffers, render targets. Each becomes a host resource through the buffer and texture
-   caches, and the pipeline through the pipeline-key cache (guest state → `PipelineId`).
+   caches, and the pipeline through the pipeline-key cache (guest state → `PipelineId`). All 32
+   vertex streams get a size, `SET_VERTEX_STREAM_SIZE_A/B(j)` at bytes 0x600 + 8j and
+   0x604 + 8j, as Eden-NX2 sizes 32 (`NativeVertexStreamSize`); `clc797.h` names 16 elements.
+   A decision-10 divergence and a **guess** until a trace shows a title sizing a stream past 15
+   (decided by the owner, 2026-11-18).
 4. Emit a `Command::Draw` (see "What the back hands the render backend").
 
 A draw whose shader was rejected is skipped and counted, once per program in the log (negative
@@ -518,16 +549,29 @@ a listed divergence pinned by a test, until a trace settles it ("What to verify"
   `classes/clc7b5.h`. When either side overlaps an image the texture cache holds, the copy is a
   host copy command; otherwise the back copies through guest memory, using the layout crate for
   block-linear sides. The destination range is invalidated in the caches. The semaphore is a
-  fenced release.
+  fenced release. When source and destination overlap, a pitch-to-pitch copy reads each line
+  whole before writing it, lines in increasing order, as Eden-NX2's per-line
+  `MemoryManager::CopyBlock` does (`engines/maxwell_dma.cpp`); a copy with a block-linear side
+  reads the whole source region before writing anything (decided by the owner, 2026-11-18).
 - **Inline-to-memory (`A140`, and `LAUNCH_DMA`/`LOAD_INLINE_DATA` at bytes 0x1B0/0x1B4 in the 3D
   and compute classes).** The back writes the data to guest memory (pitch or block-linear) in
   order. Cache invalidations from many small writes are merged until the next draw, dispatch or
-  copy (row 134).
+  copy (row 134). At most `MAX_PENDING_RANGES` (1,024) disjoint ranges are held; one more merges
+  them all into the single range covering them, which over-invalidates instead of growing. A
+  **guess**, since no reference bounds Eden-NX2's list (decided by the owner, 2026-11-18).
 - **2D (`902D`).** Surface-to-surface blits with scaling and filtering become host blit commands
   when the caches hold either surface, and CPU copies through the layout crate otherwise. Eden's
   software blitter cost 3.6% of the GPU thread on small mip copies (row 137), so the host path is
   the default. Which 2D class NVN2 binds is not in the notes: `902D` is a **guess** (no Ampere 2D
-  class exists in Mesa's headers); a bind trace confirms it.
+  class exists in Mesa's headers); a bind trace confirms it. Every blit on the CPU path reads its
+  whole source region before writing, so an overlapping blit copies the source as it was
+  (decided by the owner, 2026-11-18).
+
+A DMA copy or 2D blit whose larger side moves more than `MAX_COPY_BYTES` (256 MiB) is refused
+before anything is read, and that bound also caps the source a copy holds before writing. It is
+a **guess** with no reference behind it (Eden-NX2 sizes its buffers from the registers,
+`maxwell_dma.cpp`), large enough for a 4096 by 4096 surface of 16-byte pixels; a trace of the
+largest copy a title launches confirms it (decided by the owner, 2026-11-18).
 
 ### Releases and completion
 
@@ -633,16 +677,20 @@ impl WriteWatch {
 The kernel side (applying protections, which needs a TLB flush on some core, and recording
 faults) is the kernel's; what this design assumes of it is listed under "Interfaces", and no
 slice in any draft owns it yet (review guide, section 4). Until a watch is armed, the cache
-treats the range as untracked and reads it again at each use. The back drains the dirty log
-before each draw, dispatch and copy; with nothing dirty, that is one atomic load. It drops the
-dirty ranges from its own caches and calls the shader cache's `invalidate` for the same ranges
-(review guide, M7): the back thread is the one place CPU writes reach any GPU-side cache, and no
-fault handler calls into the shader crate. The ranges come from `ShaderCache::tracked_ranges`
-and the caches' own uploads.
+treats the range as untracked and reads it again at each use. The buffer cache also reads a
+range once more on its first use after its watch is armed, since a CPU write between the last
+unarmed read and the arming is in no dirty log (as built in G16, PR #346; decided by the owner,
+2026-11-18). The back drains the dirty log before each draw, dispatch and copy; with nothing
+dirty, that is one atomic load. It drops the dirty ranges from its own caches and calls the
+shader cache's `invalidate` for the same ranges (review guide, M7): the back thread is the one
+place CPU writes reach any GPU-side cache, and no fault handler calls into the shader crate. The
+ranges come from `ShaderCache::tracked_ranges` and the caches' own uploads.
 
 A range the guest is known to rewrite constantly (streamed uniform data, row 141) costs one
 fault per page per tracking period. The caches may mark a range "streamed" after repeated faults
-and stop tracking it, re-reading it each use instead.
+and stop tracking it, re-reading it each use instead. The buffer cache does so once
+`STREAMED_AFTER_FAULTS` (4) drains find a range written with no clean use between them: a
+**guess** to confirm by trace (decided by the owner, 2026-11-18).
 
 ### GPU writes and the CPU
 
@@ -667,9 +715,11 @@ headers (`classes/clc797tex.h`) are decoded here into an image description hande
 crate and the render backend; their component swizzle goes into the view when the backend's
 `Caps::view_swizzle` is true and into the shader variant key otherwise. Unmapped GPU addresses
 get a stand-in identity fixed by the GPU address, so an image is found again (row 103). Eviction
-thresholds come from the render backend's memory budget (rows 119, 139). The pipeline-key cache
-also keeps the list of keys seen, so the next boot can precompile them (render-backend,
-"Compiling without stalling a frame").
+thresholds come from the render backend's memory budget (rows 119, 139). The buffer cache starts
+routine eviction at half the budget (at most Eden-NX2's 1 GiB) and turns aggressive at the whole
+budget (at most 2 GiB); the halves are a **guess** to confirm by trace (decided by the owner,
+2026-11-18). The pipeline-key cache also keeps the list of keys seen, so the next boot can
+precompile them (render-backend, "Compiling without stalling a frame").
 
 ## Block-linear layout: `starquake-layout`
 
@@ -745,8 +795,9 @@ A capture starts at a present boundary and covers one or more frames:
      (value seen), back reports received, poll ticks;
    - back: memory reads, completions received, write-tracking drains, and shader lookups with
      the requests, variant keys and answers given to the shader cache's questions, so that
-     `cargo xtask shader-replay` can retranslate them offline (shader-pipeline slice 20; review
-     guide, M15).
+     `cargo xtask shader-replay` can retranslate them offline (review guide, M15). They are
+     embedded in shader-pipeline slice 20's format, the one shader capture format (decided by
+     the owner, 2026-11-18).
 4. **A blob table** of read contents, deduplicated by hash, so a command buffer read twice is
    stored once.
 5. **The outputs**, for comparison: a hash per ring entry, the render command stream, and the
@@ -974,8 +1025,8 @@ same time.
 | G16 | Buffer cache: guest range to host buffer, write-watch integration (dirty drain also calls the shader cache's `invalidate`), streamed ranges, eviction by budget | G7, #14's resource types | `eden/src/video_core/buffer_cache` (reference only); rows 120, 131, 139 | Fake memory, fake watch, recording backend: CPU write re-uploads once; an ordered unmap drops the range | C |
 | G17 | Texture cache: texture header decode, image identity by address and layout, uploads through G5, render targets, write-back on demand, swizzle in the view or in the variant key by `Caps::view_swizzle` | G5, G7, G10, #14's resource types | `eden/src/video_core/texture_cache` (reference only); rows 69, 87, 103 | Recording backend: same header twice is one image; CPU write invalidates; write-back matches G5 untile; a swizzled texture under a no-swizzle `Caps` gets an identity view | C |
 | G18 | `gpu::back::draw`: derive `DrawDesc` from 3D state; shader lookups (`ProgramMemory`, `EngineState`, `VariantKey` with `EmulationFlags` and swizzles copied in, driver constants, the wait-while-compiling setting); bindings; conditional render | G10, G16, G17, G23, #13's `lookup` types | `eden-nx2/src/video_core/engines/{maxwell_3d,draw_manager}.cpp` (reference) | Register scripts to golden draw descriptions (`insta`), with a fake shader cache returning fixed sets, pending tickets and rejections; every `EmulationFlags` field reaches the key | D |
-| G19 | `gpu::back` executor: ring entries to engines, compute dispatch emission, present as `Command::Present` (no fence wait) | G10, G11, G12, G15, G18 | none (new) | Ring text in, command list text out (`insta`) | E |
-| G20 | Capture writer and reader (`SQGC`, including shader lookups with their answers), replay memory, `starquake gpu-replay` command, capture builder in `test-support` | G14, G19 | none (new) | Golden bytes for every record kind; a built capture replays to its expected outputs; a tampered read is reported as a divergence | F |
+| G19 | `gpu::back` executor: ring entries to engines, compute dispatch emission, present as `Command::Present` (no fence wait); the issuing channel on `Release` entries and on copy and QMD releases, with G4's ring (decided 2026-11-18) | G10, G11, G12, G15, G18 | none (new) | Ring text in, command list text out (`insta`) | E |
+| G20 | Capture writer and reader (`SQGC`, including shader lookups with their answers in shader-pipeline slice 20's format), replay memory, `starquake gpu-replay` command, capture builder in `test-support` | G14, G19, shader-pipeline slice 20 | none (new) | Golden bytes for every record kind; a built capture replays to its expected outputs; a tampered read is reported as a divergence | F |
 | G21 | Wiring: `Gpu` implementing `GpuFront`, threads, `Completions` pushes, counters, flight recorder, `gpu.txt` | G14, G19, #11's session types | none (new) | A homebrew-style synthetic stream submitted through a fake gsv produces the expected command lists and completions | F |
 | G22 | Production memory: `GpuMemory` over `GpuVm` and `GuestMemory`, shim reads through `Syncpoints`; the GPU-only store (lazy host pages for sparse regions, host-only render targets in the texture cache, zero reads, free on an applied destroy; review guide, M6) | G7, G17; graphics-server slices 2 and 6 (`Syncpoints` and `GpuVm`, built in this crate) | Rows 30, 57, 80, 85 | Each `Target` kind resolves; first write allocates, unwritten pages read zero, a destroy frees only when applied; nothing charged to guest pools | D |
 | G23 | Pipeline-key cache: guest state to `PipelineId` through the render trait, keyed only on what `Caps` says is not dynamic; the list of keys seen for precompiling next boot (serialise, version) | G10, #14's pipeline types | Eden `renderer_vulkan/vk_pipeline_cache.cpp` (`LoadDiskResources`, policy only) | Recording backend: the same state twice is one pipeline; a dynamic-state change makes no new pipeline under a `Caps` that has it; golden bytes for the key list | C |
@@ -1155,6 +1206,8 @@ are in `docs/decision-log.md` (2026-11-12).
     list each such case as a divergence pinned by a test until a trace settles it.
     **Recommended: (c).** It keeps what is known separate from what was observed to work.
 11. **Decided by the owner, 2026-11-12:** (a), one store per process, as recommended.
+    **Refined 2026-11-18** (decided by the owner): one 3D store and one compute store per
+    process, the compute class using the 3D store until it writes 0x45 or 0x47 ("Macros").
 
     **Whether macro programs are shared by all of a game's GPU channels.** Each channel has its
     own macro scratch memory (row 84). Options for the programs themselves: (a) one store per

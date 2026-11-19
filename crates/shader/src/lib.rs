@@ -14,17 +14,26 @@
 //! every operand form NAK encodes for them. The [`ir`] is slice 5's IR core: Eden's operation
 //! set in arenas, with a builder, a text form that prints and parses, and a verifier.
 //!
+//! Slice 9 defines the translation inputs and what the GPU crate builds against: the
+//! [`exchange`] of questions about engine state and their answers, the [`variant`] key with its
+//! versioned encoding, the [`driver_constants`] layout, and the [`lookup`] request and result
+//! types (the shader cache that uses them is slice 19).
+//!
 //! Experiment E1, run before this slice, lives in `lower`'s tests and its results in the spec.
 
 #[cfg(feature = "test-support")]
 pub mod asm;
 pub mod decode;
+pub mod driver_constants;
+pub mod exchange;
 #[cfg(test)]
 mod gpu_harness;
 pub mod host;
 pub mod ir;
+pub mod lookup;
 pub mod lower;
 pub mod program;
 #[cfg(test)]
 mod testing;
 pub mod translate;
+pub mod variant;
