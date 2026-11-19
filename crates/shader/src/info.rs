@@ -327,20 +327,10 @@ pub enum InfoError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShaderInfo {
     stage: GuestStage,
-    loads: AttributeMask,
-    stores: AttributeMask,
-    loads_indexed: bool,
-    stores_indexed: bool,
     interpolation: [Interpolation; GENERICS as usize],
     inputs: Vec<InterfaceEntry>,
     outputs: Vec<InterfaceEntry>,
-    color_outputs: ColorOutputs,
-    stores_sample_mask: bool,
-    stores_frag_depth: bool,
-    system_values: SystemValues,
-    constant_buffers: [Option<u32>; CBUF_BANKS as usize],
-    indexed_constant_buffer_bank: bool,
-    requirements: Requirements,
+    walk: Walk,
 }
 
 impl ShaderInfo {
@@ -351,24 +341,24 @@ impl ShaderInfo {
 
     /// The attribute words the program reads, after the header fill.
     pub const fn loads(&self) -> AttributeMask {
-        self.loads
+        self.walk.loads
     }
 
     /// The attribute words the program writes, after the header fill.
     pub const fn stores(&self) -> AttributeMask {
-        self.stores
+        self.walk.stores
     }
 
     /// Whether the program reads attributes at a register-computed word (Eden's
     /// `loads_indexed_attributes`).
     pub const fn loads_indexed(&self) -> bool {
-        self.loads_indexed
+        self.walk.indexed.loads
     }
 
     /// Whether the program writes attributes at a register-computed word (Eden's
     /// `stores_indexed_attributes`).
     pub const fn stores_indexed(&self) -> bool {
-        self.stores_indexed
+        self.walk.indexed.stores
     }
 
     /// How a pixel program interpolates generic attribute `generic`; [`Interpolation::Smooth`]
@@ -393,40 +383,40 @@ impl ShaderInfo {
 
     /// The colour components the program writes (`SetFragColor`).
     pub const fn color_outputs(&self) -> ColorOutputs {
-        self.color_outputs
+        self.walk.pixel.color
     }
 
     /// Whether the program writes the sample mask.
     pub const fn stores_sample_mask(&self) -> bool {
-        self.stores_sample_mask
+        self.walk.pixel.sample_mask
     }
 
     /// Whether the program writes depth.
     pub const fn stores_frag_depth(&self) -> bool {
-        self.stores_frag_depth
+        self.walk.pixel.depth
     }
 
     /// The system values the program reads.
     pub const fn system_values(&self) -> SystemValues {
-        self.system_values
+        self.walk.system_values
     }
 
     /// The constant-buffer banks the program reads, ascending, with their sizes.
     pub fn constant_buffers(&self) -> impl Iterator<Item = ConstantBufferUse> + '_ {
         (0_u8..)
-            .zip(self.constant_buffers)
+            .zip(self.walk.constant_buffers.sizes)
             .filter_map(|(bank, size)| size.map(|size| ConstantBufferUse { bank, size }))
     }
 
     /// Whether the program reads a constant buffer whose bank is a register (Eden's
     /// `uses_cbuf_indirect`).
     pub const fn indexed_constant_buffer_bank(&self) -> bool {
-        self.indexed_constant_buffer_bank
+        self.walk.constant_buffers.indexed_bank
     }
 
     /// The host features the program needs, before the host lowering passes of slice 18.
     pub const fn requirements(&self) -> Requirements {
-        self.requirements
+        self.walk.requirements
     }
 }
 
@@ -482,8 +472,19 @@ pub fn translation_stage(slot: GuestStage, header: &ProgramHeader) -> Stage {
 /// `uses_subgroup_mask`, `uses_subgroup_vote`, `uses_subgroup_shuffles`, `uses_quad_shuffles`,
 /// `uses_fswzadd`, all of which [`Requirements::subgroup`] covers).
 pub const fn opcode_requirements(opcode: Opcode) -> Requirements {
+    Requirements {
+        subgroup: uses_subgroup(opcode),
+        f16: uses_f16(opcode),
+        f64: uses_f64(opcode),
+        i64: uses_i64(opcode) || is_global_store_or_atomic(opcode),
+        i64_atomics: uses_i64_atomics(opcode),
+    }
+}
+
+/// Eden's `uses_fp16` list.
+const fn uses_f16(opcode: Opcode) -> bool {
     use Opcode as O;
-    let f16 = matches!(
+    matches!(
         opcode,
         O::CompositeConstructF16x2
             | O::CompositeConstructF16x3
@@ -545,8 +546,13 @@ pub const fn opcode_requirements(opcode: Opcode) -> Requirements {
             | O::StorageAtomicAddF16x2
             | O::StorageAtomicMinF16x2
             | O::StorageAtomicMaxF16x2
-    );
-    let f64 = matches!(
+    )
+}
+
+/// Eden's `uses_fp64` list.
+const fn uses_f64(opcode: Opcode) -> bool {
+    use Opcode as O;
+    matches!(
         opcode,
         O::CompositeConstructF64x2
             | O::CompositeConstructF64x3
@@ -606,8 +612,13 @@ pub const fn opcode_requirements(opcode: Opcode) -> Requirements {
             | O::ConvertF64U16
             | O::ConvertF64U32
             | O::ConvertF64U64
-    );
-    let i64_atomics = matches!(
+    )
+}
+
+/// Eden's `uses_int64_bit_atomics` list.
+const fn uses_i64_atomics(opcode: Opcode) -> bool {
+    use Opcode as O;
+    matches!(
         opcode,
         O::SharedAtomicExchange64
             | O::GlobalAtomicIAdd64
@@ -627,73 +638,86 @@ pub const fn opcode_requirements(opcode: Opcode) -> Requirements {
             | O::StorageAtomicAnd64
             | O::StorageAtomicOr64
             | O::StorageAtomicXor64
-    );
-    // Eden's `uses_int64` list, then the global-memory case that sets it too: every global
-    // store and atomic (which fall through to the loads) and every global load.
-    let i64 = matches!(
+    )
+}
+
+/// Eden's `uses_int64` list, with the four `u64` forms it misses (marked), and the global
+/// loads its global-memory case also counts.
+const fn uses_i64(opcode: Opcode) -> bool {
+    use Opcode as O;
+    matches!(
         opcode,
         O::UndefU64
-            | O::LoadGlobalU8
-            | O::LoadGlobalS8
-            | O::LoadGlobalU16
-            | O::LoadGlobalS16
-            | O::LoadGlobal32
-            | O::LoadGlobal64
-            | O::LoadGlobal128
-            | O::WriteGlobalU8
-            | O::WriteGlobalS8
-            | O::WriteGlobalU16
-            | O::WriteGlobalS16
-            | O::WriteGlobal32
-            | O::WriteGlobal64
-            | O::WriteGlobal128
-            | O::SelectU64
-            | O::BitCastU64F64
-            | O::BitCastF64U64
-            | O::PackUint2x32
-            | O::UnpackUint2x32
-            | O::IAdd64
-            | O::ISub64
-            | O::INeg64
-            // Starquake's additions: `u64` forms Eden's list misses (module docs).
-            | O::IAbs64
-            | O::ConvertF16S64
-            | O::ConvertF32S64
-            | O::ConvertF64S64
-            | O::ShiftLeftLogical64
-            | O::ShiftRightLogical64
-            | O::ShiftRightArithmetic64
-            | O::ConvertS64F16
-            | O::ConvertS64F32
-            | O::ConvertS64F64
-            | O::ConvertU64F16
-            | O::ConvertU64F32
-            | O::ConvertU64F64
-            | O::ConvertU64U32
-            | O::ConvertU32U64
-            | O::ConvertF16U64
-            | O::ConvertF32U64
-            | O::ConvertF64U64
-            | O::SharedAtomicExchange64
-            | O::GlobalAtomicIAdd64
-            | O::GlobalAtomicSMin64
-            | O::GlobalAtomicUMin64
-            | O::GlobalAtomicSMax64
-            | O::GlobalAtomicUMax64
-            | O::GlobalAtomicAnd64
-            | O::GlobalAtomicOr64
-            | O::GlobalAtomicXor64
-            | O::GlobalAtomicExchange64
-            | O::StorageAtomicIAdd64
-            | O::StorageAtomicSMin64
-            | O::StorageAtomicUMin64
-            | O::StorageAtomicSMax64
-            | O::StorageAtomicUMax64
-            | O::StorageAtomicAnd64
-            | O::StorageAtomicOr64
-            | O::StorageAtomicXor64
-            | O::StorageAtomicExchange64
-            | O::GlobalAtomicIAdd32
+        | O::LoadGlobalU8
+        | O::LoadGlobalS8
+        | O::LoadGlobalU16
+        | O::LoadGlobalS16
+        | O::LoadGlobal32
+        | O::LoadGlobal64
+        | O::LoadGlobal128
+        | O::WriteGlobalU8
+        | O::WriteGlobalS8
+        | O::WriteGlobalU16
+        | O::WriteGlobalS16
+        | O::WriteGlobal32
+        | O::WriteGlobal64
+        | O::WriteGlobal128
+        | O::SelectU64
+        | O::BitCastU64F64
+        | O::BitCastF64U64
+        | O::PackUint2x32
+        | O::UnpackUint2x32
+        | O::IAdd64
+        | O::ISub64
+        | O::INeg64
+        // Starquake's additions: `u64` forms Eden's list misses (module docs).
+        | O::IAbs64
+        | O::ConvertF16S64
+        | O::ConvertF32S64
+        | O::ConvertF64S64
+        | O::ShiftLeftLogical64
+        | O::ShiftRightLogical64
+        | O::ShiftRightArithmetic64
+        | O::ConvertS64F16
+        | O::ConvertS64F32
+        | O::ConvertS64F64
+        | O::ConvertU64F16
+        | O::ConvertU64F32
+        | O::ConvertU64F64
+        | O::ConvertU64U32
+        | O::ConvertU32U64
+        | O::ConvertF16U64
+        | O::ConvertF32U64
+        | O::ConvertF64U64
+        | O::SharedAtomicExchange64
+        | O::GlobalAtomicIAdd64
+        | O::GlobalAtomicSMin64
+        | O::GlobalAtomicUMin64
+        | O::GlobalAtomicSMax64
+        | O::GlobalAtomicUMax64
+        | O::GlobalAtomicAnd64
+        | O::GlobalAtomicOr64
+        | O::GlobalAtomicXor64
+        | O::GlobalAtomicExchange64
+        | O::StorageAtomicIAdd64
+        | O::StorageAtomicSMin64
+        | O::StorageAtomicUMin64
+        | O::StorageAtomicSMax64
+        | O::StorageAtomicUMax64
+        | O::StorageAtomicAnd64
+        | O::StorageAtomicOr64
+        | O::StorageAtomicXor64
+        | O::StorageAtomicExchange64
+    )
+}
+
+/// The global stores and atomics of Eden's global-memory case, which fall through to the
+/// loads and set `uses_int64`.
+const fn is_global_store_or_atomic(opcode: Opcode) -> bool {
+    use Opcode as O;
+    matches!(
+        opcode,
+        O::GlobalAtomicIAdd32
             | O::GlobalAtomicSMin32
             | O::GlobalAtomicUMin32
             | O::GlobalAtomicSMax32
@@ -720,8 +744,14 @@ pub const fn opcode_requirements(opcode: Opcode) -> Requirements {
             | O::GlobalAtomicMinF32x2
             | O::GlobalAtomicMaxF16x2
             | O::GlobalAtomicMaxF32x2
-    );
-    let subgroup = matches!(
+    )
+}
+
+/// Eden's subgroup flags' lists: `uses_subgroup_invocation_id`, `uses_subgroup_mask`,
+/// `uses_subgroup_vote`, `uses_subgroup_shuffles`, `uses_quad_shuffles`, `uses_fswzadd`.
+const fn uses_subgroup(opcode: Opcode) -> bool {
+    use Opcode as O;
+    matches!(
         opcode,
         O::LaneId
             | O::SubgroupEqMask
@@ -740,14 +770,7 @@ pub const fn opcode_requirements(opcode: Opcode) -> Requirements {
             | O::QuadBroadcast
             | O::QuadSwap
             | O::FSwizzleAdd
-    );
-    Requirements {
-        subgroup,
-        f16,
-        f64,
-        i64,
-        i64_atomics,
-    }
+    )
 }
 
 /// `a` with every flag of `b` added.
@@ -823,18 +846,37 @@ fn interpolation(io: &PixelIo) -> Result<[Interpolation; GENERICS as usize], Inf
     Ok(out)
 }
 
-/// The walk's state.
+/// Whether the program reads and writes attributes at register-computed words.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Indexed {
+    loads: bool,
+    stores: bool,
+}
+
+/// What a pixel program writes besides attributes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PixelOutputs {
+    color: ColorOutputs,
+    sample_mask: bool,
+    depth: bool,
+}
+
+/// Each bank's used size, and whether a bank was a register.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ConstantBuffers {
+    sizes: [Option<u32>; CBUF_BANKS as usize],
+    indexed_bank: bool,
+}
+
+/// The walk's state, which [`ShaderInfo`] keeps.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Walk {
     loads: AttributeMask,
     stores: AttributeMask,
-    loads_indexed: bool,
-    stores_indexed: bool,
-    color_outputs: ColorOutputs,
-    stores_sample_mask: bool,
-    stores_frag_depth: bool,
+    indexed: Indexed,
+    pixel: PixelOutputs,
     system_values: SystemValues,
-    constant_buffers: [Option<u32>; CBUF_BANKS as usize],
-    indexed_constant_buffer_bank: bool,
+    constant_buffers: ConstantBuffers,
     requirements: Requirements,
 }
 
@@ -843,14 +885,13 @@ impl Walk {
         Self {
             loads: AttributeMask::EMPTY,
             stores: AttributeMask::EMPTY,
-            loads_indexed: false,
-            stores_indexed: false,
-            color_outputs: ColorOutputs::default(),
-            stores_sample_mask: false,
-            stores_frag_depth: false,
+            indexed: Indexed::default(),
+            pixel: PixelOutputs::default(),
             system_values: SystemValues::EMPTY,
-            constant_buffers: [None; CBUF_BANKS as usize],
-            indexed_constant_buffer_bank: false,
+            constant_buffers: ConstantBuffers {
+                sizes: [None; CBUF_BANKS as usize],
+                indexed_bank: false,
+            },
             requirements: Requirements::default(),
         }
     }
@@ -869,11 +910,11 @@ impl Walk {
                 let word = attribute_arg(at, op)?;
                 self.stores = set_word(self.stores, word, true);
             }
-            Opcode::GetAttributeIndexed => self.loads_indexed = true,
-            Opcode::SetAttributeIndexed => self.stores_indexed = true,
+            Opcode::GetAttributeIndexed => self.indexed.loads = true,
+            Opcode::SetAttributeIndexed => self.indexed.stores = true,
             Opcode::SetFragColor => self.frag_color(at, op)?,
-            Opcode::SetSampleMask => self.stores_sample_mask = true,
-            Opcode::SetFragDepth => self.stores_frag_depth = true,
+            Opcode::SetSampleMask => self.pixel.sample_mask = true,
+            Opcode::SetFragDepth => self.pixel.depth = true,
             opcode => {
                 if let Some(size) = cbuf_element_size(opcode) {
                     self.cbuf(at, op, size)?;
@@ -889,7 +930,7 @@ impl Walk {
         let entry = usize::try_from(target)
             .ok()
             .filter(|_| component < u32::from(ATTRIBUTE_COMPONENTS))
-            .and_then(|t| self.color_outputs.targets.get_mut(t))
+            .and_then(|t| self.pixel.color.targets.get_mut(t))
             .ok_or(InfoError::ColorOutput {
                 at,
                 target,
@@ -906,15 +947,15 @@ impl Walk {
         let Operand::Imm(Imm::U32(bank)) = bank else {
             // A register bank: every bank, whole (Eden's `AddRegisterIndexedLdc`, over the
             // spec's 32 banks).
-            self.indexed_constant_buffer_bank = true;
-            for slot in &mut self.constant_buffers {
+            self.constant_buffers.indexed_bank = true;
+            for slot in &mut self.constant_buffers.sizes {
                 grow(slot, INDEXED_CBUF_SIZE);
             }
             return Ok(());
         };
         let slot = usize::try_from(bank)
             .ok()
-            .and_then(|b| self.constant_buffers.get_mut(b))
+            .and_then(|b| self.constant_buffers.sizes.get_mut(b))
             .ok_or(InfoError::ConstantBufferBank { at, bank })?;
         let size = match op.args.get(1) {
             Some(Operand::Imm(Imm::U32(offset))) => offset
@@ -934,7 +975,7 @@ impl Walk {
     /// Eden's `GatherInfoFromHeader`.
     fn fill_from_header(&mut self, header: Option<&ProgramHeader>) {
         match header.map(|h| &h.io) {
-            Some(Io::Pixel(io)) if self.loads_indexed => {
+            Some(Io::Pixel(io)) if self.indexed.loads => {
                 for (index, map) in (0_u16..).zip(&io.generic) {
                     let base = GENERIC_0_X + index * ATTRIBUTE_COMPONENTS;
                     for (word, imap) in (base..).zip([map.x, map.y, map.z, map.w]) {
@@ -943,10 +984,10 @@ impl Walk {
                 }
             }
             Some(Io::Vtg(io)) => {
-                if self.loads_indexed {
+                if self.indexed.loads {
                     self.loads = fill_vtg(self.loads, &io.input);
                 }
-                if self.stores_indexed {
+                if self.indexed.stores {
                     self.stores = fill_vtg(self.stores, &io.output);
                 }
             }
@@ -1071,7 +1112,7 @@ pub fn collect(
     walk.fill_from_header(header);
     let inputs = table(walk.loads, modes.as_ref());
     let mut outputs = table(walk.stores, None);
-    for (target, mask) in (0_u8..).zip(walk.color_outputs.targets) {
+    for (target, mask) in (0_u8..).zip(walk.pixel.color.targets) {
         if mask != 0 {
             outputs.push(InterfaceEntry {
                 slot: Slot::ColorTarget(target),
@@ -1081,8 +1122,8 @@ pub fn collect(
         }
     }
     for (stored, slot) in [
-        (walk.stores_sample_mask, Slot::SampleMask),
-        (walk.stores_frag_depth, Slot::FragDepth),
+        (walk.pixel.sample_mask, Slot::SampleMask),
+        (walk.pixel.depth, Slot::FragDepth),
     ] {
         if stored {
             outputs.push(InterfaceEntry {
@@ -1094,19 +1135,9 @@ pub fn collect(
     }
     Ok(ShaderInfo {
         stage,
-        loads: walk.loads,
-        stores: walk.stores,
-        loads_indexed: walk.loads_indexed,
-        stores_indexed: walk.stores_indexed,
         interpolation: modes.unwrap_or([Interpolation::Smooth; GENERICS as usize]),
         inputs,
         outputs,
-        color_outputs: walk.color_outputs,
-        stores_sample_mask: walk.stores_sample_mask,
-        stores_frag_depth: walk.stores_frag_depth,
-        system_values: walk.system_values,
-        constant_buffers: walk.constant_buffers,
-        indexed_constant_buffer_bank: walk.indexed_constant_buffer_bank,
-        requirements: walk.requirements,
+        walk,
     })
 }

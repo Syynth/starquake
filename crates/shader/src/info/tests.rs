@@ -77,12 +77,12 @@ fn ipa(dst: Gpr, word: u16) -> Instr {
     }))
 }
 
-fn mask(x: bool, y: bool, z: bool, w: bool) -> ComponentMask {
+fn mask([x, y, z, w]: [bool; 4]) -> ComponentMask {
     ComponentMask { x, y, z, w }
 }
 
 fn all() -> ComponentMask {
-    mask(true, true, true, true)
+    mask([true; 4])
 }
 
 fn vtg_header(stage: VtgStage, input: VtgMap, output: VtgMap) -> ProgramHeader {
@@ -97,10 +97,10 @@ fn vtg_header(stage: VtgStage, input: VtgMap, output: VtgMap) -> ProgramHeader {
     }
 }
 
-fn pixel_header(io: PixelIo) -> ProgramHeader {
+fn pixel_header(io: &PixelIo) -> ProgramHeader {
     ProgramHeader {
         common: Common::default(),
-        io: Io::Pixel(Box::new(io)),
+        io: Io::Pixel(Box::new(*io)),
     }
 }
 
@@ -226,7 +226,7 @@ fn pixel_io(targets: [u8; COLOR_TARGETS], sample_mask: bool, depth: bool) -> Pix
         };
     }
     io.targets =
-        targets.map(|bits| mask(bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0));
+        targets.map(|bits| mask([bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0]));
     io.writes_sample_mask = sample_mask;
     io.writes_depth = depth;
     io
@@ -249,7 +249,7 @@ fn pixel_interface_table_from_a_synthetic_program() {
         ipa(r(9), generic(1, 0)),
         exit(),
     ];
-    let header = pixel_header(io);
+    let header = pixel_header(&io);
     let info = graphics_program_ir(GuestStage::Pixel, &program(&header, &instrs))
         .expect("translates")
         .info;
@@ -292,8 +292,8 @@ fn compute_interface_table_from_a_synthetic_function() {
     ])
     .expect("collects");
     assert_eq!(info.stage(), GuestStage::Compute);
-    assert!(info.inputs().is_empty());
-    assert!(info.outputs().is_empty());
+    assert_eq!(info.inputs(), []);
+    assert_eq!(info.outputs(), []);
     assert_eq!(
         info.system_values().iter().collect::<Vec<_>>(),
         [SystemValue::WorkgroupId, SystemValue::LocalInvocationId]
@@ -340,7 +340,7 @@ fn the_header_must_name_the_slots_stage() {
             VtgMap::default(),
             VtgMap::default(),
         )),
-        Some(pixel_header(PixelIo::default())),
+        Some(pixel_header(&PixelIo::default())),
     ];
     let slots = [
         GuestStage::VertexCullBeforeFetch,
@@ -398,7 +398,7 @@ fn translation_stage_takes_the_colour_outputs_from_a_pixel_header() {
     let mut targets = [0; COLOR_TARGETS];
     targets[1] = 0b0101;
     targets[7] = 0b1000;
-    let pixel = pixel_header(pixel_io(targets, false, false));
+    let pixel = pixel_header(&pixel_io(targets, false, false));
     assert_eq!(
         translation_stage(GuestStage::Pixel, &pixel),
         Stage {
@@ -428,7 +428,7 @@ fn graphics_program_ir_reports_each_step_in_order() {
     );
     // A pixel header in a vertex slot, with code that would not translate: the slot check
     // comes first.
-    let pixel = pixel_header(PixelIo::default());
+    let pixel = pixel_header(&PixelIo::default());
     let mut bad_code = program(&pixel, &[]);
     bad_code.push(0);
     assert_eq!(
@@ -456,7 +456,11 @@ fn graphics_program_ir_reports_each_step_in_order() {
     mixed.generic[4].x = PixelImap::Perspective;
     mixed.generic[4].y = PixelImap::Constant;
     assert_eq!(
-        graphics_program_ir(GuestStage::Pixel, &program(&pixel_header(mixed), &[exit()])).err(),
+        graphics_program_ir(
+            GuestStage::Pixel,
+            &program(&pixel_header(&mixed), &[exit()])
+        )
+        .err(),
         Some(Rejection::Info(InfoError::MixedInterpolation {
             generic: 4
         }))
@@ -511,7 +515,7 @@ fn pixel_reading(generic: u16, map: Components<PixelImap>) -> Result<ShaderInfo,
     let ops: Vec<_> = (base..base + ATTRIBUTE_COMPONENTS)
         .map(|word| (Opcode::GetAttribute, vec![attr(word), imm(0)]))
         .collect();
-    collect(GuestStage::Pixel, Some(&pixel_header(io)), &function(&ops))
+    collect(GuestStage::Pixel, Some(&pixel_header(&io)), &function(&ops))
 }
 
 #[test]
@@ -612,7 +616,11 @@ fn mixed_interpolation_is_refused_and_agreeing_components_are_not() {
         w: u,
     };
     assert_eq!(
-        collect(GuestStage::Pixel, Some(&pixel_header(io)), &Function::new()),
+        collect(
+            GuestStage::Pixel,
+            Some(&pixel_header(&io)),
+            &Function::new()
+        ),
         Err(InfoError::MixedInterpolation { generic: 9 })
     );
 }
@@ -627,7 +635,7 @@ fn only_pixel_generic_inputs_carry_an_interpolation() {
         (Opcode::GetAttribute, vec![attr(FRONT_FACE), imm(0)]),
     ];
     let info =
-        collect(GuestStage::Pixel, Some(&pixel_header(io)), &function(&ops)).expect("collects");
+        collect(GuestStage::Pixel, Some(&pixel_header(&io)), &function(&ops)).expect("collects");
     assert_eq!(
         info.inputs(),
         [
@@ -650,7 +658,7 @@ fn each_colour_target_mask_reaches_the_output_table() {
         for bits in 1..=COMPONENT_MASK {
             let mut targets = [0; COLOR_TARGETS];
             targets[target] = bits;
-            let header = pixel_header(pixel_io(targets, false, false));
+            let header = pixel_header(&pixel_io(targets, false, false));
             // Each of the target's four registers holds a constant-free value: IPA of
             // generic 0's x, so the colours survive the passes.
             let first = u8::try_from(0).expect("zero");
@@ -680,7 +688,7 @@ fn a_pixel_program_writing_a_subset_of_its_targets() {
     targets[1] = 0b0011;
     targets[4] = 0b1000;
     targets[6] = 0b0101;
-    let header = pixel_header(pixel_io(targets, false, false));
+    let header = pixel_header(&pixel_io(targets, false, false));
     let instrs: Vec<_> = (0..12)
         .map(|reg| ipa(r(reg), GENERIC_0_X))
         .chain([exit()])
@@ -703,7 +711,7 @@ fn a_pixel_program_writing_a_subset_of_its_targets() {
 fn pixel_outputs_record_each_component() {
     let info = collect(
         GuestStage::Pixel,
-        Some(&pixel_header(PixelIo::default())),
+        Some(&pixel_header(&PixelIo::default())),
         &function(&[
             (
                 Opcode::SetFragColor,
@@ -980,14 +988,14 @@ fn a_pixel_header_fills_loads_only_with_indexed_loads() {
         z: u,
         w: p,
     };
-    let header = pixel_header(io);
+    let header = pixel_header(&io);
     let direct = (Opcode::GetAttribute, vec![attr(GENERIC_0_X), imm(0)]);
     let indexed = (Opcode::GetAttributeIndexed, vec![imm(0), imm(0)]);
     // Without indexed loads the masks are the walk's.
     let info = collect(
         GuestStage::Pixel,
         Some(&header),
-        &function(&[direct.clone()]),
+        &function(std::slice::from_ref(&direct)),
     )
     .expect("collects");
     assert_eq!(words(info.loads()), [GENERIC_0_X]);
@@ -1006,13 +1014,13 @@ fn a_pixel_header_fills_loads_only_with_indexed_loads() {
 /// A vertex map with each filled field set to a distinct value.
 fn distinct_map(seed: bool) -> VtgMap {
     let mut map = VtgMap::default();
-    map.generic[if seed { 1 } else { 30 }] = mask(seed, !seed, true, false);
+    map.generic[if seed { 1 } else { 30 }] = mask([seed, !seed, true, false]);
     map.system_values_ab = SystemValuesAb {
         primitive_id: seed,
         rt_array_index: !seed,
         viewport_index: seed,
         point_size: !seed,
-        position: mask(!seed, seed, !seed, seed),
+        position: mask([!seed, seed, !seed, seed]),
         ..SystemValuesAb::default()
     };
     map.system_values_c = SystemValuesC {
@@ -1452,6 +1460,7 @@ fn has(opcode: Opcode, types: &[Type]) -> bool {
 
 #[test]
 fn requirement_lists_agree_with_the_opcode_types() {
+    use Opcode as O;
     // An independent source: the opcode table's types. Every opcode that takes or gives an f16
     // or f64 type is on Eden's list for it, and the reverse, except the listed exceptions.
     let f16_types = [Type::F16, Type::F16x2, Type::F16x3, Type::F16x4];
@@ -1478,7 +1487,6 @@ fn requirement_lists_agree_with_the_opcode_types() {
         .copied()
         .filter(|&opcode| opcode_requirements(opcode).i64 != has(opcode, &[Type::U64]))
         .collect();
-    use Opcode as O;
     assert_eq!(
         i64_diff,
         [
@@ -1541,12 +1549,12 @@ fn capabilities_follow_each_requirement() {
 #[test]
 fn checks_run_in_the_documented_order() {
     let bad_op = (Opcode::GetCbufU32, vec![imm(u32::from(CBUF_BANKS)), imm(0)]);
-    let ops = function(&[bad_op.clone()]);
+    let ops = function(std::slice::from_ref(&bad_op));
     // The header against the stage, before the interpolation and the instructions.
     let mut mixed = PixelIo::default();
     mixed.generic[0].x = PixelImap::Constant;
     mixed.generic[0].y = PixelImap::Perspective;
-    let mixed = pixel_header(mixed);
+    let mixed = pixel_header(&mixed);
     assert_eq!(
         collect(GuestStage::Vertex, Some(&mixed), &ops),
         Err(InfoError::HeaderStage {
