@@ -95,9 +95,9 @@ impl Collector {
         })
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     /// Waits until `count` entries have been popped, or the ring ended, at most `timeout`;
     /// whether `count` were.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn wait_taken(&self, count: u64, timeout: Duration) -> bool {
         let (mutex, changed) = &*self.shared;
         let deadline = Instant::now().checked_add(timeout);
@@ -115,16 +115,16 @@ impl Collector {
         state.taken >= count
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     /// The entries popped and kept since the last call, in ring order.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn drain(&self) -> Vec<RingEntry<'static>> {
         let mut state = lock(&self.shared.0);
         state.words = 0;
         state.entries.drain(..).collect()
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     /// Whether an entry was dropped past the limit.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn overflowed(&self) -> bool {
         lock(&self.shared.0).overflowed
     }
