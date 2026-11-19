@@ -107,7 +107,8 @@
 //!   every write; their state tables are empty. `compute_and_other_classes_drop_nothing`.
 //!
 //! Not here: register defaults (Eden's `InitializeRegisterDefaults` sets some 3D registers to
-//! non-zero values at boot; every file here starts zeroed), the macro calls themselves (G13),
+//! non-zero values at boot; every file here starts from [`ClassRules::initial_values`], all
+//! zero, which the back's mirror starts from too), the macro calls themselves (G13),
 //! and counters of dropped writes.
 
 mod file;
