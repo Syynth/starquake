@@ -336,6 +336,9 @@ fn a_new_mirror_starts_from_the_same_values_as_the_front_file() {
             mirror.registers().len(),
             usize::try_from(registers).unwrap()
         );
+        // No register default is seeded yet (Eden's `InitializeRegisterDefaults` is an open
+        // follow-up): every starting value is zero, on both sides.
+        assert!(mirror.registers().iter().all(|&value| value == 0));
         for method in 0..registers {
             assert_eq!(Some(mirror.value(method).unwrap()), front.get(method));
         }
