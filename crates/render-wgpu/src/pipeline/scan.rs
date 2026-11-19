@@ -39,6 +39,14 @@
 //! [`crate::pipeline::MAX_SHADER_NESTING`], since naga's validator and writers and wgpu recurse
 //! once per level on the build's thread.
 //!
+//! **Buffer sizes.** For a global in the uniform or storage address space that is not a binding
+//! array, the size of its type as naga computes it (`TypeInner::size`; for a struct that ends
+//! in a runtime-sized array, its span with one element). It is the size wgpu-core reads for the
+//! same global (`ResourceType::Buffer { size }` in `src/validation.rs`, wgpu-core 30.0.2) and,
+//! since the layouts give no `min_binding_size`, checks each bound range against when a draw or
+//! dispatch runs (`LateMinBufferBindingSizeMismatch`); the list check refuses a smaller range
+//! first (`crate::draw::BINDING_TOO_SMALL`).
+//!
 //! The walk keeps its own stack of blocks, so a deeply nested module costs heap, not call stack,
 //! and visits each block once. naga's own `Drop` of a module recurses once per level too, so a
 //! refused module is taken apart by [`dismantle`] instead.
@@ -65,6 +73,8 @@ pub(crate) struct BindingFacts {
     pub(crate) count: ArrayCount,
     /// For a storage texture (or an array of them), whether the shader only stores to it.
     pub(crate) write_only: bool,
+    /// For a uniform or storage buffer, the size of its type (module docs, "Buffer sizes").
+    pub(crate) size: Option<u64>,
 }
 
 /// What the backend reads from a module (module docs).
@@ -232,8 +242,12 @@ fn bodies(module: &naga::Module) -> impl Iterator<Item = &naga::Block> {
         .chain(module.entry_points.iter().map(|ep| &ep.function.body))
 }
 
-/// The facts for one global's type.
-fn binding_facts(module: &naga::Module, ty: naga::Handle<naga::Type>) -> BindingFacts {
+/// The facts for one global of `space` and type `ty`.
+fn binding_facts(
+    module: &naga::Module,
+    space: naga::AddressSpace,
+    ty: naga::Handle<naga::Type>,
+) -> BindingFacts {
     let inner = |h| module.types.get_handle(h).ok().map(|t| &t.inner);
     let (count, element) = match inner(ty) {
         Some(naga::TypeInner::BindingArray { base, size }) => (
@@ -252,7 +266,19 @@ fn binding_facts(module: &naga::Module, ty: naga::Handle<naga::Type>) -> Binding
             ..
         }) if *access == naga::StorageAccess::STORE
     );
-    BindingFacts { count, write_only }
+    let buffer = matches!(
+        space,
+        naga::AddressSpace::Uniform | naga::AddressSpace::Storage { .. }
+    );
+    let size = match (count, element) {
+        (ArrayCount::Single, Some(inner)) if buffer => Some(u64::from(inner.size(module.to_ctx()))),
+        _ => None,
+    };
+    BindingFacts {
+        count,
+        write_only,
+        size,
+    }
 }
 
 /// Reads the facts from `module` (module docs).
@@ -264,7 +290,7 @@ pub(crate) fn scan(module: &naga::Module) -> ModuleFacts {
             let binding = global.binding.as_ref()?;
             Some((
                 (binding.group, binding.binding),
-                binding_facts(module, global.ty),
+                binding_facts(module, global.space, global.ty),
             ))
         })
         .collect();
@@ -308,7 +334,9 @@ mod tests {
                     (0, 0),
                     BindingFacts {
                         count: ArrayCount::Single,
-                        write_only: false
+                        write_only: false,
+                        // A `vec4<f32>`: four 4-byte floats.
+                        size: Some(16),
                     }
                 )]),
             }
@@ -641,7 +669,13 @@ mod tests {
         ];
         assert_eq!(f.len(), expect.len());
         for (slot, count, write_only) in expect {
-            assert_eq!(f[&slot], BindingFacts { count, write_only }, "{slot:?}");
+            let size = None;
+            let facts = BindingFacts {
+                count,
+                write_only,
+                size,
+            };
+            assert_eq!(f[&slot], facts, "{slot:?}");
         }
     }
 

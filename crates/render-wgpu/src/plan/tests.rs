@@ -10,6 +10,24 @@ use starquake_render::command::{
 use starquake_render::resource::{FilterMode, ViewDimension};
 use starquake_render::{BufferUsage, PipelineId, StagingSlice};
 
+/// [`super::check`] with no pipelines, on the test device: these tests make no draws (their
+/// check is `crate::draw::tests`').
+fn check(
+    tables: &Tables,
+    caps: &Caps,
+    depth_copies: bool,
+    taken: &BTreeSet<ReadbackId>,
+    list: CommandList,
+) -> Result<Checked, RenderError> {
+    let draws = crate::fixtures::draw_limits(caps);
+    let rules = Rules {
+        caps,
+        depth_copies,
+        draws: &draws,
+    };
+    super::check(tables, &Registry::default(), &rules, taken, list)
+}
+
 /// Tables with a buffer, an RGBA8 render target, a BC1 texture, a 3D texture, a D32 texture,
 /// and a view of each texture.
 struct World {
@@ -392,7 +410,7 @@ fn texture_copies_become_their_kind_of_step() {
 }
 
 #[test]
-fn blits_draws_and_dispatches_wait_for_their_slices() {
+fn blits_wait_for_their_slice_and_dispatches_need_a_pipeline() {
     let w = world();
     let blit = Command::Blit(BlitDesc {
         src: w.rgba_view,
@@ -412,7 +430,7 @@ fn blits_draws_and_dispatches_wait_for_their_slices() {
     });
     assert_eq!(
         run(&w, vec![dispatch]).err(),
-        Some(RenderError::Unsupported(DRAWS_NOT_YET))
+        Some(RenderError::Invalid(validate::NO_PIPELINE))
     );
     // A good command before a refused one changes nothing: the whole list is refused.
     let marker = Command::Marker(Marker { submit: 1, draw: 2 });
@@ -750,12 +768,45 @@ fn presents_read_dumped_frames_from_the_base_layer() {
 }
 
 #[test]
-fn render_targets_are_checked_and_change_nothing() {
+fn render_targets_are_checked_and_resolved() {
+    use crate::draw::{Attachment, Targets};
     let w = world();
     let mut targets = RenderTargets::default();
     targets.colors[0] = Some(w.rgba_view);
     targets.depth_stencil = Some(w.depth_view);
-    assert_eq!(steps(&w, vec![Command::SetRenderTargets(targets)]), []);
+    let depth = w.tables.view(w.depth_view).expect("live").0.texture;
+    let attachment = |texture, format| Attachment {
+        texture,
+        format,
+        mip: 0,
+        layer: 0,
+        three_d: false,
+        size: (8, 4),
+        samples: 1,
+    };
+    let resolved = Targets {
+        colors: vec![Some(attachment(w.rgba, wgpu::TextureFormat::Rgba8Unorm))],
+        depth_stencil: Some(attachment(depth, wgpu::TextureFormat::Depth32Float)),
+    };
+    assert_eq!(
+        steps(&w, vec![Command::SetRenderTargets(targets)]),
+        [Step::Targets(resolved.clone())]
+    );
+    // The same targets again change nothing; others do.
+    let mut others = targets;
+    others.colors[0] = Some(w.srgb_view);
+    assert_eq!(
+        steps(
+            &w,
+            vec![
+                Command::SetRenderTargets(targets),
+                Command::SetRenderTargets(targets),
+                Command::SetRenderTargets(others),
+            ]
+        )
+        .len(),
+        2
+    );
     let mut wrong = RenderTargets::default();
     wrong.colors[0] = Some(w.depth_view);
     assert_eq!(

@@ -233,6 +233,48 @@ fn topologies_map_to_what_the_rewrite_draws() {
     }
 }
 
+/// A strip pipeline names 32-bit indices, and every other pipeline none (module docs,
+/// "Topology"): wgpu-core refuses an indexed strip draw whose index format the pipeline does
+/// not name, and a strip format on another topology.
+#[test]
+fn only_strip_pipelines_name_their_index_format() {
+    use wgpu::PrimitiveTopology as P;
+    let cases = [
+        (Topology::Points, P::PointList, None),
+        (Topology::Lines, P::LineList, None),
+        (
+            Topology::LineLoop,
+            P::LineStrip,
+            Some(wgpu::IndexFormat::Uint32),
+        ),
+        (
+            Topology::LineStrip,
+            P::LineStrip,
+            Some(wgpu::IndexFormat::Uint32),
+        ),
+        (Topology::Triangles, P::TriangleList, None),
+        (
+            Topology::TriangleStrip,
+            P::TriangleStrip,
+            Some(wgpu::IndexFormat::Uint32),
+        ),
+        (Topology::TriangleFan, P::TriangleList, None),
+        (Topology::Quads, P::TriangleList, None),
+        (Topology::QuadStrip, P::TriangleList, None),
+        (Topology::Polygon, P::TriangleList, None),
+    ];
+    for (guest, host, format) in cases {
+        let mut d = desc();
+        d.topology = guest;
+        let primitive = graphics(&d).expect("accepted").primitive;
+        assert_eq!(
+            (primitive.topology, primitive.strip_index_format),
+            (host, format),
+            "{guest:?}"
+        );
+    }
+}
+
 #[test]
 fn the_default_description_converts() {
     let plan = graphics(&desc()).expect("accepted");
