@@ -1269,6 +1269,7 @@ dependencies = [
  "proptest",
  "starquake-shader",
  "thiserror",
+ "twox-hash",
  "wgpu",
 ]
 
