@@ -24,7 +24,11 @@
 //! `.f16`, and `f2fp.pack_ab`. Of the integer group (`op::integer`), `test_lea`, `test_sgxt`,
 //! `test_plop3`, `test_iabs` and `test_imnmx` pin `lea` and `lea.hi` with the shifted value and
 //! `b` negated and the shift in hex, `sgxt` and `sgxt.u32`, `plop3.lut` with negated predicates
-//! and both truth tables in hex, `iabs`, and `imnmx` and `imnmx.u32` with a predicate.
+//! and both truth tables in hex, `iabs`, and `imnmx` and `imnmx.u32` with a predicate. Of the
+//! texture group (`op::texture`), `test_texture` pins the bindless `tex`, `tld`, `tld4`, `tmml`,
+//! `txd` and `txq` with `.scr`, `.b`, every level-of-detail mode, `tld4`'s `.g` and offset
+//! modes, `.ef` and `.nodep`, in that order, the operands `p0, r2, r0, r1, r3, 2d, 0x7`, and
+//! the three `txq` queries; that module's docs list what of its text is a guess.
 //! **Everything else is a guess** in `nvdisasm`'s usual style that a developer with
 //! `nvdisasm` should check (spec, "`nvdisasm` cross-check"): `urz` and `upt`, the `.rm`/`.rp`
 //! rounding names (taken from NAK's own `FRndMode` printer), `.fmz` for the `dnz` bit, float
