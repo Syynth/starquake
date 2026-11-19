@@ -169,7 +169,10 @@ impl FrontShared {
     pub fn create_address_space(&self, space: AsId, vm: Arc<GpuVm>, memory: Arc<dyn GpuMemory>) {
         let mut inbox = self.lock();
         if !inbox.spaces.insert(space) {
-            tracing::warn!(space = space.0, "an address space was made twice; the first is kept");
+            tracing::warn!(
+                space = space.0,
+                "an address space was made twice; the first is kept"
+            );
             return;
         }
         self.queue(&mut inbox, Request::CreateSpace { space, vm, memory });

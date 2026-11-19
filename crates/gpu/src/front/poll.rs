@@ -107,7 +107,9 @@ impl Backoff {
         self.sleep = self
             .sleep
             .checked_mul(2)
-            .map_or(POLL_LONGEST_SLEEP, |doubled| doubled.min(POLL_LONGEST_SLEEP));
+            .map_or(POLL_LONGEST_SLEEP, |doubled| {
+                doubled.min(POLL_LONGEST_SLEEP)
+            });
         sleep
     }
 }

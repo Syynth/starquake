@@ -103,6 +103,8 @@ impl Pending {
     /// Whether every covered channel is past its position: `done(channel, seq)` says whether
     /// the channel has finished submission `seq`, or is gone or stopped.
     pub(super) fn is_ready(&self, mut done: impl FnMut(ChannelId, u64) -> bool) -> bool {
-        self.positions.iter().all(|&(channel, seq)| done(channel, seq))
+        self.positions
+            .iter()
+            .all(|&(channel, seq)| done(channel, seq))
     }
 }

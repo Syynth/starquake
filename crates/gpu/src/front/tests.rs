@@ -27,13 +27,11 @@ use starquake_render::caps::{
 use starquake_render::recording::RecordingBackend;
 
 use super::*;
-use crate::back::fence::{
-    CloseReason, FenceClock, FenceEnv, FencedAction, Fences, Mode,
-};
+use crate::back::fence::{CloseReason, FenceClock, FenceEnv, FencedAction, Fences, Mode};
 use crate::classes::{clc76f, clc797};
 use crate::fifo::{GpEntry, MethodMode, PushBuffer, Sync};
 use crate::interface::{
-    ChannelConfig, GpfifoEntry, Kind, Submission, Submitted, SyncpointId, Target,
+    ChannelConfig, GpfifoEntry, Kind, Submission, Submitted, SyncpointId, Target, Ticket,
 };
 use crate::memory::TestGpuMemory;
 use crate::regs::EntrySink;
@@ -55,6 +53,8 @@ const GPU_BASE: u64 = 0x12_3400_0000;
 const CMD_A: u64 = GPU_BASE;
 const CMD_B: u64 = GPU_BASE + 2 * PAGE_SIZE;
 const CMD_C: u64 = GPU_BASE + 4 * PAGE_SIZE;
+/// Far from the others, for a second long stream.
+const CMD_FAR: u64 = GPU_BASE + 24 * PAGE_SIZE;
 /// Semaphores: not page aligned.
 const SEM: u64 = GPU_BASE + 48 * PAGE_SIZE + 0x10;
 const SEM2: u64 = SEM + 0x40;
@@ -242,8 +242,11 @@ struct Rig {
 fn rig_with(ring_words: usize, wrap: impl FnOnce(Arc<Memory>) -> Arc<dyn GpuMemory>) -> Rig {
     let size = usize::try_from(PAGES * PAGE_SIZE).unwrap();
     let mem = Arc::new(TestGpuMemory::new(FlatMemory::new(CPU_BASE, size)));
-    mem.map(PageRange::new(GPU_BASE, PAGES * PAGE_SIZE).unwrap(), CPU_BASE)
-        .unwrap();
+    mem.map(
+        PageRange::new(GPU_BASE, PAGES * PAGE_SIZE).unwrap(),
+        CPU_BASE,
+    )
+    .unwrap();
     let vm = Arc::new(GpuVm::new());
     vm.map(
         PageRange::new(GPU_BASE, PAGES * PAGE_SIZE).unwrap(),

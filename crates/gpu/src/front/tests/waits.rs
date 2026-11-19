@@ -107,12 +107,15 @@ fn a_value_that_moves_on_with_no_release_is_missed() {
     assert!(r.waiters.has_waiter(SPACE, SEM));
 }
 
+/// What [`Hooked`] runs before the second read of `SEM`.
+type Hook = Box<dyn FnOnce(&Memory) + Send>;
+
 /// A memory that, on the second read of `SEM`, first runs a hook: a release performed between
 /// the front's two reads.
 struct Hooked {
     inner: Arc<Memory>,
     reads: AtomicU32,
-    hook: Mutex<Option<Box<dyn FnOnce(&Memory) + Send>>>,
+    hook: Mutex<Option<Hook>>,
 }
 
 impl GpuMemory for Hooked {
@@ -224,7 +227,11 @@ fn the_poll_steps_through_its_schedule_on_the_clock() {
     // The first sleep: one nanosecond short of it, no poll; at it, a poll, and the next step
     // doubles.
     let polls = r.front.counters().polls;
-    r.clock.advance(POLL_FIRST_SLEEP - Duration::from_nanos(1));
+    r.clock.advance(
+        POLL_FIRST_SLEEP
+            .checked_sub(Duration::from_nanos(1))
+            .unwrap(),
+    );
     assert_eq!(
         r.turn(),
         Turn::Idle {
@@ -501,7 +508,9 @@ fn sync_wait_holds_the_entry_until_the_back_has_performed_earlier_work() {
     // The back performs the work and reports the marker: the entry runs.
     r.settle();
     let texts = r.take();
-    assert!(position(&texts, &scratch_text(a, 0, 0xa1)) < position(&texts, &scratch_text(a, 1, 0xa2)));
+    assert!(
+        position(&texts, &scratch_text(a, 0, 0xa1)) < position(&texts, &scratch_text(a, 1, 0xa2))
+    );
     assert_eq!(r.front.counters().sync_waits, 1);
 }
 
@@ -555,7 +564,11 @@ fn dma_macro() -> Vec<Instruction> {
         ),
         mov_reg(0, Reg::Load0),
         with_out(
-            with_imm(inst0(AluOp::Add, Reg::Zero, Reg::Gpr(0), Reg::Zero), 0, scratch(0)),
+            with_imm(
+                inst0(AluOp::Add, Reg::Zero, Reg::Gpr(0), Reg::Zero),
+                0,
+                scratch(0),
+            ),
             0,
             OutOp::Imm1,
             OutOp::Alu0,
@@ -575,7 +588,8 @@ fn a_macro_dma_read_with_unperformed_work_waits_for_the_back_and_runs_again() {
     let code = m(clc797::LOAD_MME_INSTRUCTION_RAM.method());
     let start_pointer = m(clc797::LOAD_MME_START_ADDRESS_RAM_POINTER.method());
     let start = m(clc797::LOAD_MME_START_ADDRESS_RAM.method());
-    pb.methods(MethodMode::Incrementing, 0, pointer, &[0]).unwrap();
+    pb.methods(MethodMode::Incrementing, 0, pointer, &[0])
+        .unwrap();
     pb.methods(
         MethodMode::NonIncrementing,
         0,
@@ -585,7 +599,8 @@ fn a_macro_dma_read_with_unperformed_work_waits_for_the_back_and_runs_again() {
     .unwrap();
     pb.methods(MethodMode::Incrementing, 0, start_pointer, &[0])
         .unwrap();
-    pb.methods(MethodMode::Incrementing, 0, start, &[0]).unwrap();
+    pb.methods(MethodMode::Incrementing, 0, start, &[0])
+        .unwrap();
     let call = m(clc797::CALL_MME_MACRO.method());
     let upper = u32::try_from(source >> 32).unwrap();
     let lower = u32::try_from(source & 0xffff_ffff).unwrap();
@@ -639,7 +654,8 @@ fn a_failing_macro_call_is_counted_and_the_stream_goes_on() {
     )
     .unwrap();
     // Two parameters wanted, one given.
-    pb.methods(MethodMode::IncrementOnce, 0, call, &[7]).unwrap();
+    pb.methods(MethodMode::IncrementOnce, 0, call, &[7])
+        .unwrap();
     pb.methods(MethodMode::Incrementing, 0, scratch(1), &[0xa2])
         .unwrap();
     r.submit(a, vec![r.entry(CMD_A, pb.words())]);

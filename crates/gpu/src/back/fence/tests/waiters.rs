@@ -81,7 +81,10 @@ fn every_acquire_condition_latches() {
     for (op, payload, meets, misses) in cases {
         let table = WaiterTable::new();
         table.register(waiter(9, op, payload));
-        assert!(!table.on_write(SPACE, ADDRESS, misses), "{op:?} {misses:#x}");
+        assert!(
+            !table.on_write(SPACE, ADDRESS, misses),
+            "{op:?} {misses:#x}"
+        );
         assert!(table.on_write(SPACE, ADDRESS, meets), "{op:?} {meets:#x}");
         assert!(table.is_latched(ChannelId(9)), "{op:?}");
     }

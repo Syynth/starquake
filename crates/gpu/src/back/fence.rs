@@ -754,28 +754,25 @@ impl Fences {
                 memory,
                 space,
                 release,
-            } => {
-                match write_release(&*memory, &release, &*self.env.clock) {
-                    Ok(written) => {
-                        report.released = report.released.saturating_add(1);
-                        for (address, word) in written.words(release.address) {
-                            if self.env.waiters.on_write(space, address, word) {
-                                report.latched = true;
-                            }
+            } => match write_release(&*memory, &release, &*self.env.clock) {
+                Ok(written) => {
+                    report.released = report.released.saturating_add(1);
+                    for (address, word) in written.words(release.address) {
+                        if self.env.waiters.on_write(space, address, word) {
+                            report.latched = true;
                         }
                     }
-                    Err(fault) => {
-                        let failure = ReleaseFailure {
-                            address: release.address,
-                            fault,
-                        };
-                        tracing::warn!(%failure, "fenced release failed");
-                        self.counters.failed_releases =
-                            self.counters.failed_releases.saturating_add(1);
-                        report.failed.push(failure);
-                    }
                 }
-            }
+                Err(fault) => {
+                    let failure = ReleaseFailure {
+                        address: release.address,
+                        fault,
+                    };
+                    tracing::warn!(%failure, "fenced release failed");
+                    self.counters.failed_releases = self.counters.failed_releases.saturating_add(1);
+                    report.failed.push(failure);
+                }
+            },
             FencedAction::Increment(id) => {
                 self.env.syncpoints.increment(id);
                 report.incremented = report.incremented.saturating_add(1);

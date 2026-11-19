@@ -505,9 +505,8 @@ impl Front {
         let mut index = 0;
         while let Some(pending) = self.pending.get(index) {
             let lanes = &self.lanes;
-            let ready = pending.is_ready(|channel, seq| {
-                lanes.get(&channel).is_none_or(|lane| lane.is_past(seq))
-            });
+            let ready = pending
+                .is_ready(|channel, seq| lanes.get(&channel).is_none_or(|lane| lane.is_past(seq)));
             if !ready {
                 index += 1;
                 continue;
@@ -529,7 +528,10 @@ impl Front {
         let order: Vec<ChannelId> = match self.cursor {
             Some(cursor) => self
                 .lanes
-                .range((std::ops::Bound::Excluded(cursor), std::ops::Bound::Unbounded))
+                .range((
+                    std::ops::Bound::Excluded(cursor),
+                    std::ops::Bound::Unbounded,
+                ))
                 .chain(self.lanes.range(..=cursor))
                 .map(|(&id, _)| id)
                 .collect(),

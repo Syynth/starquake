@@ -1771,12 +1771,12 @@ fn eight(address: u64, payload: u64) -> Release {
 
 /// What attaching one release with nothing recorded or in flight answers: performed at once,
 /// with whether it latched a waiter.
-fn performed(latched: bool) -> Result<Attached, FenceError> {
-    Ok(Attached::Performed(Report {
+fn performed(latched: bool) -> Attached {
+    Attached::Performed(Report {
         released: 1,
         latched,
         ..Report::default()
-    }))
+    })
 }
 
 #[test]
@@ -1786,11 +1786,13 @@ fn a_wide_release_latches_a_waiter_on_its_high_word() {
     // not, though its payload is the release's low word.
     let mut r = rig();
     r.waiters.register(waiter_on(1, SPACE, SEM, 0x5566_7788));
-    r.waiters.register(waiter_on(2, SPACE, SEM + 4, 0x1122_3344));
-    r.waiters.register(waiter_on(3, SPACE, SEM + 8, 0x5566_7788));
+    r.waiters
+        .register(waiter_on(2, SPACE, SEM + 4, 0x1122_3344));
+    r.waiters
+        .register(waiter_on(3, SPACE, SEM + 8, 0x5566_7788));
     assert_eq!(
         r.fences.attach(r.action(eight(SEM, 0x1122_3344_5566_7788))),
-        performed(true)
+        Ok(performed(true))
     );
     assert!(r.waiters.is_latched(ChannelId(1)));
     assert!(r.waiters.is_latched(ChannelId(2)));
@@ -1799,20 +1801,29 @@ fn a_wide_release_latches_a_waiter_on_its_high_word() {
     // A 4-byte release writes only its own word: a waiter on SEM + 4 is not latched by it,
     // whatever the payload's high half.
     let mut r = rig();
-    r.waiters.register(waiter_on(4, SPACE, SEM + 4, 0x1122_3344));
+    r.waiters
+        .register(waiter_on(4, SPACE, SEM + 4, 0x1122_3344));
     assert_eq!(
         r.fences.attach(r.action(four(SEM, 0x1122_3344_5566_7788))),
-        performed(false)
+        Ok(performed(false))
     );
     assert!(!r.waiters.is_latched(ChannelId(4)));
 
     // The 16-byte structure covers four words: the timestamp's halves at SEM + 8 and SEM + 12.
     let mut r = rig();
     let [t0, t1, t2, t3, t4, t5, t6, t7] = TIMESTAMP.to_le_bytes();
-    r.waiters
-        .register(waiter_on(5, SPACE, SEM + 12, u32::from_le_bytes([t4, t5, t6, t7])));
-    r.waiters
-        .register(waiter_on(6, SPACE, SEM + 8, u32::from_le_bytes([t0, t1, t2, t3])));
+    r.waiters.register(waiter_on(
+        5,
+        SPACE,
+        SEM + 12,
+        u32::from_le_bytes([t4, t5, t6, t7]),
+    ));
+    r.waiters.register(waiter_on(
+        6,
+        SPACE,
+        SEM + 8,
+        u32::from_le_bytes([t0, t1, t2, t3]),
+    ));
     let release = Release {
         form: ReleaseForm {
             size: PayloadSize::Eight,
@@ -1820,7 +1831,7 @@ fn a_wide_release_latches_a_waiter_on_its_high_word() {
         },
         ..four(SEM, 1)
     };
-    assert_eq!(r.fences.attach(r.action(release)), performed(true));
+    assert_eq!(r.fences.attach(r.action(release)), Ok(performed(true)));
     assert!(r.waiters.is_latched(ChannelId(5)));
     assert!(r.waiters.is_latched(ChannelId(6)));
 }
