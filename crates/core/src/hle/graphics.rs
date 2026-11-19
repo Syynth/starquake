@@ -53,10 +53,11 @@
 //!   [`GpuParts`] (gpu-protocol, "Graphics server sessions (#11)": "`core` creates the `Gpu`
 //!   ... and hands it to gsv"). Always a run ([`FrontMode::Live`]): the GPU completes its work
 //!   on its own (`a_run_with_the_gpu_completes_what_waits_on_it`, in `hle/tests/graphics.rs`).
-//!   Which backend a run uses, and when a run builds one, is render-backend slice R12's: the
-//!   machine still builds the null front ([`Graphics::new`]).
+//!   A live run builds it over the recording backend when its guest memory can be shared with
+//!   the GPU's threads (`crate::machine`'s `gpu` module, issue #386); render-backend slice R12
+//!   adds the choice of the wgpu backend.
 //! - **The null front** ([`NullFront`], [`Graphics::new`]): for a run with no GPU back end, and
-//!   for every replay.
+//!   for every replay (`crate::machine`'s `gpu` module says when a run has neither).
 //!
 //! [`NullFront`] runs nothing. It does what the spec asks of the front's order and completion
 //! with no GPU behind it, so that a title waiting on the GPU is not stuck:
@@ -128,6 +129,34 @@
 //! failure of the environment (decision log, 2026-11-17, "Env failures"). The drain carries on
 //! to the end of what it took, since it cannot be stopped half-way: a signal the failure refused
 //! is logged as the kernel's refusal, as `NotImplemented`.
+//!
+//! # Frames
+//!
+//! A **frame** is a present [`Graphics::turn`] hands the front ([`PresentFront::present`]): one
+//! for each frame the vsync tick latched, in either front and either mode. [`Graphics::frames`]
+//! counts them; it is `summary.json`'s `frames`, and what `--until frames=N` counts
+//! ([`Graphics::with_frame_limit`]). It is gsv's count, not the render backend's
+//! (`PresentFeedback`): the GPU never has to finish presenting a frame for it to count.
+//!
+//! **When a frame counts depends on its fence.** gsv latches a present only once its fence has
+//! been reached (render-backend, "Presenting a guest framebuffer", step 1). For a present with no
+//! fence ([`NO_FENCE`](starquake_gsv::vi2::NO_FENCE)), or one whose fence was already reached
+//! when the tick looked, the tick that counts it does not depend on the host: the count, and the
+//! guest time at which `--until frames=N` stops a run, are the same with the GPU and with the
+//! null front, and in a replay, which latches the same frames on the ticks fed back. For a present
+//! whose fence the GPU itself reaches (a syncpoint its work increments), they are not: with the
+//! GPU, the tick that counts the frame is the first after the host GPU completes that work,
+//! which depends on host timing, while the null front completes work at once. Such a run can
+//! count a frame at a later tick with the GPU than with the null front, or than in another live
+//! run, and so stop at `--until frames=N` at a different guest time. The frame tests with the GPU
+//! (`hle/tests/graphics/present.rs`, `machine/tests/graphics/frames.rs`) present with no fence.
+//!
+//! With a limit of `N`, a turn hands the front no more frames once `N` have been handed
+//! ([`frames_to_hand`]): a turn that latches more than the room left hands the first ones and
+//! drops the rest, which gsv has latched all the same (their notes are recorded and the buffers
+//! they replace released). [`Graphics::frame_limit_reached`] then says so, and the run's timer
+//! thread ends the run (`crate::machine`'s `timer` module). Pinned by
+//! `a_frame_limit_hands_the_front_exactly_that_many_presents`, in `hle/tests/graphics/present.rs`.
 //!
 //! # Telling a stalled run
 //!
@@ -203,6 +232,7 @@
 //! built here.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
@@ -436,6 +466,10 @@ pub struct Graphics {
     /// Whether the run's own inputs complete things, or only recorded notes: the front's mode,
     /// which also picks the vsync clock's turn (module docs, "The timer thread's turn").
     mode: FrontMode,
+    /// Frames handed to the front (module docs, "Frames").
+    frames: AtomicU64,
+    /// The most frames the front is handed (module docs, "Frames").
+    frame_limit: Option<NonZeroU64>,
 }
 
 impl Graphics {
@@ -456,6 +490,8 @@ impl Graphics {
             null: Some(null),
             gpu: None,
             mode,
+            frames: AtomicU64::new(0),
+            frame_limit: None,
         }
     }
 
@@ -496,7 +532,32 @@ impl Graphics {
             null: None,
             gpu: Some(gpu),
             mode: FrontMode::Live,
+            frames: AtomicU64::new(0),
+            frame_limit: None,
         })
+    }
+
+    /// This graphics server, handing the front no more than `limit` frames (module docs,
+    /// "Frames"); `None` hands it every frame.
+    #[must_use]
+    pub fn with_frame_limit(mut self, limit: Option<NonZeroU64>) -> Self {
+        self.frame_limit = limit;
+        self
+    }
+
+    /// Frames presented: the presents [`Graphics::turn`] handed the front (module docs,
+    /// "Frames").
+    #[must_use]
+    pub fn frames(&self) -> u64 {
+        self.frames.load(Ordering::SeqCst)
+    }
+
+    /// Whether the front has been handed as many frames as the limit allows: never without a
+    /// limit (module docs, "Frames").
+    #[must_use]
+    pub fn frame_limit_reached(&self) -> bool {
+        self.frame_limit
+            .is_some_and(|limit| self.frames() >= limit.get())
     }
 
     /// The completion queue, rung through `wake` if given, and the syncpoints that push to it.
@@ -610,8 +671,17 @@ impl Graphics {
             FrontMode::Live => self.shared.tick_vsync(host, now),
             FrontMode::Replay => self.shared.tick_replayed_vsync(host),
         };
-        for request in presents {
+        let latched = presents.len();
+        let handed = frames_to_hand(self.frames(), self.frame_limit, latched);
+        if handed < latched {
+            tracing::debug!(
+                dropped = latched - handed,
+                "frames latched past the run's frame limit are not presented"
+            );
+        }
+        for request in presents.into_iter().take(handed) {
             self.front.present(request);
+            self.frames.fetch_add(1, Ordering::SeqCst);
         }
         taken
     }
@@ -717,6 +787,19 @@ impl Graphics {
             syncpoints.increment_by(id, behind);
         }
     }
+}
+
+/// How many of `latched` frames a turn hands the front when `handed` were handed before and the
+/// run allows `limit` (module docs, "Frames"): every one without a limit, and otherwise no more
+/// than the limit leaves room for.
+#[must_use]
+pub fn frames_to_hand(handed: u64, limit: Option<NonZeroU64>, latched: usize) -> usize {
+    let Some(limit) = limit else {
+        return latched;
+    };
+    let room = limit.get().saturating_sub(handed);
+    // A room that does not fit a `usize` is more than any turn latches.
+    usize::try_from(room).map_or(latched, |room| room.min(latched))
 }
 
 /// The drain's [`TimerHost`] over the run's kernel (module docs, "The timer thread's turn").

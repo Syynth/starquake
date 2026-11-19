@@ -35,6 +35,12 @@
 //! and the conversions between float and integer types, with their rounding modes and
 //! flush-to-zero bits.
 //!
+//! Slice 6f decodes the texture and surface group (`decode`'s `OpTex` to `OpSuAtom`): samples,
+//! texel fetches, gathers, level-of-detail and header queries, and surface loads, stores and
+//! atomics, with every handle form ([`decode::TexRef`]) and the fields naga cannot express yet
+//! (`TMML`, per-texel gather offsets, the fault predicate of `.SPARSE` results, the
+//! minimum-LOD clamp).
+//!
 //! Slice 10 rebuilds a captured program's control flow ([`flow`]): it finds and resolves the
 //! jump tables of `BRX`, walks the program under both convergence-barrier models, splits it
 //! into blocks, inlines every call, and builds the IR's basic blocks from the flow graph.

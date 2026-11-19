@@ -24,7 +24,17 @@
 //! `.f16`, and `f2fp.pack_ab`. Of the integer group (`op::integer`), `test_lea`, `test_sgxt`,
 //! `test_plop3`, `test_iabs` and `test_imnmx` pin `lea` and `lea.hi` with the shifted value and
 //! `b` negated and the shift in hex, `sgxt` and `sgxt.u32`, `plop3.lut` with negated predicates
-//! and both truth tables in hex, `iabs`, and `imnmx` and `imnmx.u32` with a predicate.
+//! and both truth tables in hex, `iabs`, and `imnmx` and `imnmx.u32` with a predicate. Of the
+//! memory group (`op::memory`), `test_ldc` pins `ldc` with every type but `.128`, a bound and a
+//! bindless buffer, with and without an offset register, and `test_ld_st_atom` pins `ldg`,
+//! `stg`, `lds`, `sts`, `ldl`, `stl`, `atomg`, `red` and `atoms` for 32-bit accesses with `.ef`
+//! and `.strong.sm`, every atomic operation and type (in shared memory the 32-bit integer ones),
+//! and addresses with `.64`, `.x8`, a uniform register and a positive or negative offset
+//! (`+-0x1`). Of the texture group (`op::texture`), `test_texture` pins the bindless `tex`,
+//! `tld`, `tld4`, `tmml`, `txd` and `txq` with `.scr`, `.b`, every level-of-detail mode,
+//! `tld4`'s `.g` and offset modes, `.ef` and `.nodep`, in that order, the operands
+//! `p0, r2, r0, r1, r3, 2d, 0x7`, and the three `txq` queries; that module's docs list what of
+//! its text is a guess.
 //! **Everything else is a guess** in `nvdisasm`'s usual style that a developer with
 //! `nvdisasm` should check (spec, "`nvdisasm` cross-check"): `urz` and `upt`, the `.rm`/`.rp`
 //! rounding names (taken from NAK's own `FRndMode` printer), `.fmz` for the `dnz` bit, float
@@ -38,7 +48,8 @@
 //! `nvdisasm` prints the absolute target: `op::control`, `BranchOffset`), the float group's
 //! text outside NAK's cases (each printer in `op::float` says which parts), the text of every
 //! other integer instruction (its modifier names and operand order, and `~` for a bitwise-not
-//! source, which NAK's own printer writes `!`: `op::integer`), and every shell's mnemonic.
+//! source, which NAK's own printer writes `!`: `op::integer`), the memory group's text outside
+//! NAK's cases (`op::memory`'s module docs list it), and every shell's mnemonic.
 
 use std::fmt::{self, Display, Formatter};
 
