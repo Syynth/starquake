@@ -20,6 +20,13 @@
 //!   Eden reads and writes the per-thread registers before SSA. PR #4588 has no such opcodes
 //!   because it packs uniform registers into the top of Maxwell's register file
 //!   (`eden-pr4588/src/shader_recompiler/frontend/ampere/native.h`, `UniformLayout`).
+//! - `InterpolateAtOffset` is added: a pixel program's input attribute (argument 0)
+//!   interpolated at an offset from the pixel centre (argument 1, the raw register bits
+//!   `IPA.OFFSET` reads), which the attribute translator (slice 12g) emits for `IPA.OFFSET`
+//!   and for interpolation at a sample, which NAK lowers to `.OFFSET` at the sample's position.
+//!   The spec has it carried in the IR for the lowering, which naga cannot express yet (the
+//!   gap table: "Interpolation at an offset or a sample"). Neither Eden nor PR #4588 has it:
+//!   both read only the default and centroid locations.
 
 use std::fmt::{self, Display, Formatter};
 
@@ -148,6 +155,8 @@ opcodes! {
     SetAttribute => Void(Attribute, F32, U32) none;
     GetAttributeIndexed => F32(U32, U32) none;
     SetAttributeIndexed => Void(U32, F32, U32) none;
+    // starquake: a pixel input interpolated at an offset (`IPA.OFFSET`), not in Eden
+    InterpolateAtOffset => F32(Attribute, U32) none;
     GetPatch => F32(Patch) none;
     SetPatch => Void(Patch, F32) none;
     SetFragColor => Void(U32, U32, F32) none;

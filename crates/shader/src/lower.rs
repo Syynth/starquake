@@ -61,23 +61,19 @@ use crate::host::{
     GuestSlot, HostBuiltIn, HostCode, HostShader, HostStage, InterfaceSlot, Requirements,
     SlotBinding, SlotType,
 };
+use crate::ir::ATTRIBUTE_COMPONENTS as COMPONENTS;
 use crate::ir::{
     Attribute, Function, Imm, Inst, Opcode, Operand, Operation, Terminator, Value, VerifyError,
 };
+pub use crate::ir::{GENERIC_0_X, POSITION_X};
 use crate::translate::{COLOR_TARGETS, GuestStage};
 use builder::{FunctionBuilder, named_ty, push, ty};
 
 /// The entry point's name in every module.
 pub const ENTRY_POINT: &str = "main";
 
-/// The attribute word of the position's X (`attribute.h`: `PositionX = 28`).
-pub const POSITION_X: u16 = 28;
-/// The attribute word of generic 0's X (`attribute.h`: `Generic0X = 32`).
-pub const GENERIC_0_X: u16 = 32;
 /// How many generic attributes there are (`attribute.h`: `NUM_GENERICS = 32`).
 pub const GENERICS: u16 = 32;
-/// Words per attribute (X, Y, Z, W).
-const COMPONENTS: u16 = 4;
 /// How many locations a host stage binds: generic `n` uses location `n`, so generics from this
 /// one up are refused. wgpu 30.0.1 on Metal binds vertex attributes below 31 (`wgpu-hal`
 /// `metal/adapter.rs`: `max_vertex_attributes: 31`) and vertex outputs at locations up to

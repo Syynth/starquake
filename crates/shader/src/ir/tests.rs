@@ -17,12 +17,14 @@ const LEFT_OUT: [&str; 4] = [
     "IsImageScaled",
     "ResolutionDownFactor",
 ];
-/// The uniform register class's opcodes, which Eden does not have.
-const ADDED: [Opcode; 4] = [
+/// The uniform register class's opcodes and the interpolation at an offset, which Eden does not
+/// have.
+const ADDED: [Opcode; 5] = [
     Opcode::GetUniformRegister,
     Opcode::SetUniformRegister,
     Opcode::GetUniformPred,
     Opcode::SetUniformPred,
+    Opcode::InterpolateAtOffset,
 ];
 
 fn ir(text: &str) -> Function {
@@ -63,6 +65,10 @@ fn opcode_table_differs_from_eden_as_listed() {
             vec![Type::UniformPred, Type::U1],
             FlagsKind::None
         )
+    );
+    assert_eq!(
+        signature(Opcode::InterpolateAtOffset),
+        (Type::F32, vec![Type::Attribute, Type::U32], FlagsKind::None)
     );
 }
 

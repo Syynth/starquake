@@ -136,6 +136,7 @@ use std::ops::Range;
 use thiserror::Error;
 
 pub use analysis::{Analysis, analyze};
+pub(crate) use classify::{OpInfo, classify};
 pub(crate) use ir_build::read_pred;
 pub use ir_build::{BlockSource, IrBlocks};
 pub use jump_tables::{
