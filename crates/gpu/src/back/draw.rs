@@ -718,40 +718,51 @@ impl Draws {
     }
 
     /// The previous stages' stores of `requests` as the ready `set` gives them (module docs of
-    /// [`shaders`], "The previous stage's stores").
+    /// [`shaders`], "The previous stage's stores"). Allocates nothing: each stage's shader is
+    /// found by [`Draws::guest_stage`], the mapping [`Draws::stages`] uses.
     fn set_stores(requests: &[ProgramRequest], set: &ReadySet) -> PreviousStores {
-        let stages = Self::stages(requests, set);
         shaders::previous_stage_stores(requests, |stage| {
-            let index = stages.iter().find(|s| s.stage == stage)?.index;
-            Some(shaders::stored_words(
-                &set.shaders.stages.get(index)?.outputs,
-            ))
+            set.shaders
+                .stages
+                .iter()
+                .find(|shader| Self::guest_stage(requests, shader.stage) == Some(stage))
+                .map(|shader| shaders::stored_words(&shader.outputs))
         })
     }
 
-    /// Each host shader's guest stage: the vertex shader is the vertex request's (the last
-    /// vertex-like request), the fragment shader the pixel request's.
-    fn stages(requests: &[ProgramRequest], set: &ReadySet) -> Vec<SetStage> {
+    /// The guest stage of a host shader of `host`'s stage: the vertex shader is the vertex
+    /// request's (the last vertex-like request), the fragment shader the pixel request's.
+    fn guest_stage(
+        requests: &[ProgramRequest],
+        host: starquake_shader::host::HostStage,
+    ) -> Option<GuestStage> {
         use starquake_shader::host::HostStage;
+        match host {
+            HostStage::Vertex => requests
+                .iter()
+                .rev()
+                .find(|r| {
+                    matches!(
+                        r.stage,
+                        GuestStage::Vertex | GuestStage::VertexCullBeforeFetch
+                    )
+                })
+                .map(|r| r.stage),
+            HostStage::Fragment => Some(GuestStage::Pixel),
+        }
+    }
+
+    /// Each host shader's guest stage ([`Draws::guest_stage`]) and its index in the set.
+    fn stages(requests: &[ProgramRequest], set: &ReadySet) -> Vec<SetStage> {
         set.shaders
             .stages
             .iter()
             .enumerate()
             .filter_map(|(index, shader)| {
-                let stage = match shader.stage {
-                    HostStage::Vertex => requests
-                        .iter()
-                        .rev()
-                        .find(|r| {
-                            matches!(
-                                r.stage,
-                                GuestStage::Vertex | GuestStage::VertexCullBeforeFetch
-                            )
-                        })
-                        .map(|r| r.stage)?,
-                    HostStage::Fragment => GuestStage::Pixel,
-                };
-                Some(SetStage { stage, index })
+                Some(SetStage {
+                    stage: Self::guest_stage(requests, shader.stage)?,
+                    index,
+                })
             })
             .collect()
     }
