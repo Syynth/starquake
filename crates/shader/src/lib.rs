@@ -59,6 +59,13 @@
 //! `PIXLD`, and `AL2P`; it rejects the geometry and mesh instructions by name. A guarded
 //! instruction becomes a conditional block.
 //!
+//! Slice 15 maps attribute loads and stores, system values and pixel outputs to the
+//! shader's interface and collects what the lowering and the host need to know ([`info`]):
+//! the attribute words read and written, the interface tables with each pixel input's
+//! interpolation, the constant buffers read, and the host [`host::Requirements`];
+//! [`program::graphics_program_ir`] runs a graphics program's bytes through the header, the
+//! translator, the slice 8 passes and collect info.
+//!
 //! Slice 19 is the shader cache ([`cache`]): the address map, program entries and shader
 //! entries, invalidation by guest range, the negative cache, and translations queued on the
 //! shared compile pool behind tickets, driven through a translator seam until slice 17.
@@ -76,6 +83,7 @@ pub mod flow;
 #[cfg(test)]
 mod gpu_harness;
 pub mod host;
+pub mod info;
 pub mod interp;
 pub mod ir;
 pub mod lookup;

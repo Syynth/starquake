@@ -208,7 +208,13 @@ fn pair_golden_tables() {
             GuestSlot::RenderTarget(0)
         )]
     );
-    assert_eq!(pixel.requirements, Requirements { subgroup: true });
+    assert_eq!(
+        pixel.requirements,
+        Requirements {
+            subgroup: true,
+            ..Requirements::default()
+        }
+    );
 }
 
 /// The tables describe the module: each argument and output member has the binding its slot

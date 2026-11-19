@@ -345,7 +345,13 @@ impl Executor for Threads {
 /// A host target with subgroup operations.
 const TARGET: HostTarget = HostTarget {
     form: CodeForm::NagaModule,
-    caps: Requirements { subgroup: true },
+    caps: Requirements {
+        subgroup: true,
+        f16: false,
+        f64: false,
+        i64: false,
+        i64_atomics: false,
+    },
 };
 
 /// How long a test lets a wait run before calling it hung.

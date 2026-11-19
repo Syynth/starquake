@@ -1,8 +1,9 @@
 //! Test generators of the 32-bit float group's decoded operations, one per operation, every
 //! field over its whole encodable range (`decode::tests` joins them through `form`'s
 //! `GROUP_HOOKS`). A field that only some layouts have (`FMNMX`'s `.NAN` and `FSET`'s combine
-//! operation without a uniform register, a high half only for a 16-bit register, `I2F`'s select
-//! by source width, `F2FP`'s `.H1` with `.MERGE_C`) is generated only where it can be encoded.
+//! operation without a uniform register, a high half only for a 16-bit source that is not an
+//! immediate, `I2F`'s select by source width, `F2FP`'s `.H1` with `.MERGE_C`) is generated only
+//! where it can be encoded.
 
 use proptest::prelude::*;
 use proptest::sample::select;
@@ -60,8 +61,10 @@ const fn is_uniform(src: AluSrc) -> bool {
     matches!(src, AluSrc::UniformReg { .. })
 }
 
-const fn is_reg(src: AluSrc) -> bool {
-    matches!(src, AluSrc::Reg { .. })
+/// Whether a 16-bit `src` of a one-source instruction has a high-half select: every source but
+/// an immediate (`op::float`'s `has_high_half`).
+const fn has_high_half(src: AluSrc) -> bool {
+    !matches!(src, AluSrc::Imm(_))
 }
 
 /// Every operation of the group, one generator each.
@@ -165,7 +168,7 @@ fn mufu() -> BoxedStrategy<Op> {
                 op,
                 src,
                 f16,
-                high: high && f16 && is_reg(src),
+                high: high && f16 && has_high_half(src),
             })
         }))
     .boxed()
@@ -286,9 +289,9 @@ fn frnd() -> BoxedStrategy<Op> {
         any_src(),
         (any_float_type(), any_float_type()),
         any_rnd(),
-        any::<[bool; 2]>(),
+        any::<[bool; 3]>(),
     )
-        .prop_map(|(dst, src, (dst_type, src_type), rnd, [ftz, wide])| {
+        .prop_map(|(dst, src, (dst_type, src_type), rnd, [ftz, high, wide])| {
             Op::FRnd(OpFRnd {
                 dst,
                 src,
@@ -296,6 +299,7 @@ fn frnd() -> BoxedStrategy<Op> {
                 src_type,
                 rnd,
                 ftz,
+                high: high && src_type == FloatType::F16 && has_high_half(src),
                 wide,
             })
         }))
@@ -308,9 +312,9 @@ fn f2f() -> BoxedStrategy<Op> {
         any_src(),
         (any_float_type(), any_float_type()),
         any_rnd(),
-        any::<[bool; 2]>(),
+        any::<[bool; 3]>(),
     )
-        .prop_map(|(dst, src, (dst_type, src_type), rnd, [ftz, wide])| {
+        .prop_map(|(dst, src, (dst_type, src_type), rnd, [ftz, high, wide])| {
             Op::F2F(OpF2F {
                 dst,
                 src,
@@ -318,6 +322,7 @@ fn f2f() -> BoxedStrategy<Op> {
                 src_type,
                 rnd,
                 ftz,
+                high: high && src_type == FloatType::F16 && has_high_half(src),
                 wide,
             })
         }))
@@ -334,7 +339,7 @@ fn f2i() -> BoxedStrategy<Op> {
     )
         .prop_map(
             |(dst, src, (dst_type, src_type), rnd, [ftz, ntz, high, wide])| {
-                let half = src_type == FloatType::F16 && is_reg(src) && !wide;
+                let half = src_type == FloatType::F16 && has_high_half(src);
                 Op::F2I(OpF2I {
                     dst,
                     src,

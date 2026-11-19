@@ -632,8 +632,12 @@ impl Translator<'_> {
     /// target order over the targets with any component written, one register per component
     /// whether that component is written or not (`ops_attr.cpp`, `EXIT`). At most
     /// `COLOR_TARGETS * 4` = 32 registers are read, so the PR's `src_reg < 255` check cannot
-    /// fail here and is not repeated. Sample mask and depth outputs come with the SPH parser
-    /// (slice 2).
+    /// fail here and is not repeated. With the pixel program's header
+    /// ([`translate_with_header`]), the sample mask (`OMAP_SAMPLE_MASK`) is the register after
+    /// the colours and the depth (`OMAP_DEPTH`) the one after that, whether the sample mask is
+    /// written or not, as both references read them (`ops_attr.cpp`, `EXIT`: `X(src_reg)` and
+    /// `F(src_reg + 1)`; Eden's `exit_program.cpp`, `ExitFragment`, the same); at most register
+    /// 33, so the PR's two register checks cannot fail either (slice 15).
     fn exit(&mut self, op: OpExit) -> Result<(), Failure> {
         require(!op.keep_ref_count && !op.no_at_exit, Unsupported::ExitMode)?;
         require(op.pred.is_true(), Unsupported::ConditionalExit)?;
@@ -660,6 +664,17 @@ impl Translator<'_> {
                 }
                 reg = reg.saturating_add(1);
             }
+        }
+        let Some(header) = self.header else {
+            return Ok(());
+        };
+        if header.writes_sample_mask {
+            let mask = self.get(Gpr::new(reg))?;
+            self.op(Opcode::SetSampleMask, &[mask])?;
+        }
+        if header.writes_depth {
+            let depth = self.get_f32(Gpr::new(reg.saturating_add(1)))?;
+            self.op(Opcode::SetFragDepth, &[depth.into()])?;
         }
         Ok(())
     }

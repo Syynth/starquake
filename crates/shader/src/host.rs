@@ -81,11 +81,27 @@ pub struct InterfaceSlot {
 }
 
 /// Device features a shader needs beyond the baseline.
+///
+/// Slice 1 fills `subgroup` from what it lowers; slice 15's collect info
+/// ([`crate::info::ShaderInfo::requirements`]) fills every field from the IR, before the host
+/// lowering passes of slice 18 remove what the host lacks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one flag per host feature the spec's Requirements names"
+)]
 pub struct Requirements {
     /// Subgroup operations or built-ins (naga's `Capabilities::SUBGROUP`, wgpu's
     /// `Features::SUBGROUP`).
     pub subgroup: bool,
+    /// 16-bit floats (naga's `Capabilities::SHADER_FLOAT16`).
+    pub f16: bool,
+    /// 64-bit floats (naga's `Capabilities::FLOAT64`).
+    pub f64: bool,
+    /// 64-bit integers (naga's `Capabilities::SHADER_INT64`).
+    pub i64: bool,
+    /// 64-bit integer atomics (naga's `Capabilities::SHADER_INT64_ATOMIC_ALL_OPS`).
+    pub i64_atomics: bool,
 }
 
 /// One translated shader.

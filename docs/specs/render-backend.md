@@ -191,7 +191,8 @@ pub enum Command {
     Upload { from: StagingSlice, to: CopyDst },          // buffer range or texture region
     Copy(CopyDesc),                                      // buffer/texture to buffer/texture
     Blit(BlitDesc),                                      // scaled and filtered (2D engine, present)
-    Clear(ClearDesc),                                    // colour, depth, stencil; whole or rect
+    Clear(ClearDesc),                                    // colour, depth, stencil; whole or rect;
+                                                         // colour and stencil write masks
     SetRenderTargets(RenderTargets),                     // up to 8 colour views + depth/stencil
     Draw(DrawDesc),                                      // pipeline, bindings, vertex/index buffers,
                                                          // dynamic state, direct or indirect params
@@ -210,6 +211,13 @@ pub enum Command {
   2026-11-19). Load and store actions start conservative (load, store); hints
   from the guest's own invalidate methods can make them cheaper later, which matters on Apple's
   tile-based GPUs.
+- **Clears carry write masks** (decided by the owner, 2026-11-19). `ClearDesc` has a colour
+  write mask (the channels written) and a stencil write mask (the bits written), as the guest's
+  `CLEAR_SURFACE` asks (gpu-protocol, "Clears"). A clear the host API cannot perform as a clear,
+  a partial mask or a rectangle over a view it clears only whole (under wgpu: depth, stencil and
+  multisampled views), the backend draws with its own clear helper shader, with the same pixels
+  as a clear. So the gpu side never draws a clear itself and never parses the backend's helper
+  shaders. The recording backend models a masked clear on the CPU, since its pixels are exact.
 - **Barriers and image layouts are the backend's business.** Every command says which resources
   it reads and writes, so the backend can insert what its API needs. wgpu inserts them itself
   from each resource's declared usage; a direct Metal backend would need few; a direct Vulkan
@@ -418,9 +426,11 @@ under wgpu) makes pipeline creation fail with a `RenderError`; `gpu` skips and c
 
 A shader whose requirements include "subgroup size 32" (shader-pipeline, "Compute shaders") is
 refused where the device cannot meet it. wgpu-hal 30.0.2's Metal backend reports a subgroup size
-range of 4..64 on every Mac, and wgpu cannot request a size, so the wgpu backend treats the
-Apple GPU family as meeting "subgroup size 32": Apple GPUs run 32-wide SIMD groups (decided by
-the owner, 2026-11-19).
+range of 4..64 on every Mac, and wgpu cannot request a size, so the wgpu backend treats the Apple
+GPU family as meeting "subgroup size 32": Apple GPUs run 32-wide SIMD groups (decided by the owner,
+2026-11-19). As built for #433 (decided by the owner, 2026-11-19): the family is recognised by the
+adapter name's `Apple ` prefix, since wgpu 30 exposes no Metal GPU family, which is a **guess**;
+and an Apple GPU reached through Vulkan (MoltenVK) is not counted as meeting it.
 
 ### Fixed-function state the host lacks
 

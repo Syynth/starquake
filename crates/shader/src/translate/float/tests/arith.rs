@@ -103,18 +103,12 @@ fn fmul_scale_needs_ftz_and_nearest() {
     ] {
         assert_refused(Op::FMul(op), FloatUnsupported::FmulScaleModifiers);
     }
-    // Scale 1, the first the PR accepts, and scale 0, the last it refuses.
+    // Scale 1, the first the PR accepts; scale 0, the last it refuses, the decoder refuses
+    // (slice 4b), so no decoded `FMUL` carries it.
     translated(&[Instr::new(Op::FMul(OpFMul {
         scale: FMulScale::D8,
         ..scaled
     }))]);
-    assert_refused(
-        Op::FMul(OpFMul {
-            scale: FMulScale::D16,
-            ..scaled
-        }),
-        FloatUnsupported::FmulScale(FMulScale::D16),
-    );
 }
 
 /// PR #4588's "Native fused multiply-add reads a uniform multiplier or addend": `UR4 = 3`,

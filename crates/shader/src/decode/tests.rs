@@ -17,7 +17,7 @@ use super::*;
 use crate::asm::{EncodeError, assemble};
 use crate::decode::control::EXIT_OPCODE;
 use crate::decode::integer::MOV_OPCODE;
-use crate::testing::{any_form_word, any_instr, any_word_of, config, forms};
+use crate::testing::{any_form_word, any_instr, any_word_of, canonical_word, config, forms};
 
 /// The 9-bit opcode below the operand form of a 12-bit ALU `opcode` (its low [`ALU_FORM`]`.start`
 /// bits: `encode_alu_base`'s `set_field(0..9, opcode)`).
@@ -530,8 +530,11 @@ fn known_of(opcode: u16) -> u128 {
 /// lists (`REFERENCE_ROWS`, one per form, in form order): equal, except for the bits a row
 /// drops, which the form rejects (bits 62 and 63 of `MOV`'s register, constant-buffer and
 /// uniform-register forms, `mov_rejects_source_modifier_bits`, and of the same forms of
-/// `WARPSYNC` and `NANOSLEEP`, `control::control_sources_reject_modifier_bits`). Each form's
-/// fixed bits are the ones its row lists (`ReferenceRow::fixing`).
+/// `WARPSYNC` and `NANOSLEEP`, `control::control_sources_reject_modifier_bits`), and the bits
+/// a row adds, which the form knows though the row leaves them out
+/// (`framework::added_bits_are_the_listed_cases`). A row drops only bits it marks known and
+/// adds only bits it leaves out, so no bit is both. Each form's fixed bits are the ones its row
+/// lists (`ReferenceRow::fixing`).
 #[test]
 fn masks_match_the_reference_table() {
     for (forms, hooks) in GROUPS.iter().zip(&GROUP_HOOKS) {
@@ -540,8 +543,13 @@ fn masks_match_the_reference_table() {
         for (form, row) in forms.iter().zip(rows) {
             let opcode = form.opcode;
             assert_eq!(opcode, row.opcode);
-            assert_eq!(form.known & row.dropped, 0, "{opcode:#x}");
-            assert_eq!(form.known | row.dropped, row.mask(), "{opcode:#x}");
+            assert_eq!(row.dropped & !row.mask(), 0, "{opcode:#x}");
+            assert_eq!(row.added() & row.mask(), 0, "{opcode:#x}");
+            assert_eq!(
+                form.known,
+                (row.mask() & !row.dropped) | row.added(),
+                "{opcode:#x}"
+            );
             assert_eq!(form.fixed, row.fixed, "{opcode:#x}");
         }
     }
@@ -600,12 +608,12 @@ fn mov_rejects_source_modifier_bits() {
     }
 }
 
-/// Flipping any bit outside a form's mask makes the word unknown, naming that bit, whatever the
-/// form's fields hold (the mask is checked before anything is read).
+/// Flipping any bit outside a form's mask in its canonical word makes the word unknown, naming
+/// that bit, whatever the form's fields hold (the mask is checked before anything is read).
 #[test]
 fn every_bit_outside_a_form_is_rejected() {
-    for (opcode, known, fixed) in forms() {
-        let word = Instruction::from_bits(fixed).with_field(OPCODE, u64::from(opcode));
+    for (opcode, known, _) in forms() {
+        let word = canonical_word(opcode);
         assert!(decode(word).is_ok(), "{opcode:#x}");
         let mut flipped_bits = 0;
         for bit in 0..128 {

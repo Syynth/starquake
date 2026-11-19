@@ -99,10 +99,13 @@ fn a_shader_needing_a_feature_the_target_lacks_is_rejected() {
     );
     let needing = rig.place(A, GuestStage::Vertex, &program(GuestStage::Vertex, &[1]));
     rig.place(B, GuestStage::Vertex, &program(GuestStage::Vertex, &[2]));
-    rig.fake
-        .script()
-        .needs
-        .insert(needing, Requirements { subgroup: true });
+    rig.fake.script().needs.insert(
+        needing,
+        Requirements {
+            subgroup: true,
+            ..Requirements::default()
+        },
+    );
     pending(rig.lookup(&[vertex(A)]));
     pending(rig.lookup(&[vertex(B)]));
     rig.executor.run_all();
@@ -110,7 +113,10 @@ fn a_shader_needing_a_feature_the_target_lacks_is_rejected() {
     assert_eq!(
         *rejection.reason,
         Rejection::Cache(CacheRefusal::Unsupported {
-            missing: Requirements { subgroup: true }
+            missing: Requirements {
+                subgroup: true,
+                ..Requirements::default()
+            }
         })
     );
     assert_eq!(
@@ -126,14 +132,23 @@ fn a_shader_needing_a_feature_the_target_lacks_is_rejected() {
 fn a_shader_needing_a_feature_the_target_has_is_ready() {
     let mut rig = Rig::new();
     let hash = rig.place(A, GuestStage::Vertex, &program(GuestStage::Vertex, &[1]));
-    rig.fake
-        .script()
-        .needs
-        .insert(hash, Requirements { subgroup: true });
+    rig.fake.script().needs.insert(
+        hash,
+        Requirements {
+            subgroup: true,
+            ..Requirements::default()
+        },
+    );
     pending(rig.lookup(&[vertex(A)]));
     rig.executor.run_all();
     let shaders = ready(rig.lookup(&[vertex(A)]));
-    assert_eq!(shaders[0].1.needs, Requirements { subgroup: true });
+    assert_eq!(
+        shaders[0].1.needs,
+        Requirements {
+            subgroup: true,
+            ..Requirements::default()
+        }
+    );
 }
 
 #[test]

@@ -273,20 +273,42 @@ pub enum CacheRefusal {
 
 /// The features `needs` asks for that `caps` lacks, or `None` when it lacks none.
 fn missing_features(needs: Requirements, caps: Requirements) -> Option<Requirements> {
-    let Requirements { subgroup } = needs;
+    let Requirements {
+        subgroup,
+        f16,
+        f64,
+        i64,
+        i64_atomics,
+    } = needs;
     let missing = Requirements {
         subgroup: subgroup && !caps.subgroup,
+        f16: f16 && !caps.f16,
+        f64: f64 && !caps.f64,
+        i64: i64 && !caps.i64,
+        i64_atomics: i64_atomics && !caps.i64_atomics,
     };
     (missing != Requirements::default()).then_some(missing)
 }
 
 /// The names of the features in `features`, in plain words.
 fn feature_names(features: Requirements) -> String {
-    let Requirements { subgroup } = features;
-    let names: Vec<&str> = [(subgroup, "subgroup operations")]
-        .into_iter()
-        .filter_map(|(set, name)| set.then_some(name))
-        .collect();
+    let Requirements {
+        subgroup,
+        f16,
+        f64,
+        i64,
+        i64_atomics,
+    } = features;
+    let names: Vec<&str> = [
+        (subgroup, "subgroup operations"),
+        (f16, "16-bit floats"),
+        (f64, "64-bit floats"),
+        (i64, "64-bit integers"),
+        (i64_atomics, "64-bit integer atomics"),
+    ]
+    .into_iter()
+    .filter_map(|(set, name)| set.then_some(name))
+    .collect();
     if names.is_empty() {
         "no device features".into()
     } else {
