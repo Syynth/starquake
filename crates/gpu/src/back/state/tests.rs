@@ -1111,7 +1111,21 @@ fn errors_read_as_plain_words() {
                 method: "SET_BLEND",
                 indices: 0,
             },
-            "SET_BLEND has no element at the 0 indices given",
+            "SET_BLEND has no element with no index given",
+        ),
+        (
+            StateError::NoElement {
+                method: "SET_BLEND",
+                indices: 1,
+            },
+            "SET_BLEND has no element with 1 index given",
+        ),
+        (
+            StateError::NoElement {
+                method: "SET_BLEND",
+                indices: 2,
+            },
+            "SET_BLEND has no element with 2 indices given",
         ),
         (
             index_error(arrays::VIEWPORT, 16, 16),

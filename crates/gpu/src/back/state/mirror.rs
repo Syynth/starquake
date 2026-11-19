@@ -28,7 +28,7 @@ pub enum StateError {
     },
     /// The indices given do not name an element of the method: a different number of indices
     /// than the method has, or an address past 32 bits.
-    #[error("{method} has no element at the {indices} indices given")]
+    #[error("{method} has no element with {} given", indices_given(*.indices))]
     NoElement {
         /// The method's name in the class header.
         method: &'static str,
@@ -73,6 +73,15 @@ pub enum StateError {
         /// The mirror's class.
         actual: u32,
     },
+}
+
+/// How [`StateError::NoElement`] reads a number of indices: "no index", "1 index", "2 indices".
+fn indices_given(count: usize) -> String {
+    match count {
+        0 => "no index".to_owned(),
+        1 => "1 index".to_owned(),
+        _ => format!("{count} indices"),
+    }
 }
 
 /// A constant buffer bound to a bind group's slot: what `SET_CONSTANT_BUFFER_SELECTOR_A` to `_C`
