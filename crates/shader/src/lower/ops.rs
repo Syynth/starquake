@@ -32,8 +32,8 @@ use naga::{
 };
 
 use super::builder::push;
-use super::{AttributeKind, LowerError, Lowering, Var, attribute_arg, classify, directed, imm_arg};
-use crate::ir::{Flags, Imm, Opcode, Operation, Type, Value};
+use super::{AttributeKind, LowerError, Lowering, Var, attribute_arg, classify, imm_arg};
+use crate::ir::{Imm, Opcode, Operation, Type, Value};
 
 /// The bits of a 32-bit integer.
 const BITS32: u32 = u32::BITS;
@@ -523,7 +523,6 @@ impl Lowering {
             return self.done(at, Some(expr));
         }
         if let Some((width, bits, signed)) = int_to_float(opcode) {
-            check_rounding(at, op)?;
             let value = self.arg(body, at, op, 0)?;
             let source = self.low_bits(body, value, bits, signed);
             let expr = self.cast(body, source, ScalarKind::Float, Some(width));
@@ -755,7 +754,6 @@ impl Lowering {
                 })
             }
             Opcode::ConvertF16F32 | Opcode::ConvertF32F16 => {
-                check_rounding(at, op)?;
                 let width = if opcode == Opcode::ConvertF16F32 {
                     WIDTH16
                 } else {
@@ -1004,18 +1002,4 @@ impl Lowering {
             }
         }
     }
-}
-
-/// Refuses a directed rounding mode on a conversion (the parent module's divergence table).
-fn check_rounding(at: Value, op: &Operation) -> Result<(), LowerError> {
-    if let Flags::Fp(control) = op.flags
-        && let Some(rounding) = directed(control.rounding)
-    {
-        return Err(LowerError::Rounding {
-            at,
-            opcode: op.opcode,
-            rounding,
-        });
-    }
-    Ok(())
 }

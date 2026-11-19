@@ -273,3 +273,27 @@ fn demote_is_kill() {
         );
     }
 }
+
+/// A phi in a structured function is refused (a divergence in the module docs: Eden lowers its
+/// phis, `EmitPhi`; here the structurizer's pre-SSA form is what is lowered, until the SSA pass
+/// on structured functions, slice 8b, makes phis that need lowering).
+#[test]
+fn a_structured_phi_is_refused() {
+    let function = ir("block0:
+    %0: u32 = GetRegister r0
+    %1: u1 = IEqual %0, u32 0
+block1:
+    %2: u32 = Phi [block0: %0]
+    %3 = SetRegister r1, %2
+structure:
+    block0
+    if %1 {
+        block1
+    }
+    return
+");
+    assert_eq!(
+        lower_with(GuestStage::Compute, &function, &LowerInputs::DEFAULT).err(),
+        Some(LowerError::Phi(value_at(&function, 2)))
+    );
+}

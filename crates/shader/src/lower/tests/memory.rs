@@ -188,6 +188,7 @@ fn empty_local_memory_reads_zero() {
 
 /// Shared memory of four words (16 bytes), by byte offset: 32-, 64- and 128-bit stores and
 /// loads at and past the end (a 64-bit access straddling the end keeps its word inside), the
+/// 128-bit store's fourth word read back before the stores at the last word overwrite it, the
 /// 8- and 16-bit loads of each field, and the offset whose word index Eden's arithmetic shift
 /// would wrap to word 0.
 #[test]
@@ -198,37 +199,39 @@ fn shared_offsets_at_and_past_the_end() {
     let body = format!(
         "    %0: u32x4 = CompositeConstructU32x4 u32 0x84838281, u32 0x2, u32 0x3, u32 0x4
     %1 = WriteSharedU128 u32 0, %0
-    %2 = WriteSharedU32 u32 {last}, u32 0xf00d
-    %3 = WriteSharedU32 u32 {end}, u32 0xdead
-    %4: u32x2 = CompositeConstructU32x2 u32 0x55, u32 0x66
-    %5 = WriteSharedU64 u32 {last}, %4
-    %6: u32 = LoadSharedU32 u32 {last}
-    %7: u32 = LoadSharedU32 u32 {end}
-    %8: u32x2 = LoadSharedU64 u32 {last}
-    %9: u32 = CompositeExtractU32x2 %8, u32 0
-    %10: u32 = CompositeExtractU32x2 %8, u32 1
-    %11: u32x4 = LoadSharedU128 u32 0
-    %12: u32 = CompositeExtractU32x4 %11, u32 1
-    %13: u32 = CompositeExtractU32x4 %11, u32 2
-    %14: u32 = LoadSharedU8 u32 3
-    %15: u32 = LoadSharedS8 u32 3
-    %16: u32 = LoadSharedU16 u32 2
-    %17: u32 = LoadSharedS16 u32 2
-    %18: u32 = LoadSharedS8 u32 0
-    %19: u32x2 = LoadSharedU64 u32 0xfffffffc
-    %20: u32 = CompositeExtractU32x2 %19, u32 1
-    %21 = SetRegister r0, %6
-    %22 = SetRegister r1, %7
-    %23 = SetRegister r2, %9
-    %24 = SetRegister r3, %10
-    %25 = SetRegister r4, %12
-    %26 = SetRegister r5, %13
-    %27 = SetRegister r6, %14
-    %28 = SetRegister r7, %15
-    %29 = SetRegister r8, %16
-    %30 = SetRegister r9, %17
-    %31 = SetRegister r10, %18
-    %32 = SetRegister r11, %20
+    %2: u32 = LoadSharedU32 u32 {last}
+    %3 = WriteSharedU32 u32 {last}, u32 0xf00d
+    %4 = WriteSharedU32 u32 {end}, u32 0xdead
+    %5: u32x2 = CompositeConstructU32x2 u32 0x55, u32 0x66
+    %6 = WriteSharedU64 u32 {last}, %5
+    %7: u32 = LoadSharedU32 u32 {last}
+    %8: u32 = LoadSharedU32 u32 {end}
+    %9: u32x2 = LoadSharedU64 u32 {last}
+    %10: u32 = CompositeExtractU32x2 %9, u32 0
+    %11: u32 = CompositeExtractU32x2 %9, u32 1
+    %12: u32x4 = LoadSharedU128 u32 0
+    %13: u32 = CompositeExtractU32x4 %12, u32 1
+    %14: u32 = CompositeExtractU32x4 %12, u32 2
+    %15: u32 = LoadSharedU8 u32 3
+    %16: u32 = LoadSharedS8 u32 3
+    %17: u32 = LoadSharedU16 u32 2
+    %18: u32 = LoadSharedS16 u32 2
+    %19: u32 = LoadSharedS8 u32 0
+    %20: u32x2 = LoadSharedU64 u32 0xfffffffc
+    %21: u32 = CompositeExtractU32x2 %20, u32 1
+    %22 = SetRegister r0, %7
+    %23 = SetRegister r1, %8
+    %24 = SetRegister r2, %10
+    %25 = SetRegister r3, %11
+    %26 = SetRegister r4, %13
+    %27 = SetRegister r5, %14
+    %28 = SetRegister r6, %15
+    %29 = SetRegister r7, %16
+    %30 = SetRegister r8, %17
+    %31 = SetRegister r9, %18
+    %32 = SetRegister r10, %19
+    %33 = SetRegister r11, %21
+    %34 = SetRegister r12, %2
 "
     );
     let inputs = LowerInputs {
@@ -254,6 +257,8 @@ fn shared_offsets_at_and_past_the_end() {
             probe("half 1, signed", 0xffff_8483),
             probe("byte 0, signed", 0xffff_ff81),
             probe("the word after index 0x3fff_ffff, not word 0", 0),
+            // Read before the 32- and 64-bit stores at the last word overwrite it.
+            probe("a 128-bit store at 0, word 3", 0x4),
         ],
     );
 }

@@ -4,7 +4,7 @@
 use super::run::{gpu_registers, interp_registers, opaque};
 use super::*;
 use crate::decode::{Pred, UniformPred, UniformReg};
-use crate::ir::Builder;
+use crate::ir::{Builder, Flags, FpControl, FpRounding};
 
 /// One case of the GPU comparison: a name and the instructions that compute a `u32`.
 type Case = (&'static str, fn(&mut Builder<'_>) -> Value);
@@ -236,6 +236,15 @@ const INTEGER_CASES: &[Case] = &[
     ("uge", |b| {
         boolean(b, Opcode::UGreaterThanEqual, &[u(1), u(u32::MAX)])
     }),
+    ("ule", |b| {
+        boolean(b, Opcode::ULessThanEqual, &[u(u32::MAX), u(1)])
+    }),
+    ("sge", |b| {
+        boolean(b, Opcode::SGreaterThanEqual, &[u(u32::MAX), u(1)])
+    }),
+    ("ugt", |b| {
+        boolean(b, Opcode::UGreaterThan, &[u(u32::MAX), u(1)])
+    }),
     ("ieq", |b| boolean(b, Opcode::IEqual, &[u(3), u(3)])),
     ("ine", |b| boolean(b, Opcode::INotEqual, &[u(3), u(3)])),
     ("logical", |b| {
@@ -451,6 +460,43 @@ const CONVERSION_CASES: &[Case] = &[
     }),
 ];
 
+/// The half of `value`.
+fn half(builder: &mut Builder<'_>, value: f32) -> Operand {
+    op(builder, Opcode::ConvertF16F32, &[f(value)]).into()
+}
+
+/// The 16-bit comparison `opcode` of four operand pairs, one bit each: (1, 2) in bit 0, (2, 1)
+/// in bit 1, (1, 1) in bit 2 and (NaN, 1) in bit 3, so each operator, ordered or unordered,
+/// gives its own pattern.
+fn f16_compare(builder: &mut Builder<'_>, opcode: Opcode) -> Value {
+    let pairs = [(1.0, 2.0), (2.0, 1.0), (1.0, 1.0), (NAN, 1.0)];
+    let mut bits: Operand = u(0);
+    for (index, (x, y)) in pairs.into_iter().enumerate() {
+        let x = half(builder, x);
+        let y = half(builder, y);
+        let result = op(builder, opcode, &[x, y]);
+        let set = op(
+            builder,
+            Opcode::SelectU32,
+            &[result.into(), u(1 << index), u(0)],
+        );
+        bits = op(builder, Opcode::BitwiseOr32, &[bits, set.into()]).into();
+    }
+    op(builder, Opcode::Identity, &[bits])
+}
+
+/// `opcode` (a conversion to f16) of `value`, widened to f32, as its bits.
+fn to_half(builder: &mut Builder<'_>, opcode: Opcode, value: u32) -> Value {
+    let x = op(builder, opcode, &[u(value)]);
+    float(builder, Opcode::ConvertF32F16, &[x.into()])
+}
+
+/// `opcode` (a conversion from f16) of the half of `value`.
+fn from_half(builder: &mut Builder<'_>, opcode: Opcode, value: f32) -> Value {
+    let x = half(builder, value);
+    int(builder, opcode, &[x])
+}
+
 /// 16-bit float cases (`SHADER_F16`), with the half packing that counts as needing it.
 const F16_CASES: &[Case] = &[
     ("pack half", |b| {
@@ -507,6 +553,90 @@ const F16_CASES: &[Case] = &[
         let is_nan = op(b, Opcode::FPIsNan16, &[nan.into()]);
         let both = op(b, Opcode::LogicalAnd, &[lt.into(), is_nan.into()]);
         int(b, Opcode::SelectU32, &[both.into(), u(1), u(0)])
+    }),
+    ("f16 ord eq", |b| f16_compare(b, Opcode::FPOrdEqual16)),
+    ("f16 unord eq", |b| f16_compare(b, Opcode::FPUnordEqual16)),
+    ("f16 ord ne", |b| f16_compare(b, Opcode::FPOrdNotEqual16)),
+    ("f16 unord ne", |b| {
+        f16_compare(b, Opcode::FPUnordNotEqual16)
+    }),
+    ("f16 ord lt", |b| f16_compare(b, Opcode::FPOrdLessThan16)),
+    ("f16 unord lt", |b| {
+        f16_compare(b, Opcode::FPUnordLessThan16)
+    }),
+    ("f16 ord gt", |b| f16_compare(b, Opcode::FPOrdGreaterThan16)),
+    ("f16 unord gt", |b| {
+        f16_compare(b, Opcode::FPUnordGreaterThan16)
+    }),
+    ("f16 ord le", |b| {
+        f16_compare(b, Opcode::FPOrdLessThanEqual16)
+    }),
+    ("f16 unord le", |b| {
+        f16_compare(b, Opcode::FPUnordLessThanEqual16)
+    }),
+    ("f16 ord ge", |b| {
+        f16_compare(b, Opcode::FPOrdGreaterThanEqual16)
+    }),
+    ("f16 unord ge", |b| {
+        f16_compare(b, Opcode::FPUnordGreaterThanEqual16)
+    }),
+    // The narrow sources have their sign bit set and a bit above the field.
+    ("s8 to f16", |b| to_half(b, Opcode::ConvertF16S8, 0x1_0080)),
+    ("u8 to f16", |b| to_half(b, Opcode::ConvertF16U8, 0x1_0080)),
+    ("s16 to f16", |b| {
+        to_half(b, Opcode::ConvertF16S16, 0x1_8000)
+    }),
+    ("u16 to f16", |b| {
+        to_half(b, Opcode::ConvertF16U16, 0x1_8000)
+    }),
+    ("u32 to f16", |b| {
+        to_half(b, Opcode::ConvertF16U32, 0x0000_0400)
+    }),
+    ("u32 to f16 top bit", |b| {
+        to_half(b, Opcode::ConvertF16U32, 0x8000_0000)
+    }),
+    ("s32 to f16 small", |b| {
+        to_half(b, Opcode::ConvertF16S32, (-1024_i32).cast_unsigned())
+    }),
+    // Negative, past the range, infinite and NaN halves to each integer type.
+    ("f16 to s16 negative", |b| {
+        from_half(b, Opcode::ConvertS16F16, -3.75)
+    }),
+    ("f16 to s16 big", |b| {
+        from_half(b, Opcode::ConvertS16F16, 40000.0)
+    }),
+    ("f16 to s16 small", |b| {
+        from_half(b, Opcode::ConvertS16F16, -40000.0)
+    }),
+    ("f16 to s16 nan", |b| {
+        from_half(b, Opcode::ConvertS16F16, NAN)
+    }),
+    ("f16 to u16 negative", |b| {
+        from_half(b, Opcode::ConvertU16F16, -3.75)
+    }),
+    ("f16 to u16 infinite", |b| {
+        from_half(b, Opcode::ConvertU16F16, f32::INFINITY)
+    }),
+    ("f16 to s32 infinite", |b| {
+        from_half(b, Opcode::ConvertS32F16, f32::INFINITY)
+    }),
+    ("f16 to s32 negative infinite", |b| {
+        from_half(b, Opcode::ConvertS32F16, f32::NEG_INFINITY)
+    }),
+    ("f16 to s32 nan", |b| {
+        from_half(b, Opcode::ConvertS32F16, NAN)
+    }),
+    ("f16 to u32 negative", |b| {
+        from_half(b, Opcode::ConvertU32F16, -3.75)
+    }),
+    ("f16 to u32 big", |b| {
+        from_half(b, Opcode::ConvertU32F16, 65504.0)
+    }),
+    ("f16 to u32 infinite", |b| {
+        from_half(b, Opcode::ConvertU32F16, f32::INFINITY)
+    }),
+    ("f16 to u32 nan", |b| {
+        from_half(b, Opcode::ConvertU32F16, NAN)
     }),
     ("f16 pack", |b| {
         let x = op(b, Opcode::ConvertF16F32, &[f(1.0)]);
@@ -615,6 +745,163 @@ fn i64_operations_match_the_interpreter_on_the_gpu() {
     );
     let mismatches = gpu_mismatches("i64_operations", I64_CASES);
     assert!(mismatches.is_empty(), "{mismatches:#?}");
+}
+
+/// `function` made opaque and lowered as a compute shader of one invocation, with the
+/// interpreter's registers `regs` and, where the host can run it, the GPU's.
+fn interp_and_gpu(test: &str, function: &Function, regs: &[u8]) -> (Vec<u32>, Option<Vec<u32>>) {
+    let function = opaque(function);
+    let shader = lowered(GuestStage::Compute, &function, &ONE_INVOCATION);
+    let expected = interp_registers(&function, regs);
+    (expected.clone(), gpu_registers(test, &shader, regs))
+}
+
+/// `F2F` from 32 to 16 bits with each rounding mode, with and without `.FTZ`, as the translator
+/// makes it (`translate::float`, "Rounding modes and flush-to-zero"): converted to nearest,
+/// then moved one step, with the mode and the flushing also carried on `ConvertF16F32`, which
+/// this lowering ignores. On the host's GPU the results are the interpreter's, which honours
+/// the carried controls: hand-worked halves for each mode at overflow, ties, below the
+/// smallest denormal, a denormal result and a flushed one (the translator's own
+/// `f2f_emulation_matches_the_modelled_conversion` cases).
+#[test]
+fn translated_f2f_rounding_matches_the_interpreter_on_the_gpu() {
+    use crate::decode::{AluSrc, FloatType, Instr, Op, OpExit, OpF2F, PredSrc, RoundMode};
+    use crate::translate::{COLOR_TARGETS, ColorOutputs, Stage, translate};
+    // The input, `.FTZ`, then the half for nearest, down, up and toward zero.
+    let cases: [(f32, bool, [u32; 4]); 10] = [
+        (65519.0, false, [0x7bff, 0x7bff, 0x7c00, 0x7bff]),
+        (65520.0, false, [0x7c00, 0x7bff, 0x7c00, 0x7bff]),
+        (-70000.0, false, [0xfc00, 0xfc00, 0xfbff, 0xfbff]),
+        (1.000_488_3, false, [0x3c00, 0x3c00, 0x3c01, 0x3c00]),
+        (-1.000_488_3, false, [0xbc00, 0xbc01, 0xbc00, 0xbc00]),
+        (1.0e-8, false, [0x0000, 0x0000, 0x0001, 0x0000]),
+        (-1.0e-8, false, [0x8000, 0x8001, 0x8000, 0x8000]),
+        (1.0e-6, false, [0x0011, 0x0010, 0x0011, 0x0010]),
+        (1.0e-6, true, [0x0000; 4]),
+        (f32::from_bits(1), true, [0x0000; 4]),
+    ];
+    // The translator takes vertex and pixel programs; a vertex program's exit adds nothing
+    // the compute lowering refuses.
+    let stage = Stage {
+        stage: GuestStage::Vertex,
+        color_outputs: ColorOutputs {
+            targets: [0; COLOR_TARGETS],
+        },
+    };
+    for (index, mode) in RoundMode::ALL.into_iter().enumerate() {
+        let mut program = Vec::new();
+        let mut regs = Vec::new();
+        for (reg, (input, ftz, _)) in cases.iter().enumerate() {
+            let reg = u8::try_from(reg).expect("few cases");
+            program.push(Instr::new(Op::F2F(OpF2F {
+                dst: Gpr::new(reg),
+                src: AluSrc::Imm(input.to_bits()),
+                dst_type: FloatType::F16,
+                src_type: FloatType::F32,
+                rnd: mode,
+                ftz: *ftz,
+                high: false,
+                wide: false,
+            })));
+            regs.push(reg);
+        }
+        program.push(Instr::new(Op::Exit(OpExit {
+            keep_ref_count: false,
+            no_at_exit: false,
+            pred: PredSrc::TRUE,
+        })));
+        let function = translate(stage, &program).expect("translates");
+        let test = format!("translated_f2f_{mode:?}");
+        let (expected, found) = interp_and_gpu(&test, &function, &regs);
+        let worked: Vec<u32> = cases.iter().map(|(_, _, halves)| halves[index]).collect();
+        assert_eq!(expected, worked, "the interpreter, {mode:?}");
+        if let Some(found) = found {
+            assert_eq!(found, worked, "the GPU, {mode:?}");
+        }
+    }
+}
+
+/// An integer-to-float conversion ignores its carried rounding mode (decision 10 (a) treats
+/// `I2F` like arithmetic): toward zero, the interpreter rounds toward zero, while the host's
+/// GPU rounds to nearest even, as it does with no mode. Measured on an Apple GPU; the
+/// interpreter's results are the translator's `i2f_carries_its_rounding` literals.
+#[test]
+fn int_to_float_rounds_as_the_host_does_on_the_gpu() {
+    // The opcode, the source; toward zero; to nearest.
+    let cases: [(Opcode, u32, u32, u32); 3] = [
+        (Opcode::ConvertF32S32, 0x0100_0003, 0x4b80_0001, 0x4b80_0002),
+        (Opcode::ConvertF32S32, 0x7fff_ffff, 0x4eff_ffff, 0x4f00_0000),
+        (Opcode::ConvertF32U32, 0xffff_ffff, 0x4f7f_ffff, 0x4f80_0000),
+    ];
+    let mut function = Function::new();
+    let entry = function.entry();
+    let mut builder = Builder::new(&mut function, entry);
+    let mut regs = Vec::new();
+    for (reg, (opcode, source, _, _)) in cases.iter().enumerate() {
+        let reg = u8::try_from(reg).expect("few cases");
+        let flags = Flags::Fp(FpControl {
+            rounding: FpRounding::Rz,
+            ..FpControl::default()
+        });
+        let value = builder
+            .op_with(*opcode, &[u(*source)], flags)
+            .expect("a conversion");
+        let bits = op(&mut builder, Opcode::BitCastU32F32, &[value.into()]);
+        op(
+            &mut builder,
+            Opcode::SetRegister,
+            &[Operand::Imm(Imm::Reg(Gpr::new(reg))), bits.into()],
+        );
+        regs.push(reg);
+    }
+    builder
+        .terminate(Terminator::Return)
+        .expect("the block returns");
+    let (expected, found) = interp_and_gpu("int_to_float_rounding", &function, &regs);
+    let toward_zero: Vec<u32> = cases.iter().map(|case| case.2).collect();
+    let nearest: Vec<u32> = cases.iter().map(|case| case.3).collect();
+    assert_eq!(expected, toward_zero, "the interpreter");
+    if let Some(found) = found {
+        assert_eq!(found, nearest, "the GPU");
+    }
+}
+
+/// NaN results of arithmetic keep the host's bits: the lowering does not canonicalise them
+/// (the parent module's divergence table). Each case is a NaN on the host's GPU and in the
+/// interpreter, but the bits may differ: the interpreter gives its canonical binary32 NaN,
+/// itself a guess (`interp::float`), and an Apple GPU gave `0x7fc0_0000` for every case here.
+#[test]
+fn nan_results_are_the_hosts_on_the_gpu() {
+    const NAN_CASES: &[Case] = &[
+        ("fadd nan", |b| float(b, Opcode::FPAdd32, &[f(NAN), f(1.0)])),
+        ("fmul inf by 0", |b| {
+            float(b, Opcode::FPMul32, &[f(f32::INFINITY), f(0.0)])
+        }),
+        ("fsqrt -1", |b| float(b, Opcode::FPSqrt, &[f(-1.0)])),
+        ("fmax nan nan", |b| {
+            float(b, Opcode::FPMax32, &[f(NAN), f(NAN)])
+        }),
+        ("f16 add nan widened", |b| {
+            let x = half(b, NAN);
+            let y = half(b, 1.0);
+            let sum = op(b, Opcode::FPAdd16, &[x, y]);
+            float(b, Opcode::ConvertF32F16, &[sum.into()])
+        }),
+    ];
+    let (function, regs) = cases_function(NAN_CASES);
+    let (expected, found) = interp_and_gpu("nan_results", &function, &regs);
+    let is_nan = |bits: &u32| f32::from_bits(*bits).is_nan();
+    assert!(
+        expected.iter().all(is_nan),
+        "the interpreter: {expected:#x?}"
+    );
+    assert!(
+        expected.windows(2).all(|pair| pair[0] == pair[1]),
+        "the interpreter's NaN is canonical: {expected:#x?}"
+    );
+    if let Some(found) = found {
+        assert!(found.iter().all(is_nan), "the GPU: {found:#x?}");
+    }
 }
 
 /// The MSL naga writes for each group of cases above (snapshots, so a change to an

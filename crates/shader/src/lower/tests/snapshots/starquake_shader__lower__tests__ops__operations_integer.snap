@@ -79,6 +79,9 @@ int naga_div(int lhs, int rhs) {
     uint r57_ = {};
     uint r58_ = {};
     uint r59_ = {};
+    uint r60_ = {};
+    uint r61_ = {};
+    uint r62_ = {};
     r0_ = 4294967295u + 2u;
     r1_ = 1u - 2u;
     r2_ = 65537u * 65537u;
@@ -169,10 +172,13 @@ int naga_div(int lhs, int rhs) {
     r54_ = (as_type<int>(2147483648u) <= as_type<int>(2147483648u)) ? 1u : 0u;
     r55_ = (as_type<int>(1u) > as_type<int>(4294967295u)) ? 1u : 0u;
     r56_ = (1u >= 4294967295u) ? 1u : 0u;
-    r57_ = (3u == 3u) ? 1u : 0u;
-    r58_ = (3u != 3u) ? 1u : 0u;
-    bool _e507 = false || true;
-    bool _e509 = _e507 != true;
-    r59_ = ((!(_e509) && _e507) ? _e509 : _e507) ? 1u : 2u;
+    r57_ = (4294967295u <= 1u) ? 1u : 0u;
+    r58_ = (as_type<int>(4294967295u) >= as_type<int>(1u)) ? 1u : 0u;
+    r59_ = (4294967295u > 1u) ? 1u : 0u;
+    r60_ = (3u == 3u) ? 1u : 0u;
+    r61_ = (3u != 3u) ? 1u : 0u;
+    bool _e530 = false || true;
+    bool _e532 = _e530 != true;
+    r62_ = ((!(_e532) && _e530) ? _e532 : _e530) ? 1u : 2u;
     return;
 }

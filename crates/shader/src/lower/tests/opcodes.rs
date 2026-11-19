@@ -5,7 +5,7 @@ use super::ops::{bit, f, op, u};
 use super::*;
 use crate::decode::{Pred, UniformPred, UniformReg};
 use crate::host::Feature;
-use crate::ir::{Builder, Flags, FpControl, FpRounding, Patch, Type};
+use crate::ir::{Builder, Flags, FmzMode, FpControl, FpRounding, Patch, Type};
 
 /// An operand of type `ty` for the enumeration below: an immediate where the type has one, else
 /// a value made in front of the operation (a vector is constructed, an f16 converted).
@@ -318,7 +318,12 @@ fn every_opcode_is_lowered_or_refused() {
         let result = lower_with(stage, &function, &inputs);
         if LOWERED.contains(&opcode) {
             assert!(result.is_ok(), "{opcode} is lowered: {result:?}");
-            lowered(stage, &function, &inputs);
+            let shader = lowered(stage, &function, &inputs);
+            // `Requirements::missing` does not check these two (its docs).
+            assert!(
+                !shader.requirements.f64 && !shader.requirements.i64_atomics,
+                "{opcode}"
+            );
         } else {
             assert!(result.is_err(), "{opcode} is lowered but not listed");
             match result {
@@ -334,47 +339,52 @@ fn every_opcode_is_lowered_or_refused() {
     assert!(refused_alone > 0);
 }
 
-/// A conversion with a directed rounding mode is refused with the mode named; round to
-/// nearest and no mode at all are lowered. Each kind of conversion that carries controls.
+/// A conversion lowers whatever rounding mode and flushing it carries, and both are ignored:
+/// each mode, and each flushing mode, on each conversion that carries controls (the
+/// integer-to-float conversions `I2F` and `I2FP` make, the float-to-half one `F2F` makes and the
+/// widening back) gives the module the unset controls give (decision 10 (a); the parent
+/// module's divergence table).
 #[test]
-fn directed_rounding_on_a_conversion_is_refused() {
+fn conversions_lower_whatever_their_rounding() {
     for opcode in [
         Opcode::ConvertF32S32,
+        Opcode::ConvertF32U32,
         Opcode::ConvertF16F32,
         Opcode::ConvertF32F16,
         Opcode::ConvertF16U8,
     ] {
-        for (rounding, refused) in [
-            (FpRounding::DontCare, None),
-            (FpRounding::Rn, None),
-            (FpRounding::Rm, Some("towards negative infinity")),
-            (FpRounding::Rp, Some("towards positive infinity")),
-            (FpRounding::Rz, Some("towards zero")),
-        ] {
+        let module = |control: FpControl| {
             let mut function = Function::new();
             let entry = function.entry();
             let mut builder = Builder::new(&mut function, entry);
             let arg = operand_of(&mut builder, opcode.args()[0]);
-            let flags = Flags::Fp(FpControl {
-                rounding,
-                ..FpControl::default()
-            });
-            let at = builder.op_with(opcode, &[arg], flags).expect("valid");
+            builder
+                .op_with(opcode, &[arg], Flags::Fp(control))
+                .expect("valid");
             builder
                 .terminate(Terminator::Return)
                 .expect("the block returns");
             let result = lower(GuestStage::Compute, &function);
-            match refused {
-                None => assert!(result.is_ok(), "{opcode} {rounding:?}"),
-                Some(rounding) => assert_eq!(
-                    result.err(),
-                    Some(LowerError::Rounding {
-                        at,
-                        opcode,
-                        rounding
-                    })
-                ),
-            }
+            assert!(result.is_ok(), "{opcode} {control:?}: {result:?}");
+            msl(&result.expect("lowers"))
+        };
+        let unset = module(FpControl::default());
+        let roundings = [
+            FpRounding::Rn,
+            FpRounding::Rm,
+            FpRounding::Rp,
+            FpRounding::Rz,
+        ]
+        .map(|rounding| FpControl {
+            rounding,
+            ..FpControl::default()
+        });
+        let flushing = [FmzMode::Ftz, FmzMode::Fmz, FmzMode::None].map(|fmz_mode| FpControl {
+            fmz_mode,
+            ..FpControl::default()
+        });
+        for control in roundings.into_iter().chain(flushing) {
+            assert_eq!(module(control), unset, "{opcode} {control:?}");
         }
     }
 }

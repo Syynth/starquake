@@ -19,14 +19,20 @@
 //!   one block that ends in `return` or `unreachable`, which lowers as that block followed by
 //!   the node of the same name. Any other control-flow graph is [`LowerError::ControlFlow`]:
 //!   it is to be structured first ([`crate::structure`]).
-//! - **Form.** The form the structurizer leaves, before SSA: guest registers, predicates,
-//!   uniform registers and predicates, the four condition-code flags, the goto variables and the
+//! - **Form.** The form the structurizer leaves: guest registers, predicates, uniform
+//!   registers and predicates, the four condition-code flags, the goto variables and the
 //!   indirect branch variable are read and written through their get and set opcodes, and each
 //!   becomes a local variable of the entry point, zero (or false) at entry, as the interpreter
-//!   reads an unwritten one ([`crate::interp`]). Phis are refused ([`LowerError::Phi`]): the
-//!   SSA rewrite runs only on a control-flow graph (`opt::ssa`, an open owner question), so no
-//!   structured function the pipeline makes has one, and a structured phi's incoming value need
-//!   not be in scope where its block ends.
+//!   reads an unwritten one ([`crate::interp`]). The owner's ruling of 2026-11-19 (decision
+//!   log, "Owner rulings on the wave 44 and 45 questions", row 3, as the owner corrected it
+//!   that day) follows Eden's order: the structurizer runs first and SSA after it, on the
+//!   structured function, which needs slice 8b (#467, not built yet: `opt::ssa` still refuses
+//!   structured functions). This slice's choice until then: the goto variables, the indirect
+//!   branch variable and the flags are lowered here as the zero-initialised locals above, and
+//!   this slice runs no SSA pass of its own after structuring. Phis are refused
+//!   ([`LowerError::Phi`]), a listed divergence (below): a structured phi can only come from an
+//!   SSA pass that runs on structured functions, which is not built yet; once slice 8b lands,
+//!   phis reach this lowering and need lowering.
 //!
 //! # Structured control flow
 //!
@@ -161,13 +167,17 @@
 //! | What | Here | Reference | Pinned by |
 //! |---|---|---|---|
 //! | Rounding modes and flush-to-zero on arithmetic | Not expressed (decision 10): `FPFma32` is naga's fused `fma` whatever its `FpControl` | Eden's SPIR-V decorations | `tests::skeleton_modules_are_unchanged` (the `modifiers` program's `rz` and `ftz`) |
-//! | A directed rounding mode on a conversion (`ConvertF*` with `rm`, `rp` or `rz`) | Refused ([`LowerError::Rounding`]); decision 10 asks for emulation, which is not built | Eden emits it as a SPIR-V rounding decoration | `tests::opcodes::directed_rounding_on_a_conversion_is_refused` |
-//! | Flush-to-zero on a conversion | Ignored (an owner question: decision 10 asks for emulation) | SPIR-V decoration | none |
+//! | A rounding mode or flushing mode carried on a conversion (`ConvertF*` with `rn`, `rm`, `rp`, `rz`, `ftz`, `fmz` or `none`) | Ignored: the module is the one the unset controls give | Eden emits them as SPIR-V decorations | `tests::opcodes::conversions_lower_whatever_their_rounding` |
+//! | `F2F` (to half) with a directed rounding mode or `.FTZ` | Emulated upstream, as decision 10 (a) asks: `translate::float` converts to nearest and steps the half, and flushes the operand and a denormal result ("Rounding modes and flush-to-zero"); the mode and flushing it also carries on `ConvertF16F32` are ignored here | Eden: SPIR-V decorations | `tests::ops::translated_f2f_rounding_matches_the_interpreter_on_the_gpu` |
+//! | `I2F` and `I2FP` (integer to float) with a directed rounding mode | Rounds as the host does (to nearest even on an Apple GPU, measured), with or without a mode: decision 10 (a) treats it like arithmetic and asks for no emulation | The interpreter honours the carried mode; Eden: a SPIR-V decoration | `tests::ops::int_to_float_rounds_as_the_host_does_on_the_gpu` |
+//! | `F2I.FTZ` (float to integer) | The translator carries it on the rounding operation in front of the conversion, which is ignored here as on arithmetic (the first row); with a 32-bit operand the translator also flushes upstream, and with a half operand it does not, as the owner's ruling of 2026-11-19 (row 5) accepts | SPIR-V decoration | `translate::float`'s `tests::convert::f2i_flushes_denormals_before_rounding` (upstream) |
 //! | `DemoteToHelperInvocation` | naga's `Kill`, which ends the invocation; naga has no demote (spec, the naga table) | `OpDemoteToHelperInvocationEXT`: the invocation continues as a helper | `tests::structured::demote_is_kill` |
 //! | `unreachable` | A return | `OpUnreachable` | `tests::structured::unreachable_returns` |
 //! | `FPSaturate16` and `FPSaturate32` of a NaN | naga's `saturate`, whose NaN result is the host's | The interpreter gives `+0` | `tests::skeleton_modules_are_unchanged` |
 //! | NaN handling (comparisons, NaN-aware minimum, maximum and clamp, NaN to 0 on conversion) | Written out with `isnan`: wgpu-hal 30.0.2's Metal backend leaves the Metal compiler's default fast math on, under which a plain comparison treats a NaN as an ordinary value (measured on an Apple GPU: two NaNs compared equal); `isnan` and selects on it gave the interpreter's results there. Other hosts are not measured | The interpreter's results | `tests::ops::float_operations_match_the_interpreter_on_the_gpu` |
-//! | `f32` and `f16` from an integer | naga's conversion, rounding as the host does | Round to nearest even (the interpreter) | none |
+//! | `f32` and `f16` from an integer, no mode carried | naga's conversion, rounding as the host does (to nearest even on an Apple GPU, measured) | Round to nearest even (the interpreter) | `tests::ops::int_to_float_rounds_as_the_host_does_on_the_gpu` (the same module, by `tests::opcodes::conversions_lower_whatever_their_rounding`) |
+//! | NaN result bits of float arithmetic: `FPAdd32` of a NaN, `FPMul32` of infinity by 0, `FPSqrt` of -1, `FPMax32` of two NaNs, an `FPAdd16` NaN widened to f32 (the cases measured) | The host's bits, not canonicalised: an Apple GPU gave 0x7fc0_0000 for each | The interpreter's canonical NaN (the binary32 one is itself a guess, `interp::float`) | `tests::ops::nan_results_are_the_hosts_on_the_gpu` |
+//! | A phi in a structured function | Refused ([`LowerError::Phi`]): the structurizer's pre-SSA form is lowered (see "What it takes") | Eden lowers its phis (`emit_spirv.cpp` @ cf654052, `EmitPhi`) | `tests::structured::a_structured_phi_is_refused` |
 //! | A non-finite `f32` immediate | Its bits, reinterpreted: naga 30.0.1 refuses a NaN or infinite literal | A literal | `tests::opcodes::non_finite_immediates_are_bit_casts` |
 //! | Float to integer at or past 2^31 (2^32 unsigned) | Selects the maximum: naga's saturating conversion stops at the largest float below it (`naga_f2i32` gave 0x7fffff80, measured) | The interpreter saturates to the maximum | `tests::ops::conversions_and_variables_match_the_interpreter_on_the_gpu` |
 //! | Shared-memory word index | `offset >> 2`, logical | `OpShiftRightArithmetic` (`emit_spirv_shared_memory.cpp`), which differs only for offsets of 2^31 and up, all out of bounds here | `tests::memory::shared_offsets_at_and_past_the_end` |
@@ -200,8 +210,8 @@ use crate::host::{
 };
 use crate::ir::ATTRIBUTE_COMPONENTS as COMPONENTS;
 use crate::ir::{
-    Attribute, FpRounding, Function, Imm, Inst, Node, Opcode, Operand, Operation, Terminator, Type,
-    Value, VerifyError,
+    Attribute, Function, Imm, Inst, Node, Opcode, Operand, Operation, Terminator, Type, Value,
+    VerifyError,
 };
 pub use crate::ir::{GENERIC_0_X, POSITION_X};
 use crate::translate::{COLOR_TARGETS, GuestStage};
@@ -339,16 +349,6 @@ pub enum LowerError {
         opcode: Opcode,
         /// The stage.
         stage: GuestStage,
-    },
-    /// A conversion with a directed rounding mode, which is not emulated yet (decision 10).
-    #[error("{at}: {opcode} rounds {rounding}, which the lowering does not emulate yet")]
-    Rounding {
-        /// The instruction.
-        at: Value,
-        /// Its opcode.
-        opcode: Opcode,
-        /// The rounding mode's name.
-        rounding: &'static str,
     },
     /// A compute program's workgroup size is zero along an axis or has more than
     /// [`MAX_WORKGROUP_INVOCATIONS`] invocations.
@@ -1142,16 +1142,6 @@ fn error_chain(error: &dyn std::error::Error) -> String {
 /// Immediate argument `index` of `op`, if it is one.
 fn imm_arg(op: &Operation, index: usize) -> Option<Imm> {
     op.args.get(index)?.imm()
-}
-
-/// The name of a directed rounding mode, `None` for the defaults.
-const fn directed(rounding: FpRounding) -> Option<&'static str> {
-    match rounding {
-        FpRounding::DontCare | FpRounding::Rn => None,
-        FpRounding::Rm => Some("towards negative infinity"),
-        FpRounding::Rp => Some("towards positive infinity"),
-        FpRounding::Rz => Some("towards zero"),
-    }
 }
 
 /// The attribute an attribute access names (argument 0), after checking that its vertex index

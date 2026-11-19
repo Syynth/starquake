@@ -296,6 +296,21 @@ fn the_checks_run_in_their_order() {
         lower_with(GuestStage::Compute, &unlowered_graph, &fits).err(),
         Some(LowerError::ControlFlow)
     );
+    // A control-flow graph of more than one block is refused even when its entry block returns
+    // or is unreachable: only a graph of that one block lowers.
+    for end in ["return", "unreachable"] {
+        let graph = ir(&format!("block0:\n    {end}\nblock1:\n    return\n"));
+        assert_eq!(
+            lower_with(GuestStage::Compute, &graph, &fits).err(),
+            Some(LowerError::ControlFlow),
+            "{end}"
+        );
+        let alone = ir(&format!("block0:\n    {end}\n"));
+        assert!(
+            lower_with(GuestStage::Compute, &alone, &fits).is_ok(),
+            "{end} alone"
+        );
+    }
     // An unlowered operation before a missing feature.
     let function = ir("block0:
     %0: u32 = LaneId
@@ -328,14 +343,8 @@ fn the_checks_run_in_their_order() {
 /// Every new error reads as plain words.
 #[test]
 fn compute_errors_read_as_words() {
-    let function = ir("block0:\n    %0: f32 = ConvertF32S32 u32 1 {rz}\n    return\n");
-    let rounding = lower(GuestStage::Compute, &function).expect_err("directed rounding");
+    let function = ir("block0:\n    %0: u32 = IAdd32 u32 1, u32 2\n    return\n");
     let cases = [
-        (
-            rounding,
-            "%0: ConvertF32S32 rounds towards zero, which the lowering does not emulate yet"
-                .to_owned(),
-        ),
         (
             LowerError::LocalMemory {
                 bytes: MAX_LOCAL_MEMORY_BYTES + 1,
