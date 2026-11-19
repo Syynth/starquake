@@ -18,14 +18,11 @@ fn arrays(shader: &HostShader) -> Vec<(String, AddressSpace, u32)> {
                 TypeInner::Array {
                     size: ArraySize::Constant(length),
                     ..
-                } => length.get(),
-                ref other => panic!("not a sized array: {other:?}"),
-            };
-            (
-                global.name.clone().expect("named"),
-                global.space,
-                length,
-            )
+                } => Some(length.get()),
+                _ => None,
+            }
+            .expect("a sized array");
+            (global.name.clone().expect("named"), global.space, length)
         })
         .collect()
 }
@@ -49,9 +46,7 @@ fn arrays_are_sized_in_whole_words() {
         [0, 1, 1, 2, 2],
         "Eden's DivCeil(size, 4U)"
     );
-    let uses_both = compute(
-        "    %0: u32 = LoadLocal u32 0\n    %1: u32 = LoadSharedU32 u32 0\n",
-    );
+    let uses_both = compute("    %0: u32 = LoadLocal u32 0\n    %1: u32 = LoadSharedU32 u32 0\n");
     for (bytes, length) in [(4, 1), (5, 2), (8, 2), (9, 3)] {
         let shader = lowered(
             GuestStage::Compute,
@@ -108,7 +103,12 @@ fn check_on_gpu(test: &str, body: &str, inputs: &LowerInputs, probes: &[Probe]) 
         .iter()
         .zip(&found)
         .filter(|(probe, found)| probe.expected != **found)
-        .map(|(probe, found)| format!("{}: expected {:#x}, GPU {found:#x}", probe.name, probe.expected))
+        .map(|(probe, found)| {
+            format!(
+                "{}: expected {:#x}, GPU {found:#x}",
+                probe.name, probe.expected
+            )
+        })
         .collect();
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
@@ -269,9 +269,10 @@ fn shared_memory_only_in_compute() {
     ] {
         let function = compute(text);
         let opcode = match function.inst(value_at(&function, 0)) {
-            Some(Inst::Op(op)) => op.opcode,
-            _ => panic!("an operation"),
-        };
+            Some(Inst::Op(op)) => Some(op.opcode),
+            _ => None,
+        }
+        .expect("an operation");
         for stage in [GuestStage::Vertex, GuestStage::Pixel] {
             assert_eq!(
                 lower(stage, &function).err(),
@@ -325,8 +326,8 @@ fn memory_caps_at_their_edges() {
             )
         };
         let shader = at(MAX_LOCAL_MEMORY_BYTES).expect("at the cap");
-        let length = u32::try_from(MAX_LOCAL_MEMORY_BYTES / u64::from(MEMORY_WORD_BYTES))
-            .expect("small");
+        let length =
+            u32::try_from(MAX_LOCAL_MEMORY_BYTES / u64::from(MEMORY_WORD_BYTES)).expect("small");
         assert_eq!(
             arrays(&shader),
             [("local_memory".to_owned(), AddressSpace::Private, length)]

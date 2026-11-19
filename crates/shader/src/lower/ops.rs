@@ -32,9 +32,7 @@ use naga::{
 };
 
 use super::builder::push;
-use super::{
-    AttributeKind, LowerError, Lowering, Var, attribute_arg, classify, directed, imm_arg,
-};
+use super::{AttributeKind, LowerError, Lowering, Var, attribute_arg, classify, directed, imm_arg};
 use crate::ir::{Flags, Imm, Opcode, Operation, Type, Value};
 
 /// The bits of a 32-bit integer.
@@ -68,9 +66,7 @@ fn float_comparison(opcode: Opcode) -> Option<(BinaryOperator, bool)> {
         Opcode::FPUnordGreaterThan16 | Opcode::FPUnordGreaterThan32 => (Greater, true),
         Opcode::FPOrdLessThanEqual16 | Opcode::FPOrdLessThanEqual32 => (LessEqual, false),
         Opcode::FPUnordLessThanEqual16 | Opcode::FPUnordLessThanEqual32 => (LessEqual, true),
-        Opcode::FPOrdGreaterThanEqual16 | Opcode::FPOrdGreaterThanEqual32 => {
-            (GreaterEqual, false)
-        }
+        Opcode::FPOrdGreaterThanEqual16 | Opcode::FPOrdGreaterThanEqual32 => (GreaterEqual, false),
         Opcode::FPUnordGreaterThanEqual16 | Opcode::FPUnordGreaterThanEqual32 => {
             (GreaterEqual, true)
         }
@@ -527,7 +523,7 @@ impl Lowering {
             return self.done(at, Some(expr));
         }
         if let Some((width, bits, signed)) = int_to_float(opcode) {
-            self.check_rounding(at, op)?;
+            check_rounding(at, op)?;
             let value = self.arg(body, at, op, 0)?;
             let source = self.low_bits(body, value, bits, signed);
             let expr = self.cast(body, source, ScalarKind::Float, Some(width));
@@ -759,7 +755,7 @@ impl Lowering {
                 })
             }
             Opcode::ConvertF16F32 | Opcode::ConvertF32F16 => {
-                self.check_rounding(at, op)?;
+                check_rounding(at, op)?;
                 let width = if opcode == Opcode::ConvertF16F32 {
                     WIDTH16
                 } else {
@@ -843,21 +839,6 @@ impl Lowering {
                 .and_then(|slot| self.values.get_mut(slot))
                 .ok_or_else(|| LowerError::Internal(format!("{at} is outside the arena")))?;
             *slot = Some(expr);
-        }
-        Ok(())
-    }
-
-    /// Refuses a directed rounding mode on a conversion (the parent module's divergence
-    /// table).
-    fn check_rounding(&self, at: Value, op: &Operation) -> Result<(), LowerError> {
-        if let Flags::Fp(control) = op.flags
-            && let Some(rounding) = directed(control.rounding)
-        {
-            return Err(LowerError::Rounding {
-                at,
-                opcode: op.opcode,
-                rounding,
-            });
         }
         Ok(())
     }
@@ -1023,4 +1004,18 @@ impl Lowering {
             }
         }
     }
+}
+
+/// Refuses a directed rounding mode on a conversion (the parent module's divergence table).
+fn check_rounding(at: Value, op: &Operation) -> Result<(), LowerError> {
+    if let Flags::Fp(control) = op.flags
+        && let Some(rounding) = directed(control.rounding)
+    {
+        return Err(LowerError::Rounding {
+            at,
+            opcode: op.opcode,
+            rounding,
+        });
+    }
+    Ok(())
 }

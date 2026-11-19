@@ -80,7 +80,7 @@ fn structured_loops_match_the_interpreter_on_the_gpu() {
 fn the_structured_passes_keep_it_lowerable() {
     let mut function = structured(LOOPS);
     for pass in [Pass::IdentityRemoval, Pass::ConstantPropagation] {
-        run_pass(&mut function, pass).unwrap_or_else(|error| panic!("{pass}: {error}"));
+        run_pass(&mut function, pass).expect("the pass runs on a structured function");
     }
     let shader = lowered(GuestStage::Compute, &function, &LowerInputs::DEFAULT);
     let expected = interp_registers(&function, &LOOP_REGS);
@@ -135,49 +135,61 @@ structure:
 ");
     let shader = lowered(GuestStage::Compute, &function, &LowerInputs::DEFAULT);
     let top = statements(&shader);
-    let [Statement::If { accept, reject, .. }, Statement::Return { value: None }] = top.as_slice()
-    else {
-        panic!("an if and a return: {top:?}");
-    };
+    let (accept, reject) = match top.as_slice() {
+        [
+            Statement::If { accept, reject, .. },
+            Statement::Return { value: None },
+        ] => Some((accept, reject)),
+        _ => None,
+    }
+    .expect("an if and a return");
     assert!(reject.is_empty());
     let accept: Vec<&Statement> = accept
         .iter()
         .filter(|s| !matches!(s, Statement::Emit(_)))
         .collect();
-    let [
-        Statement::Loop {
-            body,
-            continuing,
-            break_if: None,
-        },
-    ] = accept.as_slice()
-    else {
-        panic!("one loop: {accept:?}");
-    };
+    let (body, continuing) = match accept.as_slice() {
+        [
+            Statement::Loop {
+                body,
+                continuing,
+                break_if: None,
+            },
+        ] => Some((body, continuing)),
+        _ => None,
+    }
+    .expect("one loop");
     assert!(continuing.is_empty());
     let looped: Vec<&Statement> = body
         .iter()
         .filter(|s| !matches!(s, Statement::Emit(_) | Statement::Store { .. }))
         .collect();
-    let [
-        Statement::If {
-            accept: break_accept,
-            reject: break_reject,
-            ..
-        },
-        Statement::If {
-            accept: repeat_accept,
-            reject: repeat_reject,
-            ..
-        },
-    ] = looped.as_slice()
-    else {
-        panic!("the break, then the repeat test: {looped:?}");
-    };
-    assert!(matches!(break_accept.iter().collect::<Vec<_>>().as_slice(), [Statement::Break]));
+    let (break_accept, break_reject, repeat_accept, repeat_reject) = match looped.as_slice() {
+        [
+            Statement::If {
+                accept: break_accept,
+                reject: break_reject,
+                ..
+            },
+            Statement::If {
+                accept: repeat_accept,
+                reject: repeat_reject,
+                ..
+            },
+        ] => Some((break_accept, break_reject, repeat_accept, repeat_reject)),
+        _ => None,
+    }
+    .expect("the break, then the repeat test");
+    assert!(matches!(
+        break_accept.iter().collect::<Vec<_>>().as_slice(),
+        [Statement::Break]
+    ));
     assert!(break_reject.is_empty());
     assert!(repeat_accept.is_empty());
-    assert!(matches!(repeat_reject.iter().collect::<Vec<_>>().as_slice(), [Statement::Break]));
+    assert!(matches!(
+        repeat_reject.iter().collect::<Vec<_>>().as_slice(),
+        [Statement::Break]
+    ));
 }
 
 /// `unreachable` lowers as a return (a divergence in the module docs), at the end of the tree
@@ -209,14 +221,15 @@ structure:
         &LowerInputs::DEFAULT,
     );
     let top = statements(&pixel);
-    let [
-        Statement::Store { .. },
-        Statement::If { accept, .. },
-        Statement::Return { value: Some(_) },
-    ] = top.as_slice()
-    else {
-        panic!("a store, an if and a return: {top:?}");
-    };
+    let accept = match top.as_slice() {
+        [
+            Statement::Store { .. },
+            Statement::If { accept, .. },
+            Statement::Return { value: Some(_) },
+        ] => Some(accept),
+        _ => None,
+    }
+    .expect("a store, an if and a return");
     assert!(
         accept
             .iter()

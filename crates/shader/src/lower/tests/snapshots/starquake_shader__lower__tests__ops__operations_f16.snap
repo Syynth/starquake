@@ -1,0 +1,58 @@
+---
+source: crates/shader/src/lower/tests/ops.rs
+expression: msl(&shader)
+---
+// language: metal2.4
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using metal::uint;
+
+int naga_f2i32(float value) {
+    return static_cast<int>(metal::clamp(value, -2147483600.0, 2147483500.0));
+}
+
+uint naga_f2u32(float value) {
+    return static_cast<uint>(metal::clamp(value, 0.0, 4294967000.0));
+}
+
+
+[[max_total_threads_per_threadgroup(1)]] kernel void main_(
+) {
+    uint r0_ = {};
+    uint r1_ = {};
+    uint r2_ = {};
+    uint r3_ = {};
+    uint r4_ = {};
+    uint r5_ = {};
+    uint r6_ = {};
+    uint r7_ = {};
+    uint r8_ = {};
+    uint r9_ = {};
+    uint r10_ = {};
+    uint r11_ = {};
+    r0_ = as_type<uint>(half2(metal::float2(1.0, -2.0)));
+    r1_ = as_type<uint>(float2(as_type<half2>(3221240832u)).y);
+    r2_ = as_type<uint>(static_cast<float>(static_cast<half>(1.5) + static_cast<half>(2.25)));
+    half _e19 = static_cast<half>(-2.0);
+    half _e20 = metal::abs(_e19);
+    r3_ = as_type<uint>(static_cast<float>(metal::fma(-(_e20), _e19, _e20)));
+    half _e27 = static_cast<half>(2.5);
+    r4_ = as_type<uint>(static_cast<float>(metal::rint(_e27) * metal::floor(_e27)));
+    half _e36 = static_cast<half>(as_type<float>(2143289344u));
+    half _e38 = static_cast<half>(0.5);
+    half _e40 = static_cast<half>(1.0);
+    half _e45 = metal::isnan(_e38) ? _e36 : (metal::isnan(_e36) ? _e38 : metal::max(_e36, _e38));
+    r5_ = as_type<uint>(static_cast<float>(metal::isnan(_e40) ? _e45 : (metal::isnan(_e45) ? _e40 : metal::min(_e45, _e40))));
+    float _e56 = static_cast<float>(static_cast<half>(-3.75));
+    r6_ = metal::isnan(_e56) ? 0u : as_type<uint>((_e56 >= 2147483600.0) ? 2147483647 : naga_f2i32(_e56));
+    float _e69 = static_cast<float>(static_cast<half>(65504.0));
+    r7_ = metal::isnan(_e69) ? 0u : metal::min(metal::max((_e69 >= 4294967300.0) ? 4294967295u : naga_f2u32(_e69), 0u), 65535u);
+    r8_ = as_type<uint>(static_cast<float>(static_cast<half>(as_type<int>(4294967293u))));
+    half _e90 = static_cast<half>(1.0);
+    half _e93 = static_cast<half>(as_type<float>(2143289344u));
+    r9_ = (((metal::isnan(_e93) || metal::isnan(_e90)) || (_e93 < _e90)) && metal::isnan(_e93)) ? 1u : 0u;
+    r10_ = as_type<uint>(half2(static_cast<metal::float2>(metal::half2(static_cast<half>(1.0), static_cast<half>(-2.0)))));
+    r11_ = as_type<uint>(static_cast<float>(static_cast<metal::half2>(float2(as_type<half2>(3221240832u))).y));
+    return;
+}

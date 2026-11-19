@@ -1,0 +1,30 @@
+---
+source: crates/shader/src/lower/tests/ops.rs
+expression: msl(&shader)
+---
+// language: metal2.4
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using metal::uint;
+
+
+[[max_total_threads_per_threadgroup(1)]] kernel void main_(
+) {
+    uint r0_ = {};
+    uint r1_ = {};
+    uint r2_ = {};
+    uint r3_ = {};
+    uint r4_ = {};
+    metal::uint2 _e2 = metal::uint2(4294967295u, 1u);
+    ulong _e12 = (static_cast<ulong>(_e2.x) | (static_cast<ulong>(_e2.y) << 32u)) + static_cast<ulong>(1u);
+    metal::uint2 _e17 = metal::uint2(static_cast<uint>(_e12), static_cast<uint>(_e12 >> 32u));
+    r0_ = _e17.x | ((8u >= 32u) ? 0u : (_e17.y << metal::min(8u, 31u)));
+    r1_ = static_cast<uint>((32u >= 64u) ? 0uL : (((63u >= 64u) ? 0uL : (static_cast<ulong>(3u) << metal::min(63u, 63u))) >> metal::min(32u, 63u)));
+    r2_ = static_cast<uint>((64u >= 64u) ? 0uL : (static_cast<ulong>(3u) << metal::min(64u, 63u)));
+    r3_ = static_cast<uint>(as_type<ulong>(as_type<long>(0uL - static_cast<ulong>(1u)) >> metal::min(64u, 63u)));
+    ulong _e75 = static_cast<ulong>(5u);
+    ulong _e78 = _e75 - static_cast<ulong>(10u);
+    r4_ = static_cast<uint>(true ? ((as_type<long>(_e78) < as_type<long>(0uL)) ? (0uL - _e78) : _e78) : _e75);
+    return;
+}

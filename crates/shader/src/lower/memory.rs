@@ -180,16 +180,16 @@ impl Lowering {
         interface: &Interface,
         inputs: &LowerInputs,
     ) -> Result<(), LowerError> {
-        self.memory.uses_local = interface.local_memory;
-        self.memory.uses_shared = interface.shared_memory;
-        if interface.local_memory {
+        self.memory.uses_local = interface.memory.local;
+        self.memory.uses_shared = interface.memory.shared;
+        if interface.memory.local {
             self.memory.local = self.array(
                 "local_memory",
                 AddressSpace::Private,
                 words(inputs.local_memory_bytes),
             )?;
         }
-        if interface.shared_memory {
+        if interface.memory.shared {
             self.memory.shared = self.array(
                 "shared_memory",
                 AddressSpace::WorkGroup,

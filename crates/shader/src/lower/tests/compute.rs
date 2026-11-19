@@ -59,7 +59,12 @@ fn a_compute_entry_point() {
         .function
         .body
         .iter()
-        .filter(|s| matches!(s, Statement::ControlBarrier(_) | Statement::MemoryBarrier(_)))
+        .filter(|s| {
+            matches!(
+                s,
+                Statement::ControlBarrier(_) | Statement::MemoryBarrier(_)
+            )
+        })
         .collect();
     assert!(matches!(
         barriers.as_slice(),
@@ -203,18 +208,15 @@ fn a_feature_the_target_lacks_is_refused() {
                     ..LowerInputs::DEFAULT
                 },
             );
-            match model {
-                Some(feature) => {
-                    assert_eq!(result.err(), Some(LowerError::Missing(feature)), "{caps:?}");
-                }
-                None => {
-                    let shader = result.expect("the target has every feature needed");
-                    assert_eq!(
-                        shader.requirements,
-                        Requirements { subgroup, f16, i64 },
-                        "{caps:?}"
-                    );
-                }
+            if let Some(feature) = model {
+                assert_eq!(result.err(), Some(LowerError::Missing(feature)), "{caps:?}");
+            } else {
+                let shader = result.expect("the target has every feature needed");
+                assert_eq!(
+                    shader.requirements,
+                    Requirements { subgroup, f16, i64 },
+                    "{caps:?}"
+                );
             }
         }
     }
@@ -324,13 +326,21 @@ fn compute_errors_read_as_words() {
     let function = ir("block0:\n    %0: f32 = ConvertF32S32 u32 1 {rz}\n    return\n");
     let rounding = lower(GuestStage::Compute, &function).expect_err("directed rounding");
     let cases = [
-        (rounding, "%0: ConvertF32S32 rounds towards zero, which the lowering does not emulate yet".to_owned()),
         (
-            LowerError::LocalMemory { bytes: MAX_LOCAL_MEMORY_BYTES + 1 },
+            rounding,
+            "%0: ConvertF32S32 rounds towards zero, which the lowering does not emulate yet"
+                .to_owned(),
+        ),
+        (
+            LowerError::LocalMemory {
+                bytes: MAX_LOCAL_MEMORY_BYTES + 1,
+            },
             "524289 bytes of local memory are more than the 524288 the lowering allows".to_owned(),
         ),
         (
-            LowerError::SharedMemory { bytes: MAX_SHARED_MEMORY_BYTES + 1 },
+            LowerError::SharedMemory {
+                bytes: MAX_SHARED_MEMORY_BYTES + 1,
+            },
             "101377 bytes of shared memory are more than the 101376 the lowering allows".to_owned(),
         ),
         (

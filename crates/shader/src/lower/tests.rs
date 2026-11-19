@@ -560,7 +560,7 @@ fn lowered(stage: GuestStage, function: &Function, inputs: &LowerInputs) -> Host
     for flags in [validation_flags(), ValidationFlags::all()] {
         Validator::new(flags, caps)
             .validate(naga_module(&shader))
-            .unwrap_or_else(|error| panic!("valid with {flags:?}: {error}"));
+            .expect("valid with this crate's flags and with every flag");
     }
     shader
 }
@@ -655,8 +655,9 @@ fn unlowered_forms_are_refused() {
     assert!(lower(pixel, &ir("block0:\n    return\n")).is_ok());
     assert!(lower(pixel, &ir("block0:\n    unreachable\n")).is_ok());
     assert!(lower(pixel, &ir("block0:\nstructure:\n    block0\n    return\n")).is_ok());
-    let control =
-        Some("a control-flow graph other than one block that returns must be structured first".into());
+    let control = Some(
+        "a control-flow graph other than one block that returns must be structured first".into(),
+    );
     assert_eq!(
         refused(pixel, "block0:\n    jump block1\nblock1:\n    return\n"),
         control

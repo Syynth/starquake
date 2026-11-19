@@ -24,7 +24,7 @@ pub(super) fn bit(value: bool) -> Operand {
 pub(super) fn op(builder: &mut Builder<'_>, opcode: Opcode, args: &[Operand]) -> Value {
     builder
         .op(opcode, args)
-        .unwrap_or_else(|error| panic!("{opcode}: {error}"))
+        .expect("the case's instruction builds")
 }
 
 /// `opcode` of `args`, whose result is a `u32`.
@@ -98,7 +98,9 @@ const NAN: f32 = f32::NAN;
 
 /// 32-bit integer cases, at the edges the interpreter defines.
 const INTEGER_CASES: &[Case] = &[
-    ("iadd wraps", |b| int(b, Opcode::IAdd32, &[u(u32::MAX), u(2)])),
+    ("iadd wraps", |b| {
+        int(b, Opcode::IAdd32, &[u(u32::MAX), u(2)])
+    }),
     ("isub wraps", |b| int(b, Opcode::ISub32, &[u(1), u(2)])),
     ("imul wraps", |b| {
         int(b, Opcode::IMul32, &[u(0x1_0001), u(0x1_0001)])
@@ -144,9 +146,15 @@ const INTEGER_CASES: &[Case] = &[
     ("sdiv negative", |b| {
         int(b, Opcode::SDiv32, &[u((-7_i32).cast_unsigned()), u(2)])
     }),
-    ("and", |b| int(b, Opcode::BitwiseAnd32, &[u(0xff00), u(0x0ff0)])),
-    ("or", |b| int(b, Opcode::BitwiseOr32, &[u(0xff00), u(0x0ff0)])),
-    ("xor", |b| int(b, Opcode::BitwiseXor32, &[u(0xff00), u(0x0ff0)])),
+    ("and", |b| {
+        int(b, Opcode::BitwiseAnd32, &[u(0xff00), u(0x0ff0)])
+    }),
+    ("or", |b| {
+        int(b, Opcode::BitwiseOr32, &[u(0xff00), u(0x0ff0)])
+    }),
+    ("xor", |b| {
+        int(b, Opcode::BitwiseXor32, &[u(0xff00), u(0x0ff0)])
+    }),
     ("not", |b| int(b, Opcode::BitwiseNot32, &[u(0xff00)])),
     ("uextract", |b| {
         int(b, Opcode::BitFieldUExtract, &[u(0xf0f0_f0f0), u(4), u(8)])
@@ -213,12 +221,18 @@ const INTEGER_CASES: &[Case] = &[
     ("uclamp low above high", |b| {
         int(b, Opcode::UClamp32, &[u(5), u(10), u(3)])
     }),
-    ("slt", |b| boolean(b, Opcode::SLessThan, &[u(u32::MAX), u(1)])),
-    ("ult", |b| boolean(b, Opcode::ULessThan, &[u(u32::MAX), u(1)])),
+    ("slt", |b| {
+        boolean(b, Opcode::SLessThan, &[u(u32::MAX), u(1)])
+    }),
+    ("ult", |b| {
+        boolean(b, Opcode::ULessThan, &[u(u32::MAX), u(1)])
+    }),
     ("sle equal", |b| {
         boolean(b, Opcode::SLessThanEqual, &[u(MIN), u(MIN)])
     }),
-    ("sgt", |b| boolean(b, Opcode::SGreaterThan, &[u(1), u(u32::MAX)])),
+    ("sgt", |b| {
+        boolean(b, Opcode::SGreaterThan, &[u(1), u(u32::MAX)])
+    }),
     ("uge", |b| {
         boolean(b, Opcode::UGreaterThanEqual, &[u(1), u(u32::MAX)])
     }),
@@ -238,13 +252,19 @@ const INTEGER_CASES: &[Case] = &[
 const FLOAT_CASES: &[Case] = &[
     ("fadd", |b| float(b, Opcode::FPAdd32, &[f(1.5), f(2.25)])),
     ("fmul", |b| float(b, Opcode::FPMul32, &[f(1.5), f(-2.0)])),
-    ("ffma", |b| float(b, Opcode::FPFma32, &[f(2.0), f(3.0), f(1.0)])),
+    ("ffma", |b| {
+        float(b, Opcode::FPFma32, &[f(2.0), f(3.0), f(1.0)])
+    }),
     ("fneg", |b| float(b, Opcode::FPNeg32, &[f(2.0)])),
     ("fabs", |b| float(b, Opcode::FPAbs32, &[f(-2.0)])),
     ("fmax", |b| float(b, Opcode::FPMax32, &[f(1.0), f(2.0)])),
     ("fmin", |b| float(b, Opcode::FPMin32, &[f(1.0), f(2.0)])),
-    ("fmax nan first", |b| float(b, Opcode::FPMax32, &[f(NAN), f(1.0)])),
-    ("fmin nan second", |b| float(b, Opcode::FPMin32, &[f(1.0), f(NAN)])),
+    ("fmax nan first", |b| {
+        float(b, Opcode::FPMax32, &[f(NAN), f(1.0)])
+    }),
+    ("fmin nan second", |b| {
+        float(b, Opcode::FPMin32, &[f(1.0), f(NAN)])
+    }),
     ("fclamp", |b| {
         float(b, Opcode::FPClamp32, &[f(5.0), f(0.0), f(1.0)])
     }),
@@ -269,7 +289,9 @@ const FLOAT_CASES: &[Case] = &[
     ("floor", |b| float(b, Opcode::FPFloor32, &[f(-1.5)])),
     ("ceil", |b| float(b, Opcode::FPCeil32, &[f(-1.5)])),
     ("trunc", |b| float(b, Opcode::FPTrunc32, &[f(-1.5)])),
-    ("ord eq", |b| boolean(b, Opcode::FPOrdEqual32, &[f(1.0), f(1.0)])),
+    ("ord eq", |b| {
+        boolean(b, Opcode::FPOrdEqual32, &[f(1.0), f(1.0)])
+    }),
     ("ord eq nan", |b| {
         boolean(b, Opcode::FPOrdEqual32, &[f(NAN), f(NAN)])
     }),
@@ -288,7 +310,9 @@ const FLOAT_CASES: &[Case] = &[
     ("unord ne equal", |b| {
         boolean(b, Opcode::FPUnordNotEqual32, &[f(1.0), f(1.0)])
     }),
-    ("ord lt", |b| boolean(b, Opcode::FPOrdLessThan32, &[f(1.0), f(2.0)])),
+    ("ord lt", |b| {
+        boolean(b, Opcode::FPOrdLessThan32, &[f(1.0), f(2.0)])
+    }),
     ("ord lt nan", |b| {
         boolean(b, Opcode::FPOrdLessThan32, &[f(NAN), f(2.0)])
     }),
@@ -328,29 +352,53 @@ const CONVERSION_CASES: &[Case] = &[
     ("f2s nan", |b| int(b, Opcode::ConvertS32F32, &[f(NAN)])),
     ("f2s big", |b| int(b, Opcode::ConvertS32F32, &[f(3.0e9)])),
     ("f2s small", |b| int(b, Opcode::ConvertS32F32, &[f(-3.0e9)])),
-    ("f2s truncates", |b| int(b, Opcode::ConvertS32F32, &[f(-1.7)])),
-    ("f2u negative", |b| int(b, Opcode::ConvertU32F32, &[f(-1.0)])),
+    ("f2s truncates", |b| {
+        int(b, Opcode::ConvertS32F32, &[f(-1.7)])
+    }),
+    ("f2u negative", |b| {
+        int(b, Opcode::ConvertU32F32, &[f(-1.0)])
+    }),
     ("f2u big", |b| int(b, Opcode::ConvertU32F32, &[f(5.0e9)])),
     ("f2u nan", |b| int(b, Opcode::ConvertU32F32, &[f(NAN)])),
-    ("f2s16 big", |b| int(b, Opcode::ConvertS16F32, &[f(40000.0)])),
-    ("f2s16 small", |b| int(b, Opcode::ConvertS16F32, &[f(-40000.0)])),
-    ("f2u16 big", |b| int(b, Opcode::ConvertU16F32, &[f(70000.0)])),
+    ("f2s16 big", |b| {
+        int(b, Opcode::ConvertS16F32, &[f(40000.0)])
+    }),
+    ("f2s16 small", |b| {
+        int(b, Opcode::ConvertS16F32, &[f(-40000.0)])
+    }),
+    ("f2u16 big", |b| {
+        int(b, Opcode::ConvertU16F32, &[f(70000.0)])
+    }),
     ("f2u16 nan", |b| int(b, Opcode::ConvertU16F32, &[f(NAN)])),
     ("s2f", |b| {
         float(b, Opcode::ConvertF32S32, &[u((-3_i32).cast_unsigned())])
     }),
-    ("u2f", |b| float(b, Opcode::ConvertF32U32, &[u(0x00ff_ffff)])),
-    ("s8 to f", |b| float(b, Opcode::ConvertF32S8, &[u(0x1_0080)])),
-    ("u8 to f", |b| float(b, Opcode::ConvertF32U8, &[u(0x1_0080)])),
-    ("s16 to f", |b| float(b, Opcode::ConvertF32S16, &[u(0x1_ffff)])),
-    ("u16 to f", |b| float(b, Opcode::ConvertF32U16, &[u(0x1_8000)])),
+    ("u2f", |b| {
+        float(b, Opcode::ConvertF32U32, &[u(0x00ff_ffff)])
+    }),
+    ("s8 to f", |b| {
+        float(b, Opcode::ConvertF32S8, &[u(0x1_0080)])
+    }),
+    ("u8 to f", |b| {
+        float(b, Opcode::ConvertF32U8, &[u(0x1_0080)])
+    }),
+    ("s16 to f", |b| {
+        float(b, Opcode::ConvertF32S16, &[u(0x1_ffff)])
+    }),
+    ("u16 to f", |b| {
+        float(b, Opcode::ConvertF32U16, &[u(0x1_8000)])
+    }),
     ("bitcast", |b| {
         let bits = op(b, Opcode::BitCastF32U32, &[u(0x4040_0000)]);
         float(b, Opcode::FPAdd32, &[bits.into(), f(1.0)])
     }),
     ("composite insert", |b| {
         let vector = op(b, Opcode::CompositeConstructU32x3, &[u(1), u(2), u(3)]);
-        let inserted = op(b, Opcode::CompositeInsertU32x3, &[vector.into(), u(9), u(1)]);
+        let inserted = op(
+            b,
+            Opcode::CompositeInsertU32x3,
+            &[vector.into(), u(9), u(1)],
+        );
         let first = op(b, Opcode::CompositeExtractU32x3, &[inserted.into(), u(0)]);
         let second = op(b, Opcode::CompositeExtractU32x3, &[inserted.into(), u(1)]);
         let third = op(b, Opcode::CompositeExtractU32x3, &[inserted.into(), u(2)]);
@@ -364,7 +412,11 @@ const CONVERSION_CASES: &[Case] = &[
             Opcode::CompositeConstructF32x4,
             &[f(1.0), f(2.0), f(3.0), f(4.0)],
         );
-        let inserted = op(b, Opcode::CompositeInsertF32x4, &[vector.into(), f(8.0), u(3)]);
+        let inserted = op(
+            b,
+            Opcode::CompositeInsertF32x4,
+            &[vector.into(), f(8.0), u(3)],
+        );
         float(b, Opcode::CompositeExtractF32x4, &[inserted.into(), u(3)])
     }),
     ("variables", |b| {
@@ -504,11 +556,7 @@ const I64_CASES: &[Case] = &[
         let ten = op(b, Opcode::ConvertU64U32, &[u(10)]);
         let negative = op(b, Opcode::ISub64, &[one.into(), ten.into()]);
         let abs = op(b, Opcode::IAbs64, &[negative.into()]);
-        let picked = op(
-            b,
-            Opcode::SelectU64,
-            &[bit(true), abs.into(), one.into()],
-        );
+        let picked = op(b, Opcode::SelectU64, &[bit(true), abs.into(), one.into()]);
         int(b, Opcode::ConvertU32U64, &[picked.into()])
     }),
 ];
@@ -567,4 +615,21 @@ fn i64_operations_match_the_interpreter_on_the_gpu() {
     );
     let mismatches = gpu_mismatches("i64_operations", I64_CASES);
     assert!(mismatches.is_empty(), "{mismatches:#?}");
+}
+
+/// The MSL naga writes for each group of cases above (snapshots, so a change to an
+/// operation's lowering shows where no GPU runs; a change is explained in its PR).
+#[test]
+fn operations_snapshot() {
+    for (name, cases) in [
+        ("operations_integer", INTEGER_CASES),
+        ("operations_float", FLOAT_CASES),
+        ("operations_conversion", CONVERSION_CASES),
+        ("operations_f16", F16_CASES),
+        ("operations_i64", I64_CASES),
+    ] {
+        let (function, _) = cases_function(cases);
+        let shader = lowered(GuestStage::Compute, &function, &ONE_INVOCATION);
+        insta::assert_snapshot!(name, msl(&shader));
+    }
 }

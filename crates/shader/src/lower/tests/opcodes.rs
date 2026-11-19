@@ -320,12 +320,12 @@ fn every_opcode_is_lowered_or_refused() {
             assert!(result.is_ok(), "{opcode} is lowered: {result:?}");
             lowered(stage, &function, &inputs);
         } else {
+            assert!(result.is_err(), "{opcode} is lowered but not listed");
             match result {
-                Ok(_) => panic!("{opcode} is lowered but not listed"),
                 // An input of an unlowered type (an f64 vector) fails first.
                 Err(LowerError::Operation { at: fault, .. }) if fault != at => {}
-                Err(error) => {
-                    assert_eq!(error, LowerError::Operation { at, opcode }, "{opcode}");
+                other => {
+                    assert_eq!(other.err(), Some(LowerError::Operation { at, opcode }));
                     refused_alone += 1;
                 }
             }

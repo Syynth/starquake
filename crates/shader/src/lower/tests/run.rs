@@ -40,9 +40,11 @@ pub(super) fn opaque(function: &Function) -> Function {
         .into();
     let mut map = std::collections::BTreeMap::new();
     for (at, inst) in function.listed() {
-        let Inst::Op(op) = inst else {
-            panic!("{at} is a phi");
-        };
+        let op = match inst {
+            Inst::Op(op) => Some(op),
+            Inst::Phi(_) => None,
+        }
+        .expect("no phi");
         let mut args = Vec::new();
         for (slot, &arg) in op.args.iter().enumerate() {
             let kept = matches!(
@@ -93,12 +95,12 @@ pub(super) fn opaque(function: &Function) -> Function {
                     };
                     emit(compare, &[zero, index(0)])
                 }
-                other => other,
+                other @ Operand::Imm(_) => other,
             });
         }
         let made = builder
             .op_with(op.opcode, &args, op.flags)
-            .unwrap_or_else(|error| panic!("{at}: {error}"));
+            .expect("the instruction builds again");
         map.insert(at, Operand::Value(made));
     }
     builder
@@ -289,11 +291,13 @@ pub(super) fn gpu_registers(test: &str, shader: &HostShader, regs: &[u8]) -> Opt
         gpu.queue.submit([encoder.finish()]);
         readback
     });
-    let readback = result.unwrap_or_else(|error| panic!("{test}: wgpu refused: {error}"));
+    let readback = result.expect("wgpu takes the module and the work");
     let (sender, receiver) = mpsc::channel();
-    readback.slice(..).map_async(wgpu::MapMode::Read, move |mapped| {
-        let _sent = sender.send(mapped);
-    });
+    readback
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |mapped| {
+            let _sent = sender.send(mapped);
+        });
     gpu.device
         .poll(wgpu::PollType::Wait {
             submission_index: None,
@@ -311,8 +315,10 @@ pub(super) fn gpu_registers(test: &str, shader: &HostShader, regs: &[u8]) -> Opt
         .to_vec();
     Some(
         bytes
-            .chunks_exact(4)
-            .map(|word| u32::from_le_bytes(word.try_into().expect("four bytes")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_le_bytes(*word))
             .collect(),
     )
 }

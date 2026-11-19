@@ -44,7 +44,7 @@
 //! # Operations
 //!
 //! The opcodes lowered, by group; every other opcode is [`LowerError::Operation`]
-//! (`tests::ops::every_opcode_is_lowered_or_refused` enumerates [`Opcode::ALL`]):
+//! (`tests::opcodes::every_opcode_is_lowered_or_refused` enumerates [`Opcode::ALL`]):
 //!
 //! - No-ops: `Void`, `Prologue`, `Epilogue` (the interpreter's no-ops); `Identity` and
 //!   `ConditionRef` are their argument.
@@ -61,15 +61,18 @@
 //!   `PackHalf2x16`, `UnpackHalf2x16`, `PackFloat2x16`, `UnpackFloat2x16`), and the 32-bit
 //!   integer and 16- and 32-bit float composites (construct, and extract and insert at an
 //!   immediate component).
-//! - 32-bit float arithmetic (`FPAbs32` to `FPIsNan32` in the opcode table, `FPRecip32` and
-//!   `FPRecipSqrt32` included) and its 16-bit counterparts where the table has one, except
-//!   `FPAdd16`'s and `FPMul16`'s 64-bit siblings: every `*64` float opcode is refused until
-//!   slice 18 lowers f64.
+//! - The 32-bit and 16-bit float operations of the table from `FPAbs16` to `FPIsNan64`
+//!   (`FPRecip32`, `FPRecipSqrt32`, `FPSqrt` and the transcendentals have only a 32-bit form);
+//!   every 64-bit float operation is refused until slice 18 lowers f64.
 //! - 32-bit integer arithmetic, bit operations and comparisons (`IAdd32` to
 //!   `UGreaterThanEqual`), the 64-bit `IAdd64`, `ISub64`, `INeg64`, `IAbs64` and shifts, and
 //!   the logical operations.
-//! - Conversions between f16, f32 and the 8-, 16- and 32-bit integers, and between u32 and u64
-//!   (`ConvertU64U32`, `ConvertU32U64`).
+//! - Conversions: f16 and f32 to 16- and 32-bit integers (`ConvertS16F16` to `ConvertU32F32`
+//!   without the f64 and 64-bit ones), 8-, 16- and 32-bit integers to f16 and f32
+//!   (`ConvertF16S8` to `ConvertF32U32` without the 64-bit ones), f16 to and from f32, and u32
+//!   to and from u64 (`ConvertU64U32`, `ConvertU32U64`). The integer-to-integer conversions
+//!   with an 8- or 16-bit type (`ConvertU16U32` to `ConvertS32S16`) are refused: the lowering
+//!   has no 8- or 16-bit integer type.
 //! - Local and shared memory (below).
 //!
 //! Each operation follows the interpreter's semantics ([`crate::interp`], "Semantics") where
@@ -81,7 +84,10 @@
 //! is itself; `FPMax32` and `FPMin32` return the operand that is not a NaN; `FPClamp` is
 //! `min(max(value, low), high)` with those; a float-to-integer conversion truncates, saturates
 //! and gives 0 for a NaN; an ordered comparison is false and an unordered one true when an
-//! operand is a NaN. Pinned by the literal expression trees in `tests::ops`.
+//! operand is a NaN. Pinned on the host's GPU, with operands the host compiler cannot fold,
+//! against the interpreter by `tests::ops` (the `*_match_the_interpreter_on_the_gpu` tests,
+//! which skip without a GPU adapter), and everywhere by the MSL of the same cases
+//! (`tests::ops::operations_snapshot`).
 //!
 //! # Interface
 //!
@@ -151,15 +157,17 @@
 //! | What | Here | Reference | Pinned by |
 //! |---|---|---|---|
 //! | Rounding modes and flush-to-zero on arithmetic | Not expressed (decision 10): `FPFma32` is naga's fused `fma` whatever its `FpControl` | Eden's SPIR-V decorations | `tests::skeleton_modules_are_unchanged` (the `modifiers` program's `rz` and `ftz`) |
-//! | A directed rounding mode on a conversion (`ConvertF*` with `rm`, `rp` or `rz`) | Refused ([`LowerError::Rounding`]); decision 10 asks for emulation, which is not built | Eden emits it as a SPIR-V rounding decoration | `tests::ops::directed_rounding_on_a_conversion_is_refused` |
+//! | A directed rounding mode on a conversion (`ConvertF*` with `rm`, `rp` or `rz`) | Refused ([`LowerError::Rounding`]); decision 10 asks for emulation, which is not built | Eden emits it as a SPIR-V rounding decoration | `tests::opcodes::directed_rounding_on_a_conversion_is_refused` |
 //! | Flush-to-zero on a conversion | Ignored (an owner question: decision 10 asks for emulation) | SPIR-V decoration | none |
 //! | `DemoteToHelperInvocation` | naga's `Kill`, which ends the invocation; naga has no demote (spec, the naga table) | `OpDemoteToHelperInvocationEXT`: the invocation continues as a helper | `tests::structured::demote_is_kill` |
 //! | `unreachable` | A return | `OpUnreachable` | `tests::structured::unreachable_returns` |
 //! | `FPSaturate16` and `FPSaturate32` of a NaN | naga's `saturate`, whose NaN result is the host's | The interpreter gives `+0` | `tests::skeleton_modules_are_unchanged` |
-//! | NaN handling (unordered comparisons, `FPIsNan`, NaN-aware minimum and maximum, NaN to 0 on conversion) | Written out explicitly, but wgpu-hal 30.0.2's Metal backend leaves the Metal compiler's default math mode, which is fast math, so the host compiler may assume no NaN (a guess from wgpu-hal's source; not measured) | The interpreter's results | `tests::ops` (the expression trees only) |
+//! | NaN handling (comparisons, NaN-aware minimum, maximum and clamp, NaN to 0 on conversion) | Written out with `isnan`: wgpu-hal 30.0.2's Metal backend leaves the Metal compiler's default fast math on, under which a plain comparison treats a NaN as an ordinary value (measured on an Apple GPU: two NaNs compared equal); `isnan` and selects on it gave the interpreter's results there. Other hosts are not measured | The interpreter's results | `tests::ops::float_operations_match_the_interpreter_on_the_gpu` |
 //! | `f32` and `f16` from an integer | naga's conversion, rounding as the host does | Round to nearest even (the interpreter) | none |
+//! | A non-finite `f32` immediate | Its bits, reinterpreted: naga 30.0.1 refuses a NaN or infinite literal | A literal | `tests::opcodes::non_finite_immediates_are_bit_casts` |
+//! | Float to integer at or past 2^31 (2^32 unsigned) | Selects the maximum: naga's saturating conversion stops at the largest float below it (`naga_f2i32` gave 0x7fffff80, measured) | The interpreter saturates to the maximum | `tests::ops::conversions_and_variables_match_the_interpreter_on_the_gpu` |
 //! | Shared-memory word index | `offset >> 2`, logical | `OpShiftRightArithmetic` (`emit_spirv_shared_memory.cpp`), which differs only for offsets of 2^31 and up, all out of bounds here | `tests::memory::shared_offsets_at_and_past_the_end` |
-//! | `PackHalf2x16` and `UnpackHalf2x16` | Need [`Requirements::f16`] (see [`capabilities`]) | Eden needs no feature (`OpExtInst PackHalf2x16`) | `tests::ops::f16_packing_needs_f16` |
+//! | `PackHalf2x16` and `UnpackHalf2x16` | Need [`Requirements::f16`] (see [`capabilities`]) | Eden needs no feature (`OpExtInst PackHalf2x16`) | `tests::opcodes::f16_packing_needs_f16` |
 //! | Out-of-bounds local and shared accesses | Read 0, write dropped, word by word | Eden does not check; the interpreter refuses | `tests::memory` |
 
 pub(crate) mod builder;
@@ -183,13 +191,13 @@ use thiserror::Error;
 
 pub use crate::host::HostCaps;
 use crate::host::{
-    Feature, GuestSlot, HostBuiltIn, HostCode, HostShader, HostStage, InterfaceSlot,
-    Requirements, SlotBinding, SlotType,
+    Feature, GuestSlot, HostBuiltIn, HostCode, HostShader, HostStage, InterfaceSlot, Requirements,
+    SlotBinding, SlotType,
 };
 use crate::ir::ATTRIBUTE_COMPONENTS as COMPONENTS;
 use crate::ir::{
-    Attribute, FpRounding, Function, Imm, Inst, Node, Opcode, Operand, Operation, Terminator,
-    Type, Value, VerifyError,
+    Attribute, FpRounding, Function, Imm, Inst, Node, Opcode, Operand, Operation, Terminator, Type,
+    Value, VerifyError,
 };
 pub use crate::ir::{GENERIC_0_X, POSITION_X};
 use crate::translate::{COLOR_TARGETS, GuestStage};
@@ -510,12 +518,24 @@ struct Interface {
     inputs: BTreeSet<u8>,
     generic_outputs: BTreeSet<u8>,
     targets: BTreeSet<u8>,
+    system: SystemValues,
+    memory: MemoryUse,
+    requirements: Requirements,
+}
+
+/// The system values a function reads that become built-in arguments.
+#[derive(Clone, Copy, Default)]
+struct SystemValues {
     lane_id: bool,
     workgroup_id: bool,
     local_invocation_id: bool,
-    local_memory: bool,
-    shared_memory: bool,
-    requirements: Requirements,
+}
+
+/// The memory spaces a function uses.
+#[derive(Clone, Copy, Default)]
+struct MemoryUse {
+    local: bool,
+    shared: bool,
 }
 
 /// Which stages may use `opcode`, when not every stage may.
@@ -566,8 +586,8 @@ impl Interface {
             // which counts as part of the f16 requirement (see [`capabilities`]).
             found.requirements.f16 |=
                 matches!(op.opcode, Opcode::PackHalf2x16 | Opcode::UnpackHalf2x16);
-            found.local_memory |= memory::is_local(op.opcode);
-            found.shared_memory |= memory::is_shared(op.opcode);
+            found.memory.local |= memory::is_local(op.opcode);
+            found.memory.shared |= memory::is_shared(op.opcode);
             match op.opcode {
                 Opcode::GetAttribute => match classify(attribute_arg(at, op, 1)?) {
                     Some(AttributeKind::Generic { index, .. }) if vertex => {
@@ -590,11 +610,11 @@ impl Interface {
                 },
                 Opcode::LaneId if vertex => return Err(LowerError::LaneIdInVertex),
                 Opcode::LaneId => {
-                    found.lane_id = true;
+                    found.system.lane_id = true;
                     found.requirements.subgroup = true;
                 }
-                Opcode::WorkgroupId => found.workgroup_id = true,
-                Opcode::LocalInvocationId => found.local_invocation_id = true,
+                Opcode::WorkgroupId => found.system.workgroup_id = true,
+                Opcode::LocalInvocationId => found.system.local_invocation_id = true,
                 Opcode::SetFragColor => {
                     let Some(Imm::U32(target)) = imm_arg(op, 0) else {
                         return Err(LowerError::Operand { at, index: 0 });
@@ -883,7 +903,8 @@ impl Lowering {
                 guest: GuestSlot::Generic(generic),
             });
         }
-        if interface.lane_id {
+        let system = interface.system;
+        if system.lane_id {
             let lane = self.builtin_arg("lane_id", types.u32, BuiltIn::SubgroupInvocationId);
             self.lane_arg = Some(lane);
             inputs.push(InterfaceSlot {
@@ -892,7 +913,7 @@ impl Lowering {
                 guest: GuestSlot::LaneId,
             });
         }
-        if interface.workgroup_id || interface.local_invocation_id {
+        if system.workgroup_id || system.local_invocation_id {
             let vec3 = ty(
                 &mut self.module,
                 TypeInner::Vector {
@@ -900,11 +921,11 @@ impl Lowering {
                     scalar: Scalar::U32,
                 },
             );
-            if interface.workgroup_id {
+            if system.workgroup_id {
                 let arg = self.builtin_arg("workgroup_id", vec3, BuiltIn::WorkGroupId);
                 self.workgroup_id_arg = Some(arg);
             }
-            if interface.local_invocation_id {
+            if system.local_invocation_id {
                 let arg = self.builtin_arg("local_id", vec3, BuiltIn::LocalInvocationId);
                 self.local_invocation_id_arg = Some(arg);
             }
