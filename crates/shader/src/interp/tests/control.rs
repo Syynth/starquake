@@ -402,7 +402,7 @@ fn run_level_errors_name_what_went_wrong() {
             .map(|e| e.to_string()),
         Some("the function is malformed: block0 has no terminator".to_owned())
     );
-    for opcode in ["VoteAll u1 true", "PhiMove u32 0x1, u32 0x2", "Join"] {
+    for opcode in ["InvocationInfo", "PhiMove u32 0x1, u32 0x2", "Join"] {
         let name = opcode.split(' ').next().unwrap_or_default();
         assert_eq!(
             eval_error(opcode),

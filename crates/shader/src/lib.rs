@@ -49,6 +49,12 @@
 //! jump tables of `BRX`, walks the program under both convergence-barrier models, splits it
 //! into blocks, inlines every call, and builds the IR's basic blocks from the flow graph.
 //!
+//! Slice 12g translates the attribute and system-value group ([`translate`]'s `attribute`
+//! module): attribute loads and stores, interpolation (with the pixel header,
+//! [`translate::translate_with_header`]), the special registers of `S2R`, `S2UR`, `CS2R` and
+//! `PIXLD`, and `AL2P`; it rejects the geometry and mesh instructions by name. A guarded
+//! instruction becomes a conditional block.
+//!
 //! Experiment E1, run before this slice, lives in `lower`'s tests and its results in the spec.
 
 #[cfg(feature = "test-support")]

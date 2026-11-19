@@ -30,12 +30,14 @@ use crate::back::qmd::tests::{SlotSpec, Spec, encode};
 use crate::back::qmd::{CONSTANT_BUFFER_SIZE_SHIFT, ConstantBuffer, QMD_ADDRESS_SHIFT, QMD_WORDS};
 use crate::classes::{Method, cl902d, cla140, clc7b5, clc7c0, clc797};
 use crate::field::Field;
-use crate::interface::{DisplayId, ImageDesc, LayerId, Rect, VmUpdate};
+use crate::interface::{DisplayId, ImageDesc, LayerId, Rect, SyncpointId, VmUpdate};
 use crate::memory::TestGpuMemory;
 use crate::ring::{MarkerToken, parse_text};
 use crate::syncpoint::Syncpoints;
 use crate::test_log::{at, captured};
 use crate::vm::GpuVm;
+
+mod cb_load;
 
 // ---------------------------------------------------------------------------------------------
 // The rig.
@@ -224,6 +226,7 @@ struct Rig {
     watch: Arc<WriteWatch>,
     shaders: Arc<Mutex<ShaderLog>>,
     ordered: Arc<OrderedTable>,
+    syncpoints: Arc<Syncpoints>,
 }
 
 impl Rig {
@@ -256,8 +259,9 @@ impl Rig {
         let clock = Arc::new(Clock::default());
         let pushed = Arc::new(Pushed::default());
         let waiters = Arc::new(WaiterTable::new());
+        let syncpoints = Arc::new(Syncpoints::new(Arc::<Pushed>::clone(&pushed)));
         let env = FenceEnv {
-            syncpoints: Arc::new(Syncpoints::new(Arc::<Pushed>::clone(&pushed))),
+            syncpoints: Arc::clone(&syncpoints),
             waiters,
             completions: pushed,
             clock: Arc::<Clock>::clone(&clock),
@@ -293,6 +297,7 @@ impl Rig {
             watch,
             shaders,
             ordered,
+            syncpoints,
         }
     }
 
@@ -1833,7 +1838,11 @@ fn deferred_instances_are_drawn_before_each_boundary() {
     let inline_word = write(cla140::CLASS, &cla140::LINE_COUNT, &[], 1);
     let boundaries: [(&str, String, String); 4] = [
         ("marker", String::new(), "marker token=0x7\n".to_owned()),
-        ("syncpoint", String::new(), "syncpoint id=5\n".to_owned()),
+        (
+            "syncpoint",
+            String::new(),
+            "syncpoint id=5 count=1\n".to_owned(),
+        ),
         ("dma", setup, launch),
         ("inline", String::new(), inline_word),
     ];
@@ -1855,6 +1864,21 @@ fn deferred_instances_are_drawn_before_each_boundary() {
 }
 
 #[test]
+fn a_syncpoint_entry_increments_by_exactly_its_count() {
+    // The count goes through the executor unchanged: a count above 16 bits and `u32::MAX` each
+    // reach the counter whole, and 0 changes nothing. Each count runs on a fresh rig, so the
+    // counter starts at 0.
+    let id = SyncpointId::new(5).unwrap();
+    for count in [0, 0x1_0000, u32::MAX] {
+        let mut rig = Rig::new();
+        rig.run(&format!("syncpoint id={} count={count}\n", id.get()));
+        rig.submit();
+        rig.exec.complete();
+        assert_eq!(rig.syncpoints.read(id), count, "count {count}");
+    }
+}
+
+#[test]
 fn a_failed_deferred_draw_does_not_stop_the_entry_after_it() {
     let refused = || {
         ExecError::Draw(DrawError::Topology {
@@ -1865,7 +1889,11 @@ fn a_failed_deferred_draw_does_not_stop_the_entry_after_it() {
         format!("release channel=3 address={SEM:#x} payload=0x1 size=4 timestamp=no op=write\n");
     let (setup, launch) = dma_setup_and_launch(0x5);
     let entries: [(&str, String, String); 5] = [
-        ("syncpoint", String::new(), "syncpoint id=5\n".to_owned()),
+        (
+            "syncpoint",
+            String::new(),
+            "syncpoint id=5 count=1\n".to_owned(),
+        ),
         ("marker", String::new(), "marker token=0x7\n".to_owned()),
         ("release", String::new(), release),
         (

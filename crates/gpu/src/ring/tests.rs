@@ -125,8 +125,12 @@ fn golden_releases() -> Vec<(RingEntry<'static>, Vec<u64>)> {
 fn golden_host() -> Vec<(RingEntry<'static>, Vec<u64>)> {
     vec![
         (
-            RingEntry::Syncpoint { id: syncpoint(191) },
-            vec![0x0000_0000_0000_bf05],
+            // Kind 5, the id at 15:8, the count (at or above 2^31) in the high half.
+            RingEntry::Syncpoint {
+                id: syncpoint(191),
+                count: 0x8000_0007,
+            },
+            vec![0x8000_0007_0000_bf05],
         ),
         (
             RingEntry::WaitForIdle {
@@ -329,6 +333,36 @@ fn an_empty_run_is_two_words() {
     assert_eq!(decode(&out), Ok((run.into_owned(), 2)));
 }
 
+/// A syncpoint entry is one word whatever its count, the count in the header's high half: at 0,
+/// at 1, at a count that differs from 1 only above its low byte, and at `u32::MAX`, each with its
+/// hand-written word and text.
+#[test]
+fn a_syncpoints_count_is_its_headers_high_half_at_every_size() {
+    let cases = [
+        (0, 0x0000_0000_0000_2a05, "syncpoint id=42 count=0"),
+        (1, 0x0000_0001_0000_2a05, "syncpoint id=42 count=1"),
+        (0x0100, 0x0000_0100_0000_2a05, "syncpoint id=42 count=256"),
+        (
+            u32::MAX,
+            0xffff_ffff_0000_2a05,
+            "syncpoint id=42 count=4294967295",
+        ),
+    ];
+    for (count, encoded, text) in cases {
+        let entry = RingEntry::Syncpoint {
+            id: syncpoint(42),
+            count,
+        };
+        assert_eq!(encoded_words(&entry), 1, "{text}");
+        let mut out = Vec::new();
+        encode(&entry, &mut out).unwrap();
+        assert_eq!(out, vec![encoded], "{text}");
+        assert_eq!(decode(&out), Ok((entry.clone(), 1)), "{text}");
+        assert_eq!(entry.to_string(), text);
+        assert_eq!(parse_entry(text), Ok(entry));
+    }
+}
+
 #[test]
 fn malformed_words_are_exact_errors() {
     // The kinds are numbered 1 to `KINDS.len()`, so the next number is the first undefined one.
@@ -406,11 +440,11 @@ fn malformed_host_entries_are_exact_errors() {
         ),
         (vec![0xc005], DecodeError::Syncpoint { value: 192 }),
         (
-            vec![0x1_0000_bf05],
+            vec![0x1_0001_bf05],
             DecodeError::Reserved {
                 kind: Kind::Syncpoint,
                 word: 0,
-                bits: 0x1_0000_0000,
+                bits: 0x1_0000,
             },
         ),
         (
@@ -605,7 +639,7 @@ fn every_golden_entry_has_its_text() {
         "release channel=23 address=0x2000 payload=0x7 size=4 timestamp=no op=write",
         "release channel=2147483672 address=0x123456780 payload=0x9abc size=8 timestamp=yes \
          op=inc.signed",
-        "syncpoint id=191",
+        "syncpoint id=191 count=2147483655",
         "wait-for-idle channel=20",
         "invalidate channel=21 what=l2-flush-dirty",
         "marker token=0x102030405060708",
@@ -702,7 +736,21 @@ fn hand_written_lines_parse() {
                 what: Invalidation::Membar,
             },
         ),
-        ("syncpoint id=0", RingEntry::Syncpoint { id: syncpoint(0) }),
+        // A syncpoint's count in either base, at 0 and at its largest.
+        (
+            "syncpoint id=0 count=0",
+            RingEntry::Syncpoint {
+                id: syncpoint(0),
+                count: 0,
+            },
+        ),
+        (
+            "syncpoint id=0x5 count=0xffffffff",
+            RingEntry::Syncpoint {
+                id: syncpoint(5),
+                count: u32::MAX,
+            },
+        ),
         // A set reference in decimal, at the value's largest.
         (
             "set-reference channel=9 value=4294967295",
@@ -832,7 +880,20 @@ fn out_of_range_and_unnamed_values_are_exact_errors() {
             "bind channel=1 subchannel=256 class=2",
             "subchannel 256 is out of range",
         ),
+        // The id is read before the count: a bad id with no count is the id's error.
         ("syncpoint id=192", "id 192 is out of range"),
+        (
+            "syncpoint id=5",
+            "a syncpoint entry needs count next, but the line ends",
+        ),
+        (
+            "syncpoint id=5 count=4294967296",
+            "count 4294967296 is out of range",
+        ),
+        (
+            "syncpoint count=1 id=5",
+            "a syncpoint entry needs id next, not \"count=1\"",
+        ),
         (
             "release channel=0 address=0 payload=0 size=2 timestamp=no op=write",
             "size 2 is out of range",
@@ -1007,8 +1068,12 @@ fn entry() -> impl Strategy<Value = RingEntry<'static>> {
             }),
         (channel.clone(), release())
             .prop_map(|(channel, release)| RingEntry::Release { channel, release }),
-        (0..u8::try_from(SYNCPOINT_COUNT).unwrap())
-            .prop_map(|id| RingEntry::Syncpoint { id: syncpoint(id) }),
+        (0..u8::try_from(SYNCPOINT_COUNT).unwrap(), any::<u32>()).prop_map(|(id, count)| {
+            RingEntry::Syncpoint {
+                id: syncpoint(id),
+                count,
+            }
+        }),
         channel
             .clone()
             .prop_map(|channel| RingEntry::WaitForIdle { channel }),

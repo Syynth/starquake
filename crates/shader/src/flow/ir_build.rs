@@ -31,7 +31,7 @@
 
 use super::{BlockEnd, BlockIndex, FlowError, FlowGraph, IndirectTarget, Invariant};
 use crate::decode::{BrxSrc, PredSrc};
-use crate::ir::{BlockId, Builder, Function, Imm, Opcode, Operand, Terminator};
+use crate::ir::{BlockId, BuildError, Builder, Function, Imm, Opcode, Operand, Terminator};
 
 /// Which flow block an IR block holds the instructions of.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -142,8 +142,10 @@ fn to_test_block(builder: &mut Builder<'_>, empty: bool) -> Result<(), FlowError
     Ok(())
 }
 
-/// The value of predicate `cond`.
-fn read_pred(builder: &mut Builder<'_>, cond: PredSrc) -> Result<Operand, FlowError> {
+/// The value of predicate `cond`: `PT` as an immediate, else `GetPred` and, when negated,
+/// `LogicalNot`. Shared with the translators, which read guards and predicate sources the same
+/// way.
+pub(crate) fn read_pred(builder: &mut Builder<'_>, cond: PredSrc) -> Result<Operand, BuildError> {
     if cond.reg.is_true() {
         return Ok(Operand::Imm(Imm::U1(!cond.negated)));
     }
