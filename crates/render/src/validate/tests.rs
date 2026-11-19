@@ -3073,3 +3073,117 @@ proptest! {
         );
     }
 }
+
+/// Shader ids for [`validate_pipeline_stages`]: index `n` is a live shader of `STAGE_OF[n]`;
+/// an index past the table names none.
+const STAGE_OF: [ShaderStage; 6] = [
+    ShaderStage::Vertex,
+    ShaderStage::TessControl,
+    ShaderStage::TessEval,
+    ShaderStage::Geometry,
+    ShaderStage::Fragment,
+    ShaderStage::Compute,
+];
+
+fn stage_of(id: ShaderId) -> Result<ShaderStage, RenderError> {
+    usize::try_from(id.index())
+        .ok()
+        .and_then(|i| STAGE_OF.get(i).copied())
+        .ok_or(RenderError::Invalid(NO_SHADER))
+}
+
+#[test]
+fn pipeline_stages_are_checked_in_stage_order() {
+    /// A change that gives one stage the wrong shader.
+    type StageFault = fn(&mut Stages);
+    let good = Stages {
+        vertex: sid(0),
+        tess_control: Some(sid(1)),
+        tess_eval: Some(sid(2)),
+        geometry: Some(sid(3)),
+        fragment: Some(sid(4)),
+    };
+    assert_eq!(validate_pipeline_stages(&good, stage_of), Ok(()));
+    let vertex = RenderError::Invalid("a pipeline's vertex shader is not a vertex shader");
+    // Each stage given the compute shader (index 5), alone and with every later stage wrong too.
+    let set: [(StageFault, RenderError); 5] = [
+        (|s| s.vertex = sid(5), vertex.clone()),
+        (
+            |s| s.tess_control = Some(sid(5)),
+            RenderError::Invalid("a pipeline's tessellation control shader is not one"),
+        ),
+        (
+            |s| s.tess_eval = Some(sid(5)),
+            RenderError::Invalid("a pipeline's tessellation evaluation shader is not one"),
+        ),
+        (
+            |s| s.geometry = Some(sid(5)),
+            RenderError::Invalid("a pipeline's geometry shader is not a geometry shader"),
+        ),
+        (
+            |s| s.fragment = Some(sid(5)),
+            RenderError::Invalid("a pipeline's fragment shader is not a fragment shader"),
+        ),
+    ];
+    assert_eq!(stage_of(sid(5)), Ok(ShaderStage::Compute));
+    for (i, (fault, error)) in set.iter().enumerate() {
+        let mut s = good;
+        fault(&mut s);
+        assert_eq!(
+            validate_pipeline_stages(&s, stage_of),
+            Err(error.clone()),
+            "{i} alone"
+        );
+        for (later, _) in &set[i + 1..] {
+            later(&mut s);
+        }
+        assert_eq!(
+            validate_pipeline_stages(&s, stage_of),
+            Err(error.clone()),
+            "{i} first"
+        );
+    }
+    // An id that names no shader is the lookup's error, in the same order.
+    let mut s = good;
+    s.fragment = Some(sid(99));
+    assert_eq!(
+        validate_pipeline_stages(&s, stage_of),
+        Err(RenderError::Invalid(NO_SHADER))
+    );
+    s.vertex = sid(4);
+    assert_eq!(validate_pipeline_stages(&s, stage_of), Err(vertex));
+    // Absent optional stages are not looked up.
+    let bare = Stages {
+        vertex: sid(0),
+        tess_control: None,
+        tess_eval: None,
+        geometry: None,
+        fragment: None,
+    };
+    assert_eq!(validate_pipeline_stages(&bare, stage_of), Ok(()));
+}
+
+#[test]
+fn a_compute_pipeline_needs_a_live_compute_shader() {
+    let desc = |index| ComputePipelineDesc { shader: sid(index) };
+    assert_eq!(validate_compute_stage(&desc(5), stage_of), Ok(()));
+    // Every other stage, each refused with the exact error, so a check that only rules out one
+    // of them fails here.
+    for (index, stage) in STAGE_OF.iter().enumerate() {
+        if *stage == ShaderStage::Compute {
+            continue;
+        }
+        let index = u32::try_from(index).expect("a small index");
+        assert_eq!(
+            validate_compute_stage(&desc(index), stage_of),
+            Err(RenderError::Invalid(
+                "a compute pipeline's shader is not a compute shader"
+            )),
+            "{stage:?}"
+        );
+    }
+    assert_eq!(
+        validate_compute_stage(&desc(99), stage_of),
+        Err(RenderError::Invalid(NO_SHADER))
+    );
+}

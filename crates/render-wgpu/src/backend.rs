@@ -2,8 +2,9 @@
 //!
 //! # Threads
 //!
-//! Calls come from any thread (the GPU back thread, later the compile workers). Each takes the
-//! one state lock, briefly: a `create_*` checks its description, allocates the id in the
+//! Calls come from any thread (the GPU back thread; the compile workers run pipeline builds,
+//! which take no lock of this module, `crate::pipeline`). Each takes the one state lock,
+//! briefly: a `create_*` checks its description, allocates the id in the
 //! submit-side tables ([`crate::plan::Tables`]) and queues the creation; `submit` checks the
 //! whole list ([`crate::plan`]), takes the next fence value and queues it. The render thread
 //! (`starquake-render`, [`crate::thread`]) takes the queue in order, creates host objects,
@@ -46,9 +47,10 @@
 //! # Lost device
 //!
 //! When wgpu reports the device lost (or the render thread stops by a panic), the `create_*`
-//! calls for buffers, textures, views and samplers, `submit`, `set_present_target` (after a
-//! window's surface is made, which a lost device does not stop), and a `wait` for a value not
-//! yet reached return [`RenderError::DeviceLost`]; a `submit` waiting for room and every `wait`
+//! calls for buffers, textures, views, samplers, shaders and pipelines (each after the checks of
+//! its description that need no lock), `submit`, `set_present_target` (after a window's surface
+//! is made, which a lost device does not stop), and a `wait` for a value not yet reached return
+//! [`RenderError::DeviceLost`]; a `submit` waiting for room and every `wait`
 //! stop waiting; and the wake is called so the back thread looks. The run ends there
 //! (render-backend, "Errors and untrusted input": exit code 2, which `core` maps). Lists still
 //! queued or in flight never complete.
@@ -89,17 +91,21 @@ use crate::adapter::AdapterReport;
 use crate::caps::{ByteLimits, FormatSupport, caps, device_features};
 use crate::config::{WgpuConfig, queue_full};
 use crate::convert::{TextureSpec, buffer_usages, sampler_descriptor, view_descriptor};
+use crate::pipeline::{
+    self as pipelines, Compile, ComputeBuild, Counters, DrawPipeline, GraphicsBuild,
+    NO_COMPILE_POOL, PipelineCell, PipelineCounts, Registry, ShaderRec,
+};
 use crate::plan::{self, Tables, TextureRec, ViewRec};
 use crate::rules;
 use crate::thread::{self, Create, ListWork, Message};
 use crate::window::{self, Target};
 use starquake_render::validate;
 use starquake_render::{
-    Backend, BufferDesc, BufferId, Caps, CommandList, CompletionWake, ComputePipelineDesc,
-    FenceValue, FrameDump, FrameSink, GraphicsPipelineDesc, MemoryBudget, PipelineId,
-    PipelineStatus, PresentFeedback, PresentTarget, Readback, ReadbackId, RenderError, ResourceId,
-    SamplerDesc, SamplerId, ShaderDesc, ShaderId, StagingSlice, TextureDesc, TextureId, ViewDesc,
-    ViewId, WaitOutcome,
+    Backend, BufferDesc, BufferId, Caps, CommandList, CompilePool, CompletionWake,
+    ComputePipelineDesc, FenceValue, FrameDump, FrameSink, GraphicsPipelineDesc, MemoryBudget,
+    PipelineId, PipelineStatus, PresentFeedback, PresentTarget, Readback, ReadbackId, RenderError,
+    ResourceId, SamplerDesc, SamplerId, ShaderDesc, ShaderId, StagingSlice, TextureDesc, TextureId,
+    ViewDesc, ViewId, WaitOutcome, WhileCompiling,
 };
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -112,20 +118,15 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
-/// A shader handed to the backend before shaders exist (slice R6).
-pub const SHADERS_NOT_YET: &str =
-    "the wgpu backend cannot create shaders yet (shaders arrive with slice R6)";
-/// A pipeline asked for before pipelines exist (slice R6).
-pub const PIPELINES_NOT_YET: &str =
-    "the wgpu backend cannot build pipelines yet (pipelines arrive with slice R6)";
-
 /// A present target of a kind this backend does not know. Unreachable while `PresentTarget` has
 /// only the window and offscreen kinds, which this backend takes; the match needs the arm because
 /// the enum is non-exhaustive (a later exported-image kind would reach it).
 const UNKNOWN_TARGET: &str = "the wgpu backend presents to a window or offscreen only";
 
-/// How long [`WgpuBackend::new`] waits for wgpu to find an adapter or open a device. Native
-/// wgpu answers at once; the bound only keeps a broken driver from hanging the caller.
+/// How long [`WgpuBackend::new`] waits for wgpu to find an adapter or open a device, and how
+/// long a pipeline build on the compile pool waits for each of its wgpu error scopes to report
+/// (`crate::pipeline`, which names its own error, [`crate::pipeline::SCOPE_TIMEOUT`]). Native
+/// wgpu answers both at once; the bound only keeps a broken driver from hanging the caller.
 pub const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Why the backend could not be made.
@@ -145,8 +146,11 @@ pub enum NewError {
     Thread(String),
 }
 
-/// Runs a wgpu future to its end on this thread, up to [`OPEN_TIMEOUT`].
-fn block_on<F: Future>(future: F) -> Result<F::Output, NewError> {
+/// Runs a wgpu future to its end on this thread, up to [`OPEN_TIMEOUT`]. [`WgpuBackend::new`]
+/// uses it for the adapter and the device, and a pipeline build for its error scopes
+/// (`crate::pipeline`), which reports the timeout in its own words rather than as
+/// [`NewError::Timeout`].
+pub(crate) fn block_on<F: Future>(future: F) -> Result<F::Output, NewError> {
     let mut future = pin!(future);
     let mut context = Context::from_waker(Waker::noop());
     let start = Instant::now();
@@ -253,6 +257,8 @@ impl PartialOrd for PendingId {
 pub(crate) struct State {
     /// The live resources.
     pub(crate) tables: Tables,
+    /// The live shaders and pipelines (`crate::pipeline`).
+    pub(crate) pipelines: Registry,
     /// Destroys waiting for their fence value.
     pub(crate) pending: Pending<PendingId>,
     /// The last fence value handed out.
@@ -308,7 +314,16 @@ impl State {
                 .samplers
                 .remove(i.index(), i.generation())
                 .is_some(),
-            ResourceId::Shader(_) | ResourceId::Pipeline(_) => false,
+            // Shaders and pipelines have no host object on the render thread: a build that
+            // still needs one holds it (`crate::pipeline`).
+            ResourceId::Shader(i) => {
+                self.pipelines.shaders.remove(i.index(), i.generation());
+                false
+            }
+            ResourceId::Pipeline(i) => {
+                self.pipelines.pipelines.remove(i.index(), i.generation());
+                false
+            }
         };
         if freed {
             self.queue.push_back(Message::Free(id));
@@ -322,7 +337,16 @@ impl State {
             ResourceId::Texture(i) => t.textures.get(i.index(), i.generation()).is_some(),
             ResourceId::View(i) => t.views.get(i.index(), i.generation()).is_some(),
             ResourceId::Sampler(i) => t.samplers.get(i.index(), i.generation()).is_some(),
-            ResourceId::Shader(_) | ResourceId::Pipeline(_) => false,
+            ResourceId::Shader(i) => self
+                .pipelines
+                .shaders
+                .get(i.index(), i.generation())
+                .is_some(),
+            ResourceId::Pipeline(i) => self
+                .pipelines
+                .pipelines
+                .get(i.index(), i.generation())
+                .is_some(),
         }
     }
 
@@ -391,12 +415,44 @@ pub struct WgpuBackend {
     adapter: wgpu::Adapter,
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
+    /// The device, for the pipeline builds on the compile pool (`crate::pipeline`).
+    device: wgpu::Device,
+    /// The compile pool and the wait-while-compiling setting, if the backend was given them.
+    compile: Option<Compile>,
+    /// Whether the device runs every subgroup 32 wide (`pipeline::subgroups_honoured`).
+    subgroups: bool,
+    /// Draws skipped for their pipelines.
+    counters: Counters,
 }
 
 impl WgpuBackend {
     /// Opens the host's default high-performance adapter, builds `Caps` from it, and starts the
-    /// render thread. `wake` is called after each advance of [`Backend::completed`].
+    /// render thread. `wake` is called after each advance of [`Backend::completed`]. A backend
+    /// made this way has no compile pool: it creates shaders but refuses every pipeline
+    /// ([`NO_COMPILE_POOL`]); `core` uses [`WgpuBackend::with_compile_pool`].
     pub fn new(config: WgpuConfig, wake: CompletionWake) -> Result<Self, NewError> {
+        Self::open(config, wake, None)
+    }
+
+    /// [`WgpuBackend::new`], with the shared compile pool that builds its pipelines and the GPU
+    /// crate's wait-while-compiling setting, which the render thread applies to a draw whose
+    /// pipeline is still compiling (`crate::pipeline`; render-backend, "The trait": `core`
+    /// constructs each backend with the shared compile pool, the wait setting and the completion
+    /// wake).
+    pub fn with_compile_pool(
+        config: WgpuConfig,
+        wake: CompletionWake,
+        pool: Arc<dyn CompilePool>,
+        setting: WhileCompiling,
+    ) -> Result<Self, NewError> {
+        Self::open(config, wake, Some(Compile { pool, setting }))
+    }
+
+    fn open(
+        config: WgpuConfig,
+        wake: CompletionWake,
+        compile: Option<Compile>,
+    ) -> Result<Self, NewError> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -434,7 +490,11 @@ impl WgpuBackend {
                 staging: config.max_staging_size,
             },
         );
-        let report = AdapterReport::new(&adapter.get_info(), adapter.features(), &limits);
+        let info = adapter.get_info();
+        let report = AdapterReport::new(&info, adapter.features(), &limits);
+        let subgroups =
+            pipelines::subgroups_honoured(features, info.subgroup_min_size, info.subgroup_max_size);
+        let host_device = device.clone();
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
             work: Condvar::new(),
@@ -457,6 +517,10 @@ impl WgpuBackend {
             adapter,
             shared,
             thread: Some(thread),
+            device: host_device,
+            compile,
+            subgroups,
+            counters: Counters::default(),
         })
     }
 
@@ -474,6 +538,41 @@ impl WgpuBackend {
     /// whose buffer wgpu failed to map (module docs). Zero unless the backend has a bug.
     pub fn host_errors(&self) -> u64 {
         self.shared.host_errors.load(Ordering::Relaxed)
+    }
+
+    /// What a draw gets for pipeline `id`, under the wait-while-compiling setting the backend
+    /// was built with (`crate::pipeline`, "Draws: wait or skip"). Under
+    /// [`WhileCompiling::Wait`] it blocks while the pipeline compiles, until its build settles;
+    /// a skipped draw is counted in [`WgpuBackend::pipeline_counts`]. The render thread calls it
+    /// for each draw (slice R7). `Err` for an id that names no live pipeline.
+    pub fn draw_pipeline(&self, id: PipelineId) -> Result<DrawPipeline, RenderError> {
+        let cell = self.pipeline_cell(id)?;
+        let setting = self
+            .compile
+            .as_ref()
+            .map_or(WhileCompiling::default(), |c| c.setting);
+        Ok(pipelines::acquire(&cell, setting, &self.counters))
+    }
+
+    /// The draws skipped for their pipelines so far.
+    pub fn pipeline_counts(&self) -> PipelineCounts {
+        self.counters.get()
+    }
+
+    /// Whether the device runs every subgroup 32 wide, so pipelines whose shaders use subgroups
+    /// are accepted (`crate::pipeline`, "Requirements").
+    pub fn honours_subgroups(&self) -> bool {
+        self.subgroups
+    }
+
+    fn pipeline_cell(&self, id: PipelineId) -> Result<Arc<PipelineCell>, RenderError> {
+        self.shared
+            .state()
+            .pipelines
+            .pipelines
+            .get(id.index(), id.generation())
+            .cloned()
+            .ok_or(RenderError::Invalid(validate::NO_PIPELINE))
     }
 
     /// How many `destroy` calls named no live resource or one already waiting to be destroyed.
@@ -519,6 +618,12 @@ impl WgpuBackend {
     #[cfg(test)]
     pub(crate) fn scratch_textures(&self) -> u64 {
         self.shared.scratch_textures.load(Ordering::Relaxed)
+    }
+
+    /// The device the pipeline builds use.
+    #[cfg(test)]
+    pub(crate) fn device(&self) -> &wgpu::Device {
+        &self.device
     }
 
     /// Sends shown frames to the live texture `id` as if it were a window's (`crate::window`,
@@ -664,8 +769,17 @@ impl Backend for WgpuBackend {
         Ok(id)
     }
 
-    fn create_shader(&self, _desc: ShaderDesc) -> Result<ShaderId, RenderError> {
-        Err(RenderError::Unsupported(SHADERS_NOT_YET))
+    /// Checks the shader and keeps its module (`crate::pipeline`, "Shaders"); wgpu first sees
+    /// it when a pipeline that uses it is built.
+    fn create_shader(&self, desc: ShaderDesc) -> Result<ShaderId, RenderError> {
+        if let Err(error) = validate::validate_shader(&self.caps, &desc) {
+            pipelines::discard(desc);
+            return Err(error);
+        }
+        let rec = ShaderRec::new(desc)?;
+        let mut state = self.live_state()?;
+        let (index, generation) = state.pipelines.shaders.insert(Arc::new(rec))?;
+        Ok(ShaderId::new(index, generation))
     }
 
     fn destroy(&self, resource: ResourceId, after: FenceValue) {
@@ -682,23 +796,96 @@ impl Backend for WgpuBackend {
         }
     }
 
+    /// Checks the description in the order `crate::pipeline` lists, then queues the build on
+    /// the compile pool and returns at once.
     fn create_graphics_pipeline(
         &self,
-        _desc: GraphicsPipelineDesc,
+        desc: GraphicsPipelineDesc,
     ) -> Result<PipelineId, RenderError> {
-        Err(RenderError::Unsupported(PIPELINES_NOT_YET))
+        let compile = self
+            .compile
+            .clone()
+            .ok_or(RenderError::Unsupported(NO_COMPILE_POOL))?;
+        validate::validate_graphics_pipeline(&self.caps, &desc)?;
+        let mut state = self.live_state()?;
+        let shader = |state: &State, id: ShaderId| {
+            state
+                .pipelines
+                .shaders
+                .get(id.index(), id.generation())
+                .cloned()
+                .ok_or(RenderError::Invalid(validate::NO_SHADER))
+        };
+        validate::validate_pipeline_stages(&desc.stages, |id| shader(&state, id).map(|s| s.stage))?;
+        let vertex = shader(&state, desc.stages.vertex)?;
+        let fragment = desc
+            .stages
+            .fragment
+            .map(|id| shader(&state, id))
+            .transpose()?;
+        let shaders = || std::iter::once(&*vertex).chain(fragment.as_deref());
+        pipelines::check_requirements(shaders(), self.subgroups)?;
+        let layout = pipelines::plan_layout(shaders())?;
+        let plan = pipelines::state::graphics(&desc)?;
+        let cell = Arc::new(PipelineCell::new());
+        let (index, generation) = state.pipelines.pipelines.insert(Arc::clone(&cell))?;
+        drop(state);
+        let build = GraphicsBuild {
+            device: self.device.clone(),
+            vertex,
+            fragment,
+            layout,
+            plan,
+        };
+        compile
+            .pool
+            .spawn(pipelines::job(cell, move || build.run()));
+        Ok(PipelineId::new(index, generation))
     }
 
+    /// As [`Backend::create_graphics_pipeline`], for a compute shader.
     fn create_compute_pipeline(
         &self,
-        _desc: ComputePipelineDesc,
+        desc: ComputePipelineDesc,
     ) -> Result<PipelineId, RenderError> {
-        Err(RenderError::Unsupported(PIPELINES_NOT_YET))
+        let compile = self
+            .compile
+            .clone()
+            .ok_or(RenderError::Unsupported(NO_COMPILE_POOL))?;
+        let mut state = self.live_state()?;
+        let shader = state
+            .pipelines
+            .shaders
+            .get(desc.shader.index(), desc.shader.generation())
+            .cloned();
+        validate::validate_compute_stage(&desc, |_| {
+            shader
+                .as_ref()
+                .map(|s| s.stage)
+                .ok_or(RenderError::Invalid(validate::NO_SHADER))
+        })?;
+        let shader = shader.ok_or(RenderError::Invalid(validate::NO_SHADER))?;
+        pipelines::check_requirements([&*shader], self.subgroups)?;
+        let layout = pipelines::plan_layout([&*shader])?;
+        let cell = Arc::new(PipelineCell::new());
+        let (index, generation) = state.pipelines.pipelines.insert(Arc::clone(&cell))?;
+        drop(state);
+        let build = ComputeBuild {
+            device: self.device.clone(),
+            shader,
+            layout,
+        };
+        compile
+            .pool
+            .spawn(pipelines::job(cell, move || build.run()));
+        Ok(PipelineId::new(index, generation))
     }
 
-    /// [`PipelineStatus::Failed`]: no pipeline exists until slice R6.
-    fn pipeline_status(&self, _id: PipelineId) -> PipelineStatus {
-        PipelineStatus::Failed
+    /// The pipeline's status; [`PipelineStatus::Failed`] for an id that names no live pipeline
+    /// (the trait has no error here).
+    fn pipeline_status(&self, id: PipelineId) -> PipelineStatus {
+        self.pipeline_cell(id)
+            .map_or(PipelineStatus::Failed, |cell| cell.status())
     }
 
     fn staging(&self, size: u64) -> Result<StagingSlice, RenderError> {
@@ -809,4 +996,4 @@ impl Backend for WgpuBackend {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

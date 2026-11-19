@@ -44,12 +44,17 @@
 //! GPU slice G15 adds the completion wake, in [`wake`]: the [`CompletionWake`] each backend is
 //! built with and calls after each advance of [`Backend::completed`], and the contract check
 //! every backend's tests run against it.
+//!
+//! Slice R6 adds the compile pool seam, in [`compile`]: the [`CompilePool`] trait `core`
+//! implements and the [`WhileCompiling`] setting a backend is built with, and, in [`validate`],
+//! the stage checks every backend applies to a pipeline's shaders.
 
 pub mod astc;
 pub mod backend;
 pub mod caps;
 pub mod capture;
 pub mod command;
+pub mod compile;
 pub mod emulation;
 pub mod error;
 pub mod fallback;
@@ -73,6 +78,7 @@ pub use backend::{
 pub use caps::{Caps, Features, FormatFeatures, FormatTable, Limits, SampleCounts};
 pub use capture::{Capture, CaptureError, CapturedList};
 pub use command::{Command, CommandList, StagingSlice};
+pub use compile::{CompileJob, CompilePool, WhileCompiling};
 pub use emulation::{DepthRange, EmulationState, emulation};
 pub use error::{RenderError, UnknownFlags};
 pub use fallback::{Conversion, HostFormat, features_for_usage, host_format};
