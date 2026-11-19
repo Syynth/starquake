@@ -13,13 +13,20 @@
 //! (`test_ldc`, `test_nanosleep`). Of the control group (`op::control`), `test_nop`,
 //! `test_redux`, `test_match` and `test_nanosleep` pin `nop`, every `redux` operation, `match`
 //! with and without its predicate and `.u64`, and `nanosleep` with each source kind and a hex
-//! immediate. **Everything else is a guess** in `nvdisasm`'s usual style that a developer with
+//! immediate. Of the attribute group (`op::attribute`), `test_isberd` pins `isberd` with every
+//! output, access, skew and memory-type modifier, in that order, and the `[r2]`/`[r2+0x42]`
+//! address; `test_isbewr` pins `isbewr` only with `.o` set and the map and `.attr` access types,
+//! with every skew and memory-type modifier and both addresses, so `isbewr` without `.o` is a
+//! guess.
+//! **Everything else is a guess** in `nvdisasm`'s usual style that a developer with
 //! `nvdisasm` should check (spec, "`nvdisasm` cross-check"): `urz` and `upt`, the `.rm`/`.rp`
 //! rounding names (taken from NAK's own `FRndMode` printer), `.fmz` for the `dnz` bit, float
 //! immediates other than small integers, `-`/`|..|` source modifiers (on registers, uniform
 //! registers and constant buffers alike), the guard prefix `@p0 `/`@!p0 `, `MOV`'s hex immediate
 //! and lane mask, the `ALD`/`AST` operand syntax and width suffixes, `EXIT`'s modifiers and
-//! predicate, the special-register names, the text of every other control instruction (branch
+//! predicate, the special-register names, the text of every other attribute instruction
+//! (`IPA`'s modes, `CS2R`'s `.32`, `S2UR`, `PIXLD`, `OUT`, `LDTRAM`, `AL2P`),
+//! the text of every other control instruction (branch
 //! offsets in particular print as a signed byte displacement from the next instruction, where
 //! `nvdisasm` prints the absolute target: `op::control`, `BranchOffset`), and every shell's
 //! mnemonic.

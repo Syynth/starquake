@@ -1,6 +1,7 @@
 //! Decoder tests: expected text, round trips, strictness and robustness. The framework's own
 //! tests (form table, operand types at their edges, shells, check order) are in `framework`.
 
+mod attribute;
 mod control;
 mod framework;
 
@@ -11,7 +12,7 @@ use super::*;
 use crate::asm::{EncodeError, assemble};
 use crate::decode::control::EXIT_OPCODE;
 use crate::decode::integer::MOV_OPCODE;
-use crate::testing::{any_form_word, any_instr, config, forms};
+use crate::testing::{any_form_word, any_instr, any_word_of, config, forms};
 
 fn r(index: u8) -> Gpr {
     Gpr::new(index)
@@ -19,6 +20,28 @@ fn r(index: u8) -> Gpr {
 
 fn p(index: u8) -> Pred {
     Pred::new(index).expect("a predicate register")
+}
+
+/// A word built by hand: `opcode`, the guard `PT` (7 at bit 12), and each `(start, value)` placed
+/// at its bit, with positions written out here rather than taken from the decoder's constants.
+fn word(opcode: u128, fields: &[(u32, u128)]) -> Instruction {
+    let mut bits = opcode | (7 << 12);
+    for &(start, value) in fields {
+        bits |= value << start;
+    }
+    Instruction::from_bits(bits)
+}
+
+/// Decodes a hand-built word and prints it.
+fn text(word: Instruction) -> String {
+    match decode(word) {
+        Ok(instr) => instr.to_string(),
+        Err(error) => format!("error: {error}"),
+    }
+}
+
+fn ur(index: u8) -> UniformReg {
+    UniformReg::new(index).expect("a uniform register")
 }
 
 /// Assembles `instr`, decodes the word and prints it.
@@ -224,21 +247,21 @@ fn unconfirmed_text_of_attribute_exit_and_s2r() {
         ),
         (
             Op::S2R(OpS2R {
-                dst: r(3),
+                dst: S2RDst::Reg(r(3)),
                 sr: SpecialReg::LANE_ID,
             }),
             "s2r r3, sr_laneid;",
         ),
         (
             Op::S2R(OpS2R {
-                dst: r(3),
+                dst: S2RDst::Reg(r(3)),
                 sr: SpecialReg::TID_Y,
             }),
             "s2r r3, sr_tid.y;",
         ),
         (
             Op::S2R(OpS2R {
-                dst: r(3),
+                dst: S2RDst::Reg(r(3)),
                 sr: SpecialReg(12),
             }),
             "s2r r3, sr12;",
@@ -597,7 +620,7 @@ fn unknown_opcodes_name_the_opcode() {
         AluForm::UniformSrc2.opcode(MOV_OPCODE),
         float::FFMA_OPCODE,
         0x000,
-        0x9c3,
+        0x9ff,
         0xfff,
     ];
     for opcode in unknown {
@@ -611,11 +634,11 @@ fn unknown_opcodes_name_the_opcode() {
     // The opcode is checked before the stray bits: an unknown opcode with stray bits too is
     // reported as the opcode.
     let both = Instruction::default()
-        .with_field(OPCODE, 0x9c3)
+        .with_field(OPCODE, 0x9ff)
         .with_flag(Field::bit(100), true);
     assert_eq!(
         decode(both),
-        Err(DecodeError::UnknownOpcode { opcode: 0x9c3 })
+        Err(DecodeError::UnknownOpcode { opcode: 0x9ff })
     );
     let stray = Instruction::default()
         .with_field(OPCODE, u64::from(EXIT_OPCODE))
@@ -629,7 +652,7 @@ fn unknown_opcodes_name_the_opcode() {
 #[test]
 fn scheduling_bits_do_not_change_the_decoding() {
     let word = assemble(&Instr::new(Op::S2R(OpS2R {
-        dst: r(9),
+        dst: S2RDst::Reg(r(9)),
         sr: SpecialReg::LANE_ID,
     })))
     .expect("encodable");

@@ -9,28 +9,6 @@ use super::super::op::control::{self, *};
 use super::*;
 use crate::asm::{EncodeError, assemble};
 
-/// A word built by hand: `opcode`, the guard `PT` (7 at bit 12), and each `(start, value)` placed
-/// at its bit, with positions written out here rather than taken from the decoder's constants.
-fn word(opcode: u128, fields: &[(u32, u128)]) -> Instruction {
-    let mut bits = opcode | (7 << 12);
-    for &(start, value) in fields {
-        bits |= value << start;
-    }
-    Instruction::from_bits(bits)
-}
-
-/// Decodes a hand-built word and prints it.
-fn text(word: Instruction) -> String {
-    match decode(word) {
-        Ok(instr) => instr.to_string(),
-        Err(error) => format!("error: {error}"),
-    }
-}
-
-fn ur(index: u8) -> UniformReg {
-    UniformReg::new(index).expect("a uniform register")
-}
-
 fn b(index: u8) -> Barrier {
     Barrier::new(index).expect("a barrier")
 }
@@ -1085,14 +1063,7 @@ fn unconfirmed_text_of_the_control_group() {
 
 /// A word of one of the group's forms (as `testing::any_form_word`, over this group alone).
 fn any_control_word() -> impl Strategy<Value = Instruction> {
-    let forms: Vec<(u16, u128, u128)> = control::FORMS
-        .iter()
-        .map(|form| (form.opcode, form.known, form.fixed))
-        .collect();
-    (0..forms.len(), any::<u128>()).prop_map(move |(index, noise)| {
-        let (opcode, known, fixed) = forms[index];
-        Instruction::from_bits((noise & known) | fixed).with_field(OPCODE, u64::from(opcode))
-    })
+    any_word_of(control::FORMS)
 }
 
 proptest! {
