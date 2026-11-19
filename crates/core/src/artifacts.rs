@@ -8,8 +8,11 @@
 //! `gpu.txt` is the GPU's flight recorder, empty for a run with no GPU (the null front).
 //! `frames/` holds the run's frame dumps (`crate::frames`), one PNG per frame kept, named by
 //! [`frame_file_name`]; it is made even when empty. A frame file left in it by an earlier run
-//! (a file whose name [`frame_number`] reads) is removed first, so the folder holds this run's
-//! frames only; any other file in it is left alone.
+//! (an entry that is not a folder, whose name [`frame_number`] reads) is removed first, so the
+//! folder holds this run's frames only; any other entry in it, a folder with a frame file's name
+//! included, is left alone. The frames are written last, after the crash report, so a frames
+//! folder that cannot be written (one of this run's frame names taken by a folder, say) fails the
+//! write without costing a crashed run its `crash.json` and `crash.txt`.
 //!
 //! Two files are added to the spec's table: [`GUEST_LOG_FILE`], the text the guest wrote with
 //! `OutputDebugString` (the event stream keeps only each line's length and hash, so without it a
@@ -119,7 +122,6 @@ pub fn write(folder: &Path, report: &RunReport) -> Result<(), ArtifactError> {
     }
     put(LOG_FILE, host_log.as_bytes())?;
     put(GPU_FILE, report.graphics.gpu_recorder.as_bytes())?;
-    write_frames(&folder.join(FRAMES_FOLDER), report)?;
 
     if let Some(crash) = report.crash() {
         let data = json(CRASH_JSON_FILE, serde_json::to_string_pretty(crash))?;
@@ -136,7 +138,8 @@ pub fn write(folder: &Path, report: &RunReport) -> Result<(), ArtifactError> {
             }
         }
     }
-    Ok(())
+    // Last: a frames folder that cannot be written does not cost a crashed run its crash report.
+    write_frames(&folder.join(FRAMES_FOLDER), report)
 }
 
 /// Makes `frames` (the artifacts folder's [`FRAMES_FOLDER`]), removes the frame files an earlier
@@ -149,7 +152,9 @@ fn write_frames(frames: &Path, report: &RunReport) -> Result<(), ArtifactError> 
     std::fs::create_dir_all(frames).map_err(io_error(frames))?;
     for entry in std::fs::read_dir(frames).map_err(io_error(frames))? {
         let entry = entry.map_err(io_error(frames))?;
-        let stale = entry.file_name().to_str().and_then(frame_number).is_some();
+        let named = entry.file_name().to_str().and_then(frame_number).is_some();
+        // A folder with a frame file's name is not an earlier run's frame: it is left alone.
+        let stale = named && !entry.file_type().map_err(io_error(&entry.path()))?.is_dir();
         if stale {
             let path = entry.path();
             std::fs::remove_file(&path).map_err(io_error(&path))?;

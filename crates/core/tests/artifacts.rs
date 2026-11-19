@@ -261,6 +261,49 @@ fn a_later_run_removes_the_frames_an_earlier_one_left_and_nothing_else() {
     assert_eq!(read(&folder, GPU_FILE), b"");
 }
 
+/// A folder in `frames/` with a frame file's name is not an earlier run's frame: the sweep
+/// leaves it alone instead of failing the write, and a crashed run still gets its crash report.
+#[test]
+fn a_folder_with_a_frame_files_name_is_left_alone() {
+    let folder = folder("frames_folder_named_like_a_frame");
+    let frames = folder.join(FRAMES_FOLDER);
+    let named = frames.join(frame_file_name(1));
+    std::fs::create_dir_all(&named).unwrap();
+    let report = RunReport {
+        graphics: with_frames().graphics,
+        ..crashed()
+    };
+    artifacts::write(&folder, &report).unwrap();
+    assert_eq!(files(&frames), ["000001.png", "000003.png", "000004.png"]);
+    assert!(named.is_dir());
+    assert_eq!(read(&frames, &frame_file_name(3)), b"third");
+    assert!(folder.join(CRASH_JSON_FILE).is_file());
+    assert!(folder.join(CRASH_TEXT_FILE).is_file());
+}
+
+/// A frame this run writes whose name a folder holds fails the write, naming the file; the crash
+/// report is written before the frames, so the crashed run keeps it.
+#[test]
+fn a_frame_that_cannot_be_written_still_leaves_the_crash_report() {
+    let folder = folder("frames_name_taken");
+    let frames = folder.join(FRAMES_FOLDER);
+    let taken = frames.join(frame_file_name(3));
+    std::fs::create_dir_all(&taken).unwrap();
+    let report = RunReport {
+        graphics: with_frames().graphics,
+        ..crashed()
+    };
+    match artifacts::write(&folder, &report) {
+        Err(ArtifactError::Io { path, .. }) => assert_eq!(path, taken),
+        other => unreachable!("expected an I/O error naming the frame file, got {other:?}"),
+    }
+    assert!(folder.join(CRASH_JSON_FILE).is_file());
+    assert_eq!(
+        read(&folder, CRASH_TEXT_FILE),
+        crashed().crash().unwrap().to_text().into_bytes()
+    );
+}
+
 #[test]
 fn a_frames_folder_that_cannot_be_made_is_an_error_naming_it() {
     let folder = folder("frames_blocked");
