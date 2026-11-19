@@ -132,12 +132,14 @@ fn alu_forms_put_sources_where_the_table_says() {
     assert_eq!(AluForm::from_bits(8), None);
 }
 
-/// The uniform-register ALU forms require bit 91 (PR #4588: "native uniform source flag"). Every
-/// form with fixed bits refuses a word without them, naming the lowest, and accepts one with
-/// them; a form without fixed bits accepts the bare word. Which forms have which fixed bits is
+/// Every form's fixed bits are required (step 3): the uniform-register ALU forms' bit 91 (PR
+/// #4588: "native uniform source flag"), and the control group's (the uniform `BRA`'s bits
+/// 87..89 and 91, `BRXU`'s bit 91). Every form with fixed bits refuses a word without them,
+/// naming the lowest, and accepts one with them; a form without fixed bits accepts the bare
+/// word. Which forms have which fixed bits is
 /// pinned by each group's rows (`masks_match_the_reference_table`).
 #[test]
-fn uniform_forms_require_bit_91() {
+fn fixed_bits_are_required() {
     let required = [
         AluForm::UniformSrc1.opcode(integer::MOV_OPCODE),
         AluForm::UniformSrc1.opcode(float::FFMA_OPCODE),

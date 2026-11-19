@@ -206,12 +206,19 @@ fn branch_words() -> Vec<(Instruction, &'static str)> {
             word(0x950, &[(24, 20), (87, 7), (34, (1 << 48) - 1)]),
             "ret.rel r20 -0x4;",
         ),
+        // RET under !p3: the condition is printed.
+        (
+            word(0x950, &[(24, 20), (87, 3), (90, 1), (34, 4)]),
+            "ret.rel !p3, r20 +0x10;",
+        ),
         // EXIT 0x94d: bits 84 and 85 alone.
         (word(0x94d, &[(87, 7), (84, 1)]), "exit.keeprefcount;"),
         (word(0x94d, &[(87, 7), (85, 1)]), "exit.no_atexit;"),
         // KILL 0x95b.
         (word(0x95b, &[(87, 7)]), "kill;"),
         (word(0x95b, &[(87, 3), (90, 1)]), "kill !p3;"),
+        // The condition !PT (never) is printed; only plain PT is left out.
+        (word(0x95b, &[(87, 7), (90, 1)]), "kill !pt;"),
     ]
 }
 
@@ -220,6 +227,11 @@ fn barrier_words() -> Vec<(Instruction, &'static str)> {
     vec![
         // BSSY 0x945: b2 at 16, offset 8 words.
         (word(0x945, &[(16, 2), (87, 7), (34, 8)]), "bssy b2, +0x20;"),
+        // BSSY under p2: the condition is printed.
+        (
+            word(0x945, &[(16, 2), (87, 2), (34, 8)]),
+            "bssy p2, b2, +0x20;",
+        ),
         // BSYNC 0x941: b15.
         (word(0x941, &[(16, 15), (87, 7)]), "bsync b15;"),
         // The condition !PT (never) is printed; only plain PT is left out.
@@ -251,23 +263,57 @@ fn barrier_words() -> Vec<(Instruction, &'static str)> {
         ),
         // 0xd48 (form 6): ur5 at 32, fixed bit 91.
         (word(0xd48, &[(32, 5), (91, 1), (87, 7)]), "warpsync ur5;"),
-        // BAR 0xb1d: every field zero (NAK's encoding), then each field alone.
-        (word(0xb1d, &[]), "bar.sync r0, p0;"),
-        (word(0xb1d, &[(87, 7)]), "bar.sync r0;"),
-        (word(0xb1d, &[(77, 1), (87, 7)]), "bar.arv r0;"),
-        (word(0xb1d, &[(77, 2), (87, 7)]), "bar.red r0;"),
-        (word(0xb1d, &[(77, 3), (87, 7)]), "bar.scan r0;"),
-        (word(0xb1d, &[(74, 1), (87, 7)]), "bar.sync.and r0;"),
-        (word(0xb1d, &[(74, 2), (87, 7)]), "bar.sync.or r0;"),
+        // BAR 0xb1d: every field zero (NAK's encoding, PR #4588's "BAR.SYNC 0"), then each
+        // field alone.
+        (word(0xb1d, &[]), "bar.sync 0x0;"),
+        (word(0xb1d, &[(77, 1)]), "bar.arv 0x0;"),
+        (word(0xb1d, &[(77, 2)]), "bar.red 0x0;"),
+        (word(0xb1d, &[(77, 3)]), "bar.scan 0x0;"),
+        (word(0xb1d, &[(74, 1)]), "bar.sync.and 0x0;"),
+        (word(0xb1d, &[(74, 2)]), "bar.sync.or 0x0;"),
+        (word(0xb1d, &[(80, 1)]), "bar.sync.defer_blocking 0x0;"),
+        // The barrier number at 32..40, its top bit set alone.
+        (word(0xb1d, &[(32, 0x83)]), "bar.sync 0x83;"),
+        // Bits 87..91 are undecoded, not a predicate: NAK's 0x31d PT (7 at 87) and !PT (bit 90
+        // too) print as raw bits, and the barrier stays unconditional.
+        (word(0xb1d, &[(87, 1)]), "bar.sync 0x0, bits87=0x1;"),
+        (word(0xb1d, &[(87, 7)]), "bar.sync 0x0, bits87=0x7;"),
         (
-            word(0xb1d, &[(80, 1), (87, 7)]),
-            "bar.sync.defer_blocking r0;",
+            word(0xb1d, &[(87, 7), (90, 1)]),
+            "bar.sync 0x0, bits87=0xf;",
         ),
         (
-            word(0xb1d, &[(32, 3), (87, 2), (90, 1)]),
-            "bar.sync r3, !p2;",
+            word(0xb1d, &[(32, 3), (90, 1)]),
+            "bar.sync 0x3, bits87=0x8;",
         ),
     ]
+}
+
+/// PR #4588's only accepted `BAR` word (`ops_memory.cpp`, `Visitor::BAR`: bits 32..79 and
+/// 81..95 zero, "BAR.SYNC 0 over the whole workgroup"), with and without bit 80 (ignored there,
+/// "the deferred-blocking scheduling qualifier"): an unconditional `BAR.SYNC` of barrier 0. Read
+/// as NAK's commented-out `0x31d` encoding it would be conditional on `P0`.
+#[test]
+fn bar_canonical_word_is_unconditional() {
+    for (defer_blocking, expected) in [
+        (false, "bar.sync 0x0;"),
+        (true, "bar.sync.defer_blocking 0x0;"),
+    ] {
+        let canonical = word(0xb1d, &[(80, u128::from(defer_blocking))]);
+        assert_eq!(text(canonical), expected);
+        let instr = decode(canonical).expect("the canonical barrier decodes");
+        assert_eq!(instr.guard, PredSrc::TRUE);
+        assert_eq!(
+            instr.op,
+            Op::Bar(OpBar {
+                mode: BarMode::Sync,
+                red: BarRed::Popc,
+                id: 0,
+                defer_blocking,
+                unknown: 0,
+            })
+        );
+    }
 }
 
 /// Hand-built words of `VOTE`, `SHFL`, `MATCH`, `REDUX`, `NOP`, `DEPBAR` and `NANOSLEEP`.
@@ -533,8 +579,8 @@ fn undefined_field_values_are_refused() {
         );
     }
     // BAR's reduction at 74..76: 2 (OR) decodes, 3 does not.
-    let bar = |red| word(0xb1d, &[(74, red), (87, 7)]);
-    assert_eq!(text(bar(2)), "bar.sync.or r0;");
+    let bar = |red| word(0xb1d, &[(74, red)]);
+    assert_eq!(text(bar(2)), "bar.sync.or 0x0;");
     assert_eq!(
         decode(bar(3)),
         Err(DecodeError::UnknownValue {
@@ -834,6 +880,24 @@ fn control_immediates_past_their_field_are_refused() {
             bits: 6
         })
     );
+    let bar = |unknown| {
+        assemble(&Instr::new(Op::Bar(OpBar {
+            mode: BarMode::Sync,
+            red: BarRed::Popc,
+            id: 0,
+            defer_blocking: false,
+            unknown,
+        })))
+    };
+    assert_eq!(bar(0xf).map(|word| word.field(BAR_UNKNOWN)), Ok(0xf));
+    assert_eq!(
+        bar(0x10),
+        Err(EncodeError::TooWide {
+            what: "barrier bits 87..91",
+            value: 0x10,
+            bits: 4
+        })
+    );
 }
 
 /// The group's opcodes against the cited reference values, written out: NAK's `sm70_encode.rs`
@@ -903,10 +967,11 @@ fn control_fields_match_the_references() {
         (NANOSLEEP_CLEAR, (83, 1)),
         (NANOSLEEP_WARP, (85, 1)),
         (NANOSLEEP_RAND, (86, 1)),
-        (BAR_SRC, (32, 8)),
+        (BAR_ID, (32, 8)),
         (BAR_RED, (74, 2)),
         (BAR_MODE, (77, 2)),
         (BAR_DEFER_BLOCKING, (80, 1)),
+        (BAR_UNKNOWN, (87, 4)),
         (VOTE_OP, (72, 2)),
         (SHFL_SRC, (24, 8)),
         (SHFL_LANE_REG, (32, 8)),

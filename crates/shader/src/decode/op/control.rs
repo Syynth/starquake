@@ -49,12 +49,24 @@
 //!   0xd)` with the comment `DEPBAR.LE SB5, 1`: bits 44..47 are read as the scoreboard (5) and
 //!   bit 47 as `.LE` (1), a guess that splits the PR's four-bit field.
 //! - **`BAR`'s fields** in form `0xb1d` (NAK's only live encoding) are the row's: bits 32..40,
-//!   74..76, 77..79, 80 and 87..91. Their meanings come from NAK's commented-out encoding of form
-//!   `0x31d` (a register at 32..40, the reduction at 74..76: `RED.POPC`, `.AND`, `.OR`; the mode
-//!   at 77..79: `SYNC`, `ARV`, `RED`, `SCAN`; a predicate at 87..91), and bit 80, which PR #4588
-//!   ignores (`ops_memory.cpp`, `Visitor::BAR`, `Ignore(80, 1)`), is named
-//!   `defer_blocking` after `nvdisasm`'s usual spelling of a workgroup barrier: all guesses. NAK's
-//!   live encoding writes zero to bits 87..91, which reads as `P0`.
+//!   74..76, 77..79, 80 and 87..91. **Conflict** between NAK's commented-out encoding of form
+//!   `0x31d` and PR #4588's reading of `0xb1d`. NAK's `0x31d` has a register at 32..40
+//!   (`set_reg_src(32..40, ..)`), the reduction at 74..76 (`RED.POPC`, `.AND`, `.OR`), the mode
+//!   at 77..79 (`SYNC`, `ARV`, `RED`, `SCAN`) and a predicate at 87..91 whose `PT` is 7
+//!   (`set_pred_src(87..90, 90, ..)`). PR #4588 accepts only one `0xb1d` word, with bits 32..63,
+//!   64..79 and 81..95 zero (`ops_memory.cpp`, `Visitor::BAR`: `Require(Take(32, 32) == 0 &&
+//!   Take(64, 16) == 0 && Take(81, 15) == 0, "native workgroup barrier mode")`), and calls it
+//!   "BAR.SYNC 0 over the whole workgroup" (the comment on `Visitor::BAR`; `lower_to_maxwell.h`,
+//!   case `0xb1d`: "BAR.SYNC 0, full workgroup"), which NAK's live encoding (every field zero)
+//!   agrees with. Read as NAK's `0x31d`, that word would be a barrier conditional on `P0`, so
+//!   the PR's reading wins for the bits it fixes: bits 32..40 are read as an immediate barrier
+//!   number ([`OpBar::id`], printed `0x0`) and bits 87..91 are kept undecoded
+//!   ([`OpBar::unknown`], printed only when not zero), so the canonical word is the
+//!   unconditional `bar.sync 0x0`. The mode and reduction keep NAK's meanings, which the PR's
+//!   word (both zero, `SYNC` and `POPC`) does not contradict. Bit 80 is `.DEFER_BLOCKING`, which
+//!   PR #4588 ignores and calls "the deferred-blocking scheduling qualifier" (`ops_memory.cpp`,
+//!   the comment on `Visitor::BAR`). Every value other than zero in bits 32..40, 74..79 and
+//!   87..91 is a guess; `nvdisasm` would settle them (owner question).
 //! - **The uniform `BRA` (`0x547`) and `BRXU` (`0x958`) require bit 91 set**, as the ALU
 //!   uniform forms do (`decode`'s module docs): NAK writes it (`set_bit(91, true)`) and PR #4588
 //!   requires it for `BRXU` (`flow.cpp`, "native computed branch mode"). The uniform `BRA` also
@@ -68,6 +80,7 @@
 //! | `WARPSYNC` and `NANOSLEEP` forms 2, 3 and 7 (`0x548`, `0x748`, `0xf48`, `0x55d`, `0x75d`, `0xf5d`) | Unknown opcodes: NAK's `encode_alu(.., None, None, Some(src), None)` puts the one source in source 1, which only forms 1, 4, 5 and 6 hold, as for `MOV` | `decode::tests::control::control_rows_left_undecoded_are_unknown_opcodes` |
 //! | Bits 62 and 63 of `WARPSYNC` and `NANOSLEEP` forms 1, 5 and 6 (`0x348`, `0xb48`, `0xd48`, `0x35d`, `0xb5d`, `0xd5d`) | Rejected: NAK never modifies these sources (a `u32` mask; `OpNanosleep::time` is unmodified), as for `MOV` | `control_sources_reject_modifier_bits` |
 //! | `BAR` form `0x31d` | Unknown opcode: NAK's encoding of it is commented out and PR #4588's translator accepts only `0xb1d` (`visitor.cpp`, case `0xb1d`) | `control_rows_left_undecoded_are_unknown_opcodes` |
+//! | `BAR` `0xb1d`, bits 32..40, 74..79 and 87..91 not zero | Decoded (the row marks them known; PR #4588's translator refuses them, `Visitor::BAR`), bits 32..40 as an immediate and 87..91 undecoded, not as NAK's `0x31d` register and predicate: a conflict (see above) | `bar_canonical_word_is_unconditional`, `hand_built_words_of_each_form_decode` |
 //! | Bits 87..90 and 91 of the uniform `BRA`, bit 91 of `BRXU` | Required set (see above); the table marks them known only | `control_fixed_bits_are_required` |
 //!
 //! Every other control form's mask is its row's exactly
@@ -820,17 +833,27 @@ const fn nanosleep(form: AluForm) -> Form {
 
 /// `BAR` (`impl SM70Op for OpBar`: `set_opcode(0xb1d)`).
 pub(crate) const BAR_OPCODE: u16 = 0xb1d;
-/// `BAR`'s register (NAK's commented-out `0x31d` encoding: `set_reg_src(32..40, ..)`, "src0 ==
-/// src1"; a guess for `0xb1d`).
-pub(crate) const BAR_SRC: Field = Field::new(32, Gpr::BITS);
+/// `BAR`'s barrier number, bits 32..40 of the row's mask, read as an immediate. A guess:
+/// PR #4588 accepts only the word with these bits zero and calls it "BAR.SYNC 0 over the whole
+/// workgroup" (`ops_memory.cpp`, `Visitor::BAR`: `Require(Take(32, 32) == 0 && ..)`), while
+/// NAK's commented-out `0x31d` encoding puts a register here (`set_reg_src(32..40, ..)`, "src0 ==
+/// src1"): a conflict (module docs).
+pub(crate) const BAR_ID: Field = Field::new(32, 8);
 /// `BAR`'s reduction (the commented-out `set_field(74..76, ..)`: "00: RED.POPC, 01: RED.AND,
 /// 02: RED.OR").
 pub(crate) const BAR_RED: Field = Field::new(74, 2);
 /// `BAR`'s mode (the commented-out `set_field(77..79, ..)`: "00: SYNC, 01: ARV, 02: RED, 03:
 /// SCAN").
 pub(crate) const BAR_MODE: Field = Field::new(77, 2);
-/// Bit 80 of `BAR` (PR #4588's row; `Ignore(80, 1)`): named `defer_blocking`, a guess.
+/// Bit 80 of `BAR`, `.DEFER_BLOCKING`: PR #4588 ignores it and calls it "the deferred-blocking
+/// scheduling qualifier" (`ops_memory.cpp`, `Visitor::BAR`, `Ignore(80, 1)`). The spelling of the
+/// name is `nvdisasm`'s usual one, not checked against `nvdisasm`.
 pub(crate) const BAR_DEFER_BLOCKING: Field = Field::bit(80);
+/// Bits 87..91 of `BAR`, kept undecoded: what they mean in `0xb1d` is unknown. NAK's
+/// commented-out `0x31d` encoding puts a predicate here (`set_pred_src(87..90, 90, ..)`, `PT`
+/// being 7), but PR #4588 requires them zero in the barrier it accepts (`Take(81, 15) == 0`),
+/// which under that reading would be a barrier conditional on `P0`: a conflict (module docs).
+pub(crate) const BAR_UNKNOWN: Field = Field::new(87, 4);
 
 /// What a `BAR` does (NAK's comment on bits 77..79).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -900,20 +923,22 @@ impl BarRed {
     }
 }
 
-/// `BAR`: a workgroup barrier. NAK encodes every field zero, which reads as `BAR.SYNC` with
-/// register `R0` and predicate `P0`; the field meanings are guesses (module docs).
+/// `BAR`: a workgroup barrier. NAK and PR #4588 encode every field zero, which reads as
+/// `bar.sync 0x0`, an unconditional barrier `0` over the whole workgroup; the meanings of the
+/// other field values are guesses (module docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct OpBar {
     /// Bits 77..79.
     pub mode: BarMode,
     /// Bits 74..76.
     pub red: BarRed,
-    /// Bits 32..40.
-    pub src: Gpr,
+    /// Bits 32..40, the barrier number (a guess).
+    pub id: u8,
     /// Bit 80.
     pub defer_blocking: bool,
-    /// Bits 87..91.
-    pub pred: PredSrc,
+    /// Bits 87..91, undecoded ([`BAR_UNKNOWN`]): printed as `bits87=` when not zero. Not a
+    /// predicate: the barrier is conditional only through its guard.
+    pub unknown: u8,
 }
 
 impl Named for OpBar {
@@ -934,9 +959,9 @@ impl Display for OpBar {
             BarRed::Or => ".or",
         })?;
         flag(f, self.defer_blocking, ".defer_blocking")?;
-        write!(f, " {}", self.src)?;
-        if !self.pred.is_true() {
-            write!(f, ", {}", self.pred)?;
+        write!(f, " {:#x}", self.id)?;
+        if self.unknown != 0 {
+            write!(f, ", bits87={:#x}", self.unknown)?;
         }
         Ok(())
     }
@@ -948,9 +973,9 @@ fn decode_bar(reader: &mut Reader) -> Result<Op, DecodeError> {
     Ok(Op::Bar(OpBar {
         mode: BarMode::from_bits(reader.field(BAR_MODE)),
         red,
-        src: reader.gpr(BAR_SRC),
+        id: reader.byte(BAR_ID),
         defer_blocking: reader.flag(BAR_DEFER_BLOCKING),
-        pred: reader.pred_src(COND, COND_NOT),
+        unknown: reader.byte(BAR_UNKNOWN),
     }))
 }
 
@@ -1543,14 +1568,7 @@ pub(crate) const FORMS: &[Form] = &[
     warpsync(SOURCE_1_FORMS[3]),
     Form::new(
         BAR_OPCODE,
-        mask_of(&[
-            BAR_SRC,
-            BAR_RED,
-            BAR_MODE,
-            BAR_DEFER_BLOCKING,
-            COND,
-            COND_NOT,
-        ]),
+        mask_of(&[BAR_ID, BAR_RED, BAR_MODE, BAR_DEFER_BLOCKING, BAR_UNKNOWN]),
         decode_bar,
     ),
     Form::new(

@@ -132,17 +132,17 @@ pub(super) fn barriers() -> Vec<BoxedStrategy<Op>> {
     let bar = (
         0..BarMode::ALL.len(),
         0..BarRed::ALL.len(),
-        any_gpr(),
+        any::<u8>(),
         any::<bool>(),
-        any_pred_src(),
+        0..(1_u8 << BAR_UNKNOWN.width),
     )
-        .prop_map(|(mode, red, src, defer_blocking, pred)| {
+        .prop_map(|(mode, red, id, defer_blocking, unknown)| {
             Op::Bar(OpBar {
                 mode: BarMode::ALL[mode],
                 red: BarRed::ALL[red],
-                src,
+                id,
                 defer_blocking,
-                pred,
+                unknown,
             })
         });
     let nop = Just(Op::Nop(OpNop {}));

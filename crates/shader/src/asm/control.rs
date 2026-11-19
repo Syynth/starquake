@@ -6,8 +6,8 @@
 
 use super::{Encode, EncodeError, Writer, no_encoding};
 use crate::decode::control::{
-    BAR_DEFER_BLOCKING, BAR_MODE, BAR_OPCODE, BAR_RED, BAR_SRC, BMOV_BARRIER, BMOV_CLEAR,
-    BMOV_FROM_BARRIER_OPCODE, BMOV_SRC, BMOV_TO_BARRIER_OPCODE, BRA_OPCODE, BRA_U,
+    BAR_DEFER_BLOCKING, BAR_ID, BAR_MODE, BAR_OPCODE, BAR_RED, BAR_UNKNOWN, BMOV_BARRIER,
+    BMOV_CLEAR, BMOV_FROM_BARRIER_OPCODE, BMOV_SRC, BMOV_TO_BARRIER_OPCODE, BRA_OPCODE, BRA_U,
     BRA_UNIFORM_OPCODE, BRA_UPRED, BRA_UPRED_NOT, BRANCH_OFFSET, BREAK_OPCODE, BRX_OPCODE, BRX_REG,
     BRX_UNIFORM_REG, BRXU_OPCODE, BSSY_OFFSET, BSSY_OPCODE, BSYNC_OPCODE, CALL_NO_INC, CALL_OPCODE,
     COND, COND_NOT, CONV_BARRIER, DEPBAR_COUNT, DEPBAR_LE, DEPBAR_OPCODE, DEPBAR_SCOREBOARD,
@@ -195,10 +195,9 @@ impl Encode for OpBar {
         writer.opcode(BAR_OPCODE);
         writer.set(BAR_MODE, self.mode.bits());
         writer.set(BAR_RED, self.red.bits());
-        writer.gpr(BAR_SRC, self.src);
+        writer.set(BAR_ID, u64::from(self.id));
         writer.flag(BAR_DEFER_BLOCKING, self.defer_blocking);
-        cond(writer, self.pred);
-        Ok(())
+        writer.checked(BAR_UNKNOWN, "barrier bits 87..91", u64::from(self.unknown))
     }
 }
 

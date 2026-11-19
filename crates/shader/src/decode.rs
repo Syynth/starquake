@@ -27,14 +27,17 @@
 //! 1. the opcode has a form, else [`DecodeError::UnknownOpcode`];
 //! 2. no bit outside the form's known-bit mask is set, else [`DecodeError::UnknownBit`] naming
 //!    the lowest such bit, as PR #4588's `FirstUnknownBit` does (`frontend/ampere/isa.h`);
-//! 3. every fixed bit of the form is set (bit 91 of the uniform-register ALU forms), else
+//! 3. every fixed bit of the form is set (bit 91 of the uniform-register ALU forms; bits 87..89
+//!    and 91 of the uniform `BRA` and bit 91 of `BRXU`, `op::control`), else
 //!    [`DecodeError::MissingBit`] naming the lowest clear one;
 //! 4. the form's function reads its fields, else [`DecodeError::UnknownValue`] for a field whose
 //!    value names nothing (a vote or reduction operation past the defined ones: `op::control`);
 //! 5. every set bit was read, else [`DecodeError::UnknownBit`] naming the lowest unread one. A
-//!    form explains some bits only in some of its layouts: in the constant-buffer ALU forms a
-//!    bound buffer reads its index (bits 54..59) and a bindless one its uniform register (bits
-//!    32..38), so a word with the other layout's bits set fails here.
+//!    form explains some bits only in some of its layouts or operations: in the constant-buffer
+//!    ALU forms a bound buffer reads its index (bits 54..59) and a bindless one its uniform
+//!    register (bits 32..38), and `REDUX` reads its signed bit (73) only for `MIN` and `MAX`
+//!    (`op::control`), so a word with a bit the decoded layout or operation does not read fails
+//!    here.
 //!
 //! Step 5 is what lets an accepted word re-assemble to itself, scheduling bits aside
 //! (`tests::decode_then_assemble_round_trips` checks it on generated words of every form). PR #4588's table lets those layout bits through
@@ -48,7 +51,7 @@
 //! uniform-register forms require bit 91 (the table marks it known; the PR's translator
 //! requires it set, `Visitor::WideSlot`: "native uniform source flag"); `MOV`'s forms 2, 3 and
 //! 7, which the table has rows for, are unknown opcodes here (see `op::integer`). Pinned by
-//! `tests::mov_rejects_source_modifier_bits`, `tests::framework::uniform_forms_require_bit_91`,
+//! `tests::mov_rejects_source_modifier_bits`, `tests::framework::fixed_bits_are_required`,
 //! `tests::unknown_opcodes_name_the_opcode` and `tests::masks_match_the_reference_table`. The
 //! control group's divergences (the same two for `WARPSYNC` and `NANOSLEEP`, `BAR`'s form
 //! `0x31d`, and the fixed bits of the uniform `BRA` and of `BRXU`) are listed in `op::control`'s
