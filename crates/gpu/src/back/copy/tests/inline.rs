@@ -486,16 +486,18 @@ fn a_word_that_faults_keeps_the_words_before_it() {
 
 #[test]
 fn a_word_straddling_the_hole_writes_none_of_its_bytes() {
+    // Lines of 2 bytes, 2 apart: the word's first two bytes are line 0, before the hole; its
+    // last two are line 1, in it. The word is probed whole, so line 0 is not written either.
     let hole = GPU_BASE + 100 * PAGE_SIZE;
     let mem = memory_with_hole(100);
     let mut rig = Rig::new(&INLINE_A140);
     rig.configure(
         Dest::Pitch {
             address: hole - 2,
-            pitch: 0,
+            pitch: 2,
         },
-        4,
-        1,
+        2,
+        2,
     )
     .launch(&mem)
     .unwrap();

@@ -1940,3 +1940,42 @@ fn remap_selector_values_match_the_header_written_out() {
         assert_eq!(other, x);
     }
 }
+
+#[test]
+fn a_destination_line_crossing_into_the_hole_writes_nothing() {
+    // Three lines, the last starting 0x20 before the hole: its run crosses a page into it. The
+    // probe reads the first byte of each page a run reaches, so the hole is found before line 0
+    // is written.
+    let mem = memory_with_hole(100);
+    let copy = Copy {
+        source: Side::Pitch {
+            address: SRC,
+            pitch: 0x40,
+        },
+        destination: Side::Pitch {
+            address: HOLE - 0x20 - 2 * 0x100,
+            pitch: 0x100,
+        },
+        length: 0x40,
+        lines: 3,
+        multi_line: true,
+    };
+    let before = snapshot_with_hole(&mem);
+    assert_eq!(
+        launch(&mem, &regs_for(&copy), &mut Recorder::default()),
+        Err(CopyError::Fault {
+            side: CopySide::Destination,
+            fault: GpuFault::Unmapped { va: HOLE },
+        })
+    );
+    assert!(snapshot_with_hole(&mem) == before);
+}
+
+/// The mapped bytes of a `memory_with_hole(100)`.
+fn snapshot_with_hole(mem: &Memory) -> Vec<u8> {
+    [
+        read(mem, GPU_BASE, 100 * PAGE_SIZE),
+        read(mem, HOLE + PAGE_SIZE, (PAGES - 101) * PAGE_SIZE),
+    ]
+    .concat()
+}

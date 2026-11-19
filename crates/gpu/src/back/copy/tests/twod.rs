@@ -1224,3 +1224,50 @@ fn a_pitch_region_is_not_bounded_by_its_width() {
     .unwrap();
     assert_eq!(pixels(&mem, destination, blit.to, 4), rows);
 }
+
+#[test]
+fn point_sampling_clamps_to_the_last_source_pixel() {
+    // One source pixel stretched over 92,819, the narrowest destination whose rounded step
+    // (2^32 / 92,819, rounded up to 46,273) times its last index reaches 1.0, past the last
+    // source pixel; it is clamped back to it.
+    let width = 92_819u32;
+    let step = ((1u128 << 32) + u128::from(width / 2)) / u128::from(width);
+    assert_eq!(step, 46_273);
+    assert!(
+        (u128::from(width - 1) * step) >> 32 >= 1,
+        "the case must reach the clamp"
+    );
+    let mem = memory();
+    let source = Side::Pitch {
+        address: SRC,
+        pitch: 0x10,
+    };
+    let destination = Side::Pitch {
+        address: DST,
+        pitch: 0x20_0000,
+    };
+    let blit = Blit {
+        format: d::SET_SRC_FORMAT_V_A8,
+        source,
+        destination,
+        from: R {
+            x: 0,
+            y: 0,
+            w: 1,
+            h: 1,
+        },
+        to: R {
+            x: 0,
+            y: 0,
+            w: width,
+            h: 1,
+        },
+        bilinear: false,
+    };
+    run(&mem, &blit, &mut Recorder::default()).unwrap();
+    let pixel = read(&mem, low(SRC), 1)[0];
+    assert_eq!(
+        read(&mem, low(DST), u64::from(width)),
+        vec![pixel; width as usize]
+    );
+}
