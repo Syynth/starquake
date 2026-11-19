@@ -9,6 +9,8 @@ use super::memory::Place;
 use super::value::{Lane, low16, low32};
 use super::{ImageCall, Input, InterpError, Run, Space, Val, type_error};
 
+mod warp;
+
 /// The most arguments any opcode takes.
 const MAX_ARGS: usize = {
     let mut most = 0;
@@ -816,6 +818,9 @@ impl Run<'_> {
         }
         if let Some((width, is_float)) = cbuf_read(opcode) {
             return self.cbuf(&args, width, is_float).map(Some);
+        }
+        if let Handled::Done(effect) = self.warp(&args, op)? {
+            return Ok(effect);
         }
         if let Handled::Done(effect) = self.context(&args, opcode)? {
             return Ok(effect);

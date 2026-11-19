@@ -101,12 +101,23 @@
 //!   texture information or argument values ([`InterpError::ImageMismatch`]), and then a reply
 //!   not of the opcode's result type ([`InterpError::ImageReply`]) are errors, checked in that
 //!   order, and a refused call leaves the script as it was. Tests stay pure.
-//! - **Warp operations**: only `LaneId` (from [`SystemValues`]); votes, shuffles, ballots and
-//!   derivatives need the rest of the warp and are not supported yet.
+//! - **Warp operations** (`emit_spirv_warp.cpp`): `LaneId` (from [`SystemValues`]), and the
+//!   votes, `SubgroupBallot`, the four shuffles, `QuadBroadcast`, `QuadSwap` and
+//!   `GetInBoundsFromOp` of a shuffle on a warp whose **only active lane is this invocation**
+//!   (`exec`'s `warp` module, added by slice 12h): a vote gives its argument (`VoteEqual`
+//!   gives true), a ballot gives this lane's bit or zero, and a shuffle computes its source
+//!   lane and in-range flag by Eden's formulas, then gives its own value when the source is
+//!   out of range or is this lane, and [`INACTIVE_LANE_VALUE`] when it is another lane (SPIR-V
+//!   leaves a read of an inactive invocation undefined; translators read every lane and
+//!   select the active ones, as PR #4588's `REDUX` does). A lane id of [`WARP_SIZE`] or more
+//!   is [`InterpError::LaneOutsideWarp`] for the ballot, the shuffles and the quad operations. Results that need several active lanes are checked
+//!   as golden IR by the translators' tests. Derivatives and the lane masks are not
+//!   supported.
 //!
-//! An operation not listed (for example `PhiMove`, `Join`, the `Get*FromOp` pseudo-operations,
-//! `EmitVertex`, `EndPrimitive`, `InvocationInfo`, `RenderArea`, the `SR_WScaleFactor`
-//! values, the 64-bit and float atomics, the warp operations other than `LaneId`) is
+//! An operation not listed (for example `PhiMove`, `Join`, the `Get*FromOp` pseudo-operations
+//! other than `GetInBoundsFromOp` of a shuffle, `EmitVertex`, `EndPrimitive`,
+//! `InvocationInfo`, `RenderArea`, the `SR_WScaleFactor` values, the 64-bit and float atomics,
+//! the lane masks `SubgroupEqMask` to `SubgroupGeMask`, `FSwizzleAdd` and the derivatives) is
 //! [`InterpError::Unsupported`], naming the opcode; translator slices add semantics as they
 //! need them.
 //!
@@ -157,7 +168,7 @@ use thiserror::Error;
 use crate::decode::{Gpr, Pred, UniformPred, UniformReg};
 use crate::ir::{
     Attribute, BlockId, Function, Inst, Node, Opcode, Operand, Patch, Site, Terminator,
-    TextureInfo, Type, Value, VerifyError,
+    TextureInfo, Type, Value, VerifyError, WARP_SIZE,
 };
 
 pub use value::Val;
@@ -167,6 +178,13 @@ pub(crate) use exec::eval_immediates;
 /// The default [`Machine::step_limit`]: about a million steps, far more than a test of one
 /// instruction or a short sequence takes.
 pub const DEFAULT_STEP_LIMIT: u64 = 1 << 20;
+
+/// What a shuffle gives when its source is a lane other than the running invocation's, which
+/// is inactive on the interpreter's one-lane warp (see the module docs). The value is the
+/// interpreter's choice, not a reference's: SPIR-V leaves it undefined
+/// (`OpGroupNonUniformShuffle`). It is not zero, so a translator that uses such a read
+/// without selecting it away changes a test's result.
+pub const INACTIVE_LANE_VALUE: u32 = 0xdead_beef;
 
 /// How many per-thread register slots there are: every name a [`Gpr`] can hold (`RZ`'s slot
 /// is never read or written; the verifier refuses accesses to it).
@@ -461,6 +479,15 @@ pub enum InterpError {
         /// The scripted call's index (counting from 0 in this run).
         index: usize,
     },
+    /// A warp operation ran with a lane id the warp does not have ([`SystemValues::lane_id`]
+    /// of [`WARP_SIZE`] or more).
+    #[error("{at}: lane {lane} is outside the warp of {WARP_SIZE} lanes")]
+    LaneOutsideWarp {
+        /// The instruction.
+        at: Value,
+        /// The lane id.
+        lane: u32,
+    },
 }
 
 /// One invocation's state, inputs and outputs. Every field is plain data a test sets before a
@@ -579,6 +606,7 @@ impl Machine {
             steps: 0,
             previous: None,
             image_index: 0,
+            in_bounds: BTreeMap::new(),
         };
         match function.structure() {
             None => run.graph()?,
@@ -614,6 +642,9 @@ struct Run<'a> {
     previous: Option<BlockId>,
     /// How many scripted image calls this run has taken.
     image_index: usize,
+    /// Each shuffle's latest in-range flag, by its id, for `GetInBoundsFromOp` (one entry per
+    /// shuffle instruction, so bounded by the function's size).
+    in_bounds: BTreeMap<Value, bool>,
 }
 
 impl Run<'_> {
