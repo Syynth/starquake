@@ -57,8 +57,8 @@
 
 use crate::plan::TexelBox;
 use crate::present::{
-    self, AcquireAction, Acquired, Crop, ScreenRect, alpha_mode, blit_params, fit,
-    present_mode, shown_size, surface_format, surface_size, view_formats, write_format,
+    self, AcquireAction, Acquired, Crop, ScreenRect, alpha_mode, blit_params, fit, present_mode,
+    shown_size, surface_format, surface_size, view_formats, write_format,
 };
 use starquake_render::command::PresentDesc;
 use starquake_render::host_shaders::present as shader;

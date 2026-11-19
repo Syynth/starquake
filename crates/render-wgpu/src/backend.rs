@@ -46,8 +46,9 @@
 //! # Lost device
 //!
 //! When wgpu reports the device lost (or the render thread stops by a panic), the `create_*`
-//! calls for buffers, textures, views and samplers, `submit`, and a `wait` for a value not yet
-//! reached return [`RenderError::DeviceLost`]; a `submit` waiting for room and every `wait`
+//! calls for buffers, textures, views and samplers, `submit`, `set_present_target` (after a
+//! window's surface is made, which a lost device does not stop), and a `wait` for a value not
+//! yet reached return [`RenderError::DeviceLost`]; a `submit` waiting for room and every `wait`
 //! stop waiting; and the wake is called so the back thread looks. The run ends there
 //! (render-backend, "Errors and untrusted input": exit code 2, which `core` maps). Lists still
 //! queued or in flight never complete.
@@ -64,7 +65,17 @@
 //! The backend's results depend on the trait calls, the adapter and the [`WgpuConfig`] only: it
 //! reads no environment variable (wgpu's `from_env` instance options are not used) and no file
 //! (render-backend, "Render capture v2", "What R5 and R6 must do now"). Present feedback carries
-//! host time, which is never guest-visible.
+//! host time, which is never guest-visible; so does whether a frame presented to a window was
+//! shown or dropped, which depends on how far behind the render thread is when it takes the list
+//! (`State::queued_presents`, `crate::present::frame_outcome`) and on what the window answers.
+//!
+//! # Present targets
+//!
+//! `set_present_target` makes a window's surface on the calling thread before anything is
+//! queued (`crate::window`), so a refused target changes nothing; an accepted one is queued
+//! behind the lists already submitted and applies to the lists after it. `submit` adds each
+//! list's presents to `State::queued_presents`, and the render thread takes them off when it
+//! takes the list (or clears them with the queue when the device is lost).
 //!
 //! # What the trait cannot report
 //!
@@ -772,9 +783,11 @@ impl Backend for WgpuBackend {
     fn set_present_target(&self, target: PresentTarget) -> Result<(), RenderError> {
         let target = match target {
             PresentTarget::Offscreen => Target::Offscreen,
-            PresentTarget::Window(handles) => {
-                Target::Window(window::make_surface(&self.instance, &self.adapter, &handles)?)
-            }
+            PresentTarget::Window(handles) => Target::Window(window::make_surface(
+                &self.instance,
+                &self.adapter,
+                &handles,
+            )?),
             // `PresentTarget` is non-exhaustive: a later kind (an exported image) is not ours yet.
             _ => return Err(RenderError::Unsupported(UNKNOWN_TARGET)),
         };

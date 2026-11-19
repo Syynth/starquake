@@ -320,7 +320,11 @@ fn each_transform_puts_each_source_corner_in_its_place() {
     for transform in TRANSFORMS {
         let got = corners(crop, transform);
         for (corner, [x, y]) in got.iter().zip(screen_corners) {
-            assert_eq!(*corner, model(transform, x, y), "{transform:?} at ({x}, {y})");
+            assert_eq!(
+                *corner,
+                model(transform, x, y),
+                "{transform:?} at ({x}, {y})"
+            );
         }
     }
     // Two quarter turns are a half turn; a quarter turn each way is none.
@@ -334,7 +338,12 @@ fn each_transform_puts_each_source_corner_in_its_place() {
             model(PresentTransform::Rotate180, x, y)
         );
         assert_eq!(
-            compose(PresentTransform::Rotate90, PresentTransform::Rotate270, x, y),
+            compose(
+                PresentTransform::Rotate90,
+                PresentTransform::Rotate270,
+                x,
+                y
+            ),
             [x, y]
         );
     }

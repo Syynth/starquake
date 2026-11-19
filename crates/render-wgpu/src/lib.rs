@@ -15,7 +15,17 @@
 //! offscreen present target, which counts presents and reads dumped frames back; and the
 //! completion wake. What it refuses until later slices, each with a named error: shaders and
 //! pipelines (R6, [`SHADERS_NOT_YET`], [`PIPELINES_NOT_YET`]), draws and dispatches (R7,
-//! [`plan::DRAWS_NOT_YET`]), blits ([`plan::BLITS_NOT_YET`]), and window targets (R8).
+//! [`plan::DRAWS_NOT_YET`]) and blits ([`plan::BLITS_NOT_YET`]).
+//!
+//! Slice R8 adds window presentation (`window`, with its choices as pure functions in
+//! [`present`]): a wgpu surface made from the frontend's window, on the calling thread (on
+//! macOS the main thread, or [`NOT_MAIN_THREAD`]); a present mode that does not wait for the
+//! display while a newer frame is ready; the newest frame winning, the others counted as dropped
+//! in `PresentFeedback`; and the present blit, drawn into the window where the present stands in
+//! its list, so a later write to the image cannot change the frame shown (the ordering test,
+//! `backend::tests::window`). Surface creation needs no `unsafe` code: the window is handed over
+//! as an owned, shared object, which wgpu's safe constructor takes (verification 11;
+//! `starquake_render::window`).
 //!
 //! Where this backend refuses what the recording backend accepts, each a
 //! `RenderError::Unsupported` whose message names the rule ([`rules`] lists them with their

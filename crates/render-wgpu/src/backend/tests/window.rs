@@ -350,7 +350,9 @@ fn a_present_queued_behind_a_newer_one_is_dropped() {
                 commands: vec![r.fill(one), r.present(1, PresentTransform::Identity, true)],
             })
             .expect("accepted");
-        entered.recv_timeout(LIST_WAIT).expect("the sink was entered");
+        entered
+            .recv_timeout(LIST_WAIT)
+            .expect("the sink was entered");
         assert_eq!(r.gpu.completed(), first);
         // Two lists queue behind it, each with a present.
         let lists = [(two, 2), (three.clone(), 3)].map(|(bytes, frame)| {
@@ -528,5 +530,39 @@ fn a_rectangle_of_a_layer_is_shown() {
         }
         assert_eq!(gpu.take_readback(id), Some(Readback::Bytes(expected)));
         assert_eq!(gpu.host_errors(), 0);
+    });
+}
+
+/// Once the device is lost, a present target is refused like every other call that would queue
+/// work; a window that cannot be made is refused for that reason first.
+#[test]
+fn a_lost_device_refuses_a_present_target() {
+    bounded(|| {
+        let counter = Arc::new(WakeCounter::new());
+        let Some(gpu) = open(
+            "lost_target",
+            WgpuConfig::DEFAULT,
+            counter.completion_wake(),
+        ) else {
+            return;
+        };
+        assert_eq!(gpu.set_present_target(PresentTarget::Offscreen), Ok(()));
+        let seen = counter.count();
+        gpu.lose_device_for_test();
+        assert!(counter.wait_beyond(seen, LIST_WAIT), "the loss is seen");
+        assert_eq!(
+            gpu.set_present_target(PresentTarget::Offscreen),
+            Err(RenderError::DeviceLost)
+        );
+        let window = WindowHandles::new(Arc::new(NoWindow), WindowSize::new(2, 2));
+        let first = if cfg!(target_os = "macos") {
+            NOT_MAIN_THREAD
+        } else {
+            NO_SURFACE
+        };
+        assert_eq!(
+            gpu.set_present_target(PresentTarget::Window(window)),
+            Err(RenderError::Unsupported(first))
+        );
     });
 }

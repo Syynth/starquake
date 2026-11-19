@@ -42,6 +42,11 @@
 //! are host memory the budget does not count, each within the widest and the tallest level the
 //! list clears in its format; wgpu releases them when the list's last submission finishes.
 //!
+//! A present to a window that the frame queue keeps is blitted into the window's texture at
+//! its place in the list (`crate::window`, "The present blit"), and the window's texture is
+//! presented after the list's last submission. A present to the offscreen target encodes
+//! nothing but a dumped frame's read.
+//!
 //! # Settling
 //!
 //! wgpu reports each list's last submission finished through `Queue::on_submitted_work_done`,
