@@ -468,53 +468,16 @@ pub const INCREMENT_VALUE: u32 = 1 << 8;
 /// `BuildIncrementCommandList` pushes two increments).
 pub const FENCE_INCREMENT_AMOUNT: u32 = 2;
 
-/// The most GP entries a channel's submission queue holds (decided by the owner, decision 12;
-/// gpu-protocol, "Back-pressure", where the figure is a **guess** at a size no title reaches).
-/// The front enforces it ([`Submitted::Full`]); gsv refuses a single submission larger than it,
-/// which could never be queued. Shared with `crates/gpu` when its front defines it.
-pub const CHANNEL_QUEUE_ENTRIES: usize = 65_536;
+/// The GPU front's queue bound, [`GpfifoEntry`], [`Submission`], [`Submitted`] and
+/// [`ChannelConfig`]: graphics-server's shared types, defined in `crates/gpu` with the front that
+/// enforces the bound (gpu-protocol slice G14) and re-exported here, where gsv's code names them.
+pub use starquake_gpu::interface::{
+    CHANNEL_QUEUE_ENTRIES, ChannelConfig, GpfifoEntry, Submission, Submitted,
+};
 
 /// The most bytes of GP entries a submission's request is read for: [`CHANNEL_QUEUE_ENTRIES`]
 /// entries. The inline input of `SubmitGPFIFO` 0x1B is read up to this.
 pub const MAX_ENTRY_BYTES: usize = CHANNEL_QUEUE_ENTRIES * GP_ENTRY_BYTES;
-
-/// One GP entry as the guest wrote it: 8 bytes, little-endian (graphics-server's `GpfifoEntry`;
-/// `starquake_gpu::fifo::GpEntry::from_raw` decodes it). Kept raw so that a submission is saved
-/// and handed on exactly as sent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct GpfifoEntry(pub u64);
-
-/// What gsv hands the GPU front for one `SubmitGPFIFO` (graphics-server's `Submission`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Submission {
-    /// The entries, in order.
-    pub entries: Vec<GpfifoEntry>,
-    /// The fence to wait on first (flag bit 0).
-    pub wait: Option<Fence>,
-    /// How many increments of the channel's syncpoint to perform after the entries.
-    pub increments: u32,
-    /// Whether to wait for idle before the increments (flag bit 4 clear).
-    pub wfi: bool,
-}
-
-/// What [`ChannelFront::submit`] answers (graphics-server's `Submitted`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Submitted {
-    /// The submission is in the channel's queue.
-    Queued,
-    /// The channel's queue cannot take it; nothing was queued, and `GpuQueueRoom` follows once
-    /// there is room.
-    Full,
-}
-
-/// What a GPU channel is made with (graphics-server's `ChannelConfig`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ChannelConfig {
-    /// The address space its addresses resolve in.
-    pub space: AsId,
-    /// The syncpoint its increments go to.
-    pub syncpoint: SyncpointId,
-}
 
 /// The GPU front refused a request (graphics-server's `GpuError`; what it holds is #12's).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]

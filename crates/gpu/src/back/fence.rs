@@ -41,11 +41,14 @@
 //! counted in [`ClosedCounts`]:
 //!
 //! - the ring is empty ([`CloseReason::RingEmpty`]): [`Fences::wait`] closes before it sleeps;
-//! - a present ([`CloseReason::Present`]) or a wait for idle ([`CloseReason::WaitForIdle`]): the
+//! - a present ([`CloseReason::Present`]), a wait for idle ([`CloseReason::WaitForIdle`]) or a
+//!   `SET_REFERENCE` ([`CloseReason::SetReference`], decided by the owner on 2026-11-18): the
 //!   executor (slice G19) calls [`Fences::close`];
-//! - a fenced release whose address has an unlatched registered waiter
-//!   ([`CloseReason::Waiter`]): [`Fences::attach`] closes after attaching it, so the parked
-//!   channel is not left waiting on recording;
+//! - a fenced release one of whose 32-bit words has an unlatched registered waiter of the
+//!   release's address space ([`CloseReason::Waiter`]): [`Fences::attach`] closes after
+//!   attaching it, so the parked channel is not left waiting on recording. An 8-byte release
+//!   covers two words and a 16-byte one four, and each is looked at
+//!   (`a_waiter_on_a_wide_releases_high_word_closes_the_open_list`);
 //! - [`CLOSE_AFTER`] (1 ms, a **guess**, so that a CPU spinning on a semaphore is not starved)
 //!   of recording ([`CloseReason::Elapsed`]): [`Fences::record`] measures from the open list's
 //!   first command, on [`FenceClock::elapsed`], and closes once a command is recorded at or past
@@ -81,8 +84,11 @@
 //!   [`FenceClock::gpu_timestamp`] at [`crate::sema::RELEASE_TIMESTAMP_OFFSET`], in one write.
 //! - **A reduction** ([`ReleaseOp::Reduce`]) reads the semaphore at the payload's width, applies
 //!   [`crate::sema::Reduction`] and writes the result back as a release of that value would.
-//! - Either then latches every waiter the low 32 bits of the new value meet
-//!   ([`WaiterTable::on_write`]); [`Report::latched`] says whether one was.
+//! - Either then latches, for each 32-bit word the release wrote (one for a 4-byte release, two
+//!   for an 8-byte one, four for the 16-byte structure), every waiter of the release's address
+//!   space on that word's address that the word meets ([`WaiterTable::on_write`]);
+//!   [`Report::latched`] says whether one was. A waiter on the high word of an 8-byte release
+//!   is latched by that word (`a_wide_release_latches_a_waiter_on_its_high_word`).
 //! - A release whose memory access fails ([`GpuFault`]) writes nothing that the memory refused,
 //!   latches nothing, and is logged at warning level and listed in [`Report::failed`]; the
 //!   actions after it are still performed.
@@ -143,6 +149,16 @@
 //!   rather than draining the ring first. A completion is still performed no sooner than the
 //!   entry the back thread is handling when it lands has been handled
 //!   (`completed_work_is_performed_while_the_ring_stays_busy`).
+//! - **Every 32-bit word of a wide release latches.** Eden-NX2's query path latches only the
+//!   32-bit word at the release's address: it calls `OnWrite(cpu_addr,
+//!   static_cast<u32>(...value))` (or `OnWrite(cpu_addr, payload)` with the 32-bit payload) once
+//!   per release (`QueryCacheBase::CounterReport` in
+//!   `eden-nx2/src/video_core/query_cache/query_cache.h` @ 50fa86bb). Here every 32-bit word
+//!   an 8- or 16-byte release writes is latched, the timestamp's halves included, and each is
+//!   looked at for the waiter close trigger ([`WaiterTable::has_waiter`]), so a waiter on the
+//!   high word of a 64-bit semaphore is not left parked
+//!   (`a_wide_release_latches_a_waiter_on_its_high_word`,
+//!   `a_waiter_on_a_wide_releases_high_word_closes_the_open_list`).
 //! - **A failed release is reported and skipped.** Eden-NX2's QMD callbacks refuse a release to
 //!   an unmapped range when it is requested (`IsFullyMappedRange`) and its query path writes
 //!   through a host pointer; here the memory is checked when the release is performed, and a
@@ -161,8 +177,14 @@
 //!   release's [`GpuMemory`] like any other; turning them into increments belongs to the
 //!   production memory (G22), which is the one that translates addresses.
 //! - Releases name no address space, so each [`FencedAction::Release`] carries the memory it
-//!   writes, chosen by the executor when it attaches the action; the waiter table's key is
-//!   discussed in its own docs.
+//!   writes and that memory's [`AsId`], chosen by the executor when it attaches the action
+//!   (whether the ring's `Release` should name its channel is the executor's, slice G19); the
+//!   waiter table's key is discussed in its own docs.
+//! - A syncpoint increment closes nothing: a channel waiting on a submission fence is a front
+//!   wait (slice G14, `crate::front`), not a waiter in the table, so the open list it waits on is
+//!   closed by the other triggers (the ring empties once the front has nothing to send; at the
+//!   latest [`CLOSE_AFTER`] of recording). Decided in slice G14; a measurement of fence-wait
+//!   latency would show whether an increment trigger is worth adding.
 
 mod waiters;
 
@@ -178,7 +200,7 @@ use std::time::Duration;
 use starquake_render::{Backend, Command, CommandList, FenceValue, RenderError};
 use thiserror::Error;
 
-use crate::interface::{Completions, GpuCompletion, SyncpointId, Ticket, VmUpdate};
+use crate::interface::{AsId, Completions, GpuCompletion, SyncpointId, Ticket, VmUpdate};
 use crate::memory::{GpuFault, GpuMemory};
 use crate::ring::{Consumer, MarkerToken, PopError, Popped, Release, ReleaseOp, RingEntry};
 use crate::sema::{PayloadSize, RELEASE_TIMESTAMP_OFFSET, ReleaseForm};
@@ -208,16 +230,24 @@ pub trait FrontWake: Send + Sync {
 }
 
 /// An ordered update or barrier to apply when its marker is performed ("Ordered address-table
-/// updates and barriers", step 4).
+/// updates and barriers", step 4). The front loop (slice G14) makes them, and keeps them by
+/// marker token for the executor in [`crate::front::OrderedTable`].
 #[derive(Clone)]
 pub struct OrderedUpdate {
-    /// The address table the update applies to.
-    pub vm: Arc<GpuVm>,
-    /// The update; `None` for a barrier.
-    pub update: Option<VmUpdate>,
+    /// The change to an address table; `None` for a barrier, which names none.
+    pub change: Option<VmChange>,
     /// The ticket reported as [`GpuCompletion::GpuOrdered`] once applied; `None` when gsv asked
     /// for no report.
     pub ticket: Option<Ticket>,
+}
+
+/// One update of one address table.
+#[derive(Clone)]
+pub struct VmChange {
+    /// The address table the update applies to.
+    pub vm: Arc<GpuVm>,
+    /// The update.
+    pub update: VmUpdate,
 }
 
 /// An action performed only after the host GPU has finished the work recorded before it.
@@ -227,6 +257,8 @@ pub enum FencedAction {
     Release {
         /// The address space the release writes, as the executor resolved it.
         memory: Arc<dyn GpuMemory>,
+        /// The id of that address space: only its waiters are latched (slice G14).
+        space: AsId,
         /// What to write.
         release: Release,
     },
@@ -254,6 +286,11 @@ pub enum CloseReason {
     Waiter,
     /// The open list has recorded for [`CLOSE_AFTER`].
     Elapsed,
+    /// A `SET_REFERENCE` arrived ([`RingEntry::SetReference`]): the back closes the open list
+    /// with no fenced action attached, as Eden-NX2's back does (`puller.cpp`, `RefCnt` →
+    /// `SignalReference`; decided by the owner on 2026-11-18). The executor (slice G19) calls
+    /// [`Fences::close`] with it.
+    SetReference,
 }
 
 /// When fenced actions are performed.
@@ -348,6 +385,8 @@ pub struct ClosedCounts {
     pub waiter: u64,
     /// [`CloseReason::Elapsed`].
     pub elapsed: u64,
+    /// [`CloseReason::SetReference`].
+    pub set_reference: u64,
 }
 
 impl ClosedCounts {
@@ -358,6 +397,7 @@ impl ClosedCounts {
             CloseReason::WaitForIdle => &mut self.wait_for_idle,
             CloseReason::Waiter => &mut self.waiter,
             CloseReason::Elapsed => &mut self.elapsed,
+            CloseReason::SetReference => &mut self.set_reference,
         };
         *slot = slot.saturating_add(1);
     }
@@ -422,13 +462,48 @@ fn low_word(value: u64) -> u32 {
     u32::from_le_bytes([a, b, c, d])
 }
 
-/// Performs `release` through `memory` (module docs, "Completion") and returns the value the
-/// semaphore now holds.
+/// The bytes a performed release wrote, from its address.
+struct Written {
+    bytes: [u8; LARGEST_RELEASE_BYTES],
+    len: usize,
+}
+
+impl Written {
+    /// Each 32-bit word written, with its GPU address, in address order (a word whose address
+    /// would pass `u64::MAX` is left out; the write itself would have failed).
+    fn words(&self, address: u64) -> impl Iterator<Item = (u64, u32)> + '_ {
+        let (words, _) = self.bytes.get(..self.len).unwrap_or(&[]).as_chunks::<4>();
+        (0u64..).zip(words).filter_map(move |(index, bytes)| {
+            let at = address.checked_add(index.checked_mul(SEMAPHORE_WORD_BYTES)?)?;
+            Some((at, u32::from_le_bytes(*bytes)))
+        })
+    }
+}
+
+/// Bytes of the 32-bit semaphore word an acquire reads: the unit a release's words are latched
+/// in.
+const SEMAPHORE_WORD_BYTES: u64 = 4;
+
+/// The GPU address of each 32-bit word `release` writes, with its index (module docs, "Closing
+/// the open list"): one for a 4-byte release, two for an 8-byte one, four for the 16-byte
+/// structure.
+fn release_words(release: &Release) -> impl Iterator<Item = (u64, u64)> + '_ {
+    let words = release.form.bytes() / SEMAPHORE_WORD_BYTES;
+    (0..words).filter_map(move |index| {
+        let at = release
+            .address
+            .checked_add(index.checked_mul(SEMAPHORE_WORD_BYTES)?)?;
+        Some((at, index))
+    })
+}
+
+/// Performs `release` through `memory` (module docs, "Completion") and returns the bytes it
+/// wrote.
 fn write_release(
     memory: &dyn GpuMemory,
     release: &Release,
     clock: &dyn FenceClock,
-) -> Result<u64, GpuFault> {
+) -> Result<Written, GpuFault> {
     let address = release.address;
     let size = release.form.size;
     let payload = match size {
@@ -457,9 +532,11 @@ fn write_release(
     if release.form.timestamp {
         put(&mut bytes, TIMESTAMP_AT, clock.gpu_timestamp());
     }
-    let len = usize::try_from(release.form.bytes()).unwrap_or(LARGEST_RELEASE_BYTES);
+    let len = usize::try_from(release.form.bytes())
+        .unwrap_or(LARGEST_RELEASE_BYTES)
+        .min(LARGEST_RELEASE_BYTES);
     memory.write(address, bytes.get(..len).unwrap_or(&bytes))?;
-    Ok(value)
+    Ok(Written { bytes, len })
 }
 
 /// The largest form a release writes: the 16-byte structure with a timestamp.
@@ -546,10 +623,11 @@ impl Fences {
             return Ok(Attached::Performed(self.perform_now(vec![action])));
         }
         if !self.open.commands.is_empty() {
-            let waited_on = matches!(
-                &action,
-                FencedAction::Release { release, .. } if self.env.waiters.has_waiter(release.address)
-            );
+            let waited_on = match &action {
+                FencedAction::Release { space, release, .. } => release_words(release)
+                    .any(|(address, _)| self.env.waiters.has_waiter(*space, address)),
+                FencedAction::Increment(_) | FencedAction::Marker { .. } => false,
+            };
             self.open_actions.push(action);
             if waited_on {
                 return Ok(self
@@ -682,34 +760,37 @@ impl Fences {
     /// Performs one action into `report` (module docs, "Completion").
     fn perform(&mut self, action: FencedAction, report: &mut Report) {
         match action {
-            FencedAction::Release { memory, release } => {
-                match write_release(&*memory, &release, &*self.env.clock) {
-                    Ok(value) => {
-                        report.released = report.released.saturating_add(1);
-                        if self.env.waiters.on_write(release.address, low_word(value)) {
+            FencedAction::Release {
+                memory,
+                space,
+                release,
+            } => match write_release(&*memory, &release, &*self.env.clock) {
+                Ok(written) => {
+                    report.released = report.released.saturating_add(1);
+                    for (address, word) in written.words(release.address) {
+                        if self.env.waiters.on_write(space, address, word) {
                             report.latched = true;
                         }
                     }
-                    Err(fault) => {
-                        let failure = ReleaseFailure {
-                            address: release.address,
-                            fault,
-                        };
-                        tracing::warn!(%failure, "fenced release failed");
-                        self.counters.failed_releases =
-                            self.counters.failed_releases.saturating_add(1);
-                        report.failed.push(failure);
-                    }
                 }
-            }
+                Err(fault) => {
+                    let failure = ReleaseFailure {
+                        address: release.address,
+                        fault,
+                    };
+                    tracing::warn!(%failure, "fenced release failed");
+                    self.counters.failed_releases = self.counters.failed_releases.saturating_add(1);
+                    report.failed.push(failure);
+                }
+            },
             FencedAction::Increment(id) => {
                 self.env.syncpoints.increment(id);
                 report.incremented = report.incremented.saturating_add(1);
             }
             FencedAction::Marker { token, ordered } => {
                 if let Some(ordered) = ordered {
-                    if let Some(update) = ordered.update {
-                        ordered.vm.apply(&update);
+                    if let Some(change) = ordered.change {
+                        change.vm.apply(&change.update);
                     }
                     if let Some(ticket) = ordered.ticket {
                         self.env

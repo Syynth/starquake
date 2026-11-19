@@ -317,11 +317,10 @@ pub const VA_RANGE_KIND: u64 = 1;
 /// The most a sync byte may be (PR: `sync <= 1` in every job's checks).
 pub const MAX_SYNC: u8 = 1;
 
-/// A GPU address space, as gsv numbers it (gpu 33). Graphics-server's `AsId`: a shared type of
-/// the spec's interface block, kept here until `crates/gpu` defines it with the rest of
-/// `GpuFront` (gpu-protocol's front slice).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct AsId(pub u32);
+/// A GPU address space, as gsv numbers it (gpu 33): graphics-server's `AsId`, defined in
+/// `crates/gpu` with the front that groups channels by it (gpu-protocol slice G14) and
+/// re-exported here.
+pub use starquake_gpu::interface::AsId;
 
 /// What gsv asks of the GPU's front for its address tables: the part of the spec's `GpuFront`
 /// this slice uses, with the spec's names and signatures (graphics-server, "What this spec

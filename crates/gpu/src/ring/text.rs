@@ -13,6 +13,7 @@
 //! marker token=0x7
 //! present address=0x40000 width=1280 height=720 pitch=20 block-height=4 format=1 shown=0,0,1280,720 layer=1 display=0
 //! capture command=start
+//! set-reference channel=1 value=0x5
 //! ```
 //!
 //! [`RingEntry`]'s `Display` writes this form, with addresses, classes, methods, values, payloads,
@@ -257,6 +258,9 @@ impl fmt::Display for RingEntry<'_> {
             Self::CaptureControl(command) => {
                 write!(f, " command={}", name_of(&CAPTURE_NAMES, *command))
             }
+            Self::SetReference { channel, value } => {
+                write!(f, " channel={} value={value:#x}", channel.0)
+            }
         }
     }
 }
@@ -489,6 +493,10 @@ pub fn parse_entry(line: &str) -> Result<RingEntry<'static>, ParseError> {
         },
         Kind::Present => present(&mut fields)?,
         Kind::CaptureControl => RingEntry::CaptureControl(fields.named("command", &CAPTURE_NAMES)?),
+        Kind::SetReference => RingEntry::SetReference {
+            channel: ChannelId(fields.number("channel")?),
+            value: fields.number("value")?,
+        },
     };
     fields.finish()?;
     Ok(entry)

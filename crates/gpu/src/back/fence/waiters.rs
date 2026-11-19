@@ -25,20 +25,24 @@
 //!   waiter carries an [`AcquireOp`], all five of them latch by [`AcquireOp::is_met`], because
 //!   the spec suspends on `SEM_EXECUTE` acquires too ("Semaphore acquires"). Pinned by
 //!   `tests::waiters::every_acquire_condition_latches`.
-//! - **Keyed by GPU address, not device address.** Eden-NX2 keys a waiter by the CPU address its
-//!   semaphore translates to, so channels of different address spaces that share memory meet.
-//!   Neither a release nor a channel names its address space yet (the spec's `AsId` has no type
-//!   until G14 and G21), so a waiter here is keyed by the GPU address the acquire read. Two
-//!   address spaces that map one semaphore at different GPU addresses do not meet, and two that
-//!   use one GPU address for different memory latch each other's waiters. **Open** until the
-//!   address-space id exists; pinned by `tests::waiters::waiters_meet_by_gpu_address_alone`.
+//! - **Keyed by address space and GPU address, not device address.** Eden-NX2 keys a waiter by
+//!   the CPU address its semaphore translates to, so channels of different address spaces that
+//!   share memory meet. Here a waiter is keyed by its channel's address space ([`AsId`], from the
+//!   channel's `ChannelConfig`) and the GPU address the acquire read, and a release latches only
+//!   the waiters of the address space it was issued in (slice G14). Two address spaces that use
+//!   one GPU address for different memory no longer latch each other's waiters
+//!   (`tests::waiters::waiters_of_another_address_space_are_not_latched`); two that map one
+//!   semaphore (shared memory) at any GPU address do not meet, so a waiter of one is resumed by
+//!   a release in the other only through the front's recheck (its poll, decision 3). **Open**:
+//!   a trace of two address spaces sharing a semaphore would show whether the latch must follow
+//!   the memory, as Eden-NX2's does.
 //! - **[`WaiterTable::has_waiter`]** is new: the back closes its open command list when a fenced
 //!   release's address has an unlatched waiter (the spec's close trigger; Eden-NX2 has none).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use crate::interface::ChannelId;
+use crate::interface::{AsId, ChannelId};
 use crate::sema::AcquireOp;
 
 /// A channel parked on an acquire: the semaphore it reads and the condition it waits for.
@@ -46,6 +50,8 @@ use crate::sema::AcquireOp;
 pub struct Waiter {
     /// The parked channel.
     pub channel: ChannelId,
+    /// The channel's address space: only a release issued in it latches the waiter.
+    pub space: AsId,
     /// The GPU address of the 32-bit semaphore word the acquire reads.
     pub address: u64,
     /// The condition.
@@ -115,28 +121,32 @@ impl WaiterTable {
             .any(|e| e.waiter.channel == channel && e.latched)
     }
 
-    /// Whether an unlatched waiter reads the semaphore at `address`: a channel is parked on it
-    /// and a release there would resume it.
-    pub fn has_waiter(&self, address: u64) -> bool {
+    /// Whether an unlatched waiter of address space `space` reads the semaphore at `address`: a
+    /// channel is parked on it and a release there would resume it.
+    pub fn has_waiter(&self, space: AsId, address: u64) -> bool {
         if self.count.load(Ordering::SeqCst) == 0 {
             return false;
         }
         self.lock()
             .iter()
-            .any(|e| e.waiter.address == address && !e.latched)
+            .any(|e| e.waiter.space == space && e.waiter.address == address && !e.latched)
     }
 
-    /// A GPU write left `value` in the 32-bit semaphore word at `address`: latches every
-    /// unlatched waiter on that address whose condition `value` meets, and returns whether it
-    /// latched any.
-    pub fn on_write(&self, address: u64, value: u32) -> bool {
+    /// A GPU write in address space `space` left `value` in the 32-bit semaphore word at
+    /// `address`: latches every unlatched waiter of that space on that address whose condition
+    /// `value` meets, and returns whether it latched any.
+    pub fn on_write(&self, space: AsId, address: u64, value: u32) -> bool {
         if self.count.load(Ordering::SeqCst) == 0 {
             return false;
         }
         let mut latched = false;
         for entry in self.lock().iter_mut() {
             let w = entry.waiter;
-            if w.address == address && !entry.latched && w.op.is_met(value, w.payload) {
+            if w.space == space
+                && w.address == address
+                && !entry.latched
+                && w.op.is_met(value, w.payload)
+            {
                 entry.latched = true;
                 latched = true;
             }

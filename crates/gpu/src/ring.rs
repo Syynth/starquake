@@ -3,7 +3,7 @@
 //!
 //! The front sends the back everything that survives it, as [`RingEntry`]s: class binds,
 //! resolved register writes, runs of data words, releases, syncpoint increments, wait-for-idle,
-//! memory operations, markers, presents and capture control. Entries are plain data, so a stream
+//! `SET_REFERENCE`, memory operations, markers, presents and capture control. Entries are plain data, so a stream
 //! of them can be printed, captured and replayed.
 //!
 //! - `entry` owns [`RingEntry`] and the ring-only data it carries; the types it shares with gsv
@@ -16,7 +16,8 @@
 //!   [`Producer`] for the front and a [`Consumer`] for the back, with back-pressure and batched
 //!   publishing, and a [`ConsumerWake`] that wakes the back without an entry (slice G15).
 //!
-//! What uses the ring (the front loop, G14; the back's executor, G19) is not here yet.
+//! The front loop (G14, [`crate::front`]) pushes into it; the back's executor (G19) is not here
+//! yet.
 
 mod encode;
 mod entry;

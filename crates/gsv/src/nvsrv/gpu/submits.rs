@@ -138,11 +138,9 @@ pub const MAX_WAITING_ENTRIES: usize = CHANNEL_QUEUE_ENTRIES;
 
 /// What a waiting submission of `entries` GP entries counts against [`MAX_WAITING_ENTRIES`]: its
 /// entries, and at least one, so that submissions with no entries cannot pile up without bound
-/// either (module docs, "The cap": a departure from the ruling's wording, for the owner).
-#[must_use]
-pub const fn charge(entries: usize) -> usize {
-    if entries == 0 { 1 } else { entries }
-}
+/// either (module docs, "The cap": a departure from the ruling's wording, for the owner). The
+/// GPU crate's one definition, which the front's queue bound charges too.
+pub use starquake_gpu::interface::charge;
 
 /// One waiting submission.
 struct Waiting {
