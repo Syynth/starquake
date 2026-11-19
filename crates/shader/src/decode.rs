@@ -80,6 +80,12 @@ pub(crate) use fields::*;
 #[cfg(test)]
 pub(crate) use form::{GROUP_HOOKS, GROUPS};
 pub use instruction::{Field, Instruction, LengthError};
+// The control-instruction opcodes and fields program capture reads before full decoding
+// (`crate::capture`), named once in `op::control`.
+pub(crate) use op::control::{
+    BRA_OPCODE, BRANCH_OFFSET, BSSY_OFFSET, BSSY_OPCODE, CALL_OPCODE, COND, COND_NOT,
+    EXIT_KEEP_REF_COUNT, EXIT_NO_AT_EXIT, EXIT_OPCODE, RET_OPCODE,
+};
 pub use op::*;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use op::{Named, attribute, control, float, integer, op_list};

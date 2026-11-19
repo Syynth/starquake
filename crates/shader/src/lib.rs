@@ -23,6 +23,9 @@
 //! stage, the attributes and system values read and written, the pixel interpolation modes, the
 //! colour targets and the local memory size.
 //!
+//! Slice 3 captures a guest program ([`capture`]): it finds where the program ends, holds it to
+//! the instruction cap, extends it through jump-table targets, and hashes its bytes.
+//!
 //! Slice 6h decodes the control and warp group (`decode`'s `OpBra` to `OpNanosleep`):
 //! branches with their [`decode::BranchOffset`], convergence barriers, calls and returns, and
 //! warp votes, shuffles, matches and reductions; `JMX` and `BPT` stay shells.
@@ -36,6 +39,7 @@
 
 #[cfg(feature = "test-support")]
 pub mod asm;
+pub mod capture;
 pub mod decode;
 pub mod driver_constants;
 pub mod exchange;
