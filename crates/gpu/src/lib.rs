@@ -7,6 +7,7 @@
 //! render backend.
 
 pub mod back;
+pub mod channel;
 pub mod classes;
 pub mod field;
 pub mod fifo;
