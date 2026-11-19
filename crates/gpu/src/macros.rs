@@ -160,16 +160,19 @@
 //!   split front runs them only with its x86-64 JIT and skips them elsewhere (`FrontRunMacro`'s
 //!   `#else`) (`compute_uses_the_3d_store_until_it_uploads` runs compute calls).
 //!
-//! # Departures from the approved spec (owner questions)
+//! # The macro upload offset
 //!
-//! - **The macro upload offset is not a register.** The spec's "Engine methods: the register
-//!   file" lists, among the side effects computed on the front, "the macro upload pointer".
-//!   Both references keep it inside the code store as a word offset (`native_write_offset =
-//!   pointer * 3`, `MacroEngine::ClearCode` in `eden-nx2/src/video_core/macro.h`, and the same
-//!   in `eden-pr4588/src/video_core/macro.h`), and leave method 0x45 as written. A Turing
-//!   instruction is three words, so no register value can hold the offset; this module keeps
-//!   it in the store, and the register file (slice G9) leaves 0x45 alone
-//!   (`the_upload_offset_lives_in_the_code_store`).
+//! The upload offset is not a register: the spec's "Engine methods: the register file", step 2,
+//! leaves `LOAD_MME_INSTRUCTION_RAM_POINTER` (method 0x45) as written and has the macro host
+//! keep the upload as a word offset, the pointer times 3 (decided by the owner, 2026-11-18). Both
+//! references do the same (`native_write_offset = pointer * 3`, `MacroEngine::ClearCode` in
+//! `eden-nx2/src/video_core/macro.h`, and the same in `eden-pr4588/src/video_core/macro.h`). A
+//! Turing instruction is three words, so no register value can hold the offset; this module
+//! keeps it in the store, and the register file (slice G9) leaves 0x45 alone
+//! (`the_upload_offset_lives_in_the_code_store`).
+//!
+//! # Departure from the approved spec (owner question)
+//!
 //! - **Two code stores per process.** The spec's "Macros" says: "The front holds the code and
 //!   the 3D and compute engines' start tables", and that Eden-NX2 "keeps one code store for all
 //!   of a process's channels (row 53); this design does the same". Eden-NX2's (and PR #4588's)

@@ -172,7 +172,9 @@ pub struct SideEffect {
 ///    252 is a **guess**; both are divergences in the module docs of `regs`, pinned by
 ///    `root_table_offset_advances`).
 ///
-/// The macro upload pointer is not here: see "Divergences" in the `regs` module docs.
+/// The macro upload pointer is not here: the macro host keeps the upload as a word offset
+/// (gpu-protocol, "Engine methods: the register file", step 2; decided by the owner,
+/// 2026-11-18), pinned by `instruction_upload_leaves_its_pointer_alone`.
 pub const SIDE_EFFECTS_3D: &[SideEffect] = &[
     SideEffect {
         trigger: MethodSpan::array(&clc797::LOAD_CONSTANT_BUFFER, LOAD_CONSTANT_BUFFER_COUNT),
@@ -225,21 +227,36 @@ pub const SIDE_EFFECTS_COMPUTE: &[SideEffect] = &[SideEffect {
     },
 }];
 
+/// The 3D class's data-load methods, which take the words written even in shadow RAM replay
+/// mode: `LOAD_CONSTANT_BUFFER(0..16)` (constant-buffer loads) and `LOAD_INLINE_DATA`
+/// (inline-to-memory data), as the gpu-protocol spec names them ("Engine methods: the register
+/// file", step 1; decided by the owner, 2026-11-18). They are the two cases of Eden-NX2's
+/// `Maxwell3D::CallMultiMethod` (`eden-nx2/src/video_core/engines/maxwell_3d.cpp`) that hand a
+/// run's words to the upload without `ProcessShadowRam`: `ProcessCBMultiData(base_start,
+/// amount)` and `upload_state.ProcessData(base_start, amount)`. **Guess** until a trace shows
+/// replay mode during an upload; see "Divergences" in the `regs` module docs for the rest.
+pub const DATA_LOADS_3D: &[MethodSpan] = &[
+    MethodSpan::array(&clc797::LOAD_CONSTANT_BUFFER, LOAD_CONSTANT_BUFFER_COUNT),
+    MethodSpan::one(&clc797::LOAD_INLINE_DATA),
+];
+
 /// What one class's register file does with a write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClassRules {
     registers: u32,
     shadow_control: Option<u32>,
+    data_loads: &'static [MethodSpan],
     state: &'static [MethodSpan],
     side_effects: &'static [SideEffect],
 }
 
 /// The 3D class (`AMPERE_B`, `0xC797`): registers below its macro range (`CALL_MME_MACRO`,
-/// method 0xE00), shadow RAM controlled by `SET_MME_SHADOW_RAM_CONTROL`, the state table
-/// [`STATE_3D`] and the side effects [`SIDE_EFFECTS_3D`].
+/// method 0xE00), shadow RAM controlled by `SET_MME_SHADOW_RAM_CONTROL` with the data loads
+/// [`DATA_LOADS_3D`], the state table [`STATE_3D`] and the side effects [`SIDE_EFFECTS_3D`].
 pub const THREE_D: ClassRules = ClassRules {
     registers: clc797::CALL_MME_MACRO.method(),
     shadow_control: Some(clc797::SET_MME_SHADOW_RAM_CONTROL.method()),
+    data_loads: DATA_LOADS_3D,
     state: STATE_3D,
     side_effects: SIDE_EFFECTS_3D,
 };
@@ -247,21 +264,23 @@ pub const THREE_D: ClassRules = ClassRules {
 /// The compute class (`AMPERE_COMPUTE_B`, `0xC7C0`): registers below its macro range
 /// (`CALL_MME_MACRO`, method 0xE00, as Eden-NX2's `kepler_compute.cpp` calls macros from 0xE00),
 /// no shadow RAM (the gpu-protocol spec applies it "for 3D", and Eden-NX2's compute engine has
-/// none), no state methods (Eden-NX2's compute front sends every write, `FrontCallMethod`), and
+/// none, so no data loads either), no state methods (Eden-NX2's compute front sends every write, `FrontCallMethod`), and
 /// the side effects [`SIDE_EFFECTS_COMPUTE`].
 pub const COMPUTE: ClassRules = ClassRules {
     registers: clc7c0::CALL_MME_MACRO.method(),
     shadow_control: None,
+    data_loads: &[],
     state: &[],
     side_effects: SIDE_EFFECTS_COMPUTE,
 };
 
 /// Every other class (DMA copy, inline-to-memory, 2D, and any class no rule set names): every
-/// method a method header can address (`NVC76F_DMA_METHOD_ADDRESS`, 12 bits), no shadow RAM, no
-/// state methods and no side effects, so every write is sent.
+/// method a method header can address (`NVC76F_DMA_METHOD_ADDRESS`, 12 bits), no shadow RAM (so
+/// no data loads), no state methods and no side effects, so every write is sent.
 pub const OTHER: ClassRules = ClassRules {
     registers: METHOD_ADDRESS.max() + 1,
     shadow_control: None,
+    data_loads: &[],
     state: &[],
     side_effects: &[],
 };
@@ -287,6 +306,17 @@ impl ClassRules {
         self.shadow_control
     }
 
+    /// The data-load methods: in shadow RAM replay mode they take the words written, where
+    /// every other method takes the shadow file's value. Empty for a class without shadow RAM.
+    pub const fn data_loads(&self) -> &'static [MethodSpan] {
+        self.data_loads
+    }
+
+    /// Whether method number `method` is one of [`ClassRules::data_loads`].
+    pub fn is_data_load(&self, method: u32) -> bool {
+        self.data_loads.iter().any(|span| span.contains(method))
+    }
+
     /// The plain-state methods. A method in none of them is a trigger.
     pub const fn state(&self) -> &'static [MethodSpan] {
         self.state
@@ -295,5 +325,17 @@ impl ClassRules {
     /// The side-effect registers, in the order their writes are sent.
     pub const fn side_effects(&self) -> &'static [SideEffect] {
         self.side_effects
+    }
+
+    /// The registers' values when a file of the class is made: the one starting state that
+    /// both the front's [`super::RegFile`] (and its shadow file) and the back's mirror
+    /// (`crate::back::state::Mirror`) begin from, so a same-value write the front drops is never
+    /// one the back has not seen. Every register is zero today. Eden sets some 3D registers to
+    /// non-zero defaults at boot (`InitializeRegisterDefaults` in
+    /// `eden-nx2/src/video_core/engines/maxwell_3d.cpp`, then copied into the shadow file);
+    /// seeding them belongs here, for both sides at once (an open follow-up of slice G9).
+    pub fn initial_values(&self) -> Box<[u32]> {
+        let registers = usize::try_from(self.registers).unwrap_or(0);
+        vec![0; registers].into_boxed_slice()
     }
 }
