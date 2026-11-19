@@ -20,36 +20,52 @@
 //!
 //! The leeway is a share of the wait's length, so a wait for a share of the time left ends before
 //! the deadline even when it ends late, and each wait leaves less time for the next. The timer
-//! thread measures how late its waits end ([`Leeway::measured`]) and asks each time for the share
-//! of what is left that, made that late and a quarter more, still ends by the deadline
-//! ([`Leeway::slice`]); the last [`LAST_WAIT`] is waited in one go. On a host that ends waits on
-//! time the estimate stays at zero and a sleep is one wait, as before.
+//! thread measures how late each of its waits that times out ends ([`Leeway::measured`]) and asks
+//! each time for the share of what is left that, made that late and one part in [`MARGIN`] more,
+//! still ends by the deadline ([`Leeway::slice`]); the last [`LAST_WAIT`] is waited in one go.
+//!
+//! A wait that ends at most [`ON_TIME`] late counts as on time, whatever its length, and lowers
+//! the estimate by one part in [`DECAY`]. So on a host that ends waits on time the estimate always
+//! comes down to zero again, however high one late wait (the thread backgrounded or paused) took
+//! it, and then a sleep is one wait, as before the timer thread measured anything. A later wait
+//! raises the estimate to its own lateness only if it is at least [`MEASURED_FROM`] long; a
+//! shorter late wait changes nothing. (When only long waits could lower the estimate, a high
+//! estimate, whose waits are all short, kept itself up for good.)
 
 use std::time::Duration;
 
 /// Parts per thousand: the unit of [`Leeway`].
-const PER_MILLE: u128 = 1_000;
+pub(super) const PER_MILLE: u128 = 1_000;
 
 /// The largest estimate: a wait ending 64 times its length late. A host later than that still
 /// sees short waits (`taskpolicy -b`, above, ends a 1 ms wait up to 64 ms late), and a sleep then
 /// ends late; the bound keeps every wait at least 1/81 of the time left.
 pub(super) const MOST: u64 = 64_000;
 
+/// [`Leeway::slice`] allows for the estimate and one part in this many more, so that a wait a
+/// little later than any measured yet still ends by the deadline.
+pub(super) const MARGIN: u128 = 4;
+
 /// At or below this much time left, a sleep waits for the rest in one go: a wait this short ends
 /// late by little even on a host that coalesces (0.5 ms for 1 ms, above), and waking more often
 /// to save that little would cost more than it saves.
 pub(super) const LAST_WAIT: Duration = Duration::from_micros(100);
 
-/// A wait shorter than this is not measured: its lateness is mostly the cost of waking at all.
+/// A wait shorter than this cannot raise the estimate: its lateness is mostly the cost of waking
+/// at all. If it was on time it still lowers it.
 pub(super) const MEASURED_FROM: Duration = Duration::from_micros(500);
 
-/// How quickly the estimate forgets: a measured wait that ended less late than estimated lowers
-/// the estimate by one part in this many, rounded up, so that it reaches zero.
+/// A wait that ends at most this late is on time: the cost of waking (a few tens of
+/// microseconds), and Linux's default timer slack (50 µs), are not worth a second wait.
+pub(super) const ON_TIME: Duration = Duration::from_micros(200);
+
+/// How quickly the estimate forgets: every wait on time, and every measured wait that shows less
+/// than the estimate, lowers it by one part in this many, rounded up, so that it reaches zero.
 pub(super) const DECAY: u64 = 8;
 
 /// How late the host has been ending the timer thread's timed waits: parts per thousand of a
-/// wait's length (module docs). Zero for a host that ends them on time; a short-lived spike (the
-/// thread was not scheduled at once) decays away by [`DECAY`].
+/// wait's length (module docs). It falls to zero on a host whose waits end at most [`ON_TIME`]
+/// late, from any height.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Leeway(u64);
 
@@ -66,30 +82,41 @@ impl Leeway {
         self.0
     }
 
+    /// The lateness [`Leeway::slice`] allows for, in parts per thousand: the estimate and one part
+    /// in [`MARGIN`] more, rounded down.
+    pub(super) fn allowed(self) -> u128 {
+        u128::from(self.0) + u128::from(self.0) / MARGIN
+    }
+
     /// How long to wait with `left` until the deadline: all of it when that is at most
-    /// [`LAST_WAIT`]; otherwise the share of it that, ended late by the estimate and a quarter
-    /// more, still ends by the deadline, `left * 1000 / (1000 + estimate * 5 / 4)`, rounded down.
+    /// [`LAST_WAIT`]; otherwise the share of it that, ended late by [`Leeway::allowed`], still
+    /// ends by the deadline, `left * 1000 / (1000 + allowed)`, rounded down.
     pub(super) fn slice(self, left: Duration) -> Duration {
         if left <= LAST_WAIT {
             return left;
         }
-        let late = u128::from(self.0) + u128::from(self.0) / 4;
-        let nanos = left.as_nanos().saturating_mul(PER_MILLE) / (PER_MILLE + late);
+        let nanos = left.as_nanos().saturating_mul(PER_MILLE) / (PER_MILLE + self.allowed());
         Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
     }
 
-    /// The estimate after a wait for `asked` that timed out after `slept`: unchanged for a wait
-    /// shorter than [`MEASURED_FROM`]; otherwise the larger of what this wait shows (its
-    /// lateness in parts per thousand of `asked`, rounded down, at most [`MOST`]) and the
-    /// estimate less one part in [`DECAY`], rounded up.
+    /// The estimate after a wait for `asked` that timed out after `slept`:
+    ///
+    /// - a wait at most [`ON_TIME`] late lowers it by one part in [`DECAY`], rounded up;
+    /// - a later wait shorter than [`MEASURED_FROM`] leaves it as it is (its lateness is mostly
+    ///   the cost of waking, so it says nothing either way);
+    /// - any other wait makes it the larger of that wait's lateness, in parts per thousand of
+    ///   `asked`, rounded down, at most [`MOST`], and the estimate lowered as above.
     pub(super) fn measured(self, asked: Duration, slept: Duration) -> Self {
+        let lowered = self.0 - self.0.div_ceil(DECAY);
+        let late = slept.saturating_sub(asked);
+        if late <= ON_TIME {
+            return Self(lowered);
+        }
         if asked < MEASURED_FROM {
             return self;
         }
-        let late = slept.saturating_sub(asked).as_nanos();
-        let seen = late.saturating_mul(PER_MILLE) / asked.as_nanos();
-        let seen = u64::try_from(seen).unwrap_or(MOST).min(MOST);
-        Self(seen.max(self.0 - self.0.div_ceil(DECAY)))
+        let seen = late.as_nanos().saturating_mul(PER_MILLE) / asked.as_nanos();
+        Self(u64::try_from(seen).unwrap_or(MOST).min(MOST).max(lowered))
     }
 }
 
@@ -108,11 +135,6 @@ mod tests {
         Duration::from_nanos(16_666_666),
         Duration::from_secs(3),
     ];
-
-    /// `estimate * 5 / 4`, the lateness [`Leeway::slice`] allows for.
-    fn allowed(estimate: u64) -> u128 {
-        u128::from(estimate) + u128::from(estimate) / 4
-    }
 
     #[test]
     fn at_most_the_last_wait_left_is_waited_in_one_go() {
@@ -141,7 +163,7 @@ mod tests {
     #[test]
     fn a_slice_is_the_longest_wait_that_ends_by_the_deadline_when_ended_late_as_allowed() {
         for estimate in ESTIMATES {
-            let late = allowed(estimate);
+            let late = Leeway::new(estimate).allowed();
             for left in LEFT {
                 let slice = Leeway::new(estimate).slice(left).as_nanos();
                 let left = left.as_nanos();
@@ -156,6 +178,8 @@ mod tests {
             }
         }
         // A 4x estimate allows 5x, so a sixth of the time left.
+        assert_eq!(Leeway::new(4_000).allowed(), 5_000);
+        assert_eq!(Leeway::new(7).allowed(), 8);
         assert_eq!(
             Leeway::new(4_000).slice(Duration::from_millis(12)),
             Duration::from_millis(2)
@@ -163,12 +187,16 @@ mod tests {
     }
 
     #[test]
-    fn a_wait_shorter_than_the_measured_minimum_changes_nothing() {
+    fn a_late_wait_shorter_than_the_measured_minimum_changes_nothing_and_an_on_time_one_lowers() {
         let short = MEASURED_FROM.checked_sub(Duration::from_nanos(1)).unwrap();
+        let late = ON_TIME + Duration::from_nanos(1);
         for estimate in ESTIMATES {
             let leeway = Leeway::new(estimate);
+            let lowered = Leeway::new(estimate - estimate.div_ceil(DECAY));
             assert_eq!(leeway.measured(short, short * 100), leeway);
-            assert_eq!(leeway.measured(short, short), leeway);
+            assert_eq!(leeway.measured(short, short + late), leeway);
+            assert_eq!(leeway.measured(short, short + ON_TIME), lowered);
+            assert_eq!(leeway.measured(short, short), lowered);
         }
         // At the minimum, the wait is measured: 100 times late is capped at the most.
         let measured = Leeway::default().measured(MEASURED_FROM, MEASURED_FROM * 101);
@@ -222,49 +250,21 @@ mod tests {
         assert_eq!(Leeway::new(9).measured(asked, asked).per_mille(), 7);
     }
 
-    /// The timer thread's sleep (`Bell::sleep`) against a modelled host that ends every wait
-    /// `late` parts per thousand of its length late: the first sleep, with nothing measured yet,
-    /// ends that late; once the estimate has been learnt, every sleep ends at its deadline to
-    /// within the last wait's own lateness, and in a few waits. Returns, per sleep, how late it
-    /// ended and how many waits it took.
-    fn sleeps(late: u64, length: Duration, count: usize) -> Vec<(Duration, usize)> {
-        let mut leeway = Leeway::default();
-        let mut ended = Vec::new();
-        for _ in 0..count {
-            let mut slept = Duration::ZERO;
-            let mut waits = 0;
-            while slept < length {
-                let asked = leeway.slice(length.checked_sub(slept).unwrap());
-                let took = asked + asked * u32::try_from(late).unwrap() / 1_000;
-                leeway = leeway.measured(asked, took);
-                slept += took;
-                waits += 1;
-            }
-            ended.push((slept.checked_sub(length).unwrap(), waits));
-        }
-        ended
-    }
-
+    /// A wait that ends no more than [`ON_TIME`] late is on time, however short: the estimate
+    /// stays at zero, and a sleep stays one wait. One nanosecond later counts.
     #[test]
-    fn against_a_host_that_ends_waits_late_a_sleep_learns_to_end_on_time() {
-        let length = Duration::from_millis(10);
-        // Late as measured from an agent's shell (half), under a utility clamp (about 7 times)
-        // and as late as the estimate goes.
-        for late in [500, 7_000, MOST] {
-            let ended = sleeps(late, length, 8);
-            let first = ended[0];
-            assert_eq!(first, (length * u32::try_from(late).unwrap() / 1_000, 1));
-            let last_wait = LAST_WAIT + LAST_WAIT * u32::try_from(late).unwrap() / 1_000;
-            for &(over, waits) in &ended[1..] {
-                assert!(over <= last_wait, "{late}: {ended:?}");
-                assert!(waits <= 8, "{late}: {ended:?}");
-            }
+    fn a_wait_at_most_the_on_time_margin_late_leaves_no_estimate() {
+        for asked in [
+            MEASURED_FROM,
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+        ] {
+            assert_eq!(
+                Leeway::default().measured(asked, asked + ON_TIME),
+                Leeway::default()
+            );
+            let over = ON_TIME + Duration::from_nanos(1);
+            assert!(Leeway::default().measured(asked, asked + over).per_mille() > 0);
         }
-        // A host that ends waits on time: one wait each, on time.
-        assert!(
-            sleeps(0, length, 8)
-                .iter()
-                .all(|&e| e == (Duration::ZERO, 1))
-        );
     }
 }

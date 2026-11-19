@@ -97,17 +97,28 @@
 //! A host may end a timed wait well after its deadline on purpose (macOS coalesces timers, by a
 //! leeway that grows with the wait's length: `leeway`'s module docs have the measurements), and
 //! then every deadline the thread sleeps for comes late by it: preemption, the kernel's
-//! timeouts, the syncpoint page's bound and the vsync ticks. So [`Bell::sleep`] does not ask for
+//! timeouts, the syncpoint page's bound and the vsync ticks. So [`sleep_for`] does not ask for
 //! the whole sleep at once: it waits in shares of the time left, each short enough to end before
 //! the deadline even as late as the host has been ending the thread's waits ([`Leeway`]),
-//! measuring each wait that times out, until the time is up or the bell rings. Where waits end
-//! on time the estimate stays at zero and a sleep is a single wait. Tests:
-//! `against_a_host_that_ends_waits_late_a_sleep_learns_to_end_on_time` (the rule, against a
-//! modelled host), `a_sleep_lasts_its_limit_and_a_ring_ends_it` (the real wait), and the real
-//! runs whose deadlines are timed, `a_held_page_request_is_answered_at_the_bound_by_the_timer_thread`
-//! and `the_timer_thread_ticks_the_vsync_clock_and_wakes_a_listener_s_waiter`.
+//! measuring each wait that times out from its own start (a ring or a spurious wake-up is not
+//! measured), until the time is up or the bell rings. Every wait that ends at most
+//! `leeway::ON_TIME` late lowers the estimate, so after one late outlier a host that ends waits
+//! on time brings it back to zero, and there a sleep is one wait. A sleep can end up to
+//! `ON_TIME` late, or as late as its last wait of at most `leeway::LAST_WAIT` made it. The
+//! rule is the same on every host; on one where every wait ends at most `ON_TIME` late it
+//! changes nothing, since the estimate never leaves zero.
+//!
+//! Tests: against model hosts, `against_a_host_that_ends_waits_late_a_sleep_learns_to_end_on_time`,
+//! `against_an_on_time_host_a_sleep_is_one_wait`,
+//! `after_one_late_outlier_an_on_time_host_brings_a_sleep_back_to_one_wait`,
+//! `from_the_largest_estimate_the_wake_rate_falls_back`, `a_spurious_or_rung_wake_is_not_measured`,
+//! `each_wait_is_measured_from_its_own_start` and `a_limit_past_the_end_of_time_is_one_wait`; on
+//! the real bell, `a_sleep_lasts_its_limit_and_a_ring_ends_it` and
+//! `from_the_largest_estimate_the_real_bell_falls_back_to_a_few_waits`; and the real runs whose
+//! deadlines are timed, `a_held_page_request_is_answered_at_the_bound_by_the_timer_thread` and
+//! `the_timer_thread_ticks_the_vsync_clock_and_wakes_a_listener_s_waiter`.
 
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use starquake_cpu::Vcpu;
@@ -142,37 +153,78 @@ impl Bell {
     pub(super) fn take_ring(&self) -> bool {
         std::mem::take(&mut *lock(&self.rung))
     }
+}
 
-    /// Sleeps for `limit`, or until rung, in waits sized by `leeway`, which it updates with how
-    /// late each wait that timed out ended (module docs, "Sleeping to a deadline").
-    fn sleep(&self, limit: Duration, leeway: &mut Leeway) {
-        let start = Instant::now();
-        let end = start.checked_add(limit);
+/// How one of a sleep's waits ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Woke {
+    /// The bell was rung (before the wait or during it); the ring is used up.
+    Rung,
+    /// The time asked for passed.
+    TimedOut,
+    /// Neither: a spurious wake-up.
+    Early,
+}
+
+/// What [`sleep_for`] waits on: the [`Bell`], or a test's model of a host.
+trait Waiter {
+    /// The host's monotonic clock now.
+    fn now(&self) -> Instant;
+
+    /// Waits for at most `asked`, or until rung.
+    fn wait(&self, asked: Duration) -> Woke;
+}
+
+impl Waiter for Bell {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn wait(&self, asked: Duration) -> Woke {
         let mut rung = lock(&self.rung);
-        while !*rung {
-            let now = Instant::now();
-            // A limit past the end of `Instant` is waited for in one go, as it always was.
-            let left = end.map_or(limit, |end| end.saturating_duration_since(now));
-            if left.is_zero() {
-                break;
-            }
-            let asked = leeway.slice(left);
-            let (guard, timed_out) = self.ring.wait_timeout(rung, asked).map_or_else(
-                |poisoned| {
-                    let (guard, result) = poisoned.into_inner();
-                    (guard, result.timed_out())
-                },
-                |(guard, result)| (guard, result.timed_out()),
-            );
+        if !*rung {
+            let (guard, result) = self
+                .ring
+                .wait_timeout(rung, asked)
+                .unwrap_or_else(PoisonError::into_inner);
             rung = guard;
-            if timed_out && !*rung {
-                *leeway = leeway.measured(asked, now.elapsed());
-            }
-            if end.is_none() {
-                break;
+            if !*rung {
+                return if result.timed_out() {
+                    Woke::TimedOut
+                } else {
+                    Woke::Early
+                };
             }
         }
         *rung = false;
+        Woke::Rung
+    }
+}
+
+/// Sleeps on `waiter` for `limit`, or until rung (module docs, "Sleeping to a deadline"): in
+/// waits sized by `leeway`, each wait that times out measured from its own start into `leeway`.
+/// A ring or a spurious wake-up is not measured. A limit past the end of `Instant` is waited for
+/// in one go, ended by a timeout, a ring or a spurious wake-up alike.
+fn sleep_for(waiter: &impl Waiter, limit: Duration, leeway: &mut Leeway) {
+    let end = waiter.now().checked_add(limit);
+    loop {
+        let now = waiter.now();
+        let left = end.map_or(limit, |end| end.saturating_duration_since(now));
+        if left.is_zero() {
+            return;
+        }
+        let asked = leeway.slice(left);
+        match waiter.wait(asked) {
+            Woke::Rung => return,
+            Woke::TimedOut => {
+                let slept = waiter.now().saturating_duration_since(now);
+                *leeway = leeway.measured(asked, slept);
+            }
+            Woke::Early => {}
+        }
+        if end.is_none() {
+            return;
+        }
     }
 }
 
@@ -255,7 +307,7 @@ fn turns<V: Vcpu, C: HostClock + Clone>(machine: &Machine<'_, V, C>) -> Result<(
         if let Some(end) = end {
             sleep = sleep.min(end.saturating_duration_since(Instant::now()));
         }
-        machine.bell.sleep(sleep, &mut leeway);
+        sleep_for(&*machine.bell, sleep, &mut leeway);
     }
     Ok(())
 }
@@ -368,12 +420,230 @@ fn next_deadline(dispatcher: &Dispatcher) -> Option<HostNanos> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
     use std::thread;
 
+    use starquake_kernel::sched::PREEMPTION_INTERVAL_NS;
+
+    use super::leeway::{LAST_WAIT, MOST, ON_TIME, PER_MILLE};
     use super::*;
 
     /// Longer than any test here may take: a sleep that a ring ends must end well before it.
     const LONG: Duration = Duration::from_secs(10);
+
+    /// The longest sleep the timer thread makes.
+    const LONGEST: Duration = Duration::from_nanos(PREEMPTION_INTERVAL_NS);
+
+    /// More waits than any sleep here may take: a model host fails the test past this many.
+    const MOST_WAITS: usize = 10_000;
+
+    /// How a model host ends a wait: given its number in the host's life and the time asked, how
+    /// long it took and how it ended.
+    type Ending<'a> = Box<dyn FnMut(usize, Duration) -> (Duration, Woke) + 'a>;
+
+    /// A model host for [`sleep_for`]: a clock that moves only by the waits, each ended as
+    /// `ending` says; it keeps what each wait asked for.
+    struct Host<'a> {
+        start: Instant,
+        elapsed: Cell<Duration>,
+        ending: RefCell<Ending<'a>>,
+        asked: RefCell<Vec<Duration>>,
+    }
+
+    impl<'a> Host<'a> {
+        fn new(ending: impl FnMut(usize, Duration) -> (Duration, Woke) + 'a) -> Self {
+            Self {
+                start: Instant::now(),
+                elapsed: Cell::new(Duration::ZERO),
+                ending: RefCell::new(Box::new(ending)),
+                asked: RefCell::new(Vec::new()),
+            }
+        }
+
+        /// A host that ends every wait by its timeout, `per_mille` parts per thousand of its
+        /// length and `extra` late.
+        fn late(per_mille: u64, extra: Duration) -> Self {
+            Self::new(move |_, asked| (asked + scaled(asked, per_mille) + extra, Woke::TimedOut))
+        }
+
+        /// How many waits it has made.
+        fn waits(&self) -> usize {
+            self.asked.borrow().len()
+        }
+
+        /// One sleep of `limit`: how late it ended and how many waits it took.
+        fn sleep(&self, limit: Duration, leeway: &mut Leeway) -> (Duration, usize) {
+            let (start, waits) = (self.now(), self.waits());
+            sleep_for(self, limit, leeway);
+            let over = (self.now() - start).saturating_sub(limit);
+            (over, self.waits() - waits)
+        }
+    }
+
+    impl Waiter for Host<'_> {
+        fn now(&self) -> Instant {
+            self.start + self.elapsed.get()
+        }
+
+        fn wait(&self, asked: Duration) -> Woke {
+            let number = self.waits();
+            assert!(number < MOST_WAITS, "the sleep did not end");
+            self.asked.borrow_mut().push(asked);
+            let (took, woke) = (self.ending.borrow_mut())(number, asked);
+            self.elapsed.set(self.elapsed.get() + took);
+            woke
+        }
+    }
+
+    /// `length` scaled by `per_mille` parts per thousand, rounded down.
+    fn scaled(length: Duration, per_mille: u64) -> Duration {
+        let nanos = length.as_nanos() * u128::from(per_mille) / PER_MILLE;
+        Duration::from_nanos(u64::try_from(nanos).unwrap())
+    }
+
+    /// Against a host that ends every wait late by a share of its length (half, as from an
+    /// agent's shell; about seven times, as under `taskpolicy -c utility`; and the largest
+    /// estimate), the first sleep, with nothing measured yet, is one wait that late; every later
+    /// one ends at most [`ON_TIME`] late, or as late as its last wait of at most [`LAST_WAIT`]
+    /// made it, in at most 8 waits.
+    #[test]
+    fn against_a_host_that_ends_waits_late_a_sleep_learns_to_end_on_time() {
+        for late in [500, 7_000, MOST] {
+            let host = Host::late(late, Duration::ZERO);
+            let mut leeway = Leeway::default();
+            let ended: Vec<_> = (0..8).map(|_| host.sleep(LONGEST, &mut leeway)).collect();
+            assert_eq!(ended[0], (scaled(LONGEST, late), 1));
+            let allowed = ON_TIME.max(LAST_WAIT + scaled(LAST_WAIT, late));
+            for &(over, waits) in &ended[1..] {
+                assert!(over <= allowed && waits <= 8, "{late}: {ended:?}");
+            }
+        }
+    }
+
+    /// A host that ends every wait at most [`ON_TIME`] late keeps each sleep one wait; a host a
+    /// nanosecond later than that is measured, and a sleep becomes more than one wait.
+    #[test]
+    fn against_an_on_time_host_a_sleep_is_one_wait() {
+        let host = Host::late(0, ON_TIME);
+        let mut leeway = Leeway::default();
+        for _ in 0..8 {
+            assert_eq!(host.sleep(LONGEST, &mut leeway), (ON_TIME, 1));
+        }
+        assert_eq!(leeway, Leeway::default());
+
+        let host = Host::late(0, ON_TIME + Duration::from_nanos(1));
+        host.sleep(LONGEST, &mut leeway);
+        assert!(leeway.per_mille() > 0);
+        assert!(host.sleep(LONGEST, &mut leeway).1 > 1);
+    }
+
+    /// One wait 20 times late (the thread backgrounded or paused), then a host whose waits end
+    /// 20 µs late: within 15 sleeps of [`PREEMPTION_INTERVAL_NS`] each sleep is one wait again
+    /// and the estimate is back at zero. Before every wait could lower the estimate, it stuck at
+    /// 20,000 and every sleep took 74 waits.
+    #[test]
+    fn after_one_late_outlier_an_on_time_host_brings_a_sleep_back_to_one_wait() {
+        let host = Host::new(|number, asked| {
+            let late = if number == 0 {
+                asked * 20
+            } else {
+                Duration::from_micros(20)
+            };
+            (asked + late, Woke::TimedOut)
+        });
+        let mut leeway = Leeway::default();
+        let waits: Vec<_> = (0..20)
+            .map(|_| host.sleep(LONGEST, &mut leeway).1)
+            .collect();
+        assert_eq!(waits[0], 1);
+        assert!(waits[15..].iter().all(|&count| count == 1), "{waits:?}");
+        assert_eq!(leeway, Leeway::default());
+    }
+
+    /// From the largest estimate, on a host whose waits end on time, the waits per sleep fall
+    /// from the most the estimate allows back to one within 30 sleeps.
+    #[test]
+    fn from_the_largest_estimate_the_wake_rate_falls_back() {
+        let host = Host::late(0, Duration::ZERO);
+        let mut leeway = Leeway::new(MOST);
+        let waits: Vec<_> = (0..40)
+            .map(|_| host.sleep(LONGEST, &mut leeway).1)
+            .collect();
+        assert!(waits[0] > 8, "{waits:?}");
+        assert!(waits[30..].iter().all(|&count| count == 1), "{waits:?}");
+    }
+
+    /// The real bell, from the largest estimate, on this host: the last 10 of 50 sleeps of
+    /// [`PREEMPTION_INTERVAL_NS`] take at most 8 waits each on average, where an estimate stuck
+    /// at the largest takes about 300.
+    #[test]
+    fn from_the_largest_estimate_the_real_bell_falls_back_to_a_few_waits() {
+        struct Counting<'a>(&'a Bell, Cell<usize>);
+        impl Waiter for Counting<'_> {
+            fn now(&self) -> Instant {
+                self.0.now()
+            }
+            fn wait(&self, asked: Duration) -> Woke {
+                self.1.set(self.1.get() + 1);
+                self.0.wait(asked)
+            }
+        }
+        let bell = Bell::default();
+        let counting = Counting(&bell, Cell::new(0));
+        let mut leeway = Leeway::new(MOST);
+        let mut waits = Vec::new();
+        for _ in 0..50 {
+            let before = counting.1.get();
+            sleep_for(&counting, LONGEST, &mut leeway);
+            waits.push(counting.1.get() - before);
+        }
+        let last: usize = waits[40..].iter().sum();
+        assert!(last <= 80, "{waits:?}");
+    }
+
+    /// Neither a spurious wake-up nor a ring is measured: a sleep whose first wait ends early
+    /// (a measure would lower the estimate) and whose second is rung after 30 times its length
+    /// (a measure would raise it) leaves the estimate as it was, and ends at the ring.
+    #[test]
+    fn a_spurious_or_rung_wake_is_not_measured() {
+        let host = Host::new(|number, asked| match number {
+            0 => (asked / 2, Woke::Early),
+            _ => (asked * 30, Woke::Rung),
+        });
+        let mut leeway = Leeway::new(800);
+        sleep_for(&host, LONGEST, &mut leeway);
+        assert_eq!(host.waits(), 2);
+        assert_eq!(leeway, Leeway::new(800));
+    }
+
+    /// Each wait is measured from its own start, not the sleep's: on a host that ends waits on
+    /// time, a sleep of several waits only lowers the estimate, once per wait.
+    #[test]
+    fn each_wait_is_measured_from_its_own_start() {
+        let host = Host::late(0, Duration::ZERO);
+        let mut leeway = Leeway::new(4_000);
+        sleep_for(&host, LONGEST, &mut leeway);
+        let waits = host.waits();
+        assert!(waits > 1, "{waits}");
+        let mut expected = Leeway::new(4_000);
+        for &asked in host.asked.borrow().iter() {
+            expected = expected.measured(asked, asked);
+        }
+        assert_eq!(leeway, expected);
+        assert!(leeway.per_mille() < 4_000);
+    }
+
+    /// A limit past the end of `Instant` is one wait for the whole of it (as long as a `Duration`
+    /// of `u64` nanoseconds goes), whether it times out or wakes early.
+    #[test]
+    fn a_limit_past_the_end_of_time_is_one_wait() {
+        for woke in [Woke::TimedOut, Woke::Early] {
+            let host = Host::new(move |_, _| (Duration::from_millis(1), woke));
+            sleep_for(&host, Duration::MAX, &mut Leeway::default());
+            let whole = Leeway::default().slice(Duration::MAX);
+            assert_eq!(*host.asked.borrow(), [whole], "{woke:?}");
+        }
+    }
 
     /// A sleep nobody rings lasts at least its limit, whether it is one wait (no lateness
     /// measured) or several (an estimate that slices it); a ring before the sleep keeps it from
@@ -383,14 +653,10 @@ mod tests {
     fn a_sleep_lasts_its_limit_and_a_ring_ends_it() {
         let bell = Bell::default();
         let limit = Duration::from_millis(30);
-        for estimate in [
-            Leeway::default(),
-            Leeway::new(4_000),
-            Leeway::new(leeway::MOST),
-        ] {
+        for estimate in [Leeway::default(), Leeway::new(4_000), Leeway::new(MOST)] {
             let mut leeway = estimate;
             let start = Instant::now();
-            bell.sleep(limit, &mut leeway);
+            sleep_for(&bell, limit, &mut leeway);
             assert!(
                 start.elapsed() >= limit,
                 "{estimate:?}: {:?}",
@@ -400,7 +666,7 @@ mod tests {
 
         bell.ring();
         let start = Instant::now();
-        bell.sleep(LONG, &mut Leeway::new(4_000));
+        sleep_for(&bell, LONG, &mut Leeway::new(4_000));
         assert!(start.elapsed() < LONG / 2, "{:?}", start.elapsed());
         assert!(!bell.take_ring());
 
@@ -410,7 +676,7 @@ mod tests {
                 bell.ring();
             });
             let start = Instant::now();
-            bell.sleep(LONG, &mut Leeway::new(4_000));
+            sleep_for(&bell, LONG, &mut Leeway::new(4_000));
             assert!(start.elapsed() < LONG / 2, "{:?}", start.elapsed());
         });
         assert!(!bell.take_ring());
