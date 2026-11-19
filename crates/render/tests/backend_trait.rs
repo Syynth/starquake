@@ -212,6 +212,7 @@ fn refused_stage_and_staging() {
         entry: "main".to_owned(),
         source: ShaderSource::SpirV(Vec::new()),
         interface: ShaderInterface::default(),
+        origin: None,
     };
     assert_eq!(
         backend.create_shader(geometry).map_err(|e| e.to_string()),

@@ -140,8 +140,8 @@
 //!   [`Pipeline::program_address`] reads. `index_buffer_pools_and_pipeline_getters`.
 //!
 //! Not here: the root tables for constant buffer banks 24 to 31, deriving anything from the
-//! groups (G18), routing ring entries to mirrors by channel and class (the executor, G19), and
-//! register defaults (above).
+//! groups (G18), routing ring entries to mirrors by channel and class (the executor, G19,
+//! `back::exec`), and register defaults (above).
 
 mod group;
 mod mirror;

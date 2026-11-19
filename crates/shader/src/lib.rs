@@ -23,6 +23,10 @@
 //! stage, the attributes and system values read and written, the pixel interpolation modes, the
 //! colour targets and the local memory size.
 //!
+//! Slice 6h decodes the control and warp group (`decode`'s `OpBra` to `OpNanosleep`):
+//! branches with their [`decode::BranchOffset`], convergence barriers, calls and returns, and
+//! warp votes, shuffles, matches and reductions; `JMX` and `BPT` stay shells.
+//!
 //! Experiment E1, run before this slice, lives in `lower`'s tests and its results in the spec.
 
 #[cfg(feature = "test-support")]

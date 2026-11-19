@@ -217,23 +217,29 @@ impl Channel {
                 return self.acquire(acquire, memory);
             }
             // `wfi` changes nothing (module docs, "Guesses").
-            HostSemaphore::Release { form, .. } => sink.entry(RingEntry::Release(Release {
-                address,
-                payload,
-                form,
-                op: ReleaseOp::Write,
-            })),
+            HostSemaphore::Release { form, .. } => sink.entry(RingEntry::Release {
+                channel: self.id,
+                release: Release {
+                    address,
+                    payload,
+                    form,
+                    op: ReleaseOp::Write,
+                },
+            }),
             HostSemaphore::Reduce {
                 reduction, size, ..
-            } => sink.entry(RingEntry::Release(Release {
-                address,
-                payload,
-                form: ReleaseForm {
-                    size,
-                    timestamp: false,
+            } => sink.entry(RingEntry::Release {
+                channel: self.id,
+                release: Release {
+                    address,
+                    payload,
+                    form: ReleaseForm {
+                        size,
+                        timestamp: false,
+                    },
+                    op: ReleaseOp::Reduce(reduction),
                 },
-                op: ReleaseOp::Reduce(reduction),
-            })),
+            }),
         }
         Ok(Step::Continue)
     }

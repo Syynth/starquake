@@ -24,7 +24,7 @@ const BOUND: Duration = Duration::from_secs(120);
 const LIST_WAIT: Duration = Duration::from_secs(10);
 
 /// Runs `f` on another thread and fails if it takes longer than [`BOUND`].
-fn bounded<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+pub(crate) fn bounded<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || tx.send(f()));
     rx.recv_timeout(BOUND).expect("the test finished in time")
@@ -32,11 +32,19 @@ fn bounded<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
 
 /// A backend, or `None` (with a notice) in CI or on a host without an adapter.
 fn open(test: &str, config: WgpuConfig, wake: CompletionWake) -> Option<WgpuBackend> {
+    open_with(test, || WgpuBackend::new(config, wake))
+}
+
+/// The backend `make` opens, or `None` (with a notice) in CI or on a host without an adapter.
+pub(crate) fn open_with(
+    test: &str,
+    make: impl FnOnce() -> Result<WgpuBackend, NewError>,
+) -> Option<WgpuBackend> {
     if std::env::var_os("CI").is_some() {
         eprintln!("skipping {test}: GPU tests are local-only until verification 3 (decision 9)");
         return None;
     }
-    match WgpuBackend::new(config, wake) {
+    match make() {
         Err(NewError::NoAdapter(reason)) => {
             eprintln!("skipping {test}: no GPU adapter on this host ({reason})");
             None
@@ -1117,13 +1125,13 @@ fn what_the_backend_refuses() {
             Err(RenderError::MissingFeature("view swizzles"))
         );
         assert!(matches!(
-            gpu.create_shader(ShaderDesc {
-                stage: starquake_render::ShaderStage::Vertex,
-                entry: "main".into(),
-                source: starquake_render::ShaderSource::SpirV(Vec::new()),
-                interface: starquake_render::ShaderInterface::default(),
-            }),
-            Err(RenderError::Unsupported(SHADERS_NOT_YET))
+            gpu.create_shader(crate::fixtures::shader_desc(
+                starquake_render::ShaderStage::Vertex,
+                "main",
+                starquake_render::ShaderSource::SpirV(Vec::new()),
+                starquake_render::ShaderInterface::default(),
+            )),
+            Err(RenderError::Unsupported(crate::pipeline::NAGA_ONLY))
         ));
         assert_eq!(
             gpu.pipeline_status(PipelineId::new(0, 0)),
@@ -1909,3 +1917,5 @@ fn pending_ids_of_different_kinds_or_generations_differ() {
     }
     assert!(pending.contains(&PendingId(ResourceId::Buffer(BufferId::new(1, 2)))));
 }
+
+mod window;

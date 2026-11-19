@@ -16,7 +16,7 @@
 //! | 1 bind | subchannel 15:8 | channel | class (low half) |
 //! | 2 write | method 23:8 | value | channel (low), class (high) |
 //! | 3 run | method 23:8 | word count | channel (low), class (high); the words, two per word, first in the low half |
-//! | 4 release | reduce 8, eight bytes 9, timestamp 10, reduction 14:12, format 17:16 | 0 | address; payload |
+//! | 4 release | reduce 8, eight bytes 9, timestamp 10, reduction 14:12, format 17:16 | channel | address; payload |
 //! | 5 syncpoint | id 15:8 | 0 | |
 //! | 6 wait for idle | | channel | |
 //! | 7 invalidate | `MEM_OP_D` operation 12:8 | channel | |
@@ -150,7 +150,7 @@ impl Kind {
             RingEntry::Bind { .. } => Self::Bind,
             RingEntry::Write { .. } => Self::Write,
             RingEntry::Run { .. } => Self::Run,
-            RingEntry::Release(_) => Self::Release,
+            RingEntry::Release { .. } => Self::Release,
             RingEntry::Syncpoint { .. } => Self::Syncpoint,
             RingEntry::WaitForIdle { .. } => Self::WaitForIdle,
             RingEntry::Invalidate { .. } => Self::Invalidate,
@@ -288,7 +288,7 @@ pub fn encoded_words(entry: &RingEntry<'_>) -> usize {
         | RingEntry::Write { .. }
         | RingEntry::Marker { .. }
         | RingEntry::SetReference { .. } => 2,
-        RingEntry::Release(_) => 3,
+        RingEntry::Release { .. } => 3,
         RingEntry::Present(_) => 8,
         RingEntry::Run { words, .. } => run_words(words.len()),
     }
@@ -339,7 +339,7 @@ pub fn encode(entry: &RingEntry<'_>, out: &mut Vec<u64>) -> Result<(), EncodeErr
                 _ => 0,
             }));
         }
-        RingEntry::Release(release) => {
+        RingEntry::Release { channel, release } => {
             let mut low = RELEASE_EIGHT_BYTES
                 .insert_truncated(head, u32::from(release.form.size == PayloadSize::Eight));
             low = RELEASE_TIMESTAMP.insert_truncated(low, u32::from(release.form.timestamp));
@@ -349,7 +349,7 @@ pub fn encode(entry: &RingEntry<'_>, out: &mut Vec<u64>) -> Result<(), EncodeErr
                 low = RELEASE_REDUCTION_OP.insert_truncated(low, op);
                 low = RELEASE_REDUCTION_FORMAT.insert_truncated(low, format);
             }
-            out.extend([word(low, 0), release.address, release.payload]);
+            out.extend([word(low, channel.0), release.address, release.payload]);
         }
         RingEntry::Syncpoint { id } => {
             out.push(word(
@@ -516,7 +516,6 @@ impl Encoded<'_> {
         } else {
             self.check_low(&[RELEASE_EIGHT_BYTES, RELEASE_TIMESTAMP])?;
         }
-        self.check_high_zero(0)?;
         let op = if reduce {
             ReleaseOp::Reduce(red_reduction(
                 RING_RELEASE,
@@ -531,15 +530,18 @@ impl Encoded<'_> {
         } else {
             PayloadSize::Four
         };
-        Ok(RingEntry::Release(Release {
-            address: self.at(1),
-            payload: self.at(2),
-            form: ReleaseForm {
-                size,
-                timestamp: RELEASE_TIMESTAMP.is_set(self.low),
+        Ok(RingEntry::Release {
+            channel: ChannelId(self.high),
+            release: Release {
+                address: self.at(1),
+                payload: self.at(2),
+                form: ReleaseForm {
+                    size,
+                    timestamp: RELEASE_TIMESTAMP.is_set(self.low),
+                },
+                op,
             },
-            op,
-        }))
+        })
     }
 
     fn syncpoint(&self) -> Result<RingEntry<'static>, DecodeError> {

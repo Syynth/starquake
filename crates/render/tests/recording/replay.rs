@@ -1,376 +1,344 @@
-//! Captures: the lists of a run on the recording backend, written to a file's bytes, read
-//! back and replayed on a second recording backend, give the results of the original run.
+//! Render capture v2 end to end (slice R11b's gate): a capture taken through
+//! `CapturingBackend` around the recording backend replays on a fresh recording backend, with a
+//! stub resolver that maps shader origins to hand-built naga modules, to the same results, with
+//! no resources made by hand.
 
 use super::fixtures::{
-    backend, buffer, clear, counting, draw, graphics, ok, rb, rect, region, slice, submit, texture,
-    upload, view,
+    MEMORY, caps, clear, counting, draw, graphics_desc, ok, rb, rect, region, slice, texture_desc,
+    upload,
 };
-use starquake_render::command::{
-    ClearValue, CopyDesc, Marker, PresentDesc, PresentTransform, RenderTargets,
+use starquake_render::capture::{
+    CaptureBuffer, CaptureReader, CaptureSink, CapturingBackend, Finding, FindingKind,
+    ReplayFrames, ReplayOptions, ReplayReport, ResolveError, ShaderResolver, WaitSetting, replay,
 };
+use starquake_render::command::{ClearValue, PresentDesc, PresentTransform, RenderTargets};
+use starquake_render::resource::{
+    AddressMode, BorderColor, FilterMode, ReductionMode, SamplerDesc, Swizzle, TextureDimension,
+    ViewDimension,
+};
+use starquake_render::shader::ShaderInterface;
 use starquake_render::{
-    Backend, BufferId, BufferUsage, Capture, CaptureError, CapturedList, Command, CommandList,
-    FenceValue, FrameDump, PipelineId, PixelFormat, PresentFeedback, Readback, RecordingBackend,
-    RenderError, TextureId, ViewId,
+    Backend, BufferDesc, BufferUsage, Command, CommandList, ComputePipelineDesc, FenceValue, Frame,
+    FrameSink, PixelFormat, PresentTarget, RecordingBackend, ResourceId, ShaderDesc, ShaderOrigin,
+    ShaderSource, ShaderStage, ViewDesc,
 };
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 const RGBA: PixelFormat = PixelFormat::A8B8G8R8Unorm;
 
-/// The resources of the run: the same calls in the same order give the same ids on any fresh
-/// recording backend.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Scene {
-    data: BufferId,
-    source: TextureId,
-    target: TextureId,
-    source_view: ViewId,
-    target_view: ViewId,
-    pipeline: PipelineId,
-}
+/// The frame tee the wiring installs: dumped frames go to the capture.
+#[derive(Debug)]
+struct Tee(Weak<CapturingBackend>);
 
-fn data_buffer(b: &RecordingBackend) -> BufferId {
-    buffer(b, 16, BufferUsage::COPY_SRC.union(BufferUsage::COPY_DST))
-}
-
-fn scene(b: &RecordingBackend) -> Scene {
-    let data = data_buffer(b);
-    let source = texture(b, RGBA, (2, 2), 1, 1);
-    let target = texture(b, RGBA, (2, 2), 1, 1);
-    Scene {
-        data,
-        source,
-        target,
-        source_view: view(b, source, RGBA, 0, (0, 1)),
-        target_view: view(b, target, RGBA, 0, (0, 1)),
-        pipeline: graphics(b),
+impl FrameSink for Tee {
+    fn frame(&self, frame: Frame) {
+        if let Some(capture) = self.0.upgrade() {
+            capture.record_frame(&frame);
+        }
     }
 }
 
-fn whole(texture: TextureId) -> starquake_render::command::CopyRegion {
-    region(texture, 0, (0, 0, 0), (2, 2, 1))
+/// An empty, validated naga module.
+fn naga() -> ShaderSource {
+    let module = naga::Module::default();
+    let info = ok(naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&module));
+    ShaderSource::Naga {
+        module: Box::new(module),
+        info: Box::new(info),
+    }
 }
 
-fn present(view: ViewId, frame: u64) -> Command {
-    Command::Present(PresentDesc {
-        view,
-        src_rect: rect(0, 0, 2, 2),
-        transform: PresentTransform::Rotate90,
-        frame,
-        dump: true,
-    })
+fn shader(stage: ShaderStage, origin: Option<&[u8]>) -> ShaderDesc {
+    ShaderDesc {
+        stage,
+        entry: "main".to_owned(),
+        source: naga(),
+        interface: ShaderInterface::default(),
+        origin: origin.map(|bytes| ShaderOrigin {
+            record: Arc::from(bytes.to_vec()),
+            stage_index: 0,
+        }),
+    }
 }
 
-/// The lists of the run: uploads, a copy, a clear, a draw, presents and readbacks, across
-/// four lists of which one is empty.
-fn lists(s: &Scene) -> Vec<CommandList> {
-    let mut targets = RenderTargets::default();
-    targets.colors[0] = Some(s.target_view);
-    let list = |commands| CommandList { commands };
-    vec![
-        list(vec![
-            Command::Marker(Marker { submit: 1, draw: 0 }),
-            upload(&counting(1, 8), slice(s.data, 4, 8)),
-            upload(&counting(100, 16), whole(s.source)),
+/// Maps the scene's three origins to hand-built naga modules of their stage.
+struct Stub;
+
+impl ShaderResolver for Stub {
+    fn resolve(&self, origin: &ShaderOrigin) -> Result<ShaderDesc, ResolveError> {
+        let stage = match &*origin.record {
+            b"vs" => ShaderStage::Vertex,
+            b"fs" => ShaderStage::Fragment,
+            b"cs" => ShaderStage::Compute,
+            _ => return Err(ResolveError::Shader("an unknown origin".to_owned())),
+        };
+        Ok(shader(stage, None))
+    }
+}
+
+/// A 2D view of all of a 4 by 4 RGBA8 texture.
+fn view_desc() -> ViewDesc {
+    ViewDesc {
+        format: RGBA,
+        dimension: ViewDimension::D2,
+        base_mip: 0,
+        mip_count: 1,
+        base_layer: 0,
+        layer_count: 1,
+        swizzle: Swizzle::IDENTITY,
+    }
+}
+
+/// A plain sampler.
+fn sampler_desc() -> SamplerDesc {
+    SamplerDesc {
+        mag_filter: FilterMode::Linear,
+        min_filter: FilterMode::Nearest,
+        mip_filter: FilterMode::Nearest,
+        address: [AddressMode::ClampToEdge; 3],
+        border_color: BorderColor::OpaqueBlack,
+        lod_bias: 0.0,
+        min_lod: 0.0,
+        max_lod: 1.0,
+        max_anisotropy: 1,
+        compare: None,
+        reduction: ReductionMode::Average,
+    }
+}
+
+/// Makes and uses every kind of resource through `b`: uploads, copies, a clear, a draw, a
+/// dispatch, readbacks known and unknown, two dumped presents, destroys. With `decoys_first`,
+/// a shader with no origin and a buffer of [`DECOY_BYTES`] are made first, which a replay with
+/// a smaller memory limit refuses, so that the ids the fresh backend hands out differ.
+fn scene(b: &dyn Backend, decoys_first: bool) {
+    if decoys_first {
+        ok(b.create_shader(shader(ShaderStage::Compute, None)));
+        ok(b.create_buffer(&BufferDesc {
+            size: DECOY_BYTES,
+            usage: BufferUsage::ALL,
+        }));
+    }
+    let buf = ok(b.create_buffer(&BufferDesc {
+        size: 256,
+        usage: BufferUsage::ALL,
+    }));
+    let tex = ok(b.create_texture(&texture_desc(RGBA, TextureDimension::D2, (4, 4, 1), 1)));
+    let view = ok(b.create_view(tex, &view_desc()));
+    let sampler = ok(b.create_sampler(&sampler_desc()));
+    let vs = ok(b.create_shader(shader(ShaderStage::Vertex, Some(b"vs"))));
+    let fs = ok(b.create_shader(shader(ShaderStage::Fragment, Some(b"fs"))));
+    let cs = ok(b.create_shader(shader(ShaderStage::Compute, Some(b"cs"))));
+    let graphics = ok(b.create_graphics_pipeline(graphics_desc(vs, Some(fs))));
+    let compute = ok(b.create_compute_pipeline(ComputePipelineDesc { shader: cs }));
+    b.pipeline_status(graphics);
+    b.pipeline_status(compute);
+    ok(b.set_present_target(PresentTarget::Offscreen));
+    let whole = region(tex, 0, (0, 0, 0), (4, 4, 1));
+    let present = |frame| {
+        Command::Present(PresentDesc {
+            view,
+            src_rect: rect(0, 0, 4, 4),
+            transform: PresentTransform::Rotate90,
+            frame,
+            dump: true,
+        })
+    };
+    let first = ok(b.submit(CommandList {
+        commands: vec![
+            upload(&counting(1, 64), slice(buf, 0, 64)),
+            upload(&counting(100, 64), whole),
+            Command::Copy(starquake_render::command::CopyDesc {
+                src: slice(buf, 0, 32),
+                dst: slice(buf, 128, 32),
+            }),
+            present(1),
             Command::Readback {
-                from: slice(s.data, 4, 8),
+                from: slice(buf, 0, 64),
                 id: rb(1),
             },
-        ]),
-        list(vec![
-            Command::Copy(CopyDesc {
-                src: whole(s.source),
-                dst: whole(s.target),
-            }),
-            clear(
-                s.target_view,
-                ClearValue::Float([0.0, 0.0, 0.0, 1.0]),
-                Some(rect(1, 0, 1, 1)),
-            ),
             Command::Readback {
-                from: whole(s.target),
+                from: whole,
                 id: rb(2),
             },
-            present(s.target_view, 1),
-        ]),
-        list(Vec::new()),
-        list(vec![
-            Command::SetRenderTargets(targets),
-            Command::Draw(draw(s.pipeline)),
+        ],
+    }));
+    b.take_readback(rb(1));
+    b.take_readback(rb(2));
+    let mut colors = [None; 8];
+    colors[0] = Some(view);
+    let second = ok(b.submit(CommandList {
+        commands: vec![
+            clear(
+                view,
+                ClearValue::Float([1.0, 0.0, 1.0, 0.0]),
+                Some(rect(0, 0, 2, 1)),
+            ),
+            Command::SetRenderTargets(RenderTargets {
+                colors,
+                depth_stencil: None,
+            }),
+            Command::Draw(draw(graphics)),
             Command::Readback {
-                from: whole(s.target),
+                from: whole,
                 id: rb(3),
             },
+            Command::Dispatch(starquake_render::command::DispatchDesc {
+                pipeline: compute,
+                bindings: Vec::new(),
+                params: starquake_render::command::DispatchParams::Direct { x: 1, y: 1, z: 1 },
+            }),
+        ],
+    }));
+    b.take_readback(rb(3));
+    b.destroy(ResourceId::Sampler(sampler), first);
+    b.destroy(ResourceId::Buffer(buf), second);
+    ok(b.submit(CommandList {
+        commands: vec![
+            upload(&counting(7, 64), whole),
+            present(2),
             Command::Readback {
-                from: whole(s.source),
+                from: whole,
                 id: rb(4),
             },
-            present(s.target_view, 2),
-            present(s.source_view, 3),
-        ]),
-    ]
+        ],
+    }));
+    b.take_readback(rb(4));
 }
 
-/// Everything a run leaves behind that a test can ask a recording backend for.
-#[derive(Debug, PartialEq)]
-struct Results {
-    completed: FenceValue,
-    /// Readbacks 1 to 5; nothing asks for the fifth.
-    readbacks: Vec<Option<Readback>>,
-    frames: Vec<FrameDump>,
-    feedback: Vec<PresentFeedback>,
-    snapshot: String,
+/// The scene captured through the wrapper around a recording backend: the capture's bytes and
+/// the backend.
+fn capture(missing_first: bool) -> (Vec<u8>, Arc<RecordingBackend>) {
+    let original = Arc::new(RecordingBackend::new(caps(), MEMORY));
+    let buffer = Arc::new(CaptureBuffer::new());
+    let inner: Arc<dyn Backend> = Arc::<RecordingBackend>::clone(&original);
+    let sink: Arc<dyn CaptureSink> = Arc::<CaptureBuffer>::clone(&buffer);
+    let wrapper = Arc::new(ok(CapturingBackend::new(
+        inner,
+        sink,
+        "test".to_owned(),
+        "recording".to_owned(),
+        WaitSetting::Wait,
+        u64::MAX,
+    )));
+    let tee: Arc<dyn FrameSink> = Arc::new(Tee(Arc::downgrade(&wrapper)));
+    original.set_frame_sink(Some(tee));
+    scene(&*wrapper, missing_first);
+    ok(wrapper.finish());
+    assert_eq!(wrapper.stopped(), None);
+    (buffer.bytes(), original)
 }
 
-fn results(b: &RecordingBackend) -> Results {
-    Results {
-        completed: b.completed(),
-        readbacks: (1..=5).map(|n| b.take_readback(rb(n))).collect(),
-        frames: b.take_frame_dumps(),
-        feedback: b.take_present_feedback(),
-        snapshot: b.snapshot(),
-    }
+/// The decoy buffer's size: the device's largest.
+const DECOY_BYTES: u64 = 1 << 20;
+
+/// Replays `bytes` on a fresh recording backend whose budget is `budget`, with the replay's
+/// memory limit at `limit` (the budget when `None`).
+fn replay_fresh(bytes: &[u8], budget: u64, limit: Option<u64>) -> (ReplayReport, RecordingBackend) {
+    let fresh = RecordingBackend::new(caps(), budget);
+    let frames = Arc::new(ReplayFrames::new());
+    let sink: Arc<dyn FrameSink> = Arc::<ReplayFrames>::clone(&frames);
+    fresh.set_frame_sink(Some(sink));
+    let len = ok(u64::try_from(bytes.len()));
+    let mut reader = ok(CaptureReader::new(bytes, len));
+    let options = ReplayOptions {
+        backend_name: "recording".to_owned(),
+        memory_limit: limit,
+        fence_timeout: Duration::from_secs(5),
+        pipeline_timeout: Duration::from_secs(5),
+    };
+    let report = ok(replay(&mut reader, &fresh, &Stub, &frames, &options));
+    (report, fresh)
 }
 
-fn fences(values: &[u64]) -> Vec<FenceValue> {
-    values.iter().copied().map(FenceValue::new).collect()
-}
+/// Results the scene compares: three readbacks with known bytes (the one after the draw is
+/// unknown), two frames, two pipelines.
+const COMPARED: u64 = 3 + 2 + 2;
 
-/// The issue's last test: the original run, its capture as a file's bytes, and the replay of
-/// what was read back from those bytes give the same readbacks (and frames, feedback, fence
-/// values and snapshot).
+/// Records in the scene without decoys: Start, 4 creates, 3 shaders with their 3 sources, 2
+/// pipelines, 2 outcomes, the target, 3 lists with 2 frames, 4 readback results, 2 destroys, End.
+const RECORDS: u64 = 1 + 4 + 6 + 2 + 2 + 1 + 3 + 2 + 4 + 2 + 1;
+
 #[test]
-fn a_replayed_capture_gives_the_results_of_the_original_run() {
-    // The original run.
-    let original = backend();
-    let s = scene(&original);
-    let signalled: Vec<FenceValue> = lists(&s)
-        .into_iter()
-        .map(|list| ok(original.submit(list)))
-        .collect();
-    assert_eq!(signalled, fences(&[1, 2, 3, 4]));
-
-    // Its capture, through a file's bytes.
-    let capture = original.capture();
-    let expected: Vec<CapturedList> = signalled
-        .iter()
-        .zip(lists(&s))
-        .map(|(fence, list)| CapturedList {
-            fence: *fence,
-            list,
-        })
-        .collect();
-    assert_eq!(capture.lists, expected);
-    let file = ok(capture.to_bytes());
-    let read = ok(Capture::from_bytes(&file));
-    assert_eq!(read, capture);
-    // The staging bytes are in the file as they were uploaded.
-    assert!(
-        file.windows(16).any(|w| w == counting(100, 16)),
-        "the image is in the file"
-    );
-
-    // The replay, on a second backend with the same resources.
-    let second = backend();
-    assert_eq!(scene(&second), s);
-    assert_eq!(read.replay(&second), Ok(signalled));
-
-    let first = results(&original);
-    // What the original run gave, so that "the same" is not two empty answers. The target is
-    // the image with its second texel cleared, until the draw makes it unknown.
-    let mut cleared = counting(100, 16);
-    cleared[4..8].copy_from_slice(&[0, 0, 0, 255]);
+fn a_capture_replays_on_a_fresh_backend_to_the_same_results() {
+    let (bytes, original) = capture(false);
+    let (report, fresh) = replay_fresh(&bytes, MEMORY, None);
     assert_eq!(
-        first.readbacks,
-        vec![
-            Some(Readback::Bytes(counting(1, 8))),
-            Some(Readback::Bytes(cleared.clone())),
-            Some(Readback::Unknown),
-            Some(Readback::Bytes(counting(100, 16))),
-            None,
-        ]
-    );
-    let pixels: Vec<(u64, Readback)> = first
-        .frames
-        .iter()
-        .map(|f| (f.frame, f.pixels.clone()))
-        .collect();
-    assert_eq!(
-        pixels,
-        vec![
-            (1, Readback::Bytes(cleared)),
-            (2, Readback::Unknown),
-            (3, Readback::Bytes(counting(100, 16))),
-        ]
-    );
-    assert_eq!(first.feedback.len(), 3);
-    assert_eq!(first.completed, FenceValue::new(4));
-
-    assert_eq!(results(&second), first);
-}
-
-/// A replay needs the resources the lists name. On a backend without them the list that
-/// names a missing one is refused, the error says which list, and the lists before it stay
-/// submitted: the error carries the fence values they signalled there, which is what a caller
-/// needs to wait for them.
-#[test]
-fn a_replay_stops_at_the_list_a_backend_refuses() {
-    let original = backend();
-    let s = scene(&original);
-    for list in lists(&s) {
-        submit(&original, list.commands);
-    }
-    let capture = original.capture();
-
-    // Nothing exists: the first list is refused, and nothing was submitted.
-    let empty = backend();
-    let refused = capture.replay(&empty);
-    assert_eq!(
-        refused,
-        Err(CaptureError::Replay {
-            list: 0,
-            submitted: Vec::new(),
-            source: RenderError::Invalid("no live buffer has this id"),
-        })
-    );
-    assert_eq!(empty.completed(), FenceValue::ZERO);
-    assert_eq!(empty.capture(), Capture::default());
-
-    // Only the buffer and the first texture exist: the first list runs, the second is refused.
-    // The backend has done other work, so its fence values are not the captured ones.
-    let partial = backend();
-    assert_eq!(data_buffer(&partial), s.data);
-    assert_eq!(texture(&partial, RGBA, (2, 2), 1, 1), s.source);
-    submit(&partial, Vec::new());
-    submit(&partial, Vec::new());
-    let refused = capture.replay(&partial).expect_err("the target is missing");
-    assert_eq!(
-        refused,
-        CaptureError::Replay {
-            list: 1,
-            submitted: fences(&[3]),
-            source: RenderError::Invalid("no live texture has this id"),
+        report,
+        ReplayReport {
+            records: RECORDS,
+            lists: 3,
+            compared: COMPARED,
+            ..ReplayReport::default()
         }
     );
+    // The same calls in the same order on a backend just as fresh: the same log, ids and all.
+    assert_eq!(fresh.snapshot(), original.snapshot());
+    assert_eq!(fresh.lists(), original.lists());
+    assert_eq!(fresh.completed(), FenceValue::new(3));
+}
+
+#[test]
+fn ids_the_fresh_backend_hands_out_differently_are_mapped() {
+    let (bytes, original) = capture(true);
+    // The decoy buffer passes the replay's memory limit, and the shader has no origin: both are
+    // refused, and every later buffer and shader has another id on the fresh backend.
+    let (report, fresh) = replay_fresh(&bytes, MEMORY, Some(DECOY_BYTES - 1));
     assert_eq!(
-        refused.to_string(),
-        "list 1 of the capture was refused: no live texture has this id"
+        report,
+        ReplayReport {
+            records: RECORDS + 2,
+            lists: 3,
+            refused: 2,
+            first_refused: Some(Finding {
+                record: 1,
+                kind: FindingKind::MissingShader
+            }),
+            compared: COMPARED,
+            ..ReplayReport::default()
+        }
     );
-    let source = std::error::Error::source(&refused).expect("the backend's error");
-    assert_eq!(source.to_string(), "no live texture has this id");
-    assert_eq!(partial.completed(), FenceValue::new(3));
-    assert_eq!(
-        partial.take_readback(rb(1)),
-        Some(Readback::Bytes(counting(1, 8)))
-    );
-    assert_eq!(partial.take_readback(rb(2)), None);
-    let lists: Vec<CommandList> = partial.lists().into_iter().map(|(_, list)| list).collect();
-    assert_eq!(
-        lists,
-        vec![
-            CommandList::new(),
-            CommandList::new(),
-            capture.lists[0].list.clone()
-        ]
+    let originals = original.lists();
+    let replayed = fresh.lists();
+    assert_eq!(replayed.len(), originals.len());
+    assert_ne!(
+        replayed, originals,
+        "the lists name the fresh backend's ids"
     );
 }
 
-/// A refusal further on carries every fence value before it, in order.
 #[test]
-fn a_refused_replay_says_what_it_submitted() {
-    let marker = |n| CommandList {
-        commands: vec![Command::Marker(Marker { submit: n, draw: n })],
-    };
-    let missing = CommandList {
-        commands: vec![Command::Readback {
-            from: slice(BufferId::new(9, 0), 0, 1),
-            id: rb(1),
-        }],
-    };
-    let capture = Capture::new([
-        (FenceValue::new(10), marker(1)),
-        (FenceValue::new(20), marker(2)),
-        (FenceValue::new(30), missing),
-        (FenceValue::new(40), marker(3)),
-    ]);
-    let b = backend();
+fn a_result_replay_cannot_reproduce_is_found() {
+    let (bytes, _) = capture(false);
+    // A fresh backend whose budget is one byte short of the buffer: the buffer is refused for
+    // the memory limit, the list and the destroy naming it are refused, and the results the
+    // list made are missing on replay.
+
+    let (report, fresh) = replay_fresh(&bytes, 255, None);
     assert_eq!(
-        capture.replay(&b),
-        Err(CaptureError::Replay {
-            list: 2,
-            submitted: fences(&[1, 2]),
-            source: RenderError::Invalid("no live buffer has this id"),
+        report.first_refused,
+        Some(Finding {
+            record: 1,
+            kind: FindingKind::MemoryLimit {
+                needed: 256,
+                limit: 255
+            }
         })
     );
-    // The list after the refused one was not submitted.
-    assert_eq!(b.completed(), FenceValue::new(2));
-}
-
-/// The fence values a replay returns are the ones the backend signals, not the captured ones:
-/// a capture can start late in its run and be replayed on a backend that has done other work.
-#[test]
-fn a_replay_returns_the_fence_values_of_its_backend() {
-    let marker = |n| CommandList {
-        commands: vec![Command::Marker(Marker { submit: n, draw: n })],
-    };
-    let capture = Capture::new([
-        (FenceValue::new(40), marker(1)),
-        (FenceValue::new(41), CommandList::new()),
-        (FenceValue::new(90), marker(2)),
-    ]);
-    let b = backend();
-    assert_eq!(capture.replay(&b), Ok(fences(&[1, 2, 3])));
-    // Again, on the same backend: the lists are submitted again.
-    assert_eq!(capture.replay(&b), Ok(fences(&[4, 5, 6])));
-    let submitted: Vec<CommandList> = b.lists().into_iter().map(|(_, list)| list).collect();
+    // The buffer's create, the first list and the buffer's destroy.
+    assert_eq!(report.refused, 3);
+    assert_eq!(report.lists, 2);
+    assert_eq!(fresh.lists().len(), 2);
+    // The first frame and the first two readbacks are missing; the later frame and readback
+    // compare equal; so do the pipelines.
+    assert_eq!(report.differences, 3);
     assert_eq!(
-        submitted,
-        vec![
-            marker(1),
-            CommandList::new(),
-            marker(2),
-            marker(1),
-            CommandList::new(),
-            marker(2),
-        ]
+        report.first_difference.map(|f| f.kind),
+        Some(FindingKind::FrameMissing(1))
     );
-    // The capture itself is unchanged.
-    assert_eq!(capture.lists[2].fence, FenceValue::new(90));
-
-    // An empty capture submits nothing.
-    let untouched = backend();
-    assert_eq!(Capture::default().replay(&untouched), Ok(Vec::new()));
-    assert_eq!(untouched.completed(), FenceValue::ZERO);
-}
-
-/// The recording backend's capture is the lists it accepted, with their fence values: empty
-/// lists are in it, refused lists are not.
-#[test]
-fn the_recording_backends_capture() {
-    let b = backend();
-    assert_eq!(b.capture(), Capture::default());
-    let marker = CommandList {
-        commands: vec![Command::Marker(Marker { submit: 7, draw: 9 })],
-    };
-    submit(&b, marker.commands.clone());
-    submit(&b, Vec::new());
-    let refused = b.submit(CommandList {
-        commands: vec![Command::Readback {
-            from: slice(BufferId::new(9, 9), 0, 4),
-            id: rb(1),
-        }],
-    });
-    assert_eq!(
-        refused,
-        Err(RenderError::Invalid("no live buffer has this id"))
-    );
-    submit(&b, marker.commands.clone());
-    assert_eq!(
-        b.capture(),
-        Capture::new([
-            (FenceValue::new(1), marker.clone()),
-            (FenceValue::new(2), CommandList::new()),
-            (FenceValue::new(3), marker),
-        ])
-    );
-    assert_eq!(b.capture().lists.len(), b.lists().len());
+    assert_eq!(report.compared, 1 + 1 + 2);
 }

@@ -22,10 +22,11 @@ use super::super::fields::{DST, mask_of};
 use super::super::form::{Form, Reader};
 use super::super::instruction::Field;
 use super::super::operand::{AluSrc, CBufRef, Gpr, UniformReg};
+use super::super::print::IntOperand;
 use super::{Named, Op, shells};
 #[cfg(test)]
 use {
-    super::super::fields::{SLOT_ABS, SLOT_NEG},
+    super::super::fields::{SLOT_ABS, SLOT_NEG, SLOT_UNIFORM},
     super::super::form::ReferenceRow,
     proptest::strategy::BoxedStrategy,
 };
@@ -108,12 +109,7 @@ impl Display for MovSrc {
     /// A register, a constant buffer or a uniform register as itself; an immediate in
     /// hexadecimal (a guess, see `print`).
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Reg(reg) => write!(f, "{reg}"),
-            Self::Imm(bits) => write!(f, "{bits:#x}"),
-            Self::CBuf(cbuf) => write!(f, "{cbuf}"),
-            Self::UniformReg(reg) => write!(f, "{reg}"),
-        }
+        IntOperand(self.to_alu()).fmt(f)
     }
 }
 
@@ -179,7 +175,8 @@ pub(crate) const FORMS: &[Form] = &[
 /// PR #4588's rows for the group's forms, in [`FORMS`] order
 /// (`eden-pr4588/src/shader_recompiler/frontend/ampere/ampere_isa_table.h` @ e5fb3b97; each
 /// row's four words, low word first). The rows of the register, constant-buffer and
-/// uniform-register forms drop bits 62 and 63, the divergence in the module docs.
+/// uniform-register forms drop bits 62 and 63, the divergence in the module docs; the
+/// uniform-register form requires bit 91.
 #[cfg(test)]
 pub(crate) const REFERENCE_ROWS: &[ReferenceRow] = &[
     ReferenceRow::new(0x202, [0x00ff_ffff, 0xc000_00ff, 0x0000_0f00, 0xffff_fe00])
@@ -188,7 +185,8 @@ pub(crate) const REFERENCE_ROWS: &[ReferenceRow] = &[
     ReferenceRow::new(0xa02, [0x00ff_ffff, 0xc7ff_ffff, 0x0800_0f00, 0xffff_fe00])
         .dropping(MOV_DROPPED),
     ReferenceRow::new(0xc02, [0x00ff_ffff, 0xc000_003f, 0x0800_0f00, 0xffff_fe00])
-        .dropping(MOV_DROPPED),
+        .dropping(MOV_DROPPED)
+        .fixing(SLOT_UNIFORM.mask()),
 ];
 
 /// The bits PR #4588's `MOV` rows mark known that `MOV` rejects: the wide slot's modifiers.

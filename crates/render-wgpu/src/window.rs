@@ -1,0 +1,718 @@
+//! Window presentation (docs/specs/render-backend.md, "Present targets" and "Presenting a guest
+//! framebuffer"; slice R8): the wgpu surface made from the frontend's window, and the present
+//! blit the render thread draws into it. The choices are [`crate::present`]'s pure functions.
+//!
+//! # Where the surface is made
+//!
+//! `set_present_target(PresentTarget::Window(..))` makes the surface on the thread that calls
+//! it ([`make_surface`]), and the render thread configures it, draws into it and presents it.
+//! On macOS, making the surface attaches a Metal layer to the window's view, which `AppKit` allows
+//! only on the main thread, and wgpu panics if asked anywhere else
+//! (`wgpu-30.0.2/src/api/surface.rs`, `SurfaceTarget`, "Panics"). So on macOS the frontend
+//! makes that call on its main thread, the thread that runs its event loop; on any other thread
+//! the backend refuses it with [`NOT_MAIN_THREAD`] instead of letting wgpu panic (checked with
+//! `objc2::MainThreadMarker`). Linux has no such rule. Configuring, acquiring and presenting
+//! happen on the render thread: wgpu's Metal layer code takes the layer's size there under its
+//! own lock (`wgpu-hal-30.0.2/src/metal/surface.rs`, `dimensions`: "safe to call off of the main
+//! thread"). That this whole path works in a real window is checked by hand, not by a test: the
+//! tests have no window and do not run on the main thread.
+//!
+//! Every fallible step of making the surface happens before the target is queued: the thread
+//! check, wgpu's surface creation, and the choice of a format, a present mode and an alpha mode
+//! the surface lists ([`crate::present`]). A refused call changes nothing, and the target in
+//! force stays.
+//!
+//! # The present blit
+//!
+//! A present that is shown ([`crate::present::frame_outcome`]) is drawn into the window where
+//! it stands in its list, in two encoded commands:
+//!
+//! 1. a copy of the presented rectangle (rounded out to whole blocks) from the guest's texture
+//!    into a texture of the backend's own that can be sampled (the guest's may not be: a present
+//!    needs only the copy-source usage, `validate::validate_present`), which also takes the
+//!    view's layer or slice out of an array, cube or 3D texture;
+//! 2. a render pass into the window's texture that clears it to black and draws `present.wgsl`
+//!    (R4) as a strip of four vertices: the image scaled to fit the window, filtered, turned by
+//!    the present's transform and converted from the guest's format to the window's
+//!    ([`crate::present`] for each choice).
+//!
+//! Both are encoded before anything after the present in the list, and lists are submitted in
+//! order on one queue, so a later command that writes the presented image cannot change what
+//! the window shows ("Submit"; pinned by
+//! `backend::tests::window::the_window_shows_the_presented_frame_after_the_image_is_written`). The
+//! window's texture is presented after the list's last submission.
+//!
+//! The backend's sampled copy, the parameter buffer, the shader, the pipelines (one per window
+//! format and filterability) and the samplers are made on first use and reused; the copy is made
+//! again only when the presented format or size changes. They are host memory the budget does
+//! not count, like the rectangle-clear scratch (`crate::thread`).
+//!
+//! # A frame that cannot be shown
+//!
+//! A present the frame queue keeps is still dropped, counted in its feedback as
+//! `PresentOutcome::Dropped`, when: the window's size has a zero side (minimised); wgpu answers
+//! the acquire with a timeout, an occluded window, a validation error, or an outdated surface
+//! twice in a row ([`crate::present::acquire_action`]); the presented image is compressed and its
+//! rectangle starts inside a block ([`crate::present::starts_on_block`]); or the surface was
+//! lost, which lets it go, so every later present to it is dropped until the frontend sets a
+//! window target again (on macOS only the main thread may make one). In tests, a stand-in
+//! texture that is no longer live drops its frames too. Two more paths drop a frame, each a
+//! backend bug the tests would show: a presented texture with no host object (counted as a
+//! host error, as `crate::thread` counts every such miss) and a present shader that does not
+//! parse (logged; R4's tests parse it).
+//!
+//! A dropped frame leaves the window showing the frame before it. That needs the window's
+//! texture never to be presented undrawn: wgpu-core clears a surface texture that was never
+//! rendered to and then presents it (`wgpu-core-30.0.2/src/present.rs`, `Queue::present`, which
+//! calls `prepare_surface_texture_for_present` in `device/queue.rs`), so the window would show a
+//! black frame while the feedback says `Dropped`. So the checks that can drop a shown frame run
+//! before the window's texture is acquired, in this order: the presented texture's host object
+//! (`crate::thread`), the block check, and making the blit's objects ([`Presenter::prepare`]).
+//! The acquire comes next, and the blit's own steps after it; if one of those fails anyway (the
+//! fit of an empty image or window, which the shared checks and [`surface_size`] rule out), the
+//! window's texture is discarded rather than presented: dropping a `SurfaceTexture` that was not
+//! presented discards it (`wgpu-30.0.2/src/api/surface_texture.rs`, its `Drop`). The stand-in
+//! target of the tests goes through the same acquire, discard and present steps and counts them
+//! ([`TestWindow`]); pinned by
+//! `backend::tests::window::a_compressed_present_inside_a_block_is_dropped` (nothing acquired for
+//! the dropped frame) and
+//! `backend::tests::window::a_blit_that_fails_after_the_acquire_discards_the_texture`.
+
+use crate::plan::TexelBox;
+use crate::present::{
+    self, AcquireAction, Acquired, Crop, FRAME_LATENCY, SURFACE_UNSUPPORTED, ScreenRect,
+    SurfaceChoice, blit_params, fit, shown_size, surface_choice, surface_size, view_formats,
+    write_format,
+};
+use starquake_render::command::PresentDesc;
+use starquake_render::host_shaders::present as shader;
+use starquake_render::{HostShader, RenderError, WindowHandles, WindowSize};
+use std::collections::HashMap;
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// A window surface asked for off the main thread on macOS (module docs).
+pub const NOT_MAIN_THREAD: &str =
+    "a window's surface must be made on the main thread on macOS (set the present target there)";
+/// wgpu could not make a surface from the window's handles.
+pub const NO_SURFACE: &str = "a surface could not be made from the window's handles";
+
+/// Whether this platform makes window surfaces on the main thread only (module docs).
+const NEEDS_MAIN_THREAD: bool = cfg!(target_os = "macos");
+
+/// Whether the calling thread is the process's main thread, where that matters.
+#[cfg(target_os = "macos")]
+fn on_main_thread() -> bool {
+    objc2::MainThreadMarker::new().is_some()
+}
+
+/// Whether the calling thread is the process's main thread, where that matters: nowhere here.
+#[cfg(not(target_os = "macos"))]
+fn on_main_thread() -> bool {
+    true
+}
+
+/// A window surface and how it is configured, made by [`make_surface`].
+#[derive(Debug)]
+pub struct WindowSurface {
+    surface: wgpu::Surface<'static>,
+    choice: SurfaceChoice,
+    size: WindowSize,
+}
+
+/// Makes a surface for `handles` on this thread and chooses how to configure it (module docs).
+/// The check order: the thread ([`NOT_MAIN_THREAD`]), wgpu's surface creation
+/// ([`NO_SURFACE`]), then the adapter's support and the surface's lists
+/// ([`SURFACE_UNSUPPORTED`]).
+pub fn make_surface(
+    instance: &wgpu::Instance,
+    adapter: &wgpu::Adapter,
+    handles: &WindowHandles,
+) -> Result<WindowSurface, RenderError> {
+    if !present::may_make_surface(NEEDS_MAIN_THREAD, on_main_thread()) {
+        return Err(RenderError::Unsupported(NOT_MAIN_THREAD));
+    }
+    let surface = instance
+        .create_surface(Arc::clone(handles.window()))
+        .map_err(|error| {
+            tracing::warn!("wgpu could not make a surface for the window: {error}");
+            RenderError::Unsupported(NO_SURFACE)
+        })?;
+    if !adapter.is_surface_supported(&surface) {
+        return Err(RenderError::Unsupported(SURFACE_UNSUPPORTED));
+    }
+    let choice = surface_choice(&surface.get_capabilities(adapter))?;
+    tracing::info!("presenting to a window with {choice:?}");
+    Ok(WindowSurface {
+        surface,
+        choice,
+        size: handles.size().clone(),
+    })
+}
+
+/// Where the render thread sends shown frames.
+#[derive(Debug)]
+pub enum Target {
+    /// No window: presents are counted (and dumped on request), never drawn.
+    Offscreen,
+    /// A window.
+    Window(WindowSurface),
+    /// A window whose surface was lost: presents are dropped (module docs).
+    Lost,
+    /// A texture of the backend's standing in for a window's, for the tests: acquired, drawn
+    /// into, discarded and presented as a window's texture is, where presenting only counts
+    /// ([`TestWindow`]). Its id is a live texture with the render-target usage.
+    #[cfg(test)]
+    Texture(starquake_render::TextureId, Arc<TestWindow>),
+}
+
+/// What the stand-in target of the tests saw ([`Target::Texture`]): how many times its texture
+/// was acquired, presented and discarded (module docs, "A frame that cannot be shown"), and a
+/// fault to inject.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct TestWindow {
+    /// Textures acquired.
+    pub acquired: AtomicU64,
+    /// Acquired textures presented.
+    pub presented: AtomicU64,
+    /// Acquired textures discarded.
+    pub discarded: AtomicU64,
+    /// When set, the next blit fails after the acquire, before it encodes anything (cleared by
+    /// that blit).
+    pub fail_next_blit: AtomicBool,
+}
+
+/// The window's texture acquired for the list being encoded.
+#[derive(Debug)]
+enum Pending {
+    /// A window's.
+    Surface(wgpu::SurfaceTexture),
+    /// The tests' stand-in's (counted, never presented).
+    #[cfg(test)]
+    Test(Arc<TestWindow>),
+}
+
+/// The backend's sampled copy of the presented image.
+#[derive(Debug)]
+struct Source {
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+    texture: wgpu::Texture,
+    /// Bind groups for it, by whether the sampler filters ([`Blit::layouts`]'s order).
+    groups: [Option<wgpu::BindGroup>; 2],
+}
+
+/// The objects every blit uses, made on the first one.
+#[derive(Debug)]
+struct Blit {
+    module: wgpu::ShaderModule,
+    params: wgpu::Buffer,
+    /// Bind group and pipeline layouts for a format that cannot be filtered (0) and one that
+    /// can (1).
+    layouts: [(wgpu::BindGroupLayout, wgpu::PipelineLayout); 2],
+    /// The nearest (0) and linear (1) samplers.
+    samplers: [wgpu::Sampler; 2],
+    /// Pipelines by the format written and filterability.
+    pipelines: HashMap<(wgpu::TextureFormat, bool), wgpu::RenderPipeline>,
+}
+
+/// The render thread's present state (module docs).
+#[derive(Debug)]
+pub struct Presenter {
+    target: Target,
+    /// The size the window's surface is configured at.
+    configured: Option<(u32, u32)>,
+    /// Whether the surface must be configured again before the next frame.
+    stale: bool,
+    /// The window's texture drawn into by the list being encoded, presented after its last
+    /// submission.
+    pending: Option<Pending>,
+    blit: Option<Blit>,
+    source: Option<Source>,
+}
+
+/// Why a shown frame was dropped after all, for the log.
+type Dropped = &'static str;
+
+impl Presenter {
+    /// A presenter for the offscreen target.
+    pub fn new() -> Self {
+        Self {
+            target: Target::Offscreen,
+            configured: None,
+            stale: false,
+            pending: None,
+            blit: None,
+            source: None,
+        }
+    }
+
+    /// Whether presents go nowhere but the count and dumps.
+    pub fn offscreen(&self) -> bool {
+        matches!(self.target, Target::Offscreen)
+    }
+
+    /// The target, for the render thread to resolve a test texture.
+    pub fn target(&self) -> &Target {
+        &self.target
+    }
+
+    /// Sets where shown frames go. The old window's surface is let go.
+    pub fn set_target(&mut self, target: Target) {
+        self.target = target;
+        self.configured = None;
+        self.stale = false;
+    }
+
+    /// The window's texture for the next frame (module docs), configuring the surface first
+    /// when its size changed or wgpu asked for it.
+    pub fn acquire(&mut self, device: &wgpu::Device) -> Result<wgpu::Texture, Dropped> {
+        let Target::Window(window) = &self.target else {
+            return Err("there is no window");
+        };
+        let max = device.limits().max_texture_dimension_2d;
+        let Some(size) = surface_size(window.size.get(), max) else {
+            return Err("the window has no area");
+        };
+        if self.configured != Some(size) || self.stale {
+            configure(device, window, size);
+            self.configured = Some(size);
+            self.stale = false;
+        }
+        for retried in [false, true] {
+            let (acquired, texture) = match window.surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(t) => (Acquired::Success, Some(t)),
+                wgpu::CurrentSurfaceTexture::Suboptimal(t) => (Acquired::Suboptimal, Some(t)),
+                wgpu::CurrentSurfaceTexture::Timeout => (Acquired::Timeout, None),
+                wgpu::CurrentSurfaceTexture::Occluded => (Acquired::Occluded, None),
+                wgpu::CurrentSurfaceTexture::Outdated => (Acquired::Outdated, None),
+                wgpu::CurrentSurfaceTexture::Lost => (Acquired::Lost, None),
+                wgpu::CurrentSurfaceTexture::Validation => (Acquired::Validation, None),
+            };
+            match (present::acquire_action(acquired, retried), texture) {
+                (AcquireAction::Show { reconfigure }, Some(texture)) => {
+                    self.stale = reconfigure;
+                    let out = texture.texture.clone();
+                    self.pending = Some(Pending::Surface(texture));
+                    return Ok(out);
+                }
+                (AcquireAction::Retry, _) => configure(device, window, size),
+                (AcquireAction::Forget, _) => {
+                    tracing::warn!(
+                        "the window's surface was lost; frames are dropped until a window \
+                         target is set again"
+                    );
+                    self.set_target(Target::Lost);
+                    return Err("the window's surface was lost");
+                }
+                (AcquireAction::Show { .. } | AcquireAction::Drop, _) => {
+                    return Err("the window gave no texture");
+                }
+            }
+        }
+        Err("the window's surface stayed out of date")
+    }
+
+    /// Acquires the stand-in target's `texture` as [`Presenter::acquire`] acquires a window's,
+    /// counting it ([`TestWindow`]).
+    #[cfg(test)]
+    pub fn acquire_test(&mut self, texture: wgpu::Texture) -> wgpu::Texture {
+        if let Target::Texture(_, window) = &self.target {
+            window.acquired.fetch_add(1, Ordering::Relaxed);
+            self.pending = Some(Pending::Test(Arc::clone(window)));
+        }
+        texture
+    }
+
+    /// Presents the window's texture the list drew into, if any; called after the list's last
+    /// submission.
+    pub fn finish(&mut self, queue: &wgpu::Queue) {
+        match self.pending.take() {
+            Some(Pending::Surface(texture)) => queue.present(texture),
+            #[cfg(test)]
+            Some(Pending::Test(window)) => {
+                window.presented.fetch_add(1, Ordering::Relaxed);
+            }
+            None => {}
+        }
+    }
+
+    /// Lets the acquired window texture go without presenting it, so the window keeps its last
+    /// frame (module docs, "A frame that cannot be shown").
+    fn discard(&mut self) {
+        match self.pending.take() {
+            // Dropping a texture that was not presented discards it.
+            Some(Pending::Surface(texture)) => drop(texture),
+            #[cfg(test)]
+            Some(Pending::Test(window)) => {
+                window.discarded.fetch_add(1, Ordering::Relaxed);
+            }
+            None => {}
+        }
+    }
+
+    /// The checks of a present of `at` read as `format` that can drop it, run before the window's
+    /// texture is acquired (module docs, "A frame that cannot be shown"): the block check, then
+    /// making the blit's objects on the first present.
+    pub fn prepare(
+        &mut self,
+        device: &wgpu::Device,
+        at: TexelBox,
+        format: wgpu::TextureFormat,
+    ) -> Result<(), Dropped> {
+        let origin = (at.origin.x, at.origin.y);
+        if !present::starts_on_block(origin, format.block_dimensions()) {
+            return Err("the presented rectangle does not start on a compressed block");
+        }
+        if self.blit.is_none() {
+            self.blit = Some(make_blit(device)?);
+        }
+        Ok(())
+    }
+
+    /// Encodes the blit of `at` in `src` (a present of `desc`, read as `format`) into `dst`, the
+    /// texture just acquired, after [`Presenter::prepare`] passed (module docs, "The present
+    /// blit"). On an error the acquired texture is discarded, not presented.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the blit needs the device, the queue, the encoder, both textures and what the \
+                  present names; a struct for them would only carry them here"
+    )]
+    pub fn blit(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        src: &wgpu::Texture,
+        at: TexelBox,
+        desc: &PresentDesc,
+        format: wgpu::TextureFormat,
+        dst: &wgpu::Texture,
+    ) -> Result<(), Dropped> {
+        let drawn = self.encode(device, queue, encoder, src, at, desc, format, dst);
+        if drawn.is_err() {
+            self.discard();
+        }
+        drawn
+    }
+
+    /// The fault [`TestWindow::fail_next_blit`] asks for, once.
+    #[cfg(test)]
+    fn test_fault(&self) -> Result<(), Dropped> {
+        match &self.pending {
+            Some(Pending::Test(window)) if window.fail_next_blit.swap(false, Ordering::Relaxed) => {
+                Err("a fault injected after the acquire")
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// [`Presenter::blit`]'s encoding.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the blit needs the device, the queue, the encoder, both textures and what the \
+                  present names; a struct for them would only carry them here"
+    )]
+    fn encode(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        src: &wgpu::Texture,
+        at: TexelBox,
+        desc: &PresentDesc,
+        format: wgpu::TextureFormat,
+        dst: &wgpu::Texture,
+    ) -> Result<(), Dropped> {
+        #[cfg(test)]
+        self.test_fault()?;
+        let shown = shown_size(desc.src_rect, desc.transform);
+        let target = (dst.width(), dst.height());
+        let screen: ScreenRect = fit(shown, target).ok_or("the image or the window is empty")?;
+        let filterable = matches!(
+            format.sample_type(None, Some(device.features())),
+            Some(wgpu::TextureSampleType::Float { filterable: true })
+        );
+        let linear = present::filter(shown, screen, filterable) == wgpu::FilterMode::Linear;
+        let written = write_format(dst.format(), format.is_srgb());
+        let Some(blit) = &mut self.blit else {
+            return Err("the blit's objects were not made (prepare runs first)");
+        };
+        let source = source(&mut self.source, device, format, at);
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: src,
+                mip_level: at.mip,
+                origin: wgpu::Origin3d {
+                    x: at.origin.x,
+                    y: at.origin.y,
+                    z: at.origin.z,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &source.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: at.extent.width,
+                height: at.extent.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let params = blit_params(target, screen, Crop::new(desc.src_rect, at), desc.transform);
+        queue.write_buffer(&blit.params, 0, &params);
+        let kind = usize::from(filterable);
+        let pipeline = blit
+            .pipelines
+            .entry((written, filterable))
+            .or_insert_with(|| make_pipeline(device, &blit.module, &blit.layouts[kind].1, written));
+        let group = source.groups[usize::from(linear)].get_or_insert_with(|| {
+            let view = source
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("starquake present"),
+                layout: &blit.layouts[kind].0,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: shader::PARAMS_BINDING,
+                        resource: blit.params.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: shader::TEXTURE_BINDING,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: shader::SAMPLER_BINDING,
+                        resource: wgpu::BindingResource::Sampler(
+                            &blit.samplers[usize::from(linear)],
+                        ),
+                    },
+                ],
+            })
+        });
+        draw(encoder, dst, written, pipeline, group);
+        Ok(())
+    }
+}
+
+/// Encodes the blit's render pass into `dst`, written as `format`: cleared to black (the bars
+/// around the image), then the strip drawn with `pipeline` and `group`.
+fn draw(
+    encoder: &mut wgpu::CommandEncoder,
+    dst: &wgpu::Texture,
+    format: wgpu::TextureFormat,
+    pipeline: &wgpu::RenderPipeline,
+    group: &wgpu::BindGroup,
+) {
+    let view = dst.create_view(&wgpu::TextureViewDescriptor {
+        format: Some(format),
+        usage: Some(wgpu::TextureUsages::RENDER_ATTACHMENT),
+        dimension: Some(wgpu::TextureViewDimension::D2),
+        base_array_layer: 0,
+        array_layer_count: Some(1),
+        base_mip_level: 0,
+        mip_level_count: Some(1),
+        ..wgpu::TextureViewDescriptor::default()
+    });
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("starquake present"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: &view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(shader::GROUP, group, &[]);
+    pass.draw(0..shader::VERTEX_COUNT, 0..1);
+}
+
+/// Configures `window`'s surface at `size`.
+fn configure(device: &wgpu::Device, window: &WindowSurface, size: (u32, u32)) {
+    window.surface.configure(
+        device,
+        &wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: window.choice.format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            width: size.0,
+            height: size.1,
+            present_mode: window.choice.present_mode,
+            desired_maximum_frame_latency: FRAME_LATENCY,
+            alpha_mode: window.choice.alpha_mode,
+            view_formats: view_formats(window.choice.format),
+        },
+    );
+}
+
+/// The backend's sampled copy for a present of `at` read as `format`, made again when the format
+/// or size changed.
+fn source<'a>(
+    slot: &'a mut Option<Source>,
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    at: TexelBox,
+) -> &'a mut Source {
+    let (width, height) = (at.extent.width, at.extent.height);
+    if let Some(s) = slot
+        && (s.format, s.width, s.height) != (format, width, height)
+    {
+        *slot = None;
+    }
+    slot.get_or_insert_with(|| Source {
+        format,
+        width,
+        height,
+        texture: device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("starquake present source"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        }),
+        groups: [None, None],
+    })
+}
+
+/// The shader, buffer, layouts and samplers every blit uses. Fails only when R4's shader does
+/// not parse, which its own tests rule out.
+fn make_blit(device: &wgpu::Device) -> Result<Blit, Dropped> {
+    let module = naga::front::wgsl::parse_str(HostShader::Present.source()).map_err(|e| {
+        tracing::error!("the present shader did not parse: {e}");
+        "the present shader did not parse"
+    })?;
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("starquake present"),
+        source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(module)),
+    });
+    let params = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("starquake present parameters"),
+        size: u64::from(shader::PARAMS_SIZE),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let layout = |filterable: bool| {
+        let group = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("starquake present"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: shader::PARAMS_BINDING,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(u64::from(shader::PARAMS_SIZE)),
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: shader::TEXTURE_BINDING,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: shader::SAMPLER_BINDING,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(if filterable {
+                        wgpu::SamplerBindingType::Filtering
+                    } else {
+                        wgpu::SamplerBindingType::NonFiltering
+                    }),
+                    count: None,
+                },
+            ],
+        });
+        let pipeline = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("starquake present"),
+            bind_group_layouts: &[Some(&group)],
+            immediate_size: 0,
+        });
+        (group, pipeline)
+    };
+    let sampler = |filter: wgpu::FilterMode| {
+        device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("starquake present"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: filter,
+            min_filter: filter,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..wgpu::SamplerDescriptor::default()
+        })
+    };
+    Ok(Blit {
+        module,
+        params,
+        layouts: [layout(false), layout(true)],
+        samplers: [
+            sampler(wgpu::FilterMode::Nearest),
+            sampler(wgpu::FilterMode::Linear),
+        ],
+        pipelines: HashMap::new(),
+    })
+}
+
+/// The blit's pipeline writing `format`.
+fn make_pipeline(
+    device: &wgpu::Device,
+    module: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("starquake present"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module,
+            entry_point: Some(shader::VERTEX),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleStrip,
+            ..wgpu::PrimitiveState::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module,
+            entry_point: Some(shader::FRAGMENT),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}

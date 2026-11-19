@@ -72,6 +72,103 @@ pub enum ResourceId {
     Pipeline(PipelineId),
 }
 
+/// The kind of a [`ResourceId`], without the id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum IdKind {
+    /// A buffer.
+    Buffer,
+    /// A texture.
+    Texture,
+    /// A view.
+    View,
+    /// A sampler.
+    Sampler,
+    /// A shader.
+    Shader,
+    /// A pipeline.
+    Pipeline,
+}
+
+impl IdKind {
+    /// How many kinds there are; [`IdKind::index`] is below it.
+    pub const COUNT: usize = 6;
+
+    /// Every kind, in declaration order.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Buffer,
+        Self::Texture,
+        Self::View,
+        Self::Sampler,
+        Self::Shader,
+        Self::Pipeline,
+    ];
+
+    /// The kind's position in [`IdKind::ALL`], for tables counted per kind.
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Buffer => 0,
+            Self::Texture => 1,
+            Self::View => 2,
+            Self::Sampler => 3,
+            Self::Shader => 4,
+            Self::Pipeline => 5,
+        }
+    }
+
+    /// The kind in words ("buffer").
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Buffer => "buffer",
+            Self::Texture => "texture",
+            Self::View => "view",
+            Self::Sampler => "sampler",
+            Self::Shader => "shader",
+            Self::Pipeline => "pipeline",
+        }
+    }
+}
+
+/// In words, as errors print it: "buffer".
+impl std::fmt::Display for IdKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl ResourceId {
+    /// The kind of resource.
+    pub const fn kind(self) -> IdKind {
+        match self {
+            Self::Buffer(_) => IdKind::Buffer,
+            Self::Texture(_) => IdKind::Texture,
+            Self::View(_) => IdKind::View,
+            Self::Sampler(_) => IdKind::Sampler,
+            Self::Shader(_) => IdKind::Shader,
+            Self::Pipeline(_) => IdKind::Pipeline,
+        }
+    }
+
+    /// The slot and generation of the id inside, whatever its kind.
+    pub const fn parts(self) -> (u32, u32) {
+        match self {
+            Self::Buffer(id) => (id.index(), id.generation()),
+            Self::Texture(id) => (id.index(), id.generation()),
+            Self::View(id) => (id.index(), id.generation()),
+            Self::Sampler(id) => (id.index(), id.generation()),
+            Self::Shader(id) => (id.index(), id.generation()),
+            Self::Pipeline(id) => (id.index(), id.generation()),
+        }
+    }
+}
+
+/// In plain words, as errors print it: "buffer 3 (generation 1)".
+impl std::fmt::Display for ResourceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (index, generation) = self.parts();
+        write!(f, "{} {index} (generation {generation})", self.kind())
+    }
+}
+
 /// A point on the backend's one completion counter. A submitted list signals its value when the
 /// host GPU has finished it; [`crate::Backend::completed`] is the highest value reached.
 #[derive(
@@ -104,7 +201,61 @@ impl FenceValue {
 
 #[cfg(test)]
 mod tests {
-    use super::{BufferId, FenceValue, ReadbackId};
+    use super::{
+        BufferId, FenceValue, IdKind, PipelineId, ReadbackId, ResourceId, SamplerId, ShaderId,
+        TextureId, ViewId,
+    };
+
+    #[test]
+    fn resource_ids_in_words() {
+        let cases = [
+            (
+                ResourceId::Buffer(BufferId::new(1, 2)),
+                "buffer 1 (generation 2)",
+            ),
+            (
+                ResourceId::Texture(TextureId::new(3, 4)),
+                "texture 3 (generation 4)",
+            ),
+            (ResourceId::View(ViewId::new(5, 6)), "view 5 (generation 6)"),
+            (
+                ResourceId::Sampler(SamplerId::new(7, 8)),
+                "sampler 7 (generation 8)",
+            ),
+            (
+                ResourceId::Shader(ShaderId::new(9, 10)),
+                "shader 9 (generation 10)",
+            ),
+            (
+                ResourceId::Pipeline(PipelineId::new(11, 12)),
+                "pipeline 11 (generation 12)",
+            ),
+        ];
+        for (id, words) in cases {
+            assert_eq!(id.to_string(), words);
+        }
+    }
+
+    #[test]
+    fn id_kinds() {
+        // Each id's kind, its words and its place in the per-kind tables, written out.
+        let cases = [
+            (ResourceId::Buffer(BufferId::new(1, 2)), "buffer", 0),
+            (ResourceId::Texture(TextureId::new(1, 2)), "texture", 1),
+            (ResourceId::View(ViewId::new(1, 2)), "view", 2),
+            (ResourceId::Sampler(SamplerId::new(1, 2)), "sampler", 3),
+            (ResourceId::Shader(ShaderId::new(1, 2)), "shader", 4),
+            (ResourceId::Pipeline(PipelineId::new(1, 2)), "pipeline", 5),
+        ];
+        assert_eq!(cases.len(), IdKind::COUNT);
+        for (i, (id, words, index)) in cases.into_iter().enumerate() {
+            let kind = id.kind();
+            assert_eq!(kind.to_string(), words);
+            assert_eq!(kind.name(), words);
+            assert_eq!(kind.index(), index);
+            assert_eq!(IdKind::ALL[i], kind);
+        }
+    }
 
     #[test]
     fn id_parts() {

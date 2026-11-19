@@ -121,15 +121,7 @@ impl TextureSpec {
 /// wgpu's view description for a checked view; `None` when the view's format has no wgpu form
 /// or the dimension is a 1D array, which `crate::rules::check_view` refuses first.
 pub fn view_descriptor(view: &ViewDesc) -> Option<wgpu::TextureViewDescriptor<'static>> {
-    let dimension = match view.dimension {
-        ViewDimension::D1 => wgpu::TextureViewDimension::D1,
-        ViewDimension::D1Array => return None,
-        ViewDimension::D2 => wgpu::TextureViewDimension::D2,
-        ViewDimension::D2Array => wgpu::TextureViewDimension::D2Array,
-        ViewDimension::Cube => wgpu::TextureViewDimension::Cube,
-        ViewDimension::CubeArray => wgpu::TextureViewDimension::CubeArray,
-        ViewDimension::D3 => wgpu::TextureViewDimension::D3,
-    };
+    let dimension = view_dimension(view.dimension)?;
     Some(wgpu::TextureViewDescriptor {
         label: None,
         format: Some(texture_format(view.format)?),
@@ -140,6 +132,20 @@ pub fn view_descriptor(view: &ViewDesc) -> Option<wgpu::TextureViewDescriptor<'s
         mip_level_count: Some(view.mip_count),
         base_array_layer: view.base_layer,
         array_layer_count: Some(view.layer_count),
+    })
+}
+
+/// wgpu's view dimension, or `None` for a 1D array, which wgpu has no view of. Shared by views
+/// and by the texture bindings of a pipeline's layout (`crate::pipeline`).
+pub(crate) const fn view_dimension(dimension: ViewDimension) -> Option<wgpu::TextureViewDimension> {
+    Some(match dimension {
+        ViewDimension::D1 => wgpu::TextureViewDimension::D1,
+        ViewDimension::D1Array => return None,
+        ViewDimension::D2 => wgpu::TextureViewDimension::D2,
+        ViewDimension::D2Array => wgpu::TextureViewDimension::D2Array,
+        ViewDimension::Cube => wgpu::TextureViewDimension::Cube,
+        ViewDimension::CubeArray => wgpu::TextureViewDimension::CubeArray,
+        ViewDimension::D3 => wgpu::TextureViewDimension::D3,
     })
 }
 
@@ -161,7 +167,8 @@ const fn address(mode: AddressMode) -> wgpu::AddressMode {
     }
 }
 
-const fn compare(function: CompareFunction) -> wgpu::CompareFunction {
+/// wgpu's comparison function; shared by samplers and a pipeline's depth and stencil tests.
+pub(crate) const fn compare(function: CompareFunction) -> wgpu::CompareFunction {
     match function {
         CompareFunction::Never => wgpu::CompareFunction::Never,
         CompareFunction::Less => wgpu::CompareFunction::Less,

@@ -54,7 +54,11 @@ use crate::command::{
 };
 use crate::error::RenderError;
 use crate::format::{FormatAspect, PixelFormat};
-use crate::pipeline::{GraphicsPipelineDesc, PolygonMode, RasterState, Topology, VertexLayout};
+use crate::id::ShaderId;
+use crate::pipeline::{
+    ComputePipelineDesc, GraphicsPipelineDesc, PolygonMode, RasterState, Stages, Topology,
+    VertexLayout,
+};
 use crate::resource::{
     AddressMode, BorderColor, BufferDesc, Extent3d, ReductionMode, SamplerDesc, TextureDesc,
     TextureDimension, TextureUsage, ViewDesc, ViewDimension,
@@ -573,6 +577,71 @@ pub fn validate_graphics_pipeline(
     Ok(())
 }
 
+/// A pipeline names a shader id that no live shader has.
+pub const NO_SHADER: &str = "no live shader has this id";
+
+/// A call names a pipeline id that no live pipeline has.
+pub const NO_PIPELINE: &str = "no live pipeline has this id";
+
+/// Checks that each shader a graphics pipeline names is live and was created for the stage it
+/// fills, in the order vertex, tessellation control, tessellation evaluation, geometry,
+/// fragment; `stage_of` gives a live shader's stage, or the error for an id that names none.
+/// Every backend's `create_graphics_pipeline` calls it, after [`validate_graphics_pipeline`].
+pub fn validate_pipeline_stages(
+    stages: &Stages,
+    mut stage_of: impl FnMut(ShaderId) -> Result<ShaderStage, RenderError>,
+) -> Result<(), RenderError> {
+    for (id, stage, wrong) in [
+        (
+            Some(stages.vertex),
+            ShaderStage::Vertex,
+            "a pipeline's vertex shader is not a vertex shader",
+        ),
+        (
+            stages.tess_control,
+            ShaderStage::TessControl,
+            "a pipeline's tessellation control shader is not one",
+        ),
+        (
+            stages.tess_eval,
+            ShaderStage::TessEval,
+            "a pipeline's tessellation evaluation shader is not one",
+        ),
+        (
+            stages.geometry,
+            ShaderStage::Geometry,
+            "a pipeline's geometry shader is not a geometry shader",
+        ),
+        (
+            stages.fragment,
+            ShaderStage::Fragment,
+            "a pipeline's fragment shader is not a fragment shader",
+        ),
+    ] {
+        if let Some(id) = id
+            && stage_of(id)? != stage
+        {
+            return Err(RenderError::Invalid(wrong));
+        }
+    }
+    Ok(())
+}
+
+/// Checks that a compute pipeline's shader is live and a compute shader, as
+/// [`validate_pipeline_stages`] does for a graphics pipeline.
+pub fn validate_compute_stage(
+    desc: &ComputePipelineDesc,
+    stage_of: impl FnOnce(ShaderId) -> Result<ShaderStage, RenderError>,
+) -> Result<(), RenderError> {
+    if stage_of(desc.shader)? == ShaderStage::Compute {
+        Ok(())
+    } else {
+        Err(RenderError::Invalid(
+            "a compute pipeline's shader is not a compute shader",
+        ))
+    }
+}
+
 /// Tessellation in pairs and with patches; optional stages supported.
 fn check_stages(caps: &Caps, desc: &GraphicsPipelineDesc) -> Result<(), RenderError> {
     let stages = &desc.stages;
@@ -834,6 +903,27 @@ pub fn packed_size(format: PixelFormat, extent: Extent3d) -> Result<u64, RenderE
         .and_then(|v| v.checked_mul(extent.depth_or_layers.into()))
         .and_then(|v| v.checked_mul(format.bytes_per_block().into()))
         .ok_or(overflow)
+}
+
+/// Bytes a texture's host object takes: the [`packed_size`] of every mip level, times the
+/// sample count. What the recording backend's budget counts, and what a render capture's
+/// replay sums against its memory limit ([`crate::capture`]).
+///
+/// The loop runs once per mip level, so a caller holding an untrusted description checks it
+/// with [`validate_texture`] first, which bounds the level count by the largest dimension.
+pub fn texture_size(desc: &TextureDesc) -> Result<u64, RenderError> {
+    let overflow = RenderError::Overflow {
+        what: "texture size",
+    };
+    let mut total: u64 = 0;
+    for mip in 0..desc.mip_levels {
+        let extent = desc.mip_extent(mip).ok_or(overflow.clone())?;
+        total = packed_size(desc.format, extent)?
+            .checked_mul(desc.sample_count.into())
+            .and_then(|level| total.checked_add(level))
+            .ok_or(overflow.clone())?;
+    }
+    Ok(total)
 }
 
 /// Checks that `slice` is non-empty and lies inside the buffer `desc` describes.

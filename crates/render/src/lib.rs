@@ -38,18 +38,25 @@
 //! [`Frame`] to the [`FrameSink`] installed on the backend, and a frame encodes itself as a
 //! PNG. This crate still does no file I/O.
 //!
-//! Slice R11 (its first part) adds host-level captures, in [`capture`]: the submitted lists
-//! and their staging bytes as a versioned file's bytes, and their replay on a backend.
+//! Slice R11b replaces R11's first part with render capture v2, in [`capture`]: the
+//! [`CapturingBackend`] that records every state-changing call and its results as a versioned
+//! stream of records, the streaming reader, and the replay on a fresh backend with the ids and
+//! fence values mapped.
 //!
 //! GPU slice G15 adds the completion wake, in [`wake`]: the [`CompletionWake`] each backend is
 //! built with and calls after each advance of [`Backend::completed`], and the contract check
 //! every backend's tests run against it.
+//!
+//! Slice R6 adds the compile pool seam, in [`compile`]: the [`CompilePool`] trait `core`
+//! implements and the [`WhileCompiling`] setting a backend is built with, and, in [`validate`],
+//! the stage checks every backend applies to a pipeline's shaders.
 
 pub mod astc;
 pub mod backend;
 pub mod caps;
 pub mod capture;
 pub mod command;
+pub mod compile;
 pub mod emulation;
 pub mod error;
 pub mod fallback;
@@ -64,14 +71,16 @@ pub mod resource;
 pub mod shader;
 pub mod validate;
 pub mod wake;
+pub mod window;
 
 pub use backend::{
     Backend, MemoryBudget, PipelineStatus, PresentFeedback, PresentOutcome, PresentTarget,
     Readback, WaitOutcome,
 };
 pub use caps::{Caps, Features, FormatFeatures, FormatTable, Limits, SampleCounts};
-pub use capture::{Capture, CaptureError, CapturedList};
+pub use capture::{CaptureError, CaptureReader, CaptureSink, CapturingBackend, ShaderResolver};
 pub use command::{Command, CommandList, StagingSlice};
+pub use compile::{CompileJob, CompilePool, WhileCompiling};
 pub use emulation::{DepthRange, EmulationState, emulation};
 pub use error::{RenderError, UnknownFlags};
 pub use fallback::{Conversion, HostFormat, features_for_usage, host_format};
@@ -79,12 +88,15 @@ pub use format::PixelFormat;
 pub use frame::{Frame, FramePixels, FrameSink};
 pub use host_shaders::HostShader;
 pub use id::{
-    BufferId, FenceValue, PipelineId, ReadbackId, ResourceId, SamplerId, ShaderId, TextureId,
-    ViewId,
+    BufferId, FenceValue, IdKind, PipelineId, ReadbackId, ResourceId, SamplerId, ShaderId,
+    TextureId, ViewId,
 };
 pub use pipeline::{ComputePipelineDesc, EmulationFlags, GraphicsPipelineDesc};
 pub use recording::slots::Slots;
 pub use recording::{FrameDump, RecordingBackend};
 pub use resource::{BufferDesc, BufferUsage, SamplerDesc, TextureDesc, TextureUsage, ViewDesc};
-pub use shader::{ResourceBinding, ShaderDesc, ShaderInterface, ShaderSource, ShaderStage};
+pub use shader::{
+    ResourceBinding, ShaderDesc, ShaderInterface, ShaderOrigin, ShaderSource, ShaderStage,
+};
 pub use wake::{CompletionWake, WakeContractError, WakeCounter, check_completion_wake};
+pub use window::{WindowHandles, WindowSize, WindowSource};

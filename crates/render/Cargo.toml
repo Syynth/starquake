@@ -10,11 +10,21 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Exports `capture::CaptureBuilder`, which writes render captures with no backend, for other
+# crates' tests (`docs/specs/testing.md`, "Shared test support"; render-backend, "Render capture
+# v2").
+test-support = []
+
 [dependencies]
 naga.workspace = true
 png.workspace = true
 postcard.workspace = true
+raw-window-handle.workspace = true
 serde.workspace = true
+# SHA-256 of a render capture's dumped frames and of its shader sources (render-backend, "Render
+# capture v2").
+sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

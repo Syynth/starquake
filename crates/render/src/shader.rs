@@ -6,10 +6,15 @@
 //! 2026-11-12). Group and binding numbers are the shader crate's, already written into the
 //! module; this crate never assigns them. SPIR-V and MSL serve a later direct backend, captures
 //! and experiments.
+//!
+//! A shader may carry its [`ShaderOrigin`]: the inputs the shader crate translated it from, which
+//! a render capture stores so that a replay can translate it again (render-backend, "Render
+//! capture v2", "Shaders"; the owner's decision 15 of 2026-11-18). Backends ignore it.
 
 use crate::format::PixelFormat;
 use crate::resource::ViewDimension;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// A shader stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -167,6 +172,22 @@ pub struct ShaderInterface {
     pub outputs: Vec<InterfaceVariable>,
 }
 
+/// Where a shader came from: the shader crate's encoded capture record of the shader entry
+/// (shader-pipeline slice 20's format, opaque here, since this crate cannot name the shader
+/// crate's types) and the stage's index in that entry's shader set (render-backend, "Render
+/// capture v2", "Shaders").
+///
+/// The GPU crate fills it only when the run captures; a render capture stores each distinct
+/// `record` once ([`crate::capture`]) and a replay hands it back to a
+/// [`crate::capture::ShaderResolver`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShaderOrigin {
+    /// The encoded record, as the shader crate wrote it.
+    pub record: Arc<[u8]>,
+    /// The stage's index in the record's shader set.
+    pub stage_index: u32,
+}
+
 /// A shader for `Backend::create_shader`.
 #[derive(Debug)]
 pub struct ShaderDesc {
@@ -178,4 +199,7 @@ pub struct ShaderDesc {
     pub source: ShaderSource,
     /// Its resources, inputs and outputs.
     pub interface: ShaderInterface,
+    /// What the shader was translated from, when the run captures; `None` otherwise. Backends
+    /// ignore it.
+    pub origin: Option<ShaderOrigin>,
 }
