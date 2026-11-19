@@ -6,6 +6,7 @@ mod control;
 mod float32;
 mod framework;
 mod integer;
+mod texture;
 
 use proptest::prelude::*;
 

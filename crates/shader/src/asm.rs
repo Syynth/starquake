@@ -117,6 +117,17 @@ pub enum EncodeError {
     /// `ISBEWR` writes only the map (0) and attributes (3) (NAK: "Invalid ISBEWR access type").
     #[error("isbewr cannot write access type {0}")]
     IsbewrAccess(u64),
+    /// A value the field holds in larger units is not a whole number of them (a texture
+    /// handle's constant-buffer offset, held in words: NAK's `assert!(cb.offset % 4 == 0)`).
+    #[error("{what} {value:#x} is not a multiple of {align}")]
+    Misaligned {
+        /// Which operand.
+        what: &'static str,
+        /// The value given.
+        value: u64,
+        /// The unit the field holds.
+        align: u64,
+    },
 }
 
 /// Builds one instruction word field by field.
