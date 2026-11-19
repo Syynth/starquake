@@ -120,12 +120,16 @@
 //!
 //! The fence path closes the open list for reasons of its own (a waiter, the elapsed time, an
 //! empty ring), so the executor learns of each submission afterwards
-//! ([`Fences::take_submitted`]). Before an address space's caches or an engine's draw path are
-//! next used, they are told the newest fence submitted since they last were
-//! ([`BufferCache::submitted`], [`TextureCache::submitted`], [`Draws::submitted`]): everything
-//! they used before a close went into the list closed, and nothing has used them since, so the
-//! fence is theirs. Two 3D engines drawing into one list each set their render targets: a draw
-//! path that did not make the last draw is told its targets are gone the same way.
+//! ([`Fences::newest_submitted`]). Before an address space's caches or an engine's draw path are
+//! next used, they are told the newest fence submitted, once ([`BufferCache::submitted`],
+//! [`TextureCache::submitted`], [`Draws::submitted`]): everything they used before a close went
+//! into a list closed by then, and nothing has used them since, so a fence at or after theirs
+//! keeps what they used alive long enough. Every use goes through this catch-up first: a draw,
+//! a dispatch (before each of a signal's dispatches, since a release between two can close the
+//! list for a waiter), a copy, a present and the drain
+//! (`tests::a_list_closed_between_two_draws_of_one_run_keeps_their_buffers_apart`). Two 3D
+//! engines drawing into one list each set their render targets: a draw path that did not make
+//! the last draw is told its targets are gone the same way.
 //!
 //! # Presents
 //!
@@ -165,7 +169,7 @@ use thiserror::Error;
 
 use crate::back::buffer::{BufferCache, InvalidationSink};
 use crate::back::copy::{
-    CopyError, INLINE_A140, INLINE_C797, INLINE_C7C0, InlineUpload, PendingWrites, blit_method,
+    CopyError, INLINE_A140, INLINE_C7C0, INLINE_C797, InlineUpload, PendingWrites, blit_method,
     dma_method,
 };
 use crate::back::draw::call::{DRAW_METHODS, UNHANDLED_METHODS};
@@ -179,11 +183,11 @@ use crate::back::readback::ReadbackIds;
 use crate::back::state::{Mirror, StateError};
 use crate::back::texture::{TextureCache, TextureError};
 use crate::channel::initial_binding;
-use crate::classes::{cl902d, cla140, clc797, clc7b5, clc7c0};
+use crate::classes::{cl902d, cla140, clc7b5, clc7c0, clc797};
 use crate::front::OrderedTable;
 use crate::interface::{AsId, ChannelId, PresentRequest};
 use crate::memory::GpuMemory;
-use crate::ring::{ClassId, RingEntry, SUBCHANNEL_COUNT, Subchannel};
+use crate::ring::{ClassId, Kind, RingEntry, SUBCHANNEL_COUNT, Subchannel};
 
 use compute::ComputeSink;
 use sinks::{CacheSink, Drained};
@@ -333,8 +337,8 @@ struct Space {
     buffers: BufferCache,
     textures: TextureCache,
     pending: PendingWrites,
-    /// The submissions epoch its caches were last told of.
-    epoch: u64,
+    /// The newest fence its caches were told of ([`catch_up`]).
+    notified: FenceValue,
 }
 
 /// What an engine does with its class's words beside its mirror.
@@ -358,8 +362,8 @@ enum Role {
 struct Engine {
     mirror: Mirror,
     role: Role,
-    /// The submissions epoch its draw path was last told of.
-    epoch: u64,
+    /// The newest fence its draw path was told of.
+    notified: FenceValue,
 }
 
 impl Engine {
@@ -369,7 +373,7 @@ impl Engine {
         class: ClassId,
         backend: &Arc<dyn Backend>,
         setting: WaitWhileCompiling,
-        epoch: u64,
+        notified: FenceValue,
     ) -> Option<Self> {
         let role = match class.0 {
             clc797::CLASS => Role::ThreeD {
@@ -387,7 +391,7 @@ impl Engine {
         Some(Self {
             mirror: Mirror::new(channel, class),
             role,
-            epoch,
+            notified,
         })
     }
 }
@@ -423,10 +427,6 @@ pub struct Executor {
     config: ExecConfig,
     present_space: Option<AsId>,
     frame: u64,
-    /// Bumped each time the fence path reports a submission.
-    epoch: u64,
-    /// The newest fence submitted.
-    last_fence: FenceValue,
     /// The 3D engine that made the open list's last draw.
     last_drawer: Option<(ChannelId, ClassId)>,
     counters: ExecCounters,
@@ -460,8 +460,6 @@ impl Executor {
             config,
             present_space: None,
             frame: 0,
-            epoch: 0,
-            last_fence: FenceValue::default(),
             last_drawer: None,
             counters: ExecCounters::default(),
             scratch: CommandList::new(),
@@ -491,7 +489,7 @@ impl Executor {
                 buffers: BufferCache::new(Arc::clone(&self.backend), Arc::clone(&watch)),
                 textures: TextureCache::new(Arc::clone(&self.backend), watch),
                 pending: PendingWrites::new(),
-                epoch: self.epoch,
+                notified: self.fences.newest_submitted(),
             },
         );
         Ok(())
@@ -524,7 +522,7 @@ impl Executor {
                 *class,
                 &self.backend,
                 self.config.setting,
-                self.epoch,
+                self.fences.newest_submitted(),
             ) {
                 state.engines.insert(*class, engine);
             }
@@ -594,7 +592,7 @@ impl Executor {
     }
 
     /// The back thread's next piece of work, waiting at most `timeout` ([`Fences::wait`]): an
-    /// entry is applied, and one refused is logged at warning level and counted
+    /// entry is applied, and one refused is logged at debug level and counted
     /// ([`ExecCounters::failed`]) without stopping the thread.
     ///
     /// # Errors
@@ -618,8 +616,8 @@ impl Executor {
         }
     }
 
-    /// Applies one ring entry (module docs, "Routing"). An error is logged at warning level and
-    /// counted before it is returned.
+    /// Applies one ring entry (module docs, "Routing"). An error is logged at debug level and
+    /// counted ([`ExecCounters::failed`]) before it is returned.
     ///
     /// # Errors
     ///
@@ -632,7 +630,9 @@ impl Executor {
             Ok(()) => self.counters.applied = self.counters.applied.saturating_add(1),
             Err(error) => {
                 self.counters.failed = self.counters.failed.saturating_add(1);
-                tracing::warn!(%error, %entry, "the back refused a ring entry");
+                // Debug, not warning: a guest can repeat a refused entry at will, and the count
+                // is the signal.
+                tracing::debug!(%error, kind = Kind::of(entry).name(), "the back refused a ring entry");
             }
         }
         result
@@ -768,7 +768,7 @@ impl Executor {
                 class,
                 &self.backend,
                 self.config.setting,
-                self.epoch,
+                self.fences.newest_submitted(),
             )
         {
             state.engines.insert(class, engine);
@@ -776,14 +776,8 @@ impl Executor {
         Ok(())
     }
 
-    /// Hands what the fence path reported to the caches: the epoch moves on a submission, and
-    /// applied updates drop their ranges.
+    /// Hands the updates the fence path applied to the caches: each drops its range.
     fn after_fences(&mut self) {
-        if let Some(fence) = self.fences.take_submitted() {
-            self.epoch = self.epoch.wrapping_add(1);
-            self.last_fence = self.last_fence.max(fence);
-            self.last_drawer = None;
-        }
         for (space, update) in self.fences.take_applied() {
             if let Some(state) = self.spaces.get_mut(&space) {
                 state.buffers.apply_update(&update);
@@ -799,7 +793,7 @@ impl Executor {
             .spaces
             .get_mut(&space)
             .ok_or(ExecError::UnknownSpace { space })?;
-        catch_up_space(state, self.epoch, self.last_fence);
+        catch_up_space(state, self.fences.newest_submitted());
         let mut drained = Drained(std::mem::take(&mut self.drained));
         state.buffers.sync_cpu_writes(&mut drained);
         if !drained.0.is_empty() {
@@ -815,37 +809,42 @@ impl Executor {
 
     /// Draws the deferred instances of `channel`'s 3D engine, or of every channel's for `None`
     /// (module docs, "Deferred instanced draws").
+    ///
+    /// Every channel's deferred instances are drawn even when one fails; the first failure is
+    /// returned. Allocates only when some channel has deferred instances.
     fn flush_deferred(&mut self, channel: Option<ChannelId>) -> Result<(), ExecError> {
-        let channels: Vec<ChannelId> = match channel {
-            Some(channel) => vec![channel],
-            None => self.channels.keys().copied().collect(),
+        let Some(channel) = channel else {
+            let deferred: Vec<ChannelId> = self
+                .channels
+                .keys()
+                .copied()
+                .filter(|&c| self.deferred_space(c).is_some())
+                .collect();
+            let mut first_error = None;
+            for channel in deferred {
+                if let Err(error) = self.flush_deferred(Some(channel))
+                    && first_error.is_none()
+                {
+                    first_error = Some(error);
+                }
+            }
+            return first_error.map_or(Ok(()), Err);
         };
-        let three_d = ClassId(clc797::CLASS);
-        let mut first_error = None;
-        for channel in channels {
-            let Some(state) = self.channels.get(&channel) else {
-                continue;
-            };
-            let Some(engine) = state.engines.get(&three_d) else {
-                continue;
-            };
-            let Role::ThreeD { draws, .. } = &engine.role else {
-                continue;
-            };
-            if !draws.has_deferred() {
-                continue;
-            }
-            let space = state.space;
-            let drawn = self
-                .before_work(space, true)
-                .and_then(|()| self.draw_step(channel, DrawStep::Flush));
-            if let Err(error) = drawn
-                && first_error.is_none()
-            {
-                first_error = Some(error);
-            }
+        let Some(space) = self.deferred_space(channel) else {
+            return Ok(());
+        };
+        self.before_work(space, true)?;
+        self.draw_step(channel, DrawStep::Flush)
+    }
+
+    /// The address space of `channel` when its 3D engine has deferred instances.
+    fn deferred_space(&self, channel: ChannelId) -> Option<AsId> {
+        let state = self.channels.get(&channel)?;
+        let engine = state.engines.get(&ClassId(clc797::CLASS))?;
+        match &engine.role {
+            Role::ThreeD { draws, .. } if draws.has_deferred() => Some(state.space),
+            _ => None,
         }
-        first_error.map_or(Ok(()), Err)
     }
 
     /// The words of a `Write` or `Run` (module docs, "Routing").
@@ -884,9 +883,7 @@ impl Executor {
     /// A run of `LOAD_ROOT_TABLE` words: stored in the mirror, then handed to the draw path whole.
     fn root_table(&mut self, channel: ChannelId, words: &[u32]) -> Result<(), ExecError> {
         let engine = self.engine_mut(channel, ClassId(clc797::CLASS))?;
-        engine
-            .mirror
-            .run(clc797::LOAD_ROOT_TABLE.method(), words)?;
+        engine.mirror.run(clc797::LOAD_ROOT_TABLE.method(), words)?;
         if let Role::ThreeD { draws, .. } = &mut engine.role {
             draws.load_root_table(&engine.mirror, words)?;
         }
@@ -909,7 +906,9 @@ impl Executor {
         value: u32,
     ) -> Result<(), ExecError> {
         let space = self.space_of(channel)?;
-        self.engine_mut(channel, class)?.mirror.write(method, value)?;
+        self.engine_mut(channel, class)?
+            .mirror
+            .write(method, value)?;
         match class.0 {
             clc797::CLASS => {
                 if method == clc797::SET_RENDER_ENABLE_C.method() {
@@ -987,8 +986,6 @@ impl Executor {
             config,
             counters,
             scratch,
-            epoch,
-            last_fence,
             ..
         } = self;
         let engine = match engine {
@@ -1003,7 +1000,7 @@ impl Executor {
         let state = spaces
             .get_mut(&space)
             .ok_or(ExecError::UnknownSpace { space })?;
-        catch_up_space(state, *epoch, *last_fence);
+        catch_up_space(state, fences.newest_submitted());
         let memory = Arc::clone(&state.memory);
         let mut pending = std::mem::take(&mut state.pending);
         let mut sink = CacheSink {
@@ -1059,26 +1056,30 @@ impl Executor {
         if launch {
             self.drain(space)?;
         }
-        self.with_sink(space, Some((channel, class)), |engine, memory, pending, sink| {
-            let Some(engine) = engine else {
-                return Ok(());
-            };
-            let inline = match &mut engine.role {
-                Role::ThreeD { inline, .. } | Role::Compute { inline } | Role::Inline(inline) => {
-                    inline
-                }
-                Role::Dma | Role::TwoD => return Ok(()),
-            };
-            inline.method(
-                inline_class,
-                method,
-                engine.mirror.registers(),
-                memory,
-                pending,
-                sink,
-            )?;
-            Ok(())
-        })
+        self.with_sink(
+            space,
+            Some((channel, class)),
+            |engine, memory, pending, sink| {
+                let Some(engine) = engine else {
+                    return Ok(());
+                };
+                let inline = match &mut engine.role {
+                    Role::ThreeD { inline, .. }
+                    | Role::Compute { inline }
+                    | Role::Inline(inline) => inline,
+                    Role::Dma | Role::TwoD => return Ok(()),
+                };
+                inline.method(
+                    inline_class,
+                    method,
+                    engine.mirror.registers(),
+                    memory,
+                    pending,
+                    sink,
+                )?;
+                Ok(())
+            },
+        )
     }
 
     /// One word to a DMA or 2D engine.
@@ -1089,18 +1090,22 @@ impl Executor {
         space: AsId,
         method: u32,
     ) -> Result<(), ExecError> {
-        self.with_sink(space, Some((channel, class)), |engine, memory, pending, sink| {
-            let Some(engine) = engine else {
-                return Ok(());
-            };
-            let registers = engine.mirror.registers();
-            match engine.role {
-                Role::Dma => dma_method(method, registers, memory, pending, sink)?,
-                Role::TwoD => blit_method(method, registers, memory, pending, sink)?,
-                _ => {}
-            }
-            Ok(())
-        })
+        self.with_sink(
+            space,
+            Some((channel, class)),
+            |engine, memory, pending, sink| {
+                let Some(engine) = engine else {
+                    return Ok(());
+                };
+                let registers = engine.mirror.registers();
+                match engine.role {
+                    Role::Dma => dma_method(method, registers, memory, pending, sink)?,
+                    Role::TwoD => blit_method(method, registers, memory, pending, sink)?,
+                    _ => {}
+                }
+                Ok(())
+            },
+        )
     }
 
     /// One word of the 3D class to its draw path, or the deferred instances (module docs).
@@ -1115,8 +1120,6 @@ impl Executor {
             shaders,
             pipelines,
             scratch,
-            epoch,
-            last_fence,
             last_drawer,
             ..
         } = self;
@@ -1127,15 +1130,16 @@ impl Executor {
         let Role::ThreeD { draws, .. } = &mut engine.role else {
             return Ok(());
         };
-        if engine.epoch != *epoch || drawer_changed {
+        let newest = fences.newest_submitted();
+        if engine.notified < newest || drawer_changed {
             // A new list, or another engine drew last: its render targets are gone.
-            draws.submitted(*last_fence);
-            engine.epoch = *epoch;
+            draws.submitted(newest);
+            engine.notified = newest;
         }
         let state = spaces
             .get_mut(&space)
             .ok_or(ExecError::UnknownSpace { space })?;
-        catch_up_space(state, *epoch, *last_fence);
+        catch_up_space(state, fences.newest_submitted());
         let memory = Arc::clone(&state.memory);
         let mut ctx = DrawContext {
             memory: &*memory,
@@ -1182,8 +1186,6 @@ impl Executor {
             config,
             counters,
             scratch,
-            epoch,
-            last_fence,
             last_drawer,
             ..
         } = self;
@@ -1194,7 +1196,7 @@ impl Executor {
         let state = spaces
             .get_mut(&space)
             .ok_or(ExecError::UnknownSpace { space })?;
-        catch_up_space(state, *epoch, *last_fence);
+        catch_up_space(state, fences.newest_submitted());
         let memory = Arc::clone(&state.memory);
         let registers = engine.mirror.registers();
         let inline = (method == LAST_INLINE_QMD_METHOD)
@@ -1206,6 +1208,7 @@ impl Executor {
             memory: &memory,
             buffers: &mut state.buffers,
             textures: &mut state.textures,
+            notified: &mut state.notified,
             shaders: &mut **shaders,
             host: compute_shaders,
             pipelines,
@@ -1239,8 +1242,6 @@ impl Executor {
             spaces,
             fences,
             scratch,
-            epoch,
-            last_fence,
             last_drawer,
             frame,
             counters,
@@ -1249,7 +1250,7 @@ impl Executor {
         let state = spaces
             .get_mut(&space)
             .ok_or(ExecError::UnknownSpace { space })?;
-        catch_up_space(state, *epoch, *last_fence);
+        catch_up_space(state, fences.newest_submitted());
         let view = state
             .textures
             .texture(&*state.memory, &present::header(info), scratch);
@@ -1316,13 +1317,29 @@ fn starts_draw(method: u32) -> bool {
         .any(|m| m.method() == method)
 }
 
-/// Tells `space`'s caches of the newest submission if they have not been told (module docs,
-/// "Lists and the caches").
-fn catch_up_space(space: &mut Space, epoch: u64, fence: FenceValue) {
-    if space.epoch != epoch {
-        space.buffers.submitted(fence);
-        space.textures.submitted(fence);
-        space.epoch = epoch;
+/// Tells `space`'s caches of `newest`, the newest fence submitted, if they have not been told
+/// (module docs, "Lists and the caches").
+fn catch_up_space(space: &mut Space, newest: FenceValue) {
+    catch_up(
+        &mut space.buffers,
+        &mut space.textures,
+        &mut space.notified,
+        newest,
+    );
+}
+
+/// Tells `buffers` and `textures` of `newest` if `notified` is older, and remembers it: a cache
+/// is told each fence once, before its first use after the list closed.
+fn catch_up(
+    buffers: &mut BufferCache,
+    textures: &mut TextureCache,
+    notified: &mut FenceValue,
+    newest: FenceValue,
+) {
+    if *notified < newest {
+        buffers.submitted(newest);
+        textures.submitted(newest);
+        *notified = newest;
     }
 }
 

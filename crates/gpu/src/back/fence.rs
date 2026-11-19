@@ -489,9 +489,7 @@ pub struct Fences {
     /// `completed()` as the last completion check read it.
     seen: FenceValue,
     counters: FenceCounters,
-    /// The newest fence submitted since [`Fences::take_submitted`] last looked.
-    submitted: Option<FenceValue>,
-    /// The newest fence ever submitted.
+    /// The newest fence any list was submitted with.
     newest: FenceValue,
     /// Updates applied since [`Fences::take_applied`] last looked, in the order applied.
     applied: Vec<(AsId, VmUpdate)>,
@@ -649,22 +647,16 @@ impl Fences {
             in_flight: VecDeque::new(),
             seen,
             counters: FenceCounters::default(),
-            submitted: None,
             newest: FenceValue::default(),
             applied: Vec::new(),
         }
     }
 
-    /// The newest fence value a list was submitted with since the last call, if any, and forgets
-    /// it: the executor (slice G19) reports it to the caches and draw paths
-    /// ([`crate::back::buffer::BufferCache::submitted`]), since lists are closed here for
-    /// reasons of the fence path's own (a waiter, the elapsed time, an empty ring).
-    pub fn take_submitted(&mut self) -> Option<FenceValue> {
-        self.submitted.take()
-    }
-
     /// The newest fence value any list was submitted with; [`FenceValue::default`] before the
-    /// first. [`Fences::take_submitted`] does not change it.
+    /// first. The executor (slice G19) tells the caches and draw paths of it
+    /// ([`crate::back::buffer::BufferCache::submitted`]) before their next use, since lists are
+    /// closed here for reasons of the fence path's own (a waiter, the elapsed time, an empty
+    /// ring).
     pub fn newest_submitted(&self) -> FenceValue {
         self.newest
     }
@@ -820,7 +812,6 @@ impl Fences {
         let actions = std::mem::take(&mut self.open_actions);
         match self.backend.submit(list) {
             Ok(fence) => {
-                self.submitted = Some(self.submitted.map_or(fence, |seen| seen.max(fence)));
                 self.newest = self.newest.max(fence);
                 self.counters.closed.count(reason);
                 tracing::trace!(?reason, fence = fence.get(), "command list submitted");

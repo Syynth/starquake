@@ -107,7 +107,7 @@ fn within<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> T {
 pub(crate) struct Clock(Mutex<Duration>);
 
 impl Clock {
-    fn set(&self, now: Duration) {
+    pub(crate) fn set(&self, now: Duration) {
         *self.0.lock().unwrap() = now;
     }
 }

@@ -46,7 +46,7 @@ use std::sync::Arc;
 use starquake_render::command::{Binding, BindingResource, DispatchDesc, DispatchParams};
 use starquake_render::pipeline::ComputePipelineDesc;
 use starquake_render::shader::ShaderStage;
-use starquake_render::{Backend, Command, CommandList};
+use starquake_render::{Backend, Command, CommandList, FenceValue};
 use starquake_shader::exchange::TextureKind;
 use starquake_shader::lookup::{EngineState, GuestStage, ProgramRequest, VariantKey};
 use thiserror::Error;
@@ -144,6 +144,8 @@ pub(super) struct ComputeSink<'a> {
     pub(super) memory: &'a Arc<dyn GpuMemory>,
     pub(super) buffers: &'a mut BufferCache,
     pub(super) textures: &'a mut TextureCache,
+    /// The newest fence the space's caches were told of.
+    pub(super) notified: &'a mut FenceValue,
     pub(super) shaders: &'a mut dyn ShaderCache,
     pub(super) host: &'a mut HostShaders,
     pub(super) pipelines: &'a mut PipelineCache,
@@ -191,6 +193,14 @@ impl ComputeSink<'_> {
                 limit,
             });
         }
+        // A release earlier in the signal may have closed the list for a waiter: the caches
+        // learn of it before this dispatch uses them (the executor's module docs).
+        super::catch_up(
+            self.buffers,
+            self.textures,
+            self.notified,
+            self.fences.newest_submitted(),
+        );
         let requests = [ProgramRequest {
             stage: GuestStage::Compute,
             address: dispatch.program,
@@ -308,7 +318,8 @@ impl QmdSink for ComputeSink<'_> {
                 Program::Accepted
             }
             Ok(false) => {
-                self.counters.dispatches_skipped = self.counters.dispatches_skipped.saturating_add(1);
+                self.counters.dispatches_skipped =
+                    self.counters.dispatches_skipped.saturating_add(1);
                 tracing::debug!(
                     qmd = dispatch.qmd,
                     program = dispatch.program,
@@ -317,7 +328,8 @@ impl QmdSink for ComputeSink<'_> {
                 Program::Rejected
             }
             Err(error) => {
-                self.counters.dispatches_skipped = self.counters.dispatches_skipped.saturating_add(1);
+                self.counters.dispatches_skipped =
+                    self.counters.dispatches_skipped.saturating_add(1);
                 tracing::warn!(qmd = dispatch.qmd, %error, "a dispatch could not be built");
                 if let ComputeError::Fence(error) = error {
                     self.failed(error);

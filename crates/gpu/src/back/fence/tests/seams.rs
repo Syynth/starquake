@@ -35,43 +35,46 @@ fn a_release_whose_read_back_faults_latches_with_the_bytes_written() {
         space: SPACE,
         release: four(SEM, 0x77),
     };
-    let (Ok(Attached::Performed(report)), events) = captured(|| r.fences.attach(action)) else {
-        panic!("nothing in flight: performed at once");
-    };
-    assert!(report.latched, "{report:?}");
-    assert_eq!(report.released, 1);
+    // Nothing in flight: performed at once.
+    let (attached, events) = captured(|| r.fences.attach(action));
+    assert!(
+        matches!(&attached, Ok(Attached::Performed(report)) if report.latched && report.released == 1),
+        "{attached:?}"
+    );
     assert_eq!(word(&r.mem, SEM), 0x77);
     let warnings = at(&events, tracing::Level::WARN);
     assert!(
-        warnings.iter().any(|e| e.contains("could not be read back")),
+        warnings
+            .iter()
+            .any(|e| e.contains("could not be read back")),
         "{events:?}"
     );
 }
 
 #[test]
-fn take_submitted_gives_the_newest_fence_once() {
+fn newest_submitted_follows_each_submission() {
     let mut r = rig();
-    assert_eq!(r.fences.take_submitted(), None);
+    assert_eq!(r.fences.newest_submitted(), FenceValue::default());
     r.fences.record(command(1)).unwrap();
     r.fences.close(CloseReason::Present).unwrap();
+    assert_eq!(r.fences.newest_submitted(), FenceValue::new(1));
     r.fences.record(command(2)).unwrap();
     r.fences.close(CloseReason::Present).unwrap();
-    assert_eq!(r.fences.take_submitted(), Some(FenceValue::new(2)));
-    assert_eq!(r.fences.take_submitted(), None);
+    assert_eq!(r.fences.newest_submitted(), FenceValue::new(2));
     // A list with no commands submits nothing.
     r.fences.close(CloseReason::Present).unwrap();
-    assert_eq!(r.fences.take_submitted(), None);
+    assert_eq!(r.fences.newest_submitted(), FenceValue::new(2));
 }
 
 #[test]
-fn take_submitted_keeps_the_highest_when_fences_come_out_of_order() {
+fn newest_submitted_keeps_the_highest_when_fences_come_out_of_order() {
     let mut r = rig();
     r.backend.script(&[5, 3]);
     for submit in [1, 2] {
         r.fences.record(command(submit)).unwrap();
         r.fences.close(CloseReason::Present).unwrap();
     }
-    assert_eq!(r.fences.take_submitted(), Some(FenceValue::new(5)));
+    assert_eq!(r.fences.newest_submitted(), FenceValue::new(5));
 }
 
 #[test]
@@ -79,8 +82,11 @@ fn a_refused_list_is_not_reported_submitted() {
     let mut r = rig();
     r.backend.refuse_next();
     r.fences.record(command(1)).unwrap();
-    assert!(r.fences.close(CloseReason::Present).is_err());
-    assert_eq!(r.fences.take_submitted(), None);
+    assert_eq!(
+        r.fences.close(CloseReason::Present),
+        Err(FenceError::Submit(REFUSED))
+    );
+    assert_eq!(r.fences.newest_submitted(), FenceValue::default());
 }
 
 #[test]
@@ -153,7 +159,7 @@ fn a_recorded_list_stays_in_one_list_and_closes_once_after_it() {
     batch.push(command(2));
     batch.push(command(3));
     r.fences.record_list(&mut batch).unwrap();
-    assert!(batch.commands.is_empty());
+    assert_eq!(batch.commands, vec![]);
     assert_eq!(r.fences.open_commands(), 0);
     assert_eq!(r.backend.submitted(), vec![FenceValue::new(1)]);
     assert_eq!(r.fences.counters().closed.elapsed, 1);

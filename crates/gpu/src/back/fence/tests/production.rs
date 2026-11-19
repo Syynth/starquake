@@ -99,10 +99,12 @@ fn a_release_to_the_shim_latches_with_the_counter_it_reads_back() {
         space: SPACE,
         release: four(address, 0xdead_beef),
     };
-    let Ok(Attached::Performed(report)) = r.fences.attach(release) else {
-        panic!("nothing in flight: the release is performed at once");
-    };
-    assert!(report.latched, "{report:?}");
+    // Nothing in flight: the release is performed at once.
+    let attached = r.fences.attach(release);
+    assert!(
+        matches!(&attached, Ok(Attached::Performed(report)) if report.latched),
+        "{attached:?}"
+    );
     assert!(r.waiters.is_latched(ChannelId(5)));
     assert_eq!(r.syncpoints.read(syncpoint(9)), 1);
 }

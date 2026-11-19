@@ -37,6 +37,7 @@ fn syncpoint(value: u8) -> SyncpointId {
 /// laid out by hand.
 fn golden() -> Vec<(RingEntry<'static>, Vec<u64>)> {
     let mut entries = golden_engine();
+    entries.extend(golden_releases());
     entries.extend(golden_host());
     entries
 }
@@ -78,8 +79,8 @@ fn golden_engine() -> Vec<(RingEntry<'static>, Vec<u64>)> {
     ]
 }
 
-/// Everything else.
-fn golden_host() -> Vec<(RingEntry<'static>, Vec<u64>)> {
+/// Releases: a write, and a reduction with every header field set.
+fn golden_releases() -> Vec<(RingEntry<'static>, Vec<u64>)> {
     vec![
         (
             // The channel in the header's high half.
@@ -117,6 +118,12 @@ fn golden_host() -> Vec<(RingEntry<'static>, Vec<u64>)> {
             },
             vec![0x8000_0018_0001_3704, 0x1_2345_6780, 0x9abc],
         ),
+    ]
+}
+
+/// Everything else.
+fn golden_host() -> Vec<(RingEntry<'static>, Vec<u64>)> {
+    vec![
         (
             RingEntry::Syncpoint { id: syncpoint(191) },
             vec![0x0000_0000_0000_bf05],

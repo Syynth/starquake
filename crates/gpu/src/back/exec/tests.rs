@@ -28,7 +28,7 @@ use crate::back::fence::{FenceEnv, Mode, OrderedUpdate, VmChange, WaiterTable};
 use crate::back::pipeline::ShaderStamp;
 use crate::back::qmd::tests::{SlotSpec, Spec, encode};
 use crate::back::qmd::{CONSTANT_BUFFER_SIZE_SHIFT, ConstantBuffer, QMD_WORDS};
-use crate::classes::{Method, cl902d, cla140, clc797, clc7b5, clc7c0};
+use crate::classes::{Method, cl902d, cla140, clc7b5, clc7c0, clc797};
 use crate::field::Field;
 use crate::interface::{DisplayId, ImageDesc, LayerId, Rect, VmUpdate};
 use crate::memory::TestGpuMemory;
@@ -216,6 +216,7 @@ fn uniform_bank(bank: u8, size: u32) -> ResourceUse {
 }
 
 struct Rig {
+    clock: Arc<Clock>,
     recording: Option<Arc<RecordingBackend>>,
     late: Option<Arc<LateBackend>>,
     exec: Executor,
@@ -228,26 +229,38 @@ struct Rig {
 impl Rig {
     fn new() -> Self {
         let recording = Arc::new(RecordingBackend::new(caps(), 1 << 40));
-        let mut rig = Self::on(Arc::<RecordingBackend>::clone(&recording), compute_set(vec![]));
+        let mut rig = Self::on(
+            Arc::<RecordingBackend>::clone(&recording),
+            compute_set(vec![]),
+        );
         rig.recording = Some(recording);
         rig
     }
 
     fn late() -> Self {
-        let late = Arc::new(LateBackend::with_caps(caps(), 1 << 40, CompletionWake::none()));
+        let late = Arc::new(LateBackend::with_caps(
+            caps(),
+            1 << 40,
+            CompletionWake::none(),
+        ));
         let mut rig = Self::on(Arc::<LateBackend>::clone(&late), compute_set(vec![]));
         rig.late = Some(late);
         rig
     }
 
     fn on(backend: Arc<dyn Backend>, compute: SetLookup) -> Self {
+        Self::with(backend, compute, ExecConfig::default())
+    }
+
+    fn with(backend: Arc<dyn Backend>, compute: SetLookup, config: ExecConfig) -> Self {
+        let clock = Arc::new(Clock::default());
         let pushed = Arc::new(Pushed::default());
         let waiters = Arc::new(WaiterTable::new());
         let env = FenceEnv {
             syncpoints: Arc::new(Syncpoints::new(Arc::<Pushed>::clone(&pushed))),
             waiters,
             completions: pushed,
-            clock: Arc::new(Clock::default()),
+            clock: Arc::<Clock>::clone(&clock),
             front: Arc::new(Front::default()),
         };
         let fences = Fences::new(Arc::clone(&backend), env, Mode::Fenced);
@@ -259,11 +272,11 @@ impl Rig {
         };
         let ordered = Arc::new(OrderedTable::new());
         let mut exec = Executor::new(
-            Arc::clone(&backend),
+            backend,
             fences,
             Box::new(fake),
             Arc::clone(&ordered),
-            ExecConfig::default(),
+            config,
         );
         let mem = memory();
         let watch = Arc::new(WriteWatch::new());
@@ -272,6 +285,7 @@ impl Rig {
         exec.add_channel(CHANNEL, SPACE).unwrap();
         exec.add_channel(OTHER, SPACE).unwrap();
         Self {
+            clock,
             recording: None,
             late: None,
             exec,
@@ -285,9 +299,8 @@ impl Rig {
     /// Applies every line of ring text `text`, each of which must be accepted.
     fn run(&mut self, text: &str) {
         for entry in parse_text(text).unwrap() {
-            if let Err(error) = self.exec.apply(&entry) {
-                panic!("{entry}: {error}");
-            }
+            let applied = self.exec.apply(&entry);
+            assert_eq!(applied, Ok(()), "{entry}");
         }
     }
 
@@ -335,7 +348,13 @@ fn method_number(method: &Method, indices: &[u32]) -> u16 {
 }
 
 /// The ring text of a write of `value` to `method` at `indices`, of `class`, on `channel`.
-fn write_on(channel: ChannelId, class: u32, method: &Method, indices: &[u32], value: u32) -> String {
+fn write_on(
+    channel: ChannelId,
+    class: u32,
+    method: &Method,
+    indices: &[u32],
+    value: u32,
+) -> String {
     let entry = RingEntry::Write {
         channel,
         class: ClassId(class),
@@ -443,7 +462,13 @@ fn draw_state() -> String {
         &[5],
         PIXEL_PROGRAM,
     );
-    text += &write(
+    text + &target_state()
+}
+
+/// The colour target, surface clip and viewport of [`draw_state`].
+fn target_state() -> String {
+    let c = THREE_D;
+    let mut text = write(
         c,
         &clc797::SET_CT_SELECT,
         &[],
@@ -608,11 +633,29 @@ fn golden_dispatch_with_qmd_releases() {
 fn dma_copy_with_semaphore(payload: u32) -> String {
     let c = clc7b5::CLASS;
     let mut text = String::from("bind channel=3 subchannel=4 class=0xc7b5\n");
-    text += &address(c, &clc7b5::OFFSET_IN_UPPER, &clc7b5::OFFSET_IN_LOWER, &[], SRC);
-    text += &address(c, &clc7b5::OFFSET_OUT_UPPER, &clc7b5::OFFSET_OUT_LOWER, &[], DST);
+    text += &address(
+        c,
+        &clc7b5::OFFSET_IN_UPPER,
+        &clc7b5::OFFSET_IN_LOWER,
+        &[],
+        SRC,
+    );
+    text += &address(
+        c,
+        &clc7b5::OFFSET_OUT_UPPER,
+        &clc7b5::OFFSET_OUT_LOWER,
+        &[],
+        DST,
+    );
     text += &write(c, &clc7b5::LINE_LENGTH_IN, &[], 16);
     text += &write(c, &clc7b5::LINE_COUNT, &[], 1);
-    text += &address(c, &clc7b5::SET_SEMAPHORE_A, &clc7b5::SET_SEMAPHORE_B, &[], SEM);
+    text += &address(
+        c,
+        &clc7b5::SET_SEMAPHORE_A,
+        &clc7b5::SET_SEMAPHORE_B,
+        &[],
+        SEM,
+    );
     text += &write(c, &clc7b5::SET_SEMAPHORE_PAYLOAD, &[], payload);
     text += &write(
         c,
@@ -698,11 +741,14 @@ fn golden_present_ordered_after_earlier_work() {
     assert_eq!(lists.len(), 2);
     for (index, (_, list)) in lists.iter().enumerate() {
         assert_eq!(draws(&list.commands), 1);
-        let Some(Command::Present(desc)) = list.commands.last() else {
-            panic!("list {index} does not end with its present");
-        };
-        assert_eq!(desc.frame, u64::try_from(index).unwrap());
-        assert_eq!(desc.src_rect.width, SIZE);
+        let frame = u64::try_from(index).unwrap();
+        assert!(
+            matches!(
+                list.commands.last(),
+                Some(Command::Present(desc)) if desc.frame == frame && desc.src_rect.width == SIZE
+            ),
+            "list {index} does not end with its present"
+        );
     }
 }
 
@@ -722,7 +768,10 @@ fn set_reference_closes_the_list_and_attaches_nothing() {
     rig.run(&(draw_state() + &draw() + "set-reference channel=3 value=0x5\n"));
     assert_eq!(rig.exec.fences().counters().closed.set_reference, 1);
     assert_eq!(rig.exec.fences().counters().fenced, 0);
-    assert_eq!(rig.late.as_ref().unwrap().submitted(), vec![FenceValue::new(1)]);
+    assert_eq!(
+        rig.late.as_ref().unwrap().submitted(),
+        vec![FenceValue::new(1)]
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -740,7 +789,10 @@ fn a_release_is_attached_to_the_list_that_recorded_the_work_before_it() {
     rig.run(&(draw() + &release(2)));
     rig.exec.close(CloseReason::RingEmpty).unwrap();
     let late = rig.late.clone().unwrap();
-    assert_eq!(late.submitted(), vec![FenceValue::new(1), FenceValue::new(2)]);
+    assert_eq!(
+        late.submitted(),
+        vec![FenceValue::new(1), FenceValue::new(2)]
+    );
     rig.exec.complete();
     assert_eq!(rig.word(SEM), 0, "no list has completed");
     late.finish(FenceValue::new(1));
@@ -759,7 +811,11 @@ fn a_release_is_written_through_its_channels_address_space() {
     let second = AsId(SPACE.0 + 1);
     let other_mem = memory();
     rig.exec
-        .add_space(second, Arc::<Memory>::clone(&other_mem), Arc::new(WriteWatch::new()))
+        .add_space(
+            second,
+            Arc::<Memory>::clone(&other_mem),
+            Arc::new(WriteWatch::new()),
+        )
         .unwrap();
     rig.exec.add_channel(ChannelId(5), second).unwrap();
     rig.run(&format!(
@@ -874,7 +930,10 @@ fn subchannel_2_starts_bound_to_inline_to_memory() {
     let two = Subchannel::new(2).unwrap();
     assert_eq!(rig.exec.bound(CHANNEL, two), Some(ClassId(cla140::CLASS)));
     for index in [0, 1, 3, 4, 5, 6, 7] {
-        assert_eq!(rig.exec.bound(CHANNEL, Subchannel::new(index).unwrap()), None);
+        assert_eq!(
+            rig.exec.bound(CHANNEL, Subchannel::new(index).unwrap()),
+            None
+        );
     }
     // An inline upload of one word to DST with no bind.
     let c = cla140::CLASS;
@@ -918,7 +977,11 @@ fn capture_control_is_counted() {
 fn spaces_and_channels_are_checked_when_added() {
     let mut rig = Rig::new();
     assert_eq!(
-        rig.exec.add_space(SPACE, Arc::<Memory>::clone(&rig.mem), Arc::clone(&rig.watch)),
+        rig.exec.add_space(
+            SPACE,
+            Arc::<Memory>::clone(&rig.mem),
+            Arc::clone(&rig.watch)
+        ),
         Err(ExecError::DuplicateSpace { space: SPACE })
     );
     assert_eq!(
@@ -992,18 +1055,26 @@ fn a_presented_frame_the_gpu_drew_is_its_render_target() {
     // The frame is the colour target the draw rendered into: one texture, no upload over it.
     let mut rig = Rig::new();
     rig.exec.set_present_space(SPACE).unwrap();
-    rig.run(&(draw_state() + &draw() + &present().replace(&format!("{FRAME:#x}"), &format!("{TARGET:#x}"))));
+    rig.run(
+        &(draw_state()
+            + &draw()
+            + &present().replace(&format!("{FRAME:#x}"), &format!("{TARGET:#x}"))),
+    );
     let commands = rig.commands();
-    let Some(Command::Present(desc)) = commands.last() else {
-        panic!("{commands:?}");
-    };
-    let Some(Command::SetRenderTargets(targets)) = commands
+    let presented = commands
         .iter()
-        .find(|c| matches!(c, Command::SetRenderTargets(_)))
-    else {
-        panic!("{commands:?}");
-    };
-    let target = targets.colors[0].unwrap();
+        .find_map(|c| match c {
+            Command::Present(desc) => Some(desc.view),
+            _ => None,
+        })
+        .unwrap();
+    let target = commands
+        .iter()
+        .find_map(|c| match c {
+            Command::SetRenderTargets(targets) => targets.colors[0],
+            _ => None,
+        })
+        .unwrap();
     let snapshot = rig.recording.as_ref().unwrap().snapshot();
     // The present's view is a view of the target's texture.
     let texture_of = |view: starquake_render::ViewId| {
@@ -1012,9 +1083,15 @@ fn a_presented_frame_the_gpu_drew_is_its_render_target() {
             .find(|l| l.starts_with(&format!("create v{}:", view.index())))
             .unwrap()
             .to_owned();
-        line.split(" of ").nth(1).unwrap().split(' ').next().unwrap().to_owned()
+        line.split(" of ")
+            .nth(1)
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap()
+            .to_owned()
     };
-    assert_eq!(texture_of(desc.view), texture_of(target));
+    assert_eq!(texture_of(presented), texture_of(target));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1110,7 +1187,10 @@ fn deferred_instances_are_drawn_before_the_channels_next_release() {
             &[],
             fields(&[
                 (clc797::BEGIN_OP, clc797::BEGIN_OP_TRIANGLES),
-                (clc797::BEGIN_INSTANCE_ID, clc797::BEGIN_INSTANCE_ID_SUBSEQUENT),
+                (
+                    clc797::BEGIN_INSTANCE_ID,
+                    clc797::BEGIN_INSTANCE_ID_SUBSEQUENT,
+                ),
             ]),
         )
         + &write(c, &clc797::END, &[], 0);
@@ -1123,31 +1203,30 @@ fn deferred_instances_are_drawn_before_the_channels_next_release() {
     rig.exec.close(CloseReason::RingEmpty).unwrap();
     let lists = rig.late.as_ref().unwrap().inner.lists();
     let (_, list) = lists.last().unwrap();
-    let Some(Command::Draw(desc)) = list.commands.last() else {
-        panic!("the deferred draw is the list's last command: {list:?}");
-    };
+    // The deferred draw, of both instances, is the list's last command.
     assert!(
         matches!(
-            desc.params,
-            starquake_render::command::DrawParams::Direct {
-                instance_count: 2,
-                ..
-            }
+            list.commands.last(),
+            Some(Command::Draw(desc)) if matches!(
+                desc.params,
+                starquake_render::command::DrawParams::Direct {
+                    instance_count: 2,
+                    ..
+                }
+            )
         ),
-        "{:?}",
-        desc.params
+        "{list:?}"
     );
 }
 
 #[test]
 fn two_channels_drawing_into_one_list_each_set_their_targets() {
     let mut rig = Rig::new();
-    let other_state = draw_state()
-        .replace("channel=3 ", "channel=9 ");
+    let other_state = draw_state().replace("channel=3 ", "channel=9 ");
     rig.run(&(draw_state() + &other_state + &draw()));
     rig.run(&draw().replace("channel=3 ", "channel=9 "));
     rig.run(&draw());
-    let _ = rig.submit();
+    rig.submit();
     let commands = rig.commands();
     let targets = commands
         .iter()
@@ -1255,8 +1334,12 @@ fn a_grid_past_the_host_limit_is_refused_and_still_releases() {
         };
         rig.write_words(QMD, &encode(&spec));
         let before = rig.exec.counters().dispatches;
-        let (_, events) = captured(|| rig.run(&compute_signal()));
-        assert_eq!(rig.exec.counters().dispatches - before, dispatched, "{grid_x}");
+        let ((), events) = captured(|| rig.run(&compute_signal()));
+        assert_eq!(
+            rig.exec.counters().dispatches - before,
+            dispatched,
+            "{grid_x}"
+        );
         if dispatched == 0 {
             assert!(
                 at(&events, tracing::Level::WARN)
@@ -1280,12 +1363,11 @@ fn a_compute_shader_binding_a_bank_the_qmd_does_not_bind_is_refused() {
     );
     rig.recording = Some(backend);
     rig.write_words(QMD, &compute_qmd());
-    let (_, events) = captured(|| rig.run(&compute_signal()));
+    let ((), events) = captured(|| rig.run(&compute_signal()));
     assert_eq!(rig.exec.counters().dispatches_skipped, 1);
     assert!(
-        at(&events, tracing::Level::WARN).iter().any(|e| e.contains(
-            "the compute shader reads constant buffer 1, which the QMD does not bind"
-        )),
+        at(&events, tracing::Level::WARN).iter().any(|e| e
+            .contains("the compute shader reads constant buffer 1, which the QMD does not bind")),
         "{events:?}"
     );
     assert_eq!(rig.word(SEM), 0x11);
@@ -1304,18 +1386,21 @@ fn entries_through_the_ring_are_applied_and_the_list_closes_when_it_empties() {
     producer.publish();
     let mut applied = 0;
     loop {
-        match rig
+        let step = rig
             .exec
             .step(&mut consumer, Duration::from_millis(10))
-            .unwrap()
-        {
+            .unwrap();
+        assert!(!matches!(step, Step::Refused(_)), "{step:?}");
+        match step {
             Step::Applied => applied += 1,
-            Step::Refused(error) => panic!("{error}"),
-            Step::Completed => {}
+            Step::Refused(_) | Step::Completed => {}
             Step::TimedOut => break,
         }
     }
-    assert_eq!(applied, parse_text(&(draw_state() + &draw())).unwrap().len());
+    assert_eq!(
+        applied,
+        parse_text(&(draw_state() + &draw())).unwrap().len()
+    );
     assert_eq!(rig.exec.fences().counters().closed.ring_empty, 1);
     assert_eq!(draws(&rig.commands()), 1);
 }
@@ -1406,11 +1491,212 @@ fn a_2d_launch_reaches_the_blit_engine() {
             &[],
             fields(&[(cl902d::SET_CLIP_ENABLE_V, 1)]),
         )
-        + &write(c, &cl902d::SET_OPERATION, &[], cl902d::SET_OPERATION_V_SRCCOPY);
+        + &write(
+            c,
+            &cl902d::SET_OPERATION,
+            &[],
+            cl902d::SET_OPERATION_V_SRCCOPY,
+        );
     rig.run(&text);
     let launch = parse_text(&write(c, &cl902d::PIXELS_FROM_MEMORY_SRC_Y0_INT, &[], 0)).unwrap();
     assert_eq!(
         rig.exec.apply(&launch[0]),
         Err(ExecError::Copy(CopyError::BlitClip))
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Lists closed mid-entry, write-backs, catch-up failures and the wait setting for compute
+
+#[test]
+fn a_list_closed_between_two_draws_of_one_run_sets_targets_again() {
+    let mut rig = Rig::new();
+    rig.run(&(draw_state() + &draw()));
+    // The open list has recorded since 0; past the close interval, the next draw's commands
+    // close it, and the draw after it starts a new list, which must set its targets again.
+    rig.clock.set(crate::back::fence::CLOSE_AFTER);
+    let run = RingEntry::Run {
+        channel: CHANNEL,
+        class: ClassId(THREE_D),
+        method: method_number(&clc797::DRAW_VERTEX_ARRAY_BEGIN_END_INSTANCE_FIRST, &[]),
+        words: std::borrow::Cow::Owned(vec![
+            fields(&[
+                (clc797::DRAW_VERTEX_ARRAY_BEGIN_END_INSTANCE_FIRST_COUNT, 3),
+                (
+                    clc797::DRAW_VERTEX_ARRAY_BEGIN_END_INSTANCE_FIRST_TOPOLOGY,
+                    clc797::BEGIN_OP_TRIANGLES,
+                ),
+            ]);
+            2
+        ]),
+    };
+    rig.run(&format!("{run}\n"));
+    rig.submit();
+    let lists = rig.recording.as_ref().unwrap().lists();
+    assert_eq!(lists.len(), 2);
+    let (_, second) = &lists[1];
+    assert_eq!(draws(&second.commands), 1);
+    assert!(
+        second
+            .commands
+            .iter()
+            .any(|c| matches!(c, Command::SetRenderTargets(_))),
+        "{second:?}"
+    );
+}
+
+#[test]
+fn a_dispatch_between_two_draws_makes_the_second_set_its_targets() {
+    let backend = Arc::new(RecordingBackend::new(caps(), 1 << 40));
+    let mut rig = Rig::on(
+        Arc::<RecordingBackend>::clone(&backend),
+        compute_set(vec![uniform_bank(0, 0x40)]),
+    );
+    rig.recording = Some(backend);
+    rig.write_words(QMD, &compute_qmd());
+    rig.run(&(draw_state() + &draw() + &compute_signal() + &draw()));
+    rig.submit();
+    let commands = rig.commands();
+    let targets = commands
+        .iter()
+        .filter(|c| matches!(c, Command::SetRenderTargets(_)))
+        .count();
+    assert_eq!((draws(&commands), targets), (2, 2), "{commands:?}");
+}
+
+#[test]
+fn a_copy_reading_a_gpu_drawn_target_writes_it_back_first() {
+    let mut rig = Rig::new();
+    let c = clc7b5::CLASS;
+    let mut copy = String::from("bind channel=3 subchannel=4 class=0xc7b5\n");
+    copy += &address(
+        c,
+        &clc7b5::OFFSET_IN_UPPER,
+        &clc7b5::OFFSET_IN_LOWER,
+        &[],
+        TARGET,
+    );
+    copy += &address(
+        c,
+        &clc7b5::OFFSET_OUT_UPPER,
+        &clc7b5::OFFSET_OUT_LOWER,
+        &[],
+        DST,
+    );
+    copy += &write(c, &clc7b5::LINE_LENGTH_IN, &[], 16);
+    copy += &write(c, &clc7b5::LINE_COUNT, &[], 1);
+    copy += &write(
+        c,
+        &clc7b5::LAUNCH_DMA,
+        &[],
+        fields(&[
+            (
+                clc7b5::LAUNCH_DMA_DATA_TRANSFER_TYPE,
+                clc7b5::LAUNCH_DMA_DATA_TRANSFER_TYPE_NON_PIPELINED,
+            ),
+            (
+                clc7b5::LAUNCH_DMA_SRC_MEMORY_LAYOUT,
+                clc7b5::LAUNCH_DMA_SRC_MEMORY_LAYOUT_PITCH,
+            ),
+            (
+                clc7b5::LAUNCH_DMA_DST_MEMORY_LAYOUT,
+                clc7b5::LAUNCH_DMA_DST_MEMORY_LAYOUT_PITCH,
+            ),
+        ]),
+    );
+    rig.run(&(draw_state() + &draw()));
+    let (_, events) = captured(|| rig.run(&copy));
+    let counters = rig.exec.counters();
+    assert_eq!(counters.write_backs, 1);
+    // The recording backend cannot know the bytes a draw rendered: the write-back fails, is
+    // logged, and the copy runs on guest memory as it is.
+    assert_eq!(counters.write_back_failures, 1);
+    assert!(
+        at(&events, tracing::Level::WARN)
+            .iter()
+            .any(|e| e.contains("a write-back before a copy failed")),
+        "{events:?}"
+    );
+    assert_eq!(rig.exec.fences().counters().closed.catch_up, 1);
+    let readbacks = rig
+        .commands()
+        .iter()
+        .filter(|c| matches!(c, Command::Readback { .. }))
+        .count();
+    assert_eq!(readbacks, 1);
+}
+
+#[test]
+fn a_copy_of_memory_no_drawn_image_holds_writes_nothing_back() {
+    let mut rig = Rig::new();
+    rig.run(&(draw_state() + &draw() + &dma_copy_with_semaphore(1)));
+    assert_eq!(rig.exec.counters().write_backs, 0);
+    assert_eq!(rig.exec.fences().counters().closed.catch_up, 0);
+}
+
+#[test]
+fn a_catch_up_the_host_never_finishes_is_counted_and_the_report_read_as_it_is() {
+    let late = Arc::new(LateBackend::with_caps(
+        caps(),
+        1 << 40,
+        CompletionWake::none(),
+    ));
+    let config = ExecConfig {
+        catch_up: Duration::from_millis(1),
+        ..ExecConfig::default()
+    };
+    let mut rig = Rig::with(
+        Arc::<LateBackend>::clone(&late),
+        compute_set(vec![]),
+        config,
+    );
+    rig.late = Some(late);
+    rig.write_words(REPORT, &[5, 1, 0, 0, 4, 1]);
+    rig.run(&(draw_state() + &draw()));
+    rig.run(&format!(
+        "release channel=3 address={:#x} payload=0x5 size=4 timestamp=no op=write\n",
+        REPORT + 16
+    ));
+    let ((), events) = captured(|| {
+        rig.run(&(conditional(clc797::SET_RENDER_ENABLE_C_MODE_RENDER_IF_EQUAL) + &draw()));
+    });
+    let counters = rig.exec.counters();
+    assert_eq!((counters.catch_ups, counters.catch_up_failures), (0, 1));
+    assert!(
+        at(&events, tracing::Level::WARN)
+            .iter()
+            .any(|e| e.contains("conditional-render catch-up failed")),
+        "{events:?}"
+    );
+    // The report still says "not equal": the second draw was skipped.
+    assert_eq!(rig.exec.draws(CHANNEL).unwrap().counters().drawn, 1);
+}
+
+#[test]
+fn a_pending_compute_program_follows_the_wait_setting() {
+    for (setting, waited) in [
+        (WaitWhileCompiling::Skip, false),
+        (WaitWhileCompiling::Wait, true),
+    ] {
+        let backend = Arc::new(RecordingBackend::new(caps(), 1 << 40));
+        let config = ExecConfig {
+            setting,
+            ..ExecConfig::default()
+        };
+        let mut rig = Rig::with(
+            Arc::<RecordingBackend>::clone(&backend),
+            SetLookup::Pending(Ticket::new(4)),
+            config,
+        );
+        rig.recording = Some(backend);
+        rig.write_words(QMD, &compute_qmd());
+        let ((), events) = captured(|| rig.run(&compute_signal()));
+        // The fake's wait answers the draw set, two shaders: refused as a bad compute set.
+        let refused = at(&events, tracing::Level::WARN)
+            .iter()
+            .any(|e| e.contains("the compute shader set holds 2 shaders"));
+        assert_eq!(refused, waited, "{setting:?}: {events:?}");
+        assert_eq!(rig.exec.counters().dispatches_skipped, 1);
+        assert_eq!(rig.word(SEM), 0x11, "{setting:?}");
+    }
 }
