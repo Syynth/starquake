@@ -17,9 +17,11 @@
 //! The forms decoded so far are slice 1's six instructions, grown to every operand form NAK
 //! encodes for them: `MOV` in forms 1, 4, 5 and 6 (register, immediate, constant buffer,
 //! uniform register), `FFMA` in all seven, `ALD`, `AST` and `S2R`; slice 6h's control and
-//! warp group (`op::control`), every instruction of it but `JMX` and `BPT`; and slice 6b's 32-bit
-//! float and conversion group (`op::float`), every instruction of it in the vector datapath's
-//! forms. Every other opcode is [`DecodeError::UnknownOpcode`].
+//! warp group (`op::control`), every instruction of it but `JMX` and `BPT`; slice 6g's
+//! attribute and system-value group (`op::attribute`), every instruction of it, `S2R` grown to
+//! its uniform form `S2UR`; and slice 6b's 32-bit float and conversion group (`op::float`),
+//! every instruction of it in the vector datapath's forms. Every other opcode is
+//! [`DecodeError::UnknownOpcode`].
 //!
 //! **Strict decoding** (owner's decision 4, 2026-11-12): a word with a bit set that its form
 //! does not explain is rejected, never decoded with the bit ignored. The decoder checks, in this
@@ -29,11 +31,13 @@
 //! 2. no bit outside the form's known-bit mask is set, else [`DecodeError::UnknownBit`] naming
 //!    the lowest such bit, as PR #4588's `FirstUnknownBit` does (`frontend/ampere/isa.h`);
 //! 3. every fixed bit of the form is set (bit 91 of the uniform-register ALU forms; bits 87..89
-//!    and 91 of the uniform `BRA` and bit 91 of `BRXU`, `op::control`), else
+//!    and 91 of the uniform `BRA` and bit 91 of `BRXU`, `op::control`; bit 91 of `LDTRAM`,
+//!    `op::attribute`), else
 //!    [`DecodeError::MissingBit`] naming the lowest clear one;
 //! 4. the form's function reads its fields, else [`DecodeError::UnknownValue`] for a field whose
 //!    value names nothing (a vote or reduction operation past the defined ones: `op::control`;
-//!    a `MUFU` function or a comparison's combine operation past them: `op::float`);
+//!    a `MUFU` function or a comparison's combine operation past them: `op::float`; an
+//!    interpolation mode, pixel value or stage-buffer type past NAK's: `op::attribute`);
 //! 5. every set bit was read, else [`DecodeError::UnknownBit`] naming the lowest unread one. A
 //!    form explains some bits only in some of its layouts or operations: in the constant-buffer
 //!    ALU forms a bound buffer reads its index (bits 54..59) and a bindless one its uniform
@@ -58,9 +62,10 @@
 //! `tests::unknown_opcodes_name_the_opcode` and `tests::masks_match_the_reference_table`. The
 //! control group's divergences (the same two for `WARPSYNC` and `NANOSLEEP`, `BAR`'s form
 //! `0x31d`, and the fixed bits of the uniform `BRA` and of `BRXU`) are listed in `op::control`'s
-//! module docs and pinned in `tests::control`; the float group's (the forms NAK never encodes,
-//! the modifier bits of slots without modifiers) in `op::float`'s and pinned in
-//! `tests::float32`.
+//! module docs and pinned in `tests::control`. The attribute group's (`OUT`'s forms 2, 3 and 7,
+//! and its sources' modifier bits) are listed in `op::attribute`'s module docs and pinned in
+//! `tests::attribute`; the float group's (the forms NAK never encodes, the modifier bits of
+//! slots without modifiers) in `op::float`'s and pinned in `tests::float32`.
 
 mod alu;
 mod fields;
@@ -78,7 +83,7 @@ use thiserror::Error;
 pub(crate) use alu::{AluForm, Slot, Source};
 pub(crate) use fields::*;
 #[cfg(test)]
-pub(crate) use form::{GROUP_HOOKS, GROUPS};
+pub(crate) use form::{Form, GROUP_HOOKS, GROUPS};
 pub use instruction::{Field, Instruction, LengthError};
 // The control-instruction opcodes and fields program capture reads before full decoding
 // (`crate::capture`), named once in `op::control`.

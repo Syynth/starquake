@@ -25,6 +25,10 @@
 //!   IR; the vertex and pixel stages handled here have one vertex);
 //! - `S2R` reads only `SR_LANEID` (the PR also reads the thread and block ids, the W scale
 //!   factors and the lane masks);
+//! - the uniform form `S2UR` is rejected whatever register it reads, and the rejection names
+//!   `"s2ur"`, not the op's mnemonic `s2r`. The PR accepts it: `visitor.cpp` dispatches `0x9c3`
+//!   with `0x919` to `Visitor::S2R` (`case 0x919: case 0x9c3:`), which writes the uniform
+//!   register through `Dst` (`Take(16, uniform_op ? 6 : 8)`) and `WriteDst`;
 //! - `MOV` and `FFMA` take only register and immediate sources: a uniform-register or
 //!   constant-buffer source, which the decoder reads since slice 4, is rejected (the PR reads
 //!   both, `visitor.cpp`, `Visitor::Value`; constant buffers and uniform registers come with
@@ -33,8 +37,9 @@
 //!
 //! Pinned by `tests::guarded_instructions_are_rejected`, `never_guarded_instructions_are_rejected`,
 //! `exit_modes_and_predicates_are_rejected`, `the_program_ends_at_its_only_exit`,
-//! `attribute_access_checks`, `s2r_lane_id`, `uniform_and_constant_buffer_sources_are_rejected`
-//! and `other_instructions_are_rejected_by_mnemonic`.
+//! `attribute_access_checks`, `s2r_lane_id`, `s2ur_is_unsupported`,
+//! `uniform_and_constant_buffer_sources_are_rejected` and
+//! `other_instructions_are_rejected_by_mnemonic`.
 
 #[cfg(test)]
 mod tests;
@@ -44,7 +49,7 @@ use std::fmt::{self, Display, Formatter};
 use thiserror::Error;
 
 use crate::decode::{
-    AluSrc, Gpr, Instr, MovSrc, Op, OpALd, OpASt, OpExit, OpFFma, OpMov, OpS2R, RoundMode,
+    AluSrc, Gpr, Instr, MovSrc, Op, OpALd, OpASt, OpExit, OpFFma, OpMov, OpS2R, RoundMode, S2RDst,
     SpecialReg,
 };
 use crate::ir::{
@@ -488,17 +493,21 @@ impl Translator<'_> {
         Ok(())
     }
 
+    /// `S2R` to a per-thread register; the uniform form, `S2UR`, is not handled yet.
     fn s2r(&mut self, op: OpS2R) -> Result<(), Failure> {
+        let S2RDst::Reg(dst) = op.dst else {
+            return Err(Failure::Unsupported(Unsupported::Instruction("s2ur")));
+        };
         require(
             op.sr == SpecialReg::LANE_ID,
             Unsupported::SpecialRegister(op.sr),
         )?;
         // A write to `RZ` is dropped, so the lane id is not read and needs no capability.
-        if op.dst.is_zero() {
+        if dst.is_zero() {
             return Ok(());
         }
         let value = self.op(Opcode::LaneId, &[])?;
-        self.set(op.dst, value.into())
+        self.set(dst, value.into())
     }
 
     /// `EXIT`: for a pixel program, the registers hold the colour outputs, four per target in
