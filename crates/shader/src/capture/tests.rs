@@ -542,6 +542,25 @@ fn a_library_exit_does_not_end_the_program() {
     );
 }
 
+/// With a call pending, an EXIT before a forward target does not mark the main program as
+/// exited (`Observe` sets `main_exited` only when `index >= last_forward_target`): the RET at 5
+/// is past every target but follows no such EXIT, so the program ends at the RET after the EXIT
+/// at 6.
+#[test]
+fn a_main_exit_before_a_forward_target_does_not_arm_the_ret() {
+    let words = [
+        call(0, 2),
+        bra(1, 5),
+        exit(),
+        filler(),
+        filler(),
+        ret(),
+        exit(),
+        ret(),
+    ];
+    assert_eq!(capture_words(&words).map(|c| c.instruction_count()), Ok(8));
+}
+
 /// A call to instruction 0 reads as no call (`if (!last_call_target)`), so the next EXIT ends
 /// the program.
 #[test]
@@ -1163,7 +1182,11 @@ fn any_word() -> impl Strategy<Value = Instruction> {
 proptest! {
     #![proptest_config(config())]
 
-    /// Arbitrary bytes never panic, as either kind of program, nor do arbitrary table words.
+    /// Arbitrary bytes never panic, as either kind of program. Random bytes almost never end a
+    /// program (a random word is a final `EXIT` about once in 2^22, and a random branch is
+    /// almost always refused first), so this test rarely reaches a finished capture: the hash
+    /// and jump tables over arbitrary words are covered by
+    /// `arbitrary_tables_never_panic_and_an_abandoned_extension_changes_nothing`.
     #[test]
     fn arbitrary_bytes_never_panic(
         bytes in prop::collection::vec(any::<u8>(), 0..1024),
@@ -1197,4 +1220,87 @@ proptest! {
             prop_assert!(opcode == u64::from(EXIT_OPCODE) || opcode == u64::from(RET_OPCODE));
         }
     }
+
+    /// A capture that succeeds, with an arbitrary tail behind it in the reader, resolves
+    /// arbitrary table words without panicking: an extension that is abandoned or not needed
+    /// leaves the capture equal to its clone, one that succeeds keeps the old bytes in front, and
+    /// every target named lies inside the capture.
+    #[test]
+    fn arbitrary_tables_never_panic_and_an_abandoned_extension_changes_nothing(
+        prefix in prop::collection::vec(any_word(), 0..32),
+        tail in prop::collection::vec(any_word(), 0..64),
+        trailing in prop::collection::vec(any::<u8>(), 0..Instruction::SIZE),
+        tables in prop::collection::vec(prop::collection::vec(any_table_word(), 0..8), 0..4),
+    ) {
+        let words = ending(&prefix);
+        let mut code = words.clone();
+        code.extend_from_slice(&tail);
+        let tables: Vec<&[u32]> = tables.iter().map(Vec::as_slice).collect();
+        for stage in [GuestStage::Vertex, GuestStage::Compute] {
+            let mut bytes = program(stage, &code);
+            bytes.extend_from_slice(&trailing);
+            let mut captured = capture(&bytes[..], stage);
+            prop_assert!(
+                matches!(&captured, Ok(c) if c.instruction_count() as usize <= words.len()),
+                "{captured:?}"
+            );
+            let captured = captured.as_mut().unwrap();
+            let before = captured.clone();
+            let _ = captured.hash();
+            let result = captured.resolve_jump_tables(&bytes[..], &tables);
+            match result.extension {
+                Extension::NotNeeded | Extension::Abandoned(_) => {
+                    prop_assert_eq!(&*captured, &before);
+                }
+                Extension::Extended { from } => {
+                    prop_assert_eq!(from, before.instruction_count());
+                    prop_assert!(captured.instruction_count() > from);
+                    prop_assert!(captured.bytes().starts_with(before.bytes()));
+                }
+            }
+            prop_assert_eq!(result.targets.len(), tables.len());
+            let count = captured.instruction_count();
+            for targets in &result.targets {
+                prop_assert!(targets.iter().all(|&index| index < count), "{targets:?}");
+            }
+            let _ = captured.hash();
+        }
+    }
+}
+
+/// How far past the prefix a branch kept by [`ending`] may reach, in instructions.
+const REACH: u32 = 64;
+
+/// `prefix` made into a program that always ends: every branch whose target is refused or lies
+/// more than [`REACH`] instructions past the prefix becomes filler, then `REACH + 1` final
+/// `EXIT`s (the last at or past every forward target, which ends the program or, with a call
+/// pending, marks the main program exited) and a `RET` (at or past every target).
+fn ending(prefix: &[Instruction]) -> Vec<Instruction> {
+    let len = u32::try_from(prefix.len()).unwrap();
+    let mut words: Vec<Instruction> = (0..)
+        .zip(prefix)
+        .map(|(index, &word)| match branch_displacement(word) {
+            Some(displacement) => match branch_target(index, displacement) {
+                Ok(target) if target <= len + REACH => word,
+                _ => filler(),
+            },
+            None => word,
+        })
+        .collect();
+    words.extend(std::iter::repeat_n(exit(), REACH as usize + 1));
+    words.push(ret());
+    words
+}
+
+/// Table words: any `u32`, or one naming a nearby instruction with either base, so that the
+/// furthest target often lies inside or just past the capture.
+fn any_table_word() -> impl Strategy<Value = u32> {
+    let header = u32::try_from(HEADER_BYTES).unwrap();
+    let size = u32::try_from(Instruction::SIZE).unwrap();
+    prop_oneof![
+        any::<u32>(),
+        (0..4 * REACH).prop_map(move |index| header + index * size),
+        (0..4 * REACH).prop_map(move |index| index * size),
+        0..header,
+    ]
 }
