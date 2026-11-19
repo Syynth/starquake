@@ -1,7 +1,7 @@
 //! Test generators of the texture and surface group's decoded operations, one per operation,
 //! every field over its whole encodable range (`decode::tests` joins them through `form`'s
-//! `GROUP_HOOKS`). A bit a form's row leaves out (`.F16` with a `.B` handle, `.CL` without a
-//! `.UR` one) is generated only where the form has it.
+//! `GROUP_HOOKS`). `.F16` and `.CL` are generated with every handle of `TEX` and `TLD`, whose
+//! forms all have them (`op::texture`'s module docs).
 
 use proptest::prelude::*;
 use proptest::sample::select;
@@ -83,7 +83,7 @@ fn textures() -> Vec<BoxedStrategy<Op>> {
                     ndv,
                     z_cmpr,
                     offset,
-                    f16: f16 && has_f16(tex),
+                    f16,
                     eviction,
                     nodep,
                     channel_mask,
@@ -111,10 +111,10 @@ fn textures() -> Vec<BoxedStrategy<Op>> {
                     srcs,
                     dim,
                     is_ms,
-                    clamp: clamp && has_clamp(tex),
+                    clamp,
                     lod_mode,
                     offset,
-                    f16: f16 && has_f16(tex),
+                    f16,
                     eviction,
                     nodep,
                     channel_mask,
