@@ -514,3 +514,11 @@ Entry format:
 - **SCOPE:** architectural (spec amendment)
 - **WHAT:** Core builds each render backend with a completion wake, as it passes the compile pool. The render thread stores each new `completed()` value and then calls the wake. The wake goes through the GPU ring's consumer wake-up, so the back thread sleeps on one thing and wakes for ring entries or for completion. Release writes stay on the back thread. A timer wake-up that finds `completed()` moved is logged and counted as a lost wake, and a contract test every backend must pass checks that a wake follows every advance. G15 builds against it; R5 implements it for wgpu.
 - **WHY:** It keeps every write the guest sees on one thread, in ring order, and reacts at once when the GPU finishes. A lost wake is bounded by the ring's 100 ms recheck, then detected and caught by a test. Eden's fencing thread carries the same obligation inside `wait()` and splits release writes across two threads. Polling would add delay to every semaphore the guest waits on.
+
+## gpu-protocol errata from wave 36
+- **WHEN:** 2026-11-18
+- **PROJECT:** starquake
+- **SYSTEM:** gpu-protocol
+- **SCOPE:** moderate (spec amendment)
+- **WHAT:** (1) `SET_REFERENCE` stays a ring entry: G4's ring gains the kind, and the back closes the open list with no action attached, as Eden-NX2 does. (2) Opcode 0 or 2 with tertiary op 0 is an old-format incrementing or non-incrementing method, per `clc76f.h`; only tertiary ops 1–3 are subdevice-mask operations, which are skipped. (3) The macro upload pointer leaves the side-effect list: the macro host (G13) keeps the upload as a word offset (pointer times 3). (4) Method 0xCC bit 12 is the inline QMD's `REQUIRE_SCHEDULING_PCAS` (bit 140); a clear bit schedules the QMD at once, as a cited rule. (5) A failing QMD request leaves nothing if it fails before its table entry is written, and keeps its own change if it fails after. (6) In shadow-RAM replay mode, data-upload methods take the written words; only state methods take the shadow value (a guess until a trace shows replay during an upload).
+- **WHY:** Nvidia's headers settle layouts (decision 10), and where the Switch 2 references agree and the spec is silent or wrong, the spec follows them. (2) and (6) avoid dropping real methods and uploading stale data, and (1) and (3) match what the code and both references already do.
