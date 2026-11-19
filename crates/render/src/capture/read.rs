@@ -89,6 +89,11 @@ impl<R: Read> CaptureReader<R> {
         }
     }
 
+    /// The bounds the reader applies.
+    pub const fn limits(&self) -> CaptureLimits {
+        self.limits
+    }
+
     /// The position the next record has; the number of records read so far.
     pub const fn position(&self) -> u64 {
         self.order.next()
@@ -121,7 +126,7 @@ impl<R: Read> CaptureReader<R> {
         let decoded = decode_body(kind, &body, record, self.limits)?;
         drop(body);
         let facts = decoded.facts();
-        self.order.check(kind, facts, self.limits.live_resources)?;
+        self.order.check(kind, facts, self.limits)?;
         if kind == RecordKind::End && self.left > 0 {
             return Err(CaptureError::TrailingBytes { count: self.left });
         }

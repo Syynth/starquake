@@ -88,8 +88,8 @@ pub use format::PixelFormat;
 pub use frame::{Frame, FramePixels, FrameSink};
 pub use host_shaders::HostShader;
 pub use id::{
-    BufferId, FenceValue, PipelineId, ReadbackId, ResourceId, SamplerId, ShaderId, TextureId,
-    ViewId,
+    BufferId, FenceValue, IdKind, PipelineId, ReadbackId, ResourceId, SamplerId, ShaderId,
+    TextureId, ViewId,
 };
 pub use pipeline::{ComputePipelineDesc, EmulationFlags, GraphicsPipelineDesc};
 pub use recording::slots::Slots;

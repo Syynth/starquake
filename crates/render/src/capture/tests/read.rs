@@ -2,12 +2,12 @@
 //! one file for each pair of neighbouring checks, the first reported.
 
 use super::super::{
-    CaptureError, CaptureLimits, CaptureReader, Create, CreateShader, Created, Destroy, Limit,
-    Record, RecordKind, ShaderCode, SourceRecord, Start, Submit, VERSION,
+    BoundedField, CaptureError, CaptureLimits, CaptureReader, Create, CreateShader, Created,
+    Destroy, Limit, Record, RecordKind, ShaderCode, SourceRecord, Start, Submit, VERSION,
 };
 use super::{END, file, framed, framed_any, prefix, read, read_with, start};
 use crate::command::CommandList;
-use crate::id::{BufferId, FenceValue, ResourceId, ShaderId, TextureId};
+use crate::id::{BufferId, FenceValue, IdKind, ResourceId, ShaderId, TextureId};
 use crate::resource::{BufferDesc, BufferUsage};
 use crate::shader::{ShaderInterface, ShaderStage};
 use std::io;
@@ -18,14 +18,33 @@ fn body<T: serde::Serialize>(value: &T) -> Vec<u8> {
     postcard::to_allocvec(value).expect("encode")
 }
 
+/// A destroy of buffer `index` after fence zero, which no list is needed to reach.
 fn destroy(index: u32) -> Vec<u8> {
+    destroy_after(ResourceId::Buffer(BufferId::new(index, 0)), 0)
+}
+
+fn destroy_after(id: ResourceId, after: u64) -> Vec<u8> {
     framed(
         RecordKind::Destroy.tag(),
         &body(&Destroy {
-            id: ResourceId::Buffer(BufferId::new(index, 0)),
-            after: FenceValue::new(1),
+            id,
+            after: FenceValue::new(after),
         }),
     )
+}
+
+fn sampler_made(index: u32) -> Vec<u8> {
+    framed(
+        RecordKind::CreateSampler.tag(),
+        &body(&Create {
+            desc: super::sampler_desc(),
+            result: Created::Made(crate::id::SamplerId::new(index, 0)),
+        }),
+    )
+}
+
+fn sampler(index: u32) -> ResourceId {
+    ResourceId::Sampler(crate::id::SamplerId::new(index, 0))
 }
 
 fn buffer_made(index: u32, generation: u32) -> Vec<u8> {
@@ -543,7 +562,7 @@ fn live_ids_are_counted_per_kind() {
         error,
         CaptureError::TooManyLive {
             record: 3,
-            kind: "buffer",
+            kind: IdKind::Buffer,
             max: 2
         }
     );
@@ -572,9 +591,103 @@ fn live_ids_are_counted_per_kind() {
         read_with(&not_live, limits),
         Err(CaptureError::TooManyLive {
             record: 4,
-            kind: "buffer",
+            kind: IdKind::Buffer,
             max: 2
         })
+    );
+}
+
+#[test]
+fn held_ids_are_counted_until_a_list_reaches_their_fence() {
+    let limits = CaptureLimits {
+        live_resources: 2,
+        ..CaptureLimits::SHIPPED
+    };
+    let too_many = |record| {
+        Err(CaptureError::TooManyLive {
+            record,
+            kind: IdKind::Sampler,
+            max: 2,
+        })
+    };
+    // Each sampler is destroyed after fence 5, past every list so far: replay holds it, so
+    // the reader counts it. Two held are accepted; the third create is refused at its record.
+    let held = |n: u32| -> Vec<Vec<u8>> {
+        (1..=n)
+            .flat_map(|i| [sampler_made(i), destroy_after(sampler(i), 5)])
+            .collect()
+    };
+    let refs = |records: &[Vec<u8>]| -> Vec<u8> {
+        file(&records.iter().map(Vec::as_slice).collect::<Vec<_>>())
+    };
+    assert!(read_with(&refs(&held(2)), limits).is_ok());
+    let mut third = held(2);
+    third.push(sampler_made(3));
+    // Start, then two pairs: the third create is record 5.
+    assert_eq!(read_with(&refs(&third), limits).map(|_| ()), too_many(5));
+    // A list at the fence releases them: the third create is accepted.
+    let mut reached = held(2);
+    reached.push(made(5));
+    reached.push(sampler_made(3));
+    assert!(read_with(&refs(&reached), limits).is_ok());
+    // A list one below the fence does not.
+    let mut below = held(2);
+    below.push(made(4));
+    below.push(sampler_made(3));
+    assert_eq!(read_with(&refs(&below), limits).map(|_| ()), too_many(6));
+    // A destroy after a fence a list has already reached frees its id at once: with list 5
+    // first, the destroys after 5 hold nothing.
+    let mut at_fence = vec![made(5)];
+    at_fence.extend(held(2));
+    at_fence.push(sampler_made(3));
+    assert!(read_with(&refs(&at_fence), limits).is_ok());
+    // And one past it holds: list 4 first, destroys after 5.
+    let mut past = vec![made(4)];
+    past.extend(held(2));
+    past.push(sampler_made(3));
+    assert_eq!(read_with(&refs(&past), limits).map(|_| ()), too_many(6));
+    // Held ids are counted per kind: a buffer is still accepted.
+    let mut other_kind = held(2);
+    other_kind.push(buffer_made(1, 0));
+    assert!(read_with(&refs(&other_kind), limits).is_ok());
+    // A list that releases one fence keeps the others: destroys after 5 and 6, list 5, then two
+    // creates; the second passes the bound.
+    let mut partly = vec![
+        sampler_made(1),
+        destroy_after(sampler(1), 5),
+        sampler_made(2),
+        destroy_after(sampler(2), 6),
+        made(5),
+        sampler_made(3),
+    ];
+    assert!(read_with(&refs(&partly), limits).is_ok());
+    partly.push(sampler_made(4));
+    assert_eq!(read_with(&refs(&partly), limits).map(|_| ()), too_many(7));
+    // The hostile case: many samplers destroyed after the largest fence, with no list.
+    let hostile: Vec<Vec<u8>> = (1..=100)
+        .flat_map(|i| [sampler_made(i), destroy_after(sampler(i), u64::MAX)])
+        .collect();
+    assert_eq!(read_with(&refs(&hostile), limits).map(|_| ()), too_many(5));
+    // The writer applies the same count.
+    let (mut w, _) = super::writer_with(limits);
+    for i in 1..=2 {
+        w.write(&Record::CreateSampler(Create {
+            desc: super::sampler_desc(),
+            result: Created::Made(crate::id::SamplerId::new(i, 0)),
+        }))
+        .expect("create");
+        w.write(&Record::Destroy(Destroy {
+            id: sampler(i),
+            after: FenceValue::new(5),
+        }))
+        .expect("destroy");
+    }
+    assert_eq!(
+        w.write(&Record::CreateSampler(Create {
+            desc: super::sampler_desc(),
+            result: Created::Made(crate::id::SamplerId::new(3, 0)),
+        })),
+        too_many(5)
     );
 }
 
@@ -659,7 +772,7 @@ fn the_first_check_in_the_documented_order_is_reported() {
     assert!(matches!(
         read(&file(&[&long_entry])),
         Err(CaptureError::TooLarge {
-            what: "entry name",
+            what: BoundedField::EntryName,
             ..
         })
     ));

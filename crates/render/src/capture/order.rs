@@ -4,13 +4,10 @@
 //! [`Order::check`] decides and changes nothing; [`Order::apply`] records the record and cannot
 //! fail, so a caller can run every other fallible step between the two.
 
-use super::CaptureError;
 use super::record::{Facts, RecordKind};
-use crate::id::{FenceValue, ResourceId};
-use std::collections::HashSet;
-
-/// Kinds of id, for the live counts.
-const ID_KINDS: usize = 6;
+use super::{CaptureError, CaptureLimits};
+use crate::id::{FenceValue, IdKind, ResourceId};
+use std::collections::{BTreeMap, HashSet};
 
 /// What the records so far have established.
 #[derive(Debug, Default)]
@@ -23,10 +20,16 @@ pub(crate) struct Order {
     last_fence: FenceValue,
     /// How many shader sources have been given.
     sources: u32,
+    /// What the sources given so far are charged ([`super::source_charge`]).
+    source_charge: u64,
     /// Ids created and not destroyed.
     live: HashSet<ResourceId>,
-    /// How many of `live` are of each kind ([`kind_index`]).
-    counts: [u64; ID_KINDS],
+    /// Ids destroyed after a fence past every accepted list, by that fence: how many of each
+    /// kind ([`IdKind::index`]). Each is still counted in `counts` until a list reaches it.
+    held: BTreeMap<FenceValue, [u64; IdKind::COUNT]>,
+    /// How many ids of each kind are held ([`IdKind::index`]): those in `live`, and those
+    /// counted in `held` (module docs of [`crate::capture`], "What reading checks, in order").
+    counts: [u64; IdKind::COUNT],
 }
 
 impl Order {
@@ -46,12 +49,14 @@ impl Order {
     }
 
     /// Whether a record of `kind` with `facts` may come next, checked in the documented order:
-    /// `Start` first, `Start` once, nothing but `End` after `Limit`, then the kind's own check.
+    /// `Start` first, `Start` once, nothing but `End` after `Limit`, then the kind's own check
+    /// (for a `ShaderSource`, its index before its charge; for a `Create*`, the id not live
+    /// before the held count).
     pub(crate) fn check(
         &self,
         kind: RecordKind,
         facts: Facts,
-        max_live: u64,
+        limits: CaptureLimits,
     ) -> Result<(), CaptureError> {
         let record = self.next;
         if !self.started && kind != RecordKind::Start {
@@ -71,14 +76,22 @@ impl Order {
                 fence: fence.get(),
             });
         }
-        if let Some(index) = facts.source
-            && index != self.sources
-        {
-            return Err(CaptureError::SourceIndex {
-                record,
-                index,
-                expected: self.sources,
-            });
+        if let Some(source) = facts.source {
+            if source.index != self.sources {
+                return Err(CaptureError::SourceIndex {
+                    record,
+                    index: source.index,
+                    expected: self.sources,
+                });
+            }
+            let needed = self.source_charge.checked_add(source.charge);
+            if needed.is_none_or(|needed| needed > limits.source_bytes) {
+                return Err(CaptureError::SourcesTooLarge {
+                    record,
+                    needed: needed.unwrap_or(u64::MAX),
+                    max: limits.source_bytes,
+                });
+            }
         }
         if let Some(index) = facts.uses_source
             && index >= self.sources
@@ -89,11 +102,11 @@ impl Order {
             if self.live.contains(&id) {
                 return Err(CaptureError::IdLive { record, id });
             }
-            if self.counts[kind_index(id)] >= max_live {
+            if self.counts[id.kind().index()] >= limits.live_resources {
                 return Err(CaptureError::TooManyLive {
                     record,
-                    kind: id.kind_name(),
-                    max: max_live,
+                    kind: id.kind(),
+                    max: limits.live_resources,
                 });
             }
         }
@@ -110,33 +123,42 @@ impl Order {
         }
         if let Some(fence) = facts.fence {
             self.last_fence = fence;
+            self.release_held(fence);
         }
-        if facts.source.is_some() {
+        if let Some(source) = facts.source {
             self.sources = self.sources.saturating_add(1);
+            self.source_charge = self.source_charge.saturating_add(source.charge);
         }
         if let Some(id) = facts.created
             && self.live.insert(id)
         {
-            let count = &mut self.counts[kind_index(id)];
+            let count = &mut self.counts[id.kind().index()];
             *count = count.saturating_add(1);
         }
-        if let Some(id) = facts.destroyed
+        if let Some((id, after)) = facts.destroyed
             && self.live.remove(&id)
         {
-            let count = &mut self.counts[kind_index(id)];
-            *count = count.saturating_sub(1);
+            if after > self.last_fence {
+                // Replay holds the id and its resource until a list reaches `after`.
+                let held = self.held.entry(after).or_default();
+                held[id.kind().index()] = held[id.kind().index()].saturating_add(1);
+            } else {
+                let count = &mut self.counts[id.kind().index()];
+                *count = count.saturating_sub(1);
+            }
         }
     }
-}
 
-/// Where `id`'s kind is counted.
-const fn kind_index(id: ResourceId) -> usize {
-    match id {
-        ResourceId::Buffer(_) => 0,
-        ResourceId::Texture(_) => 1,
-        ResourceId::View(_) => 2,
-        ResourceId::Sampler(_) => 3,
-        ResourceId::Shader(_) => 4,
-        ResourceId::Pipeline(_) => 5,
+    /// Stops counting the ids held for fences at or below `fence`, which a list has now reached.
+    fn release_held(&mut self, fence: FenceValue) {
+        while let Some(entry) = self.held.first_entry() {
+            if *entry.key() > fence {
+                return;
+            }
+            let released = entry.remove();
+            for (count, held) in self.counts.iter_mut().zip(released) {
+                *count = count.saturating_sub(held);
+            }
+        }
     }
 }

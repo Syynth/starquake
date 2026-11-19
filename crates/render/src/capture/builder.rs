@@ -177,9 +177,9 @@ impl CaptureBuilder {
     }
 
     /// `set_present_target`, accepted.
-    pub fn set_present_target(&mut self, target: PresentTarget) -> Result<(), CaptureError> {
+    pub fn set_present_target(&mut self, target: &PresentTarget) -> Result<(), CaptureError> {
         self.record(&Record::PresentTarget(TargetRecord {
-            target: CapturedTarget::of(&target),
+            target: CapturedTarget::of(target),
             result: Created::Made(()),
         }))
     }

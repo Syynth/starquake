@@ -93,6 +93,9 @@ pub struct CaptureWriter {
     /// Each source given so far, by the SHA-256 of its bytes: a lookup by content, so equal
     /// bytes get the same index whatever holds them.
     sources: HashMap<[u8; 32], u32>,
+    /// The room every record but `Limit` and `End` keeps for them ([`close_reserve`]), worked
+    /// out once when the writer is made.
+    close_reserve: u64,
     finished: bool,
 }
 
@@ -129,6 +132,7 @@ impl CaptureWriter {
             written: 0,
             order: Order::default(),
             sources: HashMap::new(),
+            close_reserve: close_reserve(),
             finished: false,
         };
         let start = Record::Start(start);
@@ -138,7 +142,7 @@ impl CaptureWriter {
         let needed = len64(header.len())
             .saturating_add(len64(prefix.len()))
             .saturating_add(len64(body.len()))
-            .saturating_add(close_reserve());
+            .saturating_add(writer.close_reserve);
         if needed > size_limit {
             return Err(CaptureError::LimitTooSmall {
                 limit: size_limit,
@@ -296,13 +300,13 @@ impl CaptureWriter {
                     len,
                     max,
                 })?;
-        self.order.check(kind, facts, self.limits.live_resources)?;
+        self.order.check(kind, facts, self.limits)?;
         let prefix =
             prefix(kind, short_len).map_err(|source| CaptureError::Encode { record, source })?;
         // `Limit` and `End` may use the room the others keep for them.
         let reserve = match kind {
             RecordKind::Limit | RecordKind::End => 0,
-            _ => close_reserve(),
+            _ => self.close_reserve,
         };
         let needed = self
             .written
@@ -347,8 +351,9 @@ pub(crate) fn prefix(kind: RecordKind, len: u32) -> Result<Vec<u8>, postcard::Er
 }
 
 /// The room every record but `Limit` and `End` keeps for them: the longest `Limit` (the
-/// largest fence value) and `End`, each with its tag and length.
-fn close_reserve() -> u64 {
+/// largest fence value) and `End`, each with its tag and length. It depends only on constants;
+/// a writer works it out once ([`CaptureWriter::with_limits`]), not per record.
+pub(crate) fn close_reserve() -> u64 {
     let framed = |record: &Record| {
         let mut body = Vec::new();
         let body_len = encode_body(record, &mut body).map_or(0, |()| body.len());

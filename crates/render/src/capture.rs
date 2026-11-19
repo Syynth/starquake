@@ -58,11 +58,18 @@
 //!    ([`CaptureError::Truncated`]); the body decodes within its length
 //!    ([`CaptureError::Decode`], [`CaptureError::RecordTrailingBytes`], and for the fields with
 //!    their own bounds [`CaptureError::TooLarge`], [`CaptureError::ListTooLong`],
-//!    [`CaptureError::ListTooBig`]); and the record fits what came before (`Start` first and
-//!    once, nothing but `End` after `Limit`, accepted `Submit` fences rising and the first above
-//!    zero, each `ShaderSource` index the next one, each `CreateShader` naming an index already
-//!    given, no `Create*` returning an id still live in the capture, at most
-//!    [`MAX_LIVE_RESOURCES`] live per id kind).
+//!    [`CaptureError::ListTooBig`], [`CaptureError::TooManyDumps`]); and the record fits what
+//!    came before (`Start` first and once, nothing but `End` after `Limit`, accepted `Submit`
+//!    fences rising and the first above zero, each `ShaderSource` index the next one and the
+//!    sources' charge within [`MAX_SHADER_SOURCES_BYTES`] ([`CaptureError::SourcesTooLarge`]),
+//!    each `CreateShader` naming an index already given, no `Create*` returning an id still
+//!    live in the capture, at most [`MAX_LIVE_RESOURCES`] held per id kind).
+//!
+//! An id is *held* from the `Create*` that returns it until its `Destroy`, or, when that
+//! `Destroy` names a fence past every accepted list so far, until an accepted list reaches that
+//! fence: replay keeps such an id, and the fresh backend's resource, until then (see
+//! [`replay`], "Identity"). So the live count bounds the destroys replay holds back as well as
+//! the ids in use (`capture::tests::read::held_ids_are_counted_until_a_list_reaches_their_fence`).
 //! 4. Nothing after `End` ([`CaptureError::TrailingBytes`]).
 //!
 //! The order checks are applied in this order: `Start` first, then `Start` once, then nothing
@@ -87,10 +94,12 @@
 //! | [`MAX_SHADER_SOURCE_BYTES`] | 2 MiB | one shader origin's bytes. A guess (below) |
 //! | [`MAX_SHADER_CODE_BYTES`] | 16 MiB | SPIR-V (four bytes a word) or MSL stored as it is. A guess (spec) |
 //! | [`MAX_TEXT_BYTES`] | 4 KiB | build id, backend name, entry names, refusal messages (spec) |
-//! | [`MAX_LIVE_RESOURCES`] | 2^20 per id kind | the reader's live set and the replay's tables. A guess (spec) |
+//! | [`MAX_LIVE_RESOURCES`] | 2^20 per id kind | the ids held (above): the reader's live set and the replay's tables of ids and held destroys; replay waits for its last fence before a create would pass it, so destroys forwarded but not yet reached count too. A guess (spec) |
+//! | [`MAX_SHADER_SOURCES_BYTES`] | 1 GiB | every `ShaderSource` the capture gives, each charged its length plus [`SOURCE_ENTRY_BYTES`]: replay keeps them all. A guess, not in the spec (below) |
+//! | [`MAX_LIST_DUMPS`] | 1024 | the presents with `dump` set in one list: the [`ReplayFrames`] sink's cap. Not in the spec (below) |
 //!
 //! [`CaptureLimits`] carries the bounds a test may lower; [`CaptureLimits::SHIPPED`] is the
-//! table's values. The text and shader bounds are fixed.
+//! table's values. The text and per-shader bounds are fixed.
 //!
 //! **Divergences from the spec's bounds, for the owner.** (1) The spec caps every record at
 //! `MAX_RECORD_BYTES`. Here only `Submit` and `ReadbackResult` may be that large; every other
@@ -105,7 +114,19 @@
 //! header and answers), which R11c should pin against slice 20's constant in a crate that sees
 //! both. Pinned by `capture::tests::bounds::the_bounds_are_the_documented_values`; (1) and (2)
 //! by `capture::tests::bounds::each_kind_cap_at_its_edge`,
-//! `a_lists_decoded_charge_at_its_edge` and `the_lists_nested_in_a_command_at_their_edge`.
+//! `a_lists_decoded_charge_at_its_edge` and `the_lists_nested_in_a_command_at_their_edge`. (7)
+//! [`MAX_SHADER_SOURCES_BYTES`] is not in the spec, whose bounds table caps one source but not
+//! how many a capture gives, while replay keeps every source for the shaders that name it; the
+//! value is a guess (as much as the largest record), for the owner to rule on. Pinned by
+//! `capture::tests::bounds::the_sources_charge_at_its_edge`. (8) [`MAX_LIST_DUMPS`] is not in
+//! the spec either: a list with more dumped presents than the [`ReplayFrames`] sink keeps would
+//! lose its first frames before replay compares them, and report them missing. Pinned by
+//! `capture::tests::bounds::a_lists_dumped_presents_at_their_edge` and
+//! `capture::tests::replay::a_list_of_dumped_frames_at_the_sinks_cap_replays_clean`. The bound
+//! is per list: frames of an earlier list whose `FrameResult` records come after a later
+//! `Submit` (a backend that delivers frames late) share the sink with that list's, so a run of
+//! such lists may still pass the cap; replay then reports the evicted frames as
+//! [`FindingKind::FrameMissing`].
 //!
 //! **Other departures from the spec's text, for the owner.** (4) The spec says a `Limit` record
 //! "says the capture stopped at the size cap". The capturing backend also closes with `Limit`
@@ -116,6 +137,17 @@
 //! (6) The spec says replay refuses a create past the memory limit "so a capture of many huge
 //! textures fails cleanly"; here the create is refused and counted and the replay goes on, as for
 //! any other id it does not hold (`capture::tests::replay`, the memory limit test).
+//! (9) The spec says a `Destroy`'s `after` "maps to the replay fence of the latest captured
+//! list at or below it (zero maps to zero)", and that "the order of calls and lists" must not
+//! differ on any backend. Replay holds a `Destroy` whose fence is past every list captured so
+//! far until a captured list reaches that fence, and forwards it then, after the `Submit`
+//! records that followed it in the capture; mapping it at once would map it to a fence the fresh
+//! backend has already passed. The GPU crate names only its last fence or zero, so only a
+//! hand-made or hostile capture takes this path
+//! (`capture::tests::replay::a_destroy_past_every_captured_list_waits_for_one_to_reach_it`).
+//! (10) The spec calls the error for bytes left inside a record `TrailingBytes`. Here that is
+//! [`CaptureError::RecordTrailingBytes`], and [`CaptureError::TrailingBytes`] is the error for
+//! bytes after the `End` record (`capture::tests::read`).
 //!
 //! **Memory while reading.** The reader holds one record. A `Submit` takes at most its
 //! [`MAX_LIST_DECODED_BYTES`] charge (each command is charged `size_of::<Command>()` plus its
@@ -145,13 +177,13 @@ pub use record::{
     Start, Submit, TargetRecord, WaitSetting,
 };
 pub use replay::{
-    Finding, FindingKind, ReplayError, ReplayFrames, ReplayOptions, ReplayReport, ResolveError,
-    ShaderResolver, map_ids, replay,
+    Finding, FindingKind, MAX_REPLAY_FRAMES, ReplayError, ReplayFrames, ReplayOptions,
+    ReplayReport, ResolveError, ShaderResolver, map_ids, replay,
 };
 pub use wrap::CapturingBackend;
 pub use write::{CaptureBuffer, CaptureSink, CaptureWriter, EncodedList};
 
-use crate::id::ResourceId;
+use crate::id::{IdKind, ResourceId};
 use thiserror::Error;
 
 /// First bytes of every capture, so that a file of another kind is refused before its body is
@@ -185,8 +217,112 @@ pub const MAX_SHADER_CODE_BYTES: u64 = 16 << 20;
 /// The longest text: build id, backend name, entry name, refusal message.
 pub const MAX_TEXT_BYTES: u64 = 4 << 10;
 
-/// The most ids of one kind live at once in a capture, and so in a replay's tables.
+/// The most ids of one kind held at once in a capture (module docs, "What reading checks, in
+/// order"), and so in a replay's tables.
 pub const MAX_LIVE_RESOURCES: u64 = 1 << 20;
+
+/// The most all of a capture's shader sources may be charged ([`SOURCE_ENTRY_BYTES`]): replay
+/// keeps every source. A guess, as much as [`MAX_RECORD_BYTES`] (module docs, "Bounds").
+pub const MAX_SHADER_SOURCES_BYTES: u64 = 1 << 30;
+
+/// What a replay's table of sources costs per source beyond the source's bytes, on the 64-bit
+/// hosts starquake runs on: the `Arc<[u8]>` in the table (a pointer and a length) and the
+/// `Arc`'s two counts. Each source is charged at least this, so an empty one is not free.
+pub const SOURCE_ENTRY_BYTES: u64 = 32;
+
+/// The most presents with `dump` set that one list may hold: the [`ReplayFrames`] sink's cap,
+/// so that replay keeps every frame one list dumps (module docs, "Bounds").
+pub const MAX_LIST_DUMPS: u64 = MAX_REPLAY_FRAMES as u64;
+
+/// What a source of `len` bytes is charged against [`CaptureLimits::source_bytes`].
+pub(crate) fn source_charge(len: usize) -> u64 {
+    write::len64(len).saturating_add(SOURCE_ENTRY_BYTES)
+}
+
+/// A field with its own bound, as [`CaptureError::TooLarge`] names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BoundedField {
+    /// The `Start` record's build id.
+    BuildId,
+    /// The `Start` record's backend name.
+    BackendName,
+    /// A shader's entry name.
+    EntryName,
+    /// A refusal's message.
+    RefusalMessage,
+    /// A shader origin's bytes.
+    ShaderSource,
+    /// SPIR-V code stored as it is.
+    SpirVCode,
+    /// MSL code stored as it is.
+    MslCode,
+    /// A draw's bindings.
+    DrawBindings,
+    /// A draw's vertex buffers.
+    DrawVertexBuffers,
+    /// A draw's viewports.
+    DrawViewports,
+    /// A draw's scissors.
+    DrawScissors,
+    /// A dispatch's bindings.
+    DispatchBindings,
+}
+
+impl BoundedField {
+    /// The field in words ("entry name").
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::BuildId => "build id",
+            Self::BackendName => "backend name",
+            Self::EntryName => "entry name",
+            Self::RefusalMessage => "refusal message",
+            Self::ShaderSource => "shader source",
+            Self::SpirVCode => "SPIR-V code",
+            Self::MslCode => "MSL code",
+            Self::DrawBindings => "draw bindings",
+            Self::DrawVertexBuffers => "draw vertex buffers",
+            Self::DrawViewports => "draw viewports",
+            Self::DrawScissors => "draw scissors",
+            Self::DispatchBindings => "dispatch bindings",
+        }
+    }
+
+    /// Whether the field is a list nested in a command, whose length counts elements rather
+    /// than bytes.
+    pub const fn is_list(self) -> bool {
+        match self {
+            Self::BuildId
+            | Self::BackendName
+            | Self::EntryName
+            | Self::RefusalMessage
+            | Self::ShaderSource
+            | Self::SpirVCode
+            | Self::MslCode => false,
+            Self::DrawBindings
+            | Self::DrawVertexBuffers
+            | Self::DrawViewports
+            | Self::DrawScissors
+            | Self::DispatchBindings => true,
+        }
+    }
+}
+
+/// In words, as errors print it: "entry name".
+impl std::fmt::Display for BoundedField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// [`CaptureError::TooLarge`] after its record, in words: bytes for a text or code, elements
+/// for a nested list.
+fn too_large(what: BoundedField, len: u64, max: u64) -> String {
+    if what.is_list() {
+        format!("the {what} list holds {len} elements, more than the {max} allowed")
+    } else {
+        format!("the {what} is {len} bytes long, more than the {max} allowed")
+    }
+}
 
 /// The bounds a reader and a writer apply that a test may lower (module docs, "Bounds").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,6 +337,10 @@ pub struct CaptureLimits {
     pub list_decoded_bytes: u64,
     /// [`MAX_LIVE_RESOURCES`].
     pub live_resources: u64,
+    /// [`MAX_SHADER_SOURCES_BYTES`].
+    pub source_bytes: u64,
+    /// [`MAX_LIST_DUMPS`].
+    pub list_dumps: u64,
 }
 
 impl CaptureLimits {
@@ -211,6 +351,8 @@ impl CaptureLimits {
         list_commands: MAX_LIST_COMMANDS,
         list_decoded_bytes: MAX_LIST_DECODED_BYTES,
         live_resources: MAX_LIVE_RESOURCES,
+        source_bytes: MAX_SHADER_SOURCES_BYTES,
+        list_dumps: MAX_LIST_DUMPS,
     };
 
     /// The largest body a record of `kind` may have: the kind's own cap (module docs, "Bounds"),
@@ -314,13 +456,13 @@ pub enum CaptureError {
         count: u64,
     },
     /// A field with its own bound is past it.
-    #[error("record {record}: the {what} is {len} bytes long, more than the {max} allowed")]
+    #[error("record {record}: {}", too_large(*what, *len, *max))]
     TooLarge {
         /// The record's position.
         record: u64,
-        /// The field, in words ("entry name"); for a list nested in a command, its length is
+        /// The field; for a list nested in a command ([`BoundedField::is_list`]), its length is
         /// counted in elements, not bytes.
-        what: &'static str,
+        what: BoundedField,
         /// Its length.
         len: u64,
         /// Its bound.
@@ -343,6 +485,20 @@ pub enum CaptureError {
         record: u64,
         /// The command, from zero, whose charge passed the bound.
         command: u64,
+        /// The bound.
+        max: u64,
+    },
+    /// A list holds more presents with `dump` set than [`CaptureLimits::list_dumps`].
+    #[error(
+        "record {record}: command {command} is dumped present {count}, more than the {max} allowed"
+    )]
+    TooManyDumps {
+        /// The record's position.
+        record: u64,
+        /// The command, from zero, that passed the bound.
+        command: u64,
+        /// The dumped presents up to and including it.
+        count: u64,
         /// The bound.
         max: u64,
     },
@@ -387,6 +543,18 @@ pub enum CaptureError {
         /// The next index.
         expected: u32,
     },
+    /// A `ShaderSource` would take the sources' charge past [`CaptureLimits::source_bytes`].
+    #[error(
+        "record {record}: the shader sources would be charged {needed} bytes, more than the {max} allowed"
+    )]
+    SourcesTooLarge {
+        /// The record's position.
+        record: u64,
+        /// The charge with this source ([`SOURCE_ENTRY_BYTES`] per source), saturating.
+        needed: u64,
+        /// The bound.
+        max: u64,
+    },
     /// A `CreateShader` names a source index not yet given.
     #[error("record {record}: shader source {index} has not been given")]
     UnknownSource {
@@ -403,13 +571,14 @@ pub enum CaptureError {
         /// The id.
         id: ResourceId,
     },
-    /// A `Create*` would make more ids of one kind live than [`CaptureLimits::live_resources`].
+    /// A `Create*` would make more ids of one kind held than [`CaptureLimits::live_resources`]
+    /// (module docs, "What reading checks, in order").
     #[error("record {record}: more than {max} {kind} ids would be live")]
     TooManyLive {
         /// The record's position.
         record: u64,
-        /// The id kind, in words.
-        kind: &'static str,
+        /// The id kind.
+        kind: IdKind,
         /// The bound.
         max: u64,
     },

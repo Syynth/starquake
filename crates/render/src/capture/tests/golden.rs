@@ -593,3 +593,46 @@ fn the_golden_bytes_read_back_as_every_record_kind() {
     kinds.dedup();
     assert_eq!(kinds, RecordKind::ALL, "every kind is in the golden file");
 }
+
+/// The variants the main golden file cannot hold beside their siblings: a second `Start` with
+/// the other wait setting, an offscreen target and a ready pipeline. Each differs from the main
+/// file's bytes in its variant byte only.
+#[test]
+fn the_other_variants_write_and_read_their_golden_bytes() {
+    let start = Start {
+        wait: WaitSetting::Wait,
+        ..golden_start()
+    };
+    let records = [
+        Record::PresentTarget(TargetRecord {
+            target: CapturedTarget::Offscreen,
+            result: Created::Made(()),
+        }),
+        Record::PipelineOutcome(PipelineOutcome {
+            pipeline: PipelineId::new(41, 42),
+            outcome: PipelineResult::Ready,
+        }),
+        Record::End,
+    ];
+    // The main file's header and `Start` (tag, two length bytes, 159 bytes of body), with the
+    // wait setting, the byte before the five of the memory limit, now 0 (Wait).
+    let mut expected = golden_file();
+    let start_end = 5 + 3 + 159;
+    expected.truncate(start_end);
+    assert_eq!(expected[start_end - 6], 0x01, "Skip in the main file");
+    expected[start_end - 6] = 0x00;
+    expected.extend([0x0C, 0x02, 0x00, 0x00]); // PresentTarget: offscreen, made
+    expected.extend([0x0E, 0x03, 0x29, 0x2A, 0x00]); // PipelineOutcome: ready
+    expected.extend([0x00, 0x00]); // End
+
+    let buffer = Arc::new(CaptureBuffer::new());
+    let sink: Arc<dyn CaptureSink> = Arc::<CaptureBuffer>::clone(&buffer);
+    let mut writer = CaptureWriter::new(sink, start.clone(), u64::MAX).expect("start");
+    for record in &records {
+        writer.write(record).expect("a golden record");
+    }
+    assert_eq!(buffer.bytes(), expected);
+    let mut all = vec![Record::Start(start)];
+    all.extend(records);
+    assert_eq!(read(&expected).expect("the golden file"), all);
+}

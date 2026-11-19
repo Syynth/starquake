@@ -19,7 +19,23 @@
 //! with the fresh one, and a `Destroy`'s fence maps to the fresh fence of the latest captured
 //! list at or below it that both sides accepted (zero when there is none). A `Destroy` whose
 //! fence is past every list captured so far waits until a captured list reaches it (or the
-//! capture ends), so that it is not mapped to a fence the fresh backend passes too early.
+//! capture ends), so that it is not mapped to a fence the fresh backend passes too early. That
+//! departs from the spec, which maps every destroy at once (departure (9) in the module docs of
+//! [`crate::capture`]).
+//!
+//! # Bounds on the tables
+//!
+//! Replay holds a fresh resource from its create until the fresh backend has passed the fence of
+//! its forwarded destroy: in use, held back with its destroy (above), or destroyed and not yet
+//! reached. The reader bounds the first two per id kind ([`CaptureLimits::live_resources`](super::CaptureLimits::live_resources), the
+//! module docs of [`crate::capture`], "What reading checks, in order"). The third depends on how
+//! fast the fresh backend runs, so before a create of a kind whose held resources are at that
+//! bound, replay waits for the last fence it handed out and forgets the destroyed ids
+//! (`capture::tests::replay::a_create_at_the_live_bound_waits_for_the_destroys_before_it`).
+//! Every forwarded destroy names a fence at or below that one, so afterwards the held count is
+//! the reader's count, which is below the bound for any create the capture made. A create the
+//! capture refused and the fresh backend made is destroyed at once and not counted. The shader
+//! sources replay keeps are bounded by the reader's [`CaptureLimits::source_bytes`](super::CaptureLimits::source_bytes).
 //!
 //! # What is compared
 //!
@@ -59,12 +75,12 @@ use crate::command::{
 use crate::error::RenderError;
 use crate::frame::{Frame, FrameSink};
 use crate::id::{
-    BufferId, FenceValue, PipelineId, ReadbackId, ResourceId, SamplerId, ShaderId, TextureId,
-    ViewId,
+    BufferId, FenceValue, IdKind, PipelineId, ReadbackId, ResourceId, SamplerId, ShaderId,
+    TextureId, ViewId,
 };
 use crate::shader::{ShaderDesc, ShaderOrigin, ShaderSource};
 use crate::validate;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -104,6 +120,7 @@ pub struct ReplayOptions {
 }
 
 /// The most frames a [`ReplayFrames`] keeps waiting to be compared; past it the oldest goes.
+/// A list may dump no more ([`super::MAX_LIST_DUMPS`]).
 pub const MAX_REPLAY_FRAMES: usize = 1024;
 
 /// The frame sink a replay's caller installs on the fresh backend, through which replay sees the
@@ -429,6 +446,9 @@ pub fn replay<R: Read>(
             .memory_limit
             .unwrap_or_else(|| backend.budget().allowed),
         used: 0,
+        max_held: reader.limits().live_resources,
+        held: HashSet::new(),
+        held_counts: [0; IdKind::COUNT],
         ids: HashMap::new(),
         charges: HashMap::new(),
         pending: BTreeMap::new(),
@@ -460,6 +480,13 @@ struct Replay<'a> {
     limit: u64,
     /// Bytes charged for live buffers and textures.
     used: u64,
+    /// The reader's bound on the ids of one kind held at once (module docs, "Bounds on the
+    /// tables").
+    max_held: u64,
+    /// The fresh resources replay holds: made for a captured id and not yet forgotten.
+    held: HashSet<ResourceId>,
+    /// How many of `held` are of each kind ([`IdKind::index`]).
+    held_counts: [u64; IdKind::COUNT],
     /// The capture's ids to the fresh backend's.
     ids: HashMap<ResourceId, ResourceId>,
     /// What each fresh buffer and texture was charged.
@@ -474,6 +501,7 @@ struct Replay<'a> {
     fences: Vec<(FenceValue, FenceValue)>,
     last_captured: FenceValue,
     last_replayed: FenceValue,
+    /// Every source given, by index; their charge is bounded by the reader.
     sources: Vec<Arc<[u8]>>,
     report: ReplayReport,
 }
@@ -501,18 +529,21 @@ impl Replay<'_> {
                     || start.caps != *self.backend.caps();
             }
             Record::CreateBuffer(c) => {
+                self.make_room(at, IdKind::Buffer)?;
                 if let Some(charge) = self.charge_buffer(at, &c.desc) {
                     let result = self.backend.create_buffer(&c.desc);
                     self.created(at, &c.result, result, ResourceId::Buffer, charge)?;
                 }
             }
             Record::CreateTexture(c) => {
+                self.make_room(at, IdKind::Texture)?;
                 if let Some(charge) = self.charge_texture(at, &c.desc) {
                     let result = self.backend.create_texture(&c.desc);
                     self.created(at, &c.result, result, ResourceId::Texture, charge)?;
                 }
             }
             Record::CreateView(c) => {
+                self.make_room(at, IdKind::View)?;
                 let mut texture = c.texture;
                 if self.map_one(at, &mut texture, ResourceId::Texture) {
                     let result = self.backend.create_view(texture, &c.desc);
@@ -520,17 +551,20 @@ impl Replay<'_> {
                 }
             }
             Record::CreateSampler(c) => {
+                self.make_room(at, IdKind::Sampler)?;
                 let result = self.backend.create_sampler(&c.desc);
                 self.created(at, &c.result, result, ResourceId::Sampler, 0)?;
             }
             Record::ShaderSource(s) => self.sources.push(s.bytes.into()),
             Record::CreateShader(c) => {
+                self.make_room(at, IdKind::Shader)?;
                 if let Some(desc) = self.shader(at, &c)? {
                     let result = self.backend.create_shader(desc);
                     self.created(at, &c.result, result, ResourceId::Shader, 0)?;
                 }
             }
             Record::CreateGraphicsPipeline(c) => {
+                self.make_room(at, IdKind::Pipeline)?;
                 let mut desc = c.desc;
                 let s = &mut desc.stages;
                 let mapped = self.map_one(at, &mut s.vertex, ResourceId::Shader)
@@ -549,6 +583,7 @@ impl Replay<'_> {
                 }
             }
             Record::CreateComputePipeline(c) => {
+                self.make_room(at, IdKind::Pipeline)?;
                 let mut desc = c.desc;
                 if self.map_one(at, &mut desc.shader, ResourceId::Shader) {
                     let result = self.backend.create_compute_pipeline(desc);
@@ -638,6 +673,10 @@ impl Replay<'_> {
             (Compared::Both(fresh), Some(old)) => {
                 let fresh = kind(fresh);
                 self.ids.insert(kind(old), fresh);
+                if self.held.insert(fresh) {
+                    let count = &mut self.held_counts[fresh.kind().index()];
+                    *count = count.saturating_add(1);
+                }
                 if charge > 0 {
                     self.used = self.used.saturating_add(charge);
                     self.charges.insert(fresh, charge);
@@ -829,7 +868,23 @@ impl Replay<'_> {
             if let Some(charge) = self.charges.remove(&fresh) {
                 self.used = self.used.saturating_sub(charge);
             }
+            if self.held.remove(&fresh) {
+                let count = &mut self.held_counts[fresh.kind().index()];
+                *count = count.saturating_sub(1);
+            }
         }
+    }
+
+    /// Before a create of `kind`: when replay holds as many resources of that kind as the reader
+    /// allows, waits for the last fence and forgets the destroyed ids (module docs, "Bounds on
+    /// the tables").
+    fn make_room(&mut self, at: u64, kind: IdKind) -> Result<(), ReplayError> {
+        if self.held_counts[kind.index()] < self.max_held {
+            return Ok(());
+        }
+        self.wait_last(at)?;
+        self.prune();
+        Ok(())
     }
 
     fn submit(&mut self, at: u64, s: Submit) -> Result<(), ReplayError> {

@@ -3,9 +3,10 @@
 
 use super::super::replay::MAX_REPLAY_FRAMES;
 use super::super::{
-    CaptureError, CaptureLimits, CreateShader, Created, MAX_DESCRIPTION_BYTES, MAX_LIST_COMMANDS,
-    MAX_LIST_DECODED_BYTES, MAX_LIVE_RESOURCES, MAX_RECORD_BYTES, MAX_SHADER_CODE_BYTES,
-    MAX_SHADER_SOURCE_BYTES, MAX_TEXT_BYTES, Record, RecordKind, ShaderCode, SourceRecord, Start,
+    BoundedField, CaptureError, CaptureLimits, CreateShader, Created, MAX_DESCRIPTION_BYTES,
+    MAX_LIST_COMMANDS, MAX_LIST_DECODED_BYTES, MAX_LIST_DUMPS, MAX_LIVE_RESOURCES,
+    MAX_RECORD_BYTES, MAX_SHADER_CODE_BYTES, MAX_SHADER_SOURCE_BYTES, MAX_SHADER_SOURCES_BYTES,
+    MAX_TEXT_BYTES, Record, RecordKind, SOURCE_ENTRY_BYTES, ShaderCode, SourceRecord, Start,
     Submit,
 };
 use super::{END, file, framed_any, length, prefix, read, read_with, start, writer, writer_with};
@@ -36,6 +37,14 @@ fn the_bounds_are_the_documented_values() {
     assert_eq!(MAX_LIVE_RESOURCES, 1_048_576);
     assert_eq!(MAX_COMMAND_BINDINGS, 4096);
     assert_eq!(MAX_REPLAY_FRAMES, 1024);
+    assert_eq!(MAX_SHADER_SOURCES_BYTES, 1_073_741_824);
+    assert_eq!(MAX_LIST_DUMPS, 1024);
+    // A source's table entry: an `Arc<[u8]>` (pointer and length) and the `Arc`'s two counts.
+    assert_eq!(SOURCE_ENTRY_BYTES, 32);
+    assert_eq!(
+        u64::try_from(size_of::<std::sync::Arc<[u8]>>() + 2 * size_of::<usize>()).expect("small"),
+        SOURCE_ENTRY_BYTES
+    );
     assert_eq!(
         CaptureLimits::SHIPPED,
         CaptureLimits {
@@ -44,6 +53,8 @@ fn the_bounds_are_the_documented_values() {
             list_commands: MAX_LIST_COMMANDS,
             list_decoded_bytes: MAX_LIST_DECODED_BYTES,
             live_resources: MAX_LIVE_RESOURCES,
+            source_bytes: MAX_SHADER_SOURCES_BYTES,
+            list_dumps: MAX_LIST_DUMPS,
         }
     );
 }
@@ -190,21 +201,21 @@ fn texts_at_their_edge() {
     assert!(read(&start_with(&at, &at)).is_ok());
     assert_eq!(
         read(&start_with(&over, "")).map(|_| ()),
-        too_long("build id")
+        too_long(BoundedField::BuildId)
     );
     assert_eq!(
         read(&start_with("", &over)).map(|_| ()),
-        too_long("backend name")
+        too_long(BoundedField::BackendName)
     );
     // The build id is checked before the backend name.
     assert_eq!(
         read(&start_with(&over, &over)).map(|_| ()),
-        too_long("build id")
+        too_long(BoundedField::BuildId)
     );
     assert_eq!(
         CaptureError::TooLarge {
             record: 0,
-            what: "build id",
+            what: BoundedField::BuildId,
             len: 4097,
             max: 4096
         }
@@ -221,7 +232,7 @@ fn texts_at_their_edge() {
     };
     assert_eq!(
         super::super::CaptureWriter::new(sink, long_start, u64::MAX).map(|_| ()),
-        too_long("backend name")
+        too_long(BoundedField::BackendName)
     );
 
     // Entry names and refusal messages.
@@ -239,14 +250,14 @@ fn texts_at_their_edge() {
     assert!(matches!(
         w.write(&shader(&over, made())),
         Err(CaptureError::TooLarge {
-            what: "entry name",
+            what: BoundedField::EntryName,
             ..
         })
     ));
     assert!(matches!(
         w.write(&shader("main", Created::Refused(over.clone()))),
         Err(CaptureError::TooLarge {
-            what: "refusal message",
+            what: BoundedField::RefusalMessage,
             ..
         })
     ));
@@ -261,7 +272,7 @@ fn texts_at_their_edge() {
     assert!(matches!(
         w.write_submit(list, &Created::Refused(over)),
         Err(CaptureError::TooLarge {
-            what: "refusal message",
+            what: BoundedField::RefusalMessage,
             ..
         })
     ));
@@ -297,7 +308,7 @@ fn shader_source_and_code_at_their_edge() {
         w.write(&source(MAX_SHADER_SOURCE_BYTES + 1)),
         Err(CaptureError::TooLarge {
             record: 1,
-            what: "shader source",
+            what: BoundedField::ShaderSource,
             len: MAX_SHADER_SOURCE_BYTES + 1,
             max: MAX_SHADER_SOURCE_BYTES
         })
@@ -319,7 +330,7 @@ fn shader_source_and_code_at_their_edge() {
         w.write(&code(ShaderCode::SpirV(vec![0; words + 1]))),
         Err(CaptureError::TooLarge {
             record: 1,
-            what: "SPIR-V code",
+            what: BoundedField::SpirVCode,
             len: MAX_SHADER_CODE_BYTES + 4,
             max: MAX_SHADER_CODE_BYTES
         })
@@ -330,7 +341,7 @@ fn shader_source_and_code_at_their_edge() {
         ))),
         Err(CaptureError::TooLarge {
             record: 1,
-            what: "MSL code",
+            what: BoundedField::MslCode,
             len: MAX_SHADER_CODE_BYTES + 1,
             max: MAX_SHADER_CODE_BYTES
         })
@@ -569,27 +580,27 @@ fn the_lists_nested_in_a_command_at_their_edge() {
         (
             draw(bindings, 0, 0, 0),
             draw(bindings + 1, 0, 0, 0),
-            "draw bindings",
+            BoundedField::DrawBindings,
         ),
         (
             draw(0, buffers, 0, 0),
             draw(0, buffers + 1, 0, 0),
-            "draw vertex buffers",
+            BoundedField::DrawVertexBuffers,
         ),
         (
             draw(0, 0, viewports, 0),
             draw(0, 0, viewports + 1, 0),
-            "draw viewports",
+            BoundedField::DrawViewports,
         ),
         (
             draw(0, 0, 0, viewports),
             draw(0, 0, 0, viewports + 1),
-            "draw scissors",
+            BoundedField::DrawScissors,
         ),
         (
             dispatch(bindings),
             dispatch(bindings + 1),
-            "dispatch bindings",
+            BoundedField::DispatchBindings,
         ),
     ];
     for (at, over, what) in cases {
@@ -623,8 +634,8 @@ fn the_lists_nested_in_a_command_at_their_edge() {
             _ => unreachable!("a draw or dispatch"),
         };
         let max = match what {
-            "draw bindings" | "dispatch bindings" => MAX_COMMAND_BINDINGS,
-            "draw vertex buffers" => GUEST_VERTEX_BUFFERS,
+            BoundedField::DrawBindings | BoundedField::DispatchBindings => MAX_COMMAND_BINDINGS,
+            BoundedField::DrawVertexBuffers => GUEST_VERTEX_BUFFERS,
             _ => GUEST_VIEWPORTS,
         };
         assert_eq!(
@@ -672,5 +683,207 @@ fn the_end_record_has_no_body() {
             len: 1,
             max: 0
         })
+    );
+}
+
+/// A `ShaderSource` record of `len` bytes, framed.
+fn source_record(index: u32, len: usize) -> Vec<u8> {
+    let body = postcard::to_allocvec(&SourceRecord {
+        index,
+        bytes: vec![0xA5; len],
+    })
+    .expect("encode");
+    framed_any(RecordKind::ShaderSource.tag(), &body)
+}
+
+#[test]
+fn the_sources_charge_at_its_edge() {
+    // Two sources of different lengths, each charged its length and the entry cost.
+    let both = 3 + SOURCE_ENTRY_BYTES + 2 + SOURCE_ENTRY_BYTES;
+    let limits = |source_bytes| CaptureLimits {
+        source_bytes,
+        ..CaptureLimits::SHIPPED
+    };
+    let two = file(&[&source_record(0, 3), &source_record(1, 2)]);
+    assert!(read_with(&two, limits(both)).is_ok());
+    let error = read_with(&two, limits(both - 1)).expect_err("one byte short");
+    assert_eq!(
+        error,
+        CaptureError::SourcesTooLarge {
+            record: 2,
+            needed: both,
+            max: both - 1
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "record 2: the shader sources would be charged {both} bytes, more than the {} allowed",
+            both - 1
+        )
+    );
+    // An empty source is charged the entry cost: one fits a bound of exactly that, two do not.
+    let empties = file(&[&source_record(0, 0), &source_record(1, 0)]);
+    assert_eq!(
+        read_with(&empties, limits(SOURCE_ENTRY_BYTES)),
+        Err(CaptureError::SourcesTooLarge {
+            record: 2,
+            needed: 2 * SOURCE_ENTRY_BYTES,
+            max: SOURCE_ENTRY_BYTES
+        })
+    );
+    assert!(read_with(&empties, limits(2 * SOURCE_ENTRY_BYTES)).is_ok());
+    // The index is checked before the charge: a wrong index past the charge is reported as such.
+    let both_faults = file(&[&source_record(0, 3), &source_record(5, 2)]);
+    assert_eq!(
+        read_with(&both_faults, limits(both - 1)),
+        Err(CaptureError::SourceIndex {
+            record: 2,
+            index: 5,
+            expected: 1
+        })
+    );
+    // The writer applies the same charge, through the shader-source path the wrapper uses.
+    let (mut w, _) = writer_with(limits(both - 1));
+    assert_eq!(w.shader_source(&[1, 2, 3]), Ok(0));
+    assert_eq!(
+        w.shader_source(&[4, 5]),
+        Err(CaptureError::SourcesTooLarge {
+            record: 2,
+            needed: both,
+            max: both - 1
+        })
+    );
+    // A refused source changes nothing: a smaller one still fits, at the next index.
+    assert_eq!(w.shader_source(&[6]), Ok(1));
+}
+
+#[test]
+fn the_sources_charge_saturates_rather_than_wrapping() {
+    use super::super::order::Order;
+    use super::super::record::{Facts, SourceFact};
+    let source = |index, charge| Facts {
+        source: Some(SourceFact { index, charge }),
+        ..Facts::default()
+    };
+    let limits = CaptureLimits {
+        source_bytes: u64::MAX,
+        ..CaptureLimits::SHIPPED
+    };
+    let mut order = Order::default();
+    order.apply(RecordKind::Start, Facts::default());
+    order.apply(RecordKind::ShaderSource, source(0, u64::MAX - 1));
+    // Exactly at the bound with the second, then one past it, which would wrap.
+    assert_eq!(
+        order.check(RecordKind::ShaderSource, source(1, 1), limits),
+        Ok(())
+    );
+    assert_eq!(
+        order.check(RecordKind::ShaderSource, source(1, 2), limits),
+        Err(CaptureError::SourcesTooLarge {
+            record: 2,
+            needed: u64::MAX,
+            max: u64::MAX
+        })
+    );
+}
+
+/// A dumped (or not) present of frame `frame`.
+fn present(frame: u64, dump: bool) -> Command {
+    Command::Present(crate::command::PresentDesc {
+        view: crate::id::ViewId::new(1, 0),
+        src_rect: Rect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        },
+        transform: crate::command::PresentTransform::Identity,
+        frame,
+        dump,
+    })
+}
+
+/// A list that starts with a present that is not dumped, then `dumped` dumped presents.
+fn dumps(dumped: u64) -> CommandList {
+    let mut commands = vec![present(0, false)];
+    commands.extend((1..=dumped).map(|frame| present(frame, true)));
+    CommandList { commands }
+}
+
+#[test]
+fn a_lists_dumped_presents_at_their_edge() {
+    let max = MAX_LIST_DUMPS;
+    // Presents that are not dumped are not counted: the one in front and one more at the end.
+    let mut at = dumps(max);
+    at.commands.push(present(max + 1, false));
+    assert!(read(&file(&[&submit_record(&at)])).is_ok());
+    let over = dumps(max + 1);
+    // The first command is not dumped, so the extra dumped present is command `max + 1`.
+    let expected = CaptureError::TooManyDumps {
+        record: 1,
+        command: max + 1,
+        count: max + 1,
+        max,
+    };
+    assert_eq!(read(&file(&[&submit_record(&over)])), Err(expected.clone()));
+    assert_eq!(
+        expected.to_string(),
+        "record 1: command 1025 is dumped present 1025, more than the 1024 allowed"
+    );
+    let (w, _) = writer();
+    assert!(w.encode_list(&at).is_ok());
+    assert_eq!(w.encode_list(&over).map(|_| ()), Err(expected));
+    // A test may lower it.
+    let limits = CaptureLimits {
+        list_dumps: 2,
+        ..CaptureLimits::SHIPPED
+    };
+    assert!(read_with(&file(&[&submit_record(&dumps(2))]), limits).is_ok());
+    assert_eq!(
+        read_with(&file(&[&submit_record(&dumps(3))]), limits),
+        Err(CaptureError::TooManyDumps {
+            record: 1,
+            command: 3,
+            count: 3,
+            max: 2
+        })
+    );
+}
+
+#[test]
+fn bounded_fields_in_words() {
+    // Every field, its words and whether its length counts elements, written out.
+    let cases = [
+        (BoundedField::BuildId, "build id", false),
+        (BoundedField::BackendName, "backend name", false),
+        (BoundedField::EntryName, "entry name", false),
+        (BoundedField::RefusalMessage, "refusal message", false),
+        (BoundedField::ShaderSource, "shader source", false),
+        (BoundedField::SpirVCode, "SPIR-V code", false),
+        (BoundedField::MslCode, "MSL code", false),
+        (BoundedField::DrawBindings, "draw bindings", true),
+        (BoundedField::DrawVertexBuffers, "draw vertex buffers", true),
+        (BoundedField::DrawViewports, "draw viewports", true),
+        (BoundedField::DrawScissors, "draw scissors", true),
+        (BoundedField::DispatchBindings, "dispatch bindings", true),
+    ];
+    for (field, words, list) in cases {
+        assert_eq!(field.to_string(), words);
+        assert_eq!(field.is_list(), list, "{words}");
+    }
+    let error = |what| CaptureError::TooLarge {
+        record: 1,
+        what,
+        len: 4097,
+        max: 4096,
+    };
+    assert_eq!(
+        error(BoundedField::DrawBindings).to_string(),
+        "record 1: the draw bindings list holds 4097 elements, more than the 4096 allowed"
+    );
+    assert_eq!(
+        error(BoundedField::EntryName).to_string(),
+        "record 1: the entry name is 4097 bytes long, more than the 4096 allowed"
     );
 }

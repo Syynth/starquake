@@ -3,9 +3,9 @@
 //! order across threads, and an early stop that still closes the file.
 
 use super::super::{
-    CaptureBuffer, CaptureError, CaptureSink, CaptureWriter, CapturedTarget, CapturingBackend,
-    Created, FrameResult, PipelineOutcome, PipelineResult, ReadbackResult, Record, RecordKind,
-    ShaderCode, WaitSetting,
+    BoundedField, CaptureBuffer, CaptureError, CaptureSink, CaptureWriter, CapturedTarget,
+    CapturingBackend, Created, FrameResult, PipelineOutcome, PipelineResult, ReadbackResult,
+    Record, RecordKind, ShaderCode, WaitSetting,
 };
 use super::{Knob, Spy, caps, naga, read, sampler_desc, shader, start, texture_desc, view_desc};
 use crate::backend::{Backend, PipelineStatus, PresentTarget, WaitOutcome};
@@ -551,7 +551,7 @@ fn a_shader_source_past_its_bound_stops_the_capture_and_the_shader_is_made() {
     assert!(matches!(
         capture.stopped(),
         Some(CaptureError::TooLarge {
-            what: "shader source",
+            what: BoundedField::ShaderSource,
             ..
         })
     ));
@@ -589,7 +589,7 @@ fn a_list_past_its_bounds_stops_the_capture_and_is_submitted() {
     assert!(matches!(
         capture.stopped(),
         Some(CaptureError::TooLarge {
-            what: "dispatch bindings",
+            what: BoundedField::DispatchBindings,
             ..
         })
     ));
@@ -690,4 +690,50 @@ fn two_threads_submitting_get_one_order() {
         .count();
     assert_eq!(u64::try_from(submits).expect("small"), 2 * lists);
     assert_eq!(inner.completed(), FenceValue::new(2 * lists));
+}
+
+#[test]
+fn a_window_target_is_recorded_without_its_handles() {
+    use crate::window::raw_window_handle::{
+        DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, WindowHandle,
+    };
+    use crate::window::{WindowHandles, WindowSize};
+    /// A window whose handles are never available: the recording backend does not ask.
+    struct NoWindow;
+    impl HasWindowHandle for NoWindow {
+        fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+            Err(HandleError::Unavailable)
+        }
+    }
+    impl HasDisplayHandle for NoWindow {
+        fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
+            Err(HandleError::Unavailable)
+        }
+    }
+    let (inner, capture, buffer) = wrapped(u64::MAX);
+    let b: &dyn Backend = &*capture;
+    let window = WindowHandles::new(Arc::new(NoWindow), WindowSize::new(4, 3));
+    assert_eq!(b.set_present_target(PresentTarget::Window(window)), Ok(()));
+    assert_eq!(b.set_present_target(PresentTarget::Offscreen), Ok(()));
+    capture.finish().expect("end");
+    // The window reached the wrapped backend; the capture holds only which kind it was.
+    assert_eq!(
+        inner.snapshot(),
+        "present target window\npresent target offscreen\n"
+    );
+    let records = read(&buffer.bytes()).expect("a well-formed capture");
+    assert_eq!(
+        records[1..],
+        [
+            Record::PresentTarget(super::super::TargetRecord {
+                target: CapturedTarget::Window,
+                result: Created::Made(()),
+            }),
+            Record::PresentTarget(super::super::TargetRecord {
+                target: CapturedTarget::Offscreen,
+                result: Created::Made(()),
+            }),
+            Record::End,
+        ]
+    );
 }

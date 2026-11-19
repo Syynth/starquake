@@ -2,7 +2,8 @@
 //! a body is encoded and decoded (module docs of [`crate::capture`], "Layout").
 
 use super::{
-    CaptureError, CaptureLimits, MAX_SHADER_CODE_BYTES, MAX_SHADER_SOURCE_BYTES, MAX_TEXT_BYTES,
+    BoundedField, CaptureError, CaptureLimits, MAX_SHADER_CODE_BYTES, MAX_SHADER_SOURCE_BYTES,
+    MAX_TEXT_BYTES,
 };
 use crate::backend::{PresentTarget, Readback};
 use crate::caps::Caps;
@@ -468,11 +469,14 @@ impl Record {
                 ..Facts::default()
             },
             Self::ShaderSource(s) => Facts {
-                source: Some(s.index),
+                source: Some(SourceFact {
+                    index: s.index,
+                    charge: super::source_charge(s.bytes.len()),
+                }),
                 ..Facts::default()
             },
             Self::Destroy(d) => Facts {
-                destroyed: Some(d.id),
+                destroyed: Some((d.id, d.after)),
                 ..Facts::default()
             },
             Self::Submit(s) => Facts {
@@ -495,14 +499,23 @@ impl Record {
 pub(crate) struct Facts {
     /// The id a `Create*` returned.
     pub(crate) created: Option<ResourceId>,
-    /// The id a `Destroy` names.
-    pub(crate) destroyed: Option<ResourceId>,
+    /// The id a `Destroy` names, and the fence after which it goes.
+    pub(crate) destroyed: Option<(ResourceId, FenceValue)>,
     /// The fence an accepted `Submit` signalled.
     pub(crate) fence: Option<FenceValue>,
-    /// The index a `ShaderSource` gives.
-    pub(crate) source: Option<u32>,
+    /// The index a `ShaderSource` gives, and its charge.
+    pub(crate) source: Option<SourceFact>,
     /// The source index a `CreateShader` names.
     pub(crate) uses_source: Option<u32>,
+}
+
+/// What the order checks need to know of a `ShaderSource`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SourceFact {
+    /// The index it gives.
+    pub(crate) index: u32,
+    /// What it is charged ([`super::source_charge`]).
+    pub(crate) charge: u64,
 }
 
 /// Checks the fields with their own bounds, in field order (module docs, "Bounds"). A
@@ -511,8 +524,8 @@ pub(crate) fn check_fields(record: &Record, position: u64) -> Result<(), Capture
     let text = |what, text: &str| bound(position, what, text.len(), MAX_TEXT_BYTES);
     match record {
         Record::Start(s) => {
-            text("build id", &s.build)?;
-            text("backend name", &s.backend)
+            text(BoundedField::BuildId, &s.build)?;
+            text(BoundedField::BackendName, &s.backend)
         }
         Record::CreateBuffer(c) => check_result(&c.result, position),
         Record::CreateTexture(c) => check_result(&c.result, position),
@@ -522,21 +535,26 @@ pub(crate) fn check_fields(record: &Record, position: u64) -> Result<(), Capture
         Record::CreateComputePipeline(c) => check_result(&c.result, position),
         Record::ShaderSource(s) => bound(
             position,
-            "shader source",
+            BoundedField::ShaderSource,
             s.bytes.len(),
             MAX_SHADER_SOURCE_BYTES,
         ),
         Record::CreateShader(c) => {
-            text("entry name", &c.entry)?;
+            text(BoundedField::EntryName, &c.entry)?;
             match &c.code {
                 ShaderCode::SpirV(words) => bound(
                     position,
-                    "SPIR-V code",
+                    BoundedField::SpirVCode,
                     words.len().saturating_mul(size_of::<u32>()),
                     MAX_SHADER_CODE_BYTES,
                 )?,
                 ShaderCode::Msl(source) => {
-                    bound(position, "MSL code", source.len(), MAX_SHADER_CODE_BYTES)?;
+                    bound(
+                        position,
+                        BoundedField::MslCode,
+                        source.len(),
+                        MAX_SHADER_CODE_BYTES,
+                    )?;
                 }
                 ShaderCode::Origin { .. } | ShaderCode::Missing => {}
             }
@@ -557,14 +575,17 @@ pub(crate) fn check_fields(record: &Record, position: u64) -> Result<(), Capture
 pub(crate) fn check_result<T>(result: &Created<T>, position: u64) -> Result<(), CaptureError> {
     match result {
         Created::Made(_) => Ok(()),
-        Created::Refused(message) => {
-            bound(position, "refusal message", message.len(), MAX_TEXT_BYTES)
-        }
+        Created::Refused(message) => bound(
+            position,
+            BoundedField::RefusalMessage,
+            message.len(),
+            MAX_TEXT_BYTES,
+        ),
     }
 }
 
 /// [`CaptureError::TooLarge`] when `len` is past `max`.
-fn bound(position: u64, what: &'static str, len: usize, max: u64) -> Result<(), CaptureError> {
+fn bound(position: u64, what: BoundedField, len: usize, max: u64) -> Result<(), CaptureError> {
     let len = u64::try_from(len).unwrap_or(u64::MAX);
     if len > max {
         return Err(CaptureError::TooLarge {
@@ -578,12 +599,14 @@ fn bound(position: u64, what: &'static str, len: usize, max: u64) -> Result<(), 
 }
 
 /// Running checks on a list's commands, shared by the writer and the reader: the command
-/// count first, then each command's nested lists and the list's decoded charge.
+/// count first, then each command's nested lists, the list's decoded charge and its count of
+/// dumped presents.
 pub(crate) struct ListCheck {
     position: u64,
     limits: CaptureLimits,
     command: u64,
     charged: u64,
+    dumps: u64,
 }
 
 impl ListCheck {
@@ -605,10 +628,12 @@ impl ListCheck {
             limits,
             command: 0,
             charged: 0,
+            dumps: 0,
         })
     }
 
-    /// Checks one more command: its nested lists, then the list's charge with it.
+    /// Checks one more command: its nested lists, then the list's charge with it, then, for a
+    /// present with `dump` set, the list's dumped presents.
     pub(crate) fn command(&mut self, command: &Command) -> Result<(), CaptureError> {
         check_nested(command).map_err(|over| CaptureError::TooLarge {
             record: self.position,
@@ -623,6 +648,19 @@ impl ListCheck {
                 command: self.command,
                 max: self.limits.list_decoded_bytes,
             });
+        }
+        if let Command::Present(present) = command
+            && present.dump
+        {
+            self.dumps = self.dumps.saturating_add(1);
+            if self.dumps > self.limits.list_dumps {
+                return Err(CaptureError::TooManyDumps {
+                    record: self.position,
+                    command: self.command,
+                    count: self.dumps,
+                    max: self.limits.list_dumps,
+                });
+            }
         }
         self.command = self.command.saturating_add(1);
         Ok(())

@@ -164,6 +164,9 @@ pub(super) enum Knob {
     Lost,
     /// Every `wait` times out.
     TimeOut,
+    /// `completed` reports no fence past the largest a `wait` was asked for, so a destroy is
+    /// reached only once something waits for it.
+    Lagging,
 }
 
 /// A recording backend with a [`Knob`], which keeps every `destroy` call and every shader origin
@@ -175,6 +178,10 @@ pub(super) struct Spy {
     knob: Knob,
     destroys: Mutex<Vec<(ResourceId, FenceValue)>>,
     origins: Mutex<Vec<Option<ShaderOrigin>>>,
+    /// The largest fence a `wait` was asked for ([`Knob::Lagging`]).
+    waited: Mutex<FenceValue>,
+    /// Sampler creates, destroys and waits, in call order.
+    log: Mutex<Vec<String>>,
 }
 
 impl Spy {
@@ -185,7 +192,18 @@ impl Spy {
             knob,
             destroys: Mutex::default(),
             origins: Mutex::default(),
+            waited: Mutex::default(),
+            log: Mutex::default(),
         }
+    }
+
+    /// Sampler creates, destroys and waits so far, in words.
+    pub(super) fn log(&self) -> Vec<String> {
+        self.log.lock().expect("unpoisoned").clone()
+    }
+
+    fn note(&self, event: String) {
+        self.log.lock().expect("unpoisoned").push(event);
     }
 
     /// The `destroy` calls so far.
@@ -222,6 +240,7 @@ impl Backend for Spy {
         self.inner.create_view(texture, desc)
     }
     fn create_sampler(&self, desc: &SamplerDesc) -> Result<SamplerId, RenderError> {
+        self.note("sampler".to_owned());
         self.inner.create_sampler(desc)
     }
     fn create_shader(&self, desc: ShaderDesc) -> Result<ShaderId, RenderError> {
@@ -236,6 +255,7 @@ impl Backend for Spy {
             .lock()
             .expect("unpoisoned")
             .push((resource, after));
+        self.note(format!("destroy after {}", after.get()));
         self.inner.destroy(resource, after);
     }
     fn create_graphics_pipeline(
@@ -266,12 +286,20 @@ impl Backend for Spy {
         self.inner.submit(list)
     }
     fn completed(&self) -> FenceValue {
-        self.inner.completed()
+        let done = self.inner.completed();
+        if self.knob == Knob::Lagging {
+            return done.min(*self.waited.lock().expect("unpoisoned"));
+        }
+        done
     }
     fn wait(&self, value: FenceValue, timeout: Duration) -> Result<WaitOutcome, RenderError> {
+        self.note(format!("wait {}", value.get()));
         if self.knob == Knob::TimeOut {
             return Ok(WaitOutcome::TimedOut);
         }
+        let mut waited = self.waited.lock().expect("unpoisoned");
+        *waited = (*waited).max(value);
+        drop(waited);
         self.inner.wait(value, timeout)
     }
     fn take_readback(&self, id: ReadbackId) -> Option<Readback> {

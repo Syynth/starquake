@@ -24,6 +24,7 @@
 
 use super::{Binding, BufferSlice, Command, Rect, Viewport};
 use crate::caps::{GUEST_VERTEX_BUFFERS, GUEST_VIEWPORTS};
+use crate::capture::BoundedField;
 use serde::Deserialize;
 use serde::de::{Deserializer, Error, SeqAccess, Visitor};
 use std::fmt;
@@ -37,8 +38,8 @@ pub const MAX_COMMAND_BINDINGS: u32 = 4096;
 /// A nested list longer than its cap, as the writer reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct NestedOver {
-    /// The list, in words.
-    pub(crate) what: &'static str,
+    /// The list.
+    pub(crate) what: BoundedField,
     /// Its length.
     pub(crate) len: u64,
     /// Its cap.
@@ -48,27 +49,31 @@ pub(crate) struct NestedOver {
 /// Checks every nested list of `command` against its cap (module docs), in field order:
 /// bindings, vertex buffers, viewports, scissors.
 pub(crate) fn check_nested(command: &Command) -> Result<(), NestedOver> {
-    let lists: &[(&'static str, usize, u32)] = match command {
+    let lists: &[(BoundedField, usize, u32)] = match command {
         Command::Draw(draw) => &[
-            ("draw bindings", draw.bindings.len(), MAX_COMMAND_BINDINGS),
             (
-                "draw vertex buffers",
+                BoundedField::DrawBindings,
+                draw.bindings.len(),
+                MAX_COMMAND_BINDINGS,
+            ),
+            (
+                BoundedField::DrawVertexBuffers,
                 draw.vertex_buffers.len(),
                 GUEST_VERTEX_BUFFERS,
             ),
             (
-                "draw viewports",
+                BoundedField::DrawViewports,
                 draw.dynamic.viewports.len(),
                 GUEST_VIEWPORTS,
             ),
             (
-                "draw scissors",
+                BoundedField::DrawScissors,
                 draw.dynamic.scissors.len(),
                 GUEST_VIEWPORTS,
             ),
         ],
         Command::Dispatch(dispatch) => &[(
-            "dispatch bindings",
+            BoundedField::DispatchBindings,
             dispatch.bindings.len(),
             MAX_COMMAND_BINDINGS,
         )],

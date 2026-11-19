@@ -72,16 +72,79 @@ pub enum ResourceId {
     Pipeline(PipelineId),
 }
 
-impl ResourceId {
-    /// The kind of resource, in words ("buffer").
-    pub const fn kind_name(self) -> &'static str {
+/// The kind of a [`ResourceId`], without the id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum IdKind {
+    /// A buffer.
+    Buffer,
+    /// A texture.
+    Texture,
+    /// A view.
+    View,
+    /// A sampler.
+    Sampler,
+    /// A shader.
+    Shader,
+    /// A pipeline.
+    Pipeline,
+}
+
+impl IdKind {
+    /// How many kinds there are; [`IdKind::index`] is below it.
+    pub const COUNT: usize = 6;
+
+    /// Every kind, in declaration order.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Buffer,
+        Self::Texture,
+        Self::View,
+        Self::Sampler,
+        Self::Shader,
+        Self::Pipeline,
+    ];
+
+    /// The kind's position in [`IdKind::ALL`], for tables counted per kind.
+    pub const fn index(self) -> usize {
         match self {
-            Self::Buffer(_) => "buffer",
-            Self::Texture(_) => "texture",
-            Self::View(_) => "view",
-            Self::Sampler(_) => "sampler",
-            Self::Shader(_) => "shader",
-            Self::Pipeline(_) => "pipeline",
+            Self::Buffer => 0,
+            Self::Texture => 1,
+            Self::View => 2,
+            Self::Sampler => 3,
+            Self::Shader => 4,
+            Self::Pipeline => 5,
+        }
+    }
+
+    /// The kind in words ("buffer").
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Buffer => "buffer",
+            Self::Texture => "texture",
+            Self::View => "view",
+            Self::Sampler => "sampler",
+            Self::Shader => "shader",
+            Self::Pipeline => "pipeline",
+        }
+    }
+}
+
+/// In words, as errors print it: "buffer".
+impl std::fmt::Display for IdKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl ResourceId {
+    /// The kind of resource.
+    pub const fn kind(self) -> IdKind {
+        match self {
+            Self::Buffer(_) => IdKind::Buffer,
+            Self::Texture(_) => IdKind::Texture,
+            Self::View(_) => IdKind::View,
+            Self::Sampler(_) => IdKind::Sampler,
+            Self::Shader(_) => IdKind::Shader,
+            Self::Pipeline(_) => IdKind::Pipeline,
         }
     }
 
@@ -102,7 +165,7 @@ impl ResourceId {
 impl std::fmt::Display for ResourceId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (index, generation) = self.parts();
-        write!(f, "{} {index} (generation {generation})", self.kind_name())
+        write!(f, "{} {index} (generation {generation})", self.kind())
     }
 }
 
@@ -139,8 +202,8 @@ impl FenceValue {
 #[cfg(test)]
 mod tests {
     use super::{
-        BufferId, FenceValue, PipelineId, ReadbackId, ResourceId, SamplerId, ShaderId, TextureId,
-        ViewId,
+        BufferId, FenceValue, IdKind, PipelineId, ReadbackId, ResourceId, SamplerId, ShaderId,
+        TextureId, ViewId,
     };
 
     #[test]
@@ -170,6 +233,27 @@ mod tests {
         ];
         for (id, words) in cases {
             assert_eq!(id.to_string(), words);
+        }
+    }
+
+    #[test]
+    fn id_kinds() {
+        // Each id's kind, its words and its place in the per-kind tables, written out.
+        let cases = [
+            (ResourceId::Buffer(BufferId::new(1, 2)), "buffer", 0),
+            (ResourceId::Texture(TextureId::new(1, 2)), "texture", 1),
+            (ResourceId::View(ViewId::new(1, 2)), "view", 2),
+            (ResourceId::Sampler(SamplerId::new(1, 2)), "sampler", 3),
+            (ResourceId::Shader(ShaderId::new(1, 2)), "shader", 4),
+            (ResourceId::Pipeline(PipelineId::new(1, 2)), "pipeline", 5),
+        ];
+        assert_eq!(cases.len(), IdKind::COUNT);
+        for (i, (id, words, index)) in cases.into_iter().enumerate() {
+            let kind = id.kind();
+            assert_eq!(kind.to_string(), words);
+            assert_eq!(kind.name(), words);
+            assert_eq!(kind.index(), index);
+            assert_eq!(IdKind::ALL[i], kind);
         }
     }
 

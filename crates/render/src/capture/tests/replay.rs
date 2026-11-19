@@ -20,7 +20,10 @@ use crate::frame::{Frame, FramePixels, FrameSink};
 use crate::id::{BufferId, FenceValue, PipelineId, ReadbackId, ResourceId, ShaderId};
 use crate::pipeline::ComputePipelineDesc;
 use crate::resource::{BufferDesc, BufferUsage, Origin3d};
-use crate::shader::{ShaderDesc, ShaderOrigin, ShaderSource, ShaderStage};
+use crate::shader::{
+    InterfaceVariable, Interpolation, ScalarKind, ShaderDesc, ShaderInterface, ShaderOrigin,
+    ShaderSource, ShaderStage,
+};
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -36,7 +39,8 @@ fn options() -> ReplayOptions {
 }
 
 /// Translates origins by their first byte: `X` cannot be translated, `F` stops the replay,
-/// `E` gives another entry name, anything else a compute shader named `main`.
+/// `E` gives another entry name, `S` another stage, `I` another interface, anything else a
+/// compute shader named `main`.
 struct Stub;
 
 impl ShaderResolver for Stub {
@@ -46,6 +50,19 @@ impl ShaderResolver for Stub {
             Some(b'F') => Err(ResolveError::Fatal("translator 2, capture 1".to_owned())),
             Some(b'E') => Ok(ShaderDesc {
                 entry: "other".to_owned(),
+                ..shader(ShaderStage::Compute, naga(), None)
+            }),
+            Some(b'S') => Ok(shader(ShaderStage::Fragment, naga(), None)),
+            Some(b'I') => Ok(ShaderDesc {
+                interface: ShaderInterface {
+                    outputs: vec![InterfaceVariable {
+                        location: 0,
+                        scalar: ScalarKind::Float,
+                        components: 4,
+                        interpolation: Interpolation::Perspective,
+                    }],
+                    ..ShaderInterface::default()
+                },
                 ..shader(ShaderStage::Compute, naga(), None)
             }),
             _ => Ok(shader(ShaderStage::Compute, naga(), None)),
@@ -341,6 +358,89 @@ fn a_destroys_fence_maps_to_the_latest_list_at_or_below_it() {
 }
 
 #[test]
+fn a_create_at_the_live_bound_waits_for_the_destroys_before_it() {
+    // A list at fence 1, then samplers each destroyed after it. The fresh backend reaches a
+    // fence only when waited for, so every forwarded destroy stays pending until replay waits.
+    let pairs = |n: u32| {
+        let mut b = builder();
+        let buf = b.create_buffer(buffer_desc(4)).expect("buffer");
+        let fence = b.submit(&list(vec![upload(buf, &[1])])).expect("list");
+        for _ in 0..n {
+            let sampler = b.create_sampler(super::sampler_desc()).expect("sampler");
+            b.destroy(ResourceId::Sampler(sampler), fence)
+                .expect("destroy");
+        }
+        b.finish().expect("end")
+    };
+    let limits = super::super::CaptureLimits {
+        live_resources: 2,
+        ..super::super::CaptureLimits::SHIPPED
+    };
+    let replay_lagging = |bytes: &[u8]| {
+        let spy = Spy::new(Knob::Lagging);
+        let len = u64::try_from(bytes.len()).expect("small");
+        let mut reader = CaptureReader::with_limits(bytes, len, limits).expect("header");
+        let report =
+            replay(&mut reader, &spy, &Stub, &ReplayFrames::new(), &options()).expect("replays");
+        (report, spy.log())
+    };
+    let words = |events: &[&str]| -> Vec<String> { events.iter().map(|&e| e.to_owned()).collect() };
+    // Two samplers held: the bound, and no wait before either create.
+    let (report, log) = replay_lagging(&pairs(2));
+    assert_eq!((report.refused, report.differences), (0, 0));
+    assert_eq!(
+        log,
+        words(&[
+            "sampler",
+            "destroy after 1",
+            "sampler",
+            "destroy after 1",
+            "wait 1",
+        ])
+    );
+    // The third create finds two held, still pending: replay waits for fence 1 first, which
+    // forgets both, so the fourth create finds one and does not wait.
+    let (report, log) = replay_lagging(&pairs(4));
+    assert_eq!((report.refused, report.differences), (0, 0));
+    assert_eq!(
+        log,
+        words(&[
+            "sampler",
+            "destroy after 1",
+            "sampler",
+            "destroy after 1",
+            "wait 1",
+            "sampler",
+            "destroy after 1",
+            "sampler",
+            "destroy after 1",
+            "wait 1",
+        ])
+    );
+    // A buffer create is counted apart: two pending samplers do not make it wait.
+    let mut b = builder();
+    let buf = b.create_buffer(buffer_desc(4)).expect("buffer");
+    let fence = b.submit(&list(vec![upload(buf, &[1])])).expect("list");
+    for _ in 0..2 {
+        let sampler = b.create_sampler(super::sampler_desc()).expect("sampler");
+        b.destroy(ResourceId::Sampler(sampler), fence)
+            .expect("destroy");
+    }
+    b.create_buffer(buffer_desc(4)).expect("buffer");
+    let (_, log) = replay_lagging(&b.finish().expect("end"));
+    assert_eq!(
+        log,
+        words(&[
+            "sampler",
+            "destroy after 1",
+            "sampler",
+            "destroy after 1",
+            "wait 1",
+        ])
+    );
+}
+
+#[test]
 fn the_memory_limit_refuses_a_create_past_it_and_frees_on_destroy() {
     let mut b = builder();
     let first = b.create_buffer(buffer_desc(64)).expect("buffer");
@@ -540,6 +640,33 @@ fn shaders_are_translated_again_and_their_failures_counted() {
 }
 
 #[test]
+fn a_shader_whose_stage_or_interface_alone_changed_is_a_difference() {
+    // Each resolver arm changes one of the three compared fields and keeps the other two.
+    for first in *b"ESI" {
+        let mut b = builder();
+        b.create_shader(&shader(
+            ShaderStage::Compute,
+            naga(),
+            Some(ShaderOrigin {
+                record: Arc::from(vec![first]),
+                stage_index: 0,
+            }),
+        ))
+        .expect("shader");
+        let bytes = b.finish().expect("end");
+        let report = run(&bytes, &Spy::new(Knob::Plain)).expect("replays");
+        let arm = char::from(first);
+        // Start, source, shader: the shader is record 2.
+        assert_eq!(
+            report.first_difference,
+            Some(finding(2, FindingKind::ShaderChanged)),
+            "{arm}"
+        );
+        assert_eq!((report.differences, report.refused), (1, 0), "{arm}");
+    }
+}
+
+#[test]
 fn readbacks_are_compared_byte_for_byte_where_both_are_known() {
     let mut b = builder();
     let buf = b.create_buffer(buffer_desc(4)).expect("buffer");
@@ -622,8 +749,11 @@ fn pipeline_outcomes_are_compared_once_settled() {
     );
 }
 
+/// A frame result to record: its number, its width and height, and its hash.
+type FrameCase = (u64, (u32, u32), Option<[u8; 32]>);
+
 /// A capture that presents an uploaded 2 by 2 image as frame 7, then the frame results given.
-fn presenting(results: &[(u64, u32, Option<[u8; 32]>)]) -> Vec<u8> {
+fn presenting(results: &[FrameCase]) -> Vec<u8> {
     let mut b = builder();
     let tex = b.create_texture(texture_desc()).expect("texture");
     let view = b.create_view(tex, view_desc()).expect("view");
@@ -651,11 +781,11 @@ fn presenting(results: &[(u64, u32, Option<[u8; 32]>)]) -> Vec<u8> {
         }),
     ]))
     .expect("list");
-    for &(frame, width, sha256) in results {
+    for &(frame, (width, height), sha256) in results {
         b.record(&Record::FrameResult(super::super::FrameResult {
             frame,
             width,
-            height: 2,
+            height,
             sha256,
         }))
         .expect("frame");
@@ -683,24 +813,35 @@ fn frames_are_compared_by_size_and_hash() {
         pixels: FramePixels::Rgba8(PIXELS.to_vec()),
     })
     .sha256;
-    let same = replay_frames(&presenting(&[(7, 2, hash)]));
+    let same = replay_frames(&presenting(&[(7, (2, 2), hash)]));
     assert_eq!((same.compared, same.differences), (1, 0));
-    let other = replay_frames(&presenting(&[(7, 2, Some([0; 32]))]));
+    let other = replay_frames(&presenting(&[(7, (2, 2), Some([0; 32]))]));
     assert_eq!(
         other.first_difference,
         Some(finding(4, FindingKind::Frame(7)))
     );
-    let wider = replay_frames(&presenting(&[(7, 3, hash)]));
+    let wider = replay_frames(&presenting(&[(7, (3, 2), hash)]));
     assert_eq!(
         wider.first_difference,
         Some(finding(4, FindingKind::Frame(7)))
     );
     assert_eq!(wider.compared, 0);
+    // The height alone differing is a difference too.
+    let taller = replay_frames(&presenting(&[(7, (2, 3), hash)]));
+    assert_eq!(
+        taller.first_difference,
+        Some(finding(4, FindingKind::Frame(7)))
+    );
+    assert_eq!((taller.differences, taller.compared), (1, 0));
     // Unknown pixels in the capture: sizes compared, hashes not.
-    let unknown = replay_frames(&presenting(&[(7, 2, None)]));
+    let unknown = replay_frames(&presenting(&[(7, (2, 2), None)]));
     assert_eq!((unknown.compared, unknown.differences), (0, 0));
     // A frame never presented on replay; and frame 7 taken once only.
-    let missing = replay_frames(&presenting(&[(8, 2, hash), (7, 2, hash), (7, 2, hash)]));
+    let missing = replay_frames(&presenting(&[
+        (8, (2, 2), hash),
+        (7, (2, 2), hash),
+        (7, (2, 2), hash),
+    ]));
     assert_eq!(
         missing.first_difference,
         Some(finding(4, FindingKind::FrameMissing(8)))
@@ -709,6 +850,73 @@ fn frames_are_compared_by_size_and_hash() {
     assert_eq!(
         FindingKind::FrameMissing(8).to_string(),
         "frame 8 was not presented on replay"
+    );
+}
+
+/// A capture of one list that presents the uploaded image `n` times, dumped, as frames 0 to
+/// `n - 1`, then each frame's result; or the builder's refusal.
+fn dumping(n: u64) -> Result<Vec<u8>, CaptureError> {
+    let mut b = builder();
+    let tex = b.create_texture(texture_desc()).expect("texture");
+    let view = b.create_view(tex, view_desc()).expect("view");
+    let mut commands = vec![Command::Upload {
+        from: StagingSlice::from_bytes(PIXELS.to_vec()),
+        to: CopyRegion::Texture(TextureRegion {
+            texture: tex,
+            mip: 0,
+            origin: Origin3d::default(),
+            extent: texture_desc().size,
+        }),
+    }];
+    commands.extend((0..n).map(|frame| {
+        Command::Present(PresentDesc {
+            view,
+            src_rect: Rect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            },
+            transform: PresentTransform::Identity,
+            frame,
+            dump: true,
+        })
+    }));
+    b.submit(&list(commands))?;
+    for frame in 0..n {
+        b.frame_result(&Frame {
+            frame,
+            width: 2,
+            height: 2,
+            transform: PresentTransform::Identity,
+            pixels: FramePixels::Rgba8(PIXELS.to_vec()),
+        })
+        .expect("frame");
+    }
+    b.finish()
+}
+
+#[test]
+fn a_list_of_dumped_frames_at_the_sinks_cap_replays_clean() {
+    let cap = u64::try_from(MAX_REPLAY_FRAMES).expect("small");
+    assert_eq!(super::super::MAX_LIST_DUMPS, cap);
+    // At the cap, the sink keeps every frame the list dumps until replay compares it.
+    let report = replay_frames(&dumping(cap).expect("at the cap"));
+    assert_eq!(
+        (report.differences, report.refused, report.compared),
+        (0, 0, cap)
+    );
+    // One more cannot be written: the frame past the cap would have gone before replay read
+    // the first frame's result. The upload is command 0, so the extra present is command `cap`
+    // plus one.
+    assert_eq!(
+        dumping(cap + 1).map(|_| ()),
+        Err(CaptureError::TooManyDumps {
+            record: 3,
+            command: cap + 1,
+            count: cap + 1,
+            max: cap,
+        })
     );
 }
 
@@ -791,7 +999,7 @@ fn a_window_target_is_replayed_offscreen() {
         result: Created::Made(()),
     }))
     .expect("target");
-    b.set_present_target(crate::backend::PresentTarget::Offscreen)
+    b.set_present_target(&crate::backend::PresentTarget::Offscreen)
         .expect("target");
     let bytes = b.finish().expect("end");
     let spy = Spy::new(Knob::Plain);
