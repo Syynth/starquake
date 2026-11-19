@@ -82,33 +82,40 @@ fn golden_engine() -> Vec<(RingEntry<'static>, Vec<u64>)> {
 fn golden_host() -> Vec<(RingEntry<'static>, Vec<u64>)> {
     vec![
         (
-            RingEntry::Release(Release {
-                address: 0x2000,
-                payload: 0x7,
-                form: ReleaseForm {
-                    size: PayloadSize::Four,
-                    timestamp: false,
+            // The channel in the header's high half.
+            RingEntry::Release {
+                channel: ChannelId(23),
+                release: Release {
+                    address: 0x2000,
+                    payload: 0x7,
+                    form: ReleaseForm {
+                        size: PayloadSize::Four,
+                        timestamp: false,
+                    },
+                    op: ReleaseOp::Write,
                 },
-                op: ReleaseOp::Write,
-            }),
-            vec![0x0000_0000_0000_0004, 0x2000, 0x7],
+            },
+            vec![0x0000_0017_0000_0004, 0x2000, 0x7],
         ),
         (
             // Reduce (bit 8), eight bytes (9), timestamp (10), RED_INC = 3 at 14:12, signed = 1
-            // at 17:16.
-            RingEntry::Release(Release {
-                address: 0x1_2345_6780,
-                payload: 0x9abc,
-                form: ReleaseForm {
-                    size: PayloadSize::Eight,
-                    timestamp: true,
+            // at 17:16; a channel at or above 2^31 in the high half.
+            RingEntry::Release {
+                channel: ChannelId(0x8000_0018),
+                release: Release {
+                    address: 0x1_2345_6780,
+                    payload: 0x9abc,
+                    form: ReleaseForm {
+                        size: PayloadSize::Eight,
+                        timestamp: true,
+                    },
+                    op: ReleaseOp::Reduce(Reduction {
+                        op: ReductionOp::Inc,
+                        format: ReductionFormat::Signed,
+                    }),
                 },
-                op: ReleaseOp::Reduce(Reduction {
-                    op: ReductionOp::Inc,
-                    format: ReductionFormat::Signed,
-                }),
-            }),
-            vec![0x0000_0000_0001_3704, 0x1_2345_6780, 0x9abc],
+            },
+            vec![0x8000_0018_0001_3704, 0x1_2345_6780, 0x9abc],
         ),
         (
             RingEntry::Syncpoint { id: syncpoint(191) },
@@ -383,15 +390,6 @@ fn malformed_host_entries_are_exact_errors() {
                 bits: 0x3000,
             },
         ),
-        // Release: the high half of the header.
-        (
-            vec![0x1_0000_0004, 0, 0],
-            DecodeError::Reserved {
-                kind: Kind::Release,
-                word: 0,
-                bits: 0x1_0000_0000,
-            },
-        ),
         (
             vec![0x2_0104, 0, 0],
             DecodeError::Reduction(crate::sema::DecodeError::UndefinedFormat {
@@ -576,6 +574,7 @@ fn entries_name_their_channel_and_own_their_words() {
             RingEntry::Bind { channel, .. }
             | RingEntry::Write { channel, .. }
             | RingEntry::Run { channel, .. }
+            | RingEntry::Release { channel, .. }
             | RingEntry::WaitForIdle { channel }
             | RingEntry::SetReference { channel, .. }
             | RingEntry::Invalidate { channel, .. } => Some(*channel),
@@ -596,8 +595,9 @@ fn every_golden_entry_has_its_text() {
         "bind channel=17 subchannel=5 class=0xc797",
         "write channel=18 class=0xc7c0 method=0xe23 value=0xdeadbeef",
         "run channel=19 class=0xa140 method=0x6d words=0x11111111,0x22222222,0x33333333",
-        "release address=0x2000 payload=0x7 size=4 timestamp=no op=write",
-        "release address=0x123456780 payload=0x9abc size=8 timestamp=yes op=inc.signed",
+        "release channel=23 address=0x2000 payload=0x7 size=4 timestamp=no op=write",
+        "release channel=2147483672 address=0x123456780 payload=0x9abc size=8 timestamp=yes \
+         op=inc.signed",
         "syncpoint id=191",
         "wait-for-idle channel=20",
         "invalidate channel=21 what=l2-flush-dirty",
@@ -661,31 +661,31 @@ fn hand_written_lines_parse() {
         ),
         // Every reduction name and both formats.
         (
-            "release address=0 payload=0 size=4 timestamp=no op=add.unsigned",
+            "release channel=0 address=0 payload=0 size=4 timestamp=no op=add.unsigned",
             reduce(ReductionOp::Add, ReductionFormat::Unsigned),
         ),
         (
-            "release address=0 payload=0 size=4 timestamp=no op=min.signed",
+            "release channel=0 address=0 payload=0 size=4 timestamp=no op=min.signed",
             reduce(ReductionOp::Min, ReductionFormat::Signed),
         ),
         (
-            "release address=0 payload=0 size=4 timestamp=no op=max.unsigned",
+            "release channel=0 address=0 payload=0 size=4 timestamp=no op=max.unsigned",
             reduce(ReductionOp::Max, ReductionFormat::Unsigned),
         ),
         (
-            "release address=0 payload=0 size=4 timestamp=no op=dec.unsigned",
+            "release channel=0 address=0 payload=0 size=4 timestamp=no op=dec.unsigned",
             reduce(ReductionOp::Dec, ReductionFormat::Unsigned),
         ),
         (
-            "release address=0 payload=0 size=4 timestamp=no op=and.unsigned",
+            "release channel=0 address=0 payload=0 size=4 timestamp=no op=and.unsigned",
             reduce(ReductionOp::And, ReductionFormat::Unsigned),
         ),
         (
-            "release address=0 payload=0 size=4 timestamp=no op=or.unsigned",
+            "release channel=0 address=0 payload=0 size=4 timestamp=no op=or.unsigned",
             reduce(ReductionOp::Or, ReductionFormat::Unsigned),
         ),
         (
-            "release address=0 payload=0 size=4 timestamp=no op=xor.unsigned",
+            "release channel=0 address=0 payload=0 size=4 timestamp=no op=xor.unsigned",
             reduce(ReductionOp::Xor, ReductionFormat::Unsigned),
         ),
         (
@@ -711,15 +711,18 @@ fn hand_written_lines_parse() {
 }
 
 fn reduce(op: ReductionOp, format: ReductionFormat) -> RingEntry<'static> {
-    RingEntry::Release(Release {
-        address: 0,
-        payload: 0,
-        form: ReleaseForm {
-            size: PayloadSize::Four,
-            timestamp: false,
+    RingEntry::Release {
+        channel: ChannelId(0),
+        release: Release {
+            address: 0,
+            payload: 0,
+            form: ReleaseForm {
+                size: PayloadSize::Four,
+                timestamp: false,
+            },
+            op: ReleaseOp::Reduce(Reduction { op, format }),
         },
-        op: ReleaseOp::Reduce(Reduction { op, format }),
-    })
+    }
 }
 
 #[test]
@@ -824,23 +827,23 @@ fn out_of_range_and_unnamed_values_are_exact_errors() {
         ),
         ("syncpoint id=192", "id 192 is out of range"),
         (
-            "release address=0 payload=0 size=2 timestamp=no op=write",
+            "release channel=0 address=0 payload=0 size=2 timestamp=no op=write",
             "size 2 is out of range",
         ),
         (
-            "release address=0 payload=0 size=4 timestamp=maybe op=write",
+            "release channel=0 address=0 payload=0 size=4 timestamp=maybe op=write",
             "\"maybe\" is not a valid timestamp",
         ),
         (
-            "release address=0 payload=0 size=4 timestamp=no op=add",
+            "release channel=0 address=0 payload=0 size=4 timestamp=no op=add",
             "\"add\" is not a valid op",
         ),
         (
-            "release address=0 payload=0 size=4 timestamp=no op=add.float",
+            "release channel=0 address=0 payload=0 size=4 timestamp=no op=add.float",
             "\"add.float\" is not a valid op",
         ),
         (
-            "release address=0 payload=0 size=4 timestamp=no op=mul.signed",
+            "release channel=0 address=0 payload=0 size=4 timestamp=no op=mul.signed",
             "\"mul.signed\" is not a valid op",
         ),
         (
@@ -995,7 +998,8 @@ fn entry() -> impl Strategy<Value = RingEntry<'static>> {
                 method,
                 words: Cow::Owned(words),
             }),
-        release().prop_map(RingEntry::Release),
+        (channel.clone(), release())
+            .prop_map(|(channel, release)| RingEntry::Release { channel, release }),
         (0..u8::try_from(SYNCPOINT_COUNT).unwrap())
             .prop_map(|id| RingEntry::Syncpoint { id: syncpoint(id) }),
         channel
