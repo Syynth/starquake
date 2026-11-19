@@ -134,7 +134,10 @@ fn the_recording_backend_reports_wgpus_default_limits() {
         (12, 8, 16, 4, 16)
     );
     // render-wgpu's `WGPU_MAX_ANISOTROPY` and `WGPU_VIEWPORTS`.
-    assert_eq!((limits.max_sampler_anisotropy, limits.max_viewports), (16, 1));
+    assert_eq!(
+        (limits.max_sampler_anisotropy, limits.max_viewports),
+        (16, 1)
+    );
     assert_eq!(caps.features, Features::ALL);
     assert_eq!(caps.stages, StageSupport::ALL);
     assert_eq!(caps.dynamic_state, DynamicState::ALL);
@@ -186,7 +189,9 @@ fn finishing_reads_the_gpu_and_keeps_a_clean_ending() {
     let (graphics, keeper) =
         super::graphics(&EnvSource::Live, Some(&memory), None, Arc::new(NoWake))
             .unwrap_or_else(|error| unreachable!("{error}"));
-    graphics.front().barrier(starquake_gpu::interface::Ticket(7));
+    graphics
+        .front()
+        .barrier(starquake_gpu::interface::Ticket(7));
     for (clean, name) in [
         (Ending::Exited, "exited"),
         (Ending::FramesReached, "frames reached"),

@@ -73,8 +73,8 @@ use starquake_shader::lookup::{EngineState, ProgramMemory, ProgramRequest, Ticke
 
 use super::Ending;
 use crate::frames::FrameKeeper;
-use crate::hle::graphics::{FrontMode, GpuParts};
 use crate::hle::Graphics;
+use crate::hle::graphics::{FrontMode, GpuParts};
 use crate::report::{EnvSource, GraphicsReport};
 
 /// The memory budget the run's recording backend reports: starquake's own number. The recording

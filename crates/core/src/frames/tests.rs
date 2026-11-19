@@ -1,8 +1,8 @@
 //! The frame keeper: which frames it keeps within its budget, what it counts, and the files it
 //! makes.
 
-use starquake_render::frame::RGBA8_BYTES;
 use starquake_render::command::PresentTransform;
+use starquake_render::frame::RGBA8_BYTES;
 
 use super::*;
 use crate::host_log::HostLog;

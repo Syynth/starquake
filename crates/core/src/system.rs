@@ -226,7 +226,8 @@ pub(crate) mod host {
         let mut vcpu = new_vcpu()?;
         // The GPU's threads read the same address space (`crate::machine`, "The GPU and the
         // frames").
-        let gpu_memory: Arc<dyn starquake_memory::GuestMemory> = Arc::<AddressSpace<PhysicalMemory>>::clone(&space);
+        let gpu_memory: Arc<dyn starquake_memory::GuestMemory> =
+            Arc::<AddressSpace<PhysicalMemory>>::clone(&space);
         let guest = GuestProgram {
             space: &*space,
             placed: &placed,

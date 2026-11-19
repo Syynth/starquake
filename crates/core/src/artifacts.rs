@@ -149,11 +149,7 @@ fn write_frames(frames: &Path, report: &RunReport) -> Result<(), ArtifactError> 
     std::fs::create_dir_all(frames).map_err(io_error(frames))?;
     for entry in std::fs::read_dir(frames).map_err(io_error(frames))? {
         let entry = entry.map_err(io_error(frames))?;
-        let stale = entry
-            .file_name()
-            .to_str()
-            .and_then(frame_number)
-            .is_some();
+        let stale = entry.file_name().to_str().and_then(frame_number).is_some();
         if stale {
             let path = entry.path();
             std::fs::remove_file(&path).map_err(io_error(&path))?;

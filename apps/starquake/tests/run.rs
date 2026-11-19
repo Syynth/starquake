@@ -357,7 +357,7 @@ fn hello_exits_with_code_0_and_leaves_its_output_and_trace() {
     assert!(counters.values().all(|count| count == 0), "{counters:?}");
     assert_eq!(text(&artifacts, GPU_FILE), "");
     assert_eq!(summary["frames"], 0);
-    assert!(files(&artifacts.join(FRAMES_FOLDER)).is_empty());
+    assert_eq!(files(&artifacts.join(FRAMES_FOLDER)), Vec::<String>::new());
     // The date the run pinned, and that it was pinned.
     let [_, seconds] = common::pinned_date();
     assert_eq!(

@@ -62,8 +62,8 @@
 
 use std::ffi::OsString;
 use std::fs::File;
-use std::num::NonZeroU64;
 use std::io::{Read, Seek, Write};
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -840,26 +840,6 @@ mod tests {
                 &["run", "a.nro", "--until", "frames=0"],
                 UsageError::BadFrames("frames=0".into()),
             ),
-            // One condition only, whichever two are given.
-            (
-                &[
-                    "run",
-                    "a.nro",
-                    "--until",
-                    "frames=1",
-                    "--until",
-                    "timeout=1s",
-                ],
-                UsageError::Repeated("--until"),
-            ),
-            (
-                &["run", "a.nro", "--until=timeout=1s", "--until=frames=2"],
-                UsageError::Repeated("--until"),
-            ),
-            (
-                &["run", "a.nro", "--until=frames=1", "--until=frames=1"],
-                UsageError::Repeated("--until"),
-            ),
             // An empty folder would put the artifacts in the current directory.
             (
                 &["run", "a.nro", "--artifacts", ""],
@@ -972,7 +952,10 @@ mod tests {
             })
         };
         let cases = [
-            (&["run", "a.nro", "--until", "frames=3"][..], frames(3, None)),
+            (
+                &["run", "a.nro", "--until", "frames=3"][..],
+                frames(3, None),
+            ),
             (&["run", "--until=frames=4", "a.nro"], frames(4, None)),
             (
                 &["run", "--artifacts", "out", "--until", "frames=5", "a.nro"],
@@ -1002,6 +985,25 @@ mod tests {
         };
         let options = run_options(&plain, Vec::new(), None);
         assert_eq!((options.until_frames, options.timeout), (None, None));
+        // One condition only, whichever two are given, in either order and form.
+        for words in [
+            &[
+                "run",
+                "a.nro",
+                "--until",
+                "frames=1",
+                "--until",
+                "timeout=1s",
+            ][..],
+            &["run", "a.nro", "--until=timeout=1s", "--until=frames=2"],
+            &["run", "a.nro", "--until=frames=1", "--until=frames=1"],
+        ] {
+            assert_eq!(
+                parse(&args(words)),
+                Err(UsageError::Repeated("--until")),
+                "{words:?}"
+            );
+        }
     }
 
     #[test]

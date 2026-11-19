@@ -9,9 +9,9 @@ use starquake_core::artifacts::{
     self, ArtifactError, CRASH_JSON_FILE, CRASH_TEXT_FILE, EVENTS_FILE, FRAMES_FOLDER, GPU_FILE,
     GUEST_LOG_FILE, LOG_FILE, SUMMARY_FILE, TRACE_FILE,
 };
+use starquake_core::crash::{CrashReport, Exception, Module};
 use starquake_core::frames::{DumpedFrames, FrameFile, frame_file_name};
 use starquake_core::report::GraphicsReport;
-use starquake_core::crash::{CrashReport, Exception, Module};
 use starquake_core::services_report::ServicesReport;
 use starquake_core::{ExitReason, Mapping, RunReport};
 use starquake_cpu::GuestRegs;
@@ -174,7 +174,7 @@ fn a_clean_run_writes_the_summary_trace_events_and_guest_log_and_no_crash_report
     assert_eq!(summary["host_log_lines_dropped"], 0);
     // A run with no GPU: an empty `gpu.txt`, an empty `frames/` and `null` counters.
     assert_eq!(read(&folder, GPU_FILE), b"");
-    assert!(files(&folder.join(FRAMES_FOLDER)).is_empty());
+    assert_eq!(files(&folder.join(FRAMES_FOLDER)), Vec::<String>::new());
     assert_eq!(summary["gpu"], serde_json::Value::Null);
     assert_eq!(summary["frames"], 0);
 }
@@ -233,13 +233,25 @@ fn a_later_run_removes_the_frames_an_earlier_one_left_and_nothing_else() {
     let frames = folder.join(FRAMES_FOLDER);
     std::fs::create_dir_all(&frames).unwrap();
     // An earlier run's frames, and files that are not frame files.
-    for name in ["000001.png", "000003.png", "1.png", "notes.txt", "000002.png.bak"] {
+    for name in [
+        "000001.png",
+        "000003.png",
+        "1.png",
+        "notes.txt",
+        "000002.png.bak",
+    ] {
         std::fs::write(frames.join(name), b"old").unwrap();
     }
     artifacts::write(&folder, &with_frames()).unwrap();
     assert_eq!(
         files(&frames),
-        ["000002.png.bak", "000003.png", "000004.png", "1.png", "notes.txt"]
+        [
+            "000002.png.bak",
+            "000003.png",
+            "000004.png",
+            "1.png",
+            "notes.txt"
+        ]
     );
     // The frame of the same number is this run's.
     assert_eq!(read(&frames, "000003.png"), b"third");

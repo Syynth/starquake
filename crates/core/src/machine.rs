@@ -227,8 +227,8 @@ use crate::frames::FrameKeeper;
 use crate::hle::{FspHost, Graphics, HostFolder, Reads};
 use crate::image::{PAGE, Placement};
 use crate::report::{
-    ExitReason, GUEST_LOG_BYTES, GraphicsReport, Mapping, RunDate, RunOptions, RunReport,
-    ThreadPc, empty_dump,
+    ExitReason, GUEST_LOG_BYTES, GraphicsReport, Mapping, RunDate, RunOptions, RunReport, ThreadPc,
+    empty_dump,
 };
 use crate::services_report::{LastStubbed, ServicesReport};
 use crate::space::{MapSink, Touch};
@@ -874,6 +874,11 @@ pub(crate) fn run_within<V: Vcpu, C: HostClock + Clone + 'static>(
 
 /// [`run_within`], with the services `install` puts in front of the kernel instead of a real
 /// run's.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the run from boot to report in order; the GPU's memory and report are one field \
+              each among the others"
+)]
 pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
     vcpus: Vcpus<'_, V>,
     guest: GuestProgram<'_, V>,

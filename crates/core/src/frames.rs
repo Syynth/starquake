@@ -57,7 +57,7 @@ pub const FRAME_NUMBER_DIGITS: usize = 6;
 /// `000042.png` for frame 42.
 #[must_use]
 pub fn frame_file_name(frame: u64) -> String {
-    format!("{frame:0width$}.png", width = FRAME_NUMBER_DIGITS)
+    format!("{frame:0FRAME_NUMBER_DIGITS$}.png")
 }
 
 /// The frame number a file of [`FRAMES_FOLDER`] is named for, when `name` is exactly what

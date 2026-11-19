@@ -518,7 +518,10 @@ fn a_presented_image_is_dumped_as_a_png_of_its_pixels() {
     use crate::report::{EnvSource, GraphicsReport, RunReport};
 
     let linear = linear_image();
-    let memory = Arc::new(FlatMemory::new(BASE, usize::try_from(PAGES * PAGE_SIZE).unwrap()));
+    let memory = Arc::new(FlatMemory::new(
+        BASE,
+        usize::try_from(PAGES * PAGE_SIZE).unwrap(),
+    ));
     memory.write(IMAGE_AT, &tiled_image(&linear)).unwrap();
     let shared: Arc<dyn GuestMemory> = Arc::<FlatMemory>::clone(&memory);
     let (graphics, keeper) = gpu::graphics(&EnvSource::Live, Some(&shared), None, Arc::new(NoWake))
@@ -541,7 +544,10 @@ fn a_presented_image_is_dumped_as_a_png_of_its_pixels() {
     let gpu = Arc::clone(graphics.gpu().unwrap());
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     while gpu.counters().presents < 1 || !gpu.is_idle() {
-        assert!(std::time::Instant::now() < deadline, "the GPU never presented");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the GPU never presented"
+        );
         std::thread::sleep(Duration::from_millis(1));
     }
     gpu.stop().unwrap();
@@ -554,7 +560,10 @@ fn a_presented_image_is_dumped_as_a_png_of_its_pixels() {
         },
         ..RunReport::emulator_error(String::new(), Duration::ZERO)
     };
-    assert_eq!((report.graphics.dumps.unknown, report.graphics.dumps.dropped), (0, 0));
+    assert_eq!(
+        (report.graphics.dumps.unknown, report.graphics.dumps.dropped),
+        (0, 0)
+    );
     let scratch = Scratch::new("frame-dump");
     let folder = scratch.path().join("artifacts");
     crate::artifacts::write(&folder, &report).unwrap();

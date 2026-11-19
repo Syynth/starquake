@@ -135,12 +135,7 @@ fn presenting_guest(script: &Script, image_at: u64, count: u32) -> ScriptedVcpu 
             step(script, |script, vars| {
                 script.tipc();
                 let [low, high] = halves(DISPLAY_SESSION_FLAGS[0]);
-                script.write_words(&[
-                    tipc_type(root_command::OPEN_DISPLAY_SESSION),
-                    2,
-                    low,
-                    high,
-                ]);
+                script.write_words(&[tipc_type(root_command::OPEN_DISPLAY_SESSION), 2, low, high]);
                 vars.gsv
             }),
             send(),
@@ -209,7 +204,15 @@ fn presenting_guest(script: &Script, image_at: u64, count: u32) -> ScriptedVcpu 
                 // 229: the token, the slot, the image, offset 0, the whole extent, the layout,
                 // then zeros up to the fence, which is none.
                 let mut words = vec![tipc_type(vi2_command::PRESENT_CLIENT_BUFFER), 24];
-                words.extend([token_low, token_high, slot, vars.image, 0, EXTENT, PRESENT_LAYOUT]);
+                words.extend([
+                    token_low,
+                    token_high,
+                    slot,
+                    vars.image,
+                    0,
+                    EXTENT,
+                    PRESENT_LAYOUT,
+                ]);
                 words.extend(vec![0; PRESENT_WORD_FENCE - PRESENT_WORD_LAYOUT - 1]);
                 words.extend([NO_FENCE, 0, 0, 0]);
                 script.write_words(&words);
@@ -405,11 +408,17 @@ fn a_run_with_the_gpu_reports_its_counters_and_flight_recorder() {
     // gsv sends the destroy with no ticket and then a barrier with the job's: two ordered.
     assert_eq!(counters.ordered, 2);
     let recorder = &report.graphics.gpu_recorder;
-    assert!(recorder.starts_with("0 address space 1 made\n"), "{recorder}");
+    assert!(
+        recorder.starts_with("0 address space 1 made\n"),
+        "{recorder}"
+    );
     assert!(recorder.contains("sparse region destroy"), "{recorder}");
     assert!(recorder.contains("barrier, ticket"), "{recorder}");
     assert_eq!(report.summary().gpu, Some(counters));
     // Nothing was presented, so nothing was dumped.
     assert_eq!(report.graphics.frames, 0);
-    assert_eq!(report.graphics.dumps, crate::frames::DumpedFrames::default());
+    assert_eq!(
+        report.graphics.dumps,
+        crate::frames::DumpedFrames::default()
+    );
 }

@@ -583,6 +583,29 @@ mod tests {
         );
     }
 
+    /// The graphics part of `the_summary_layout_is_pinned`'s report: every count distinct.
+    fn pinned_graphics() -> GraphicsReport {
+        let file = |frame: u64| crate::frames::FrameFile {
+            frame,
+            png: vec![1],
+        };
+        GraphicsReport {
+            frames: 13,
+            dumps: DumpedFrames {
+                files: vec![file(1), file(2)],
+                unknown: 14,
+                dropped: 15,
+            },
+            gpu: Some(GpuCounters {
+                words: 16,
+                lists_submitted: 17,
+                ..GpuCounters::default()
+            }),
+            // Not in the summary: `gpu.txt`.
+            gpu_recorder: "0 address space 1 made\n".to_owned(),
+        }
+    }
+
     #[test]
     fn the_summary_layout_is_pinned() {
         // Every field holds a distinct non-default value, so a swapped or dropped one shows.
@@ -624,30 +647,7 @@ mod tests {
             // Not in the summary.
             environment: vec![starquake_trace::EnvRecord::Random(3)],
             environment_dropped: 2,
-            graphics: GraphicsReport {
-                frames: 13,
-                dumps: DumpedFrames {
-                    files: vec![
-                        crate::frames::FrameFile {
-                            frame: 1,
-                            png: vec![1],
-                        },
-                        crate::frames::FrameFile {
-                            frame: 2,
-                            png: vec![2],
-                        },
-                    ],
-                    unknown: 14,
-                    dropped: 15,
-                },
-                gpu: Some(GpuCounters {
-                    words: 16,
-                    lists_submitted: 17,
-                    ..GpuCounters::default()
-                }),
-                // Not in the summary: `gpu.txt`.
-                gpu_recorder: "0 address space 1 made\n".to_owned(),
-            },
+            graphics: pinned_graphics(),
         };
         let json = serde_json::to_string_pretty(&report.summary()).unwrap();
         assert_eq!(
@@ -699,50 +699,33 @@ mod tests {
     "rtc_at_boot": 1709164811,
     "source": "host"
   },
-  "gpu": {
-    "words": 16,
-    "submissions": 0,
-    "submissions_full": 0,
-    "submissions_dropped": 0,
-    "increments": 0,
-    "acquires_parked": 0,
-    "fence_waits": 0,
-    "sync_waits": 0,
-    "macro_catch_ups": 0,
-    "polls": 0,
-    "ordered": 0,
-    "macro_failures": 0,
-    "channels_stopped": 0,
-    "presents_pushed": 0,
-    "entries_applied": 0,
-    "entries_refused": 0,
-    "unhandled_words": 0,
-    "captures": 0,
-    "presents": 0,
-    "dispatches": 0,
-    "dispatches_skipped": 0,
-    "write_backs": 0,
-    "write_back_failures": 0,
-    "render_catch_ups": 0,
-    "render_catch_up_failures": 0,
-    "fenced_actions": 0,
-    "fenced_actions_skipped_empty": 0,
-    "lists_submitted": 17,
-    "lost_wakes": 0,
-    "failed_releases": 0,
-    "back_wait_failures": 0,
-    "refused_controls": 0
-  }
+  "gpu": GPU
 }"#
+            // The counters' own layout is pinned by `the_gpus_counters_json_is_pinned`
+            // (`hle/tests/graphics/gpu.rs`); here, that they are the summary's `gpu`.
+            .replace(
+                "GPU",
+                &serde_json::to_string_pretty(&report.graphics.gpu)
+                    .unwrap()
+                    .replace('\n', "\n  ")
+            )
         );
         assert_eq!(report.summary().version, SUMMARY_VERSION);
-        // A run with no GPU writes `null`, and every frame count zero.
+    }
+
+    #[test]
+    fn a_run_with_no_gpu_has_null_counters_and_no_frames() {
         let none = serde_json::to_value(
             RunReport::emulator_error(String::new(), Duration::ZERO).summary(),
         )
         .unwrap();
         assert_eq!(none["gpu"], serde_json::Value::Null);
-        for count in ["frames", "frames_dumped", "frames_unknown", "frames_dropped"] {
+        for count in [
+            "frames",
+            "frames_dumped",
+            "frames_unknown",
+            "frames_dropped",
+        ] {
             assert_eq!(none[count], 0, "{count}");
         }
     }
