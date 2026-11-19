@@ -16,8 +16,9 @@
 //!
 //! The forms decoded so far are slice 1's six instructions, grown to every operand form NAK
 //! encodes for them: `MOV` in forms 1, 4, 5 and 6 (register, immediate, constant buffer,
-//! uniform register), `FFMA` in all seven, `ALD`, `AST`, `EXIT` and `S2R`. Every other opcode is
-//! [`DecodeError::UnknownOpcode`].
+//! uniform register), `FFMA` in all seven, `ALD`, `AST` and `S2R`; and slice 6h's control and
+//! warp group (`op::control`), every instruction of it but `JMX` and `BPT`. Every other opcode
+//! is [`DecodeError::UnknownOpcode`].
 //!
 //! **Strict decoding** (owner's decision 4, 2026-11-12): a word with a bit set that its form
 //! does not explain is rejected, never decoded with the bit ignored. The decoder checks, in this
@@ -28,7 +29,8 @@
 //!    the lowest such bit, as PR #4588's `FirstUnknownBit` does (`frontend/ampere/isa.h`);
 //! 3. every fixed bit of the form is set (bit 91 of the uniform-register ALU forms), else
 //!    [`DecodeError::MissingBit`] naming the lowest clear one;
-//! 4. the form's function reads its fields;
+//! 4. the form's function reads its fields, else [`DecodeError::UnknownValue`] for a field whose
+//!    value names nothing (a vote or reduction operation past the defined ones: `op::control`);
 //! 5. every set bit was read, else [`DecodeError::UnknownBit`] naming the lowest unread one. A
 //!    form explains some bits only in some of its layouts: in the constant-buffer ALU forms a
 //!    bound buffer reads its index (bits 54..59) and a bindless one its uniform register (bits
@@ -100,6 +102,21 @@ pub enum DecodeError {
         opcode: u16,
         /// The lowest clear required bit.
         bit: u32,
+    },
+    /// A field holds a value that names nothing in the opcode's form.
+    #[error(
+        "opcode {opcode:#05x} has the value {value} in its {width}-bit field at bit {bit}, which \
+         its form does not define"
+    )]
+    UnknownValue {
+        /// Bits 0..12.
+        opcode: u16,
+        /// The field's first bit.
+        bit: u32,
+        /// The field's width.
+        width: u32,
+        /// The value read.
+        value: u64,
     },
 }
 

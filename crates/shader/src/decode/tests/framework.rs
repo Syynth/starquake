@@ -132,8 +132,10 @@ fn alu_forms_put_sources_where_the_table_says() {
     assert_eq!(AluForm::from_bits(8), None);
 }
 
-/// The uniform-register forms require bit 91 (PR #4588: "native uniform source flag"); the
-/// others do not have it fixed.
+/// The uniform-register ALU forms require bit 91 (PR #4588: "native uniform source flag"). Every
+/// form with fixed bits refuses a word without them, naming the lowest, and accepts one with
+/// them; a form without fixed bits accepts the bare word. Which forms have which fixed bits is
+/// pinned by each group's rows (`masks_match_the_reference_table`).
 #[test]
 fn uniform_forms_require_bit_91() {
     let required = [
@@ -141,18 +143,25 @@ fn uniform_forms_require_bit_91() {
         AluForm::UniformSrc1.opcode(float::FFMA_OPCODE),
         AluForm::UniformSrc2.opcode(float::FFMA_OPCODE),
     ];
+    for opcode in required {
+        assert_eq!(lookup(opcode).expect("a form").fixed, SLOT_UNIFORM.mask());
+    }
     for (opcode, _, fixed) in forms() {
         let word = Instruction::default().with_field(OPCODE, u64::from(opcode));
-        if required.contains(&opcode) {
-            assert_eq!(fixed, SLOT_UNIFORM.mask(), "{opcode:#x}");
+        if fixed == 0 {
+            assert!(decode(word).is_ok(), "{opcode:#x}");
+        } else {
             assert_eq!(
                 decode(word),
-                Err(DecodeError::MissingBit { opcode, bit: 91 })
+                Err(DecodeError::MissingBit {
+                    opcode,
+                    bit: fixed.trailing_zeros()
+                })
             );
-            assert!(decode(word.with_flag(SLOT_UNIFORM, true)).is_ok());
-        } else {
-            assert_eq!(fixed, 0, "{opcode:#x}");
-            assert!(decode(word).is_ok(), "{opcode:#x}");
+            assert!(
+                decode(Instruction::from_bits(word.bits() | fixed)).is_ok(),
+                "{opcode:#x}"
+            );
         }
     }
     assert_eq!(

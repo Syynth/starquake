@@ -163,6 +163,21 @@ impl Display for FloatOperand {
     }
 }
 
+/// An ALU source of an integer or bit instruction: an immediate prints in hexadecimal (NAK's
+/// `test_nanosleep`: `0x87654321`), the other kinds as themselves under their modifiers.
+pub(crate) struct IntOperand(pub(crate) AluSrc);
+
+impl Display for IntOperand {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            AluSrc::Reg { reg, abs, neg } => modified(f, &reg, abs, neg),
+            AluSrc::UniformReg { reg, abs, neg } => modified(f, &reg, abs, neg),
+            AluSrc::CBuf { cbuf, abs, neg } => modified(f, &cbuf, abs, neg),
+            AluSrc::Imm(bits) => write!(f, "{bits:#x}"),
+        }
+    }
+}
+
 impl Display for Instr {
     /// The instruction with its guard (left out when it is `PT`) and the closing `;`.
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
