@@ -14,7 +14,7 @@ use super::host::{
     SEMAPHOREB, SEMAPHOREC, SEMAPHORED, SET_OBJECT, SET_REFERENCE, WFI, YIELD,
 };
 use super::*;
-use crate::classes::{clc76f, clc797, clc7c0};
+use crate::classes::{clc7c0, clc76f, clc797};
 use crate::fifo::{
     Level, PushBuffer, SEC_OP, SEC_OP_RESERVED6, SUBDEVICE_OPCODE, SubdeviceMask, TERT_OP,
 };
@@ -100,8 +100,11 @@ struct Rig {
 fn make_rig() -> Rig {
     let size = usize::try_from(PAGES * PAGE_SIZE).unwrap();
     let mem = TestGpuMemory::new(FlatMemory::new(CPU_BASE, size));
-    mem.map(PageRange::new(GPU_BASE, PAGES * PAGE_SIZE).unwrap(), CPU_BASE)
-        .unwrap();
+    mem.map(
+        PageRange::new(GPU_BASE, PAGES * PAGE_SIZE).unwrap(),
+        CPU_BASE,
+    )
+    .unwrap();
     Rig {
         mem,
         channel: Channel::new(ID),
@@ -350,10 +353,7 @@ fn only_subchannel_2_starts_bound() {
             unbound(4, false),
         ]
     );
-    assert_eq!(
-        rig.channel.dropped_count(DroppedKind::UnboundSubchannel),
-        4
-    );
+    assert_eq!(rig.channel.dropped_count(DroppedKind::UnboundSubchannel), 4);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -474,16 +474,23 @@ fn a_data_word_after_a_parked_acquire_is_read_again() {
     rig.set_sem(0);
     // Two SEMAPHORED words under one non-incrementing header: acquire, acquire.
     let mut pb = PushBuffer::new();
-    pb.methods(MethodMode::Incrementing, 0, m(SEMAPHOREA), &[
-        u32::try_from(SEM >> 32).unwrap(),
-        u32::try_from(SEM & 0xffff_ffff).unwrap(),
-        1,
-    ])
+    pb.methods(
+        MethodMode::Incrementing,
+        0,
+        m(SEMAPHOREA),
+        &[
+            u32::try_from(SEM >> 32).unwrap(),
+            u32::try_from(SEM & 0xffff_ffff).unwrap(),
+            1,
+        ],
+    )
     .unwrap();
-    pb.methods(MethodMode::NonIncrementing, 0, m(SEMAPHORED), &[
-        acquire_op(AcquireOp::Equal),
-        acquire_op(AcquireOp::Equal),
-    ])
+    pb.methods(
+        MethodMode::NonIncrementing,
+        0,
+        m(SEMAPHORED),
+        &[acquire_op(AcquireOp::Equal), acquire_op(AcquireOp::Equal)],
+    )
     .unwrap();
     let second = pb.words().len() - 1;
     rig.start(CMD, pb.words());
@@ -576,7 +583,12 @@ fn sem_execute_acquire_parks_item_5() {
     let cases = [
         (AcquireOp::Equal, 0x0300, 0x0200, 0x0300),
         (AcquireOp::GreaterOrEqual, 0x0300, 0x02ff, 0x0300),
-        (AcquireOp::CircularGreaterOrEqual, 0x0300, 0x8000_0300, 0x8000_02ff),
+        (
+            AcquireOp::CircularGreaterOrEqual,
+            0x0300,
+            0x8000_0300,
+            0x8000_02ff,
+        ),
         (AcquireOp::And, 0x0300, 0x0400, 0x0100),
         (AcquireOp::Nor, 0x0300, 0x0100, 0x0400),
     ];
@@ -586,11 +598,12 @@ fn sem_execute_acquire_parks_item_5() {
             rig.set_sem(value);
             // SEMAPHOREA-C point elsewhere, so reading the wrong registers fails.
             let mut pb = PushBuffer::new();
-            pb.methods(MethodMode::Incrementing, 0, m(SEMAPHOREA), &[
-                0x12,
-                0x3400_0000,
-                !payload,
-            ])
+            pb.methods(
+                MethodMode::Incrementing,
+                0,
+                m(SEMAPHOREA),
+                &[0x12, 0x3400_0000, !payload],
+            )
             .unwrap();
             let word = sema::encode_sem_execute(&HostSemaphore::Acquire {
                 op,
@@ -824,27 +837,32 @@ fn semaphore_address_upper_bits_follow_the_header() {
     let mut pb = PushBuffer::new();
     // SEMAPHOREA: only 7:0 (0x12) count; Eden-NX2 would shift all 32 bits. SEMAPHOREB: bits
     // 1:0 are not part of the address.
-    pb.methods(MethodMode::Incrementing, 0, m(SEMAPHOREA), &[
-        0xffff_ff12,
-        0x3456_789b,
-        7,
-        release_op(false, false),
-    ])
+    pb.methods(
+        MethodMode::Incrementing,
+        0,
+        m(SEMAPHOREA),
+        &[0xffff_ff12, 0x3456_789b, 7, release_op(false, false)],
+    )
     .unwrap();
     // SEM_ADDR_LO 0x0000_1003, SEM_ADDR_HI 0xffff_ff34: Eden-NX2 would keep 25 bits.
-    pb.methods(MethodMode::Incrementing, 0, m(SEM_ADDR_LO), &[
-        0x0000_1003,
-        0xffff_ff34,
-        8,
+    pb.methods(
+        MethodMode::Incrementing,
         0,
-        sema::encode_sem_execute(&HostSemaphore::Release {
-            form: ReleaseForm {
-                size: PayloadSize::Four,
-                timestamp: false,
-            },
-            wfi: false,
-        }),
-    ])
+        m(SEM_ADDR_LO),
+        &[
+            0x0000_1003,
+            0xffff_ff34,
+            8,
+            0,
+            sema::encode_sem_execute(&HostSemaphore::Release {
+                form: ReleaseForm {
+                    size: PayloadSize::Four,
+                    timestamp: false,
+                },
+                wfi: false,
+            }),
+        ],
+    )
     .unwrap();
     rig.start(CMD, pb.words());
     rig.run().unwrap();
@@ -933,9 +951,15 @@ fn mem_op_d_triggers_the_operation() {
 fn set_reference_and_wfi() {
     let mut rig = make_rig();
     let mut pb = PushBuffer::new();
-    pb.methods(MethodMode::Incrementing, 0, m(SET_REFERENCE), &[0x0102_0304])
+    pb.methods(
+        MethodMode::Incrementing,
+        0,
+        m(SET_REFERENCE),
+        &[0x0102_0304],
+    )
+    .unwrap();
+    pb.methods(MethodMode::Incrementing, 3, m(WFI), &[1])
         .unwrap();
-    pb.methods(MethodMode::Incrementing, 3, m(WFI), &[1]).unwrap();
     rig.start(CMD, pb.words());
     rig.run().unwrap();
     assert_eq!(
@@ -1091,7 +1115,8 @@ fn a_method_run_crosses_from_host_to_engine_methods() {
     // An incrementing run from 0x3f goes to the host (unknown) then to the engine.
     let mut rig = make_rig();
     let mut pb = PushBuffer::new();
-    pb.methods(MethodMode::Incrementing, 2, 0x3f, &[1, 2]).unwrap();
+    pb.methods(MethodMode::Incrementing, 2, 0x3f, &[1, 2])
+        .unwrap();
     rig.start(CMD, pb.words());
     rig.run().unwrap();
     assert_eq!(
@@ -1172,9 +1197,12 @@ fn bind_reads_nvclass_only() {
     let engine_sw = clc76f::SET_OBJECT_ENGINE
         .insert(clc7c0::CLASS, clc76f::SET_OBJECT_ENGINE_SW)
         .unwrap();
-    pb.methods(MethodMode::Incrementing, 4, m(SET_OBJECT), &[
-        0xffe0_0000 | clc797::CLASS,
-    ])
+    pb.methods(
+        MethodMode::Incrementing,
+        4,
+        m(SET_OBJECT),
+        &[0xffe0_0000 | clc797::CLASS],
+    )
     .unwrap();
     pb.methods(MethodMode::Incrementing, 5, m(SET_OBJECT), &[engine_sw])
         .unwrap();
@@ -1224,8 +1252,10 @@ fn old_format_headers_run_as_methods() {
 fn subdevice_mask_operations_are_skipped() {
     let mut rig = make_rig();
     let mut pb = PushBuffer::new();
-    pb.header(&MethodHeader::SubdeviceMask(SubdeviceMask::Set { mask: 0xfff }))
-        .unwrap();
+    pb.header(&MethodHeader::SubdeviceMask(SubdeviceMask::Set {
+        mask: 0xfff,
+    }))
+    .unwrap();
     pb.header(&MethodHeader::SubdeviceMask(SubdeviceMask::Store {
         mask: 0x123,
     }))
@@ -1566,19 +1596,30 @@ fn malformed_words_are_dropped_and_the_stream_goes_on() {
         .insert(TERT_OP.insert(0, 1).unwrap(), 0x7)
         .unwrap();
     let bad_group2 = TERT_OP
-        .insert(SEC_OP.insert(0, crate::fifo::SEC_OP_GRP2_USE_TERT).unwrap(), 1)
+        .insert(
+            SEC_OP.insert(0, crate::fifo::SEC_OP_GRP2_USE_TERT).unwrap(),
+            1,
+        )
         .unwrap();
     let bad_sem_execute = 7;
     let bad_semaphored = 3;
     let mut rig = make_rig();
     let mut pb = PushBuffer::new();
     pb.data(&[reserved, bad_subdevice, bad_group2]);
-    pb.methods(MethodMode::Incrementing, 0, m(SEM_EXECUTE), &[
-        bad_sem_execute,
-    ])
+    pb.methods(
+        MethodMode::Incrementing,
+        0,
+        m(SEM_EXECUTE),
+        &[bad_sem_execute],
+    )
     .unwrap();
-    pb.methods(MethodMode::Incrementing, 0, m(SEMAPHORED), &[bad_semaphored])
-        .unwrap();
+    pb.methods(
+        MethodMode::Incrementing,
+        0,
+        m(SEMAPHORED),
+        &[bad_semaphored],
+    )
+    .unwrap();
     pb.immediate(2, 0x100, 1).unwrap();
     rig.start(CMD, pb.words());
     assert_eq!(rig.run(), Ok(RunOutcome::EntryDone));
@@ -1683,8 +1724,7 @@ fn errors_read_as_plain_words() {
         "a method header for 3 words from method 0xffe runs past method 0xfff"
     );
     assert_eq!(
-        DroppedWord::BadHeader(fifo::DecodeError::ReservedOpcode { word: 0xc000_0000 })
-            .to_string(),
+        DroppedWord::BadHeader(fifo::DecodeError::ReservedOpcode { word: 0xc000_0000 }).to_string(),
         "method header 0xc0000000 uses the reserved opcode 6"
     );
     assert_eq!(
@@ -1746,7 +1786,9 @@ fn any_word() -> impl Strategy<Value = u32> {
         (0u32..8, 0u32..0x48, 0u32..8, 0u32..8).prop_map(|(op, method, subchannel, count)| {
             let word = SEC_OP.insert(0, op).unwrap();
             let word = crate::fifo::METHOD_ADDRESS.insert(word, method).unwrap();
-            let word = crate::fifo::METHOD_SUBCHANNEL.insert(word, subchannel).unwrap();
+            let word = crate::fifo::METHOD_SUBCHANNEL
+                .insert(word, subchannel)
+                .unwrap();
             crate::fifo::METHOD_COUNT.insert(word, count).unwrap()
         }),
         0u32..0x20,

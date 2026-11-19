@@ -127,9 +127,8 @@ impl Channel {
             SEM_EXECUTE => match sema::decode_sem_execute(value) {
                 Ok(op) => {
                     let size = match op {
-                        HostSemaphore::Acquire { size, .. } | HostSemaphore::Reduce { size, .. } => {
-                            size
-                        }
+                        HostSemaphore::Acquire { size, .. }
+                        | HostSemaphore::Reduce { size, .. } => size,
                         HostSemaphore::Release { form, .. } => form.size,
                     };
                     let address = self.regs.sem_execute_address();

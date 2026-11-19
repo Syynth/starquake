@@ -780,14 +780,13 @@ impl Channel {
         let left_in_entry = u64::from(current.entry.length - current.offset);
         let left_in_page = (PAGE_SIZE - va % PAGE_SIZE) / WORD_BYTES;
         let words = left_in_entry.min(left_in_page);
-        let bytes = usize::try_from(words * WORD_BYTES)
-            .map_err(|_| ChannelError::ReadFault {
+        let bytes = usize::try_from(words * WORD_BYTES).map_err(|_| ChannelError::ReadFault {
+            va,
+            fault: GpuFault::OutOfRange {
                 va,
-                fault: GpuFault::OutOfRange {
-                    va,
-                    len: words * WORD_BYTES,
-                },
-            })?;
+                len: words * WORD_BYTES,
+            },
+        })?;
         self.scratch.clear();
         self.scratch.resize(bytes, 0);
         memory
@@ -795,11 +794,10 @@ impl Channel {
             .map_err(|fault| ChannelError::ReadFault { va, fault })?;
         self.chunk.start = current.offset;
         self.chunk.words.clear();
-        self.chunk.words.extend(
-            self.scratch
-                .chunks_exact(4)
-                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
-        );
+        let (words, _) = self.scratch.as_chunks::<4>();
+        self.chunk
+            .words
+            .extend(words.iter().map(|&bytes| u32::from_le_bytes(bytes)));
         self.chunk
             .word(current.offset)
             .map(|word| (va, word))
@@ -1008,9 +1006,10 @@ fn advance(pending: Pending) -> Option<Pending> {
 /// is an error; module docs).
 fn runs_past_method_space(mode: MethodMode, method: u16, count: u16) -> bool {
     let last = match (mode, count) {
-        (_, 0) | (MethodMode::NonIncrementing, _) => u32::from(method),
+        (_, 0) | (MethodMode::NonIncrementing, _) | (MethodMode::IncrementOnce, 1) => {
+            u32::from(method)
+        }
         (MethodMode::Incrementing, count) => u32::from(method) + u32::from(count) - 1,
-        (MethodMode::IncrementOnce, 1) => u32::from(method),
         (MethodMode::IncrementOnce, _) => u32::from(method) + 1,
     };
     last > METHOD_MAX
