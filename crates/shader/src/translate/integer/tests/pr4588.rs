@@ -533,12 +533,13 @@ fn integer_multiply_preserves_high_words_and_modular_multiply_add() {
     }
 }
 
-/// `LEA.X` in the PR's carry tests is the same as `LEA` with a carry input: the PR's
-/// "Native LEA predicate carry" chain written with `LEA.HI.X` for the high word.
+/// Not one of the PR's cases: the chain of the case above with a 64-bit index, the high word
+/// made by `LEA.HI.X` from the index's high word and the low link's carry. The low word goes to
+/// R4 so the high link still reads the index's low word in R0.
 #[test]
 fn lea_hi_x_carries_into_the_high_word() {
     let low = Op::Lea(OpLea {
-        dst: r(0),
+        dst: r(4),
         overflow: p(0),
         a: reg(0),
         b: reg(2),
@@ -563,12 +564,6 @@ fn lea_hi_x_carries_into_the_high_word() {
             carry: ps(0, false),
         },
     });
-    // The high word reads the old R0, so it runs first in the chain the compiler emits; here
-    // the low word is written to R4 to keep R0.
-    let low = match low {
-        Op::Lea(lea) => Op::Lea(OpLea { dst: r(4), ..lea }),
-        other => other,
-    };
     let function = build(&[Instr::new(low), Instr::new(high)]).expect("translates");
     for (index, base) in [(0x8000_0000_u64, 0xffff_fff0_u64), (0x1_0000_0001, 0x10)] {
         let mut machine = machine_with(&[

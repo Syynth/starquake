@@ -77,18 +77,24 @@
 //! | `IADD3.X` and `LEA.X` | Bit 74 in every form (the decoder, after NAK) | `IADD3.X` is source 2's absolute-value bit (bit 62 in forms 3 and 7, none in form 2); `LEA.X` with `b` in the register slot (forms 2, 3 and 7) refused (`Require(!b.abs)`) | `tests::alu::extended_adds_in_every_form` |
 //! | `LEA`'s high word in forms 2, 3 and 7 | Source 2, the wide slot (NAK's operand order) | Bits 64..72, the same register as `b` | `tests::alu::lea_hi_reads_its_high_word_from_source_2` |
 //! | `BREV` | Every source form (1, 4, 5, 6) | Form 1 only (`case 0x301`) | `tests::alu::brev_takes_every_source_form` |
-//! | `PRMT`, forms 2, 3 and 7 | Refused, the selector is not an immediate | Refused the same way: the selector is the register at 64..72 | `tests::rejections::each_check_names_its_reason` |
+//!
+//! `PRMT` is translated with an immediate selector only (form 4): in forms 1, 2, 3 and 7 the
+//! selector is a register, which the PR refuses too ("native register permute selector";
+//! `tests::rejections::prmt_takes_only_an_immediate_selector`).
 //!
 //! `IDP` is translated in its `.2A` mode only, the one the PR translates (`Visitor::IDP`,
-//! "IDP.2A.LO.U16.U8", the PR's reading of the one encoding it met: a guess the PR marks as
-//! such); `.4A`, which neither reference translates, is refused by name
-//! ([`IntegerUnsupported::IdpFourWay`]). `BMSK` has no translator in either reference (none in
-//! the PR's `ops_*.cpp`, Eden's Maxwell has no such instruction, and NAK's `OpBMsk` has no
-//! fold) and is refused by name ([`IntegerUnsupported::Instruction`]).
+//! "IDP.2A.LO.U16.U8", which the PR's comment says follows its reference lowering for the only
+//! encoding it saw: a guess until an `nvdisasm` or hardware check); `.4A`, which neither
+//! reference translates, is refused by name ([`IntegerUnsupported::IdpFourWay`]). `BMSK` has no
+//! translator in either reference (none in the PR's `ops_*.cpp`, Eden's Maxwell has no such
+//! instruction, and NAK's `OpBMsk` has no fold) and is refused by name
+//! ([`IntegerUnsupported::Instruction`]).
 //!
-//! Where the PR's reading and NAK's differ on the meaning of a decoded field, this module
-//! follows the decoder: `LEA.HI.X` with a negated `b` subtracts it as the PR's `.HI` path does
-//! (`ir.INeg(addend)`), and `IMAD.X`'s negated addend is a bitwise not as in the PR.
+//! The decoder reads the negation bits of `LEA.X` and `IMAD.X` as bitwise nots (NAK's `BNot`).
+//! This module follows the PR on each: `IMAD.X`'s negated addend and the 64-bit `LEA.X` path's
+//! negated `b` are bitwise nots, but `LEA.HI.X` subtracts a negated `b`, as the PR's `.HI` path
+//! does (`ir.INeg(addend)`; `tests::alu::lea_hi_x_subtracts_a_negated_addend`). Which one the
+//! hardware does there needs an `nvdisasm` or hardware check (an owner question).
 
 #[cfg(test)]
 mod tests;

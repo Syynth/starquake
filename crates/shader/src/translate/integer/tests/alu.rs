@@ -314,6 +314,24 @@ fn lea_hi_reads_its_high_word_from_source_2() {
     }
 }
 
+/// `LEA.HI.X` with a negated `b` subtracts it, as PR #4588's `.HI` path does (`ir.INeg`),
+/// where the wide `LEA.X` path takes the bitwise not.
+#[test]
+fn lea_hi_x_subtracts_a_negated_addend() {
+    let (a, high, b) = (0x8000_0001_u32, 3_u32, 5_u32);
+    let mut machine = machine_with(&[0, a, b, high]);
+    machine.preds[1] = true;
+    let op = OpLea {
+        dst_high: true,
+        a_high: reg(3),
+        carry: ps(1, false),
+        ..lea(0, reg(1), neg(2), 4)
+    };
+    run_op(Op::LeaX(OpLeaX { lea: op }), &mut machine);
+    let top = ((((u64::from(high)) << 32 | u64::from(a)) << 4) >> 32) as u32;
+    assert_eq!(machine.regs[0], top.wrapping_sub(b).wrapping_add(1));
+}
+
 /// `LOP3` gives every truth table's function of three values (bit `a << 2 | b << 1 | c` of
 /// each table, Eden's `ApplyLUT`), and its predicate output says whether it is not zero.
 #[test]

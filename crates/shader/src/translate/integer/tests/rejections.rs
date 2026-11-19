@@ -559,3 +559,26 @@ fn bindless_buffers_are_refused_in_every_position() {
     let bound = Op::IAdd3(iadd3(0, [reg(1), cb(0, 0), reg(3)]));
     assert!(build(&[Instr::new(bound)]).is_ok());
 }
+
+/// `PRMT`'s forms 2, 3 and 7 put the selector in the register slot (and `b` in the wide
+/// slot), so they are refused as PR #4588 refuses them; form 1 (a register selector) too.
+/// Form 4, the immediate selector, is the one translated.
+#[test]
+fn prmt_takes_only_an_immediate_selector() {
+    let mut machine = Machine::new();
+    machine.uniform_regs[1] = 1;
+    for b in [AluSrc::Imm(5), cb(0, 0), ureg(1), reg(2)] {
+        let op = OpPrmt {
+            dst: r(0),
+            srcs: [reg(1), b],
+            sel: reg(3),
+            mode: PrmtMode::Index,
+        };
+        assert_eq!(
+            refusal(Op::Prmt(op)),
+            IntegerUnsupported::PermuteSelector.into(),
+            "{b:?}"
+        );
+    }
+    accepted(Op::Prmt(prmt(AluSrc::Imm(0x7654), PrmtMode::Index)));
+}
