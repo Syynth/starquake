@@ -75,7 +75,8 @@
 //! (`NumViewports`), 8 blend targets and colour masks (`NumRenderTargets`), and 16 vertex
 //! attributes in each of the header's two halves (Eden's `NumVertexAttributes`, 32, covers both).
 //!
-//! The literal values are pinned by `regs::tests::reset_values_are_the_references_written_out`.
+//! The literal values are pinned by
+//! `regs::tests::defaults::reset_values_are_the_references_written_out`.
 
 use crate::back::state::{BLEND_TARGETS, VERTEX_ATTRIBUTES_PER_HALF, VIEWPORTS};
 use crate::classes::{Method, cl902d, clc797 as c};

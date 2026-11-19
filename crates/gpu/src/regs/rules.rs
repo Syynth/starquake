@@ -268,9 +268,9 @@ pub const THREE_D: ClassRules = ClassRules {
 /// The compute class (`AMPERE_COMPUTE_B`, `0xC7C0`): registers below its macro range
 /// (`CALL_MME_MACRO`, method 0xE00, as Eden-NX2's `kepler_compute.cpp` calls macros from 0xE00),
 /// no shadow RAM (the gpu-protocol spec applies it "for 3D", and Eden-NX2's compute engine has
-/// none, so no data loads either), no state methods (Eden-NX2's compute front sends every write, `FrontCallMethod`),
-/// the side effects [`SIDE_EFFECTS_COMPUTE`], and no reset values (Eden-NX2's `KeplerCompute`
-/// constructor sets no register).
+/// none, so no data loads either), no state methods (Eden-NX2's compute front sends every
+/// write, `FrontCallMethod`), the side effects [`SIDE_EFFECTS_COMPUTE`], and no reset values
+/// (Eden-NX2's `KeplerCompute` constructor sets no register).
 pub const COMPUTE: ClassRules = ClassRules {
     registers: clc7c0::CALL_MME_MACRO.method(),
     shadow_control: None,
