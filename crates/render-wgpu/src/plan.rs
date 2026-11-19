@@ -42,7 +42,8 @@ use starquake_render::{
 use std::collections::BTreeSet;
 
 /// A list with a blit.
-pub const BLITS_NOT_YET: &str = "the wgpu backend cannot blit yet (pipelines arrive with slice R6)";
+pub const BLITS_NOT_YET: &str =
+    "the wgpu backend cannot blit yet (blits need the host shaders' pipelines, a later slice)";
 /// A list with a draw or a dispatch.
 pub const DRAWS_NOT_YET: &str =
     "the wgpu backend cannot draw or dispatch yet (draws arrive with slice R7)";

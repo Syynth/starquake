@@ -2,8 +2,9 @@
 //!
 //! # Threads
 //!
-//! Calls come from any thread (the GPU back thread, later the compile workers). Each takes the
-//! one state lock, briefly: a `create_*` checks its description, allocates the id in the
+//! Calls come from any thread (the GPU back thread; the compile workers run pipeline builds,
+//! which take no lock of this module, `crate::pipeline`). Each takes the one state lock,
+//! briefly: a `create_*` checks its description, allocates the id in the
 //! submit-side tables ([`crate::plan::Tables`]) and queues the creation; `submit` checks the
 //! whole list ([`crate::plan`]), takes the next fence value and queues it. The render thread
 //! (`starquake-render`, [`crate::thread`]) takes the queue in order, creates host objects,
@@ -46,7 +47,8 @@
 //! # Lost device
 //!
 //! When wgpu reports the device lost (or the render thread stops by a panic), the `create_*`
-//! calls for buffers, textures, views and samplers, `submit`, and a `wait` for a value not yet
+//! calls for buffers, textures, views, samplers, shaders and pipelines (each after the checks of
+//! its description that need no lock), `submit`, and a `wait` for a value not yet
 //! reached return [`RenderError::DeviceLost`]; a `submit` waiting for room and every `wait`
 //! stop waiting; and the wake is called so the back thread looks. The run ends there
 //! (render-backend, "Errors and untrusted input": exit code 2, which `core` maps). Lists still

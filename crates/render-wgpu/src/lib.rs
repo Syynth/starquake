@@ -3,7 +3,8 @@
 //!
 //! [`WgpuBackend::new`] opens the host's default adapter (Metal on macOS, Vulkan on Linux),
 //! builds `Caps` from what it reports ([`caps`]), with `view_swizzle` off, and starts the render
-//! thread. `core` builds it with a [`WgpuConfig`] and the GPU crate's `CompletionWake`, and
+//! thread. `core` builds it with [`WgpuBackend::with_compile_pool`]: a [`WgpuConfig`], the GPU
+//! crate's `CompletionWake`, the shared compile pool and the wait-while-compiling setting; and
 //! hands the GPU crate an `Arc<dyn Backend>`; nothing downcasts it, so a capture wrapper can sit
 //! in front (render-backend, "Render capture v2").
 //!
@@ -13,9 +14,20 @@
 //! clears and readbacks (mapped after the list completes); `destroy` deferred by fence value;
 //! fences from wgpu's completion reports; the render thread with its bounded queue; the
 //! offscreen present target, which counts presents and reads dumped frames back; and the
-//! completion wake. What it refuses until later slices, each with a named error: shaders and
-//! pipelines (R6, [`SHADERS_NOT_YET`], [`PIPELINES_NOT_YET`]), draws and dispatches (R7,
-//! [`plan::DRAWS_NOT_YET`]), blits ([`plan::BLITS_NOT_YET`]), and window targets (R8).
+//! completion wake. What it refuses until later slices, each with a named error: draws and
+//! dispatches (R7, [`plan::DRAWS_NOT_YET`]), blits ([`plan::BLITS_NOT_YET`]), and window targets
+//! (R8).
+//!
+//! Slice R6 adds shaders and pipelines, in [`pipeline`]: shaders kept as naga modules and handed
+//! to wgpu (`ShaderSource::Naga`) by the first pipeline build that needs them; bind group and
+//! pipeline layouts from each stage's `ShaderInterface`, with binding arrays given their size;
+//! graphics and compute pipelines built on the compile pool, their status `Compiling` until the
+//! build settles; failed pipelines cached as failed; and [`WgpuBackend::draw_pipeline`], which
+//! applies the wait-while-compiling setting to a draw (wait, or skip and count) for the render
+//! thread's encoder (slice R7). A pipeline whose shaders need subgroups of 32 is refused on a
+//! device that cannot promise them, which is every Mac under wgpu (an owner question). No driver
+//! cache blob is made: wgpu's is Vulkan only and needs an `unsafe` call ([`pipeline`], "Not
+//! here").
 //!
 //! Where this backend refuses what the recording backend accepts, each a
 //! `RenderError::Unsupported` whose message names the rule ([`rules`] lists them with their
@@ -42,6 +54,10 @@
 //! recording backend (hand-built lists, and 40 lists drawn from a fixed seed, of uploads,
 //! copies, clears, readbacks and presents with frame dumps) and require identical bytes for
 //! every readback and frame the recording backend knows.
+//!
+//! The pipeline tests (`pipeline::tests`) build hand-written WGSL modules, parsed into naga IR,
+//! into pipelines, among them a binding array; scripted compile delays (a pool that holds its
+//! jobs until the test releases them) exercise both settings and the skip count.
 //!
 //! The GPU tests run on a real adapter. They skip themselves, with a notice, where the host has
 //! none, and in CI (the `CI` environment variable): they stay local-only until verification 3

@@ -57,7 +57,9 @@
 //! The render thread meets a draw whose pipeline may still be compiling, and asks
 //! [`crate::WgpuBackend::draw_pipeline`], which applies the GPU crate's wait-while-compiling
 //! setting ([`WhileCompiling`], passed at construction; [`on_draw`] is the decision): under
-//! `Wait` it blocks until the build settles, so pipeline waits block the render thread; under
+//! `Wait` it blocks until the build settles, so pipeline waits block the render thread (holding
+//! no lock of the backend's while it waits: `tests::under_wait_a_draw_waits_for_a_delayed_build`
+//! asks `pipeline_status` meanwhile); under
 //! `Skip` a compiling pipeline's draw is skipped and counted, each draw once
 //! ([`PipelineCounts::skipped_while_compiling`]). A failed pipeline's draws are skipped under
 //! either setting, and counted once per pipeline, by the first draw that meets it

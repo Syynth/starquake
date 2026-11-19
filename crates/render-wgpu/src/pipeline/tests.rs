@@ -374,6 +374,14 @@ const VERTEX: &str = "
         return vec4(x, y, 0.0, 1.0) + offset;
     }";
 
+/// Uses the subgroup invocation id, and binds (0, 0) as a storage buffer.
+const SUBGROUP_FRAGMENT: &str = "
+    @group(0) @binding(0) var<storage, read_write> out: array<u32>;
+    @fragment fn main(@builtin(subgroup_invocation_id) lane: u32) -> @location(0) vec4<f32> {
+        out[lane] = 1u;
+        return vec4(0.0);
+    }";
+
 const BARE_VERTEX: &str = "
     @vertex fn main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
         return vec4(f32(i), 0.0, 0.0, 1.0);
@@ -1028,6 +1036,63 @@ fn nothing_is_created_once_the_device_is_lost() {
         assert_eq!(
             gpu.create_graphics_pipeline(graphics_desc(vs, Some(fs))),
             Err(RenderError::DeviceLost)
+        );
+        // Check 3 comes after the shared checks and before the ids (module docs, "Pipelines").
+        let mut geometry = graphics_desc(vs, Some(fs));
+        geometry.stages.geometry = Some(vs);
+        assert_eq!(
+            gpu.create_graphics_pipeline(geometry),
+            Err(RenderError::StageUnsupported(ShaderStage::Geometry))
+        );
+        let stale = ShaderId::new(fs.index(), fs.generation() + 1);
+        assert_eq!(
+            gpu.create_graphics_pipeline(graphics_desc(vs, Some(stale))),
+            Err(RenderError::DeviceLost)
+        );
+        assert_eq!(
+            gpu.create_compute_pipeline(ComputePipelineDesc { shader: stale }),
+            Err(RenderError::DeviceLost)
+        );
+    });
+}
+
+/// Checks 4, 5 and 6 of the module docs' order with two faults at once, on a device that
+/// cannot promise subgroups of 32 (every Mac); elsewhere the test says so and stops.
+#[test]
+fn requirements_come_after_the_ids_and_before_the_layout() {
+    bounded(|| {
+        let Some(gpu) = gpu(
+            "requirements order",
+            Arc::new(ThreadPool),
+            WhileCompiling::Wait,
+        ) else {
+            return;
+        };
+        if gpu.honours_subgroups() {
+            eprintln!("skipping requirements order: this device honours subgroups of 32");
+            return;
+        }
+        let vs = vertex(&gpu);
+        // A fragment shader that uses subgroups and binds (0, 0) as a storage buffer, which the
+        // vertex shader binds as a uniform buffer.
+        let fs = fragment(&gpu, SUBGROUP_FRAGMENT, storage_out());
+        assert_eq!(
+            gpu.create_graphics_pipeline(graphics_desc(vs, Some(fs))),
+            Err(RenderError::Unsupported(SUBGROUP_SIZE)),
+            "requirements before the layout's conflict"
+        );
+        assert_eq!(
+            gpu.create_graphics_pipeline(graphics_desc(fs, Some(fs))),
+            Err(RenderError::Invalid(
+                "a pipeline's vertex shader is not a vertex shader"
+            )),
+            "the stages before the requirements"
+        );
+        let bare = bare_vertex(&gpu);
+        assert_eq!(
+            gpu.create_graphics_pipeline(graphics_desc(bare, Some(fs))),
+            Err(RenderError::Unsupported(SUBGROUP_SIZE)),
+            "alone"
         );
     });
 }

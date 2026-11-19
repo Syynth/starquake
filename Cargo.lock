@@ -1234,6 +1234,7 @@ dependencies = [
 name = "starquake-render-wgpu"
 version = "0.0.0"
 dependencies = [
+ "naga",
  "starquake-render",
  "thiserror",
  "tracing",
