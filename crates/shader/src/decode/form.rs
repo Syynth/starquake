@@ -74,6 +74,9 @@ pub(crate) struct ReferenceRow {
     /// Bits the row marks known that the form rejects: a divergence the group's module docs
     /// list and a test of its own pins.
     pub(crate) dropped: u128,
+    /// The form's fixed bits, which the row can only mark known: the bits every valid word of
+    /// the form has set (`Form::fixed`).
+    pub(crate) fixed: u128,
 }
 
 #[cfg(test)]
@@ -84,12 +87,18 @@ impl ReferenceRow {
             opcode,
             words,
             dropped: 0,
+            fixed: 0,
         }
     }
 
     /// This row, with `dropped` bits that the form rejects.
     pub(crate) const fn dropping(self, dropped: u128) -> Self {
         Self { dropped, ..self }
+    }
+
+    /// This row, with `fixed` bits that the form requires set.
+    pub(crate) const fn fixing(self, fixed: u128) -> Self {
+        Self { fixed, ..self }
     }
 
     /// The row's known-bit mask.
@@ -227,13 +236,6 @@ impl Reader {
     }
 
     /// Reads a field as a two's-complement number of its width (`width` at most 64).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the memory and control slices' offsets are its first users"
-        )
-    )]
     pub(crate) fn signed(&mut self, field: Field) -> i64 {
         let raw = self.field(field);
         let unused = 64_u32.saturating_sub(field.width);
@@ -263,13 +265,6 @@ impl Reader {
     }
 
     /// Reads a uniform predicate field ([`UniformPred::BITS`] wide) and its negation bit.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the uniform datapath slice (6d) is its first user"
-        )
-    )]
     pub(crate) fn uniform_pred_src(&mut self, reg: Field, not: Field) -> UniformPredSrc {
         UniformPredSrc {
             // Cannot fail for a field of `UniformPred::BITS`.
@@ -281,5 +276,16 @@ impl Reader {
     /// Reads the guard predicate.
     pub(crate) fn guard(&mut self) -> PredSrc {
         self.pred_src(GUARD, GUARD_NOT)
+    }
+
+    /// The error for `field` holding `value`, which names nothing in this word's form.
+    pub(crate) fn unknown_value(&self, field: Field, value: u64) -> DecodeError {
+        DecodeError::UnknownValue {
+            // Cannot fail: the field is twelve bits wide.
+            opcode: u16::try_from(self.opcode()).unwrap_or(u16::MAX),
+            bit: field.start,
+            width: field.width,
+            value,
+        }
     }
 }

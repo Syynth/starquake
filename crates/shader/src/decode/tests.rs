@@ -1,6 +1,7 @@
 //! Decoder tests: expected text, round trips, strictness and robustness. The framework's own
 //! tests (form table, operand types at their edges, shells, check order) are in `framework`.
 
+mod control;
 mod framework;
 
 use proptest::prelude::*;
@@ -493,8 +494,10 @@ fn known_of(opcode: u16) -> u128 {
 
 /// Each group's known-bit masks against the rows of PR #4588's generated table that the group
 /// lists (`REFERENCE_ROWS`, one per form, in form order): equal, except for the bits a row
-/// drops, which the form rejects (only `MOV`'s register, constant-buffer and uniform-register
-/// forms drop any, bits 62 and 63: `mov_rejects_source_modifier_bits`).
+/// drops, which the form rejects (bits 62 and 63 of `MOV`'s register, constant-buffer and
+/// uniform-register forms, `mov_rejects_source_modifier_bits`, and of the same forms of
+/// `WARPSYNC` and `NANOSLEEP`, `control::control_sources_reject_modifier_bits`). Each form's
+/// fixed bits are the ones its row lists (`ReferenceRow::fixing`).
 #[test]
 fn masks_match_the_reference_table() {
     for (forms, hooks) in GROUPS.iter().zip(&GROUP_HOOKS) {
@@ -505,6 +508,7 @@ fn masks_match_the_reference_table() {
             assert_eq!(opcode, row.opcode);
             assert_eq!(form.known & row.dropped, 0, "{opcode:#x}");
             assert_eq!(form.known | row.dropped, row.mask(), "{opcode:#x}");
+            assert_eq!(form.fixed, row.fixed, "{opcode:#x}");
         }
     }
 }
@@ -793,8 +797,8 @@ proptest! {
         prop_assert_eq!(decode(word), Ok(instr));
     }
 
-    /// A word of a form either is rejected for a bit its layout does not read, or decodes and
-    /// re-assembles to itself, scheduling bits aside.
+    /// A word of a form either is rejected for a bit its layout does not read, or for a field
+    /// value that names nothing, or decodes and re-assembles to itself, scheduling bits aside.
     #[test]
     fn decode_then_assemble_round_trips(word in any_form_word(), sched in any::<u32>()) {
         let word = word.with_field(SCHEDULING, u64::from(sched));
@@ -809,16 +813,29 @@ proptest! {
                 prop_assert_eq!(read & (1 << bit), 0);
                 prop_assert!(word.bits() & (1 << bit) != 0);
             }
+            Err(DecodeError::UnknownValue { bit, width, value, .. }) => {
+                // Step 4: the value is the word's own, in a field inside the form's mask.
+                let field = Field::new(bit, width);
+                prop_assert_eq!(word.field(field), value);
+                let opcode = u16::try_from(word.field(OPCODE)).expect("12 bits");
+                prop_assert_eq!(field.mask() & !known_of(opcode), 0);
+            }
             Err(error) => prop_assert!(false, "{error}"),
         }
     }
 
-    /// A form's function reads no bit outside the form's mask.
+    /// A form's function reads no bit outside the form's mask (a word it refuses at step 4,
+    /// for a field value, has nothing read to compare).
     #[test]
     fn forms_read_only_their_known_bits(word in any_form_word()) {
-        let read = bits_read(word).expect("the form's function accepts the word");
         let opcode = u16::try_from(word.field(OPCODE)).expect("12 bits");
-        prop_assert_eq!(read & !known_of(opcode), 0);
+        match bits_read(word) {
+            Some(read) => prop_assert_eq!(read & !known_of(opcode), 0),
+            None => prop_assert!(
+                matches!(decode(word), Err(DecodeError::UnknownValue { .. })),
+                "{opcode:#x}"
+            ),
+        }
     }
 
     /// Arbitrary words never panic the decoder.
