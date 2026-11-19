@@ -19,7 +19,7 @@ pub mod interp;
 pub mod memo;
 
 #[cfg(test)]
-mod testing;
+pub(crate) mod testing;
 #[cfg(test)]
 mod tests;
 

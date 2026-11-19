@@ -12,6 +12,7 @@ pub mod classes;
 pub mod field;
 pub mod fifo;
 pub mod interface;
+pub mod macros;
 pub mod memory;
 pub mod mme;
 pub mod regs;

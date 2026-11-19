@@ -341,6 +341,13 @@ pub trait ChannelSink {
     fn set_reference(&mut self, value: u32);
     /// A dropped word or a carried method.
     fn note(&mut self, note: Note);
+    /// Whether the channel must stop before its next word: a macro call is waiting for a
+    /// catch-up (slice G13, `crate::macros`). [`Channel::run`] asks after every word it executes,
+    /// and before it reads any; while this is `true` it returns [`RunOutcome::Held`] and reads
+    /// nothing more. The default never holds.
+    fn holds(&self) -> bool {
+        false
+    }
 }
 
 /// A structural error: the channel stops and every later call returns the same error.
@@ -515,6 +522,9 @@ pub enum RunOutcome {
     Parked(Acquire),
     /// The quantum of words was used; the entry goes on at the next call.
     QuantumUsed,
+    /// The sink holds the channel ([`ChannelSink::holds`]): a macro call waits for a catch-up.
+    /// The channel goes on from the word after the last one it executed once the sink lets it.
+    Held,
 }
 
 /// A method header's data words still owed.
@@ -695,10 +705,12 @@ impl Channel {
     }
 
     /// Reads and executes words of the current entry until it ends, the channel parks on an
-    /// acquire, or `quantum` words have been read in this call.
+    /// acquire, the sink holds it ([`ChannelSink::holds`]), or `quantum` words have been read in
+    /// this call.
     ///
     /// An idle channel returns [`RunOutcome::Idle`] and a parked one
-    /// [`RunOutcome::Parked`], reading nothing. A stopped channel returns its error, also one
+    /// [`RunOutcome::Parked`], reading nothing; a running channel whose sink holds it returns
+    /// [`RunOutcome::Held`], reading nothing. A stopped channel returns its error, also one
     /// stopped while parked (`an_unreadable_semaphore_stops_the_channel`). The end
     /// of the entry is checked before the quantum, so an entry whose last word is the
     /// quantum's last returns [`RunOutcome::EntryDone`].
@@ -717,6 +729,9 @@ impl Channel {
         }
         if let Some(acquire) = self.parked {
             return Ok(RunOutcome::Parked(acquire));
+        }
+        if self.current.is_some() && sink.holds() {
+            return Ok(RunOutcome::Held);
         }
         let mut used = 0u32;
         loop {
@@ -743,7 +758,14 @@ impl Channel {
                 current.offset = current.offset.saturating_add(1);
             }
             match self.execute(va, word, memory, sink) {
-                Ok(Step::Continue) => {}
+                Ok(Step::Continue) => {
+                    if sink.holds() {
+                        // As for a used quantum, words read ahead are not kept: the channel
+                        // reads the next word again when the sink lets it go on.
+                        self.chunk.clear();
+                        return Ok(RunOutcome::Held);
+                    }
+                }
                 Ok(Step::Park(acquire)) => {
                     self.parked = Some(acquire);
                     return Ok(RunOutcome::Parked(acquire));

@@ -117,6 +117,7 @@ mod state_3d;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use file::Journal;
 pub use file::{EntrySink, RegFile, RegsError, ShadowMode};
 pub use rules::{
     COMPUTE, ClassRules, FALCON04_SCRATCH_VALUE, LOAD_CONSTANT_BUFFER_COUNT, MethodSpan, OTHER,
