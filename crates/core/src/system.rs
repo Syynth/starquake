@@ -12,10 +12,10 @@
 //! backends exist) a program still parses, and [`System::run`] reports [`Error::NoCpuBackend`]
 //! as an emulator error.
 //!
-//! A run's guest RAM is sized from the program it loads, up to the application pool of the
-//! program's console, and a program that cannot fit is refused before the VM is made, as
-//! [`Error::OutOfRam`] (the `ram` module docs say what is counted; [`THREAD_LOCAL_RAM`] and
-//! [`WORKING_RAM`] are two of the parts).
+//! A run's guest RAM is the application pool of the program's console, less its system
+//! resource's charge, reserved whole and backed lazily, and a program that cannot fit in it is
+//! refused before the VM is made, as [`Error::OutOfRam`] (the `ram` module docs say what is
+//! counted; [`THREAD_LOCAL_RAM`] is one of the parts).
 
 #[cfg_attr(
     not(any(test, all(target_os = "macos", target_arch = "aarch64"))),
@@ -26,7 +26,7 @@
 )]
 mod ram;
 
-pub use ram::{THREAD_LOCAL_RAM, WORKING_RAM};
+pub use ram::THREAD_LOCAL_RAM;
 
 use std::time::Instant;
 
@@ -214,9 +214,9 @@ pub(crate) mod host {
         let ram_config = RamConfig::at_least(guest_ram.size)
             .map_err(|error| starquake_cpu::Error::Host(format!("guest RAM: {error}")))?;
         let _one_vm = ONE_VM.lock().unwrap_or_else(PoisonError::into_inner);
-        // PROVISIONAL: all of the backend's table pool for the one address space. The table pool
-        // is not sized with guest RAM: it is the backend's fixed size, a second limit the fit
-        // check above does not count (`ram`'s module docs, "The table pool").
+        // PROVISIONAL: all of the backend's table pool for the one address space. The pool holds
+        // every table one address space can have, backed lazily like guest RAM (`ram`'s module
+        // docs, "The table pool").
         let backend = HvfBackend::new(ram_config)?;
         let ram = backend.ram();
         // The kernel's address space decides what is mapped; this one makes it real, and is

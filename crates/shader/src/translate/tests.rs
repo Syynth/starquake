@@ -1,15 +1,19 @@
-//! Translator tests: golden IR, each rejection with its exact error, and the limits at their
-//! edges.
+//! Translator tests: golden IR of straight-line programs through the translation driver, `EXIT`,
+//! the shared guard helper, each rejection with its exact error, and the limits at their edges.
+//! Whole programs with branches and guards are the driver's (`driver::tests`).
 
 use proptest::prelude::*;
 
+use super::driver::translate_instrs;
 use super::*;
 use crate::asm::assemble;
 use crate::decode::{
-    AluSrc, CBufRef, OPCODE, OpAL2P, OpALd, OpASt, OpCS2R, OpExit, OpFFma, OpIpa, OpPixLd, OpS2R,
-    PixVal, Pred, PredSrc, RoundMode, S2RDst, UniformReg,
+    AluSrc, CBuf, CBufRef, MovSrc, Op, OpALd, OpASt, OpExit, OpFFma, OpMov, OpS2R, Pred, RoundMode,
+    S2RDst,
 };
+use crate::flow::BranchTables;
 use crate::interp::Machine;
+use crate::ir::Function;
 use crate::testing::{any_instr, config};
 
 fn r(index: u8) -> Gpr {
@@ -69,6 +73,11 @@ fn ast(data: Gpr, addr: u16, comps: u8) -> OpASt {
         patch: false,
         phys: false,
     }
+}
+
+/// `program` through the translation driver, with no header.
+fn translate(stage: Stage, program: &[Instr]) -> Result<Function, TranslateError> {
+    translate_instrs(stage, None, program)
 }
 
 /// Translates `instr` followed by `EXIT` in a vertex program.
@@ -246,474 +255,62 @@ fn s2ur_writes_the_uniform_register() {
     );
 }
 
-/// `instr` under `guard`.
-fn under(guard: PredSrc, instr: Instr) -> Instr {
-    Instr { guard, ..instr }
-}
-
-fn p2(negated: bool) -> PredSrc {
-    PredSrc {
-        reg: Pred::new(2).expect("p2"),
-        negated,
-    }
-}
-
-/// A guard on a pure instruction, plain or negated, is kept as a select of the new value
-/// against the register's old one (PR #4588's `guard_select`, `Visitor::X`), and the next,
-/// unguarded instruction writes plainly. Run on the interpreter, the register takes the new
-/// value exactly when the guard holds.
+/// `MOV` is the integer group's (slice 12a), slice 1's restricted `MOV` path being retired: a
+/// uniform-register or constant-buffer source, which slice 1 refused, translates, and a partial
+/// lane mask is the integer group's refusal.
 #[test]
-fn guarded_pure_instructions_become_selects() {
-    let guarded = |negated| under(p2(negated), mov(r(0), MovSrc::Imm(7)));
-    let ir = translate(VERTEX, &[guarded(false), mov(r(1), MovSrc::Imm(9)), exit()])
-        .expect("translates");
-    assert_eq!(ir.verify(), Ok(()));
-    assert_eq!(
-        ir.to_string(),
-        "block0:\n\
-         \x20   %0: u1 = GetPred p2\n\
-         \x20   %1: u32 = GetRegister r0\n\
-         \x20   %2: u32 = SelectU32 %0, u32 0x7, %1\n\
-         \x20   %3 = SetRegister r0, %2\n\
-         \x20   %4 = SetRegister r1, u32 0x9\n\
-         \x20   return\n"
-    );
-    let negated = translate(VERTEX, &[guarded(true), exit()]).expect("translates");
-    assert_eq!(
-        negated.to_string(),
-        "block0:\n\
-         \x20   %0: u1 = GetPred p2\n\
-         \x20   %1: u1 = LogicalNot %0\n\
-         \x20   %2: u32 = GetRegister r0\n\
-         \x20   %3: u32 = SelectU32 %1, u32 0x7, %2\n\
-         \x20   %4 = SetRegister r0, %3\n\
-         \x20   return\n"
-    );
-    for negated in [false, true] {
-        let ir = translate(VERTEX, &[guarded(negated), exit()]).expect("translates");
-        for p in [false, true] {
-            let mut machine = Machine::default();
-            machine.regs[0] = 3;
-            machine.preds[2] = p;
-            machine.run(&ir).expect("runs");
-            let runs = p != negated;
-            assert_eq!(
-                machine.regs[0],
-                if runs { 7 } else { 3 },
-                "p2 {p}, negated {negated}"
-            );
-        }
-    }
-    // Each register of a multi-word write selects on its own old value.
-    let load = under(p2(false), Instr::new(Op::ALd(ald(r(4), 0x80, 2))));
-    let ir = one(load).expect("translates");
-    assert_eq!(
-        ir.to_string(),
-        "block0:\n\
-         \x20   %0: u1 = GetPred p2\n\
-         \x20   %1: f32 = GetAttribute a0x80, u32 0x0\n\
-         \x20   %2: u32 = BitCastU32F32 %1\n\
-         \x20   %3: u32 = GetRegister r4\n\
-         \x20   %4: u32 = SelectU32 %0, %2, %3\n\
-         \x20   %5 = SetRegister r4, %4\n\
-         \x20   %6: f32 = GetAttribute a0x84, u32 0x0\n\
-         \x20   %7: u32 = BitCastU32F32 %6\n\
-         \x20   %8: u32 = GetRegister r5\n\
-         \x20   %9: u32 = SelectU32 %0, %7, %8\n\
-         \x20   %10 = SetRegister r5, %9\n\
-         \x20   return\n"
-    );
-    for p in [false, true] {
-        let mut machine = Machine::default();
-        machine.regs[4] = 1;
-        machine.regs[5] = 2;
-        machine.preds[2] = p;
-        machine
-            .attributes
-            .insert((crate::ir::Attribute(0x20), 0), 10.0_f32.to_bits());
-        machine
-            .attributes
-            .insert((crate::ir::Attribute(0x21), 0), 20.0_f32.to_bits());
-        machine.run(&ir).expect("runs");
-        let wanted = if p {
-            [10.0_f32.to_bits(), 20.0_f32.to_bits()]
-        } else {
-            [1, 2]
-        };
-        assert_eq!([machine.regs[4], machine.regs[5]], wanted, "p2 {p}");
-    }
-}
-
-/// A guard on an instruction that is not pure (`AST` here) makes it a conditional block: the
-/// predicate is read, the instruction runs in a block of its own, and translation goes on in
-/// the block after it. Run on the interpreter, the attribute is written exactly when the guard
-/// holds.
-#[test]
-fn guarded_side_effects_become_conditional_blocks() {
-    let store = |negated| under(p2(negated), Instr::new(Op::ASt(ast(r(0), 0x80, 1))));
-    let ir =
-        translate(VERTEX, &[store(false), mov(r(1), MovSrc::Imm(9)), exit()]).expect("translates");
-    assert_eq!(ir.verify(), Ok(()));
-    assert_eq!(
-        ir.to_string(),
-        "block0:\n\
-         \x20   %0: u1 = GetPred p2\n\
-         \x20   branch %0, block1, block2\n\
-         block1:\n\
-         \x20   %1: u32 = GetRegister r0\n\
-         \x20   %2: f32 = BitCastF32U32 %1\n\
-         \x20   %3 = SetAttribute a0x80, %2, u32 0x0\n\
-         \x20   jump block2\n\
-         block2:\n\
-         \x20   %4 = SetRegister r1, u32 0x9\n\
-         \x20   return\n"
-    );
-    for negated in [false, true] {
-        let ir = translate(VERTEX, &[store(negated), exit()]).expect("translates");
-        for p in [false, true] {
-            let mut machine = Machine::default();
-            machine.preds[2] = p;
-            machine.regs[0] = 1.5_f32.to_bits();
-            machine.run(&ir).expect("runs");
-            let written = machine
-                .outputs
-                .get(&(crate::ir::Attribute(0x20), 0))
-                .copied();
-            assert_eq!(
-                written,
-                (p != negated).then_some(1.5_f32.to_bits()),
-                "p2 {p}, negated {negated}"
-            );
-        }
-    }
-}
-
-/// One instruction of each operation whose guard [`translate`] reads itself (every one it takes
-/// but the float group's, which [`float`] guards), each in a form it accepts in a vertex
-/// program, with the class PR #4588's `classify.h` gives its opcode written out: `(instr, pure,
-/// uniform)`.
-fn one_of_each_translated_op() -> Vec<(Instr, bool, bool)> {
-    let ipa = OpIpa {
-        dst: r(0),
-        addr: 0x70,
-        freq: crate::decode::InterpFreq::Pass,
-        loc: crate::decode::InterpLoc::Default,
-        offset: Gpr::RZ,
-        pred: Pred::PT,
-    };
-    let s2r = |dst| OpS2R {
-        dst,
-        sr: SpecialReg::LANE_ID,
-    };
-    let ur1 = UniformReg::new(1).expect("ur1");
-    vec![
-        // `classify.h`: `MOV` by its base, in every form.
-        (mov(r(0), MovSrc::Imm(7)), true, false),
-        // `case 0x321: // ALD`, `case 0x326: // IPA`, `case 0x805: // CS2R`, `case 0x919:
-        // // S2R`.
-        (Instr::new(Op::ALd(ald(r(0), 0x80, 1))), true, false),
-        (Instr::new(Op::Ipa(ipa)), true, false),
-        (
-            Instr::new(Op::CS2R(OpCS2R {
-                dst: r(0),
-                sr: SpecialReg::SRZ,
-                wide: false,
-            })),
-            true,
-            false,
-        ),
-        (Instr::new(Op::S2R(s2r(S2RDst::Reg(r(0))))), true, false),
-        // `case 0x9c3: // S2UR`, with the uniform datapath instructions.
-        (Instr::new(Op::S2R(s2r(S2RDst::Uniform(ur1)))), true, true),
-        // No row: `AST` (`0x322`), `AL2P` (`0x920`) and `PIXLD` (`0x925`) are plain.
-        (Instr::new(Op::ASt(ast(r(0), 0x80, 1))), false, false),
-        (
-            Instr::new(Op::AL2P(OpAL2P {
-                dst: r(0),
-                offset: r(1),
-                addr: 0x80,
-                comps: 1,
-                output: false,
-            })),
-            false,
-            false,
-        ),
-        (
-            Instr::new(Op::PixLd(OpPixLd {
-                dst: r(0),
-                val: PixVal::MyIndex,
-                pred: Pred::PT,
-            })),
-            false,
-            false,
-        ),
-    ]
-}
-
-/// The 12-bit opcode of `instr` as the test assembler encodes it.
-fn encoded_opcode(instr: Instr) -> u16 {
-    let word = assemble(&instr).expect("encodable");
-    u16::try_from(word.field(OPCODE)).expect("12 bits")
-}
-
-/// The translator classifies a guard by flow analysis's table, looked up by the opcode the
-/// decoder reads the operation from: for each operation it takes, its `opcode` is the one the
-/// test assembler encodes (`MOV`: the same class in every operand form), the class is
-/// `classify.h`'s, and the guard becomes a select exactly for the pure ones. The float group,
-/// `FFMA` included, takes its own guard, so `opcode` does not name it.
-#[test]
-fn guards_classify_by_the_flow_table() {
-    for (instr, pure, uniform) in one_of_each_translated_op() {
-        let encoded = encoded_opcode(instr);
-        let info = classify(opcode(instr.op).expect("named"));
-        assert_eq!(info, classify(encoded), "{instr}");
-        if !matches!(instr.op, Op::Mov(_)) {
-            assert_eq!(opcode(instr.op), Some(encoded), "{instr}");
-        }
-        assert_eq!((info.pure, info.uniform), (pure, uniform), "{instr}");
-        let wanted = if pure {
-            Guarding::Select { uniform }
-        } else {
-            Guarding::Block { uniform }
-        };
-        assert_eq!(guarding(under(p2(false), instr)), wanted, "{instr}");
-        assert_eq!(guarding(instr), Guarding::Always, "{instr}");
-    }
-    // Every source form of `MOV` classifies as its register form does.
+fn mov_is_the_integer_groups() {
+    let ur4 = UniformReg::new(4).expect("ur4");
     let cbuf = CBufRef {
-        buf: crate::decode::CBuf::Binding(1),
+        buf: CBuf::Binding(1),
         offset: 0x10,
     };
-    let ur1 = UniformReg::new(1).expect("ur1");
-    for src in [
-        MovSrc::Reg(r(1)),
-        MovSrc::Imm(7),
-        MovSrc::CBuf(cbuf),
-        MovSrc::UniformReg(ur1),
-    ] {
-        let instr = mov(r(0), src);
-        assert_eq!(
-            classify(encoded_opcode(instr)),
-            classify(opcode(instr.op).expect("named")),
-            "{instr}"
-        );
-    }
-    // `FFMA`, in every source form, is the float group's: `opcode` does not name it, since
-    // `translate` hands it to `float` before it reads a guard.
-    let ffma = |srcs| {
-        Instr::new(Op::FFma(OpFFma {
-            dst: r(0),
-            srcs,
-            saturate: false,
-            rnd: RoundMode::NearestEven,
-            ftz: false,
-            dnz: false,
-        }))
-    };
-    let reg = AluSrc::reg(r(1));
-    for other in [reg, AluSrc::Imm(0x3f80_0000)] {
-        let instr = ffma([reg, other, reg]);
-        assert!(float::in_group(&instr.op), "{instr}");
-        assert_eq!(opcode(instr.op), None, "{instr}");
-    }
-    // The guard rules before the class: `@!PT` never runs, whatever the operation.
-    let never = PredSrc {
-        reg: Pred::PT,
-        negated: true,
-    };
-    assert_eq!(
-        guarding(under(never, mov(r(0), MovSrc::Imm(7)))),
-        Guarding::Never
-    );
-    // An operation `opcode` does not name gets a conditional block.
-    let nop = Instr::new(Op::Nop(crate::decode::OpNop {}));
-    assert_eq!(opcode(nop.op), None);
-    assert_eq!(
-        guarding(under(p2(false), nop)),
-        Guarding::Block { uniform: false }
-    );
-}
-
-/// The guard of a pure uniform datapath instruction reads a uniform predicate,
-/// `GetUniformPred` (PR #4588's `classify.h` and `UPred`), and every other guard a predicate,
-/// for each operation the translator takes; of these, only `S2UR` is uniform. `S2UR`'s select
-/// reads the uniform register's old value.
-#[test]
-fn a_guard_on_each_pure_uniform_op_reads_a_uniform_predicate() {
-    let guard = PredSrc {
-        reg: Pred::new(3).expect("p3"),
-        negated: true,
-    };
-    let mut uniform_ops = Vec::new();
-    for (instr, _, uniform) in one_of_each_translated_op() {
-        let text = one(under(guard, instr)).expect("translates").to_string();
-        let first = text.lines().nth(1).unwrap_or_default().to_owned();
-        if uniform {
-            uniform_ops.push(instr.op.mnemonic());
-            assert_eq!(first, "    %0: u1 = GetUniformPred up3", "{instr}");
-        } else {
-            assert_eq!(first, "    %0: u1 = GetPred p3", "{instr}");
-        }
-    }
-    assert_eq!(uniform_ops, ["s2r"]);
-    let ur1 = UniformReg::new(1).expect("ur1");
-    let s2ur = under(
-        guard,
-        Instr::new(Op::S2R(OpS2R {
-            dst: S2RDst::Uniform(ur1),
-            sr: SpecialReg::LANE_ID,
-        })),
-    );
-    let ir = one(s2ur).expect("translates");
+    let ir = translate(
+        VERTEX,
+        &[
+            mov(r(0), MovSrc::UniformReg(ur4)),
+            mov(r(1), MovSrc::CBuf(cbuf)),
+            exit(),
+        ],
+    )
+    .expect("translates");
     assert_eq!(
         ir.to_string(),
         "block0:\n\
-         \x20   %0: u1 = GetUniformPred up3\n\
-         \x20   %1: u1 = LogicalNot %0\n\
-         \x20   %2: u32 = LaneId\n\
-         \x20   %3: u32 = GetUniformRegister ur1\n\
-         \x20   %4: u32 = SelectU32 %1, %2, %3\n\
-         \x20   %5 = SetUniformRegister ur1, %4\n\
+         \x20   %0: u32 = GetUniformRegister ur4\n\
+         \x20   %1 = SetRegister r0, %0\n\
+         \x20   %2: u32 = GetCbufU32 u32 0x1, u32 0x10\n\
+         \x20   %3 = SetRegister r1, %2\n\
          \x20   return\n"
     );
-    for up in [false, true] {
-        let mut machine = Machine::default();
-        machine.uniform_preds[3] = up;
-        machine.uniform_regs[1] = 2;
-        machine.system.lane_id = 6;
-        machine.run(&ir).expect("runs");
-        assert_eq!(machine.uniform_regs[1], if up { 2 } else { 6 }, "up3 {up}");
-    }
-}
-
-/// A guarded `EXIT` is a conditional exit, which the straight-line translator does not build.
-#[test]
-fn a_guarded_exit_is_rejected() {
-    let guarded = Instr {
-        guard: PredSrc {
-            reg: Pred::new(0).expect("p0"),
-            negated: false,
-        },
-        ..exit()
-    };
+    let mut machine = Machine::default();
+    machine.uniform_regs[4] = 0x55;
+    machine.cbufs.insert(1, (0_u8..0x20).collect());
+    machine.run(&ir).expect("runs");
+    assert_eq!(machine.regs[0], 0x55);
     assert_eq!(
-        translate(VERTEX, &[guarded]),
-        Err(TranslateError::Unsupported {
-            index: 0,
-            instr: guarded,
-            what: Unsupported::Guard
-        })
+        machine.regs[1],
+        u32::from_le_bytes([0x10, 0x11, 0x12, 0x13])
     );
-    assert_eq!(
-        translate(VERTEX, &[guarded]).map_err(|error| error.to_string()),
-        Err("instruction 0 (@p0 exit;): a guarded exit is not supported".into())
-    );
-}
-
-/// `@!PT` never runs: it translates to nothing, as the PR skips it (`Visitor::Run`,
-/// `guard.Never()`), and an `EXIT` under it does not end the program.
-#[test]
-fn never_guarded_instructions_are_skipped() {
-    let never = PredSrc {
-        reg: Pred::PT,
-        negated: true,
-    };
-    let skipped = |instr: Instr| Instr {
-        guard: never,
-        ..instr
-    };
-    let program = [
-        skipped(mov(r(0), MovSrc::Imm(1))),
-        skipped(Instr::new(Op::ASt(ast(r(0), 0x80, 1)))),
-        skipped(Instr::new(Op::Nop(crate::decode::OpNop {}))),
-        skipped(exit()),
-        exit(),
-    ];
-    let ir = translate(VERTEX, &program).expect("translates");
-    assert_eq!(ir.to_string(), "block0:\n    return\n");
-    // The same instruction under `PT` translates to something.
-    let ir = one(mov(r(0), MovSrc::Imm(1))).expect("translates");
-    assert_eq!(
-        ir.to_string(),
-        "block0:\n    %0 = SetRegister r0, u32 0x1\n    return\n"
-    );
-}
-
-#[test]
-fn mov_lane_mask_must_be_full() {
     let partial = Instr::new(Op::Mov(OpMov {
         dst: r(0),
         src: MovSrc::Imm(1),
         quad_lanes: 0xe,
     }));
-    assert_eq!(one(partial), unsupported(partial, Unsupported::MovLaneMask));
-    assert!(one(mov(r(0), MovSrc::Imm(1))).is_ok());
-}
-
-/// The decoder reads uniform-register and constant-buffer sources of `MOV`; the translator
-/// rejects them and keeps translating register and immediate sources. (`FFMA` reads them since
-/// slice 12b: `float::tests::sources_of_every_kind`.)
-#[test]
-fn uniform_and_constant_buffer_sources_are_rejected() {
-    use crate::decode::{CBuf, CBufRef, UniformReg};
-    let cbuf = CBufRef {
-        buf: CBuf::Binding(1),
-        offset: 0x10,
-    };
-    let ureg = UniformReg::new(4).expect("ur4");
-    for src in [MovSrc::CBuf(cbuf), MovSrc::UniformReg(ureg)] {
-        let instr = mov(r(0), src);
-        assert_eq!(one(instr), unsupported(instr, Unsupported::Source));
-    }
-    let instr = mov(r(0), MovSrc::UniformReg(ureg));
     assert_eq!(
-        one(instr).map_err(|error| error.to_string()),
+        one(partial),
+        Err(TranslateError::Integer {
+            index: 0,
+            instr: partial,
+            error: integer::IntegerError::Unsupported(integer::IntegerUnsupported::MovLaneMask),
+        })
+    );
+    assert_eq!(
+        one(partial).map_err(|error| error.to_string()),
         Err(
-            "instruction 0 (mov r0, ur4;): a uniform-register or constant-buffer source is not \
-             supported"
+            "instruction 0 (mov r0, 0x1, 0xe;): a mov with a partial lane mask is not supported"
                 .into()
         )
-    );
-    assert!(one(mov(r(0), MovSrc::Reg(r(1)))).is_ok());
-}
-
-/// Every operation but the six of slice 1 is rejected by its mnemonic.
-#[test]
-fn other_instructions_are_rejected_by_mnemonic() {
-    use crate::decode::{
-        ChannelMask, MemEvictionPriority, OpIAbs, OpNop, OpTex, Pred, TexDim, TexLodMode, TexRef,
-    };
-    let iabs = Op::IAbs(OpIAbs {
-        dst: r(0),
-        src: AluSrc::reg(r(1)),
-    });
-    let tex = Op::Tex(OpTex {
-        dsts: [r(0), Gpr::RZ],
-        fault: Pred::PT,
-        tex: TexRef::Bindless,
-        srcs: [r(1), r(2)],
-        dim: TexDim::D2,
-        lod_mode: TexLodMode::Auto,
-        ndv: false,
-        z_cmpr: false,
-        offset: false,
-        f16: false,
-        eviction: MemEvictionPriority::Normal,
-        nodep: false,
-        channel_mask: ChannelMask::RGBA,
-        scalar: false,
-    });
-    for op in [iabs, Op::Nop(OpNop {}), tex] {
-        let instr = Instr::new(op);
-        assert_eq!(
-            one(instr),
-            unsupported(instr, Unsupported::Instruction(op.mnemonic()))
-        );
-    }
-    let instr = Instr::new(Op::Nop(OpNop {}));
-    assert_eq!(
-        one(instr).map_err(|error| error.to_string()),
-        Err("instruction 0 (nop;): nop is not supported".into())
     );
 }
 
@@ -986,83 +583,80 @@ fn attribute_registers_stop_before_rz() {
     assert!(one(Instr::new(Op::ASt(ast(Gpr::RZ, 0x80, 4)))).is_ok());
 }
 
+/// `EXIT`'s mode bits are refused by flow analysis first ([`FlowError::SpecialExit`]); the
+/// `EXIT` translator's own check, kept for the PR's order, refuses them too when it is reached
+/// directly. An `EXIT` with a predicate of its own is no longer refused: flow analysis gives it a
+/// block whose test reads the predicate (`driver::tests::a_conditional_exit_writes_its_outputs_only_where_it_exits`).
 #[test]
-fn exit_modes_and_predicates_are_rejected() {
-    let cases = [
-        (
-            OpExit {
-                keep_ref_count: true,
-                no_at_exit: false,
-                pred: PredSrc::TRUE,
-            },
-            Unsupported::ExitMode,
-        ),
-        (
-            OpExit {
-                keep_ref_count: false,
-                no_at_exit: true,
-                pred: PredSrc::TRUE,
-            },
-            Unsupported::ExitMode,
-        ),
-        (
-            OpExit {
-                keep_ref_count: false,
-                no_at_exit: false,
-                pred: PredSrc {
-                    reg: Pred::new(3).expect("p3"),
-                    negated: false,
-                },
-            },
-            Unsupported::ConditionalExit,
-        ),
-        (
-            OpExit {
-                keep_ref_count: false,
-                no_at_exit: false,
-                pred: PredSrc {
-                    reg: Pred::PT,
-                    negated: true,
-                },
-            },
-            Unsupported::ConditionalExit,
-        ),
+fn exit_mode_bits_are_refused() {
+    let modes = [
+        OpExit {
+            keep_ref_count: true,
+            no_at_exit: false,
+            pred: PredSrc::TRUE,
+        },
+        OpExit {
+            keep_ref_count: false,
+            no_at_exit: true,
+            pred: PredSrc::TRUE,
+        },
     ];
-    for (op, what) in cases {
+    for op in modes {
         let instr = Instr::new(Op::Exit(op));
-        assert_eq!(translate(VERTEX, &[instr]), unsupported(instr, what));
+        assert_eq!(
+            translate(VERTEX, &[instr]),
+            Err(TranslateError::Flow(FlowError::SpecialExit { index: 0 }))
+        );
+        let mut function = Function::new();
+        let entry = function.entry();
+        let mut t = Translator {
+            b: Builder::new(&mut function, entry),
+            stage: VERTEX,
+            header: None,
+        };
+        assert!(matches!(
+            t.exit(op),
+            Err(Failure::Unsupported(Unsupported::ExitMode))
+        ));
     }
+    let conditional = Instr::new(Op::Exit(OpExit {
+        pred: PredSrc {
+            reg: Pred::new(3).expect("p3"),
+            negated: false,
+        },
+        ..modes[0]
+    }));
+    let conditional = Instr {
+        op: match conditional.op {
+            Op::Exit(op) => Op::Exit(OpExit {
+                keep_ref_count: false,
+                ..op
+            }),
+            other => other,
+        },
+        ..conditional
+    };
+    assert!(translate(VERTEX, &[conditional, exit()]).is_ok());
 }
 
+/// A program must exit: an empty one and one that runs off its end are flow analysis's
+/// refusals; instructions after the program's only `EXIT` are not reached, so they are neither
+/// decoded nor translated.
 #[test]
-fn the_program_ends_at_its_only_exit() {
-    assert_eq!(translate(VERTEX, &[]), Err(TranslateError::NoExit));
+fn the_program_runs_to_an_exit() {
+    assert_eq!(
+        translate(VERTEX, &[]),
+        Err(TranslateError::Flow(FlowError::ProgramSize { len: 0 }))
+    );
     assert_eq!(
         translate(VERTEX, &[mov(r(0), MovSrc::Imm(1))]),
-        Err(TranslateError::NoExit)
+        Err(TranslateError::Flow(FlowError::RunsPastEnd { last: 0 }))
     );
-    assert_eq!(
-        translate(VERTEX, &[exit(), mov(r(0), MovSrc::Imm(1)), exit()]),
-        Err(TranslateError::AfterExit { index: 1, exit: 0 })
-    );
-    assert!(translate(VERTEX, &[mov(r(0), MovSrc::Imm(1)), exit()]).is_ok());
-}
-
-#[test]
-fn only_vertex_and_pixel_stages_translate() {
-    for stage in [
-        GuestStage::VertexCullBeforeFetch,
-        GuestStage::TessellationInit,
-        GuestStage::Tessellation,
-        GuestStage::Geometry,
-        GuestStage::Compute,
-    ] {
-        let stage = Stage { stage, ..VERTEX };
-        assert_eq!(
-            translate(stage, &[exit()]),
-            Err(TranslateError::Stage(Unsupported::Stage(stage.stage)))
-        );
-    }
+    let mut code = vec![assemble(&exit()).expect("encodable")];
+    // A word that does not decode, after the exit: never reached.
+    code.push(crate::decode::Instruction::default());
+    let blocks = translate_flow(VERTEX, None, &code, &BranchTables::new(0)).expect("translates");
+    assert_eq!(blocks.function.to_string(), "block0:\n    return\n");
 }
 
 #[test]
@@ -1077,13 +671,118 @@ fn rejections_read_as_words() {
         )
     );
     assert_eq!(
-        TranslateError::AfterExit { index: 3, exit: 2 }.to_string(),
-        "instruction 3 follows the exit at 2"
-    );
-    assert_eq!(
         TranslateError::Stage(Unsupported::Stage(GuestStage::Geometry)).to_string(),
         "geometry programs are not supported yet"
     );
+    assert_eq!(
+        TranslateError::Decode {
+            index: 2,
+            error: crate::decode::DecodeError::UnknownOpcode { opcode: 0 }
+        }
+        .to_string(),
+        "instruction 2: unknown opcode 0x000"
+    );
+    assert_eq!(
+        TranslateError::Flow(FlowError::RunsPastEnd { last: 4 }).to_string(),
+        "control runs past instruction 4, the last of the program"
+    );
+    assert_eq!(
+        TranslateError::TooManyInstructions.to_string(),
+        format!(
+            "the program, its calls inlined, has more than {MAX_TRANSLATED_INSTRUCTIONS} \
+             instructions to translate"
+        )
+    );
+    assert_eq!(
+        Unsupported::MemoryGroup("ld").to_string(),
+        "ld, of the memory group, which is not translated yet,"
+    );
+}
+
+/// The shared guard helper: the split block branches on the condition to the instruction's
+/// block (made first) or the block after (made second); the instruction's block jumps to the
+/// block after, which takes over the split block's terminator; the builder is left in the
+/// instruction's block. In a block flow analysis has terminated, the old terminator moves; in an
+/// open block, the open terminator does.
+#[test]
+fn the_guard_helper_moves_the_terminator_to_the_block_after() {
+    for old in [Terminator::Return, Terminator::None] {
+        let mut function = Function::new();
+        let entry = function.entry();
+        let mut b = Builder::new(&mut function, entry);
+        b.terminate(old).expect("terminates");
+        let cond = b
+            .op(
+                Opcode::GetPred,
+                &[Operand::Imm(Imm::Pred(Pred::new(1).expect("p1")))],
+            )
+            .expect("reads")
+            .into();
+        let join = split_for_guard(&mut b, cond).expect("splits");
+        let then = b.block();
+        assert_eq!((then.index(), join.index()), (1, 2), "{old:?}");
+        let block = |id| function.block(id).map(|block| block.terminator);
+        assert_eq!(
+            block(entry),
+            Some(Terminator::Branch {
+                cond,
+                then,
+                otherwise: join
+            })
+        );
+        assert_eq!(block(then), Some(Terminator::Jump(join)));
+        assert_eq!(block(join), Some(old));
+    }
+}
+
+/// `conditional_block`: no split when the block's guard is tested or the guard is `PT`; else
+/// the guard's read, the split, the body in the instruction's block and the builder left in the
+/// block after.
+#[test]
+fn conditional_block_splits_only_for_an_untested_guard() {
+    let p1 = PredSrc {
+        reg: Pred::new(1).expect("p1"),
+        negated: false,
+    };
+    for (guard, tested, splits) in [
+        (p1, false, true),
+        (p1, true, false),
+        (PredSrc::TRUE, false, false),
+    ] {
+        let mut function = Function::new();
+        let entry = function.entry();
+        let mut b = Builder::new(&mut function, entry);
+        b.terminate(Terminator::Return).expect("terminates");
+        let mut body_block = None;
+        conditional_block::<BuildError>(&mut b, guard, tested, |b| {
+            body_block = Some(b.block());
+            b.op(Opcode::Barrier, &[])?;
+            Ok(())
+        })
+        .expect("builds");
+        let after = b.block();
+        if splits {
+            assert_eq!(body_block.map(BlockId::index), Some(1));
+            assert_eq!(after.index(), 2);
+            assert_eq!(
+                function.to_string(),
+                "block0:\n\
+                 \x20   %0: u1 = GetPred p1\n\
+                 \x20   branch %0, block1, block2\n\
+                 block1:\n\
+                 \x20   %1 = Barrier\n\
+                 \x20   jump block2\n\
+                 block2:\n\
+                 \x20   return\n"
+            );
+        } else {
+            assert_eq!((body_block, after), (Some(entry), entry));
+            assert_eq!(
+                function.to_string(),
+                "block0:\n    %0 = Barrier\n    return\n"
+            );
+        }
+    }
 }
 
 /// Every guest stage has a plain-words name.
@@ -1113,8 +812,8 @@ fn guest_stages_read_as_words() {
 proptest! {
     #![proptest_config(config())]
 
-    /// Arbitrary instruction sequences never panic the translator, and what it accepts
-    /// verifies.
+    /// Arbitrary instruction sequences, ended by an `EXIT`, never panic the driver, and what it
+    /// accepts verifies.
     #[test]
     fn arbitrary_programs_never_panic(
         program in proptest::collection::vec(any_instr(), 0..12),
@@ -1122,17 +821,10 @@ proptest! {
         targets in any::<[u8; COLOR_TARGETS]>(),
     ) {
         let stage = if pixel_stage { pixel(targets) } else { VERTEX };
+        let mut program = program;
+        program.push(exit());
         if let Ok(ir) = translate(stage, &program) {
             prop_assert_eq!(ir.verify(), Ok(()));
-        }
-    }
-
-    /// A generated operation that `opcode` names classifies as the opcode the test assembler
-    /// encodes for it (the fixed list is `guards_classify_by_the_flow_table`).
-    #[test]
-    fn named_opcodes_classify_as_encoded(instr in any_instr()) {
-        if let Some(named) = opcode(instr.op) {
-            prop_assert_eq!(classify(named), classify(encoded_opcode(instr)));
         }
     }
 }

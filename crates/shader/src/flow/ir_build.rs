@@ -146,19 +146,10 @@ fn to_test_block(builder: &mut Builder<'_>, empty: bool) -> Result<(), FlowError
 }
 
 /// The value of predicate `cond`: `PT` as an immediate, else `GetPred` and, when negated,
-/// `LogicalNot`. Shared with the translators, which read guards and predicate sources the same
-/// way.
-pub(crate) fn read_pred(builder: &mut Builder<'_>, cond: PredSrc) -> Result<Operand, BuildError> {
-    if cond.reg.is_true() {
-        return Ok(Operand::Imm(Imm::U1(!cond.negated)));
-    }
-    let value = builder.op(Opcode::GetPred, &[Operand::Imm(Imm::Pred(cond.reg))])?;
-    if !cond.negated {
-        return Ok(Operand::Value(value));
-    }
-    Ok(Operand::Value(
-        builder.op(Opcode::LogicalNot, &[Operand::Value(value)])?,
-    ))
+/// `LogicalNot`; the translators' shared source reader, which reads guards and predicate sources
+/// the same way.
+fn read_pred(builder: &mut Builder<'_>, cond: PredSrc) -> Result<Operand, BuildError> {
+    crate::translate::source::pred(builder, cond)
 }
 
 /// The value of the register an indirect branch reads.
