@@ -1,5 +1,6 @@
-//! Guest RAM sized from the program a run loads, at the exact edge, on both ways a program
-//! arrives: an NRO ([`System::new`]) and a NUP title ([`System::from_nup`]). A program that
+//! The fit check of guest RAM (the program's whole application pool), at the exact edge, on
+//! both ways a program arrives: an NRO ([`System::new`]) and a NUP title ([`System::from_nup`]).
+//! A program that
 //! fits its console's application pool with no byte to spare loads and runs; one byte more is
 //! [`Error::OutOfRam`], found before the VM is made (`crates/core/src/system/ram.rs`).
 //!
