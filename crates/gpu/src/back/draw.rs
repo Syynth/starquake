@@ -27,7 +27,8 @@
 //!    as Eden's `RefreshStages` has it (`eden-nx2/src/video_core/shader_cache.cpp` @ 50fa86bb).
 //!    `SET_PIPELINE_SHADER_TYPE` is not read: Eden takes the stage from the slot.
 //! 4. **The variant key** ([`shaders::variant_key`]), with the backend's [`EmulationFlags`](starquake_render::EmulationFlags)
-//!    from [`starquake_render::emulation`] and, without view swizzle, the texture swizzles.
+//!    from [`starquake_render::emulation`], the previous stages' stores
+//!    ([`shaders::previous_stage_stores`]) and, without view swizzle, the texture swizzles.
 //! 5. **The lookup** ([`ShaderLookup::lookup`]): `Ready` gives the set; `Pending` follows the
 //!    one wait-while-compiling setting ([`WaitWhileCompiling`], owner's decision 9 and the
 //!    first of the graphics decisions of 2026-11-12): wait for the ticket, or skip
@@ -155,7 +156,7 @@ use starquake_render::{
 };
 use starquake_shader::driver_constants::{ClipDepth, DRIVER_CONSTANTS_SIZE, DriverConstants};
 use starquake_shader::lookup::{GuestStage, ProgramRequest};
-use starquake_shader::variant::{KeyError, Swizzle, TextureSwizzles};
+use starquake_shader::variant::{KeyError, PreviousStores, Swizzle, TextureSwizzles};
 use thiserror::Error;
 
 use crate::back::buffer::{BufferCache, BufferError};
@@ -266,6 +267,11 @@ pub const MAX_REJECTED_SETS: usize = 4096;
 /// The most request sets whose texture handles are remembered for the swizzle key (the same
 /// kind of guess).
 pub const MAX_SWIZZLE_SETS: usize = 4096;
+
+/// The most request sets whose previous stages' stores are remembered for the key (the same
+/// kind of guess as [`MAX_SWIZZLE_SETS`]; past it a set is looked up with the empty stores
+/// first, then with its own).
+pub const MAX_STORE_SETS: usize = 4096;
 
 /// [`CONSTANTS_ALIGN`] as a length.
 const ALIGN_BYTES: usize = 256;
@@ -466,6 +472,9 @@ pub struct Draws {
     rejected: HashSet<Vec<ProgramRequest>>,
     rejected_limit: usize,
     swizzle_handles: HashMap<Vec<ProgramRequest>, Vec<(GuestStage, HandleSource)>>,
+    /// The previous stages' stores each request set's last ready answer gave.
+    previous_stores: HashMap<Vec<ProgramRequest>, PreviousStores>,
+    previous_stores_limit: usize,
     constants: Option<BufferId>,
     /// What the last upload held: the root tables' generation and the encoded driver constants.
     uploaded: Option<(u64, [u8; DRIVER_CONSTANTS_SIZE])>,
@@ -509,6 +518,8 @@ impl Draws {
             rejected: HashSet::new(),
             rejected_limit: MAX_REJECTED_SETS,
             swizzle_handles: HashMap::new(),
+            previous_stores: HashMap::new(),
+            previous_stores_limit: MAX_STORE_SETS,
             constants: None,
             uploaded: None,
             last_targets: None,
@@ -712,31 +723,54 @@ impl Draws {
             .collect()
     }
 
-    /// Each host shader's guest stage: the vertex shader is the vertex request's (the last
-    /// vertex-like request), the fragment shader the pixel request's.
-    fn stages(requests: &[ProgramRequest], set: &ReadySet) -> Vec<SetStage> {
+    /// The previous stages' stores of `requests` as the ready `set` gives them (module docs of
+    /// [`shaders`], "The previous stage's stores"). Allocates nothing: each stage's shader is
+    /// found by [`Draws::guest_stage`], the mapping [`Draws::stages`] uses.
+    fn set_stores(requests: &[ProgramRequest], set: &ReadySet) -> PreviousStores {
+        shaders::previous_stage_stores(requests, |stage| {
+            set.shaders
+                .stages
+                .iter()
+                .find(|shader| Self::guest_stage(requests, shader.stage) == Some(stage))
+                .map(|shader| shaders::stored_words(&shader.outputs))
+        })
+    }
+
+    /// The guest stage of a host shader of `host`'s stage: the vertex shader is the vertex
+    /// request's (the last vertex-like request), the fragment shader the pixel request's.
+    fn guest_stage(
+        requests: &[ProgramRequest],
+        host: starquake_shader::host::HostStage,
+    ) -> Option<GuestStage> {
         use starquake_shader::host::HostStage;
+        match host {
+            HostStage::Vertex => requests
+                .iter()
+                .rev()
+                .find(|r| {
+                    matches!(
+                        r.stage,
+                        GuestStage::Vertex | GuestStage::VertexCullBeforeFetch
+                    )
+                })
+                .map(|r| r.stage),
+            HostStage::Fragment => Some(GuestStage::Pixel),
+            // A draw's set has no compute shader.
+            HostStage::Compute => None,
+        }
+    }
+
+    /// Each host shader's guest stage ([`Draws::guest_stage`]) and its index in the set.
+    fn stages(requests: &[ProgramRequest], set: &ReadySet) -> Vec<SetStage> {
         set.shaders
             .stages
             .iter()
             .enumerate()
             .filter_map(|(index, shader)| {
-                let stage = match shader.stage {
-                    HostStage::Vertex => requests
-                        .iter()
-                        .rev()
-                        .find(|r| {
-                            matches!(
-                                r.stage,
-                                GuestStage::Vertex | GuestStage::VertexCullBeforeFetch
-                            )
-                        })
-                        .map(|r| r.stage)?,
-                    HostStage::Fragment => GuestStage::Pixel,
-                    // A draw's set has no compute shader.
-                    HostStage::Compute => return None,
-                };
-                Some(SetStage { stage, index })
+                Some(SetStage {
+                    stage: Self::guest_stage(requests, shader.stage)?,
+                    index,
+                })
             })
             .collect()
     }
@@ -828,12 +862,13 @@ impl Draws {
             memory: ctx.memory,
         };
         let programs = GuestPrograms(ctx.memory);
-        let key_for = |swizzles: Vec<Swizzle>| -> Result<_, DrawError> {
+        let key_for = |swizzles: Vec<Swizzle>, stores: PreviousStores| -> Result<_, DrawError> {
             Ok(shaders::variant_key(
                 &vertex.types,
                 &targets.formats.colors,
                 blend.dual_source,
                 emulation_key,
+                stores,
                 TextureSwizzles::new(swizzles)?,
             ))
         };
@@ -845,27 +880,48 @@ impl Draws {
                 .get(&requests)
                 .map_or_else(Vec::new, |handles| Self::swizzles(&answers, handles))
         };
+        let first_stores = self
+            .previous_stores
+            .get(&requests)
+            .copied()
+            .unwrap_or(PreviousStores::EMPTY);
         let mut lookup = ctx.shaders.lookup(
             &requests,
-            &key_for(first_swizzles.clone())?,
+            &key_for(first_swizzles.clone(), first_stores)?,
             &programs,
             &answers,
         );
         self.counters.lookups = self.counters.lookups.saturating_add(1);
-        if !caps.view_swizzle
-            && let SetLookup::Ready(set) = &lookup
-        {
-            let handles = Self::texture_handles(&requests, set);
-            let swizzles = Self::swizzles(&answers, &handles);
-            if self.swizzle_handles.len() < MAX_SWIZZLE_SETS
-                || self.swizzle_handles.contains_key(&requests)
-            {
-                self.swizzle_handles.insert(requests.clone(), handles);
+        if let SetLookup::Ready(set) = &lookup {
+            // With view swizzle `first_swizzles` is always empty, so its copy allocates
+            // nothing; without it the swizzles are computed once from the set's handles.
+            let swizzles = if caps.view_swizzle {
+                first_swizzles.clone()
+            } else {
+                let handles = Self::texture_handles(&requests, set);
+                let swizzles = Self::swizzles(&answers, &handles);
+                // A known set is updated in place; only a new one under the cap clones the
+                // request list for its key.
+                if let Some(known) = self.swizzle_handles.get_mut(&requests) {
+                    *known = handles;
+                } else if self.swizzle_handles.len() < MAX_SWIZZLE_SETS {
+                    self.swizzle_handles.insert(requests.clone(), handles);
+                }
+                swizzles
+            };
+            // Learning the stores allocates nothing for a known set: `set_stores` allocates
+            // nothing, and the remembered entry is updated in place. Only a new set under the
+            // cap clones the request list for its key.
+            let stores = Self::set_stores(&requests, set);
+            if let Some(known) = self.previous_stores.get_mut(&requests) {
+                *known = stores;
+            } else if self.previous_stores.len() < self.previous_stores_limit {
+                self.previous_stores.insert(requests.clone(), stores);
             }
-            if swizzles != first_swizzles {
-                lookup = ctx
-                    .shaders
-                    .lookup(&requests, &key_for(swizzles)?, &programs, &answers);
+            if swizzles != first_swizzles || stores != first_stores {
+                lookup =
+                    ctx.shaders
+                        .lookup(&requests, &key_for(swizzles, stores)?, &programs, &answers);
                 self.counters.lookups = self.counters.lookups.saturating_add(1);
             }
         }
