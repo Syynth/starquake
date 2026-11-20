@@ -100,55 +100,59 @@ fn hfma2_text_matches_nak_nvdisasm_cases() {
 // ---------------------------------------------------------------------------------------------
 // Hand-built words.
 
-/// One hand-built word of every form of the group, and its text. Fields: destination at 16,
-/// source 0 at 24, the wide slot at 32 (register, immediate, or a constant buffer's offset at 38
-/// and index at 54, or a uniform register with bit 91), the register slot at 64, a comparison at
-/// 76, predicate destinations at 81 and 84, the accumulator at 87.
-#[test]
-fn hand_built_words_of_each_form_decode() {
-    let cbuf: &[(u32, u128)] = &[(38, 8), (54, 1)];
+/// The destination r1 at 16 and source 0 r2 at 24.
+const DST_A: &[(u32, u128)] = &[(16, 1), (24, 2)];
+/// A bound constant buffer `c[0x1][0x8]`: offset 8 at 38, index 1 at 54.
+const CBUF: &[(u32, u128)] = &[(38, 8), (54, 1)];
+/// Source 0 r2, comparison 1 (`.lt`), destinations p1 at 81 and pt at 84, the accumulator PT.
+const PREDICATE_BASE: &[(u32, u128)] = &[(24, 2), (76, 1), (81, 1), (84, 7), (87, 7)];
+
+/// The fields of `base` and then `more`.
+fn with(base: &[(u32, u128)], more: &[(u32, u128)]) -> Vec<(u32, u128)> {
+    base.iter().chain(more).copied().collect()
+}
+
+/// Hand-built words of `HADD2`, `HFMA2` and `HMUL2`, one per form (and a bindless constant
+/// buffer), and their text.
+fn half_words() -> Vec<(Instruction, String)> {
     let mut cases: Vec<(Instruction, String)> = Vec::new();
     let mut push = |opcode: u128, fields: &[(u32, u128)], expected: &str| {
         cases.push((word(opcode, fields), expected.to_string()));
     };
-    let dst_a = [(16, 1), (24, 2)];
-    let with = |base: &[(u32, u128)], more: &[(u32, u128)]| -> Vec<(u32, u128)> {
-        base.iter().chain(more).copied().collect()
-    };
     // HADD2: the second operand in the wide slot.
-    push(0x230, &with(&dst_a, &[(32, 3)]), "hadd2 r1, r2, r3;");
+    push(0x230, &with(DST_A, &[(32, 3)]), "hadd2 r1, r2, r3;");
     push(
         0x430,
-        &with(&dst_a, &[(32, HALVES)]),
+        &with(DST_A, &[(32, HALVES)]),
         "hadd2 r1, r2, 0x3c004000;",
     );
-    push(0x630, &with(&dst_a, cbuf), "hadd2 r1, r2, c[0x1][0x8];");
+    push(0x630, &with(DST_A, CBUF), "hadd2 r1, r2, c[0x1][0x8];");
     push(
         0xe30,
-        &with(&dst_a, &[(32, 3), (91, 1)]),
+        &with(DST_A, &[(32, 3), (91, 1)]),
         "hadd2 r1, r2, ur3;",
     );
     // A bindless constant buffer, which PR #4588's translator refuses.
     push(
         0x630,
-        &with(&dst_a, &[(32, 5), (38, 8), (91, 1)]),
+        &with(DST_A, &[(32, 5), (38, 8), (91, 1)]),
         "hadd2 r1, r2, cx[ur5][0x8];",
     );
     // HFMA2 in its seven forms.
-    let hfma2 = with(&dst_a, &[(64, 4)]);
+    let hfma2 = with(DST_A, &[(64, 4)]);
     push(0x231, &with(&hfma2, &[(32, 3)]), "hfma2 r1, r2, r3, r4;");
     push(
         0x431,
         &with(&hfma2, &[(32, HALVES)]),
         "hfma2 r1, r2, r4, 0x3c004000;",
     );
-    push(0x631, &with(&hfma2, cbuf), "hfma2 r1, r2, r4, c[0x1][0x8];");
+    push(0x631, &with(&hfma2, CBUF), "hfma2 r1, r2, r4, c[0x1][0x8];");
     push(
         0x831,
         &with(&hfma2, &[(32, HALVES)]),
         "hfma2 r1, r2, 0x3c004000, r4;",
     );
-    push(0xa31, &with(&hfma2, cbuf), "hfma2 r1, r2, c[0x1][0x8], r4;");
+    push(0xa31, &with(&hfma2, CBUF), "hfma2 r1, r2, c[0x1][0x8], r4;");
     push(
         0xc31,
         &with(&hfma2, &[(32, 3), (91, 1)]),
@@ -160,20 +164,29 @@ fn hand_built_words_of_each_form_decode() {
         "hfma2 r1, r2, r4, ur3;",
     );
     // HMUL2: the second operand in source 1.
-    push(0x232, &with(&dst_a, &[(32, 3)]), "hmul2 r1, r2, r3;");
+    push(0x232, &with(DST_A, &[(32, 3)]), "hmul2 r1, r2, r3;");
     push(
         0x832,
-        &with(&dst_a, &[(32, HALVES)]),
+        &with(DST_A, &[(32, HALVES)]),
         "hmul2 r1, r2, 0x3c004000;",
     );
-    push(0xa32, &with(&dst_a, cbuf), "hmul2 r1, r2, c[0x1][0x8];");
+    push(0xa32, &with(DST_A, CBUF), "hmul2 r1, r2, c[0x1][0x8];");
     push(
         0xc32,
-        &with(&dst_a, &[(32, 3), (91, 1)]),
+        &with(DST_A, &[(32, 3), (91, 1)]),
         "hmul2 r1, r2, ur3;",
     );
+    cases
+}
+
+/// Hand-built words of the packed-half comparisons and `HMNMX2`, one per form, and their text.
+fn half_comparison_words() -> Vec<(Instruction, String)> {
+    let mut cases: Vec<(Instruction, String)> = Vec::new();
+    let mut push = |opcode: u128, fields: &[(u32, u128)], expected: &str| {
+        cases.push((word(opcode, fields), expected.to_string()));
+    };
     // HSET2, with .bf as NAK writes it, comparison 2 (.eq) and the accumulator PT.
-    let set_base = with(&dst_a, &[(71, 1), (76, 2), (87, 7)]);
+    let set_base = with(DST_A, &[(71, 1), (76, 2), (87, 7)]);
     push(
         0x233,
         &with(&set_base, &[(32, 3)]),
@@ -186,7 +199,7 @@ fn hand_built_words_of_each_form_decode() {
     );
     push(
         0x633,
-        &with(&set_base, cbuf),
+        &with(&set_base, CBUF),
         "hset2.bf.eq.and r1, r2, c[0x1][0x8], pt;",
     );
     push(
@@ -195,29 +208,28 @@ fn hand_built_words_of_each_form_decode() {
         "hset2.bf.eq.and r1, r2, ur3, pt;",
     );
     // HSETP2: comparison 1 (.lt), destinations p1 and pt, the accumulator PT.
-    let predicate_base = [(24, 2), (76, 1), (81, 1), (84, 7), (87, 7)];
     push(
         0x234,
-        &with(&predicate_base, &[(32, 3)]),
+        &with(PREDICATE_BASE, &[(32, 3)]),
         "hsetp2.lt.and p1, pt, r2, r3, pt;",
     );
     push(
         0x434,
-        &with(&predicate_base, &[(32, HALVES)]),
+        &with(PREDICATE_BASE, &[(32, HALVES)]),
         "hsetp2.lt.and p1, pt, r2, 0x3c004000, pt;",
     );
     push(
         0x634,
-        &with(&predicate_base, cbuf),
+        &with(PREDICATE_BASE, CBUF),
         "hsetp2.lt.and p1, pt, r2, c[0x1][0x8], pt;",
     );
     push(
         0xe34,
-        &with(&predicate_base, &[(32, 3), (91, 1)]),
+        &with(PREDICATE_BASE, &[(32, 3), (91, 1)]),
         "hsetp2.lt.and p1, pt, r2, ur3, pt;",
     );
     // HMNMX2 with the predicate p1.
-    let hmnmx2 = with(&dst_a, &[(87, 1)]);
+    let hmnmx2 = with(DST_A, &[(87, 1)]);
     push(0x240, &with(&hmnmx2, &[(32, 3)]), "hmnmx2 r1, r2, r3, p1;");
     push(
         0x840,
@@ -226,7 +238,7 @@ fn hand_built_words_of_each_form_decode() {
     );
     push(
         0xa40,
-        &with(&hmnmx2, cbuf),
+        &with(&hmnmx2, CBUF),
         "hmnmx2 r1, r2, c[0x1][0x8], p1;",
     );
     push(
@@ -234,47 +246,56 @@ fn hand_built_words_of_each_form_decode() {
         &with(&hmnmx2, &[(32, 3), (91, 1)]),
         "hmnmx2 r1, r2, ur3, p1;",
     );
+    cases
+}
+
+/// Hand-built words of the double instructions, one per form, and their text.
+fn double_words() -> Vec<(Instruction, String)> {
+    let mut cases: Vec<(Instruction, String)> = Vec::new();
+    let mut push = |opcode: u128, fields: &[(u32, u128)], expected: &str| {
+        cases.push((word(opcode, fields), expected.to_string()));
+    };
     // DADD: the second operand in source 2, the register slot in form 1.
-    push(0x229, &with(&dst_a, &[(64, 4)]), "dadd r1, r2, r4;");
+    push(0x229, &with(DST_A, &[(64, 4)]), "dadd r1, r2, r4;");
     push(
         0x429,
-        &with(&dst_a, &[(32, DOUBLE_ONE)]),
+        &with(DST_A, &[(32, DOUBLE_ONE)]),
         "dadd r1, r2, 0x3ff00000;",
     );
-    push(0x629, &with(&dst_a, cbuf), "dadd r1, r2, c[0x1][0x8];");
+    push(0x629, &with(DST_A, CBUF), "dadd r1, r2, c[0x1][0x8];");
     push(
         0xe29,
-        &with(&dst_a, &[(32, 3), (91, 1)]),
+        &with(DST_A, &[(32, 3), (91, 1)]),
         "dadd r1, r2, ur3;",
     );
     // DMUL: the second operand in source 1.
-    push(0x228, &with(&dst_a, &[(32, 3)]), "dmul r1, r2, r3;");
+    push(0x228, &with(DST_A, &[(32, 3)]), "dmul r1, r2, r3;");
     push(
         0x828,
-        &with(&dst_a, &[(32, DOUBLE_ONE)]),
+        &with(DST_A, &[(32, DOUBLE_ONE)]),
         "dmul r1, r2, 0x3ff00000;",
     );
-    push(0xa28, &with(&dst_a, cbuf), "dmul r1, r2, c[0x1][0x8];");
+    push(0xa28, &with(DST_A, CBUF), "dmul r1, r2, c[0x1][0x8];");
     push(
         0xc28,
-        &with(&dst_a, &[(32, 3), (91, 1)]),
+        &with(DST_A, &[(32, 3), (91, 1)]),
         "dmul r1, r2, ur3;",
     );
     // DFMA in its seven forms.
-    let dfma = with(&dst_a, &[(64, 4)]);
+    let dfma = with(DST_A, &[(64, 4)]);
     push(0x22b, &with(&dfma, &[(32, 3)]), "dfma r1, r2, r3, r4;");
     push(
         0x42b,
         &with(&dfma, &[(32, DOUBLE_ONE)]),
         "dfma r1, r2, r4, 0x3ff00000;",
     );
-    push(0x62b, &with(&dfma, cbuf), "dfma r1, r2, r4, c[0x1][0x8];");
+    push(0x62b, &with(&dfma, CBUF), "dfma r1, r2, r4, c[0x1][0x8];");
     push(
         0x82b,
         &with(&dfma, &[(32, DOUBLE_ONE)]),
         "dfma r1, r2, 0x3ff00000, r4;",
     );
-    push(0xa2b, &with(&dfma, cbuf), "dfma r1, r2, c[0x1][0x8], r4;");
+    push(0xa2b, &with(&dfma, CBUF), "dfma r1, r2, c[0x1][0x8], r4;");
     push(
         0xc2b,
         &with(&dfma, &[(32, 3), (91, 1)]),
@@ -288,24 +309,34 @@ fn hand_built_words_of_each_form_decode() {
     // DSETP: as HSETP2.
     push(
         0x22a,
-        &with(&predicate_base, &[(32, 3)]),
+        &with(PREDICATE_BASE, &[(32, 3)]),
         "dsetp.lt.and p1, pt, r2, r3, pt;",
     );
     push(
         0x42a,
-        &with(&predicate_base, &[(32, DOUBLE_ONE)]),
+        &with(PREDICATE_BASE, &[(32, DOUBLE_ONE)]),
         "dsetp.lt.and p1, pt, r2, 0x3ff00000, pt;",
     );
     push(
         0x62a,
-        &with(&predicate_base, cbuf),
+        &with(PREDICATE_BASE, CBUF),
         "dsetp.lt.and p1, pt, r2, c[0x1][0x8], pt;",
     );
     push(
         0xe2a,
-        &with(&predicate_base, &[(32, 3), (91, 1)]),
+        &with(PREDICATE_BASE, &[(32, 3), (91, 1)]),
         "dsetp.lt.and p1, pt, r2, ur3, pt;",
     );
+    cases
+}
+
+/// One hand-built word of every form of the group, and its text. Fields: destination at 16,
+/// source 0 at 24, the wide slot at 32 (register, immediate, or a constant buffer's offset at 38
+/// and index at 54, or a uniform register with bit 91), the register slot at 64, a comparison at
+/// 76, predicate destinations at 81 and 84, the accumulator at 87.
+#[test]
+fn hand_built_words_of_each_form_decode() {
+    let cases = [half_words(), half_comparison_words(), double_words()].concat();
     let mut opcodes: Vec<u16> = Vec::new();
     for (word, expected) in &cases {
         assert_eq!(text(*word), *expected, "{:#x}", word.bits());
