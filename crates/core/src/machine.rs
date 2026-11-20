@@ -870,6 +870,13 @@ pub(crate) fn run<V: Vcpu, C: HostClock + Clone + 'static>(
 }
 
 /// [`run`], its GPU drawing with the backend `render` chose (`crate::renderer`): a real run's.
+#[cfg_attr(
+    all(test, not(all(target_os = "macos", target_arch = "aarch64"))),
+    expect(
+        dead_code,
+        reason = "only the hypervisor backend runs a real program; the tests run through `run`"
+    )
+)]
 pub(crate) fn run_rendering<V: Vcpu, C: HostClock + Clone + 'static>(
     vcpus: Vcpus<'_, V>,
     guest: GuestProgram<'_, V>,

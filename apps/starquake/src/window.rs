@@ -4,10 +4,10 @@
 //!
 //! The process's main thread owns the window and its event loop (`winit` 0.30). The run goes to
 //! a thread of its own ([`RUN_THREAD`], with [`RUN_STACK`] bytes of stack), drawing with the wgpu
-//! backend ([`RenderSetup::windowed`]), and hands the window's handles to the backend: the
-//! backend makes the window's surface on the main thread, which on macOS is the only thread
-//! allowed to (render-backend, "Present targets"), through a job posted to the event loop
-//! ([`MainThread`]). When the run ends, its thread wakes the event loop, which closes the window
+//! backend (`starquake_core::renderer::RenderSetup::windowed`), and hands the window's handles to
+//! the backend: the backend makes the window's surface on the main thread, which on macOS is the
+//! only thread allowed to (render-backend, "Present targets"), through a job posted to the event
+//! loop (`starquake_core::renderer::MainThread`). When the run ends, its thread wakes the event loop, which closes the window
 //! and returns the run's report.
 //!
 //! What the window does, all of it outside what the guest sees (the guest is paced by the
@@ -43,9 +43,8 @@
 
 use std::time::Instant;
 
-use starquake_core::renderer::RenderSetup;
 #[cfg(feature = "wgpu")]
-use starquake_core::renderer::{MainThread, WindowTarget};
+use starquake_core::renderer::{MainThread, RenderSetup, WindowTarget};
 use starquake_core::{RunOptions, RunReport, System};
 
 /// Why `--window` refused to make a window: not on the main thread (module docs).
