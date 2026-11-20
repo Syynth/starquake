@@ -71,11 +71,12 @@
 //! # Usage, and which answers carry the format
 //!
 //! [`Question::TextureKind`] says how the program uses the handle ([`TextureUsage`]), so a
-//! shader is specialised on the header's format bits only for a use that reads them as the
-//! spec says, image use (spec, "Translation inputs: questions and answers"; decided by the
-//! owner, 2026-11-19, ruling 7; Eden's one other read is below, under "Where Eden reads the
-//! format, and the divergences"). [`EngineState::texture_kind`] keeps the sketch's signature and reports the whole
-//! [`TextureKind`] whatever the usage; the exchange records it through [`TextureKind::for_usage`]:
+//! shader is specialised on the header's format bits only for the use the spec says reads them,
+//! image use (spec, "Translation inputs: questions and answers"; decided by the owner,
+//! 2026-11-19, ruling 7). Eden reads them elsewhere, for one fetch, and not for image use: see
+//! "Where Eden reads the format, and the divergences" below. [`EngineState::texture_kind`]
+//! keeps the sketch's signature and reports the whole [`TextureKind`] whatever the usage; the
+//! exchange records it through [`TextureKind::for_usage`]:
 //!
 //! - [`TextureUsage::Sampled`]: the format is replaced by [`TextureFormat::UNREAD`], so two
 //!   headers that differ only in their format bits, with the same kind, give equal answers and
