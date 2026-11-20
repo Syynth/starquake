@@ -1815,3 +1815,30 @@ fn a_flipped_viewport_meets_the_position_bound_after_the_flip() {
         Err(RenderError::Unsupported(VIEWPORT))
     );
 }
+
+/// `check::graphics_info` takes `flipped_viewport` from the pipeline's own
+/// `EmulationFlags::FLIPPED_VIEWPORT`, with no GPU: the plan comes from the pure
+/// `pipeline::state::graphics`. The flag alone sets it, every other flag without it does not, so
+/// a read of another flag (or a constant) fails here and not only in the local GPU test
+/// `a_flipped_viewport_draws_the_upright_pixels`.
+#[test]
+fn graphics_info_reads_the_flipped_viewport_flag() {
+    use crate::fixtures::graphics_desc;
+    use starquake_render::pipeline::EmulationFlags;
+    let others = EmulationFlags::ALL.difference(EmulationFlags::FLIPPED_VIEWPORT);
+    for (flags, expected) in [
+        (EmulationFlags::EMPTY, false),
+        (EmulationFlags::FLIPPED_VIEWPORT, true),
+        (others, false),
+        (EmulationFlags::ALL, true),
+    ] {
+        let mut desc = graphics_desc(
+            starquake_render::ShaderId::new(0, 0),
+            Some(starquake_render::ShaderId::new(1, 0)),
+        );
+        desc.emulation = flags;
+        let plan = crate::pipeline::state::graphics(&desc).expect("a plain description plans");
+        let info = check::graphics_info(&desc, &plan, LayoutInfo { groups: vec![] });
+        assert_eq!(info.flipped_viewport, expected, "{flags:?}");
+    }
+}

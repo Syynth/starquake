@@ -86,9 +86,13 @@
 //! 2026-11-19; the render crate's `emulation` module docs give the arithmetic). What is still
 //! refused, with [`VIEWPORT`]: a flipped viewport for a pipeline without the flag (its shader
 //! does not flip, so drawing would land on the wrong rows), a negative width, a depth outside
-//! 0..=1, and a size or position past the device's range after the flip. Pinned by
+//! 0..=1 (whether the shader should remap one instead, as the spec's row says, is an open owner
+//! question: the render crate's `emulation` module docs, "A depth outside 0..=1"), and a size or
+//! position past the device's range after the flip. Pinned by
 //! `draw::tests::a_flipped_viewport_is_set_positive_only_for_a_flipped_pipeline` and, on a real
-//! GPU, `backend::tests::draws::a_flipped_viewport_draws_the_upright_pixels`.
+//! GPU, `backend::tests::draws::a_flipped_viewport_draws_the_upright_pixels`; that the check
+//! reads the pipeline's own flag is pinned with no GPU by
+//! `draw::tests::graphics_info_reads_the_flipped_viewport_flag`.
 //!
 //! # The checks
 //!
