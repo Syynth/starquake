@@ -664,14 +664,27 @@ a first-in, first-out list of (`FenceValue`, fenced actions).
 
 When `Backend::completed()` passes a list's fence, the back performs its actions in order:
 writes the release (4 or 16 bytes, with the timestamp for 16-byte releases, row 52; the
-timestamp is guest time from the kernel's clock, which `core` passes through the `Gpu`'s config,
-so a replay writes the same value; decided by the owner, 2026-11-19), or applies the reduction;
+timestamp is guest time from the kernel's clock, so a replay writes the same value; decided by
+the owner, 2026-11-19), or applies the reduction;
 latches any registered waiter the new value satisfies; increments `Syncpoints` (which pushes
 `GpuCompletion::SyncpointChanged` to gsv's completion queue when the counter is watched);
 reports markers. Then it wakes the front if anything was latched or reported.
 Completions are batched: one wake for all actions of all lists completed at that point (row 124;
 the owner's decision: "several are batched into one completion check"). Performing these at
 record time instead is kept only as a debugging switch.
+
+**The release timestamp's unit and clock** (decided by the owner, 2026-11-20). The timestamp is
+counted in guest GPU timer ticks at 614.4 MHz, from guest time's zero: Eden's `GPUTickFreq`
+(`eden-nx2/src/common/cpu_features.h` @ 50fa86bb, "GM20B GPU Tick Frequency = 614.4 MHz"),
+which Eden-NX2's `GPU::GetTicks` gives the 16-byte writes. The kernel owns the conversion from
+guest time (`starquake_kernel::time::gpu_ticks_at`, `GPU_TIMER_HZ`). The rate is a **guess** for
+Switch 2: it is the Switch 1 GPU's, both Switch 2 references keep it unchanged, and no source
+gives the Switch 2 timer's rate; a hardware trace of two 16-byte releases a known guest time
+apart would confirm or replace it. The timer counts at its full rate, as under Eden-NX2's
+`GpuClock::Normal`, not divided by the default `GpuClock::Boost` multiplier (a listed divergence
+in the kernel's `time` module). The clock reaches the back thread as `GpuParts::fence_clock` in
+`core` (`GpuDeps::fence_clock` in this crate), not through `GpuConfig`: `GpuConfig` is `Copy +
+Eq` settings, and a shared clock is neither.
 
 **How the back thread sleeps** (decided by the owner, 2026-11-18; render-backend, "The completion
 wake"). The back thread sleeps on the ring's wake-up, which both the front's publish and the

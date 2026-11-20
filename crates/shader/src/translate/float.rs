@@ -179,12 +179,12 @@ use std::fmt::{self, Display, Formatter};
 
 use thiserror::Error;
 
+use super::source;
 use crate::decode::{
     AluSrc, CBuf, CBufRef, FMulScale, FSwzAddOp, FloatCmpOp, FloatType, Gpr, Instr, IntType,
     MuFuOp, Op, OpF2F, OpF2FP, OpF2I, OpFAdd, OpFFma, OpFMnMx, OpFMul, OpFRnd, OpFSel, OpFSet,
     OpFSetP, OpFSwzAdd, OpI2FP, OpMuFu, Pred, PredSetOp, PredSrc, RoundMode,
 };
-use crate::flow::read_pred;
 use crate::ir::{
     BuildError, Builder, Flags, FmzMode, FpControl, FpRounding, Function, Imm, Inst, Opcode,
     Operand,
@@ -194,8 +194,9 @@ use crate::ir::{
 /// (`visitor.cpp`, `Visitor::Cbuf`: "native constant buffer address").
 pub const CBUF_BANKS: u8 = 32;
 /// The bytes of a constant-buffer word: a byte offset that is not a multiple of it is read as
-/// the 32 bits starting there, from two aligned words (`Visitor::Cbuf`: `byte_offset % 4`).
-pub const CBUF_WORD_BYTES: u16 = 4;
+/// the 32 bits starting there, from two aligned words (`Visitor::Cbuf`: `byte_offset % 4`;
+/// the shared source reader's constant).
+pub use super::source::CBUF_WORD_BYTES;
 /// What `FSET` writes when its comparison holds: `1.0` (`ops_alu.cpp`, `FSET`:
 /// `Imm32(0x3f800000U)`).
 pub const FSET_TRUE: u32 = 0x3f80_0000;
@@ -788,6 +789,12 @@ struct Emit<'b, 'f> {
     b: &'b mut Builder<'f>,
 }
 
+impl source::Emit for Emit<'_, '_> {
+    fn emit_op(&mut self, opcode: Opcode, args: &[Operand]) -> Result<Operand, BuildError> {
+        Ok(self.b.op(opcode, args)?.into())
+    }
+}
+
 impl Emit<'_, '_> {
     fn op(&mut self, op: &Op) -> Result<(), FloatError> {
         match *op {
@@ -823,12 +830,9 @@ impl Emit<'_, '_> {
         Ok(self.b.op_with(opcode, args, Flags::Fp(control))?.into())
     }
 
-    /// A register's raw bits; `RZ` reads zero (`Visitor::X`).
+    /// A register's raw bits; `RZ` reads zero (`Visitor::X`, the shared reader).
     fn get(&mut self, reg: Gpr) -> Result<Operand, FloatError> {
-        if reg.is_zero() {
-            return Ok(imm32(0));
-        }
-        self.emit(Opcode::GetRegister, &[Operand::Imm(Imm::Reg(reg))])
+        Ok(source::reg(self, reg)?)
     }
 
     /// Writes a register's raw bits; a write to `RZ` is dropped (`Visitor::X`).
@@ -849,41 +853,10 @@ impl Emit<'_, '_> {
         self.emit(Opcode::BitCastF32U32, &[bits])
     }
 
-    /// A constant-buffer word at a byte offset (`Visitor::Cbuf`).
-    fn cbuf(&mut self, bank: u8, offset: u16) -> Result<Operand, FloatError> {
-        let bank = imm32(u32::from(bank));
-        let skew = offset % CBUF_WORD_BYTES;
-        let aligned = u32::from(offset - skew);
-        if skew == 0 {
-            return self.emit(Opcode::GetCbufU32, &[bank, imm32(aligned)]);
-        }
-        let skew_bits = u32::from(skew) * u8::BITS;
-        let next = aligned + u32::from(CBUF_WORD_BYTES);
-        let low = self.emit(Opcode::GetCbufU32, &[bank, imm32(aligned)])?;
-        let high = self.emit(Opcode::GetCbufU32, &[bank, imm32(next)])?;
-        let low = self.emit(Opcode::ShiftRightLogical32, &[low, imm32(skew_bits)])?;
-        let high = self.emit(
-            Opcode::ShiftLeftLogical32,
-            &[high, imm32(u32::BITS - skew_bits)],
-        )?;
-        self.emit(Opcode::BitwiseOr32, &[low, high])
-    }
-
-    /// A source's raw bits, without modifiers (`Visitor::Value`).
+    /// A source's raw bits, without modifiers (`Visitor::Value`, the shared reader); a constant
+    /// buffer named by a uniform register is refused.
     fn value(&mut self, src: AluSrc) -> Result<Operand, FloatError> {
-        match src {
-            AluSrc::Reg { reg, .. } => self.get(reg),
-            AluSrc::UniformReg { reg, .. } if reg.is_zero() => Ok(imm32(0)),
-            AluSrc::UniformReg { reg, .. } => self.emit(
-                Opcode::GetUniformRegister,
-                &[Operand::Imm(Imm::UniformReg(reg))],
-            ),
-            AluSrc::Imm(bits) => Ok(imm32(bits)),
-            AluSrc::CBuf { cbuf, .. } => match cbuf.buf {
-                CBuf::Binding(bank) => self.cbuf(bank, cbuf.offset),
-                CBuf::BindlessUniform(_) => Err(FloatUnsupported::BindlessConstantBuffer.into()),
-            },
-        }
+        source::alu_bits(self, src)?.ok_or_else(|| FloatUnsupported::BindlessConstantBuffer.into())
     }
 
     /// Takes the absolute value, then negates (Eden's `FPAbsNeg`).
@@ -951,7 +924,7 @@ impl Emit<'_, '_> {
 
     /// A predicate's value (`Visitor::Pred`): `PT` is an immediate.
     fn pred(&mut self, src: PredSrc) -> Result<Operand, FloatError> {
-        Ok(read_pred(self.b, src)?)
+        Ok(source::pred(self, src)?)
     }
 
     /// Writes a predicate; a write to `PT` is dropped (`Visitor::SetPred`).

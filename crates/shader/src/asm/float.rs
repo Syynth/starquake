@@ -8,7 +8,7 @@
 //! A field the operation's form has no bits for is refused ([`EncodeError::NoBits`]) rather
 //! than dropped, so that every value the assembler accepts decodes back to itself.
 
-use super::{Encode, EncodeError, Writer};
+use super::{Encode, EncodeError, Writer, wide_operand};
 use crate::decode::control::{COND, COND_NOT, PRED_DST};
 use crate::decode::float::{
     CMP_OP, CVT_DST_SIZE, CVT_SRC_SIZE, DNZ, F2F_OPCODE, F2F_WIDE_OPCODE, F2FP_C, F2FP_H1,
@@ -92,11 +92,7 @@ impl Encode for OpFAdd {
     /// ZERO, b)`; the register slot `b` leaves is [`OpFAdd::ignored`].
     fn encode(&self, writer: &mut Writer) -> Result<(), EncodeError> {
         let [a, b] = self.srcs;
-        let sources = if matches!(b, AluSrc::Reg { .. }) {
-            [Some(a), Some(b), None]
-        } else {
-            [Some(a), None, Some(b)]
-        };
+        let sources = wide_operand(a, b, matches!(b, AluSrc::Reg { .. }));
         writer.alu(Self::MNEMONIC, FADD_OPCODE, sources, true)?;
         writer.gpr(DST, self.dst);
         writer.gpr(SRC2, self.ignored);
