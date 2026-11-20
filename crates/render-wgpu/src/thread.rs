@@ -32,10 +32,14 @@
 //! refuses a readback whose padded read would not fit the largest buffer), and the padding is
 //! stripped when the bytes are copied out ([`unpad`]).
 //!
-//! A clear of a whole level clears each layer (or slice) in a render pass of its own; a clear of
-//! a rectangle clears a scratch texture once and copies the rectangle from it into each layer,
-//! since wgpu clears only whole attachments (the shared checks keep that path to colour,
-//! single-sampled views, [`crate::rules::check_clear_area`]). One list's rectangle clears share
+//! A clear is done as the check pass decided ([`crate::clear::clear_how`]). A clear of a whole
+//! level with every channel and stencil bit clears each layer (or slice) in a render pass of its
+//! own; an unmasked clear of a rectangle of a single-sampled colour view clears a scratch texture
+//! once and copies the rectangle from it into each layer, since wgpu clears only whole
+//! attachments; any other clear (masked, or a rectangle of a depth, stencil or multisampled
+//! view) draws the clear shader into each layer ([`crate::clear`]). A drawn clear writes its
+//! value into the clear shader's parameter buffer with `Queue::write_buffer`, so, like an
+//! upload, it first submits what the encoder holds. One list's rectangle clears share
 //! one scratch texture per view format, made on the first such clear, as wide as the widest and
 //! as tall as the tallest rectangle the list clears in that format ([`scratch_sizes`]), so a list
 //! holds at most one scratch per format however many rectangles it clears. The scratch textures
@@ -70,6 +74,7 @@
 mod pass;
 
 use crate::backend::Shared;
+use crate::clear::{Area, ClearHow, Drawer};
 use crate::convert::TextureSpec;
 use crate::draw::DrawLimits;
 use crate::draw::RewriteScratch;
@@ -306,6 +311,8 @@ struct Render {
     limits: DrawLimits,
     /// The index rewrite's pipeline, made on the first rewrite.
     rewrite: Option<IndexRewrite>,
+    /// The drawn clears' objects ([`crate::clear`]), made on the first drawn clear.
+    clears: Option<Drawer>,
 }
 
 /// What the thread does next.
@@ -345,6 +352,7 @@ pub fn start(
         presenter: Presenter::new(),
         limits,
         rewrite: None,
+        clears: None,
     };
     std::thread::Builder::new()
         .name("starquake-render".into())
@@ -607,11 +615,19 @@ impl Render {
         for (index, step) in work.steps.into_iter().enumerate() {
             let queued = frame_outcome(Some(index) == last_present, work.newer_queued);
             let upload = matches!(step, Step::WriteBuffer { .. } | Step::WriteTexture { .. });
+            // A drawn clear writes its value through the queue, as an upload does (module docs).
+            let drawn = matches!(
+                step,
+                Step::Clear(ClearStep {
+                    how: ClearHow::Draw(_),
+                    ..
+                })
+            );
             // Every command but a draw closes the render pass (`crate::draw`, "Render passes").
             if !matches!(step, Step::Draw(_)) {
                 rec.close();
             }
-            if upload && recorded {
+            if (upload || drawn) && recorded {
                 let finished = std::mem::replace(&mut encoder, self.encoder());
                 self.queue.submit([finished.finish()]);
             }
@@ -828,10 +844,19 @@ impl Render {
         )
     }
 
-    fn clear(&self, encoder: &mut wgpu::CommandEncoder, step: &ClearStep, scratch: &mut Scratch) {
-        let Some(texture) = self.texture(step.texture) else {
+    fn clear(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        step: &ClearStep,
+        scratch: &mut Scratch,
+    ) {
+        if step.how == ClearHow::Nothing {
+            return;
+        }
+        let Some(texture) = self.texture(step.texture).cloned() else {
             return;
         };
+        let texture = &texture;
         let (dimension, first, count, sliced) = match step.layers {
             Layers::Array { first, count } => (wgpu::TextureViewDimension::D2, first, count, false),
             Layers::Slices { count } => (wgpu::TextureViewDimension::D3, 0, count, true),
@@ -850,6 +875,26 @@ impl Render {
             })
         };
         let end = first.saturating_add(count);
+        if let ClearHow::Draw(drawn) = &step.how {
+            if self.clears.is_none() {
+                self.clears = Drawer::new(&self.device);
+            }
+            let Some(drawer) = self.clears.as_mut() else {
+                self.shared.host_error(&"the clear shader did not parse");
+                return;
+            };
+            self.queue.write_buffer(drawer.params(), 0, &drawn.params);
+            let area = Area {
+                size: step.size,
+                rect: step.rect,
+            };
+            for z in first..end {
+                let (layer, slice) = if sliced { (0, Some(z)) } else { (z, None) };
+                let target = view(texture, layer, step.mip);
+                drawer.draw(&self.device, encoder, (&target, slice), drawn, area);
+            }
+            return;
+        }
         let Some(rect) = step.rect else {
             for z in first..end {
                 let (layer, slice) = if sliced { (0, Some(z)) } else { (z, None) };
@@ -1212,6 +1257,7 @@ pub fn scratch_sizes(steps: &[Step]) -> HashMap<wgpu::TextureFormat, (u32, u32)>
         if let Step::Clear(ClearStep {
             format,
             rect: Some(rect),
+            how: ClearHow::Scratch,
             ..
         }) = step
         {

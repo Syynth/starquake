@@ -300,12 +300,27 @@ impl Store {
         }
     }
 
-    /// Writes `texel` over and over into the bytes `rows` covers; each row must be whole texels.
-    pub(super) fn fill(&mut self, rows: &Rows, texel: &[u8]) -> Result<(), RenderError> {
+    /// Writes `texel` over and over into the bytes `rows` covers, each row whole texels, through
+    /// `written`, which gives for each byte of a texel the bits written (`0xff` for a byte
+    /// written whole). A written bit takes the texel's bit and a bit left out keeps its value. A
+    /// byte is known after the write when all its bits were written or it was known before,
+    /// since then every bit of it is known; a byte partly written over unknown bits stays
+    /// unknown.
+    pub(super) fn fill(
+        &mut self,
+        rows: &Rows,
+        texel: &[u8],
+        written: &[u8],
+    ) -> Result<(), RenderError> {
         rows.check(self.len)?;
         if texel.is_empty() || !rows.row_bytes.is_multiple_of(texel.len()) {
             return Err(RenderError::Invalid(
                 "a recorded fill does not cover whole texels",
+            ));
+        }
+        if written.len() != texel.len() {
+            return Err(RenderError::Invalid(
+                "a recorded fill's write mask is not one texel long",
             ));
         }
         let data = self.data_mut();
@@ -317,10 +332,16 @@ impl Store {
             ) else {
                 return Err(overflow());
             };
-            for chunk in dst_b.chunks_exact_mut(texel.len()) {
-                chunk.copy_from_slice(texel);
+            let texels = dst_b
+                .chunks_exact_mut(texel.len())
+                .zip(dst_k.chunks_exact_mut(texel.len()));
+            for (bytes, known) in texels {
+                let each = bytes.iter_mut().zip(known).zip(texel).zip(written);
+                for (((byte, known), &new), &mask) in each {
+                    *byte = (*byte & !mask) | (new & mask);
+                    *known = *known || mask == u8::MAX;
+                }
             }
-            dst_k.fill(true);
         }
         Ok(())
     }
@@ -486,7 +507,8 @@ mod tests {
             depth: 1,
         };
         let rows = Rows::blocks(SHAPE, area).expect("inside");
-        s.fill(&rows, &[0xab, 0xcd]).expect("whole texels");
+        s.fill(&rows, &[0xab, 0xcd], &[0xff, 0xff])
+            .expect("whole texels");
         assert_eq!(
             s.gather(&Rows::range(0, 8, s.len()).expect("fits")),
             Ok(Packed::Data {
@@ -495,16 +517,55 @@ mod tests {
             })
         );
         assert_eq!(
-            s.fill(&rows, &[1, 2, 3]),
+            s.fill(&rows, &[1, 2, 3], &[0xff; 3]),
             Err(RenderError::Invalid(
                 "a recorded fill does not cover whole texels"
             ))
         );
         assert_eq!(
-            s.fill(&rows, &[]),
+            s.fill(&rows, &[], &[]),
             Err(RenderError::Invalid(
                 "a recorded fill does not cover whole texels"
             ))
+        );
+        // A mask one byte short or long of the texel, on texels that would otherwise fit.
+        for written in [&[0xff][..], &[0xff, 0xff, 0xff]] {
+            assert_eq!(
+                s.fill(&rows, &[1, 2], written),
+                Err(RenderError::Invalid(
+                    "a recorded fill's write mask is not one texel long"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn a_masked_fill_writes_only_its_bits_and_knows_only_whole_or_known_bytes() {
+        let mut s = Store::new(SHAPE.len().expect("small"));
+        let all = Rows::range(0, 8, s.len()).expect("fits");
+        // Bytes 0..4 known as 0x0f each; bytes 4..8 never written.
+        let first_half = Rows::range(0, 4, s.len()).expect("fits");
+        s.fill(&first_half, &[0x0f], &[0xff]).expect("known part");
+        // Texels of two bytes over all eight: the first byte written whole, the second through
+        // its high nibble.
+        s.fill(&all, &[0xa5, 0xc3], &[0xff, 0xf0]).expect("masked");
+        assert_eq!(
+            s.gather(&all),
+            Ok(Packed::Data {
+                // Byte 1 and 3 keep their known low nibble 0xf; bytes 5 and 7 keep their unknown
+                // (zero) low nibble.
+                bytes: vec![0xa5, 0xcf, 0xa5, 0xcf, 0xa5, 0xc0, 0xa5, 0xc0],
+                known: vec![true, true, true, true, true, false, true, false],
+            })
+        );
+        // A mask of nothing changes nothing, known or not.
+        s.fill(&all, &[0x11, 0x22], &[0, 0]).expect("nothing");
+        assert_eq!(
+            s.gather(&all),
+            Ok(Packed::Data {
+                bytes: vec![0xa5, 0xcf, 0xa5, 0xcf, 0xa5, 0xc0, 0xa5, 0xc0],
+                known: vec![true, true, true, true, true, false, true, false],
+            })
         );
     }
 

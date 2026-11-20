@@ -443,18 +443,10 @@ fn clears_write_what_the_recording_backend_knows() {
             };
             let mut list = vec![
                 upload(pattern(bytes, 21), region(tex, 0, (0, 0, 0), (8, 4, 1))),
-                Command::Clear(ClearDesc {
-                    target: view,
-                    value,
-                    rect: Some(partial),
-                }),
+                Command::Clear(ClearDesc::unmasked(view, value, Some(partial))),
             ];
             list.push(p.readback(region(tex, 0, (0, 0, 0), (8, 4, 1))));
-            list.push(Command::Clear(ClearDesc {
-                target: view,
-                value,
-                rect: None,
-            }));
+            list.push(Command::Clear(ClearDesc::unmasked(view, value, None)));
             list.push(p.readback(region(tex, 0, (0, 0, 0), (8, 4, 1))));
             assert_eq!(p.run(list), Ok(()), "{format}");
         }
@@ -502,21 +494,17 @@ fn clears_write_the_layers_and_slices_of_their_view() {
                 pattern(4 * 4 * 3 * 4, 29),
                 region(deep, 0, (0, 0, 0), (4, 4, 3)),
             ),
-            Command::Clear(ClearDesc {
-                target: layers,
+            Command::Clear(ClearDesc::unmasked(
+                layers,
                 value,
-                rect: Some(Rect {
+                Some(Rect {
                     x: 1,
                     y: 1,
                     width: 2,
                     height: 3,
                 }),
-            }),
-            Command::Clear(ClearDesc {
-                target: slices,
-                value,
-                rect: None,
-            }),
+            )),
+            Command::Clear(ClearDesc::unmasked(slices, value, None)),
         ];
         list.push(p.readback(region(array, 0, (0, 0, 0), (4, 4, 5))));
         list.push(p.readback(region(deep, 0, (0, 0, 0), (4, 4, 3))));
@@ -547,11 +535,7 @@ fn an_upload_lands_after_the_commands_before_it() {
         let b = p.buffer(64);
         let mut list = vec![
             // A clear, then an upload into part of what it cleared: the upload wins there.
-            Command::Clear(ClearDesc {
-                target: view,
-                value: ClearValue::Float([0.0; 4]),
-                rect: None,
-            }),
+            Command::Clear(ClearDesc::unmasked(view, ClearValue::Float([0.0; 4]), None)),
             upload(pattern(2 * 2 * 4, 31), region(tex, 0, (1, 1, 0), (2, 2, 1))),
             // An upload, a copy of it, then a second upload: the copy holds the first.
             upload(pattern(64, 37), slice(a, 0, 64)),
@@ -733,11 +717,7 @@ fn random_command(
             };
             let r = area(rng);
             let rect = (rng.below(2) == 0).then_some(r);
-            Command::Clear(ClearDesc {
-                target,
-                value,
-                rect,
-            })
+            Command::Clear(ClearDesc::unmasked(target, value, rect))
         }
     }
 }
@@ -919,21 +899,21 @@ fn the_queue_holds_at_most_its_depth() {
             .expect("view");
         let mut last = FenceValue::ZERO;
         for n in 0..12 {
-            let clear = Command::Clear(ClearDesc {
-                target: view,
-                value: ClearValue::Float([
+            let clear = Command::Clear(ClearDesc::unmasked(
+                view,
+                ClearValue::Float([
                     f32::from(u8::try_from(n).expect("small")) / 16.0,
                     0.0,
                     0.0,
                     1.0,
                 ]),
-                rect: Some(Rect {
+                Some(Rect {
                     x: 1,
                     y: 1,
                     width: 1000,
                     height: 1000,
                 }),
-            });
+            ));
             last = gpu
                 .submit(CommandList {
                     commands: vec![clear],
@@ -1471,11 +1451,7 @@ fn depth_and_stencil_texels_copy_as_wgpu_allows() {
             upload(pattern(2048, 47), region(d16, 0, (0, 0, 0), (128, 4, 2))),
             upload(pattern(512, 53), region(s8, 0, (0, 0, 0), (256, 2, 1))),
             upload(pattern(32, 57), region(line, 0, (0, 0, 0), (8, 1, 2))),
-            Command::Clear(ClearDesc {
-                target: d32_view,
-                value: ClearValue::Depth(0.25),
-                rect: None,
-            }),
+            Command::Clear(ClearDesc::unmasked(d32_view, ClearValue::Depth(0.25), None)),
             // Out of each into the buffer at offsets on 4 bytes, then into D16, S8 and the
             // one-row texture from it.
             Command::Copy(CopyDesc {
@@ -1628,16 +1604,16 @@ fn a_lists_rectangle_clears_share_one_scratch_per_format() {
             &whole_view(PixelFormat::R32Uint, ViewDimension::D2, (0, 1)),
         );
         let rect = |target, n: u32, x, y, width, height| {
-            Command::Clear(ClearDesc {
+            Command::Clear(ClearDesc::unmasked(
                 target,
-                value: ClearValue::Uint([n, n + 1, n + 2, n + 3]),
-                rect: Some(Rect {
+                ClearValue::Uint([n, n + 1, n + 2, n + 3]),
+                Some(Rect {
                     x,
                     y,
                     width,
                     height,
                 }),
-            })
+            ))
         };
         let mut list = vec![
             upload(
@@ -1921,3 +1897,5 @@ fn pending_ids_of_different_kinds_or_generations_differ() {
 mod window;
 
 mod draws;
+
+mod clears;

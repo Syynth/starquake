@@ -14,6 +14,7 @@ use crate::command::{
 };
 use crate::format::PixelFormat;
 use crate::id::{BufferId, FenceValue, PipelineId, ReadbackId, ResourceId, TextureId, ViewId};
+use crate::pipeline::ColorWrites;
 use crate::resource::{
     BufferDesc, BufferUsage, Extent3d, FilterMode, Origin3d, Swizzle, SwizzleSource, TextureDesc,
     TextureDimension, TextureUsage, ViewDesc, ViewDimension,
@@ -403,13 +404,7 @@ fn every_command_has_a_line() {
 #[test]
 fn clear_lines() {
     let view = ViewId::new(4, 0);
-    let clear = |value| {
-        Command::Clear(ClearDesc {
-            target: view,
-            value,
-            rect: None,
-        })
-    };
+    let clear = |value| Command::Clear(ClearDesc::unmasked(view, value, None));
     for (command, line) in [
         (
             clear(ClearValue::Sint([-1, 0, 1, 2])),
@@ -433,6 +428,42 @@ fn clear_lines() {
                 stencil: 2,
             }),
             "clear v4 to depth 1.0 stencil 2 in the whole view".to_owned(),
+        ),
+    ] {
+        assert_eq!(snapshot::command(&command), line);
+    }
+}
+
+/// A clear's masks show only when one leaves something out.
+#[test]
+fn masked_clear_lines() {
+    let masked = |color_mask, stencil_mask| {
+        Command::Clear(ClearDesc {
+            target: ViewId::new(4, 0),
+            value: ClearValue::Stencil(7),
+            rect: None,
+            color_mask,
+            stencil_mask,
+        })
+    };
+    let base = "clear v4 to stencil 7 in the whole view";
+    for (command, line) in [
+        (masked(ColorWrites::ALL, 0xff), base.to_owned()),
+        (
+            masked(ColorWrites::RED | ColorWrites::ALPHA, 0xff),
+            format!("{base} writing colour [ra]"),
+        ),
+        (
+            masked(ColorWrites::GREEN | ColorWrites::BLUE, 0x0f),
+            format!("{base} writing colour [gb] writing stencil 0x0f"),
+        ),
+        (
+            masked(ColorWrites::EMPTY, 0xfe),
+            format!("{base} writing colour [] writing stencil 0xfe"),
+        ),
+        (
+            masked(ColorWrites::ALL, 0),
+            format!("{base} writing stencil 0x00"),
         ),
     ] {
         assert_eq!(snapshot::command(&command), line);

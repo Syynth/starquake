@@ -8,8 +8,8 @@
 //! the ring marks no macro's end, so the executor calls [`Draws::flush`] at the boundaries its
 //! module docs list ("Deferred instanced draws"). It hands each run of `LOAD_ROOT_TABLE` words
 //! to [`Draws::load_root_table`] before the selector write that follows the run. A word written
-//! to `CLEAR_SURFACE` is a clear ([`clear`], slice G24), which shares the draw path's render
-//! targets, conditional render answer and host-object lifetime.
+//! to `CLEAR_SURFACE` is a clear ([`clear`], slice G24), which reads the render targets from the
+//! same registers and shares the draw path's conditional render answer.
 //!
 //! # A draw, step by step
 //!
@@ -221,13 +221,13 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// Whether a draw was appended, which sets render targets: a draw, or a clear drawn
-    /// ([`clear::Cleared::drew`]).
+    /// Whether a draw was appended, which sets render targets: a draw. A clear is a
+    /// `Command::Clear` and sets none ([`clear`], "Masks and partial areas are the render
+    /// backend's").
     pub fn drew(&self) -> bool {
         match self {
             Self::Drawn => true,
-            Self::Skipped(_) => false,
-            Self::Cleared(cleared) => cleared.drew(),
+            Self::Skipped(_) | Self::Cleared(_) => false,
         }
     }
 }
@@ -428,13 +428,6 @@ pub enum DrawError {
     /// A state the code rules out was reached (a bug, reported rather than a panic).
     #[error("internal error: {0}")]
     Internal(&'static str),
-    /// A masked clear needs a new pipeline and the draw-based clear holds its cap
-    /// ([`clear::MAX_CLEAR_PIPELINES`]).
-    #[error("the clear pipeline table is full ({limit} pipelines)")]
-    ClearPipelinesFull {
-        /// Its cap.
-        limit: usize,
-    },
 }
 
 /// What a draw needs besides its own state: guest memory, the caches, the shader cache and the
@@ -500,7 +493,7 @@ impl Draws {
         Self {
             host_shaders: HostShaders::new(Arc::clone(&backend)),
             samplers: Samplers::new(Arc::clone(&backend)),
-            clears: clear::Clears::new(Arc::clone(&backend)),
+            clears: clear::Clears::new(),
             backend,
             setting,
             calls: DrawCalls::new(),
@@ -531,11 +524,6 @@ impl Draws {
     /// What clears have done so far ([`clear`]).
     pub fn clear_counters(&self) -> clear::ClearCounters {
         self.clears.counters()
-    }
-
-    /// The pipelines the draw-based clear holds ([`clear`]).
-    pub fn clear_pipelines(&self) -> usize {
-        self.clears.pipelines()
     }
 
     /// How many times each fixed-function part was derived, in [`fixed::Part::ALL`] order.
@@ -585,7 +573,7 @@ impl Draws {
         if method == clc797::CLEAR_SURFACE.method() {
             return self
                 .clears
-                .clear(ctx, mirror, value, self.execute, &mut self.last_targets)
+                .clear(ctx, mirror, value, self.execute)
                 .map(|cleared| Some(Outcome::Cleared(cleared)));
         }
         match self.calls.method(mirror, method, value)? {
@@ -1142,7 +1130,6 @@ impl Drop for Draws {
         }
         self.samplers.destroy_all(self.last_fence);
         self.host_shaders.destroy_all(self.last_fence);
-        self.clears.destroy_all(self.last_fence);
     }
 }
 

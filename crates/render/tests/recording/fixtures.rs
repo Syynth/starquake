@@ -184,11 +184,7 @@ pub fn upload(bytes: &[u8], to: CopyRegion) -> Command {
 }
 
 pub fn clear(target: ViewId, value: ClearValue, r: Option<Rect>) -> Command {
-    Command::Clear(ClearDesc {
-        target,
-        value,
-        rect: r,
-    })
+    Command::Clear(ClearDesc::unmasked(target, value, r))
 }
 
 pub fn submit(b: &RecordingBackend, commands: Vec<Command>) -> FenceValue {

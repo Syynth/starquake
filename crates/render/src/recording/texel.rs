@@ -51,6 +51,7 @@
 
 use crate::command::ClearValue;
 use crate::format::{FormatAspect, NumericType, PixelFormat};
+use crate::pipeline::ColorWrites;
 
 /// A channel's position in a clear value: red, green, blue, alpha (depth and stencil use 0).
 #[derive(Clone, Copy, Debug)]
@@ -65,6 +66,18 @@ enum Channel {
 type Field = (Channel, u32, u32);
 
 use Channel::{A, B, G, R};
+
+impl Channel {
+    /// The write-mask bit of a colour channel (`ClearDesc::color_mask`).
+    const fn write_bit(self) -> ColorWrites {
+        match self {
+            Self::R => ColorWrites::RED,
+            Self::G => ColorWrites::GREEN,
+            Self::B => ColorWrites::BLUE,
+            Self::A => ColorWrites::ALPHA,
+        }
+    }
+}
 
 const RGBA8: &[Field] = &[(R, 0, 8), (G, 8, 8), (B, 16, 8), (A, 24, 8)];
 const BGRA8: &[Field] = &[(B, 0, 8), (G, 8, 8), (R, 16, 8), (A, 24, 8)];
@@ -132,15 +145,53 @@ pub(super) fn buffer_copy_exact(format: PixelFormat) -> bool {
     format.aspect() != FormatAspect::DepthStencil && format != PixelFormat::X8D24Unorm
 }
 
-/// The bytes one texel of `format` holds after a clear to `value`, or `None` when the answer is
-/// not exact on every device or the format is not modelled (module docs). A value whose kind
-/// does not suit the format gives `None` too; the validation refuses those first.
+/// The bytes one texel of `format` holds after an unmasked clear to `value`, or `None` when the
+/// answer is not exact on every device or the format is not modelled (module docs). A value whose
+/// kind does not suit the format gives `None` too; the validation refuses those first.
+#[cfg(test)]
 pub(super) fn encode_clear(format: PixelFormat, value: ClearValue) -> Option<Vec<u8>> {
+    let all_stencil = crate::command::ALL_STENCIL_BITS;
+    encode_masked_clear(format, value, ColorWrites::ALL, all_stencil).map(|t| t.bytes)
+}
+
+/// What a clear writes into one texel: the bytes, and which bits of each byte it writes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ClearTexel {
+    /// The texel's bytes; a bit [`ClearTexel::written`] leaves out is zero here.
+    pub bytes: Vec<u8>,
+    /// For each byte, the bits the clear writes; the others keep their value.
+    pub written: Vec<u8>,
+}
+
+/// What a clear to `value` through `color_mask` and `stencil_mask` (`ClearDesc`'s masks) writes
+/// into one texel of `format`, or `None` when a channel it writes is not exact on every device or
+/// the format is not modelled (module docs). A channel it does not write is neither encoded nor
+/// checked, so a masked-out channel's value does not matter. A colour channel is written whole
+/// when `color_mask` names it; a stencil channel through `stencil_mask`, bit by bit; a depth
+/// channel whole. A value whose kind does not suit the format gives `None`; the validation
+/// refuses those first.
+pub(super) fn encode_masked_clear(
+    format: PixelFormat,
+    value: ClearValue,
+    color_mask: ColorWrites,
+    stencil_mask: u8,
+) -> Option<ClearTexel> {
     let fields = layout(format)?;
     let numeric = format.numeric();
     let mut word: u128 = 0;
+    let mut written: u128 = 0;
     for &(channel, shift, bits) in fields {
         let i = channel as usize;
+        let mask = match (value, numeric) {
+            (ClearValue::Float(_) | ClearValue::Uint(_) | ClearValue::Sint(_), _) => {
+                if !color_mask.contains(channel.write_bit()) {
+                    continue;
+                }
+                max_unsigned(bits)
+            }
+            (ClearValue::Stencil(_), _) => u64::from(stencil_mask) & max_unsigned(bits),
+            _ => max_unsigned(bits),
+        };
         let encoded = match (value, numeric) {
             (ClearValue::Float(c), NumericType::Unorm) => {
                 let v = *c.get(i)?;
@@ -158,10 +209,14 @@ pub(super) fn encode_clear(format: PixelFormat, value: ClearValue) -> Option<Vec
             (ClearValue::Stencil(s), NumericType::Uint) if format.has_stencil() => uint(s, bits)?,
             _ => return None,
         };
-        word |= u128::from(encoded) << shift;
+        word |= u128::from(encoded & mask) << shift;
+        written |= u128::from(mask) << shift;
     }
     let len = usize::try_from(format.bytes_per_block()).ok()?;
-    Some(word.to_le_bytes().get(..len)?.to_vec())
+    Some(ClearTexel {
+        bytes: word.to_le_bytes().get(..len)?.to_vec(),
+        written: written.to_le_bytes().get(..len)?.to_vec(),
+    })
 }
 
 /// `v` as a `bits`-wide unsigned normalised integer, when exact: only for the clamped

@@ -5,7 +5,10 @@ use super::fixtures::{
     MEMORY, backend, buffer, caps, clear, counting, ok, read, rect, region, slice, submit, texture,
     upload, view,
 };
-use starquake_render::command::{BlitDesc, ClearValue, CopyDesc, PresentDesc, PresentTransform};
+use starquake_render::command::{
+    BlitDesc, ClearDesc, ClearValue, CopyDesc, PresentDesc, PresentTransform,
+};
+use starquake_render::pipeline::ColorWrites;
 use starquake_render::resource::{
     FilterMode, Swizzle, SwizzleSource, TextureDimension, ViewDimension,
 };
@@ -350,6 +353,261 @@ fn a_clear_of_a_3d_view_covers_every_slice_of_its_level() {
         read(&b, region(t, 0, (0, 0, 0), (1, 1, 1))),
         Readback::Unknown
     );
+}
+
+/// A clear through masks.
+fn masked(
+    target: ViewId,
+    value: ClearValue,
+    r: Option<starquake_render::command::Rect>,
+    color_mask: ColorWrites,
+    stencil_mask: u8,
+) -> Command {
+    Command::Clear(ClearDesc {
+        target,
+        value,
+        rect: r,
+        color_mask,
+        stencil_mask,
+    })
+}
+
+/// A texture of `format`, `size`, one layer and mip, its view, and its first texel row region.
+fn one(b: &RecordingBackend, format: PixelFormat, size: (u32, u32)) -> (TextureId, ViewId) {
+    let t = texture(b, format, size, 1, 1);
+    (t, view(b, t, format, 0, (0, 1)))
+}
+
+#[test]
+fn a_masked_colour_clear_keeps_the_channels_it_leaves_out() {
+    let b = backend();
+    let f = PixelFormat::A8B8G8R8Uint;
+    let (t, v) = one(&b, f, (3, 1));
+    let whole = region(t, 0, (0, 0, 0), (3, 1, 1));
+    submit(
+        &b,
+        vec![
+            upload(&[1, 2, 3, 4].repeat(3), whole),
+            masked(
+                v,
+                ClearValue::Uint([9, 8, 7, 6]),
+                Some(rect(1, 0, 2, 1)),
+                ColorWrites::RED | ColorWrites::BLUE,
+                0,
+            ),
+        ],
+    );
+    assert_eq!(
+        read(&b, whole),
+        bytes(vec![1, 2, 3, 4, 9, 2, 7, 4, 9, 2, 7, 4])
+    );
+    // Every one-channel mask writes that channel alone.
+    for (i, channel) in [
+        ColorWrites::RED,
+        ColorWrites::GREEN,
+        ColorWrites::BLUE,
+        ColorWrites::ALPHA,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (t, v) = one(&b, f, (1, 1));
+        let texel = region(t, 0, (0, 0, 0), (1, 1, 1));
+        submit(
+            &b,
+            vec![
+                upload(&[1, 2, 3, 4], texel),
+                masked(v, ClearValue::Uint([9; 4]), None, channel, 0xff),
+            ],
+        );
+        let mut expected = vec![1, 2, 3, 4];
+        expected[i] = 9;
+        assert_eq!(read(&b, texel), bytes(expected), "channel {i}");
+    }
+}
+
+#[test]
+fn a_masked_clear_over_unknown_bytes_knows_only_what_it_writes_whole() {
+    let b = backend();
+    let f = PixelFormat::R8G8Uint;
+    let (t, v) = one(&b, f, (1, 1));
+    let texel = region(t, 0, (0, 0, 0), (1, 1, 1));
+    // Red alone over a texel nothing wrote: green is still unknown, so the texel is.
+    let red = masked(v, ClearValue::Uint([5, 6, 0, 0]), None, ColorWrites::RED, 0);
+    submit(&b, vec![red]);
+    assert_eq!(read(&b, texel), Readback::Unknown);
+    // Then green alone: both bytes are known now.
+    let green = masked(
+        v,
+        ClearValue::Uint([0, 6, 0, 0]),
+        None,
+        ColorWrites::GREEN,
+        0,
+    );
+    submit(&b, vec![green]);
+    assert_eq!(read(&b, texel), bytes(vec![5, 6]));
+}
+
+#[test]
+fn a_channel_inside_a_byte_is_written_through_its_bits() {
+    // R5G6B5 lays out blue in bits 0..5, green in 5..11 and red in 11..16 (`recording::texel`):
+    // green shares both bytes with the other channels.
+    let b = backend();
+    let f = PixelFormat::R5G6B5Unorm;
+    let green = ClearValue::Float([0.0, 1.0, 0.0, 0.0]);
+    let (t, v) = one(&b, f, (1, 1));
+    let texel = region(t, 0, (0, 0, 0), (1, 1, 1));
+    // Known bits first: red and blue all ones, green zero (0xf81f).
+    submit(
+        &b,
+        vec![
+            upload(&[0x1f, 0xf8], texel),
+            masked(v, green, None, ColorWrites::GREEN, 0xff),
+        ],
+    );
+    assert_eq!(read(&b, texel), bytes(vec![0xff, 0xff]));
+    // Over unknown bits, a byte only partly written stays unknown.
+    let (t, v) = one(&b, f, (1, 1));
+    submit(&b, vec![masked(v, green, None, ColorWrites::GREEN, 0xff)]);
+    assert_eq!(
+        read(&b, region(t, 0, (0, 0, 0), (1, 1, 1))),
+        Readback::Unknown
+    );
+}
+
+#[test]
+fn a_stencil_clear_writes_the_bits_of_its_mask() {
+    let b = backend();
+    let f = PixelFormat::S8Uint;
+    for (mask, expected) in [
+        // (0xaa & !0x0f) | (0x55 & 0x0f)
+        (0x0f, 0xa5),
+        (0xf0, 0x5a),
+        (0xff, 0x55),
+        (0x00, 0xaa),
+    ] {
+        let (t, v) = one(&b, f, (1, 1));
+        let texel = region(t, 0, (0, 0, 0), (1, 1, 1));
+        submit(
+            &b,
+            vec![
+                upload(&[0xaa], texel),
+                masked(v, ClearValue::Stencil(0x55), None, ColorWrites::EMPTY, mask),
+            ],
+        );
+        assert_eq!(read(&b, texel), bytes(vec![expected]), "mask {mask:#04x}");
+    }
+    // Over a stencil nothing wrote: a partial mask leaves it unknown, a full one knows it.
+    for (mask, expected) in [
+        (0x7f, Readback::Unknown),
+        (0xfe, Readback::Unknown),
+        (0xff, bytes(vec![0x55])),
+    ] {
+        let (t, v) = one(&b, f, (1, 1));
+        submit(
+            &b,
+            vec![masked(
+                v,
+                ClearValue::Stencil(0x55),
+                None,
+                ColorWrites::EMPTY,
+                mask,
+            )],
+        );
+        assert_eq!(
+            read(&b, region(t, 0, (0, 0, 0), (1, 1, 1))),
+            expected,
+            "mask {mask:#04x}"
+        );
+    }
+}
+
+#[test]
+fn masks_a_clear_does_not_read_change_nothing() {
+    let b = backend();
+    // A depth clear has no mask: an empty colour mask and stencil mask still write depth.
+    let (t, v) = one(&b, PixelFormat::D16Unorm, (1, 1));
+    submit(
+        &b,
+        vec![masked(
+            v,
+            ClearValue::Depth(1.0),
+            None,
+            ColorWrites::EMPTY,
+            0,
+        )],
+    );
+    assert_eq!(
+        read(&b, region(t, 0, (0, 0, 0), (1, 1, 1))),
+        bytes(vec![0xff, 0xff])
+    );
+    // A colour clear's stencil mask is not read.
+    let (t, v) = one(&b, PixelFormat::R8Uint, (1, 1));
+    submit(
+        &b,
+        vec![masked(
+            v,
+            ClearValue::Uint([3, 0, 0, 0]),
+            None,
+            ColorWrites::ALL,
+            0,
+        )],
+    );
+    assert_eq!(read(&b, region(t, 0, (0, 0, 0), (1, 1, 1))), bytes(vec![3]));
+}
+
+#[test]
+fn only_the_channels_a_clear_writes_must_be_exact() {
+    let b = backend();
+    let f = PixelFormat::A8B8G8R8Unorm;
+    // Green's 0.5 has no exact 8-bit form, but green is left out.
+    let value = ClearValue::Float([1.0, 0.5, 0.0, 0.0]);
+    let (t, v) = one(&b, f, (1, 1));
+    let texel = region(t, 0, (0, 0, 0), (1, 1, 1));
+    submit(
+        &b,
+        vec![
+            upload(&[1, 1, 1, 1], texel),
+            masked(v, value, None, ColorWrites::RED, 0),
+        ],
+    );
+    assert_eq!(read(&b, texel), bytes(vec![0xff, 1, 1, 1]));
+    // Written, it makes the clear's area unknown.
+    submit(&b, vec![masked(v, value, None, ColorWrites::GREEN, 0)]);
+    assert_eq!(read(&b, texel), Readback::Unknown);
+}
+
+#[test]
+fn an_empty_mask_writes_nothing_even_in_a_format_not_modelled() {
+    let b = backend();
+    // `B10G11R11_FLOAT` is not modelled (`recording::texel`): a clear that writes any channel
+    // of it makes its area unknown, but one that writes none leaves it known.
+    let f = PixelFormat::B10G11R11Float;
+    let (t, v) = one(&b, f, (1, 1));
+    let texel = region(t, 0, (0, 0, 0), (1, 1, 1));
+    let value = ClearValue::Float([0.0; 4]);
+    submit(
+        &b,
+        vec![
+            upload(&[1, 2, 3, 4], texel),
+            masked(v, value, None, ColorWrites::EMPTY, 0xff),
+        ],
+    );
+    assert_eq!(read(&b, texel), bytes(vec![1, 2, 3, 4]));
+    submit(&b, vec![masked(v, value, None, ColorWrites::RED, 0xff)]);
+    assert_eq!(read(&b, texel), Readback::Unknown);
+    // A stencil value through an empty mask, likewise, on a two-aspect format.
+    let f = PixelFormat::S8Uint;
+    let (t, v) = one(&b, f, (1, 1));
+    let texel = region(t, 0, (0, 0, 0), (1, 1, 1));
+    submit(
+        &b,
+        vec![
+            upload(&[7], texel),
+            masked(v, ClearValue::Stencil(9), None, ColorWrites::ALL, 0),
+        ],
+    );
+    assert_eq!(read(&b, texel), bytes(vec![7]));
 }
 
 fn blit(

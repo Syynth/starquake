@@ -15,16 +15,20 @@
 //!   writer with no backend, for other crates' tests.
 //!
 //! Version 1 (slice R11's first part) is replaced, not kept beside: a version-1 file is refused
-//! with [`CaptureError::UnsupportedVersion`] (decision 18).
+//! with [`CaptureError::UnsupportedVersion`] (decision 18). So is a version-2 file: version 3
+//! adds the write masks of a clear ([`crate::command::ClearDesc::color_mask`] and
+//! [`crate::command::ClearDesc::stencil_mask`], after its rectangle; the owner's ruling 6 of
+//! 2026-11-19, issue #455), and a version-2 `Clear` command would decode with the next
+//! command's bytes as its masks.
 //!
-//! # Layout (version 2)
+//! # Layout (version 3)
 //!
 //! Everything is `postcard`: unsigned integers are little-endian base-128 varints.
 //!
 //! | Bytes | What |
 //! |---|---|
 //! | 4 | [`MAGIC`], `SQRC` |
-//! | varint | [`VERSION`] (`u32`), 2 |
+//! | varint | [`VERSION`] (`u32`), 3 |
 //! | per record: 1 | the record's tag ([`RecordKind::tag`]) |
 //! | per record: varint | the body's length in bytes (`u32`) |
 //! | per record: the rest | the body: the postcard encoding of that kind's struct |
@@ -38,12 +42,14 @@
 //! types of anything a record holds ([`Caps`](crate::Caps), the descriptions, [`Command`](crate::Command)), needs a new
 //! [`VERSION`] in the same change, once a version has shipped.
 //!
-//! Version 2 has not shipped: nothing writes a capture outside tests until the wiring slice
+//! No version has shipped yet: nothing writes a capture outside tests until the wiring slice
 //! (R11c) lands. So a `CreateShader` record's interface gained each binding's array count and the
 //! shader's requirements ([`crate::shader::ResourceBinding::count`],
 //! [`crate::shader::ShaderRequirements`]; the owner's ruling 20 of 2026-11-19) without a new
-//! version: the version stays 2, and the golden bytes pin the new layout
-//! (`capture::tests::golden`). The rule above applies from the first build that writes captures.
+//! version: the version stayed 2, and the golden bytes pin the new layout
+//! (`capture::tests::golden`). The clear masks took version 3 all the same, as issue #455 asks
+//! (`capture::tests::golden::header`, and `command::tests::golden_bytes` for the command layout).
+//! The rule above applies from the first build that writes captures.
 //! A binding's array count decodes as any non-zero `u32`, `u32::MAX` included, with no bound
 //! beyond what a live interface allows (`capture::tests::read::a_binding_array_count_of_u32_max_decodes`);
 //! a count the device cannot make a layout entry for fails the replayed pipeline's build, as it
@@ -203,7 +209,7 @@ use thiserror::Error;
 pub const MAGIC: [u8; 4] = *b"SQRC";
 
 /// Layout version written into every capture and required when reading one.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// The largest body of any record, and of a `Submit` or `ReadbackResult` (module docs, "Bounds").
 pub const MAX_RECORD_BYTES: u64 = 1 << 30;

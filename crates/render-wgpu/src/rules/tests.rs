@@ -2,7 +2,6 @@
 
 use super::*;
 use crate::fixtures::{formats, sampler, test_caps, texture, view};
-use starquake_render::command::Rect;
 use starquake_render::resource::{Origin3d, TextureDimension, ViewDimension};
 use starquake_render::{Caps, PixelFormat, RenderError, TextureUsage};
 
@@ -618,45 +617,6 @@ fn buffer_copies_are_between_two_buffers() {
         Ok(()),
         "another generation"
     );
-}
-
-#[test]
-fn partial_clears_are_colour_and_single_sampled() {
-    let rect = |x, y, w, h| Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
-    let rgba = texture(PixelFormat::A8B8G8R8Unorm, 8, 8, SAMPLED);
-    let depth = texture(PixelFormat::D32Float, 8, 8, SAMPLED);
-    let ms = TextureDesc {
-        sample_count: 4,
-        ..rgba
-    };
-    let part = rect(1, 0, 7, 8);
-    let full = rect(0, 0, 8, 8);
-    assert_eq!(
-        check_clear_area(&rgba, rgba.format, Some(&part), 8, 8),
-        Ok(())
-    );
-    assert_eq!(
-        check_clear_area(&depth, depth.format, Some(&full), 8, 8),
-        Ok(())
-    );
-    assert_eq!(check_clear_area(&depth, depth.format, None, 8, 8), Ok(()));
-    assert_eq!(
-        check_clear_area(&depth, depth.format, Some(&part), 8, 8),
-        Err(refused(WHOLE_CLEAR))
-    );
-    for edge in [rect(0, 1, 8, 7), rect(0, 0, 7, 8), rect(0, 0, 8, 7)] {
-        assert_eq!(
-            check_clear_area(&ms, ms.format, Some(&edge), 8, 8),
-            Err(refused(WHOLE_CLEAR)),
-            "{edge:?}"
-        );
-    }
-    assert_eq!(check_clear_area(&ms, ms.format, Some(&full), 8, 8), Ok(()));
 }
 
 #[test]

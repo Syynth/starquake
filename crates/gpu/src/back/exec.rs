@@ -179,9 +179,10 @@
 //! path that did not make the last draw is told its targets are gone the same way
 //! (`tests::two_channels_drawing_into_one_list_each_set_their_targets`), and so is one drawing
 //! after a dispatch or present
-//! (`tests::a_dispatch_between_two_draws_makes_the_second_set_its_targets`), or after another
-//! engine's clear that drew (`back::draw::clear`, "The draw-based clear";
-//! `tests::clear::a_masked_clear_on_another_channel_makes_the_next_draw_set_its_targets`).
+//! (`tests::a_dispatch_between_two_draws_makes_the_second_set_its_targets`). A clear, masked or
+//! not and on any channel, is a `Command::Clear` and sets no targets, so a draw after one keeps
+//! its own (`back::draw::clear`, "Masks and partial areas are the render backend's";
+//! `tests::clear::a_masked_clear_on_another_channel_leaves_the_next_draws_targets`).
 //!
 //! # Presents
 //!

@@ -72,9 +72,9 @@ fn tags() {
 #[test]
 fn header() {
     let mut expected = b"SQRC".to_vec();
-    expected.push(0x02);
+    expected.push(0x03);
     assert_eq!(super::super::MAGIC, *b"SQRC");
-    assert_eq!(super::super::VERSION, 2);
+    assert_eq!(super::super::VERSION, 3);
     assert!(super::prefix().starts_with(&expected));
 }
 
@@ -487,7 +487,7 @@ fn golden_results() -> Vec<Record> {
 /// The file of [`golden_start`] and [`golden_records`], by hand.
 fn golden_file() -> Vec<u8> {
     let mut f: Vec<u8> = b"SQRC".to_vec();
-    f.push(0x02); // version
+    f.push(0x03); // version
     // Start: tag 1, 159 bytes.
     f.extend([0x01, 0x9F, 0x01]);
     f.extend([0x02, b'b', b'1', 0x03, b'r', b'e', b'c']);

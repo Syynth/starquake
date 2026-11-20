@@ -176,7 +176,7 @@ fn start_with(build: &str, backend: &str) -> Vec<u8> {
         backend: backend.to_owned(),
         ..start()
     };
-    let mut f = b"SQRC\x02".to_vec();
+    let mut f = b"SQRC\x03".to_vec();
     f.extend(framed_any(
         RecordKind::Start.tag(),
         &postcard::to_allocvec(&s).expect("encode"),
