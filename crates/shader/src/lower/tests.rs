@@ -680,8 +680,9 @@ fn unlowered_forms_are_refused() {
         "control flow is checked before the instructions"
     );
     // A phi of a type with no naga type is refused. One in the first block run takes no value
-    // (the interpreter refuses it, `PhiAtStart`); here it reads its local's zero (a divergence
-    // in the module docs).
+    // (the interpreter refuses it, `PhiAtStart`); here it is accepted, not refused. That it
+    // reads its local's zero (a divergence in the module docs) is pinned by
+    // `structured::a_phi_in_the_first_block_run_reads_zero_on_the_gpu`.
     assert_eq!(
         refused(pixel, "block0:\n    %0: f64 = Phi\n    return\n"),
         Some("%0: a phi of type f64 is not lowered".into())

@@ -5,6 +5,7 @@ use naga::Statement;
 
 use super::run::{gpu_registers, interp_registers};
 use super::*;
+use crate::interp::{InterpError, Machine};
 use crate::opt::{Pass, run as run_pass};
 use crate::structure::{MAX_STRUCTURE_WORK, structure};
 
@@ -300,6 +301,37 @@ fn structured_phis_match_the_interpreter_on_the_gpu() {
         assert_eq!(found, expected);
     }
     insta::assert_snapshot!("structured_phis", msl(&shader));
+}
+
+/// A phi in the first block run, which no block ran before (`lower` module docs, the divergence
+/// table): the interpreter refuses it (`PhiAtStart`), and the lowering reads its local
+/// variable's zero. The phi plus 5 goes to r1, so the GPU gives 5 only if the phi read 0; the
+/// MSL (snapshot) zero-initialises the phi's local (`uint phi0_ = {};`).
+#[test]
+fn a_phi_in_the_first_block_run_reads_zero_on_the_gpu() {
+    const ADDED: u32 = 5;
+    let function = ir(&format!(
+        "block0:
+    %0: u32 = Phi
+    %1: u32 = IAdd32 %0, u32 {ADDED}
+    %2 = SetRegister r1, %1
+structure:
+    block0
+    return
+"
+    ));
+    assert_eq!(
+        Machine::new().run(&function).err(),
+        Some(InterpError::PhiAtStart(value_at(&function, 0))),
+        "the interpreter refuses it"
+    );
+    let shader = lowered(GuestStage::Compute, &function, &LowerInputs::DEFAULT);
+    let text = msl(&shader);
+    assert!(text.contains("uint phi0_ = {};"), "{text}");
+    if let Some(found) = gpu_registers("first_block_phi", &shader, &[1]) {
+        assert_eq!(found, [ADDED]);
+    }
+    insta::assert_snapshot!("first_block_phi", text);
 }
 
 /// A function whose block3 has a phi taking `incoming`, with block1 inside an `if` defining %1.
