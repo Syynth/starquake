@@ -89,7 +89,11 @@ fn hand_built_words_decode() {
         // R2UR: dst 16..22, src 24..32, PT at 81..84.
         (0x3c2, vec![(16, 5), (24, 0x9a), (81, 7)], "r2ur ur5, r154;"),
         // UMOV: dst, the immediate at 32..64; or the register at 32..38 and bit 91.
-        (0x882, vec![(16, 6), (32, 0x8765_4321)], "umov ur6, 0x87654321;"),
+        (
+            0x882,
+            vec![(16, 6), (32, 0x8765_4321)],
+            "umov ur6, 0x87654321;",
+        ),
         (0xc82, vec![(16, 7), (32, 9), (91, 1)], "umov ur7, ur9;"),
         // ULDC: dst, offset 38..54, index 54..59, type 73..76; bindless: handle 24..30, bit 91.
         (
@@ -111,7 +115,14 @@ fn hand_built_words_decode() {
         // LDCG: addr 24..30, offset 38..70, type, the predicate 87..91, bit 91.
         (
             0x8b8,
-            vec![(16, 2), (24, 4), (38, 0xffff_fff0), (73, 3), (87, 5), (91, 1)],
+            vec![
+                (16, 2),
+                (24, 4),
+                (38, 0xffff_fff0),
+                (73, 3),
+                (87, 5),
+                (91, 1),
+            ],
             "uldc.s16 ur2, [ur4+-0x10], up5;",
         ),
         (
@@ -140,196 +151,346 @@ fn hand_built_words_decode() {
             vec![(68, 7), (71, 1), (77, 7), (81, 7), (84, 7), (87, 7)],
             "uplop3.lut upt, upt, upt, upt, !upt, 0x0, 0x0;",
         ),
-        (0x89c, vec![(77, 7), (80, 1), (81, 7), (84, 7), (87, 7)], "uplop3.lut upt, upt, upt, !upt, up0, 0x0, 0x0;"),
-        (0x89c, vec![(81, 7), (84, 7), (87, 7), (90, 1)], "uplop3.lut upt, upt, !upt, up0, up0, 0x0, 0x0;"),
+        (
+            0x89c,
+            vec![(77, 7), (80, 1), (81, 7), (84, 7), (87, 7)],
+            "uplop3.lut upt, upt, upt, !upt, up0, 0x0, 0x0;",
+        ),
+        (
+            0x89c,
+            vec![(81, 7), (84, 7), (87, 7), (90, 1)],
+            "uplop3.lut upt, upt, !upt, up0, up0, 0x0, 0x0;",
+        ),
     ];
     for (opcode, fields, expected) in cases {
         assert_eq!(text(word(opcode, &fields)), expected, "{opcode:#x}");
     }
 }
 
-/// One hand-built word per twin form, each field a distinct value, its registers six bits wide
+/// A hand-built word: its opcode, its fields as `(start, value)` and the text it decodes to.
+type Case = (u128, &'static [(u32, u128)], &'static str);
+
+/// One hand-built word per twin form (`hand_built_twin_words_decode`), each field a distinct value, its registers six bits wide
 /// and bit 91 set; the vector op's fields at the vector op's positions (`op::integer`'s tests).
+const TWIN_CASES: &[Case] = &[
+    // UIADD3: dst 16, a 24, b 32 (form 1) or the immediate, c 64; .X bit 74; the negations
+    // 72, 63 and 75; the carries 87..91 and 77..81; the overflows 81..84 and 84..87.
+    (
+        0x290,
+        &[
+            (16, 1),
+            (24, 2),
+            (32, 3),
+            (64, 4),
+            (77, 7),
+            (81, 5),
+            (84, 6),
+            (87, 7),
+        ],
+        "uiadd3 ur1, up5, up6, ur2, ur3, ur4;",
+    ),
+    (
+        0x490,
+        &[
+            (16, 1),
+            (24, 2),
+            (32, 0x99),
+            (64, 4),
+            (72, 1),
+            (74, 1),
+            (77, 2),
+            (81, 7),
+            (84, 7),
+            (87, 3),
+        ],
+        "uiadd3.x ur1, ~ur2, ur4, 0x99, up3, up2;",
+    ),
+    (
+        0x890,
+        &[
+            (16, 62),
+            (24, 63),
+            (32, 0x123),
+            (64, 0),
+            (75, 1),
+            (77, 7),
+            (81, 7),
+            (84, 7),
+            (87, 7),
+        ],
+        "uiadd3 ur62, urz, 0x123, -ur0;",
+    ),
+    // ULEA: a 24, b 32 or the immediate, a_high 64; .HI 80, .X 74, .SX32 73, the shifted
+    // value's modifier 72, the shift 75..80, the overflow 81..84, the carry 87..91.
+    (
+        0x291,
+        &[
+            (16, 1),
+            (24, 2),
+            (32, 3),
+            (63, 1),
+            (64, 4),
+            (75, 5),
+            (80, 1),
+            (81, 7),
+            (87, 7),
+        ],
+        "ulea.hi ur1, ur2, -ur3, ur4, 0x5;",
+    ),
+    (
+        0x491,
+        &[
+            (16, 1),
+            (24, 2),
+            (32, 0x40),
+            (64, 4),
+            (72, 1),
+            (73, 1),
+            (74, 1),
+            (75, 31),
+            (81, 3),
+            (87, 2),
+        ],
+        "ulea.x.sx32 ur1, up3, ~ur2, ur4, 0x40, 0x1f, up2;",
+    ),
+    (
+        0x891,
+        &[(16, 1), (24, 2), (32, 0x40), (64, 63), (81, 7), (87, 7)],
+        "ulea ur1, ur2, 0x40, 0x0;",
+    ),
+    // ULOP3: the table 72..80, the predicate 81..84, !UPT at 87..91 (fixed).
+    (
+        0x292,
+        &[
+            (16, 1),
+            (24, 2),
+            (32, 3),
+            (64, 4),
+            (72, 0x96),
+            (81, 7),
+            (87, 15),
+        ],
+        "ulop3.lut ur1, ur2, ur3, ur4, 0x96, !upt;",
+    ),
+    (
+        0x492,
+        &[
+            (16, 1),
+            (24, 2),
+            (32, 0xff),
+            (64, 4),
+            (72, 0xc0),
+            (81, 2),
+            (87, 15),
+        ],
+        "ulop3.lut up2, ur1, ur2, ur4, 0xff, 0xc0, !upt;",
+    ),
+    (
+        0x892,
+        &[
+            (16, 1),
+            (24, 2),
+            (32, 0xff),
+            (64, 4),
+            (72, 0x3c),
+            (81, 7),
+            (87, 15),
+        ],
+        "ulop3.lut ur1, ur2, 0xff, ur4, 0x3c, !upt;",
+    ),
+    // UPRMT: a 24, the selector 32 or the immediate, b 64, the mode 72..75.
+    (
+        0x296,
+        &[(16, 1), (24, 2), (32, 3), (64, 4), (72, 1)],
+        "uprmt.f4e ur1, ur2, ur3, ur4;",
+    ),
+    (
+        0x496,
+        &[(16, 1), (24, 2), (32, 0x3210), (64, 4), (72, 6)],
+        "uprmt.rc16 ur1, ur2, ur4, 0x3210;",
+    ),
+    (
+        0x896,
+        &[(16, 1), (24, 2), (32, 0x5410), (64, 4)],
+        "uprmt ur1, ur2, 0x5410, ur4;",
+    ),
+    // USHF: low 24, shift 32 or the immediate, high 64; the type 73..75, .W 75, .R 76,
+    // .HI 80.
+    (
+        0x299,
+        &[(16, 1), (24, 2), (32, 3), (64, 4), (73, 3), (76, 1)],
+        "ushf.r.u32 ur1, ur2, ur3, ur4;",
+    ),
+    (
+        0x499,
+        &[(16, 1), (24, 2), (32, 0x1f), (64, 4), (73, 2), (75, 1)],
+        "ushf.l.w.s32 ur1, ur2, ur4, 0x1f;",
+    ),
+    (
+        0x899,
+        &[(16, 1), (24, 2), (32, 0x10), (64, 4), (80, 1)],
+        "ushf.l.s64.hi ur1, ur2, 0x10, ur4;",
+    ),
+    // UIMAD: .X 74, signed 73, the carry 87..91, the negations, UPT at 81..84 (fixed).
+    (
+        0x2a4,
+        &[
+            (16, 1),
+            (24, 2),
+            (32, 3),
+            (64, 4),
+            (73, 1),
+            (81, 7),
+            (87, 7),
+        ],
+        "uimad ur1, ur2, ur3, ur4;",
+    ),
+    (
+        0x4a4,
+        &[
+            (16, 1),
+            (24, 2),
+            (32, 0x80),
+            (64, 4),
+            (74, 1),
+            (81, 7),
+            (87, 4),
+        ],
+        "uimad.x.u32 ur1, ur2, ur4, 0x80, up4;",
+    ),
+    (
+        0x8a4,
+        &[
+            (16, 1),
+            (24, 2),
+            (32, 0x80),
+            (64, 4),
+            (72, 1),
+            (75, 1),
+            (81, 7),
+            (87, 7),
+        ],
+        "uimad.u32 ur1, -ur2, 0x80, -ur4;",
+    ),
+    // UIMAD.WIDE: signed 73, the carry 87..91 (not printed), UPT at 81..84.
+    (
+        0x2a5,
+        &[
+            (16, 2),
+            (24, 3),
+            (32, 4),
+            (64, 6),
+            (73, 1),
+            (81, 7),
+            (87, 7),
+        ],
+        "uimad.wide ur2, ur3, ur4, ur6;",
+    ),
+    (
+        0x4a5,
+        &[(16, 2), (24, 3), (32, 0x1000), (64, 6), (81, 7), (87, 1)],
+        "uimad.wide.u32 ur2, ur3, ur6, 0x1000;",
+    ),
+    (
+        0x8a5,
+        &[(16, 2), (24, 3), (32, 0x1000), (64, 6), (81, 7)],
+        "uimad.wide.u32 ur2, ur3, 0x1000, ur6;",
+    ),
+    // UISETP: the comparison 76..79, signed 73, the combination 74..76, .EX 72, the
+    // destinations 81..84 and 84..87, the accumulator 87..91, the low comparison 68..72.
+    (
+        0x28c,
+        &[
+            (24, 2),
+            (32, 3),
+            (68, 7),
+            (73, 1),
+            (74, 1),
+            (76, 1),
+            (81, 0),
+            (84, 7),
+            (87, 7),
+        ],
+        "uisetp.lt.or up0, upt, ur2, ur3, upt;",
+    ),
+    (
+        0x88c,
+        &[
+            (24, 2),
+            (32, 0x7),
+            (68, 5),
+            (72, 1),
+            (74, 2),
+            (76, 6),
+            (81, 1),
+            (84, 2),
+            (87, 3),
+            (90, 1),
+        ],
+        "uisetp.ge.u32.xor.ex up1, up2, ur2, 0x7, !up3, up5;",
+    ),
+    // USEL: the condition 87..91.
+    (
+        0x287,
+        &[(16, 1), (24, 2), (32, 3), (87, 6)],
+        "usel ur1, ur2, ur3, up6;",
+    ),
+    (
+        0x887,
+        &[(16, 1), (24, 2), (32, 0x11), (87, 6), (90, 1)],
+        "usel ur1, ur2, 0x11, !up6;",
+    ),
+    // USGXT: signed 73, .W 75.
+    (
+        0x29a,
+        &[(16, 1), (24, 2), (32, 3), (73, 1), (75, 1)],
+        "usgxt.w ur1, ur2, ur3;",
+    ),
+    (
+        0x89a,
+        &[(16, 1), (24, 2), (32, 0x8)],
+        "usgxt.u32 ur1, ur2, 0x8;",
+    ),
+    // UBMSK: .W 75.
+    (
+        0x29b,
+        &[(16, 1), (24, 2), (32, 3), (75, 1)],
+        "ubmsk.w ur1, ur2, ur3;",
+    ),
+    (
+        0x89b,
+        &[(16, 1), (24, 2), (32, 0x8)],
+        "ubmsk ur1, ur2, 0x8;",
+    ),
+    // UFLO: the source 32 or the immediate, its not 63 (form 1), signed 73, .SH 74, UPT
+    // at 81..84.
+    (
+        0x2bd,
+        &[(16, 1), (32, 3), (63, 1), (73, 1), (81, 7)],
+        "uflo ur1, ~ur3;",
+    ),
+    (
+        0x8bd,
+        &[(16, 1), (32, 0x8000_0000), (74, 1), (81, 7)],
+        "uflo.u32.sh ur1, 0x80000000;",
+    ),
+    // UBREV.
+    (0x2be, &[(16, 1), (32, 3)], "ubrev ur1, ur3;"),
+    (0x8be, &[(16, 1), (32, 0xf0)], "ubrev ur1, 0xf0;"),
+    // UPOPC: the not 63 (form 1).
+    (0x2bf, &[(16, 1), (32, 3), (63, 1)], "upopc ur1, ~ur3;"),
+    (0x8bf, &[(16, 1), (32, 0xf0)], "upopc ur1, 0xf0;"),
+    (0x2bf, &[(16, 63), (32, 63)], "upopc urz, urz;"),
+];
+
+/// Each of [`TWIN_CASES`] decodes to its text, with bit 91 set.
 #[test]
 fn hand_built_twin_words_decode() {
-    let cases: Vec<(u128, Vec<(u32, u128)>, &str)> = vec![
-        // UIADD3: dst 16, a 24, b 32 (form 1) or the immediate, c 64; .X bit 74; the negations
-        // 72, 63 and 75; the carries 87..91 and 77..81; the overflows 81..84 and 84..87.
-        (
-            0x290,
-            vec![(16, 1), (24, 2), (32, 3), (64, 4), (77, 7), (81, 5), (84, 6), (87, 7)],
-            "uiadd3 ur1, up5, up6, ur2, ur3, ur4;",
-        ),
-        (
-            0x490,
-            vec![(16, 1), (24, 2), (32, 0x99), (64, 4), (72, 1), (74, 1), (77, 2), (81, 7), (84, 7), (87, 3)],
-            "uiadd3.x ur1, ~ur2, ur4, 0x99, up3, up2;",
-        ),
-        (
-            0x890,
-            vec![(16, 62), (24, 63), (32, 0x123), (64, 0), (75, 1), (77, 7), (81, 7), (84, 7), (87, 7)],
-            "uiadd3 ur62, urz, 0x123, -ur0;",
-        ),
-        // ULEA: a 24, b 32 or the immediate, a_high 64; .HI 80, .X 74, .SX32 73, the shifted
-        // value's modifier 72, the shift 75..80, the overflow 81..84, the carry 87..91.
-        (
-            0x291,
-            vec![(16, 1), (24, 2), (32, 3), (63, 1), (64, 4), (75, 5), (80, 1), (81, 7), (87, 7)],
-            "ulea.hi ur1, ur2, -ur3, ur4, 0x5;",
-        ),
-        (
-            0x491,
-            vec![(16, 1), (24, 2), (32, 0x40), (64, 4), (72, 1), (73, 1), (74, 1), (75, 31), (81, 3), (87, 2)],
-            "ulea.x.sx32 ur1, up3, ~ur2, ur4, 0x40, 0x1f, up2;",
-        ),
-        (
-            0x891,
-            vec![(16, 1), (24, 2), (32, 0x40), (64, 63), (81, 7), (87, 7)],
-            "ulea ur1, ur2, 0x40, 0x0;",
-        ),
-        // ULOP3: the table 72..80, the predicate 81..84, !UPT at 87..91 (fixed).
-        (
-            0x292,
-            vec![(16, 1), (24, 2), (32, 3), (64, 4), (72, 0x96), (81, 7), (87, 15)],
-            "ulop3.lut ur1, ur2, ur3, ur4, 0x96, !upt;",
-        ),
-        (
-            0x492,
-            vec![(16, 1), (24, 2), (32, 0xff), (64, 4), (72, 0xc0), (81, 2), (87, 15)],
-            "ulop3.lut up2, ur1, ur2, ur4, 0xff, 0xc0, !upt;",
-        ),
-        (
-            0x892,
-            vec![(16, 1), (24, 2), (32, 0xff), (64, 4), (72, 0x3c), (81, 7), (87, 15)],
-            "ulop3.lut ur1, ur2, 0xff, ur4, 0x3c, !upt;",
-        ),
-        // UPRMT: a 24, the selector 32 or the immediate, b 64, the mode 72..75.
-        (
-            0x296,
-            vec![(16, 1), (24, 2), (32, 3), (64, 4), (72, 1)],
-            "uprmt.f4e ur1, ur2, ur3, ur4;",
-        ),
-        (
-            0x496,
-            vec![(16, 1), (24, 2), (32, 0x3210), (64, 4), (72, 6)],
-            "uprmt.rc16 ur1, ur2, ur4, 0x3210;",
-        ),
-        (
-            0x896,
-            vec![(16, 1), (24, 2), (32, 0x5410), (64, 4)],
-            "uprmt ur1, ur2, 0x5410, ur4;",
-        ),
-        // USHF: low 24, shift 32 or the immediate, high 64; the type 73..75, .W 75, .R 76,
-        // .HI 80.
-        (
-            0x299,
-            vec![(16, 1), (24, 2), (32, 3), (64, 4), (73, 3), (76, 1)],
-            "ushf.r.u32 ur1, ur2, ur3, ur4;",
-        ),
-        (
-            0x499,
-            vec![(16, 1), (24, 2), (32, 0x1f), (64, 4), (73, 2), (75, 1)],
-            "ushf.l.w.s32 ur1, ur2, ur4, 0x1f;",
-        ),
-        (
-            0x899,
-            vec![(16, 1), (24, 2), (32, 0x10), (64, 4), (80, 1)],
-            "ushf.l.s64.hi ur1, ur2, 0x10, ur4;",
-        ),
-        // UIMAD: .X 74, signed 73, the carry 87..91, the negations, UPT at 81..84 (fixed).
-        (
-            0x2a4,
-            vec![(16, 1), (24, 2), (32, 3), (64, 4), (73, 1), (81, 7), (87, 7)],
-            "uimad ur1, ur2, ur3, ur4;",
-        ),
-        (
-            0x4a4,
-            vec![(16, 1), (24, 2), (32, 0x80), (64, 4), (74, 1), (81, 7), (87, 4)],
-            "uimad.x.u32 ur1, ur2, ur4, 0x80, up4;",
-        ),
-        (
-            0x8a4,
-            vec![(16, 1), (24, 2), (32, 0x80), (64, 4), (72, 1), (75, 1), (81, 7), (87, 7)],
-            "uimad.u32 ur1, -ur2, 0x80, -ur4;",
-        ),
-        // UIMAD.WIDE: signed 73, the carry 87..91 (not printed), UPT at 81..84.
-        (
-            0x2a5,
-            vec![(16, 2), (24, 3), (32, 4), (64, 6), (73, 1), (81, 7), (87, 7)],
-            "uimad.wide ur2, ur3, ur4, ur6;",
-        ),
-        (
-            0x4a5,
-            vec![(16, 2), (24, 3), (32, 0x1000), (64, 6), (81, 7), (87, 1)],
-            "uimad.wide.u32 ur2, ur3, ur6, 0x1000;",
-        ),
-        (
-            0x8a5,
-            vec![(16, 2), (24, 3), (32, 0x1000), (64, 6), (81, 7)],
-            "uimad.wide.u32 ur2, ur3, 0x1000, ur6;",
-        ),
-        // UISETP: the comparison 76..79, signed 73, the combination 74..76, .EX 72, the
-        // destinations 81..84 and 84..87, the accumulator 87..91, the low comparison 68..72.
-        (
-            0x28c,
-            vec![(24, 2), (32, 3), (68, 7), (73, 1), (74, 1), (76, 1), (81, 0), (84, 7), (87, 7)],
-            "uisetp.lt.or up0, upt, ur2, ur3, upt;",
-        ),
-        (
-            0x88c,
-            vec![(24, 2), (32, 0x7), (68, 5), (72, 1), (74, 2), (76, 6), (81, 1), (84, 2), (87, 3), (90, 1)],
-            "uisetp.ge.u32.xor.ex up1, up2, ur2, 0x7, !up3, up5;",
-        ),
-        // USEL: the condition 87..91.
-        (
-            0x287,
-            vec![(16, 1), (24, 2), (32, 3), (87, 6)],
-            "usel ur1, ur2, ur3, up6;",
-        ),
-        (
-            0x887,
-            vec![(16, 1), (24, 2), (32, 0x11), (87, 6), (90, 1)],
-            "usel ur1, ur2, 0x11, !up6;",
-        ),
-        // USGXT: signed 73, .W 75.
-        (
-            0x29a,
-            vec![(16, 1), (24, 2), (32, 3), (73, 1), (75, 1)],
-            "usgxt.w ur1, ur2, ur3;",
-        ),
-        (0x89a, vec![(16, 1), (24, 2), (32, 0x8)], "usgxt.u32 ur1, ur2, 0x8;"),
-        // UBMSK: .W 75.
-        (
-            0x29b,
-            vec![(16, 1), (24, 2), (32, 3), (75, 1)],
-            "ubmsk.w ur1, ur2, ur3;",
-        ),
-        (0x89b, vec![(16, 1), (24, 2), (32, 0x8)], "ubmsk ur1, ur2, 0x8;"),
-        // UFLO: the source 32 or the immediate, its not 63 (form 1), signed 73, .SH 74, UPT
-        // at 81..84.
-        (
-            0x2bd,
-            vec![(16, 1), (32, 3), (63, 1), (73, 1), (81, 7)],
-            "uflo ur1, ~ur3;",
-        ),
-        (
-            0x8bd,
-            vec![(16, 1), (32, 0x8000_0000), (74, 1), (81, 7)],
-            "uflo.u32.sh ur1, 0x80000000;",
-        ),
-        // UBREV.
-        (0x2be, vec![(16, 1), (32, 3)], "ubrev ur1, ur3;"),
-        (0x8be, vec![(16, 1), (32, 0xf0)], "ubrev ur1, 0xf0;"),
-        // UPOPC: the not 63 (form 1).
-        (0x2bf, vec![(16, 1), (32, 3), (63, 1)], "upopc ur1, ~ur3;"),
-        (0x8bf, vec![(16, 1), (32, 0xf0)], "upopc ur1, 0xf0;"),
-        (0x2bf, vec![(16, 63), (32, 63)], "upopc urz, urz;"),
-    ];
-    let wrong: Vec<(u128, String, &str)> = cases
-        .into_iter()
-        .map(|(opcode, mut fields, expected)| {
-            fields.push((91, 1));
-            (opcode, text(word(opcode, &fields)), expected)
+    let wrong: Vec<(u128, String, &str)> = TWIN_CASES
+        .iter()
+        .map(|&(opcode, fields, expected)| {
+            let word = word(opcode, fields).with_field(Field::bit(91), 1);
+            (opcode, text(word), expected)
         })
         .filter(|(_, actual, expected)| actual != expected)
         .collect();
@@ -380,7 +541,11 @@ fn opcodes_are_the_references_literals() {
         [0x3c2, 0x882, 0xc82, 0xab9, 0xabb, 0x8b8, 0x89c]
     );
     assert_eq!(
-        [uniform::ULDC_INDEX, uniform::LDCG_ADDR, uniform::LDCG_OFFSET],
+        [
+            uniform::ULDC_INDEX,
+            uniform::LDCG_ADDR,
+            uniform::LDCG_OFFSET
+        ],
         [Field::new(24, 6), Field::new(24, 6), Field::new(38, 32)]
     );
 }
@@ -406,7 +571,11 @@ fn twin_rows_drop_the_vector_ops_bits() {
             let vector = twin.vector.form(form);
             let (_, row) = form_and_row(uniform_form.opcode);
             let (_, vector_row) = form_and_row(vector.opcode);
-            assert_eq!(row.dropped, vector_row.dropped, "{:#x}", uniform_form.opcode);
+            assert_eq!(
+                row.dropped, vector_row.dropped,
+                "{:#x}",
+                uniform_form.opcode
+            );
             assert_eq!(uniform_form.fixed, vector.fixed | 1 << 91);
             // The narrowed bits: the top two of each register field the vector form has.
             let narrowed: u128 = twin
@@ -443,7 +612,10 @@ fn twin_register_fields_are_the_listed_ones() {
     assert_eq!(starts(0x087, AluForm::Reg), [16, 24, 32]);
     assert_eq!(starts(0x0bd, AluForm::Reg), [16, 32]);
     assert_eq!(starts(0x0bf, AluForm::ImmSrc1), [16]);
-    for field in Twin::of_base(0x090).expect("a twin").register_fields(AluForm::Reg) {
+    for field in Twin::of_base(0x090)
+        .expect("a twin")
+        .register_fields(AluForm::Reg)
+    {
         assert_eq!(field.map(|field| field.width), Some(8));
     }
     assert_eq!(Twin::of_base(0x010), None);
@@ -467,7 +639,12 @@ fn uniform_datapath_forms_require_bit_91() {
     ];
     for form in uniform::FORMS {
         let bit_91 = form.fixed & (1 << 91) != 0;
-        assert_eq!(bit_91, required.contains(&form.opcode), "{:#x}", form.opcode);
+        assert_eq!(
+            bit_91,
+            required.contains(&form.opcode),
+            "{:#x}",
+            form.opcode
+        );
         if bit_91 {
             let canonical = canonical_word(form.opcode);
             assert!(decode(canonical).is_ok());
@@ -529,10 +706,7 @@ fn umov_rejects_the_bits_above_its_register() {
     for bit in 38..64 {
         assert_eq!(
             decode(Instruction::from_bits(base.bits() | 1 << bit)),
-            Err(DecodeError::UnknownBit {
-                opcode: 0xc82,
-                bit
-            })
+            Err(DecodeError::UnknownBit { opcode: 0xc82, bit })
         );
     }
     // The immediate form reads all 32.
@@ -610,7 +784,9 @@ fn uniform_registers_at_the_edges_of_their_encoding() {
         };
         for value in [0, 62, 63] {
             let word = base.with_field(Field::new(start, 6), value);
-            let instr = decode(word).unwrap_or_else(|e| panic!("{opcode:#x} {start}: {e}"));
+            let decoded = decode(word);
+            assert!(decoded.is_ok(), "{opcode:#x} {start}: {decoded:?}");
+            let instr = decoded.expect("decodes");
             assert_eq!(assemble(&instr).map(Instruction::bits), Ok(word.bits()));
         }
         for (bit, value) in [(start + 6, 64), (start + 7, 128)] {
@@ -630,7 +806,13 @@ fn uniform_registers_at_the_edges_of_their_encoding() {
     );
     let edges = [(0, "up0"), (6, "up6"), (7, "upt")];
     for (value, name) in edges {
-        let fields = [(68, value), (77, value), (81, value), (84, value), (87, value)];
+        let fields = [
+            (68, value),
+            (77, value),
+            (81, value),
+            (84, value),
+            (87, value),
+        ];
         assert_eq!(
             text(word(0x89c, &fields)),
             format!("uplop3.lut {name}, {name}, {name}, {name}, {name}, 0x0, 0x0;")
@@ -672,9 +854,15 @@ fn twin_text_marks_exactly_the_register_operands() {
             .filter(|&index| uniform::starts_operand(text, index))
             .collect()
     };
-    assert_eq!(starts("prmt.rc8 r1, rz, -r2, |r3|, ~r4, !pt, p0, 0x7, [r5]"), [9, 13, 18, 23, 29, 34, 38, 48]);
+    assert_eq!(
+        starts("prmt.rc8 r1, rz, -r2, |r3|, ~r4, !pt, p0, 0x7, [r5]"),
+        [9, 13, 18, 23, 29, 34, 38, 48]
+    );
     assert_eq!(starts("x r p q pz rr r1x p12 r255"), [18, 22]);
-    let rc8 = word(0x296, &[(16, 1), (24, 2), (32, 3), (64, 4), (72, 3), (91, 1)]);
+    let rc8 = word(
+        0x296,
+        &[(16, 1), (24, 2), (32, 3), (64, 4), (72, 3), (91, 1)],
+    );
     assert_eq!(text(rc8), "uprmt.rc8 ur1, ur2, ur3, ur4;");
 }
 
@@ -754,7 +942,10 @@ fn the_reader_refuses_a_too_wide_field_with_the_exact_error() {
     );
     assert_eq!(reader.fault(), Some(first), "the first fault is kept");
     let mut reader = Reader::new(word);
-    assert_eq!(reader.pred_src(Field::new(40, 4), Field::bit(100)).reg, Pred::PT);
+    assert_eq!(
+        reader.pred_src(Field::new(40, 4), Field::bit(100)).reg,
+        Pred::PT
+    );
     assert_eq!(
         reader.fault(),
         Some(DecodeError::UnknownValue {
@@ -766,7 +957,9 @@ fn the_reader_refuses_a_too_wide_field_with_the_exact_error() {
     );
     let mut reader = Reader::new(word);
     assert_eq!(
-        reader.uniform_pred_src(Field::new(48, 4), Field::bit(100)).reg,
+        reader
+            .uniform_pred_src(Field::new(48, 4), Field::bit(100))
+            .reg,
         UniformPred::UPT
     );
     assert_eq!(
@@ -787,7 +980,12 @@ fn the_reader_refuses_a_too_wide_field_with_the_exact_error() {
         .with_field(Field::new(48, 4), 7);
     let mut reader = Reader::new(edges);
     assert_eq!(reader.uniform_reg(Field::new(16, 8)), UniformReg::URZ);
-    assert!(reader.pred_src(Field::new(40, 4), Field::bit(100)).reg.is_true());
+    assert!(
+        reader
+            .pred_src(Field::new(40, 4), Field::bit(100))
+            .reg
+            .is_true()
+    );
     assert!(reader.uniform_pred(Field::new(48, 4)).is_true());
     assert_eq!(reader.fault(), None);
 }

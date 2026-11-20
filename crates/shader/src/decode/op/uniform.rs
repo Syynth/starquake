@@ -32,7 +32,7 @@
 //! **The twins reuse the vector structs.** The uniform ALU forms are NAK's `encode_ualu_base`:
 //! the vector op's fields at the vector op's positions, every register field six bits wide
 //! (`set_ureg`, "Before SM100 UGPRs encode in 6 bits"), bit 91 set ("All uniform ALU requires
-//! bit 91 set"), a 9-bit opcode of their own, and only forms 1, 2 and 4 ("UALU never has UReg",
+//! bit 91 set"), a 9-bit opcode of their own, and only forms 1, 2 and 4 ("UALU never has `UReg`",
 //! "UALU does not support cbufs"). So a twin is a [`Uniform`] of the vector struct: the struct's
 //! [`Gpr`] operands name the uniform registers of the same numbers ([`Gpr::RZ`] names `URZ`), its
 //! predicate operands the uniform predicates (`PT` is `UPT`), as PR #4588's translator reads the
@@ -143,8 +143,8 @@ use std::fmt::{self, Display, Formatter};
 use super::super::DecodeError;
 use super::super::alu::{self, AluForm};
 use super::super::fields::{
-    ALU_FORM, CBUF_INDEX, CBUF_OFFSET, DST, SLOT_IMM, SLOT_REG, SLOT_UNIFORM, SLOT_UNIFORM_REG, SRC0, SRC2,
-    mask_of,
+    ALU_FORM, CBUF_INDEX, CBUF_OFFSET, DST, SLOT_IMM, SLOT_REG, SLOT_UNIFORM, SLOT_UNIFORM_REG,
+    SRC0, SRC2, mask_of,
 };
 use super::super::form::{Form, Reader};
 use super::super::instruction::Field;
@@ -272,12 +272,11 @@ impl Twin {
 
     /// The twin of the 9-bit opcode `base`.
     pub(crate) fn of_base(base: u64) -> Option<Self> {
-        TWINS
-            .into_iter()
-            .find(|twin| u64::from(twin.base) == base)
+        TWINS.into_iter().find(|twin| u64::from(twin.base) == base)
     }
 
-    /// The twin of the vector instruction with the 9-bit opcode `base`.
+    /// The twin of the vector instruction with the 9-bit opcode `base` (for the test assembler).
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn of_vector_base(base: u64) -> Option<Self> {
         TWINS
             .into_iter()
@@ -318,11 +317,8 @@ impl Twin {
         let mut index = 0;
         while index < fields.len() {
             if let Some(field) = fields[index] {
-                narrow |= Field::new(
-                    field.start + UniformReg::BITS,
-                    Gpr::BITS - UniformReg::BITS,
-                )
-                .mask();
+                narrow |=
+                    Field::new(field.start + UniformReg::BITS, Gpr::BITS - UniformReg::BITS).mask();
             }
             index += 1;
         }
@@ -839,7 +835,10 @@ fn decode_uplop3(reader: &mut Reader) -> Op {
     let low = reader.byte(PLOP3_LUT0_LOW);
     let high = reader.byte(PLOP3_LUT0_HIGH);
     Op::UPLop3(OpUPLop3 {
-        dsts: [reader.uniform_pred(PRED_DST), reader.uniform_pred(PRED_DST1)],
+        dsts: [
+            reader.uniform_pred(PRED_DST),
+            reader.uniform_pred(PRED_DST1),
+        ],
         srcs: [
             reader.uniform_pred_src(COND, COND_NOT),
             reader.uniform_pred_src(PRED_B, PRED_B_NOT),
@@ -873,9 +872,11 @@ const OTHER_FORMS: [Form; 7] = [
         Ok(decode_r2ur(reader))
     })
     .with_fixed(PRED_DST.mask()),
-    Form::new(UMOV_IMM_OPCODE, mask_of(&[UNIFORM_DST, SLOT_IMM]), |reader| {
-        Ok(decode_umov(reader))
-    }),
+    Form::new(
+        UMOV_IMM_OPCODE,
+        mask_of(&[UNIFORM_DST, SLOT_IMM]),
+        |reader| Ok(decode_umov(reader)),
+    ),
     Form::new(
         UMOV_UR_OPCODE,
         mask_of(&[UNIFORM_DST, SLOT_UNIFORM_REG]),

@@ -42,7 +42,9 @@
 //! `0x111` and `0x112` when either type is 64 bits wide).
 //!
 //! The uniform datapath's forms of these instructions (`UFADD` and the others, PR #4588's rows
-//! with 9-bit opcodes `0x050` to `0x05d` and `0x0ba`) are slice 6d's.
+//! with 9-bit opcodes `0x050` to `0x05d` and `0x0ba`) are slice 6d's, which leaves them unknown
+//! opcodes (`op::uniform`'s module docs: NAK encodes them only from SM 12.0, and `UF2FP` has
+//! fields `OpF2FP` lacks).
 //!
 //! # Decisions taken here
 //!

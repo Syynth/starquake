@@ -8,18 +8,17 @@
 use super::{Encode, EncodeError, Writer, no_encoding};
 use crate::decode::control::{COND, COND_NOT, PRED_DST, UNIFORM_BIT, UNIFORM_DST};
 use crate::decode::integer::{
-    PLOP3_LUT0_HIGH, PLOP3_LUT0_LOW, PLOP3_LUT1, PRED_B, PRED_B_NOT, PRED_C, PRED_C_NOT,
-    PRED_DST1,
+    PLOP3_LUT0_HIGH, PLOP3_LUT0_LOW, PLOP3_LUT1, PRED_B, PRED_B_NOT, PRED_C, PRED_C_NOT, PRED_DST1,
 };
 use crate::decode::memory::{LDC_HANDLE, MEM_TYPE};
 use crate::decode::uniform::{
-    LDCG_ADDR, LDCG_OFFSET, LDCG_OPCODE, R2UR_OPCODE, TwinOperands, ULDC_INDEX, ULDC_OPCODE,
-    ULDC64_OPCODE, UMOV_IMM_OPCODE, UMOV_UR_OPCODE, UPLOP3_OPCODE, Twin,
+    LDCG_ADDR, LDCG_OFFSET, LDCG_OPCODE, R2UR_OPCODE, Twin, TwinOperands, ULDC_INDEX, ULDC_OPCODE,
+    ULDC64_OPCODE, UMOV_IMM_OPCODE, UMOV_UR_OPCODE, UPLOP3_OPCODE,
 };
 use crate::decode::{
     ALU_FORM, AluForm, CBUF_INDEX, CBUF_OFFSET, CBuf, Gpr, Named, OPCODE, OpR2UR, OpULdc, OpUMov,
-    OpUP2UR, OpUPLop3, SLOT_IMM, SLOT_UNIFORM, SLOT_UNIFORM_REG, SRC0, ULdcSrc, UMovSrc,
-    Uniform, UniformReg,
+    OpUP2UR, OpUPLop3, SLOT_IMM, SLOT_UNIFORM, SLOT_UNIFORM_REG, SRC0, ULdcSrc, UMovSrc, Uniform,
+    UniformReg,
 };
 
 impl Encode for OpR2UR {
@@ -123,8 +122,7 @@ where
             mnemonic,
             what: "its vector encoding",
         };
-        let twin =
-            Twin::of_vector_base(opcode & ((1 << ALU_FORM.start) - 1)).ok_or(unencodable)?;
+        let twin = Twin::of_vector_base(opcode & ((1 << ALU_FORM.start) - 1)).ok_or(unencodable)?;
         let form = AluForm::from_bits(opcode >> ALU_FORM.start).ok_or(unencodable)?;
         if !twin.forms().contains(&form) {
             return Err(EncodeError::NoForm {
