@@ -432,6 +432,12 @@ GPU family as meeting "subgroup size 32": Apple GPUs run 32-wide SIMD groups (de
 adapter name's `Apple ` prefix, since wgpu 30 exposes no Metal GPU family, which is a **guess**;
 and an Apple GPU reached through Vulkan (MoltenVK) is not counted as meeting it.
 
+The size check reads the shader crate's narrower "needs subgroup size 32" flag, not the
+subgroup capability, so a shader whose only subgroup operations are quad operations is not
+refused where a size of 32 is not met (shader-pipeline, "Compute shaders"; decided by the owner,
+2026-11-20). R6's cross-check of each shader's interface against its naga module stays in
+production ("Shader emission").
+
 ### Fixed-function state the host lacks
 
 A console GPU has fixed-function features some hosts do not. For each, `Caps` says whether it is
@@ -473,6 +479,21 @@ in `ShaderDesc` as `ShaderSource::Naga` and converts the tables into the backend
   layouts from `ShaderInterface`, which carries the shader's requirements and each binding's
   array count, so the backend reads neither from the naga module (decided by the owner,
   2026-11-19; R11b's capture records carry them with the interface).
+  R6 still scans the module, in production and not only in tests, as a cross-check of the
+  interface (decided by the owner, 2026-11-20): wgpu-core 30.0.2 does not compare a binding
+  array's size with its layout entry's count (`Interface::new` in `src/validation.rs` keeps only
+  the array's base type), so a wrong count would otherwise reach the host driver, and an
+  interface that left out subgroups would skip the subgroup-size check. A module binding-array
+  size that differs from the interface's count, or a module that uses subgroups without the
+  interface declaring them, refuses the pipeline with the exact error
+  (`starquake-render-wgpu`'s pipeline module docs).
+- **Metal fast math, measured** (decided by the owner, 2026-11-20). wgpu-hal 30.0.2's Metal
+  backend leaves the Metal compiler's default fast math on, so a plain float comparison treats a
+  NaN as an ordinary value: `a == b` of two NaNs is true on an Apple GPU. naga's float-to-integer
+  conversion saturates to the largest float below the integer's maximum (0x7fffff80 for a signed
+  32-bit result), not to the maximum. The shader crate's lowering therefore routes every float
+  comparison and float-to-integer conversion through its NaN-safe helpers (shader-pipeline, "The
+  backend through naga") rather than relying on the host compiler's float rules.
 - **A direct backend, later:** does not run naga's writers itself either. It states the form it
   wants (SPIR-V with its descriptor-set map, or MSL with its buffer, texture and sampler indices)
   and its bounds-check policy in the target it gives the shader crate when the shader cache is
