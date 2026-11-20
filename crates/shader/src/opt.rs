@@ -49,7 +49,7 @@ mod dce;
 mod identity;
 mod ssa;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::fmt::{self, Display, Formatter};
 

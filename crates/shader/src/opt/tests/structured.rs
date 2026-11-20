@@ -2,7 +2,7 @@
 //! blocks it adds where paths meet, values carried out of a body by a phi, the structurizer's
 //! goto and condition variables turned into values, and the refusal of a structured phi.
 
-use super::{error, parse, ran, value};
+use super::{check_phi_scope, error, parse, ran, value};
 use crate::interp::Machine;
 use crate::ir::Function;
 use crate::opt::{Pass, PassError, optimize, run};
@@ -16,13 +16,15 @@ fn machine(words: &[u32]) -> Machine {
     machine
 }
 
-/// Checks that the rewrite of `text` leaves the same machine as `text` itself from each of
-/// `starts`, and returns the rewritten function.
+/// Checks that the rewrite of `text` keeps each phi's incoming values in scope
+/// ([`check_phi_scope`]) and leaves the same machine as `text` itself from each of `starts`,
+/// and returns the rewritten function.
 fn rewrite_keeps_state(text: &str, starts: &[Machine]) -> Function {
     let before = parse(text);
     before.verify().expect("the input verifies");
     let mut rewritten = before.clone();
     run(&mut rewritten, Pass::SsaRewrite).expect("rewrites");
+    check_phi_scope(&rewritten).expect("phi values in scope");
     for start in starts {
         assert_eq!(ran(&rewritten, start), ran(&before, start), "{rewritten}");
     }
@@ -486,4 +488,80 @@ fn a_read_in_an_inner_loop_reaches_to_the_outermost_loops_end() {
     for (word, r1) in [(0, 1), (3, 3)] {
         assert_eq!(ran(&out, &machine(&[word])).regs[1], r1);
     }
+}
+
+/// A function whose block3 has a phi taking `incoming`, with block1 inside an `if` defining %1,
+/// and `extra` (blocks placed nowhere in the tree, which the verifier refuses) after block3.
+fn phi_taking(incoming: &str, extra: &str) -> Function {
+    parse(&format!(
+        "block0:
+    %0: u1 = IEqual u32 0, u32 0
+block1:
+    %1: u32 = IAdd32 u32 1, u32 2
+block2:
+    %2: u32 = IAdd32 u32 3, u32 4
+block3:
+    %3: u32 = Phi {incoming}
+    %4 = SetRegister r1, %3
+{extra}structure:
+    block0
+    if %0 {{
+        block1
+    }}
+    block2
+    block3
+    return
+"
+    ))
+}
+
+/// The test-side scope checker the equivalence proptests and the flow tests run
+/// ([`check_phi_scope`]): it accepts a value in scope at the end of the block named, and an
+/// immediate, and refuses a value not yet computed there, one whose `if` body has ended, and a
+/// block the tree does not place, each with its own message. The verifier accepts the first
+/// two refused cases (it only checks that the value is listed somewhere); it refuses the third
+/// itself, so on verified functions that branch of the checker cannot fire.
+#[test]
+fn the_scope_checker_refuses_a_phi_value_out_of_scope() {
+    for incoming in [
+        "[block1: %1]",
+        "[block2: %2]",
+        "[block2: u32 9]",
+        "[block0: %0]",
+    ] {
+        assert_eq!(
+            check_phi_scope(&phi_taking(incoming, "")),
+            Ok(()),
+            "{incoming}"
+        );
+    }
+    let message = |text: &str, function: &Function| format!("{text}\n{function}");
+    for (incoming, from) in [("[block0: %1]", 0), ("[block2: %1]", 2)] {
+        let function = phi_taking(incoming, "");
+        function.verify().expect("the verifier accepts it");
+        assert_eq!(
+            check_phi_scope(&function),
+            Err(message(
+                &format!("%3 takes %1 from block{from}, where it is not in scope"),
+                &function
+            )),
+            "{incoming}"
+        );
+    }
+    let function = phi_taking("[block4: %1]", "block4:\n");
+    assert_eq!(
+        check_phi_scope(&function),
+        Err(message(
+            "a phi takes a value from block4, which the tree does not place",
+            &function
+        ))
+    );
+    // A control-flow graph has nothing to check.
+    assert_eq!(
+        check_phi_scope(&parse(
+            "block0:\n    jump block1\nblock1:\n    %0: u32 = Phi [block0: %1]\n    \
+             %1: u32 = IAdd32 u32 1, u32 2\n    return\n"
+        )),
+        Ok(())
+    );
 }

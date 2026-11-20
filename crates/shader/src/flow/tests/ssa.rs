@@ -10,7 +10,8 @@ use crate::asm::assemble;
 use crate::decode::{BrxSrc, Gpr, Instruction, UniformReg};
 use crate::interp::{InterpError, Machine};
 use crate::ir::{Attribute, Builder, Function, GENERIC_0_X, Imm, Opcode, Operand, Value};
-use crate::opt::optimize;
+use crate::opt::tests::check_phi_scope;
+use crate::opt::{Pass, optimize, run};
 use crate::structure::MAX_STRUCTURE_WORK;
 
 /// The register the filled blocks fold their flow block numbers into.
@@ -110,8 +111,9 @@ fn start(words: [u32; 3]) -> Machine {
 }
 
 /// Builds `code`'s blocks, fills the graph, structures the blocks, fills the structured
-/// function, runs every pass on it, and checks the optimized function from each of `starts`
-/// against the graph: the same ending, outputs and demotion. Returns the graph's endings and
+/// function, runs every pass on it, checks that the SSA rewrite's output and the optimized
+/// function keep each phi's incoming values in scope, and checks the optimized function from
+/// each of `starts` against the graph: the same ending, outputs and demotion. Returns the graph's endings and
 /// final machines, and the optimized function.
 fn check(
     code: &[Instruction],
@@ -132,8 +134,14 @@ fn check(
     let mut tree = structured.function.clone();
     fill(&mut tree, &ir, code, tables);
     tree.verify().expect("the filled tree verifies");
+    // The scope rule the lowering relies on (`opt::ssa` module docs, "Scope"), after the SSA
+    // rewrite alone and after every pass.
+    let mut rewritten = tree.clone();
+    run(&mut rewritten, Pass::SsaRewrite).expect("the rewrite runs on the structured function");
+    check_phi_scope(&rewritten).expect("the rewrite keeps phi values in scope");
     let mut optimized = tree.clone();
     optimize(&mut optimized).expect("the passes run on the structured function");
+    check_phi_scope(&optimized).expect("the passes keep phi values in scope");
     let text = optimized.to_string();
     assert!(!text.contains("GotoVariable"), "{text}");
     assert!(!text.contains("GetRegister"), "{text}");

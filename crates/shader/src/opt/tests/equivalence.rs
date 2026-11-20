@@ -350,7 +350,10 @@ fn observable(machine: &Machine) -> Machine {
     }
 }
 
-/// Runs every pass on `function`, checking each output verifies and keeps the result.
+/// Runs every pass on `function`, checking each output verifies, keeps the result and, when
+/// structured, keeps each phi's incoming values in scope ([`super::check_phi_scope`]): so the
+/// output of the SSA rewrite alone (the first pass) and of all of them (what
+/// [`optimize`](crate::opt::optimize) runs) are both checked.
 fn check_equivalence(function: &Function, start: &Machine) -> Result<Function, TestCaseError> {
     let reference = super::ran(function, start);
     let mut current = function.clone();
@@ -358,6 +361,8 @@ fn check_equivalence(function: &Function, start: &Machine) -> Result<Function, T
         run(&mut current, pass).map_err(|e| TestCaseError::fail(format!("{pass}: {e}")))?;
         current
             .verify()
+            .map_err(|e| TestCaseError::fail(format!("{pass}: {e}")))?;
+        super::check_phi_scope(&current)
             .map_err(|e| TestCaseError::fail(format!("{pass}: {e}")))?;
         let mut machine = start.clone();
         machine
@@ -379,7 +384,8 @@ fn check_equivalence(function: &Function, start: &Machine) -> Result<Function, T
 }
 
 /// [`check_equivalence`] on `function` structured first, which must run as `function` does;
-/// the output names no goto variable.
+/// the output of each pass keeps its phis' incoming values in scope, and the last names no goto
+/// variable.
 fn check_structured(function: &Function, start: &Machine) -> Result<(), TestCaseError> {
     let structured = structure(function.clone(), MAX_STRUCTURE_WORK)
         .map_err(|e| TestCaseError::fail(format!("structuring: {e}")))?
