@@ -417,8 +417,9 @@ fn the_group_is_the_memory_table() {
     assert_eq!(seen, memory.len());
 }
 
-/// `CCTL`, which neither reference translates, is refused by its mnemonic; `ERRBAR` and
-/// `LDGDEPBAR` are this group's and translate.
+/// `CCTL`, which neither reference translates, is refused by name
+/// ([`MemoryUnsupported::CacheControl`]); `ERRBAR` and `LDGDEPBAR` are this group's and
+/// translate.
 #[test]
 fn cctl_is_refused_by_name() {
     let cctl = Op::CCtl(OpCCtl {
@@ -429,13 +430,11 @@ fn cctl_is_refused_by_name() {
     let refused = build_op(cctl);
     assert_eq!(
         refused,
-        Err(MemoryError::Unsupported(MemoryUnsupported::Instruction(
-            "cctl"
-        )))
+        Err(MemoryError::Unsupported(MemoryUnsupported::CacheControl))
     );
     assert_eq!(
         refused.map_err(|error| error.to_string()),
-        Err("cctl, which neither reference translates, is not supported".to_owned())
+        Err("a cctl, which neither reference translates, is not supported".to_owned())
     );
     assert!(build_op(Op::ErrBar(OpErrBar {})).is_ok());
     assert!(build_op(Op::LdgDepBar(OpLdgDepBar {})).is_ok());

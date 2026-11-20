@@ -969,3 +969,518 @@ fn faults_report_in_the_documented_order_3() {
         assert_eq!(refused(op), Some(what), "{op}");
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// The descriptor word (bit 76) and the fields only the global forms read.
+
+/// A descriptor `LDG` or `STG` (bit 76, the uniform address on) with each field as given: the
+/// exact word PR #4588's lowering reads as a descriptor when `pred` is `PT`, `wide` and
+/// `reg_64` are set, the type is one it takes, the order weak, the eviction priority normal
+/// and `reg` even and not `RZ`.
+#[derive(Clone, Copy)]
+struct Descriptor {
+    store: bool,
+    pred: PredSrc,
+    wide: bool,
+    mem_type: MemType,
+    order: MemOrder,
+    eviction: MemEvictionPriority,
+    reg_64: bool,
+    reg: u8,
+    uniform: u8,
+}
+
+impl Descriptor {
+    /// The accepted word: `R2:R3` and `UR8:UR9`, 32 bits.
+    const fn exact(store: bool) -> Self {
+        Self {
+            store,
+            pred: PredSrc::TRUE,
+            wide: true,
+            mem_type: MemType::B32,
+            order: MemOrder::Weak,
+            eviction: MemEvictionPriority::Normal,
+            reg_64: true,
+            reg: 2,
+            uniform: 8,
+        }
+    }
+
+    fn op(self) -> Op {
+        let addr = with_uniform(self.reg, self.reg_64, self.uniform, self.wide, true, 0x10);
+        let space = MemSpace::Global(GlobalAccess {
+            order: self.order,
+            eviction: self.eviction,
+        });
+        if self.store {
+            Op::St(OpSt {
+                bit76: true,
+                ..st(8, self.mem_type, space, addr)
+            })
+        } else {
+            Op::Ld(OpLd {
+                bit76: true,
+                pred: self.pred,
+                space,
+                ..ldg(8, self.mem_type, addr)
+            })
+        }
+    }
+}
+
+/// One clearing step of the order test: the fault reported, and how to clear it.
+type Step = (DescriptorFault, fn(&mut Descriptor));
+
+/// Each condition of the lowering's descriptor word at its edge, both sides, in `LDG` and
+/// `STG`: the exact word translates, and a word one field off it is refused with that field's
+/// [`DescriptorFault`]. With the uniform address off, bit 76 changes nothing, so the same
+/// fields translate.
+#[test]
+fn descriptor_words_at_each_edge() {
+    for store in [false, true] {
+        let exact = Descriptor::exact(store);
+        assert!(accepted(exact.op()), "store {store}");
+        // Bit 72: the uniform register a pair, or a single (even or odd) register.
+        for uniform in [8, 9] {
+            let single = Descriptor {
+                wide: false,
+                uniform,
+                ..exact
+            };
+            assert_eq!(
+                refused(single.op()),
+                Some(MemoryUnsupported::DescriptorAddress(
+                    DescriptorFault::UniformSingle
+                )),
+                "store {store} UR{uniform}"
+            );
+        }
+        // The uniform pair: UR60 translates; UR62, which the lowering takes, is refused by the
+        // native translator's bound.
+        assert!(accepted(
+            Descriptor {
+                uniform: 60,
+                ..exact
+            }
+            .op()
+        ));
+        assert_eq!(
+            refused(
+                Descriptor {
+                    uniform: 62,
+                    ..exact
+                }
+                .op()
+            ),
+            Some(MemoryUnsupported::GlobalUniformAddress {
+                reg: ur(62),
+                pair: true,
+            })
+        );
+        // Bit 90: the register a pair, or a single register.
+        assert_eq!(
+            refused(
+                Descriptor {
+                    reg_64: false,
+                    ..exact
+                }
+                .op()
+            ),
+            Some(MemoryUnsupported::DescriptorAddress(
+                DescriptorFault::RegisterSingle
+            ))
+        );
+        // The register: R0 and R252 (the lowering's own bound, `address + 2 >
+        // reserved_register`, is not mirrored) translate, RZ is refused.
+        for reg in [0, 252] {
+            assert!(accepted(Descriptor { reg, ..exact }.op()), "R{reg}");
+        }
+        assert_eq!(
+            refused(Descriptor { reg: 255, ..exact }.op()),
+            Some(MemoryUnsupported::DescriptorAddress(
+                DescriptorFault::ZeroRegister
+            ))
+        );
+    }
+    // The load predicate: PT translates; a register or a negated PT is refused.
+    let exact = Descriptor::exact(false);
+    for pred in [ps(0, false), ps(6, true), ps(7, true)] {
+        assert_eq!(
+            refused(Descriptor { pred, ..exact }.op()),
+            Some(MemoryUnsupported::DescriptorAddress(
+                DescriptorFault::LoadPredicate
+            )),
+            "{pred:?}"
+        );
+    }
+}
+
+/// The order, eviction priority and type of the lowering's descriptor word at each value, in
+/// `LDG` and `STG`: the weak order, the normal eviction priority and the types the lowering
+/// takes translate, every other value is refused with its [`DescriptorFault`], and the system
+/// order with [`MemoryUnsupported::SystemOrder`] first.
+#[test]
+fn descriptor_orders_evictions_and_types() {
+    for store in [false, true] {
+        let exact = Descriptor::exact(store);
+        // Every order: weak translates, the system scope is refused first by its own check.
+        for &order in MemOrder::ALL {
+            let expected = match order {
+                MemOrder::Weak => None,
+                MemOrder::Strong(MemScope::System) => Some(MemoryUnsupported::SystemOrder),
+                MemOrder::Constant | MemOrder::Strong(_) => {
+                    Some(MemoryUnsupported::DescriptorAddress(DescriptorFault::Order))
+                }
+            };
+            assert_eq!(
+                refused(Descriptor { order, ..exact }.op()),
+                expected,
+                "{order:?}"
+            );
+        }
+        // Every eviction priority: normal translates.
+        for &eviction in MemEvictionPriority::ALL {
+            let expected = (eviction != MemEvictionPriority::Normal).then_some(
+                MemoryUnsupported::DescriptorAddress(DescriptorFault::Eviction),
+            );
+            assert_eq!(
+                refused(Descriptor { eviction, ..exact }.op()),
+                expected,
+                "{eviction:?}"
+            );
+        }
+        // Every type: the load takes .u16, 32, 64 and 128 bits, the store .u8, .u16, 32 and
+        // 64 bits.
+        for &mem_type in MemType::ALL {
+            let taken = if store {
+                [MemType::U8, MemType::U16, MemType::B32, MemType::B64]
+            } else {
+                [MemType::U16, MemType::B32, MemType::B64, MemType::B128]
+            };
+            let expected = (!taken.contains(&mem_type)).then_some(
+                MemoryUnsupported::DescriptorAddress(DescriptorFault::Type(mem_type)),
+            );
+            assert_eq!(
+                refused(Descriptor { mem_type, ..exact }.op()),
+                expected,
+                "store {store} {mem_type:?}"
+            );
+        }
+    }
+}
+
+/// With the uniform address off, bit 76 changes nothing: a word with every descriptor field
+/// off translates, as the uniform register is neither added nor a descriptor.
+#[test]
+fn bit_76_without_the_uniform_address_is_not_a_descriptor() {
+    for store in [false, true] {
+        let addr = with_uniform(2, false, 9, false, false, 0);
+        let space = MemSpace::Global(GlobalAccess {
+            order: MemOrder::Constant,
+            eviction: MemEvictionPriority::First,
+        });
+        let op = if store {
+            Op::St(OpSt {
+                bit76: true,
+                ..st(8, MemType::I8, space, addr)
+            })
+        } else {
+            Op::Ld(OpLd {
+                bit76: true,
+                pred: ps(0, false),
+                space,
+                ..ldg(8, MemType::I8, addr)
+            })
+        };
+        assert!(accepted(op), "store {store}");
+    }
+}
+
+/// Every descriptor fault present at once reports them in [`DescriptorFault`]'s order: each
+/// step clears the fault just reported and the next is reported, until the word translates.
+/// The checks before it (the register pair, the system order) come first.
+#[test]
+fn descriptor_faults_report_in_the_documented_order() {
+    for store in [false, true] {
+        let exact = Descriptor::exact(store);
+        let mut word = Descriptor {
+            pred: if store { PredSrc::TRUE } else { ps(0, false) },
+            wide: false,
+            mem_type: MemType::I8,
+            order: MemOrder::Constant,
+            eviction: MemEvictionPriority::First,
+            reg_64: false,
+            reg: 255,
+            uniform: 9,
+            ..exact
+        };
+        // An odd register pair and the system order come before every descriptor fault.
+        let odd = Descriptor {
+            reg_64: true,
+            reg: 3,
+            order: MemOrder::Strong(MemScope::System),
+            ..word
+        };
+        assert_eq!(
+            refused(odd.op()),
+            Some(MemoryUnsupported::GlobalRegisterAddress(r(3)))
+        );
+        let system = Descriptor {
+            order: MemOrder::Strong(MemScope::System),
+            ..word
+        };
+        assert_eq!(refused(system.op()), Some(MemoryUnsupported::SystemOrder));
+        let mut steps: Vec<Step> = Vec::new();
+        if !store {
+            steps.push((DescriptorFault::LoadPredicate, |d| d.pred = PredSrc::TRUE));
+        }
+        let rest: [Step; 6] = [
+            (DescriptorFault::UniformSingle, |d: &mut Descriptor| {
+                d.wide = true;
+                d.uniform = 8;
+            }),
+            (DescriptorFault::Type(MemType::I8), |d: &mut Descriptor| {
+                d.mem_type = MemType::B32;
+            }),
+            (DescriptorFault::Order, |d: &mut Descriptor| {
+                d.order = MemOrder::Weak;
+            }),
+            (DescriptorFault::Eviction, |d: &mut Descriptor| {
+                d.eviction = MemEvictionPriority::Normal;
+            }),
+            (DescriptorFault::RegisterSingle, |d: &mut Descriptor| {
+                d.reg_64 = true;
+            }),
+            (DescriptorFault::ZeroRegister, |d: &mut Descriptor| {
+                d.reg = 2;
+            }),
+        ];
+        steps.extend(rest);
+        for (fault, clear) in steps {
+            assert_eq!(
+                refused(word.op()),
+                Some(MemoryUnsupported::DescriptorAddress(fault)),
+                "store {store}"
+            );
+            clear(&mut word);
+        }
+        assert!(accepted(word.op()), "store {store}");
+    }
+}
+
+/// Each descriptor fault's exact message.
+#[test]
+fn descriptor_faults_have_their_messages() {
+    let exact = Descriptor::exact(false);
+    let cases = [
+        (
+            Descriptor {
+                pred: ps(0, false),
+                ..exact
+            },
+            "a load predicate",
+        ),
+        (
+            Descriptor {
+                wide: false,
+                ..exact
+            },
+            "a single uniform register",
+        ),
+        (
+            Descriptor {
+                mem_type: MemType::I16,
+                ..exact
+            },
+            "type s16",
+        ),
+        (
+            Descriptor {
+                store: true,
+                mem_type: MemType::B128,
+                ..exact
+            },
+            "type b128",
+        ),
+        (
+            Descriptor {
+                order: MemOrder::Strong(MemScope::Gpu),
+                ..exact
+            },
+            "a memory order other than weak",
+        ),
+        (
+            Descriptor {
+                eviction: MemEvictionPriority::Last,
+                ..exact
+            },
+            "an eviction priority other than normal",
+        ),
+        (
+            Descriptor {
+                reg_64: false,
+                ..exact
+            },
+            "a single address register",
+        ),
+        (
+            Descriptor { reg: 255, ..exact },
+            "rz as the address register",
+        ),
+    ];
+    for (descriptor, field) in cases {
+        assert_eq!(
+            message(descriptor.op()),
+            format!("a descriptor-addressed global access (bit 76) with {field} is not supported")
+        );
+    }
+}
+
+/// The fields only `LDG` reads (its load predicate and predicate destination) and bit 76 of
+/// `LDG` and `STG` are refused in a hand-built `LDS`, `LDL`, `STS` and `STL`, which no
+/// encoding has, with the exact variant; with them `PT` and clear the same operations
+/// translate. All three present report the load predicate, then the predicate destination,
+/// then bit 76, before the uniform address.
+#[test]
+fn global_only_fields_are_refused_by_hand() {
+    let loads = [
+        (Space::Shared, lds(1, MemType::B32, 2, OffsetStride::X1, 0)),
+        (Space::Local, ldl(1, MemType::B32, 2, 0)),
+    ];
+    for (space, load) in loads {
+        let fault = |field| Some(MemoryUnsupported::GlobalOnlyField { space, field });
+        assert_eq!(refused_by_hand(Op::Ld(load)), None, "{space}");
+        assert!(build_op(Op::Ld(load)).is_ok(), "{space}");
+        for pred in [ps(0, false), ps(7, true)] {
+            assert_eq!(
+                refused_by_hand(Op::Ld(OpLd { pred, ..load })),
+                fault(GlobalOnlyField::LoadPredicate),
+                "{space} {pred:?}"
+            );
+        }
+        assert_eq!(
+            refused_by_hand(Op::Ld(OpLd {
+                pred_dst: p(0),
+                ..load
+            })),
+            fault(GlobalOnlyField::PredicateDestination)
+        );
+        assert_eq!(
+            refused_by_hand(Op::Ld(OpLd {
+                bit76: true,
+                ..load
+            })),
+            fault(GlobalOnlyField::Bit76)
+        );
+        // Order: all three, then the last two, with the uniform address on as well.
+        let uniform = with_uniform(2, false, 1, false, true, 0);
+        let all = OpLd {
+            pred: ps(0, false),
+            pred_dst: p(0),
+            bit76: true,
+            addr: uniform,
+            ..load
+        };
+        assert_eq!(
+            refused_by_hand(Op::Ld(all)),
+            fault(GlobalOnlyField::LoadPredicate)
+        );
+        assert_eq!(
+            refused_by_hand(Op::Ld(OpLd {
+                pred: PredSrc::TRUE,
+                ..all
+            })),
+            fault(GlobalOnlyField::PredicateDestination)
+        );
+        assert_eq!(
+            refused_by_hand(Op::Ld(OpLd {
+                pred: PredSrc::TRUE,
+                pred_dst: Pred::PT,
+                ..all
+            })),
+            fault(GlobalOnlyField::Bit76)
+        );
+        assert_eq!(
+            refused_by_hand(Op::Ld(OpLd {
+                pred: PredSrc::TRUE,
+                pred_dst: Pred::PT,
+                bit76: false,
+                ..all
+            })),
+            Some(MemoryUnsupported::UniformAddress(space))
+        );
+    }
+}
+
+/// Bit 76 is refused in a hand-built `STS` and `STL`, with the exact variant, and the same
+/// stores translate with it clear; each [`GlobalOnlyField`] has its exact message.
+#[test]
+fn global_only_fields_are_refused_in_hand_built_stores() {
+    for (space, mem_space) in [(Space::Shared, SHARED), (Space::Local, LOCAL)] {
+        let store = st(4, MemType::B32, mem_space, plain(2, false, 0));
+        assert_eq!(refused_by_hand(Op::St(store)), None, "{space}");
+        assert!(build_op(Op::St(store)).is_ok(), "{space}");
+        assert_eq!(
+            refused_by_hand(Op::St(OpSt {
+                bit76: true,
+                ..store
+            })),
+            Some(MemoryUnsupported::GlobalOnlyField {
+                space,
+                field: GlobalOnlyField::Bit76,
+            })
+        );
+    }
+    assert_eq!(
+        MemoryError::from(MemoryUnsupported::GlobalOnlyField {
+            space: Space::Shared,
+            field: GlobalOnlyField::LoadPredicate,
+        })
+        .to_string(),
+        "a shared access with a load predicate, which only the global forms read, is not supported"
+    );
+    assert_eq!(
+        MemoryError::from(MemoryUnsupported::GlobalOnlyField {
+            space: Space::Local,
+            field: GlobalOnlyField::PredicateDestination,
+        })
+        .to_string(),
+        "a local access with a predicate destination, which only the global forms read, is not \
+         supported"
+    );
+    assert_eq!(
+        MemoryError::from(MemoryUnsupported::GlobalOnlyField {
+            space: Space::Shared,
+            field: GlobalOnlyField::Bit76,
+        })
+        .to_string(),
+        "a shared access with bit 76, which only the global forms read, is not supported"
+    );
+}
+
+/// A hand-built shared `RED` (`AtomDst::Reduction` in shared memory), which no encoding has,
+/// is refused, before the uniform address; the same atomic with a destination translates.
+#[test]
+fn a_shared_reduction_is_refused_by_hand() {
+    let shared = atom(1, AtomOp::Add, AtomType::U32, SHARED, plain(2, false, 0), 3);
+    assert_eq!(refused_by_hand(Op::Atom(shared)), None);
+    let reduction = OpAtom {
+        dst: AtomDst::Reduction { ignored: r(0) },
+        ..shared
+    };
+    assert_eq!(
+        refused_by_hand(Op::Atom(reduction)),
+        Some(MemoryUnsupported::SharedReduction)
+    );
+    assert_eq!(
+        refused_by_hand(Op::Atom(OpAtom {
+            addr: with_uniform(2, false, 1, false, true, 0),
+            ..reduction
+        })),
+        Some(MemoryUnsupported::SharedReduction)
+    );
+    assert_eq!(
+        MemoryError::from(MemoryUnsupported::SharedReduction).to_string(),
+        "a shared reduction, which no encoding has, is not supported"
+    );
+}

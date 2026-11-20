@@ -85,13 +85,24 @@
 //!
 //! The checks run in this order: the group; the guard (`!PT` appends nothing); the forms PR
 //! #4588's `Visitor::Run` sends to no translator or neither reference translates
-//! ([`MemoryUnsupported::Instruction`] for `CCTL`, [`MemoryUnsupported::CompareAndSwap`],
+//! ([`MemoryUnsupported::CacheControl`] for `CCTL`, [`MemoryUnsupported::CompareAndSwap`],
 //! [`MemoryUnsupported::UniformStore`], [`MemoryUnsupported::UniformSharedAtomic`],
 //! [`MemoryUnsupported::BindlessConstantLoad`]); each `Require` of the PR's translator for the
 //! form, in the PR's order, as a named [`MemoryUnsupported`] whose doc names the PR's message;
 //! then the bits the decoder reads but the PR's translator does not consume, in bit order, as
-//! `Visitor::CheckConsumed` refuses the lowest stray bit ("bit N not modelled"); then, for a
-//! guarded instruction, the successor phis. Every check runs before anything is appended.
+//! `Visitor::CheckConsumed` refuses the lowest stray bit ("bit N not modelled"); then, for the
+//! uniform `LDG` and `STG` with bit 76 and the uniform address on, the lowering's descriptor
+//! word ([`MemoryUnsupported::DescriptorAddress`], its fields in [`DescriptorFault`]'s order;
+//! "Decisions taken here"); then, for a guarded instruction, the successor phis. Every check
+//! runs before anything is appended.
+//!
+//! Three forms no encoding has are refused when built by hand, first in their space's checks:
+//! a local atomic ([`MemoryUnsupported::LocalAtomic`]), a shared reduction
+//! ([`MemoryUnsupported::SharedReduction`]), and a shared or local load or store with a field
+//! only the global forms read, `LDG`'s load predicate or predicate destination or bit 76
+//! ([`MemoryUnsupported::GlobalOnlyField`], in that order, before the uniform address;
+//! `tests::rejections::global_only_fields_are_refused_by_hand`), which the shared and local
+//! translations would otherwise ignore.
 //!
 //! The PR's checks the decoder makes first are not repeated: the types and atomic operations no
 //! encoding names (`Require(type <= 6)`, `Require(atom_op <= 8)`), bit 91 of the forms without a
@@ -110,13 +121,8 @@
 //! # Decisions taken here (the decoder's open readings)
 //!
 //! The decoder (slice 6e) left these readings to this slice. Each follows PR #4588's native
-//! translator, the frontend the spec ports, except bit 76 (the last bullet), and each is a guess
-//! until an `nvdisasm` or hardware check. The PR runs titles through its lowering to Maxwell by
-//! default and through the native translator only when asked
-//! (`eden-pr4588/src/video_core/shader_environment.cpp`: `EDEN_NATIVE_FRONTEND` unset keeps the
-//! lowering, `lower_to_maxwell.h`), so where the two parts read a field differently and the
-//! native translator would translate the word to something else, decision 8 of the 2026-11-12
-//! graphics rulings ("otherwise the one a title ran on") takes the lowering's reading:
+//! translator, the frontend the spec ports, except bit 76 (the last bullet, an **owner
+//! question**), and each is a guess until an `nvdisasm` or hardware check.
 //!
 //! - **The uniform-address bits.** Bit 91 turns the uniform register on (`LDG`, `STG`, `ATOMG`:
 //!   `use_uniform = Take(91, 1)`). In the uniform `LDG` and `STG` the register's 64-bit flag is
@@ -137,15 +143,45 @@
 //!   where the decoder keeps NAK's unsigned `u16`
 //!   (`tests::constant::ldc_offsets_are_signed`).
 //! - **Bit 76 of the uniform `LDG` and `STG`** (`0x981`, `0x986`; the decoder's `bit76`, meaning
-//!   unknown there) with the uniform address on makes the uniform register a memory descriptor,
-//!   which is checked as an address register would be but not added to the address: the
-//!   lowering reads the word `0x0c1e1100` (bits 72, 76, 81..85, 90 and 91; the type masked) of
-//!   `LDG` as a "descriptor address" whose address is the register pair alone, and `0x0c101100`
-//!   of `STG` likewise (`lower_to_maxwell.h`, `descriptor_address` and `sized_store`; PR #4588's
-//!   test "Native descriptor-addressed global loads retain the explicit 64-bit pointer"). The
-//!   native translator ignores the bit with the memory order (`Ignore(76, 4)`) and adds the
-//!   uniform register. With the uniform address off the bit changes nothing
-//!   (`tests::global::bit_76_makes_the_uniform_register_a_descriptor`).
+//!   unknown there) with the uniform address on. **Owner question**: this departs from two
+//!   approved sentences of `docs/specs/shader-pipeline.md`: "Where PR #4588's native visitor and
+//!   its lowering disagree (`SHFL` 0x989, `DEPBAR` scoreboard 0, `WARPSYNC`), the native visitor
+//!   is followed." and "Deliberately not ported: ... everything in PR #4588's
+//!   `lower_to_maxwell.h`." The two options:
+//!   1. **The native visitor's reading** (what those sentences give): bit 76 is ignored with
+//!      the memory order (`Ignore(76, 4)`), and the uniform register is added to the address as
+//!      in any uniform `LDG` or `STG`.
+//!   2. **The lowering's reading** (what this module does, pending the owner): the PR runs
+//!      titles through its lowering to Maxwell by default and through the native translator
+//!      only when asked (`eden-pr4588/src/video_core/shader_environment.cpp`:
+//!      `EDEN_NATIVE_FRONTEND` unset keeps the lowering), and decision 8 of the 2026-11-12
+//!      graphics rulings says "otherwise the one a title ran on". The lowering reads one exact
+//!      word as a "descriptor address" whose address is the register pair alone, the uniform
+//!      register a memory descriptor that is checked as an address register would be but not
+//!      added: `LDG`'s `(insn.words[2] & ~0xe00U) == 0x0c1e1100` and `STG`'s `sized_store`,
+//!      `(insn.words[2] & ~(0x3fU | 0xe00U)) == 0x0c101100` (`lower_to_maxwell.h`; PR #4588's
+//!      test "Native descriptor-addressed global loads retain the explicit 64-bit pointer").
+//!      That word has bits 90 (register pair) and 72 (uniform pair) set, no load predicate, the
+//!      weak order, the normal eviction priority and, in `LDG`, the predicate destination
+//!      `PT`; `LDG` takes `.u16`, 32, 64 and 128 bits (its `size` check) and `STG` `.u8`,
+//!      `.u16`, 32 and 64 bits; the register is an even pair that is not `RZ` ("native
+//!      descriptor load address pair", "native descriptor store address pair").
+//!
+//!   Only that word is read as a descriptor here. The lowering refuses every other bit-76 word
+//!   with the uniform address on, and the native translator adds the uniform register to it,
+//!   so neither reference gives a descriptor reading for it: it is refused
+//!   ([`MemoryUnsupported::DescriptorAddress`] with the first [`DescriptorFault`]:
+//!   `tests::rejections::descriptor_words_at_each_edge`,
+//!   `tests::rejections::descriptor_orders_evictions_and_types`). The lowering's register bound
+//!   (`address + 2 > reserved_register`, from the scratch registers it reserves for the whole
+//!   shader) is not mirrored: the native translator's bound applies (`R252` is accepted, the
+//!   same test). Nor is its uniform bound, which maps `UR62` to an even host register and takes
+//!   the pair: the native translator's `uniform + 1 < 63` refuses it here
+//!   ([`MemoryUnsupported::GlobalUniformAddress`], the same test). With the uniform address off
+//!   the bit changes nothing (`tests::global::bit_76_makes_the_uniform_register_a_descriptor`,
+//!   `tests::rejections::bit_76_without_the_uniform_address_is_not_a_descriptor`). If the owner
+//!   picks the native visitor's reading, `global_addr` drops its `descriptor` and
+//!   `check_descriptor` goes; the refused words then translate.
 //!
 //! # Constant buffers
 //!
@@ -180,8 +216,11 @@
 //! | `LDL` past the local memory size | each word selects 0 where the byte offset is not below `env.LocalMemorySize()` | no bound here: slice 16's pass 6 bounds every indexed local access | `tests::local::ldl_reads_without_a_bound` |
 //! | `LDC` with `RZ` | `IAdd(X(255), Imm32(offset))` | the immediate offset alone (the same value) | `tests::constant::only_a_register_offset_is_indexed` |
 //! | `LDG`'s load predicate | writes the registers, then rewrites each with a select of its new value | selects the loaded value before writing (the same values) | `tests::global::a_false_load_predicate_gives_zero` |
-//! | The uniform `LDG` and `STG` with bit 76 and the uniform address on | the native translator adds the uniform register; the lowering does not (above) | the lowering's reading: a descriptor, not added | `tests::global::bit_76_makes_the_uniform_register_a_descriptor`, `tests::pr4588::descriptor_addressed_global_loads_retain_the_explicit_64_bit_pointer` |
-//! | `LDGSTS`'s enable predicate | the native translator requires bits 85..90 clear ("native global-to-shared copy mode", `Take(85, 5) == 0`) and then reads bits 87..90 as the predicate, so only `P0` passes, against its own comment ("the enable predicate (87..89 plus the negate bit 70)"); the lowering takes any predicate (its test "Native global-to-shared copy retains its source predicate", `PT` included) | any predicate, as the decoder reads it (the lowering's reading, decision 8). **Owner question**: refuse all but `P0` as the native translator does | `tests::barriers::any_predicate_enables_a_copy` |
+//! | The uniform `LDG` and `STG` with bit 76, the uniform address on and the lowering's exact descriptor word | the native translator adds the uniform register; the lowering does not (above) | the lowering's reading: a descriptor, not added. **Owner question**: the spec says "Where PR #4588's native visitor and its lowering disagree (`SHFL` 0x989, `DEPBAR` scoreboard 0, `WARPSYNC`), the native visitor is followed." and "Deliberately not ported: ... everything in PR #4588's `lower_to_maxwell.h`." | `tests::global::bit_76_makes_the_uniform_register_a_descriptor`, `tests::pr4588::descriptor_addressed_global_loads_retain_the_explicit_64_bit_pointer` |
+//! | Any other uniform `LDG` or `STG` with bit 76 and the uniform address on: `RZ` as the register, bit 90 or 72 clear, a load predicate, an order other than weak, an eviction priority other than normal, `LDG` `.u8`, `.s8` or `.s16`, `STG` `.s8`, `.s16` or `.128` | the native translator adds the uniform register; the lowering refuses the word | refused ([`MemoryUnsupported::DescriptorAddress`]), departing from both | `tests::rejections::descriptor_words_at_each_edge`, `tests::rejections::descriptor_orders_evictions_and_types`, `tests::rejections::descriptor_faults_report_in_the_documented_order` |
+//! | A descriptor word's register at or past the lowering's reserved register | the lowering refuses it ("native descriptor load address pair"); the native translator takes an even pair below `R254` | the native translator's bound: an even pair below `R254`, not `RZ` | `tests::rejections::descriptor_words_at_each_edge` (`R252`) |
+//! | A descriptor word's uniform pair `UR62` | the lowering takes it (`uniform_register(62)` is even); the native translator refuses it (`uniform + 1 < 63`) | refused, the native translator's bound | `tests::rejections::descriptor_words_at_each_edge` (`UR62`, `UR60`) |
+//! | `LDGSTS`'s enable predicate | the native translator requires bits 85..90 clear ("native global-to-shared copy mode", `Take(85, 5) == 0`) and then reads bits 87..90 as the predicate, so only `P0` passes, against its own comment ("the enable predicate (87..89 plus the negate bit 70)"); the lowering takes any predicate (its test "Native global-to-shared copy retains its source predicate", `PT` included) | any predicate, as the decoder reads it (the lowering's reading, decision 8). **Owner question**: refuse all but `P0` as the native translator does; the spec says "Where PR #4588's native visitor and its lowering disagree (`SHFL` 0x989, `DEPBAR` scoreboard 0, `WARPSYNC`), the native visitor is followed." and "Deliberately not ported: ... everything in PR #4588's `lower_to_maxwell.h`." | `tests::barriers::any_predicate_enables_a_copy` |
 //!
 //! # Not translated
 //!
@@ -191,9 +230,10 @@
 //! `0x38d`; no case in `Visitor::Run`, and Eden's IR has no compare-and-swap operation); the
 //! uniform `STL`, `STS` and `ATOMS`; the bindless `LDC`; atomic types other than `U32` and
 //! `S32` (the PR's `Require(type <= 1)`, where Eden's Maxwell translator also takes 64-bit and
-//! float atomics); and `MEMBAR.SM` (scope 1, the PR's `Require(scope == 0 || scope == 2 ||
-//! scope == 3 || scope == 5)`). `ULDC` and `ULDC.64` are slice 6d's and `LDCG` has no slice:
-//! neither decodes yet, so neither reaches this module.
+//! float atomics); `MEMBAR.SM` (scope 1, the PR's `Require(scope == 0 || scope == 2 ||
+//! scope == 3 || scope == 5)`); and the bit-76 uniform `LDG` and `STG` words other than the
+//! lowering's descriptor word ("Decisions taken here"). `ULDC` and `ULDC.64` are slice 6d's
+//! and `LDCG` has no slice: neither decodes yet, so neither reaches this module.
 
 #[cfg(test)]
 mod tests;
@@ -205,9 +245,10 @@ use thiserror::Error;
 use super::integer::{GuardMode, split_for_guard, successor_phi};
 use crate::decode::memory::MEM_OFFSET;
 use crate::decode::{
-    AtomDst, AtomOp, AtomType, CBuf, DecodeError, Gpr, Instr, Instruction, LdcMode, MemAddr,
-    MemBarScope, MemOrder, MemScope, MemSpace, MemType, OffsetStride, Op, OpAtom, OpAtomsPopc,
-    OpLd, OpLdGsts, OpLdc, OpMemBar, OpSt, Pred, UniformReg, decode,
+    AtomDst, AtomOp, AtomType, CBuf, DecodeError, GlobalAccess, Gpr, Instr, Instruction, LdcMode,
+    MemAddr, MemBarScope, MemEvictionPriority, MemOrder, MemScope, MemSpace, MemType, OffsetStride,
+    Op, OpAtom, OpAtomsPopc, OpLd, OpLdGsts, OpLdc, OpMemBar, OpSt, Pred, PredSrc, UniformReg,
+    decode,
 };
 use crate::flow::read_pred;
 use crate::ir::{BlockId, BuildError, Builder, Imm, Opcode, Operand};
@@ -270,10 +311,10 @@ impl Display for TypeName {
 /// translator does not read it, or a form no reference translates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum MemoryUnsupported {
-    /// An instruction neither reference translates (`CCTL`: no case in `Visitor::Run`; Eden's
-    /// Maxwell `CCTL` throws `NotImplemented`).
-    #[error("{0}, which neither reference translates,")]
-    Instruction(&'static str),
+    /// `CCTL`, which neither reference translates (no case in `Visitor::Run`; Eden's Maxwell
+    /// `CCTL` throws `NotImplemented`).
+    #[error("a cctl, which neither reference translates,")]
+    CacheControl,
     /// A compare-and-swap atomic (`ATOMG.CAS` `0x3a9`, `ATOMS.CAS` `0x38d`): no case in
     /// `Visitor::Run`, and Eden's IR has no compare-and-swap operation.
     #[error("a {0} compare-and-swap atomic, which neither reference translates,")]
@@ -290,6 +331,21 @@ pub enum MemoryUnsupported {
     /// support local"); only a hand-built operation reaches it.
     #[error("a local atomic, which no encoding has,")]
     LocalAtomic,
+    /// A reduction (`RED`'s destination) in shared memory, which no encoding has (`RED` is
+    /// global only, `0x98e`); only a hand-built operation reaches it.
+    #[error("a shared reduction, which no encoding has,")]
+    SharedReduction,
+    /// A field only the global forms read, set in a shared or local load or store: `LDG`'s load
+    /// predicate or predicate destination, or bit 76 of `LDG` and `STG`. No encoding of `LDS`,
+    /// `LDL`, `STS` or `STL` has these fields (the decoder leaves them `PT` and clear), so only
+    /// a hand-built operation reaches it.
+    #[error("a {space} access with {field}, which only the global forms read,")]
+    GlobalOnlyField {
+        /// The space.
+        space: Space,
+        /// The field.
+        field: GlobalOnlyField,
+    },
     /// A bindless `LDC` (`0x582`; `Visitor::LDC`: "native bindless constant load", and
     /// `Visitor::Run` takes only `0xb82`).
     #[error("a bindless ldc")]
@@ -387,6 +443,12 @@ pub enum MemoryUnsupported {
         /// The global address register pair.
         global: Gpr,
     },
+    /// A uniform `LDG` or `STG` with bit 76 and the uniform address on whose word is not the
+    /// one PR #4588's lowering reads as a memory descriptor (module docs, "Decisions taken
+    /// here"): the lowering refuses every other such word and the native translator adds the
+    /// uniform register, so neither reference gives the descriptor reading for it.
+    #[error("a descriptor-addressed global access (bit 76) with {0}")]
+    DescriptorAddress(DescriptorFault),
     /// The system-scope memory order of a global access, which sets bit 80: the PR ignores bits
     /// 76..80 only (`Ignore(76, 4)`, "memory ordering"), so `CheckConsumed` refuses it.
     #[error("a global access with the system-scope memory order")]
@@ -418,6 +480,79 @@ pub enum MemoryUnsupported {
     /// it.
     #[error("a membar.sc")]
     BarrierSc,
+}
+
+/// A field that only the global forms read ([`MemoryUnsupported::GlobalOnlyField`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GlobalOnlyField {
+    /// `LDG`'s load predicate other than `PT`.
+    LoadPredicate,
+    /// `LDG`'s predicate destination other than `PT`.
+    PredicateDestination,
+    /// Bit 76 of `LDG` and `STG`.
+    Bit76,
+}
+
+impl Display for GlobalOnlyField {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::LoadPredicate => "a load predicate",
+            Self::PredicateDestination => "a predicate destination",
+            Self::Bit76 => "bit 76",
+        })
+    }
+}
+
+/// The first condition of PR #4588's lowering's descriptor word that a bit-76 uniform `LDG` or
+/// `STG` fails ([`MemoryUnsupported::DescriptorAddress`]), checked in this order (bit order,
+/// then the register): the lowering compares the whole of bits 64..96 at once, so the order is
+/// this module's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DescriptorFault {
+    /// `LDG`'s load predicate (bits 64..68) is not `PT`: the word must have them zero.
+    LoadPredicate,
+    /// Bit 72 is clear: the uniform register is not a pair.
+    UniformSingle,
+    /// A type the lowering does not take there: `LDG` takes `.u16`, 32, 64 and 128 bits (its
+    /// `size != 2 && size != 4 && size != 5 && size != 6` refusal), `STG` `.u8`, `.u16`, 32 and
+    /// 64 bits (`sized_store`: `width == 0 || width == 2 || width == 4 || width == 5`).
+    Type(MemType),
+    /// A memory order other than weak (bits 77..81 zero; the system scope is refused first, as
+    /// [`MemoryUnsupported::SystemOrder`]).
+    Order,
+    /// An eviction priority other than normal (bits 84..87 are 1).
+    Eviction,
+    /// Bit 90 is clear: the address register is not a pair.
+    RegisterSingle,
+    /// The address register is `RZ` (the lowering's `address & 1`: 255 is odd).
+    ZeroRegister,
+}
+
+impl Display for DescriptorFault {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LoadPredicate => f.write_str("a load predicate"),
+            Self::UniformSingle => f.write_str("a single uniform register"),
+            Self::Type(mem_type) => write!(f, "type {}", type_word(*mem_type)),
+            Self::Order => f.write_str("a memory order other than weak"),
+            Self::Eviction => f.write_str("an eviction priority other than normal"),
+            Self::RegisterSingle => f.write_str("a single address register"),
+            Self::ZeroRegister => f.write_str("rz as the address register"),
+        }
+    }
+}
+
+/// A memory type in plain words, for error messages.
+const fn type_word(mem_type: MemType) -> &'static str {
+    match mem_type {
+        MemType::U8 => "u8",
+        MemType::I8 => "s8",
+        MemType::U16 => "u16",
+        MemType::I16 => "s16",
+        MemType::B32 => "b32",
+        MemType::B64 => "b64",
+        MemType::B128 => "b128",
+    }
 }
 
 /// Why a memory instruction was not translated.
@@ -668,6 +803,75 @@ const fn check_order(space: MemSpace) -> Result<(), MemoryUnsupported> {
     }
 }
 
+/// The fields only the global forms read, which a shared or local load or store must leave
+/// `PT` and clear ([`MemoryUnsupported::GlobalOnlyField`]): the load predicate, the predicate
+/// destination, then bit 76.
+fn check_global_only(
+    space: Space,
+    pred: PredSrc,
+    pred_dst: Pred,
+    bit76: bool,
+) -> Result<(), MemoryUnsupported> {
+    let fault = |field| MemoryUnsupported::GlobalOnlyField { space, field };
+    require(pred.is_true(), fault(GlobalOnlyField::LoadPredicate))?;
+    require(
+        pred_dst.is_true(),
+        fault(GlobalOnlyField::PredicateDestination),
+    )?;
+    require(!bit76, fault(GlobalOnlyField::Bit76))
+}
+
+/// The types PR #4588's lowering takes in a descriptor `LDG`: `.u16`, 32, 64 and 128 bits
+/// (`size != 2 && size != 4 && size != 5 && size != 6` is refused).
+const fn descriptor_load_type(mem_type: MemType) -> bool {
+    matches!(
+        mem_type,
+        MemType::U16 | MemType::B32 | MemType::B64 | MemType::B128
+    )
+}
+
+/// The types PR #4588's lowering takes in a descriptor `STG` (`sized_store`: `width == 0 ||
+/// width == 2 || width == 4 || width == 5`): `.u8`, `.u16`, 32 and 64 bits.
+const fn descriptor_store_type(mem_type: MemType) -> bool {
+    matches!(
+        mem_type,
+        MemType::U8 | MemType::U16 | MemType::B32 | MemType::B64
+    )
+}
+
+/// The conditions of PR #4588's lowering's descriptor word (`lower_to_maxwell.h`: `LDG`'s
+/// `(insn.words[2] & ~0xe00U) == 0x0c1e1100`, `STG`'s `sized_store`, `(insn.words[2] &
+/// ~(0x3fU | 0xe00U)) == 0x0c101100`, then "native descriptor load address pair" and "native
+/// descriptor store address pair"), in [`DescriptorFault`]'s order. The checks made before it
+/// cover the rest of the word: bit 91 is on (the caller's `descriptor`), the predicate
+/// destination is `PT` ([`MemoryUnsupported::LoadResidency`]), a uniform pair is even and below
+/// `URZ` and a register pair even ([`check_global_addr`]); the decoder refuses the other bits.
+fn check_descriptor(
+    pred: PredSrc,
+    addr: MemAddr,
+    mem_type: MemType,
+    type_ok: bool,
+    access: GlobalAccess,
+) -> Result<(), MemoryUnsupported> {
+    let fault = MemoryUnsupported::DescriptorAddress;
+    require(pred.is_true(), fault(DescriptorFault::LoadPredicate))?;
+    require(
+        addr.uniform.is_some_and(|uniform| uniform.wide),
+        fault(DescriptorFault::UniformSingle),
+    )?;
+    require(type_ok, fault(DescriptorFault::Type(mem_type)))?;
+    require(
+        matches!(access.order, MemOrder::Weak),
+        fault(DescriptorFault::Order),
+    )?;
+    require(
+        matches!(access.eviction, MemEvictionPriority::Normal),
+        fault(DescriptorFault::Eviction),
+    )?;
+    require(addr.reg_64, fault(DescriptorFault::RegisterSingle))?;
+    require(!addr.reg.is_zero(), fault(DescriptorFault::ZeroRegister))
+}
+
 fn check(op: &Op) -> Result<(), MemoryUnsupported> {
     match *op {
         Op::Ld(ld) => check_ld(ld),
@@ -676,7 +880,7 @@ fn check(op: &Op) -> Result<(), MemoryUnsupported> {
         Op::Atom(atom) => check_atom(atom),
         Op::MemBar(bar) => check_membar(bar),
         Op::LdGsts(copy) => check_ldgsts(copy),
-        Op::CCtl(_) => Err(MemoryUnsupported::Instruction(op.mnemonic())),
+        Op::CCtl(_) => Err(MemoryUnsupported::CacheControl),
         _ => Ok(()),
     }
 }
@@ -690,16 +894,23 @@ fn check_ld(ld: OpLd) -> Result<(), MemoryUnsupported> {
         words,
     };
     match ld.space {
-        MemSpace::Global(_) => {
+        MemSpace::Global(access) => {
             require(
                 ld.pred_dst.is_true(),
                 MemoryUnsupported::LoadResidency(ld.pred_dst),
             )?;
-            check_global_addr(global_addr(ld.addr, ld.bit76))?;
+            let addr = global_addr(ld.addr, ld.bit76);
+            check_global_addr(addr)?;
             require(run_ok(ld.dst, words), destination)?;
-            check_order(ld.space)
+            check_order(ld.space)?;
+            if addr.descriptor {
+                let type_ok = descriptor_load_type(ld.mem_type);
+                check_descriptor(ld.pred, ld.addr, ld.mem_type, type_ok, access)?;
+            }
+            Ok(())
         }
         MemSpace::Shared(_) => {
+            check_global_only(space, ld.pred, ld.pred_dst, ld.bit76)?;
             let uniform = ld.addr.uniform;
             require(
                 !uniform.is_some_and(|uniform| uniform.enabled),
@@ -715,6 +926,7 @@ fn check_ld(ld: OpLd) -> Result<(), MemoryUnsupported> {
             require(!ld.zd, MemoryUnsupported::SharedLoadZd)
         }
         MemSpace::Local(_) => {
+            check_global_only(space, ld.pred, ld.pred_dst, ld.bit76)?;
             require(
                 !ld.addr
                     .uniform
@@ -735,12 +947,19 @@ fn check_st(st: OpSt) -> Result<(), MemoryUnsupported> {
         words,
     };
     match st.space {
-        MemSpace::Global(_) => {
-            check_global_addr(global_addr(st.addr, st.bit76))?;
+        MemSpace::Global(access) => {
+            let addr = global_addr(st.addr, st.bit76);
+            check_global_addr(addr)?;
             require(run_ok(st.data, words), data)?;
-            check_order(st.space)
+            check_order(st.space)?;
+            if addr.descriptor {
+                let type_ok = descriptor_store_type(st.mem_type);
+                check_descriptor(PredSrc::TRUE, st.addr, st.mem_type, type_ok, access)?;
+            }
+            Ok(())
         }
         MemSpace::Local(_) | MemSpace::Shared(_) => {
+            check_global_only(space, PredSrc::TRUE, Pred::PT, st.bit76)?;
             require(
                 st.addr.uniform.is_none(),
                 MemoryUnsupported::UniformStore(space),
@@ -817,7 +1036,8 @@ fn check_atom(atom: OpAtom) -> Result<(), MemoryUnsupported> {
             check_order(atom.space)?;
             require(!atom.addr.reg_64, MemoryUnsupported::ReductionRegister64)
         }
-        (MemSpace::Shared(_), _) => {
+        (MemSpace::Shared(_), AtomDst::Reduction { .. }) => Err(MemoryUnsupported::SharedReduction),
+        (MemSpace::Shared(_), AtomDst::Reg(_)) => {
             require(
                 atom.addr.uniform.is_none(),
                 MemoryUnsupported::UniformSharedAtomic,
