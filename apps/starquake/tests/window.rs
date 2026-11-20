@@ -4,8 +4,10 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use starquake::window::{NOT_MAIN_THREAD, may_open};
-use starquake::{Command, RunArgs, USAGE, UsageError, execute, parse, render_choice};
+use starquake::window::{NOT_MAIN_THREAD, NotMainThread, may_open};
+use starquake::{
+    Command, RunArgs, USAGE, UsageError, execute, headless_setup, parse, render_choice,
+};
 use starquake_core::artifacts::SUMMARY_FILE;
 use starquake_core::exit_code;
 use starquake_core::renderer::{BackendFlag, Choice, ChoiceError, IfUnavailable, WGPU_BUILT};
@@ -86,6 +88,39 @@ fn each_flag_reaches_the_choice_in_its_own_place() {
     } else {
         assert_eq!(choice(&["run", "a.nro"]), Ok(Choice::Recording));
     }
+}
+
+/// The setup a run without `--window` hands the run (`headless_setup`) has the backend its flags
+/// choose, and no window: the default, `--backend recording` and `--backend wgpu` each give their
+/// own on a build with the wgpu backend, so a run handed another setup (the recording backend
+/// whatever the flags, say) fails here.
+#[test]
+fn a_headless_run_is_handed_the_backend_its_flags_choose() {
+    let setup = |args: &RunArgs| {
+        headless_setup(args).map(|setup| (setup.choice(), setup.window().is_none()))
+    };
+    let recording = parsed(&["run", "a.nro", "--backend", "recording"]);
+    assert_eq!(setup(&recording), Ok((Choice::Recording, true)));
+    let default = parsed(&["run", "a.nro"]);
+    let mut wgpu = default.clone();
+    wgpu.backend = Some(BackendFlag::Wgpu);
+    if WGPU_BUILT {
+        assert_eq!(
+            setup(&default),
+            Ok((Choice::Wgpu(IfUnavailable::UseRecording), true))
+        );
+        assert_eq!(
+            setup(&wgpu),
+            Ok((Choice::Wgpu(IfUnavailable::EndRun), true))
+        );
+    } else {
+        assert_eq!(setup(&default), Ok((Choice::Recording, true)));
+        assert_eq!(setup(&wgpu), Err(ChoiceError::WgpuNotBuilt));
+    }
+    // A combination the choice refuses is refused here too.
+    let mut conflict = recording;
+    conflict.window = true;
+    assert_eq!(setup(&conflict), Err(ChoiceError::RecordingWindow));
 }
 
 #[test]
@@ -188,12 +223,13 @@ fn the_usage_names_both_flags() {
 #[test]
 fn only_the_main_thread_may_open_the_window() {
     assert_eq!(may_open(true), Ok(()));
-    assert_eq!(may_open(false), Err(NOT_MAIN_THREAD));
+    assert_eq!(may_open(false), Err(NotMainThread));
     assert_eq!(
-        NOT_MAIN_THREAD,
+        NotMainThread.to_string(),
         "`--window` needs the process's main thread, which owns the window and its events; this \
          run was started on another thread"
     );
+    assert_eq!(NOT_MAIN_THREAD, NotMainThread.to_string());
 }
 
 /// Helpers, in a `cfg(test)` module so they may unwrap like the tests do.
@@ -226,15 +262,15 @@ mod support {
 
 use support::{scratch, summary_error};
 
-/// `run --window` from a thread that is not the process's main thread (a test's) is refused
-/// before anything runs, as an emulator error with the exact words, exit code 2 and the
-/// artifacts written. It needs no VM, so it runs on every host.
-#[test]
-fn a_window_off_the_main_thread_is_refused_before_the_run() {
-    if !WGPU_BUILT {
-        return;
-    }
-    let folder = scratch("off-main");
+/// How long a test here waits for a `run --window` it started on a thread of its own.
+const REFUSAL_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `run --window` of the hello program in the scratch folder `name`, by `execute` on a thread
+/// named `thread` (not the process's main thread in either test harness), is refused before
+/// anything runs, as an emulator error with the exact words, exit code 2 and the artifacts
+/// written.
+fn assert_refused_off_the_main_thread(name: &str, thread: &str) {
+    let folder = scratch(name);
     let hello = folder.join("hello.nro");
     std::fs::write(&hello, programs::hello().unwrap()).unwrap();
     let artifacts = folder.join("artifacts");
@@ -246,8 +282,17 @@ fn a_window_off_the_main_thread_is_refused_before_the_run() {
         "--artifacts".into(),
         artifacts.clone().into(),
     ];
-    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-    let code = execute(&line, &mut stdout, &mut stderr);
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name(thread.to_owned())
+        .spawn(move || {
+            let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+            let code = execute(&line, &mut stdout, &mut stderr);
+            done.send((code, stdout)).unwrap();
+        })
+        .unwrap();
+    // A run that panicked drops the sender: `recv_timeout` then fails at once.
+    let (code, stdout) = finished.recv_timeout(REFUSAL_WAIT).unwrap();
     let stdout = String::from_utf8(stdout).unwrap();
     assert_eq!(code, exit_code::EMULATOR_ERROR, "{stdout}");
     assert_eq!(
@@ -259,6 +304,29 @@ fn a_window_off_the_main_thread_is_refused_before_the_run() {
     );
     assert_eq!(summary_error(&artifacts), NOT_MAIN_THREAD);
     std::fs::remove_dir_all(&folder).unwrap();
+}
+
+/// `run --window` from a thread that is not the process's main thread (a test's) is refused
+/// before anything runs. It needs no VM, so it runs on every host.
+#[test]
+fn a_window_off_the_main_thread_is_refused_before_the_run() {
+    if !WGPU_BUILT {
+        return;
+    }
+    assert_refused_off_the_main_thread("off-main", "a test's");
+}
+
+/// A thread that is not the process's main thread but is named `main`, the name Rust gives the
+/// main thread, is refused all the same (`starquake::window`'s module docs, "When no window can be
+/// made"): on macOS by `AppKit`'s check, and on Linux by the thread id against the process id,
+/// where a check of the name alone would pass it on to winit, whose `EventLoop::new` then
+/// panics.
+#[test]
+fn a_thread_named_main_is_still_refused_the_window() {
+    if !WGPU_BUILT {
+        return;
+    }
+    assert_refused_off_the_main_thread("named-main", "main");
 }
 
 /// A Linux host with no X11 or Wayland display cannot make a window: `run --window`, on the

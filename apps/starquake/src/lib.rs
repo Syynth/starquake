@@ -50,9 +50,9 @@
 //! (`starquake_core::hle::graphics`, "Frames").
 //!
 //! The render backend a run draws with is `starquake_core::renderer::choose_backend`'s choice
-//! ([`render_choice`]): the wgpu backend where this build has it (the `wgpu` feature, on by
-//! default), falling back to the recording backend, with a warning in `log.txt`, on a host
-//! with no GPU adapter; or the backend `--backend recording|wgpu` names, which is starquake's own
+//! ([`render_choice`]; a run without `--window` is handed it as [`headless_setup`]): the wgpu
+//! backend where this build has it (the `wgpu` feature, on by default), falling back to the
+//! recording backend, with a warning in `log.txt`, on a host with no GPU adapter; or the backend `--backend recording|wgpu` names, which is starquake's own
 //! flag on `run` (the contract names it for `render-replay` only; an owner question listed in
 //! `starquake_core::renderer`). `--window` shows the frames in a plain window while the program
 //! runs ([`window`], render-backend decision 11); it needs the wgpu backend and changes nothing
@@ -174,6 +174,13 @@ pub struct RunArgs {
 /// [`choose_backend`] of this build ([`WGPU_BUILT`]), `--backend` and `--window`.
 pub fn render_choice(args: &RunArgs) -> Result<Choice, ChoiceError> {
     choose_backend(WGPU_BUILT, args.backend, args.window)
+}
+
+/// What the run `args` asks for renders with when it shows no window: [`render_choice`]'s
+/// backend, with no window. A run with `--window` renders with the setup [`window::run`] makes
+/// around its window instead; for it, this says only whether the flags can be followed.
+pub fn headless_setup(args: &RunArgs) -> Result<RenderSetup, ChoiceError> {
+    render_choice(args).map(RenderSetup::headless)
 }
 
 /// A parsed command line.
@@ -561,17 +568,17 @@ fn run(
     stderr: &mut dyn Write,
 ) -> u8 {
     let started = Instant::now();
-    let mut report = match (load(&args.program), render_choice(args)) {
+    let mut report = match (load(&args.program), headless_setup(args)) {
         (Err(message), _) => RunReport::emulator_error(message, started.elapsed()),
         // Not reached from `execute`: `parse` refuses every combination the choice refuses. It
         // keeps such a refusal an emulator error rather than a run with another backend.
         (Ok(_), Err(refused)) => RunReport::emulator_error(refused.to_string(), started.elapsed()),
-        (Ok(Loaded { system, romfs }), Ok(choice)) => {
+        (Ok(Loaded { system, romfs }), Ok(setup)) => {
             let options = run_options(args, command_line, romfs);
             if args.window {
                 window::run(system, options, started)
             } else {
-                system.run_rendering(&options, RenderSetup::headless(choice))
+                system.run_rendering(&options, setup)
             }
         }
     };

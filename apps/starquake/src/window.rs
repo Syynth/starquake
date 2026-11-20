@@ -23,17 +23,26 @@
 //!
 //! The run ends as an emulator error before it starts, with nothing run, when:
 //!
-//! - this is not the process's main thread ([`NOT_MAIN_THREAD`]): winit makes event loops on
-//!   the main thread only (on macOS `AppKit` requires it, and elsewhere winit refuses by default).
-//!   On macOS the check is `AppKit`'s own (`objc2::MainThreadMarker`); elsewhere it is the thread's
-//!   name, which Rust gives the main thread as `main` and no other thread unless a program names
-//!   one so (a **guess** that holds for this program, which names its other threads otherwise);
+//! - this is not the process's main thread ([`NotMainThread`], whose words are
+//!   [`NOT_MAIN_THREAD`]): winit makes event loops on the main thread only (on macOS `AppKit`
+//!   requires it, and on Linux winit 0.30.13's `EventLoop::new` panics off the main thread unless
+//!   the loop is built for any thread). On macOS the check is `AppKit`'s own
+//!   (`objc2::MainThreadMarker`). On Linux it is winit's own: the thread's id equals the
+//!   process's (`gettid() == getpid()`, winit 0.30.13 `src/platform_impl/linux/mod.rs`,
+//!   `is_main_thread`), so a thread that is merely named `main` is refused
+//!   (`a_thread_named_main_is_still_refused_the_window`, in `tests/window.rs`). The event loop is
+//!   also built for any thread (`EventLoopBuilderExtX11::with_any_thread`) wherever winit has X11
+//!   and Wayland, so that starquake's check is the only gate and winit's never panics. Elsewhere
+//!   (a Unix host other than macOS and Linux, which starquake does not support) the check is the
+//!   thread's name, which Rust gives the main thread as `main` and no other thread unless a
+//!   program names one so: a **guess**, which a thread named `main` defeats;
 //! - the event loop or the window cannot be made ([`NO_WINDOW`], then winit's reason): a Linux
 //!   host with neither an X11 nor a Wayland display, for one.
 //!
 //! The command line always runs on the main thread, so the first case is reached only when
-//! [`crate::execute`] is called from another thread, as a test does
-//! (`a_window_off_the_main_thread_is_refused_before_the_run`, in `tests/window.rs`). The second
+//! [`crate::execute`] is called from another thread, as two tests do
+//! (`a_window_off_the_main_thread_is_refused_before_the_run` and
+//! `a_thread_named_main_is_still_refused_the_window`, in `tests/window.rs`). The second
 //! is tested where it can be made to happen: a child process on Linux with no display variable
 //! (`a_host_with_no_display_ends_the_run_before_it_starts`, same file).
 //!
@@ -47,7 +56,7 @@ use std::time::Instant;
 use starquake_core::renderer::{MainThread, RenderSetup, WindowTarget};
 use starquake_core::{RunOptions, RunReport, System};
 
-/// Why `--window` refused to make a window: not on the main thread (module docs).
+/// The words of [`NotMainThread`] (module docs).
 pub const NOT_MAIN_THREAD: &str = "`--window` needs the process's main thread, which owns the \
                                    window and its events; this run was started on another thread";
 
@@ -68,13 +77,19 @@ pub const RUN_THREAD: &str = "run";
 /// a run without a window runs on.
 pub const RUN_STACK: usize = 8 << 20;
 
+/// Why `--window` refused to make a window: this is not the process's main thread (module
+/// docs, "When no window can be made").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{words}", words = NOT_MAIN_THREAD)]
+pub struct NotMainThread;
+
 /// Whether `--window` may make its window on this thread, from whether it is the process's main
 /// thread (module docs, "When no window can be made").
-pub fn may_open(on_main_thread: bool) -> Result<(), &'static str> {
+pub fn may_open(on_main_thread: bool) -> Result<(), NotMainThread> {
     if on_main_thread {
         Ok(())
     } else {
-        Err(NOT_MAIN_THREAD)
+        Err(NotMainThread)
     }
 }
 
@@ -84,8 +99,15 @@ fn on_main_thread() -> bool {
     objc2::MainThreadMarker::new().is_some()
 }
 
-/// Whether the calling thread is the process's main thread: its name (module docs).
-#[cfg(not(all(feature = "wgpu", target_os = "macos")))]
+/// Whether the calling thread is the process's main thread: whether its thread id is the
+/// process id, the check winit's Linux event loop makes (module docs).
+#[cfg(target_os = "linux")]
+fn on_main_thread() -> bool {
+    rustix::thread::gettid() == rustix::process::getpid()
+}
+
+/// Whether the calling thread is the process's main thread: its name, a guess (module docs).
+#[cfg(not(any(all(feature = "wgpu", target_os = "macos"), target_os = "linux")))]
 fn on_main_thread() -> bool {
     std::thread::current().name() == Some("main")
 }
@@ -95,7 +117,7 @@ fn on_main_thread() -> bool {
 #[must_use]
 pub fn run(system: System, options: RunOptions, started: Instant) -> RunReport {
     if let Err(refused) = may_open(on_main_thread()) {
-        return RunReport::emulator_error(refused.to_owned(), started.elapsed());
+        return RunReport::emulator_error(refused.to_string(), started.elapsed());
     }
     shown::run(system, options, started)
 }
@@ -247,7 +269,20 @@ mod shown {
     /// Makes the event loop and the window, runs the program on its own thread, and returns its
     /// report once it has ended (module docs).
     pub(super) fn run(system: System, options: RunOptions, started: Instant) -> RunReport {
-        let event_loop = match EventLoop::<Wake>::with_user_event().build() {
+        let mut builder = EventLoop::<Wake>::with_user_event();
+        // Wherever winit has X11 and Wayland: its own main-thread check would panic; starquake's
+        // (`super::on_main_thread`) has already refused another thread (module docs).
+        #[cfg(all(
+            unix,
+            not(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android",
+                target_os = "redox"
+            ))
+        ))]
+        winit::platform::x11::EventLoopBuilderExtX11::with_any_thread(&mut builder, true);
+        let event_loop = match builder.build() {
             Ok(event_loop) => event_loop,
             Err(error) => {
                 return RunReport::emulator_error(

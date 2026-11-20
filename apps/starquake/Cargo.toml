@@ -26,6 +26,11 @@ winit = { workspace = true, optional = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { workspace = true, optional = true }
 
+# Whether `run --window` is on the process's main thread on Linux: its thread id against the
+# process id, as winit's event loop checks (src/window.rs).
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix.workspace = true
+
 [dev-dependencies]
 starquake-testkit.workspace = true
 # Reads back the flight-recorder dump the command wrote.

@@ -1885,6 +1885,7 @@ name = "starquake"
 version = "0.0.0"
 dependencies = [
  "objc2 0.6.5",
+ "rustix 1.1.6",
  "serde_json",
  "starquake-core",
  "starquake-gpu",

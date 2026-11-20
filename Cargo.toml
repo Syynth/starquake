@@ -45,6 +45,11 @@ sha2 = "0.11.1"
 # compressed file as one zstd frame (docs/references.md, `nup`). Without default features: the
 # `hash` feature only adds an xxHash the reader does not need (it checks SHA-256 itself).
 ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
+# Whether `starquake run --window` is on the process's main thread on Linux (apps/starquake,
+# src/window.rs): the thread's id against the process's, the check winit's Linux event loop makes
+# before it would panic. Safe wrappers, so the app needs no unsafe code. Pure Rust (the
+# `linux_raw` backend), and already in the tree, at this version. Only the two calls' modules.
+rustix = { version = "1.1.6", default-features = false, features = ["std", "thread", "process"] }
 # PNG encoding of frame dumps in the render crate (docs/specs/render-backend.md, "Frame dumps and
 # headless runs"). Pure Rust, as are its dependencies (crc32fast, fdeflate, flate2 on miniz_oxide).
 png = "0.18.1"
