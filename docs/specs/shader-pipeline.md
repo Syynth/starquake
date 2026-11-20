@@ -406,6 +406,27 @@ every float-to-integer conversion: a listed divergence, marked as a guess until 
 translated from Eden's Maxwell translators, since PR #4588 has no translator for them. Each is
 listed in its translator's module docs and pinned by a test.
 
+**The memory translator's readings, as built in slice 12e** (decided by the owner, 2026-11-20).
+PR #4588 runs titles through its lowering to Maxwell by default and through its native
+translator only when asked (`eden-pr4588/src/video_core/shader_environment.cpp`,
+`EDEN_NATIVE_FRONTEND`), so where the two read a field differently, the lowering's reading is
+"the one a title ran on" under graphics-server decision 8, and slice 12e follows it: bit 76 of
+the uniform `LDG` and `STG` (`0x981`, `0x986`) with the uniform address on makes the uniform
+register a memory descriptor, checked like an address register but not added to the address
+(`lower_to_maxwell.h`, `descriptor_address`); and `LDGSTS` takes any enable predicate, where
+the native translator passes only `P0`. Strong ordering (`.STRONG.SM`) is ignored, as the native
+translator ignores it. Each is a guess until an `nvdisasm` or hardware check, listed in the
+translator's module docs and pinned by a test there.
+
+**The texture translator's bounds, as built in slice 12f** (decided by the owner, 2026-11-20).
+A texture handle's constant buffer must be below `DESCRIPTOR_BUFFERS` = 18, PR #4588's bound
+(Eden's `MaxConstBuffers`), although the host model has 32 constant-buffer slots ("Passes
+needed for correctness", item 2): a handle in buffers 18 to 31 is refused by name. `TEX.B`
+takes PR #4588's operand layout (the level or depth reference at `B` and the handle register
+after it; scalar 32-bit results and at most one operand after the coordinates), where NAK's
+packing puts the handle first and never scalarises a bindless sample. Both are guesses; a title whose handle sits in buffer 18 or above, or an
+`nvdisasm` check of a `TEX.B` with a level, would settle them.
+
 ### Passes needed for correctness
 
 In order (following Eden's order in `frontend/maxwell/translate_program.cpp`, lines 378–409):
@@ -443,7 +464,12 @@ In order (following Eden's order in `frontend/maxwell/translate_program.cpp`, li
    high field: kept until E3 settles it with a large-local-memory shader; decided by the owner,
    2026-11-19) or the QMD (compute); shared memory a workgroup array sized from the QMD. All
    indexed accesses are bounds-checked. Slice 16 owns this pass (decided by the owner,
-   2026-11-18).
+   2026-11-18). The shared atomics and the narrow shared stores (`WriteSharedU8`,
+   `WriteSharedU16`) need the shared array to be atomic, and slice 16c lowers them with the
+   global atomics: an atomic shared array, and a compare-and-swap loop on the word where naga
+   has no direct atomic, as Eden does (`CasLoop` in
+   `eden/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp`; decided by the owner,
+   2026-11-20).
 7. **Dead code elimination**, then **collect info**: the resource table, the interface, and the
    host features the shader needs. Dead code elimination is Eden's single walk in post order,
    so dead phi cycles in loops survive it; a mark-and-sweep that removes them is not built (as
@@ -485,6 +511,18 @@ control flow need another route (an upstream change, or a different wgpu entry p
 (Settled by E1, 2026-11-12: wgpu validates with every flag, but naga 30.0.1 gives derivatives
 no uniformity requirement, so wgpu accepts them; see "What to verify before building".)
 
+**Float comparisons and float-to-integer conversions** (decided by the owner, 2026-11-20). Every
+lowering slice routes them through the NaN-safe helpers in `lower/ops.rs` that slice 16 built,
+never through a plain naga comparison or conversion. An ordered comparison is
+`!(isnan(a) || isnan(b)) && a op b` and an unordered one `isnan(a) || isnan(b) || a op b`; a
+conversion selects the integer's maximum at or past it and 0 for a NaN, around naga's own
+conversion. The reasons are measured, not guessed (render-backend, "Shader emission"): wgpu-hal
+30.0.2 leaves the Metal compiler's fast math on, under which a plain `a == b` of two NaNs is true,
+and naga's float-to-integer conversion saturates to the largest float below the integer's
+maximum (0x7fffff80 for a signed 32-bit result), not to the maximum. Slice 16's test
+`tests::ops::float_operations_match_the_interpreter_on_the_gpu` runs the helpers on an Apple GPU
+against the interpreter.
+
 **What naga 30.0.1 can express**, from its IR source (`naga/src/ir/mod.rs`,
 `naga/src/valid/mod.rs`, `naga-types/src/lib.rs`), to be confirmed by experiment E1:
 
@@ -493,7 +531,7 @@ no uniformity requirement, so wgpu accepts them; see "What to verify before buil
 | Vertex, pixel, compute stages | Yes | Use |
 | Task and mesh stages | Yes: IR, MSL `[[object]]`/`[[mesh]]`, SPIR-V `MeshShadingEXT`. The render draft's wgpu table says naga cannot emit them for Metal; E1 settles which is right (review guide, M12). wgpu's mesh support is experimental | Use when mesh work starts (deferred) |
 | f16, i64, f64, 64-bit atomics, image atomics | Yes, behind capabilities | Use; Metal lacks f64 (lowering pass) |
-| Subgroup ballot, vote, shuffle, quad operations | Yes | Use for `VOTE`, `SHFL`, `MATCH`, `REDUX`, `FSWZADD`; needs a subgroup size of 32 |
+| Subgroup ballot, vote, shuffle, quad operations | Yes | Use for `VOTE`, `SHFL`, `MATCH`, `REDUX`, `FSWZADD`; needs a subgroup size of 32 where the reference assumes 32 lanes ("Compute shaders"); lowered with derivatives in slice 16b (decided by the owner, 2026-11-20) |
 | Binding arrays with non-uniform indexing | Yes | Use for bindless (decision 8) |
 | Barycentrics, dual-source blending, early depth test, clip and cull distances | Yes | Use |
 | Geometry and tessellation stages | **No** (`ShaderStage` has no such variants); wgpu has no such stages either | Deferred until a direct Vulkan backend; decision 13 |
@@ -526,6 +564,13 @@ shader on a wgpu, Vulkan or Metal host has to be specialised on:
   specialises (`MakeRuntimeInfo` in `eden/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp`),
   not what the next stage reads, which the GPU crate cannot build from engine state (decided by
   the owner, 2026-11-19).
+- **A named exception, vertex-output interpolation.** The vertex stage's key carries the
+  interpolation modes of the paired pixel program's header (SPH), which the GPU crate reads when
+  it builds the draw, and the vertex stage's outputs take those modes. wgpu refuses a pipeline
+  whose vertex outputs and fragment inputs differ in interpolation, and only the pixel
+  program's header gives the mode, so the vertex stage cannot learn it from what an earlier
+  stage stores (decided by the owner, 2026-11-20). It is the one place a stage is specialised
+  on the stage after it.
 - Compute: workgroup size (naga needs it as a constant in the entry point) and shared-memory size.
 
 Two groups of fields come from the render backend, through the GPU crate, because only the
@@ -600,6 +645,14 @@ records "needs subgroup size 32" in its requirements (Apple GPUs run 32-wide SIM
 hosts must request it; render backend's concern). wgpu cannot request a size and reports 4..64
 on every Mac, so the wgpu backend treats the Apple GPU family as meeting the requirement
 (render-backend, "What a pipeline is made of"; decided by the owner, 2026-11-19).
+
+"Needs subgroup size 32" is its own flag in `Requirements`, narrower than the subgroup
+capability (naga's `Capabilities::SUBGROUP`, which any subgroup operation or built-in needs):
+the lowering sets it only for an operation whose result depends on 32 lanes, as the reference
+assumes, so a shader whose only subgroup operations are quad operations needs the capability
+but not the size, and is not refused where a size of 32 is not met (decided by the owner,
+2026-11-20). The render backend refuses a pipeline on the narrower flag and keeps checking the
+capability against the module (render-backend, "What a pipeline is made of").
 
 A compute program that is rejected must still let its dispatch complete and fire its QMD
 releases, or queues waiting on it hang (row 61). That is the GPU crate's job; the shader crate's
@@ -747,7 +800,7 @@ pub struct HostShader {
     pub outputs: Vec<InterfaceSlot>,
     pub driver_constants: DriverConstantsLayout,
     pub workgroup_size: Option<[u32; 3]>,
-    pub requirements: Requirements,       // f16, i64, f64, subgroup size 32, mesh, ...
+    pub requirements: Requirements,       // f16, i64, f64, subgroups, subgroup size 32, mesh, ...
 }
 
 pub enum HostCode {
@@ -829,15 +882,19 @@ One pull request each. "Offline" means testable with no game and no GPU. Slices 
 | 14 | Global memory to storage buffers | 8b, 12e, 12i | Eden `global_memory_to_storage_buffer_pass.cpp` | Golden IR; linear-time test | E |
 | 15 | Inputs and outputs, collect info | 2, 8b, 12g, 12i | Eden `attribute.h`, `collect_shader_info_pass.cpp`, `exit_program.cpp` | Golden interface tables per stage | E |
 | 16 | Lowering to naga: arithmetic, control flow, compute entry points; the local and shared memory pass (pass 6) | 1, 8b, 11 | New | naga validation on every test module | E |
-| 17 | Lowering to naga: graphics entry points, interface, resources (group and binding assignment), textures and swizzles from the variant key, driver constants; the sampler LOD bias applied in the shader, guest 1D arrays sampled as 2D textures of height 1, and the guest y-flip and depth remap in the vertex shader, for the render backend's R7 (decided by the owner, 2026-11-19) | 8b, 12i, 13, 15, 16 | New | Same, plus golden resource and interface tables for end-to-end fixtures; wgpu acceptance locally; the speed test ("The offline test harness") | F |
-| 18 | Host lowering passes: f64 and f16 to f32, subgroup-size requirement | 7, 8, 16 | Eden `lower_fp64_to_fp32.cpp`, `lower_fp16_to_fp32.cpp` | Interpreter equivalence within stated precision | F |
+| 16b | Lowering to naga: warp operations and derivatives. Votes, ballots, lane masks, shuffles, quad operations, `FSwizzleAdd` and derivatives become naga's subgroup and derivative operations, recording "needs subgroup size 32" (the narrower flag, "Compute shaders") for each operation whose result depends on 32 lanes; comparisons and conversions through the NaN-safe helpers ("The backend through naga"; decided by the owner, 2026-11-20) | 16 | Eden `backend/spirv/emit_spirv_warp.cpp` (`EmitVote*`, `EmitSubgroup*Mask`, `EmitShuffle*`, `EmitQuad*`, `EmitFSwizzleAdd`, `EmitDP*`) | naga validation on every test module; interpreter equivalence on the GPU for each operation (locally on a Mac); a quad-only module sets the subgroup capability and not the size flag | E (after 16) |
+| 16c | Lowering to naga: memory atomics, shared and global (12e's), and the narrow shared stores (`WriteSharedU8`, `WriteSharedU16`): an atomic shared array, and a compare-and-swap loop on the word where naga has no direct atomic, as Eden does (pass 6; decided by the owner, 2026-11-20) | 12e, 16; the global atomics also 14 and 17 (their storage buffers) | Eden `backend/spirv/emit_spirv_atomic.cpp`, `emit_spirv_shared_memory.cpp`, `spirv_emit_context.cpp` (`CasLoop`) | naga validation on every test module; interpreter equivalence on the GPU for each atomic and narrow store (locally on a Mac), including a store at each byte and half-word of a word | E (after 16; the global atomics F, after 17) |
+| 17 | Lowering to naga: graphics entry points, interface, resources (group and binding assignment), textures and swizzles from the variant key, driver constants; the sampler LOD bias applied in the shader, guest 1D arrays sampled as 2D textures of height 1, and the guest y-flip and depth remap in the vertex shader, for the render backend's R7 (decided by the owner, 2026-11-19); the vertex stage's output interpolation from the variant key ("Pipeline-state specialisation"; decided by the owner, 2026-11-20) | 8b, 12i, 13, 15, 16, 16b (pixel programs take derivatives and quad operations; decided by the owner, 2026-11-20) | New | Same, plus golden resource and interface tables for end-to-end fixtures; wgpu acceptance locally; the speed test ("The offline test harness") | F |
+| 18 | Host lowering passes: f64 and f16 to f32, subgroup-size requirement (the narrower flag 16b records; decided by the owner, 2026-11-20) | 7, 8, 16, 16b | Eden `lower_fp64_to_fp32.cpp`, `lower_fp16_to_fp32.cpp` | Interpreter equivalence within stated precision | F |
 | 19 | Shader cache: three layers, invalidation, negative cache (a rejection names the failing program), tickets on an executor; adapts to the GPU crate's `ShaderLookup` seam, `wait(ticket)` included (decided by the owner, 2026-11-19) | 3, 9 (a fake translator before 17) | New; Eden-NX2 rows 90, 112 | Deterministic tests with a scripted executor; invalidation edges | D |
 | 20 | Shader capture format (the one format; `SQGC` embeds it) and `cargo xtask shader-replay` | 3, 9 | New | Golden bytes; replay of a synthetic capture | E |
 | 21 | Persistent cache entries: inputs only (program bytes, answers, variant key), serialise, version, load and retranslate on workers; defines `ShaderStamp`, the digest of an entry's key (decided by the owner, 2026-11-19) | 19, 20 | New | Golden bytes; a stale translator version is refused | after M3 |
 | 22 | Final-code emission for a direct backend: naga's SPIR-V or MSL writer with the `HostTarget`'s binding map and bounds-check policy | 17; a direct backend scheduled (render-backend, "Deferred") | New | SPIR-V read back and `spirv-val` where installed; MSL goldens and Apple's compiler on a Mac | when a direct backend is scheduled |
 
-The critical path to a first present is 1 → 4 → 6h → 10 → 11 → 8b → 16 → 17, with 5 → 7 ahead of 8,
-11 and every translator. Slice 17 also waits for 13 (after 8b, 9 and 6e/6f → 12e/12f) and 15 (after
+The critical path to a first present is 1 → 4 → 6h → 10 → 11 → 8b → 16 → 16b → 17, with 5 → 7
+ahead of 8, 11 and every translator; 16b is on it because slice 17 lowers pixel programs, which
+take derivatives and quad operations (decided by the owner, 2026-11-20). Slice 16c is not, unless
+a first title's programs use atomics or narrow shared stores. Slice 17 also waits for 13 (after 8b, 9 and 6e/6f → 12e/12f) and 15 (after
 2, 8b and 6g → 12g). A first present also needs the translators its programs use: 12a, 12b, 12g and
 12h (12h after 10), the translation driver that runs them, 12i (after 12a to 12h), and slice 8's
 rework for structured functions, 8b (after 8 and 11), which slices 13 to 17 wait for (decided by
