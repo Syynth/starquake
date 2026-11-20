@@ -122,6 +122,7 @@
 //! vertex layout, which the backend refuses, so such a draw is skipped as a failed pipeline
 //! (`tests::every_emulation_flag_reaches_the_key_through_a_draw`).
 
+pub mod cached;
 pub mod call;
 pub mod clear;
 pub mod conditional;
@@ -727,6 +728,8 @@ impl Draws {
                         })
                         .map(|r| r.stage)?,
                     HostStage::Fragment => GuestStage::Pixel,
+                    // A draw's set has no compute shader.
+                    HostStage::Compute => return None,
                 };
                 Some(SetStage { stage, index })
             })

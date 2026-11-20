@@ -1,0 +1,43 @@
+---
+source: crates/shader/src/lower/tests/memory.rs
+expression: msl(&shader)
+---
+// language: metal2.4
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using metal::uint;
+
+struct type_2 {
+    uint inner[2];
+};
+struct type_3 {
+    uint inner[3];
+};
+
+[[max_total_threads_per_threadgroup(1)]] kernel void main_(
+  uint __local_invocation_index [[thread_index_in_threadgroup]]
+, threadgroup type_3& shared_memory
+) {
+    type_2 local_memory = {};
+    if (__local_invocation_index == 0u) {
+        shared_memory = {};
+    }
+    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    if (1u < 2u) {
+        local_memory.inner[1u] = 7u;
+    }
+    uint _e14 = local_memory.inner[metal::min(1u, 1u)];
+    uint _e18 = 4u >> 2u;
+    uint _e26 = shared_memory.inner[metal::min(_e18, 2u)];
+    uint _e30 = _e18 + 1u;
+    uint _e37 = shared_memory.inner[metal::min(_e30, 2u)];
+    uint _e42 = 2u >> 2u;
+    uint _e50 = shared_memory.inner[metal::min(_e42, 2u)];
+    uint _e55 = (2u << 3u) & 16u;
+    uint _e62 = 8u >> 2u;
+    if (_e62 < 3u) {
+        shared_memory.inner[_e62] = (1u < 2u) ? _e14 : 0u;
+    }
+    return;
+}

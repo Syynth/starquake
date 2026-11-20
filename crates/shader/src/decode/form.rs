@@ -12,6 +12,16 @@
 //! generators (`any_ops`) the same way, from the same list of modules, so a slice adds a form
 //! and its tests' data in its own module and edits no shared list.
 //!
+//! **Known bits and canonical words** (slice 4b; owner's ruling 33, 2026-11-19). A form's mask
+//! is its PR #4588 row's, less the bits the form rejects (`ReferenceRow::dropping`) and plus the
+//! bits the row leaves out that another reference names (`ReferenceRow::adding`, with a
+//! `Namer` for each): NAK's 16-bit source swizzle at bit 60, for example, which PR #4588's
+//! rows mark in only some forms. And a form whose bare word, its opcode and fixed bits alone,
+//! holds a field value that names nothing (`F2F`'s float size 0, `FMUL`'s scale 0) gives a
+//! canonical word (`ReferenceRow::with_canonical`), from which tests build its valid words, so
+//! that the decoder can refuse that zero with [`DecodeError::UnknownValue`] where a reference
+//! refuses it.
+//!
 //! The [`Reader`] records every bit a decode function reads, the way PR #4588's translator
 //! records the bits it takes (`visitor.cpp`, `Visitor::Take`): after the form's function has
 //! run, a set bit nobody read is rejected, so bits a form explains only in some of its layouts
@@ -62,9 +72,42 @@ impl Form {
     }
 }
 
+/// A reference that names a bit PR #4588's row for a form leaves out: why a form knows a bit
+/// beyond its row ([`ReferenceRow::adding`]). Each such bit is a divergence from the row, which
+/// the group's module docs list with the test that pins it.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Namer {
+    /// NAK's encoder writes the bit in this form (`sm70_encode.rs` @ 52238762).
+    NakEncoder,
+    /// NAK's encoder names the bit for this instruction only in a comment and writes nothing
+    /// there (`sm70_encode.rs` @ 52238762): a guess until an `nvdisasm` check (verification E2).
+    NakComment,
+    /// PR #4588's translator reads the bit in this form though the form's row leaves it out
+    /// (`frontend/ampere/ops_*.cpp` @ e5fb3b97).
+    Pr4588Translator,
+}
+
+#[cfg(test)]
+impl Namer {
+    /// Every namer, in [`Self::index`] order.
+    pub(crate) const ALL: [Self; 3] = [Self::NakEncoder, Self::NakComment, Self::Pr4588Translator];
+
+    /// The namer's position in [`Self::ALL`] and in a [`ReferenceRow`]'s added bits.
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::NakEncoder => 0,
+            Self::NakComment => 1,
+            Self::Pr4588Translator => 2,
+        }
+    }
+}
+
 /// One row of PR #4588's decode table for a decoded form (`ampere_isa_table.h` @ e5fb3b97), and
-/// the bits of it the form rejects. Each group lists the rows of its own forms, in its `FORMS`
-/// order, as `REFERENCE_ROWS`; `decode::tests::masks_match_the_reference_table` checks them.
+/// how the form departs from it: the bits it rejects, the bits it adds (with the reference that
+/// names each), the bits it requires, and the fields of its canonical word. Each group lists the
+/// rows of its own forms, in its `FORMS` order, as `REFERENCE_ROWS`;
+/// `decode::tests::masks_match_the_reference_table` checks them.
 #[cfg(test)]
 pub(crate) struct ReferenceRow {
     /// The row's opcode.
@@ -74,9 +117,19 @@ pub(crate) struct ReferenceRow {
     /// Bits the row marks known that the form rejects: a divergence the group's module docs
     /// list and a test of its own pins.
     pub(crate) dropped: u128,
+    /// Bits the row leaves out that the form knows, indexed by [`Namer::index`] of the
+    /// reference that names them: a divergence the group's module docs list, which
+    /// `decode::tests::framework::added_bits_are_the_listed_cases` enumerates and
+    /// `decode::tests::framework::added_bits_decode_print_and_round_trip` pins.
+    added: [u128; Namer::ALL.len()],
     /// The form's fixed bits, which the row can only mark known: the bits every valid word of
     /// the form has set (`Form::fixed`).
     pub(crate) fixed: u128,
+    /// The fields, besides the opcode and the fixed bits, that the form's canonical word sets:
+    /// none where the bare word (the opcode and the fixed bits alone) decodes, and otherwise a
+    /// value for each field whose zero names nothing. Tests build each form's base word from
+    /// it (`testing::canonical_word`).
+    pub(crate) canonical: u128,
 }
 
 #[cfg(test)]
@@ -87,7 +140,9 @@ impl ReferenceRow {
             opcode,
             words,
             dropped: 0,
+            added: [0; Namer::ALL.len()],
             fixed: 0,
+            canonical: 0,
         }
     }
 
@@ -96,9 +151,23 @@ impl ReferenceRow {
         Self { dropped, ..self }
     }
 
+    /// This row, with `bits` that the row leaves out and the form knows because `by` names
+    /// them. The bits of several calls accumulate.
+    pub(crate) const fn adding(self, bits: u128, by: Namer) -> Self {
+        let mut added = self.added;
+        added[by.index()] |= bits;
+        Self { added, ..self }
+    }
+
     /// This row, with `fixed` bits that the form requires set.
     pub(crate) const fn fixing(self, fixed: u128) -> Self {
         Self { fixed, ..self }
+    }
+
+    /// This row, with the fields `canonical` that the form's canonical word sets besides its
+    /// opcode and fixed bits.
+    pub(crate) const fn with_canonical(self, canonical: u128) -> Self {
+        Self { canonical, ..self }
     }
 
     /// The row's known-bit mask.
@@ -108,6 +177,32 @@ impl ReferenceRow {
             .rev()
             .fold(0, |bits, &word| (bits << 32) | u128::from(word))
     }
+
+    /// The bits the form adds to the row because `by` names them.
+    pub(crate) const fn added_by(&self, by: Namer) -> u128 {
+        self.added[by.index()]
+    }
+
+    /// Every bit the form adds to the row, whichever reference names it.
+    pub(crate) fn added(&self) -> u128 {
+        self.added.iter().fold(0, |bits, &more| bits | more)
+    }
+}
+
+/// The bits of `value` placed in `field`, for a row's canonical fields in a constant: what
+/// `Instruction::with_field` writes into a clear word, its bits above the field's width dropped
+/// (`decode::tests::framework::field_values_match_with_field`).
+#[cfg(test)]
+pub(crate) const fn field_value(field: Field, value: u64) -> u128 {
+    let mut bits = 0;
+    let mut index = 0;
+    while index < field.width && index < u64::BITS {
+        if (value >> index) & 1 != 0 {
+            bits |= Field::bit(field.start.saturating_add(index)).mask();
+        }
+        index += 1;
+    }
+    bits
 }
 
 /// One group's test hooks, so that a slice adds its tests' data in its own module.

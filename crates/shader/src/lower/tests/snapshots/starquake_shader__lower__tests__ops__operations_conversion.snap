@@ -1,0 +1,93 @@
+---
+source: crates/shader/src/lower/tests/ops.rs
+expression: msl(&shader)
+---
+// language: metal2.4
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using metal::uint;
+
+int naga_f2i32(float value) {
+    return static_cast<int>(metal::clamp(value, -2147483600.0, 2147483500.0));
+}
+
+uint naga_f2u32(float value) {
+    return static_cast<uint>(metal::clamp(value, 0.0, 4294967000.0));
+}
+
+
+[[max_total_threads_per_threadgroup(1)]] kernel void main_(
+) {
+    uint r0_ = {};
+    uint r1_ = {};
+    uint r2_ = {};
+    uint r3_ = {};
+    uint r4_ = {};
+    uint r5_ = {};
+    uint r6_ = {};
+    uint r7_ = {};
+    uint r8_ = {};
+    uint r9_ = {};
+    uint r10_ = {};
+    uint r11_ = {};
+    uint r12_ = {};
+    uint r13_ = {};
+    uint r14_ = {};
+    uint r15_ = {};
+    uint r16_ = {};
+    uint r17_ = {};
+    uint r18_ = {};
+    uint r19_ = {};
+    uint r20_ = {};
+    uint r21_ = {};
+    bool p2_ = {};
+    uint ur3_ = {};
+    bool up1_ = {};
+    bool goto7_ = {};
+    uint indirect_branch = {};
+    bool zero_flag = {};
+    bool carry_flag = {};
+    float _e1 = as_type<float>(2143289344u);
+    r0_ = metal::isnan(_e1) ? 0u : as_type<uint>((_e1 >= 2147483600.0) ? 2147483647 : naga_f2i32(_e1));
+    r1_ = metal::isnan(3000000000.0) ? 0u : as_type<uint>((3000000000.0 >= 2147483600.0) ? 2147483647 : naga_f2i32(3000000000.0));
+    r2_ = metal::isnan(-3000000000.0) ? 0u : as_type<uint>((-3000000000.0 >= 2147483600.0) ? 2147483647 : naga_f2i32(-3000000000.0));
+    r3_ = metal::isnan(-1.7) ? 0u : as_type<uint>((-1.7 >= 2147483600.0) ? 2147483647 : naga_f2i32(-1.7));
+    r4_ = metal::isnan(-1.0) ? 0u : ((-1.0 >= 4294967300.0) ? 4294967295u : naga_f2u32(-1.0));
+    r5_ = metal::isnan(5000000000.0) ? 0u : ((5000000000.0 >= 4294967300.0) ? 4294967295u : naga_f2u32(5000000000.0));
+    float _e66 = as_type<float>(2143289344u);
+    r6_ = metal::isnan(_e66) ? 0u : ((_e66 >= 4294967300.0) ? 4294967295u : naga_f2u32(_e66));
+    r7_ = metal::isnan(40000.0) ? 0u : as_type<uint>(metal::min(metal::max((40000.0 >= 2147483600.0) ? 2147483647 : naga_f2i32(40000.0), -32768), 32767));
+    r8_ = metal::isnan(-40000.0) ? 0u : as_type<uint>(metal::min(metal::max((-40000.0 >= 2147483600.0) ? 2147483647 : naga_f2i32(-40000.0), -32768), 32767));
+    r9_ = metal::isnan(70000.0) ? 0u : metal::min(metal::max((70000.0 >= 4294967300.0) ? 4294967295u : naga_f2u32(70000.0), 0u), 65535u);
+    float _e121 = as_type<float>(2143289344u);
+    r10_ = metal::isnan(_e121) ? 0u : metal::min(metal::max((_e121 >= 4294967300.0) ? 4294967295u : naga_f2u32(_e121), 0u), 65535u);
+    r11_ = as_type<uint>(static_cast<float>(as_type<int>(4294967293u)));
+    r12_ = as_type<uint>(static_cast<float>(16777215u));
+    r13_ = as_type<uint>(static_cast<float>(metal::extract_bits(as_type<int>(65664u), metal::min(0u, 32u), metal::min(8u, 32u - metal::min(0u, 32u)))));
+    r14_ = as_type<uint>(static_cast<float>(metal::extract_bits(65664u, metal::min(0u, 32u), metal::min(8u, 32u - metal::min(0u, 32u)))));
+    r15_ = as_type<uint>(static_cast<float>(metal::extract_bits(as_type<int>(131071u), metal::min(0u, 32u), metal::min(16u, 32u - metal::min(0u, 32u)))));
+    r16_ = as_type<uint>(static_cast<float>(metal::extract_bits(98304u, metal::min(0u, 32u), metal::min(16u, 32u - metal::min(0u, 32u)))));
+    r17_ = as_type<uint>(as_type<float>(1077936128u) + 1.0);
+    metal::uint3 _e183 = metal::uint3(1u, 2u, 3u);
+    metal::uint3 _e187 = metal::uint3(_e183.x, 9u, _e183.z);
+    r18_ = (_e187.x + _e187.y) | ((8u >= 32u) ? 0u : (_e187.z << metal::min(8u, 31u)));
+    metal::float4 _e206 = metal::float4(1.0, 2.0, 3.0, 4.0);
+    r19_ = as_type<uint>(metal::float4(_e206.x, _e206.y, _e206.z, 8.0).w);
+    p2_ = true;
+    up1_ = true;
+    ur3_ = 40u;
+    goto7_ = true;
+    indirect_branch = 2u;
+    carry_flag = true;
+    bool _e228 = p2_;
+    bool _e230 = up1_;
+    bool _e232 = goto7_;
+    bool _e234 = carry_flag;
+    bool _e236 = zero_flag;
+    uint _e243 = ur3_;
+    uint _e245 = indirect_branch;
+    r20_ = ((((_e228 && _e230) && _e232) && _e234) && !(_e236)) ? (_e243 + _e245) : 0u;
+    r21_ = 0u + 4u;
+    return;
+}

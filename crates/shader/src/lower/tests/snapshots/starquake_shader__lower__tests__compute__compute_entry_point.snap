@@ -1,0 +1,24 @@
+---
+source: crates/shader/src/lower/tests/compute.rs
+expression: msl(&shader)
+---
+// language: metal2.4
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using metal::uint;
+
+
+struct main_Input {
+};
+[[max_total_threads_per_threadgroup(64)]] kernel void main_(
+  metal::uint3 workgroup_id [[threadgroup_position_in_grid]]
+, metal::uint3 local_id [[thread_position_in_threadgroup]]
+) {
+    uint r0_ = {};
+    r0_ = workgroup_id.z + local_id.x;
+    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    metal::threadgroup_barrier(metal::mem_flags::mem_device);
+    return;
+}

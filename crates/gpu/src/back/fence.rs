@@ -107,8 +107,10 @@
 //!   high word of an 8-byte release is latched by that word
 //!   (`a_wide_release_latches_a_waiter_on_its_high_word`).
 //! - A release whose memory access fails ([`GpuFault`]) writes nothing that the memory refused,
-//!   latches nothing, and is logged at warning level and listed in [`Report::failed`]; the
-//!   actions after it are still performed.
+//!   latches nothing, and is logged at the level its action names ([`FailureLog`]: warning
+//!   level, or debug level for the repeats the executor marks), counted
+//!   ([`FenceCounters::failed_releases`]) and listed in [`Report::failed`]; the actions after it
+//!   are still performed.
 //! - **An increment** of count `n` calls [`Syncpoints::increment_by`] once: one wrapping
 //!   addition of `n` to the counter, as `n` of Eden's increments would leave it (the
 //!   `std::atomic<u32>` `fetch_add(1)` of `SyncpointManager::Increment` in
@@ -329,6 +331,16 @@ pub struct VmChange {
     pub update: VmUpdate,
 }
 
+/// The level at which a fenced release that fails is logged (module docs, "Completion").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureLog {
+    /// Warning level: every release but the repeats below.
+    Warn,
+    /// Debug level: a report semaphore release to GPU address 0 after the first of its channel
+    /// (`back::exec`, "Report semaphores"), which the native SDK may write at every flush.
+    Debug,
+}
+
 /// An action performed only after the host GPU has finished the work recorded before it.
 #[derive(Clone)]
 pub enum FencedAction {
@@ -340,6 +352,8 @@ pub enum FencedAction {
         space: AsId,
         /// What to write.
         release: Release,
+        /// The level at which a failure to perform it is logged; it is counted either way.
+        failure: FailureLog,
     },
     /// `count` increments of a syncpoint, added at once (module docs, "Completion").
     Increment {
@@ -1033,6 +1047,7 @@ impl Fences {
                 memory,
                 space,
                 release,
+                failure: level,
             } => match write_release(&*memory, &release, &*self.env.clock) {
                 Ok(written) => {
                     report.released = report.released.saturating_add(1);
@@ -1048,7 +1063,10 @@ impl Fences {
                         address: release.address,
                         fault,
                     };
-                    tracing::warn!(%failure, "fenced release failed");
+                    match level {
+                        FailureLog::Warn => tracing::warn!(%failure, "fenced release failed"),
+                        FailureLog::Debug => tracing::debug!(%failure, "fenced release failed"),
+                    }
                     self.counters.failed_releases = self.counters.failed_releases.saturating_add(1);
                     report.failed.push(failure);
                 }

@@ -111,12 +111,17 @@
 //! `eden-nx2/src/video_core/engines/maxwell_3d.cpp` @ 50fa86bb), which its ring carries. The
 //! spec's ring has no entry for the end of a macro. Here a channel's deferred instances are
 //! drawn ([`Draws::flush`]) before any entry of that channel that is not a `Write` or `Run` of
-//! its 3D class, and every channel's before a `Syncpoint`, `Marker` or `Present`, so the work
-//! after them in the stream comes after the draw. A **divergence**, and an owner question: a
-//! ring entry for the end of a macro would let the back draw them where Eden-NX2 does.
-//! Pinned by `tests::deferred_instances_are_drawn_before_the_channels_next_release` and, for a
-//! marker, a syncpoint, a DMA word and an inline-to-memory word, by
-//! `tests::deferred_instances_are_drawn_before_each_boundary`.
+//! its 3D class, before a word of its 3D class that releases a report semaphore (a
+//! `SET_REPORT_SEMAPHORE_D` word that [`report::decide`] answers with a release; below,
+//! "Report semaphores"), and every channel's before a `Syncpoint`, `Marker` or `Present`, so
+//! the work after them in the stream comes after the draw. A **divergence**, and an owner
+//! question: a ring entry for the end of a macro would let the back draw them where Eden-NX2
+//! does. Pinned by `tests::deferred_instances_are_drawn_before_the_channels_next_release`; for
+//! a marker, a syncpoint, a DMA word and an inline-to-memory word, by
+//! `tests::deferred_instances_are_drawn_before_each_boundary`; for a report semaphore, by
+//! `tests::report::deferred_instances_are_drawn_before_a_report_semaphore_release` and, with
+//! the open list empty when the report arrives,
+//! `tests::report::deferred_instances_are_drawn_before_a_release_that_finds_the_open_list_empty`.
 //!
 //! A deferred draw that fails (a topology only checked when it is drawn, a non-finite
 //! viewport) does not stop the entry that drew it: the release, increment or marker is still
@@ -124,7 +129,28 @@
 //! engine, since one channel's bad draw must not drop another channel's fence or ordered
 //! update. The entry's own error is returned first; the deferred draw's is returned when the
 //! entry's own work succeeded, and logged and counted otherwise
-//! (`tests::a_failed_deferred_draw_does_not_stop_the_entry_after_it`).
+//! (`tests::a_failed_deferred_draw_does_not_stop_the_entry_after_it`; for a report semaphore,
+//! `tests::report::a_failed_deferred_draw_before_a_report_still_releases_and_returns_the_draws_error`).
+//!
+//! # Report semaphores
+//!
+//! A `SET_REPORT_SEMAPHORE_D` word of the 3D class, once the mirror stored it and the draw path
+//! saw it, is decided by [`report::decide`]: a report of no counter becomes a fenced release of
+//! the payload ([`FencedAction::Release`]) through the channel's memory and address space,
+//! attached after the channel's deferred instances are drawn, exactly as a `Release` entry is;
+//! a counter report writes nothing and is logged at warning level, the first of the run only;
+//! an `ACQUIRE` or a `TRAP` does nothing. `back::report` has the fields, the reference and the
+//! divergences. Pinned in `tests/report.rs`.
+//!
+//! The native SDK writes a payload report to GPU address 0, which the title seen had not
+//! mapped, and may do so at every queue flush. Such a release fails when it is performed, as
+//! any release to an unmapped address does (`back::fence`, "A failed release is reported and
+//! skipped"), and every failure is counted
+//! ([`crate::back::fence::FenceCounters::failed_releases`]); but only the channel's first
+//! report release to address 0 is logged at warning level, and later ones of that channel at
+//! debug level ([`FailureLog::Debug`]), so a title that writes one per flush does not fill the
+//! log. A failed release to any other address warns every time.
+//! `tests::report::a_report_to_address_0_is_logged_once_per_channel_and_each_failure_counted`.
 //!
 //! # Conditional rendering
 //!
@@ -226,10 +252,11 @@ use crate::back::draw::clear::CLEAR_METHODS;
 use crate::back::draw::conditional;
 use crate::back::draw::shaders::{HostShaders, ShaderLookup};
 use crate::back::draw::{DrawContext, DrawError, Draws, WaitWhileCompiling};
-use crate::back::fence::{CloseReason, FenceError, FencedAction, Fences, Settled};
+use crate::back::fence::{CloseReason, FailureLog, FenceError, FencedAction, Fences, Settled};
 use crate::back::pipeline::PipelineCache;
 use crate::back::qmd::{LAST_INLINE_QMD_METHOD, QMD_BYTES, QmdError, QmdTable, inline_qmd_address};
 use crate::back::readback::ReadbackIds;
+use crate::back::report::{self, ReportAction};
 use crate::back::state::{Mirror, StateError};
 use crate::back::texture::{TextureCache, TextureError};
 use crate::channel::initial_binding;
@@ -486,6 +513,9 @@ struct Channel {
     space: AsId,
     bound: [Option<ClassId>; SUBCHANNELS],
     engines: BTreeMap<ClassId, Engine>,
+    /// Whether a report semaphore release to GPU address 0 has been attached for this channel
+    /// (module docs, "Report semaphores").
+    zero_report_seen: bool,
 }
 
 impl Channel {
@@ -518,6 +548,8 @@ pub struct Executor {
     drained: Vec<PageRange>,
     /// The constant-buffer upload (slice G25) and its scratch bytes.
     cb_load: ConstantBufferLoad,
+    /// Whether a counter report has been logged (module docs, "Report semaphores").
+    counter_report_logged: bool,
 }
 
 impl Executor {
@@ -549,6 +581,7 @@ impl Executor {
             scratch: CommandList::new(),
             drained: Vec::new(),
             cb_load: ConstantBufferLoad::new(),
+            counter_report_logged: false,
         }
     }
 
@@ -597,6 +630,7 @@ impl Executor {
             space,
             bound: [None; SUBCHANNELS],
             engines: BTreeMap::new(),
+            zero_report_seen: false,
         };
         for (index, slot) in (0u8..).zip(state.bound.iter_mut()) {
             *slot = Subchannel::new(index).and_then(initial_binding);
@@ -823,6 +857,7 @@ impl Executor {
                         memory,
                         space,
                         release: *release,
+                        failure: FailureLog::Warn,
                     })
                 });
                 self.then_deferred(own, deferred)
@@ -1170,7 +1205,11 @@ impl Executor {
                     self.before_work(space, true)?;
                 }
                 self.inline_word(channel, class, space, method)?;
-                self.draw_step(channel, DrawStep::Method { method, value })
+                self.draw_step(channel, DrawStep::Method { method, value })?;
+                if method == clc797::SET_REPORT_SEMAPHORE_D.method() {
+                    self.report_semaphore(channel, space)?;
+                }
+                Ok(())
             }
             clc7c0::CLASS => {
                 self.inline_word(channel, class, space, method)?;
@@ -1196,6 +1235,55 @@ impl Executor {
             }
             cla140::CLASS => self.inline_word(channel, class, space, method),
             _ => Ok(()),
+        }
+    }
+
+    /// A write of `SET_REPORT_SEMAPHORE_D` on `channel`'s 3D engine, once the mirror stored it
+    /// (module docs, "Report semaphores").
+    fn report_semaphore(&mut self, channel: ChannelId, space: AsId) -> Result<(), ExecError> {
+        let class = ClassId(clc797::CLASS);
+        match report::decide(&self.engine_mut(channel, class)?.mirror)? {
+            ReportAction::Release(release) => {
+                let failure = self.report_failure_log(channel, release.address);
+                let deferred = self.flush_deferred(Some(channel));
+                let own = self.memory(space).and_then(|memory| {
+                    self.attach(FencedAction::Release {
+                        memory,
+                        space,
+                        release,
+                        failure,
+                    })
+                });
+                self.then_deferred(own, deferred)
+            }
+            ReportAction::Counter { report } => {
+                if !self.counter_report_logged {
+                    self.counter_report_logged = true;
+                    tracing::warn!(
+                        channel = channel.0,
+                        report,
+                        "a counter report was asked for and is not written; later ones are not logged"
+                    );
+                }
+                Ok(())
+            }
+            ReportAction::Nothing => Ok(()),
+        }
+    }
+
+    /// The level at which a failure of `channel`'s report semaphore release to `address` is
+    /// logged: debug for a release to GPU address 0 after the channel's first, warning
+    /// otherwise (module docs, "Report semaphores").
+    fn report_failure_log(&mut self, channel: ChannelId, address: u64) -> FailureLog {
+        let repeat = address == 0
+            && self
+                .channels
+                .get_mut(&channel)
+                .is_some_and(|state| std::mem::replace(&mut state.zero_report_seen, true));
+        if repeat {
+            FailureLog::Debug
+        } else {
+            FailureLog::Warn
         }
     }
 
@@ -1275,6 +1363,7 @@ impl Executor {
                 memory: Arc::clone(&memory),
                 space,
                 release,
+                failure: FailureLog::Warn,
             };
             if let Err(error) = fences.attach(action)
                 && attached.is_ok()

@@ -96,6 +96,7 @@ use crate::decode::{
     ALD_OPCODE, CS2R_OPCODE, Gpr, IPA_OPCODE, InterpFreq, InterpLoc, Op, OpAL2P, OpALd, OpASt,
     OpCS2R, OpIpa, OpPixLd, OpS2R, PixVal, Pred, S2R_OPCODE, S2RDst, S2UR_OPCODE, SpecialReg,
 };
+use crate::info::attribute;
 use crate::ir::{
     ATTRIBUTE_COMPONENTS, ATTRIBUTE_WORD_BYTES, Attribute, GENERIC_0_X, Imm, Opcode, Operand,
     POSITION_W, Value,
@@ -174,15 +175,15 @@ impl From<AttributeRejection> for Failure {
 
 /// The last attribute word Eden's `IsGeneric` counts (`Generic31X = 156`; `IsGeneric`:
 /// `attribute <= Attribute::Generic31X`).
-pub(super) const GENERIC_31_X: u16 = 156;
+pub(super) use crate::info::attribute::{FOG_COORDINATE, GENERIC_31_X};
 /// The legacy colours, `ColorFrontDiffuseR = 160` to `ColorBackSpecularA = 175` (Eden's
 /// `IsLegacyAttribute`).
-pub(super) const LEGACY_COLORS: std::ops::RangeInclusive<u16> = 160..=175;
-/// `FogCoordinate = 186` (`IsLegacyAttribute`).
-pub(super) const FOG_COORDINATE: u16 = 186;
+pub(super) const LEGACY_COLORS: std::ops::RangeInclusive<u16> =
+    attribute::COLOR_FRONT_DIFFUSE_R..=attribute::COLOR_BACK_SPECULAR_A;
 /// The fixed-function texture coordinates, `FixedFncTexture0S = 192` to
 /// `FixedFncTexture9Q = 231` (`IsLegacyAttribute`).
-pub(super) const LEGACY_TEXTURES: std::ops::RangeInclusive<u16> = 192..=231;
+pub(super) const LEGACY_TEXTURES: std::ops::RangeInclusive<u16> =
+    attribute::FIXED_FNC_TEXTURE_0_S..=attribute::FIXED_FNC_TEXTURE_9_Q;
 /// How many registers `CS2R.64` writes.
 pub(super) const CS2R_PAIR: u32 = 2;
 /// The bits of `1.0`, which the PR writes for the W scale factors (`ops_misc.cpp`, `S2R`: "the

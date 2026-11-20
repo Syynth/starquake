@@ -34,6 +34,7 @@ fn a_release_whose_read_back_faults_latches_with_the_bytes_written() {
         memory: Arc::new(WriteOnly(Arc::clone(&r.mem))),
         space: SPACE,
         release: four(SEM, 0x77),
+        failure: FailureLog::Warn,
     };
     // Nothing in flight: performed at once.
     let (attached, events) = captured(|| r.fences.attach(action));
@@ -206,6 +207,7 @@ fn settle_with_nothing_pending_does_nothing() {
         memory: Arc::<Memory>::clone(&r.mem),
         space: AsId(SPACE.0 + 1),
         release: four(SEM, 1),
+        failure: FailureLog::Warn,
     };
     r.fences.attach(elsewhere).unwrap();
     assert_eq!(
