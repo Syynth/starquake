@@ -889,16 +889,21 @@ impl Draws {
             if !caps.view_swizzle {
                 let handles = Self::texture_handles(&requests, set);
                 swizzles = Self::swizzles(&answers, &handles);
-                if self.swizzle_handles.len() < MAX_SWIZZLE_SETS
-                    || self.swizzle_handles.contains_key(&requests)
-                {
+                // A known set is updated in place; only a new one under the cap clones the
+                // request list for its key.
+                if let Some(known) = self.swizzle_handles.get_mut(&requests) {
+                    *known = handles;
+                } else if self.swizzle_handles.len() < MAX_SWIZZLE_SETS {
                     self.swizzle_handles.insert(requests.clone(), handles);
                 }
             }
+            // Learning the stores allocates nothing for a known set: `set_stores` allocates
+            // nothing, and the remembered entry is updated in place. Only a new set under the
+            // cap clones the request list for its key.
             let stores = Self::set_stores(&requests, set);
-            if self.previous_stores.len() < self.previous_stores_limit
-                || self.previous_stores.contains_key(&requests)
-            {
+            if let Some(known) = self.previous_stores.get_mut(&requests) {
+                *known = stores;
+            } else if self.previous_stores.len() < self.previous_stores_limit {
                 self.previous_stores.insert(requests.clone(), stores);
             }
             if swizzles != first_swizzles || stores != first_stores {

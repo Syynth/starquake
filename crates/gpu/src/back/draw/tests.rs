@@ -32,10 +32,12 @@ use starquake_shader::lookup::{
     VariantKey,
 };
 use starquake_shader::program::translate_program;
-use starquake_shader::translate::{ColorOutputs, Stage, TranslateError, Unsupported};
+use starquake_shader::translate::{
+    COLOR_TARGETS, ColorOutputs, Stage, TranslateError, Unsupported,
+};
 use starquake_shader::variant::{
-    AttributeMask, AttributeType, ColorType, CompareFunction as KeyCompare, EmulationKey,
-    FollowingStage, PreviousStores, Swizzle, SwizzleSource,
+    ATTRIBUTE_MASK_LANES, AttributeMask, AttributeType, ColorType, CompareFunction as KeyCompare,
+    EmulationKey, FollowingStage, PreviousStores, Swizzle, SwizzleSource, VERTEX_ATTRIBUTES,
 };
 
 use super::call::{DrawCalls, Source, Started};
@@ -4180,11 +4182,18 @@ fn previous_stage_stores_follow_the_request_order() {
     );
 }
 
-/// The 32 bytes of the pixel stage's stores in an encoded key: after the version, 32 attribute
-/// types, 8 colour types, the dual-source switch and the three earlier stages' 32 bytes each.
+/// The bytes of the pixel stage's stores in an encoded key (`variant`'s module docs,
+/// "Encoding"): after the version byte, one byte per vertex attribute, one per colour target,
+/// the dual-source byte and the masks of the stages before the pixel stage in
+/// [`FollowingStage::ALL`], each [`ATTRIBUTE_MASK_LANES`] 64-bit lanes.
 fn pixel_stores_bytes(key: &VariantKey) -> Vec<u8> {
-    let at = 1 + 32 + 8 + 1 + 3 * 32;
-    key.encode()[at..at + 32].to_vec()
+    let mask_bytes = ATTRIBUTE_MASK_LANES * size_of::<u64>();
+    let pixel = FollowingStage::ALL
+        .iter()
+        .position(|stage| *stage == FollowingStage::Pixel)
+        .expect("the pixel stage is a following stage");
+    let at = 1 + VERTEX_ATTRIBUTES + COLOR_TARGETS + 1 + pixel * mask_bytes;
+    key.encode()[at..at + mask_bytes].to_vec()
 }
 
 #[test]
@@ -4246,6 +4255,97 @@ fn the_previous_stages_stores_reach_the_key() {
     assert_eq!(pixel_stores_bytes(&rig.shaders.seen[5].key), golden);
     assert_ne!(rig.shaders.seen[5].key, rig.shaders.seen[2].key);
     assert_eq!(rig.draws.counters().lookups, 6);
+}
+
+#[test]
+fn the_pixel_stage_follows_vertex_b_when_vertex_a_is_enabled() {
+    // Slot 0 (VertexA, `GuestStage::VertexCullBeforeFetch`) enabled beside the basic VertexB and
+    // pixel programs: the host vertex shader is VertexB's, the last vertex-like request
+    // (`Draws::guest_stage`), so the pixel stage gets its stores.
+    let mut rig = Rig::new(ready_with(
+        vertex_storing(&[2]),
+        host_shader(GuestStage::Pixel),
+    ));
+    rig.basic();
+    rig.set(
+        &clc797::SET_PIPELINE_SHADER,
+        &[0],
+        fields(&[(clc797::SET_PIPELINE_SHADER_ENABLE, 1)]),
+    );
+    rig.address(
+        &clc797::SET_PIPELINE_PROGRAM_ADDRESS_A,
+        &clc797::SET_PIPELINE_PROGRAM_ADDRESS_B,
+        &[0],
+        0x12_3456_7800,
+    );
+    assert_eq!(rig.draw(), Outcome::Drawn);
+    let stages: Vec<_> = rig.shaders.seen[0]
+        .requests
+        .iter()
+        .map(|r| r.stage)
+        .collect();
+    assert_eq!(
+        stages,
+        [
+            GuestStage::VertexCullBeforeFetch,
+            GuestStage::Vertex,
+            GuestStage::Pixel
+        ]
+    );
+    let stored = words(&[28, 29, 30, 31, 40, 41, 42, 43]);
+    assert_eq!(pixel_stores(&rig).last(), Some(&stored));
+    assert_eq!(pixel_stores(&rig), [AttributeMask::EMPTY, stored]);
+}
+
+#[test]
+fn swizzles_alone_cause_a_second_lookup() {
+    // Without view swizzle, a known set whose stores stay the same but whose texture bindings
+    // change is looked up again for the swizzles alone.
+    let mut rig = Rig::with(
+        caps(false, Features::ALL, 16),
+        WaitWhileCompiling::Wait,
+        ready(vec![], vec![]),
+    );
+    rig.basic();
+    let sources = [
+        tex::TEXHEAD_BL_X_SOURCE_IN_B,
+        tex::TEXHEAD_BL_X_SOURCE_IN_G,
+        tex::TEXHEAD_BL_X_SOURCE_IN_R,
+        tex::TEXHEAD_BL_X_SOURCE_IN_ONE_FLOAT,
+    ];
+    rig.write_words(
+        HEADERS + u64::from(HEADER_INDEX) * shaders::HEADER_BYTES,
+        &texture_header(TEXTURE, sources),
+    );
+    // Two draws of the set binding no texture: the first looks it up again for the stores, the
+    // second once with them remembered.
+    assert_eq!(rig.draw(), Outcome::Drawn);
+    assert_eq!(rig.draw(), Outcome::Drawn);
+    assert_eq!(rig.draws.counters().lookups, 3);
+    // The same set (same requests, same stores) now binds the swizzled texture.
+    rig.shaders.default = ready(vec![], vec![texture_use(0, 1), sampler_use(0, 2)]);
+    assert_eq!(rig.draw(), Outcome::Drawn);
+    assert_eq!(rig.draws.counters().lookups, 5);
+    let swizzled = Swizzle {
+        x: SwizzleSource::B,
+        y: SwizzleSource::G,
+        z: SwizzleSource::R,
+        w: SwizzleSource::OneFloat,
+    };
+    let last = rig.shaders.seen.last().expect("a lookup was made");
+    assert_eq!(last.key.texture_swizzles.as_slice(), [swizzled]);
+    // The two lookups of the third draw differ in the swizzles only.
+    let mut first = rig.shaders.seen[3].key.clone();
+    first.texture_swizzles = last.key.texture_swizzles.clone();
+    assert_eq!(first, last.key);
+    // The known set's remembered handles were updated in place: the fourth draw is one lookup,
+    // with the swizzles.
+    assert_eq!(rig.draw(), Outcome::Drawn);
+    assert_eq!(rig.draws.counters().lookups, 6);
+    assert_eq!(
+        rig.shaders.seen[5].key.texture_swizzles.as_slice(),
+        [swizzled]
+    );
 }
 
 #[test]
