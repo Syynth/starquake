@@ -941,6 +941,7 @@ fn resource(group: u32, binding: u32, kind: ResourceKind) -> ResourceBinding {
         group,
         binding,
         kind,
+        count: None,
     }
 }
 

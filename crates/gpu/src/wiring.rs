@@ -106,8 +106,9 @@
 //! A poll counted past the first look's started after it, since no turn was in progress while
 //! the first look read the front quiet. A poll that finds the wait ended
 //! resumes the channel, and its turn ends busy, so the second look says "busy"
-//! (`a_released_acquire_is_busy_until_a_poll_has_looked`,
-//! `a_cpu_release_of_a_parked_acquire_is_busy_through_the_threads`); one that finds nothing
+//! (`a_cpu_release_of_a_parked_acquire_is_busy_through_the_threads`; with no poll at all the
+//! answer is "busy" too, `a_released_acquire_is_busy_until_a_poll_has_looked`); one that finds
+//! nothing
 //! leaves the GPU idle (`a_channel_parked_on_an_unreleased_acquire_is_idle`). A channel that
 //! still waits after that poll waits on something only the guest can end.
 //!
@@ -257,7 +258,10 @@ pub struct GpuDeps {
     pub watch: Arc<WriteWatch>,
     /// The front thread's clock.
     pub front_clock: Arc<dyn FrontClock>,
-    /// The back thread's clock.
+    /// The back thread's clock. Its [`FenceClock::gpu_timestamp`] is what a 16-byte release
+    /// writes: in a run, guest time from the kernel's clock, which `starquake-core` passes here
+    /// (gpu-protocol, "Fenced completion"; the fence path's module docs, "Guesses and open
+    /// items").
     pub fence_clock: Arc<dyn FenceClock>,
 }
 
@@ -285,8 +289,11 @@ impl Default for GpuConfig {
 }
 
 /// The host clock as the back thread's: [`FenceClock::elapsed`] is the time since the clock was
-/// made, and the timestamp a 16-byte release writes is the same time in nanoseconds (a
-/// **guess** at the timestamp's unit, as the fence path's module docs list).
+/// made, and the timestamp a 16-byte release writes is the same time in nanoseconds. That
+/// timestamp is host time, not the guest time gpu-protocol asks for ("Fenced completion"), so
+/// a run does not use this clock for the back: `starquake-core` passes one that reads guest time
+/// ([`GpuDeps::fence_clock`]). It remains for a GPU that has no run's clock to read, such as
+/// this crate's tests and `core`'s graphics-server tests.
 impl FenceClock for HostClock {
     fn elapsed(&self) -> Duration {
         FrontClock::now(self)

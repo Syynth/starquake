@@ -1436,11 +1436,14 @@ fn handle_forms_require_their_fixed_bit() {
     }
 }
 
-/// `.F16` (bit 79) and `.CL` (bit 77) decode only in the forms whose rows mark them known: the
-/// constant-buffer and `.UR` forms of `TEX` and `TLD` for `.F16`, `TLD.UR` for `.CL`. Elsewhere
-/// the bit is unknown.
+/// `.F16` (bit 79) decodes in every form of `TEX` and `TLD` and `.CL` (bit 77) in every form of
+/// `TLD`, the forms adding them where PR #4588's rows leave them out (`TEX.B`'s bit 79, named by
+/// PR #4588's `Visitor::TEX`; `TLD`'s constant-buffer and `.B` bit 77 and `TLD.B`'s bit 79,
+/// named by NAK's `OpTld` comments). `TLD4`, whose rows have no bit 79 and which neither
+/// reference names a `.F16` for, refuses it (module docs). Each decoded word prints the flag and
+/// re-assembles to itself.
 #[test]
-fn f16_and_clamp_only_where_the_rows_have_them() {
+fn f16_and_clamp_in_every_form_that_names_them() {
     let handle_bits = |opcode: u16| -> Vec<(u32, u128)> {
         let fixed = lookup(opcode).expect("a form").fixed;
         (0..128)
@@ -1451,27 +1454,38 @@ fn f16_and_clamp_only_where_the_rows_have_them() {
     let with = |opcode: u16, bit: u32| {
         let mut fields = handle_bits(opcode);
         fields.push((bit, 1));
-        decode(word(opcode.into(), &fields))
+        let word = word(opcode.into(), &fields);
+        (word, decode(word))
     };
-    for opcode in [0xb60, 0xf60, 0xb66, 0xf66] {
-        assert!(with(opcode, 79).is_ok(), "{opcode:#x}");
+    for (opcode, bit, flag) in [
+        (0xb60, 79, ".f16"),
+        (0x361, 79, ".f16"),
+        (0xf60, 79, ".f16"),
+        (0xb66, 79, ".f16"),
+        (0x367, 79, ".f16"),
+        (0xf66, 79, ".f16"),
+        (0xb66, 77, ".cl"),
+        (0x367, 77, ".cl"),
+        (0xf66, 77, ".cl"),
+    ] {
+        let (word, decoded) = with(opcode, bit);
+        assert!(decoded.is_ok(), "{opcode:#x} bit {bit}: {decoded:?}");
+        let instr = decoded.expect("decodes");
+        let text = instr.to_string();
+        assert!(text.contains(flag), "{opcode:#x}: {text}");
+        let plain = decode(Instruction::from_bits(word.bits() & !(1 << bit)));
+        let plain_text = plain.expect("decodes").to_string();
+        assert!(!plain_text.contains(flag), "{opcode:#x}: {plain_text}");
+        assert_eq!(assemble(&instr), Ok(word), "{opcode:#x} bit {bit}");
     }
-    for opcode in [0x361, 0x367, 0xb63, 0x364, 0xf63] {
+    for opcode in [0xb63, 0x364, 0xf63] {
         assert_eq!(
-            with(opcode, 79),
+            with(opcode, 79).1,
             Err(DecodeError::UnknownBit { opcode, bit: 79 }),
             "{opcode:#x}"
         );
     }
-    assert!(with(0xf66, 77).is_ok());
-    for opcode in [0xb66, 0x367] {
-        assert_eq!(
-            with(opcode, 77),
-            Err(DecodeError::UnknownBit { opcode, bit: 77 })
-        );
-    }
-    // The rows agree: bit 79 is known in exactly the four forms, bit 77 of TLD only in its .UR
-    // form.
+    // The masks: bit 79 is known in exactly the six forms, bit 77 of TLD in all three.
     let known = |opcode: u16, bit: u32| lookup(opcode).expect("a form").known & (1 << bit) != 0;
     // Of the texture forms (the surface forms' bit 79 is their memory order's).
     let texture_forms = [
@@ -1486,15 +1500,71 @@ fn f16_and_clamp_only_where_the_rows_have_them() {
     .flat_map(|opcodes| [Some(opcodes.cbuf), Some(opcodes.bindless), opcodes.uniform])
     .flatten();
     let f16_forms: Vec<u16> = texture_forms.filter(|&opcode| known(opcode, 79)).collect();
-    assert_eq!(f16_forms, [0xb60, 0xf60, 0xb66, 0xf66]);
-    assert!(!known(0xb66, 77) && !known(0x367, 77) && known(0xf66, 77));
+    assert_eq!(f16_forms, [0xb60, 0x361, 0xf60, 0xb66, 0x367, 0xf66]);
+    assert!(known(0xb66, 77) && known(0x367, 77) && known(0xf66, 77));
 }
 
-/// The assembler refuses `.F16` with a `.B` handle and `.CL` without a `.UR` one, the bits the
-/// rows of those forms leave out (`f16_and_clamp_only_where_the_rows_have_them`), and accepts
-/// them where the forms have them.
+/// `.F16` is bit 79 alone, as PR #4588 reads it (`ops_texture.cpp`, `TEX` and `TLD`:
+/// `Take(79, 1)`), though NAK's `OpTld` comment spans bits 79 and 80 ("bits 79..81: .F16", a
+/// half-open range): bit 80, the one past [`TEX_F16`], stays unknown in every `TEX` and `TLD`
+/// form (module docs, "Divergences from PR #4588's table").
 #[test]
-fn encoder_refuses_f16_and_clamp_where_the_forms_lack_them() {
+fn f16_is_bit_79_alone_and_bit_80_stays_unknown() {
+    // The reference literal: PR #4588's `Take(79, 1)`.
+    assert_eq!(TEX_F16, Field::bit(79));
+    let past_f16 = TEX_F16.start + TEX_F16.width;
+    let forms: Vec<u16> = [TEX_OPCODES, TLD_OPCODES]
+        .into_iter()
+        .flat_map(|opcodes| [Some(opcodes.cbuf), Some(opcodes.bindless), opcodes.uniform])
+        .flatten()
+        .collect();
+    assert_eq!(forms.len(), 6, "{forms:x?}");
+    for opcode in forms {
+        let fixed = lookup(opcode).expect("a form").fixed;
+        let mut fields: Vec<(u32, u128)> = (0..128)
+            .filter(|bit| fixed & (1 << bit) != 0)
+            .map(|bit| (bit, 1))
+            .collect();
+        fields.push((past_f16, 1));
+        assert_eq!(
+            decode(word(opcode.into(), &fields)),
+            Err(DecodeError::UnknownBit {
+                opcode,
+                bit: past_f16
+            }),
+            "{opcode:#x}"
+        );
+    }
+}
+
+/// The rows' own bits, before the forms add any: PR #4588's rows mark bit 79 known in the
+/// constant-buffer and `.UR` forms of `TEX` and `TLD` only, and bit 77 of `TLD` in its `.UR`
+/// form only, so the added bits are exactly the others (`framework::added_bits_are_the_listed_cases`).
+#[test]
+fn rows_leave_out_the_added_texture_bits() {
+    let row_has = |opcode: u16, bit: u32| {
+        texture::REFERENCE_ROWS
+            .iter()
+            .find(|row| row.opcode == opcode)
+            .expect("a row")
+            .mask()
+            & (1 << bit)
+            != 0
+    };
+    for opcode in [0xb60, 0xf60, 0xb66, 0xf66] {
+        assert!(row_has(opcode, 79), "{opcode:#x}");
+    }
+    for opcode in [0x361, 0x367, 0xb63, 0x364, 0xf63] {
+        assert!(!row_has(opcode, 79), "{opcode:#x}");
+    }
+    assert!(row_has(0xf66, 77) && !row_has(0xb66, 77) && !row_has(0x367, 77));
+}
+
+/// The assembler writes `.F16` with every handle of `TEX` and `TLD`, and `.CL` with every handle
+/// of `TLD` (`f16_and_clamp_in_every_form_that_names_them`): at exactly bits 79 and 77, each
+/// word decoding back to the op.
+#[test]
+fn encoder_writes_f16_and_clamp_with_every_handle() {
     let tex = |tex, f16| {
         assemble(&Instr::new(Op::Tex(OpTex {
             dsts: [r(1), Gpr::RZ],
@@ -1513,15 +1583,24 @@ fn encoder_refuses_f16_and_clamp_where_the_forms_lack_them() {
             scalar: false,
         })))
     };
-    assert_eq!(
-        tex(TexRef::Bindless, true),
-        Err(EncodeError::NoBits {
-            mnemonic: "tex",
-            what: ".f16 with a handle in the sources"
-        })
-    );
-    assert!(tex(TexRef::Bindless, false).is_ok());
-    assert!(tex(TexRef::Uniform(ur(2)), true).is_ok());
+    let cbuf = TexRef::CBuf(TexCBufRef {
+        index: 1,
+        offset: 8,
+    });
+    let handles = [cbuf, TexRef::Bindless, TexRef::Uniform(ur(2))];
+    for handle in handles {
+        let on = tex(handle, true).expect("encodable");
+        let off = tex(handle, false).expect("encodable");
+        assert_eq!(on.bits() ^ off.bits(), 1 << 79, "{handle:?}");
+        let Ok(Instr {
+            op: Op::Tex(decoded),
+            ..
+        }) = decode(on)
+        else {
+            unreachable!("{handle:?}: a TEX word");
+        };
+        assert!(decoded.f16 && decoded.tex == handle, "{handle:?}");
+    }
     let tld = |tex, f16, clamp| {
         assemble(&Instr::new(Op::Tld(OpTld {
             dsts: [r(1), Gpr::RZ],
@@ -1540,25 +1619,22 @@ fn encoder_refuses_f16_and_clamp_where_the_forms_lack_them() {
             scalar: false,
         })))
     };
-    let cbuf = TexRef::CBuf(TexCBufRef {
-        index: 1,
-        offset: 8,
-    });
-    assert!(tld(cbuf, true, false).is_ok());
-    assert_eq!(
-        tld(TexRef::Bindless, true, false),
-        Err(EncodeError::NoBits {
-            mnemonic: "tld",
-            what: ".f16 with a handle in the sources"
-        })
-    );
-    for tex in [cbuf, TexRef::Bindless] {
-        assert_eq!(
-            tld(tex, false, true).map_err(|error| error.to_string()),
-            Err("tld has no bits for .cl without a uniform-register handle".into())
-        );
+    for handle in handles {
+        let plain = tld(handle, false, false).expect("encodable");
+        for (f16, clamp, bit) in [(true, false, 79), (false, true, 77)] {
+            let word = tld(handle, f16, clamp).expect("encodable");
+            assert_eq!(word.bits() ^ plain.bits(), 1 << bit, "{handle:?}");
+            let Ok(Instr {
+                op: Op::Tld(decoded),
+                ..
+            }) = decode(word)
+            else {
+                unreachable!("{handle:?}: a TLD word");
+            };
+            assert_eq!((decoded.f16, decoded.clamp), (f16, clamp), "{handle:?}");
+            assert_eq!(decoded.tex, handle);
+        }
     }
-    assert!(tld(TexRef::Uniform(ur(4)), true, true).is_ok());
 }
 
 /// `TLD4.UR` rejects bit 89, which PR #4588's row marks known (module docs); it is the only bit

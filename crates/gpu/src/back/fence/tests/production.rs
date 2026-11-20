@@ -52,6 +52,7 @@ fn a_release_to_the_shim_increments_its_syncpoint_after_its_list_completes() {
         memory: Arc::<VmMemory<FlatMemory>>::clone(&mem),
         space: SPACE,
         release: four(SHIM + 9 * SHIM_STRIDE, 0xdead_beef),
+        failure: FailureLog::Warn,
     };
     assert_eq!(r.fences.attach(release), Ok(Attached::Open));
     let fence = r.fences.close(CloseReason::Present).unwrap().unwrap();
@@ -98,6 +99,7 @@ fn a_release_to_the_shim_latches_with_the_counter_it_reads_back() {
         memory: Arc::<VmMemory<FlatMemory>>::clone(&mem),
         space: SPACE,
         release: four(address, 0xdead_beef),
+        failure: FailureLog::Warn,
     };
     // Nothing in flight: the release is performed at once.
     let attached = r.fences.attach(release);
@@ -118,6 +120,7 @@ fn a_release_the_shim_cannot_take_is_reported_and_increments_nothing() {
         memory: Arc::<VmMemory<FlatMemory>>::clone(&mem),
         space: SPACE,
         release: four(address, 1),
+        failure: FailureLog::Warn,
     };
     // Nothing in flight: performed at once, and listed as failed with the shim's fault.
     assert_eq!(

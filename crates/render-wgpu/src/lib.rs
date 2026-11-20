@@ -27,7 +27,7 @@
 //! thread's encoder (slice R7). A pipeline whose shaders need subgroups of 32 is refused on a
 //! device that cannot promise them; an Apple GPU under Metal counts as promising them, although
 //! wgpu reports a range of 4 to 64 there ([`SubgroupSupport`], decided by the owner, 2026-11-19).
-//! A pipeline whose vertex shader uses subgroups is also refused on a device without subgroups in
+//! A pipeline whose vertex shader requires subgroups is also refused on a device without subgroups in
 //! vertex shaders, which includes every Apple GPU under wgpu 30 ([`pipeline::VERTEX_SUBGROUPS`]).
 //! No driver cache blob is made: wgpu's is Vulkan only and needs an `unsafe` call ([`pipeline`],
 //! "Not here").
@@ -79,13 +79,16 @@
 //!   the checks): a shader that is not a naga module ([`pipeline::NAGA_ONLY`]), whose module has no
 //!   entry point of its name for its stage ([`pipeline::NO_ENTRY_POINT`]), or whose blocks nest
 //!   deeper than [`pipeline::MAX_SHADER_NESTING`] ([`pipeline::NESTING`]); a pipeline asked of a
-//!   backend without a compile pool ([`pipeline::NO_COMPILE_POOL`]), or with a shader that needs
+//!   backend without a compile pool ([`pipeline::NO_COMPILE_POOL`]), with a shader whose interface
+//!   and module disagree (a binding array whose size is not a constant,
+//!   [`pipeline::layout::UNSIZED_BINDING_ARRAY`]; another array count,
+//!   [`pipeline::ARRAY_COUNT_MISMATCH`]; subgroups the requirements leave out,
+//!   [`pipeline::UNDECLARED_SUBGROUPS`]), or with a shader that requires
 //!   subgroups of 32 on a device that cannot promise them ([`pipeline::SUBGROUP_SIZE`]), or with a
-//!   vertex shader that uses subgroups on a device without them in vertex shaders
+//!   vertex shader that requires subgroups on a device without them in vertex shaders
 //!   ([`pipeline::VERTEX_SUBGROUPS`]); layouts
 //!   where two stages bind one group and binding as different resources
-//!   ([`pipeline::layout::STAGE_CONFLICT`]), with a binding array whose size is not a constant
-//!   ([`pipeline::layout::UNSIZED_BINDING_ARRAY`]), with a 1D array texture
+//!   ([`pipeline::layout::STAGE_CONFLICT`]), with a 1D array texture
 //!   ([`pipeline::layout::ONE_D_ARRAY`]) or with a storage texture whose format has no wgpu form
 //!   ([`pipeline::layout::STORAGE_FORMAT`]); and fixed-function state with a vertex attribute wgpu
 //!   has no format for ([`pipeline::state::VERTEX_FORMAT`]), a topology with adjacency

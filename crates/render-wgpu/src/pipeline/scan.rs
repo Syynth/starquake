@@ -1,17 +1,20 @@
 //! What the backend reads from a shader's naga module beside its `ShaderInterface`: whether the
 //! entry point exists for the shader's stage, whether the module uses subgroup operations, and,
-//! per bound global, its binding-array size and storage-texture access.
+//! per bound global, its binding-array size, storage-texture access and buffer size.
 //!
-//! The interface table says what kind of resource sits at each group and binding; the module is
-//! where the shader crate wrote the rest (render-backend, "Shader emission": "group and binding
-//! numbers already assigned in the module by the shader crate"). Two layout facts are only
-//! there:
+//! The interface table says what kind of resource sits at each group and binding, each
+//! binding's array count and the shader's requirements (render-backend, "Shader emission";
+//! decided by the owner, 2026-11-19, ruling 20), and the backend builds layouts and checks
+//! requirements from it. Two of the facts read here serve only as a cross-check of the
+//! interface (`crate::pipeline::agreement`, "The interface and the module" in the pipeline
+//! docs):
 //!
-//! - **A binding array's size.** wgpu needs an explicit layout entry with a `count` for a
-//!   binding array: a layout derived from the shader fails with "mapping of `ResourceBinding` ...
-//!   is missing" (`docs/specs/shader-pipeline.md`, the E1 table). The size is the module's
-//!   `TypeInner::BindingArray` size; an array whose size is not a constant (a runtime-sized or
-//!   override-sized array) is refused, since a layout needs a number.
+//! - **A binding array's size**, the module's `TypeInner::BindingArray` size, or "not a
+//!   constant" for a runtime-sized or override-sized array, which no interface can describe.
+//! - **Subgroups** (below).
+//!
+//! The others are facts the interface does not carry:
+//!
 //! - **A storage texture's access.** wgpu-core accepts a write-only shader global with a
 //!   read-write layout entry, but a read-only global needs a read-only entry
 //!   (`check_binding_use` in wgpu-core 30.0.2 `src/validation.rs`: "A write-only shader (but not
@@ -19,7 +22,7 @@
 //!   read-write format support, so the global's declared access picks the entry
 //!   (`crate::pipeline::layout`).
 //!
-//! **Subgroups.** A module uses subgroups when a function or entry point holds a
+//! **Subgroups.** A module uses subgroups, for the cross-check, when a function or entry point holds a
 //! `SubgroupBallot` or `SubgroupCollectiveOperation` statement, or a `SubgroupGather` statement
 //! of any mode but the two quad modes (`GatherMode::QuadBroadcast` and `GatherMode::QuadSwap`),
 //! at any depth of nested blocks, or when an entry point argument, an entry point result or a

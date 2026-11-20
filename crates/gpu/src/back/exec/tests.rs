@@ -213,6 +213,7 @@ fn uniform_bank(bank: u8, size: u32) -> ResourceUse {
             binding: 0,
         },
         kind: ResourceKind::UniformBuffer,
+        count: None,
         source: ResourceSource::ConstantBuffer { bank, size },
     }
 }
@@ -2423,3 +2424,4 @@ fn a_present_with_no_space_and_a_bad_format_is_no_present_space() {
 
 // Clears through the executor (slice G24).
 mod clear;
+mod report;

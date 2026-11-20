@@ -33,8 +33,9 @@ use crate::resource::{
 };
 use crate::shader::{
     InterfaceVariable, Interpolation, ResourceBinding, ResourceKind, SampleKind, ScalarKind,
-    ShaderInterface, ShaderStage,
+    ShaderInterface, ShaderRequirements, ShaderStage,
 };
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 #[test]
@@ -344,15 +345,24 @@ fn golden_shaders() -> Vec<Record> {
             stage: ShaderStage::Geometry,
             entry: "vs".to_owned(),
             interface: ShaderInterface {
-                resources: vec![ResourceBinding {
-                    group: 25,
-                    binding: 26,
-                    kind: ResourceKind::SampledTexture {
-                        dimension: ViewDimension::D2Array,
-                        sample: SampleKind::Float { filterable: true },
-                        multisampled: true,
+                resources: vec![
+                    ResourceBinding {
+                        group: 25,
+                        binding: 26,
+                        kind: ResourceKind::SampledTexture {
+                            dimension: ViewDimension::D2Array,
+                            sample: SampleKind::Float { filterable: true },
+                            multisampled: true,
+                        },
+                        count: NonZeroU32::new(0x4E),
                     },
-                }],
+                    ResourceBinding {
+                        group: 0x4F,
+                        binding: 0x50,
+                        kind: ResourceKind::Sampler { comparison: true },
+                        count: None,
+                    },
+                ],
                 inputs: vec![InterfaceVariable {
                     location: 27,
                     scalar: ScalarKind::Uint,
@@ -365,6 +375,13 @@ fn golden_shaders() -> Vec<Record> {
                     components: 4,
                     interpolation: Interpolation::Linear,
                 }],
+                requirements: ShaderRequirements {
+                    subgroup: true,
+                    f16: true,
+                    f64: true,
+                    i64: true,
+                    i64_atomics: true,
+                },
             },
             code: ShaderCode::Origin {
                 source: 1,
@@ -504,20 +521,28 @@ fn golden_file() -> Vec<u8> {
     // ShaderSource 0 and 1.
     f.extend([0x06, 0x03, 0x00, 0x01, 0xAA]);
     f.extend([0x06, 0x04, 0x01, 0x02, 0xBB, 0xCC]);
-    // CreateShader from source 1.
-    f.extend([0x07, 0x1C, 0x03, 0x02, b'v', b's']);
-    f.extend([0x01, 0x19, 0x1A, 0x02, 0x03, 0x00, 0x01, 0x01]);
+    // CreateShader from source 1: 40 bytes.
+    f.extend([0x07, 0x28, 0x03, 0x02, b'v', b's']);
+    // Two resources: a sampled texture array of 0x4E, then one comparison sampler.
+    f.extend([0x02, 0x19, 0x1A, 0x02, 0x03, 0x00, 0x01, 0x01, 0x01, 0x4E]);
+    f.extend([0x4F, 0x50, 0x04, 0x01, 0x00]);
     f.extend([0x01, 0x1B, 0x02, 0x03, 0x02, 0x01, 0x1C, 0x01, 0x04, 0x01]);
+    f.extend([0x01; 5]); // requirements: subgroup, f16, f64, i64, i64_atomics
     f.extend([0x00, 0x01, 0x1D, 0x00, 0x1E, 0x1F]);
-    // CreateShader with SPIR-V.
-    f.extend([0x07, 0x10, 0x00, 0x01, b'a', 0x00, 0x00, 0x00]);
+    // CreateShader with SPIR-V; the empty interface is three empty tables and no requirements.
+    f.extend([
+        0x07, 0x15, 0x00, 0x01, b'a', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]);
     f.extend([0x01, 0x02, 0x83, 0x84, 0x8C, 0x39, 0x05, 0x00, 0x43, 0x44]);
     // CreateShader with MSL, refused "r".
-    f.extend([0x07, 0x0C, 0x04, 0x01, b'b', 0x00, 0x00, 0x00]);
+    f.extend([
+        0x07, 0x11, 0x04, 0x01, b'b', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]);
     f.extend([0x02, 0x01, b'k', 0x01, 0x01, b'r']);
     // CreateShader with no origin.
     f.extend([
-        0x07, 0x0A, 0x05, 0x01, b'c', 0x00, 0x00, 0x00, 0x03, 0x00, 0x45, 0x46,
+        0x07, 0x0F, 0x05, 0x01, b'c', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00,
+        0x45, 0x46,
     ]);
     // CreateGraphicsPipeline: 140 bytes.
     f.extend([0x08, 0x8C, 0x01]);

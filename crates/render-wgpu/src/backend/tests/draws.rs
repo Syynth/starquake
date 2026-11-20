@@ -173,6 +173,7 @@ fn uniform_at_zero() -> ShaderInterface {
             group: 0,
             binding: 0,
             kind: ResourceKind::UniformBuffer,
+            count: None,
         }],
         ..ShaderInterface::default()
     }
@@ -798,6 +799,7 @@ fn a_dispatch_writes_its_storage_buffer() {
                         group: 0,
                         binding: 0,
                         kind: ResourceKind::StorageBuffer { writable: true },
+                        count: None,
                     }],
                     ..ShaderInterface::default()
                 },
@@ -986,11 +988,13 @@ fn writer_shader(gpu: &WgpuBackend) -> ShaderId {
                     group: 0,
                     binding: 0,
                     kind: ResourceKind::UniformBuffer,
+                    count: None,
                 },
                 ResourceBinding {
                     group: 0,
                     binding: 1,
                     kind: ResourceKind::StorageBuffer { writable: true },
+                    count: None,
                 },
             ],
             ..ShaderInterface::default()
@@ -1274,11 +1278,13 @@ fn sampling_shader(gpu: &WgpuBackend, filterable: bool) -> ShaderId {
                         sample: SampleKind::Float { filterable },
                         multisampled: false,
                     },
+                    count: None,
                 },
                 ResourceBinding {
                     group: 0,
                     binding: 1,
                     kind: ResourceKind::Sampler { comparison: false },
+                    count: None,
                 },
             ],
             ..ShaderInterface::default()

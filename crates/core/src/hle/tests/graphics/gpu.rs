@@ -92,6 +92,7 @@ fn with_gpu() -> Graphics {
             guest: Arc::new(FlatMemory::new(0x8000_0000, 0x1000)),
             watch: Arc::new(WriteWatch::new()),
             config: GpuConfig::default(),
+            fence_clock: Arc::new(starquake_gpu::front::HostClock::new()),
         },
     )
     .unwrap()

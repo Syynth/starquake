@@ -182,6 +182,7 @@ fn uniform(group: u32, binding: u32, bank: u8, size: u32) -> ResourceUse {
     ResourceUse {
         slot: Slot { group, binding },
         kind: ResourceKind::UniformBuffer,
+        count: None,
         source: ResourceSource::ConstantBuffer { bank, size },
     }
 }
@@ -194,6 +195,7 @@ fn texture_use(group: u32, binding: u32) -> ResourceUse {
             sample: SampleKind::Float { filterable: true },
             multisampled: false,
         },
+        count: None,
         source: ResourceSource::Texture(HandleSource {
             bank: HANDLE_BANK,
             offset: HANDLE_OFFSET,
@@ -205,6 +207,7 @@ fn sampler_use(group: u32, binding: u32) -> ResourceUse {
     ResourceUse {
         slot: Slot { group, binding },
         kind: ResourceKind::Sampler { comparison: false },
+        count: None,
         source: ResourceSource::Sampler(HandleSource {
             bank: HANDLE_BANK,
             offset: HANDLE_OFFSET,
@@ -216,6 +219,7 @@ fn driver_use(group: u32, binding: u32) -> ResourceUse {
     ResourceUse {
         slot: Slot { group, binding },
         kind: ResourceKind::UniformBuffer,
+        count: None,
         source: ResourceSource::DriverConstants,
     }
 }
@@ -3289,7 +3293,8 @@ fn the_shader_description_carries_the_module_slots_and_resources() {
         [starquake_render::ResourceBinding {
             group: 2,
             binding: 3,
-            kind: ResourceKind::UniformBuffer
+            kind: ResourceKind::UniformBuffer,
+            count: None,
         }]
     );
     // Built-ins are not interface variables: an exit-only vertex shader writes only position.
@@ -3299,6 +3304,116 @@ fn the_shader_description_carries_the_module_slots_and_resources() {
         .filter(|s| matches!(s.binding, starquake_shader::host::SlotBinding::Location(_)))
         .count();
     assert_eq!(desc.interface.outputs.len(), locations);
+}
+
+/// A shader with a binding array and a subgroup requirement keeps both through the conversion
+/// (render-backend, "Shader emission": the interface "carries the shader's requirements and each
+/// binding's array count"; ruling 20 of 2026-11-19), and one without either keeps neither: each
+/// row's count is its own, in table order.
+#[test]
+fn the_conversion_keeps_binding_array_counts_and_requirements() {
+    let four = std::num::NonZeroU32::new(4);
+    let resources = [
+        ResourceUse {
+            count: four,
+            ..texture_use(1, 5)
+        },
+        uniform(2, 3, 1, 0x10),
+    ];
+    for subgroup in [true, false] {
+        let mut shader = host_shader(GuestStage::Pixel);
+        shader.requirements = starquake_shader::host::Requirements {
+            subgroup,
+            ..starquake_shader::host::Requirements::default()
+        };
+        let desc = shaders::shader_desc(&shader, &resources);
+        let counts: Vec<_> = desc
+            .interface
+            .resources
+            .iter()
+            .map(|r| (r.group, r.binding, r.count))
+            .collect();
+        assert_eq!(counts, [(1, 5, four), (2, 3, None)], "subgroup {subgroup}");
+        assert_eq!(
+            desc.interface.requirements,
+            starquake_render::ShaderRequirements {
+                subgroup,
+                ..starquake_render::ShaderRequirements::default()
+            },
+        );
+    }
+}
+
+/// The requirements map field by field: each field set alone reaches the field it mirrors and
+/// no other, so two swapped fields fail; none set and all set map to the same.
+#[test]
+fn requirements_map_field_by_field() {
+    use starquake_render::ShaderRequirements;
+    use starquake_shader::host::Requirements;
+    let none = Requirements::default();
+    let cases = [
+        (
+            Requirements {
+                subgroup: true,
+                ..none
+            },
+            ShaderRequirements {
+                subgroup: true,
+                ..ShaderRequirements::default()
+            },
+        ),
+        (
+            Requirements { f16: true, ..none },
+            ShaderRequirements {
+                f16: true,
+                ..ShaderRequirements::default()
+            },
+        ),
+        (
+            Requirements { f64: true, ..none },
+            ShaderRequirements {
+                f64: true,
+                ..ShaderRequirements::default()
+            },
+        ),
+        (
+            Requirements { i64: true, ..none },
+            ShaderRequirements {
+                i64: true,
+                ..ShaderRequirements::default()
+            },
+        ),
+        (
+            Requirements {
+                i64_atomics: true,
+                ..none
+            },
+            ShaderRequirements {
+                i64_atomics: true,
+                ..ShaderRequirements::default()
+            },
+        ),
+        (none, ShaderRequirements::default()),
+        (
+            Requirements {
+                subgroup: true,
+                f16: true,
+                f64: true,
+                i64: true,
+                i64_atomics: true,
+            },
+            ShaderRequirements {
+                subgroup: true,
+                f16: true,
+                f64: true,
+                i64: true,
+                i64_atomics: true,
+            },
+        ),
+    ];
+    for (from, to) in cases {
+        assert_eq!(shaders::requirements(from), to, "{from:?}");
+    }
 }
 
 #[test]

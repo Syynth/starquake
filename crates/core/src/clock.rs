@@ -37,10 +37,11 @@ pub(crate) const NRO_CONSOLE: Console = Console::Switch1;
 /// What a run counts time with: the console its process was built for, and the host clock.
 ///
 /// The clock is cloned: one copy goes into the environment, where the kernel reads it and every
-/// reading is recorded, and the loop keeps the other to stamp the events it records itself
-/// (PROVISIONAL: lifecycle and fault events, until the kernel records them). Both copies must
-/// read the same time, so the clock is one that reads the host, not one that counts its own
-/// readings.
+/// reading is recorded, and the loop keeps another to stamp the events it records itself
+/// (PROVISIONAL: lifecycle and fault events, until the kernel records them); a run's GPU gets a
+/// third for the timestamps its semaphore releases write (`crate::machine`'s `gpu` module, "The
+/// GPU's clocks"). The copies must read the same time, so the clock is one that reads the host,
+/// not one that counts its own readings.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Timebase<C> {
     /// The console the process was built for: the kernel gives it that console's counter rate,
