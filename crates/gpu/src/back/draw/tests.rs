@@ -3117,7 +3117,10 @@ fn the_conversion_keeps_binding_array_counts_and_requirements() {
     ];
     for subgroup in [true, false] {
         let mut shader = host_shader(GuestStage::Pixel);
-        shader.requirements = starquake_shader::host::Requirements { subgroup };
+        shader.requirements = starquake_shader::host::Requirements {
+            subgroup,
+            ..starquake_shader::host::Requirements::default()
+        };
         let desc = shaders::shader_desc(&shader, &resources);
         let counts: Vec<_> = desc
             .interface
@@ -3128,21 +3131,83 @@ fn the_conversion_keeps_binding_array_counts_and_requirements() {
         assert_eq!(counts, [(1, 5, four), (2, 3, None)], "subgroup {subgroup}");
         assert_eq!(
             desc.interface.requirements,
-            starquake_render::ShaderRequirements { subgroup },
+            starquake_render::ShaderRequirements {
+                subgroup,
+                ..starquake_render::ShaderRequirements::default()
+            },
         );
     }
 }
 
-/// The requirements map field by field: each value of each field reaches the field it mirrors.
+/// The requirements map field by field: each field set alone reaches the field it mirrors and
+/// no other, so two swapped fields fail; none set and all set map to the same.
 #[test]
 fn requirements_map_field_by_field() {
     use starquake_render::ShaderRequirements;
     use starquake_shader::host::Requirements;
-    for subgroup in [true, false] {
-        assert_eq!(
-            shaders::requirements(Requirements { subgroup }),
-            ShaderRequirements { subgroup }
-        );
+    let none = Requirements::default();
+    let cases = [
+        (
+            Requirements {
+                subgroup: true,
+                ..none
+            },
+            ShaderRequirements {
+                subgroup: true,
+                ..ShaderRequirements::default()
+            },
+        ),
+        (
+            Requirements { f16: true, ..none },
+            ShaderRequirements {
+                f16: true,
+                ..ShaderRequirements::default()
+            },
+        ),
+        (
+            Requirements { f64: true, ..none },
+            ShaderRequirements {
+                f64: true,
+                ..ShaderRequirements::default()
+            },
+        ),
+        (
+            Requirements { i64: true, ..none },
+            ShaderRequirements {
+                i64: true,
+                ..ShaderRequirements::default()
+            },
+        ),
+        (
+            Requirements {
+                i64_atomics: true,
+                ..none
+            },
+            ShaderRequirements {
+                i64_atomics: true,
+                ..ShaderRequirements::default()
+            },
+        ),
+        (none, ShaderRequirements::default()),
+        (
+            Requirements {
+                subgroup: true,
+                f16: true,
+                f64: true,
+                i64: true,
+                i64_atomics: true,
+            },
+            ShaderRequirements {
+                subgroup: true,
+                f16: true,
+                f64: true,
+                i64: true,
+                i64_atomics: true,
+            },
+        ),
+    ];
+    for (from, to) in cases {
+        assert_eq!(shaders::requirements(from), to, "{from:?}");
     }
 }
 

@@ -513,7 +513,10 @@ fn storage_out() -> ShaderInterface {
 /// shader that uses subgroups.
 fn subgroups(interface: ShaderInterface) -> ShaderInterface {
     ShaderInterface {
-        requirements: ShaderRequirements { subgroup: true },
+        requirements: ShaderRequirements {
+            subgroup: true,
+            ..interface.requirements
+        },
         ..interface
     }
 }
@@ -603,7 +606,7 @@ fn vertex_subgroups_need_the_vertex_feature() {
         subgroups(storage_out()),
     );
     let compute_ballot = rec(ShaderStage::Compute, BALLOT, subgroups(storage_out()));
-    assert!(vertex_ballot.uses_subgroups() && !plain_vertex.uses_subgroups());
+    assert!(vertex_ballot.requires_subgroups() && !plain_vertex.requires_subgroups());
     // The refusal's reason, or `None` for accepted.
     let (refused, size) = (Some(VERTEX_SUBGROUPS), Some(SUBGROUP_SIZE));
     for (shaders, honoured, vertex, expected, why) in [
@@ -2044,6 +2047,113 @@ fn the_interface_check_comes_after_the_ids_and_before_the_requirements() {
             Err(RenderError::Invalid(ARRAY_COUNT_MISMATCH)),
             "a compute pipeline with both faults: the interface first"
         );
+        // Check 4 before check 5 for a compute pipeline too: a fragment shader whose interface
+        // leaves out the subgroups its module uses is refused as not a compute shader.
+        let fragment_undeclared = fragment(&gpu, SUBGROUP_FRAGMENT, storage_out());
+        assert_eq!(
+            gpu.create_compute_pipeline(ComputePipelineDesc {
+                shader: fragment_undeclared
+            }),
+            Err(RenderError::Invalid(
+                "a compute pipeline's shader is not a compute shader"
+            )),
+            "a compute pipeline's stage before its interface"
+        );
+    });
+}
+
+/// Check 5 runs shader by shader in stage order on a device: a vertex shader that leaves out
+/// the subgroups its module uses beside a fragment shader whose interface calls a binding array
+/// one resource is refused for the vertex shader's fault.
+#[test]
+fn a_graphics_pipeline_cross_checks_its_shaders_in_stage_order() {
+    bounded(|| {
+        let Some(gpu) = gpu(
+            "interface stage order",
+            Arc::new(ThreadPool),
+            WhileCompiling::Wait,
+        ) else {
+            return;
+        };
+        let vs = gpu
+            .create_shader(shader_desc(
+                ShaderStage::Vertex,
+                "main",
+                wgsl(VERTEX_BALLOT),
+                ShaderInterface::default(),
+            ))
+            .expect("the shader itself is accepted");
+        let fs = fragment(
+            &gpu,
+            BINDING_ARRAY,
+            rows(&[(0, texture(true)), (1, SAMPLER)]),
+        );
+        assert_eq!(
+            gpu.create_graphics_pipeline(graphics_desc(vs, Some(fs))),
+            Err(RenderError::Invalid(UNDECLARED_SUBGROUPS)),
+        );
+        // Each fault alone, so both shaders really are faulty.
+        assert_eq!(
+            gpu.create_graphics_pipeline(graphics_desc(bare_vertex(&gpu), Some(fs))),
+            Err(RenderError::Invalid(ARRAY_COUNT_MISMATCH)),
+        );
+        assert_eq!(
+            gpu.create_graphics_pipeline(graphics_desc(vs, None)),
+            Err(RenderError::Invalid(UNDECLARED_SUBGROUPS)),
+        );
+        assert_eq!(gpu.host_errors(), 0);
+    });
+}
+
+/// An interface row the module does not bind is not cross-checked, count or none (module docs,
+/// "Not cross-checked"), and its count goes into the layout. A count wgpu cannot make a layout
+/// entry for (a texture array of `u32::MAX`, past every device's binding-array limit; a uniform
+/// buffer array on a device without uniform buffer binding arrays) is accepted when the pipeline
+/// is asked for and fails its build: the pipeline settles `Failed`, as a wgpu validation error
+/// and not a host error. The same row with no count builds.
+#[test]
+fn an_unbound_row_with_a_count_wgpu_refuses_fails_the_build() {
+    bounded(|| {
+        let Some(gpu) = gpu("unbound count", Arc::new(ThreadPool), WhileCompiling::Wait) else {
+            return;
+        };
+        let vs = bare_vertex(&gpu);
+        let with_extra = |kind, count| {
+            let mut interface = rows(&[(0, UNIFORM), (1, texture(true)), (2, SAMPLER), (3, kind)]);
+            interface.resources[3].count = count;
+            let fs = fragment(&gpu, FRAGMENT, interface);
+            let id = gpu
+                .create_graphics_pipeline(graphics_desc(vs, Some(fs)))
+                .expect("an unbound row is not cross-checked");
+            settled(&gpu, id)
+        };
+        for kind in [texture(true), UNIFORM] {
+            assert_eq!(with_extra(kind, None), PipelineStatus::Ready, "{kind:?}");
+        }
+        let limit = gpu
+            .device()
+            .limits()
+            .max_binding_array_elements_per_shader_stage;
+        assert!(
+            limit < u32::MAX,
+            "the device's binding-array limit is {limit}"
+        );
+        assert_eq!(
+            with_extra(texture(true), NonZeroU32::new(u32::MAX)),
+            PipelineStatus::Failed,
+            "a texture array of u32::MAX"
+        );
+        let uniform_arrays = wgpu::Features::BUFFER_BINDING_ARRAY;
+        if gpu.device().features().contains(uniform_arrays) {
+            eprintln!("skipping the uniform buffer array: the device has uniform buffer arrays");
+        } else {
+            assert_eq!(
+                with_extra(UNIFORM, NonZeroU32::new(2)),
+                PipelineStatus::Failed,
+                "a uniform buffer array of 2"
+            );
+        }
+        assert_eq!(gpu.host_errors(), 0);
     });
 }
 

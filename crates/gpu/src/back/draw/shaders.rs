@@ -492,8 +492,20 @@ fn variable(binding: SlotBinding, ty: SlotType) -> Option<InterfaceVariable> {
 /// "What the render backend (#14) gets": the interface "also carries `requirements`"; decided
 /// by the owner, 2026-11-19, ruling 20).
 pub const fn requirements(requirements: Requirements) -> ShaderRequirements {
-    let Requirements { subgroup } = requirements;
-    ShaderRequirements { subgroup }
+    let Requirements {
+        subgroup,
+        f16,
+        f64,
+        i64,
+        i64_atomics,
+    } = requirements;
+    ShaderRequirements {
+        subgroup,
+        f16,
+        f64,
+        i64,
+        i64_atomics,
+    }
 }
 
 /// The one conversion from a translated shader to the render crate's description (render-backend

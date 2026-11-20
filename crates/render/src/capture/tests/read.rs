@@ -339,7 +339,8 @@ fn a_zero_binding_array_count_does_not_decode() {
                 0x05, 0x01, b'm', // compute, entry "m"
                 0x01, 0x00, 0x00, 0x00, // one uniform buffer at group 0, binding 0
                 0x01, count, // its array count, `Some(count)`
-                0x00, 0x00, 0x00, // no inputs, no outputs, no requirements
+                0x00, 0x00, // no inputs, no outputs
+                0x00, 0x00, 0x00, 0x00, 0x00, // no requirements (five flags)
                 0x03, 0x00, 0x01, 0x00, // no origin; made shader 1, generation 0
             ],
         )
@@ -361,6 +362,33 @@ fn a_zero_binding_array_count_does_not_decode() {
             record: 1,
             source: postcard::Error::SerdeDeCustom
         })
+    );
+}
+
+/// A binding's array count has no bound at decode beyond being non-zero, as live (the capture
+/// module docs): a `CreateShader` whose row says `Some(u32::MAX)` reads with that count, which
+/// the backend then puts in the layout (render-wgpu's pipeline docs, "Not cross-checked").
+#[test]
+fn a_binding_array_count_of_u32_max_decodes() {
+    let body = [
+        0x05, 0x01, b'm', // compute, entry "m"
+        0x01, 0x00, 0x00, 0x00, // one uniform buffer at group 0, binding 0
+        0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, // its array count, `Some(u32::MAX)`
+        0x00, 0x00, // no inputs, no outputs
+        0x00, 0x00, 0x00, 0x00, 0x00, // no requirements (five flags)
+        0x03, 0x00, 0x01, 0x00, // no origin; made shader 1, generation 0
+    ];
+    let records = read(&file(&[&framed(RecordKind::CreateShader.tag(), &body)]))
+        .expect("a count of u32::MAX reads");
+    let count = match &records[1] {
+        Record::CreateShader(made) => made.interface.resources.first().map(|r| r.count),
+        _ => None,
+    };
+    assert_eq!(
+        count,
+        Some(std::num::NonZeroU32::new(u32::MAX)),
+        "{:?}",
+        records[1]
     );
 }
 

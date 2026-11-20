@@ -57,10 +57,14 @@
 //! pipeline is cached as failed: nothing builds it again (rows 90 and 112: cache rejections
 //! negatively), and `pipeline_status` says `Failed` from then on.
 //!
-//! **The interface and the module.** Layouts and requirements come from each shader's
-//! `ShaderInterface`, which carries the shader's requirements and each binding's array count, so
-//! the backend reads neither from the naga module (render-backend, "Shader emission"; decided by
-//! the owner, 2026-11-19, ruling 20). The module scan ([`scan`]) stays as a cross-check, run at
+//! **The interface and the module.** The layout entries' array counts and the requirements come
+//! from each shader's `ShaderInterface`, which carries the shader's requirements and each
+//! binding's array count, so the backend reads neither of those two facts from the naga module
+//! (render-backend, "Shader emission"; decided by the owner, 2026-11-19, ruling 20). The rest of
+//! what the layouts and the draw check need beside the interface's rows still comes from the
+//! module: each storage texture's access and each buffer's declared size ([`scan`]), and the
+//! texture and sampler pairs the shader samples with (naga's `FunctionInfo::sampling_set`,
+//! `layout::non_filtering_samplers`). The module scan ([`scan`]) stays as a cross-check, run at
 //! step 5 by [`agreement`], because a wrong interface would otherwise pass unseen: wgpu-core
 //! 30.0.2 does not compare a binding array's size with its layout entry's `count`
 //! (`Interface::new` in `src/validation.rs` keeps only the array's base type), so a wrong count
@@ -75,7 +79,16 @@
 //! cross-checked:
 //!
 //! - **An interface that declares more than the module uses.** A row the module does not bind is
-//!   left out of the comparison (wgpu accepts a layout entry no shader uses), and a set
+//!   left out of the comparison, and its count still goes into the layout. wgpu accepts a lone
+//!   layout entry no shader uses, but not every arrayed one: an array count past the device's
+//!   binding-array limit (`u32::MAX` on a texture), or a binding array of a kind the device has no
+//!   feature for (a uniform buffer array without `wgpu::Features::BUFFER_BINDING_ARRAY`), is
+//!   accepted when the pipeline is asked for and fails its build, so the pipeline settles
+//!   `Failed` (a wgpu validation error, not a host error). The same row with no count builds.
+//!   Before this slice the layout took the count from the module, so such a row got none and the
+//!   pipeline built. Pinned by `tests::an_unbound_row_with_a_count_wgpu_refuses_fails_the_build`.
+//!   A capture carries any non-zero count too (`starquake_render::capture`), so a replay of such a
+//!   pipeline fails its build the same way. A set
 //!   `requirements.subgroup` with a module that uses no size-dependent subgroup operation (a quad
 //!   operation alone, say, which the shader crate's flag also covers: it mirrors naga's
 //!   `Capabilities::SUBGROUP`) is honoured as declared. The backend is then stricter than the
@@ -123,9 +136,10 @@
 //! `tests::vertex_subgroups_need_the_vertex_feature` (the pure rule) and
 //! `tests::a_vertex_subgroup_pipeline_follows_the_device` (on the host's GPU).
 //!
-//! The other requirements (f16, i64 and the binding-array features) are wgpu's to check: it
-//! validates each module against the device's features, and a module that needs one the device
-//! lacks fails its pipeline.
+//! The other requirements the interface carries (`f16`, `f64`, `i64`, `i64_atomics`) and the
+//! binding-array features are wgpu's to check: it validates each module against the device's
+//! features, and a module that needs one the device lacks fails its pipeline. The backend reads
+//! only `requirements.subgroup`.
 //!
 //! # Draws: wait or skip
 //!
@@ -183,9 +197,9 @@ pub const NO_ENTRY_POINT: &str = "the shader's module has no entry point of its 
 /// A shader that needs subgroups of 32 on a device that cannot promise them.
 pub const SUBGROUP_SIZE: &str =
     "the device cannot promise the subgroup size of 32 a shader of this pipeline needs";
-/// A vertex shader that uses subgroups on a device without subgroups in vertex shaders
+/// A vertex shader that requires subgroups on a device without subgroups in vertex shaders
 /// (`wgpu::Features::SUBGROUP_VERTEX`; module docs, "Requirements").
-pub const VERTEX_SUBGROUPS: &str = "the device has no subgroup operations in vertex shaders, which this pipeline's vertex shader uses";
+pub const VERTEX_SUBGROUPS: &str = "the device has no subgroup operations in vertex shaders, which this pipeline's vertex shader requires";
 /// A shader whose interface gives a binding another array count than its module declares
 /// (module docs, "The interface and the module").
 pub const ARRAY_COUNT_MISMATCH: &str =
@@ -501,7 +515,7 @@ impl ShaderRec {
     }
 
     /// Whether the shader's interface requires subgroups (module docs, "Requirements").
-    pub(crate) fn uses_subgroups(&self) -> bool {
+    pub(crate) fn requires_subgroups(&self) -> bool {
         self.interface.requirements.subgroup
     }
 
@@ -800,14 +814,14 @@ pub(crate) fn check_interfaces<'a>(
 }
 
 /// Refuses `shaders` that need subgroups of 32 when the device cannot promise them
-/// ([`SUBGROUP_SIZE`]), then a vertex shader that uses subgroups when the device has none in
+/// ([`SUBGROUP_SIZE`]), then a vertex shader that requires subgroups when the device has none in
 /// vertex shaders ([`VERTEX_SUBGROUPS`]); module docs, "Requirements".
 pub(crate) fn check_requirements<'a>(
     shaders: impl IntoIterator<Item = &'a ShaderRec>,
     subgroups: SubgroupVerdict,
 ) -> Result<(), RenderError> {
     let (mut any, mut vertex) = (false, false);
-    for shader in shaders.into_iter().filter(|s| s.uses_subgroups()) {
+    for shader in shaders.into_iter().filter(|s| s.requires_subgroups()) {
         any = true;
         vertex |= shader.stage == ShaderStage::Vertex;
     }

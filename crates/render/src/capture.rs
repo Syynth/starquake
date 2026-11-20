@@ -44,6 +44,10 @@
 //! [`crate::shader::ShaderRequirements`]; the owner's ruling 20 of 2026-11-19) without a new
 //! version: the version stays 2, and the golden bytes pin the new layout
 //! (`capture::tests::golden`). The rule above applies from the first build that writes captures.
+//! A binding's array count decodes as any non-zero `u32`, `u32::MAX` included, with no bound
+//! beyond what a live interface allows (`capture::tests::read::a_binding_array_count_of_u32_max_decodes`);
+//! a count the device cannot make a layout entry for fails the replayed pipeline's build, as it
+//! does live.
 //!
 //! # What a capture holds
 //!

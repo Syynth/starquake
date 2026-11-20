@@ -27,7 +27,7 @@
 //! thread's encoder (slice R7). A pipeline whose shaders need subgroups of 32 is refused on a
 //! device that cannot promise them; an Apple GPU under Metal counts as promising them, although
 //! wgpu reports a range of 4 to 64 there ([`SubgroupSupport`], decided by the owner, 2026-11-19).
-//! A pipeline whose vertex shader uses subgroups is also refused on a device without subgroups in
+//! A pipeline whose vertex shader requires subgroups is also refused on a device without subgroups in
 //! vertex shaders, which includes every Apple GPU under wgpu 30 ([`pipeline::VERTEX_SUBGROUPS`]).
 //! No driver cache blob is made: wgpu's is Vulkan only and needs an `unsafe` call ([`pipeline`],
 //! "Not here").

@@ -81,7 +81,10 @@ impl ShaderResolver for Stub {
             }
             Some(b'R') => Ok(ShaderDesc {
                 interface: ShaderInterface {
-                    requirements: ShaderRequirements { subgroup: true },
+                    requirements: ShaderRequirements {
+                        subgroup: true,
+                        ..ShaderRequirements::default()
+                    },
                     ..arrayed()
                 },
                 ..shader(ShaderStage::Compute, naga(), None)

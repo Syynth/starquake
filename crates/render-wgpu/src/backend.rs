@@ -596,7 +596,7 @@ impl WgpuBackend {
     }
 
     /// Whether the device runs subgroup operations in vertex shaders
-    /// (`wgpu::Features::SUBGROUP_VERTEX`), so a pipeline whose vertex shader uses subgroups is
+    /// (`wgpu::Features::SUBGROUP_VERTEX`), so a pipeline whose vertex shader requires subgroups is
     /// accepted (`crate::pipeline`, "Requirements").
     pub fn honours_vertex_subgroups(&self) -> bool {
         self.subgroups.vertex
