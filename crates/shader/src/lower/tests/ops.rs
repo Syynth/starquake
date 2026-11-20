@@ -766,7 +766,8 @@ fn interp_and_gpu(test: &str, function: &Function, regs: &[u8]) -> (Vec<u32>, Op
 #[test]
 fn translated_f2f_rounding_matches_the_interpreter_on_the_gpu() {
     use crate::decode::{AluSrc, FloatType, Instr, Op, OpExit, OpF2F, PredSrc, RoundMode};
-    use crate::translate::{COLOR_TARGETS, ColorOutputs, Stage, translate};
+    use crate::translate::driver::translate_instrs;
+    use crate::translate::{COLOR_TARGETS, ColorOutputs, Stage};
     // The input, `.FTZ`, then the half for nearest, down, up and toward zero.
     let cases: [(f32, bool, [u32; 4]); 10] = [
         (65519.0, false, [0x7bff, 0x7bff, 0x7c00, 0x7bff]),
@@ -810,7 +811,7 @@ fn translated_f2f_rounding_matches_the_interpreter_on_the_gpu() {
             no_at_exit: false,
             pred: PredSrc::TRUE,
         })));
-        let function = translate(stage, &program).expect("translates");
+        let function = translate_instrs(stage, None, &program).expect("translates");
         let test = format!("translated_f2f_{mode:?}");
         let (expected, found) = interp_and_gpu(&test, &function, &regs);
         let worked: Vec<u32> = cases.iter().map(|(_, _, halves)| halves[index]).collect();

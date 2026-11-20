@@ -68,8 +68,8 @@
 //! # Guards
 //!
 //! An instruction under a guard predicate other than `PT` becomes a conditional block (spec,
-//! "Instruction translation"), made as the integer translator makes it (`integer`'s
-//! `split_for_guard`): the block tests the guard and branches to a new block holding the
+//! "Instruction translation"), made with the shared guard helper (`super`'s
+//! `split_for_guard`, which the integer translator uses too): the block tests the guard and branches to a new block holding the
 //! instruction, which jumps to a second new block that takes the first block's terminator, and
 //! the builder is left there. The split is made after every check, so a refused instruction
 //! leaves the function untouched (`tests::guards::refusals_leave_the_function_untouched`). A
@@ -242,7 +242,8 @@ use std::fmt::{self, Display, Formatter};
 
 use thiserror::Error;
 
-use super::integer::{GuardMode, split_for_guard, successor_phi};
+use super::integer::{GuardMode, successor_phi};
+use super::{source, split_for_guard};
 use crate::decode::memory::MEM_OFFSET;
 use crate::decode::{
     AtomDst, AtomOp, AtomType, CBuf, DecodeError, GlobalAccess, Gpr, Instr, Instruction, LdcMode,
@@ -250,7 +251,6 @@ use crate::decode::{
     Op, OpAtom, OpAtomsPopc, OpLd, OpLdGsts, OpLdc, OpMemBar, OpSt, Pred, PredSrc, UniformReg,
     decode,
 };
-use crate::flow::read_pred;
 use crate::ir::{BlockId, BuildError, Builder, Imm, Opcode, Operand};
 
 /// A memory space, for error messages.
@@ -684,7 +684,8 @@ pub fn translate_memory(
             if let Some(successor) = successor_phi(builder.function(), block) {
                 return Err(MemoryError::SuccessorPhi { block, successor });
             }
-            Some(split_for_guard(builder, guard)?)
+            let cond = source::pred(builder, guard)?;
+            Some(split_for_guard(builder, cond)?)
         }
         None => None,
     };
@@ -1341,7 +1342,7 @@ impl Emit<'_, '_> {
                 if ld.pred.is_true() || ld.dst.is_zero() {
                     return self.set_words(ld.dst, value, words);
                 }
-                let enabled = read_pred(self.b, ld.pred)?;
+                let enabled = source::pred(self.b, ld.pred)?;
                 let mut parts = Vec::with_capacity(usize::from(words));
                 if words == 1 {
                     parts.push(value);
@@ -1527,7 +1528,7 @@ impl Emit<'_, '_> {
 
     /// `Visitor::LDGSTS`: four words copied, then a workgroup memory barrier.
     fn ldgsts(&mut self, copy: OpLdGsts) -> Result<(), BuildError> {
-        let enabled = read_pred(self.b, copy.enable)?;
+        let enabled = source::pred(self.b, copy.enable)?;
         let global_offset = i32::from(copy.global_offset);
         let shared_offset = i32::from(copy.shared_offset).saturating_mul(COPY_SHARED_UNIT);
         let mut step = 0_i32;
