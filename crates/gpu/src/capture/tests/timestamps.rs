@@ -4,6 +4,7 @@
 //! as a `timestamp` record, and a replay writes the recorded value.
 
 use super::*;
+use crate::capture::builder::BUILDER_TIMESTAMP;
 use crate::capture::{
     Access, BackRecord, Capture, ContentHash, Divergence, ReplayError, ReplayOptions, ReplayOutput,
     Thread, replay,
@@ -188,4 +189,29 @@ fn a_changed_timestamp_record_diverges_at_the_write_it_feeds() {
             ),
         })
     );
+}
+
+/// A builder never given a guest time reads [`BUILDER_TIMESTAMP`]: the capture records it, the
+/// release writes it at [`RELEASE_TIMESTAMP_OFFSET`] after the payload, and the replay writes
+/// the same.
+#[test]
+fn a_fresh_builder_s_release_writes_the_builder_timestamp() {
+    let mut builder = builder();
+    let channel = channel(&mut builder);
+    let first = submission_at(&builder, CMD, &releases_with_timestamp(SEM, PAYLOAD));
+    builder.submit(channel, first).unwrap();
+    builder.run().unwrap();
+    let capture = builder.finish().unwrap();
+    let capture = Capture::parse(&capture.to_bytes().unwrap()).unwrap();
+    assert_eq!(timestamps(&capture), [BUILDER_TIMESTAMP]);
+    let expected = structure(PAYLOAD, BUILDER_TIMESTAMP);
+    let offset = usize::try_from(RELEASE_TIMESTAMP_OFFSET).unwrap();
+    assert_eq!(expected[offset..], BUILDER_TIMESTAMP.to_le_bytes());
+    let write = write_record(&capture, SEM);
+    let BackRecord::Access(Access::Write { data, .. }) = &capture.back[write] else {
+        unreachable!("found as a write");
+    };
+    assert_eq!(capture.blobs.get(*data).unwrap(), &expected[..]);
+    let output = replay(capture, ReplayOptions::default()).unwrap();
+    assert_eq!(back_writes(&output), [(SEM, expected)]);
 }
