@@ -56,9 +56,11 @@
 //! `BMOV` is a plain instruction). An instruction whose guard is `!PT` never runs and is
 //! skipped. When [`FlowBlock::guard_tested`] is set the block holds one instruction whose
 //! guard the graph has already tested, so the translator ignores that guard; any other
-//! guarded instruction in a block is a pure one (`classify.h`, `pure`). The translation driver
-//! makes it a conditional block of its own (spec, "Instruction translation", "Guards"; the
-//! owner's ruling of 2026-11-19, row 2), where PR #4588 keeps the guard as a select
+//! guarded instruction in a block is a pure one (`classify.h`, `pure`) or one of the
+//! `OpKind::Nop` instructions above (`NOP`, `DEPBAR`, `BREAK`, `WARPSYNC` with an immediate),
+//! which write no IR. The translation driver makes a guarded pure one a conditional block of
+//! its own (spec, "Instruction translation", "Guards"; the owner's ruling of 2026-11-19, row
+//! 2), where PR #4588 keeps the guard as a select, and translates the others as they are
 //! ([`crate::translate::driver`]'s "Guards").
 //!
 //! A `KILL` gets a conditional block of its own that holds it and ends in [`BlockEnd::Kill`]:
@@ -140,7 +142,9 @@ use thiserror::Error;
 
 pub use analysis::{Analysis, analyze};
 pub(crate) use analysis::{is_never, opcode_of};
-pub(crate) use classify::classify;
+#[cfg(test)]
+pub(crate) use classify::OpKind;
+pub(crate) use classify::{OpInfo, classify};
 pub use ir_build::{BlockSource, IrBlocks};
 pub use jump_tables::{
     JumpTable, JumpTableQuestions, MAX_TABLE_ENTRIES, ResolvedTable, ResolvedTables,

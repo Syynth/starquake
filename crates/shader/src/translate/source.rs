@@ -117,8 +117,9 @@ pub(crate) fn pred(e: &mut impl Emit, src: PredSrc) -> Result<Operand, BuildErro
     Ok(value)
 }
 
-/// The guard of a uniform datapath instruction (`classify.h`'s `uniform`: `S2UR`, `VOTEU`),
-/// read as the uniform predicate of the same number (`Visitor::Run`: `UPred(guard.index,
+/// The guard of a uniform datapath instruction (`classify.h`'s `uniform`: `UMOV`, `ULDC`,
+/// `ULDC.64`, `S2UR`, `UPLOP3`, `VOTEU` and the uniform ALU forms; of these only `S2UR` and
+/// `VOTEU` have a decode form so far), read as the uniform predicate of the same number (`Visitor::Run`: `UPred(guard.index,
 /// guard.negated)`); `PT` names `UPT`, which reads as the immediate.
 pub(crate) fn uniform_guard(e: &mut impl Emit, guard: PredSrc) -> Result<Operand, BuildError> {
     let reg = UniformPred::new(guard.reg.index()).unwrap_or(UniformPred::UPT);

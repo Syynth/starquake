@@ -35,21 +35,45 @@
 //! 5. Translation, block by block and instruction by instruction, stopping at the first
 //!    refusal (there is no partial translation, spec "Instruction translation").
 //!
+//! Each pair of neighbouring checks is pinned with both faults at once:
+//! `tests::the_stage_is_checked_before_flow_analysis` (1 before 2),
+//! `tests::flow_analysis_is_checked_before_decoding` (2 before 4),
+//! `tests::the_budget_is_checked_before_decoding` (3 before 4) and
+//! `tests::the_lowest_undecodable_instruction_is_refused` (4 before 5). Flow analysis comes
+//! before the size because the size is counted over its blocks.
+//!
 //! # Guards
 //!
-//! An instruction under `!PT` never runs and becomes nothing, as `Visitor::Run` returns when
-//! `guard.Never()` (flow analysis leaves such an instruction in its block's range and skips it
-//! the same way, `flow::is_never`). An instruction under `PT`, and the one instruction of a block
-//! whose guard flow analysis has tested ([`crate::flow::FlowBlock::guard_tested`]: a guarded
-//! instruction that is not pure, a conditional `EXIT`, a `KILL`), is translated as if unguarded.
-//! Any other guarded instruction is a pure one flow analysis left in its block, and becomes a
-//! conditional block (the owner's ruling of 2026-11-19, row 2, where PR #4588 keeps a select,
-//! `guard_select`): the driver reads the guard (a uniform predicate of the same number for a
-//! uniform datapath instruction, `classify.h`'s `uniform` list, as `Visitor::Run` reads it with
-//! `UPred`; a predicate for the others, `Pred`), splits the block with the shared guard helper
-//! ([`super::split_for_guard`]), translates the instruction into the new block as if
-//! unguarded, and carries on in the block after it. Every group's translator is so handed its
-//! instruction with the guard already handled.
+//! As `Visitor::Run` reads them (`visitor.cpp`: it reads a guard only when `info.pure &&
+//! !guard.Always()`, after the `guard.Never()` return), with a conditional block where the PR
+//! keeps a select:
+//!
+//! - An instruction under `!PT` never runs and becomes nothing, as `Visitor::Run` returns when
+//!   `guard.Never()` (flow analysis leaves such an instruction in its block's range and skips it
+//!   the same way, `flow::is_never`).
+//! - An instruction under `PT`, and the one instruction of a block whose guard flow analysis has
+//!   tested ([`crate::flow::FlowBlock::guard_tested`]: a guarded instruction that is not pure, a
+//!   conditional `EXIT`, a `KILL`), is translated as if unguarded.
+//! - A guarded pure instruction (`classify.h`'s `pure`), which flow analysis leaves in its
+//!   block, becomes a conditional block (the owner's ruling of 2026-11-19, row 2, where PR #4588
+//!   keeps a select, `guard_select`): the driver reads the guard (a uniform predicate of the same
+//!   number for a uniform datapath instruction, `classify.h`'s `uniform`, as `Visitor::Run`
+//!   reads it with `UPred`; a predicate for the others, `Pred`), splits the block with the shared
+//!   guard helper ([`super::split_for_guard`]), translates the instruction into the new block as
+//!   if unguarded, and carries on in the block after it.
+//! - Any other guarded instruction flow analysis leaves in its block is one of `classify.h`'s
+//!   `OpKind::Nop`: `NOP`, `DEPBAR`, `BREAK` and `WARPSYNC` with an immediate (flow analysis
+//!   refuses a guarded `BSSY` and a guarded `BRX`, [`FlowError::PredicatedBssy`] and its
+//!   indirect-branch checks, and ends a block at a `BRA`, `BSYNC`, `CALL` or `RET`). It is
+//!   translated as is, its guard not read and no block made, as `Visitor::Run` reads no guard
+//!   for an instruction that is not pure; none of the four writes IR (the control group's
+//!   module docs). The spec says "Every guarded instruction becomes a conditional block, pure
+//!   ones included" ("Instruction translation", "Guards"): for these four a block would hold
+//!   nothing, so leaving it out changes no result. **Owner question**: whether a guarded
+//!   instruction that writes no IR should still get its (empty) conditional block. Pinned by
+//!   `tests::a_guarded_instruction_that_is_not_pure_reads_no_guard`.
+//!
+//! Every group's translator is so handed its instruction with the guard already handled.
 //!
 //! # Dispatch
 //!
@@ -62,15 +86,18 @@
 //! `MEMBAR`, `LDGSTS`, `LDGDEPBAR`, `ERRBAR`, `ATOMS.POPC`); the attribute group (`super`'s
 //! `GROUPS`). An operation none of them takes (the half and double group, the uniform group,
 //! the tensor group) is refused by its mnemonic ([`Unsupported::Instruction`]). The groups are
-//! disjoint, so the order decides nothing but speed
-//! (`tests::the_groups_are_disjoint`).
+//! disjoint, so the order decides nothing but speed: `tests::the_groups_are_disjoint` checks
+//! that every decoded operation (one instruction of each, from the deterministic
+//! `tests::decoded_samples`, which `tests::these_instructions_reach_every_decoded_operation`
+//! checks reach every operation but the shells no word decodes to) belongs to exactly one
+//! group.
 //!
 //! # Bounds
 //!
 //! Inlining copies a function's blocks to every call site (slice 10), so a program's inlined
 //! graph can hold far more instructions than the program: a function of 2^15 instructions
 //! called from 2^15 sites would be 2^30 translations. [`MAX_TRANSLATED_INSTRUCTIONS`] bounds the
-//! count before anything is decoded or translated, and the IR the translators write grows with
+//! count before anything is decoded or translated (`tests::the_budget_is_checked_before_decoding`), and the IR the translators write grows with
 //! it: each instruction's translator writes an amount of IR fixed by its form (a `REDUX`, for
 //! one, a shuffle for each of the warp's 32 lanes), plus a guard's read and split. The decoded
 //! instructions are kept once per instruction of the program, which flow analysis holds to
@@ -95,8 +122,8 @@ use super::{
 use crate::capture::MAX_INSTRUCTIONS;
 use crate::decode::{Instr, Instruction, Op, decode};
 use crate::flow::{
-    BranchTables, FlowError, FlowGraph, Invariant, IrBlocks, classify, flow_graph, is_never,
-    opcode_of,
+    BranchTables, FlowError, FlowGraph, Invariant, IrBlocks, OpInfo, classify, flow_graph,
+    is_never, opcode_of,
 };
 use crate::ir::{BlockId, Builder, Function};
 use crate::sph::PixelIo;
@@ -139,15 +166,9 @@ pub fn translate_flow(
             .ok_or(FlowError::Internal(Invariant::NoBlock(source.flow.index())))?;
         let mut at = source.block;
         for index in flow.code.clone() {
-            // Flow analysis made every block from `code`, and `decode_held` decoded every
-            // instruction a block holds, so neither lookup fails.
-            let slot = usize::try_from(index)
-                .map_err(|_| FlowError::Internal(Invariant::NoBlock(source.flow.index())))?;
-            let (Some(word), Some(Some(instr))) = (code.get(slot), decoded.get(slot)) else {
-                return Err(FlowError::Internal(Invariant::NoBlock(source.flow.index())).into());
-            };
-            let uniform = classify(opcode_of(*word)).uniform;
-            at = driver.instruction(function, at, slot, *instr, uniform, flow.guard_tested)?;
+            let (slot, word, instr) = held(code, &decoded, index)?;
+            let info = classify(opcode_of(word));
+            at = driver.instruction(function, at, slot, instr, info, flow.guard_tested)?;
         }
     }
     Ok(blocks)
@@ -166,6 +187,23 @@ fn charge(lengths: impl Iterator<Item = usize>, cap: u32) -> Result<u64, Transla
             .ok_or(TranslateError::TooManyInstructions)?;
     }
     Ok(total)
+}
+
+/// Instruction `index` of a flow block: its position in `code`, its word and its decoded form
+/// from `decoded` ([`decode_held`]). Flow analysis made every block from `code`, and
+/// `decode_held` decoded every instruction a block holds, so this fails only on a bug in the
+/// driver, with [`TranslateError::NotDecoded`].
+fn held(
+    code: &[Instruction],
+    decoded: &[Option<Instr>],
+    index: u32,
+) -> Result<(usize, Instruction, Instr), TranslateError> {
+    let not_decoded = TranslateError::NotDecoded { index };
+    let slot = usize::try_from(index).map_err(|_| not_decoded)?;
+    match (code.get(slot), decoded.get(slot)) {
+        (Some(word), Some(Some(instr))) => Ok((slot, *word, *instr)),
+        _ => Err(not_decoded),
+    }
 }
 
 /// Every instruction a block of `graph` holds, decoded once, in ascending order: the first that
@@ -212,25 +250,40 @@ impl Driver {
     }
 
     /// Translates `instr`, instruction `index` of the program, into `function` at the end of
-    /// block `at`, whose flow block's `guard_tested` is `guard_tested`; `uniform` says its guard
-    /// is a uniform predicate (`classify.h`'s `uniform`). See the module docs, "Guards". Returns
-    /// the block where translation continues.
+    /// block `at`, whose flow block's `guard_tested` is `guard_tested`; `info` is its opcode's
+    /// class (`classify.h`'s `Classify`). See the module docs, "Guards". Returns the block where
+    /// translation continues.
     fn instruction(
         &mut self,
         function: &mut Function,
         at: BlockId,
         index: usize,
         instr: Instr,
-        uniform: bool,
+        info: OpInfo,
         guard_tested: bool,
     ) -> Result<BlockId, TranslateError> {
         if is_never(instr.guard) {
             return Ok(at);
         }
-        if guard_tested || instr.guard.is_true() {
+        if guard_tested || instr.guard.is_true() || !info.pure {
             self.dispatch(function, at, index, instr)?;
             return Ok(at);
         }
+        self.conditional(function, at, index, instr, info.uniform)
+    }
+
+    /// Makes `instr`, instruction `index`, a conditional block at the end of block `at`: reads
+    /// its guard (a uniform predicate when `uniform`, else a predicate), splits the block with
+    /// [`split_for_guard`] and translates `instr` into the new block as if unguarded. Returns
+    /// the block after it.
+    fn conditional(
+        &mut self,
+        function: &mut Function,
+        at: BlockId,
+        index: usize,
+        instr: Instr,
+        uniform: bool,
+    ) -> Result<BlockId, TranslateError> {
         let mut b = Builder::new(function, at);
         let cond = if uniform {
             source::uniform_guard(&mut b, instr.guard)?
@@ -355,18 +408,20 @@ pub(crate) fn translate_instrs(
 
 /// `program`, decoded instructions of a straight-line program that ends at its first `EXIT`,
 /// translated by the driver's per-instruction path ([`Driver::instruction`]) into one block that
-/// returns, for the tests' hand-built instructions no word encodes: the block flow analysis
-/// would build for such a program, except that a guarded instruction that is not pure gets its
-/// conditional block from the driver, not from flow analysis (the same blocks). A guard is read
-/// as a uniform predicate when the assembler encodes the instruction and `classify.h` says so.
-/// Instructions after the first unguarded `EXIT` are ignored, as flow analysis never reaches
-/// them; a guarded `EXIT` is not supported here.
+/// returns, for the tests' hand-built instructions no word encodes: the blocks flow analysis
+/// would build for such a program. A guarded instruction that is not pure and is a
+/// straight-line one (`classify.h`'s `OpKind::Plain`), and a guarded one the assembler cannot
+/// encode, gets the conditional block flow analysis would give it, behind a test of its guard
+/// as a predicate, from [`Driver::conditional`]; every other instruction goes through
+/// [`Driver::instruction`] with its class. Instructions after the first unguarded `EXIT` are
+/// ignored, as flow analysis never reaches them; a guarded `EXIT` is not supported here.
 #[cfg(test)]
 pub(crate) fn translate_decoded(
     stage: Stage,
     header: Option<&PixelIo>,
     program: &[Instr],
 ) -> Result<Function, TranslateError> {
+    use crate::flow::OpKind;
     use crate::ir::Terminator;
     if !matches!(stage.stage, GuestStage::Vertex | GuestStage::Pixel) {
         return Err(TranslateError::Stage(Unsupported::Stage(stage.stage)));
@@ -375,11 +430,23 @@ pub(crate) fn translate_decoded(
     let mut at = function.entry();
     let mut driver = Driver::new(stage, header);
     for (index, instr) in program.iter().enumerate() {
-        let uniform =
-            crate::asm::assemble(instr).is_ok_and(|word| classify(opcode_of(word)).uniform);
+        let info = crate::asm::assemble(instr)
+            .ok()
+            .map(|word| classify(opcode_of(word)));
         let exits = matches!(instr.op, Op::Exit(_));
         assert!(!exits || instr.guard.is_true(), "a guarded exit: {instr}");
-        at = driver.instruction(&mut function, at, index, *instr, uniform, false)?;
+        let guarded = !is_never(instr.guard) && !instr.guard.is_true();
+        let own_block = guarded && info.is_none_or(|info| info.kind == OpKind::Plain && !info.pure);
+        at = match info {
+            _ if own_block => driver.conditional(&mut function, at, index, *instr, false)?,
+            Some(info) => driver.instruction(&mut function, at, index, *instr, info, false)?,
+            // Not guarded (a guarded one has its own block), so its class is not read.
+            None if is_never(instr.guard) => at,
+            None => {
+                driver.dispatch(&mut function, at, index, *instr)?;
+                at
+            }
+        };
         if exits {
             break;
         }

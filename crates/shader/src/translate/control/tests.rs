@@ -1990,12 +1990,15 @@ proptest! {
             Err(other) => prop_assert!(false, "{}", other),
         }
     }
+}
 
-    /// [`in_group`], the translation driver's test for this group, names exactly the operations
-    /// [`translate_control`] takes as its own: every decoded operation but those it refuses as
-    /// another group's.
-    #[test]
-    fn in_group_matches_the_dispatch(instr in crate::testing::any_instr()) {
+/// [`in_group`], the translation driver's test for this group, names exactly the operations
+/// [`translate_control`] takes as its own: for every decoded operation (one instruction of each,
+/// at least, from the driver's deterministic `decoded_samples`), `in_group` holds exactly when
+/// the translator does not refuse it as another group's.
+#[test]
+fn in_group_matches_the_dispatch() {
+    for instr in crate::translate::driver::tests::decoded_samples() {
         let mut function = Function::new();
         let entry = function.entry();
         // Unguarded: an instruction under `!PT` becomes nothing in every group.
@@ -2011,6 +2014,6 @@ proptest! {
                 ..
             })
         );
-        prop_assert_eq!(in_group(&instr.op), !other_group, "{}", instr);
+        assert_eq!(in_group(&instr.op), !other_group, "{instr}");
     }
 }

@@ -26,13 +26,15 @@
 //! constant and turns into a rejection naming the same thing, except the colour-register bound
 //! of `EXIT`, which cannot fail here (see `Translator::exit`).
 //!
-//! **Guards.** Every guarded instruction becomes a conditional block, pure ones included (spec,
+//! **Guards.** A guarded instruction becomes a conditional block, pure ones included (spec,
 //! "Instruction translation", "Guards"; decided by the owner, 2026-11-19): flow analysis gives a
 //! guarded instruction that is not pure a block of its own and tests its guard there
-//! ([`crate::flow::FlowBlock::guard_tested`]); the driver builds the conditional block of every
-//! other guarded instruction with [`split_for_guard`], the shared guard helper, which the group
-//! translators that take a guard themselves ([`integer`]; [`float`] and [`texture`] through
-//! [`conditional_block`]) use too. Slice 1's straight-line `translate()`, which kept a guarded
+//! ([`crate::flow::FlowBlock::guard_tested`]); the driver builds the conditional block of a
+//! guarded pure instruction with [`split_for_guard`], the shared guard helper, and translates
+//! the guarded instructions that write no IR (`NOP`, `DEPBAR`, `BREAK`, `WARPSYNC` with an
+//! immediate) as they are, with no block ([`driver`]'s "Guards", which lists this as an owner
+//! question). The group translators that take a guard themselves ([`integer`]; [`float`] and
+//! [`texture`] through [`conditional_block`]) use the same helper. Slice 1's straight-line `translate()`, which kept a guarded
 //! pure instruction as a select, is retired (the owner's ruling of 2026-11-19, row 1), and so is
 //! its `MOV` path, which took only register and immediate sources: `MOV` is the integer
 //! group's, which reads every source form.
@@ -232,6 +234,17 @@ pub enum TranslateError {
     /// The program's control flow cannot be rebuilt (slice 10).
     #[error(transparent)]
     Flow(#[from] FlowError),
+    /// An instruction a flow block holds is not among the instructions the driver decoded: its
+    /// index is past the program or names one that was not decoded (a bug in the translation
+    /// driver, which decodes every instruction a flow block holds first).
+    #[error(
+        "instruction {index}, which a flow block holds, was not decoded (a bug in the translation \
+         driver)"
+    )]
+    NotDecoded {
+        /// The instruction's index in the program, as the flow block holds it.
+        index: u32,
+    },
     /// The program, its calls inlined, holds more instructions than the driver translates
     /// ([`MAX_TRANSLATED_INSTRUCTIONS`]).
     #[error(

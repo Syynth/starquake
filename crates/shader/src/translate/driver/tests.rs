@@ -6,21 +6,21 @@
 
 use std::collections::BTreeMap;
 
-use proptest::prelude::*;
-
 use super::*;
 use crate::asm::assemble;
 use crate::capture::MAX_INSTRUCTIONS;
 use crate::decode::{
-    AluSrc, BraCond, BranchOffset, BrxSrc, DecodeError, GUARD, Gpr, IntCmpOp, MemAddr,
-    MemEvictionPriority, MemSpace, MemType, MovSrc, OPCODE, OpALd, OpASt, OpBra, OpBrx, OpCall,
-    OpExit, OpFAdd, OpHmma, OpIAdd3, OpISetP, OpKill, OpLd, OpMov, OpNop, OpRet, OpS2R, Pred,
-    PredSetOp, PredSrc, RoundMode, S2RDst, SpecialReg, UniformAddr, UniformReg,
+    AluSrc, BREAK_OPCODE, BraCond, BranchOffset, BrxSrc, DecodeError, GUARD, Gpr, IntCmpOp,
+    MemAddr, MemEvictionPriority, MemSpace, MemType, MovSrc, OPCODE, OpALd, OpASt, OpBra, OpBrx,
+    OpCall, OpDepBar, OpExit, OpFAdd, OpHmma, OpIAdd3, OpISetP, OpKill, OpLd, OpMov, OpNop, OpRet,
+    OpS2R, OpVote, OpWarpSync, Pred, PredSetOp, PredSrc, RoundMode, S2RDst, SpecialReg,
+    UniformAddr, UniformPred, UniformReg, VoteDst, VoteOp,
 };
 use crate::interp::Machine;
 use crate::ir::{Attribute, Inst, Node, Opcode};
 use crate::structure::MAX_STRUCTURE_WORK;
-use crate::testing::{any_instr, config};
+use crate::testing::{canonical_word, forms};
+use crate::translate::control::{DEPBAR_REQUIRED_SCOREBOARD, FULL_WARP_MASK};
 use crate::translate::{COLOR_TARGETS, ColorOutputs, attribute};
 
 const VERTEX: Stage = Stage {
@@ -161,6 +161,36 @@ fn exit() -> Instr {
 
 fn nop() -> Instr {
     Instr::new(Op::Nop(OpNop {}))
+}
+
+/// `VOTE.ANY ballot, vote, pred`.
+fn vote_any(ballot: u8, vote: u8, pred: PredSrc) -> Instr {
+    Instr::new(Op::Vote(OpVote {
+        op: VoteOp::Any,
+        dst: VoteDst::Reg {
+            ballot: r(ballot),
+            vote: Pred::new(vote).expect("a predicate"),
+        },
+        pred,
+    }))
+}
+
+/// `VOTEU.ANY ballot, vote, pred`.
+fn voteu_any(ballot: u8, vote: u8, pred: PredSrc) -> Instr {
+    Instr::new(Op::Vote(OpVote {
+        op: VoteOp::Any,
+        dst: VoteDst::Uniform {
+            ballot: ur(ballot),
+            vote: UniformPred::new(vote).expect("a uniform predicate"),
+        },
+        pred,
+    }))
+}
+
+/// How many times `function`'s text reads `what` (an opcode and its operand, such as
+/// `GetPred p0`).
+fn reads(function: &Function, what: &str) -> usize {
+    function.to_string().matches(&format!("= {what}\n")).count()
 }
 
 /// An item of a program being built: a word, or a branch, call or return resolved when built.
@@ -583,7 +613,11 @@ fn a_guarded_kill_demotes() {
 
 /// Guarded instructions of the groups the interpreter can run: integer, float, attribute and
 /// control, in branches, each run exactly when its guard holds; a guarded texture instruction
-/// is translated into its conditional block.
+/// is translated into its conditional block. The control group's are a `VOTE`, which flow
+/// analysis gives a block of its own behind a test of its guard (not pure), and a `VOTEU`,
+/// which the driver splits on its guard read as a uniform predicate (pure and uniform), both
+/// with destinations that tell whether they ran: a guard that is ignored, read twice or read as
+/// the wrong kind of predicate changes them.
 #[test]
 fn guarded_instructions_of_every_group() {
     let code = Program::default()
@@ -591,7 +625,8 @@ fn guarded_instructions_of_every_group() {
         .op(under(p(0), add_imm(2, 2, 5)))
         .op(under(p(1), fadd(3, 1, 1)))
         .op(under(p(2), ast(3, 0x90)))
-        .op(under(p(0), nop()))
+        .op(under(p(0), vote_any(5, 4, p(1))))
+        .op(under(p(3), voteu_any(6, 2, p(1))))
         .item(Item::Bra {
             guard: p(1),
             label: "skip",
@@ -601,17 +636,25 @@ fn guarded_instructions_of_every_group() {
         .op(exit())
         .build();
     let blocks = translated(VERTEX, &code);
-    for bits in 0_u8..8 {
+    for bits in 0_u8..16 {
+        let [p0, p1, p2, up3] = [1, 2, 4, 8].map(|bit| bits & bit != 0);
         let machine = run_both(&blocks, |machine| {
-            machine.preds[0] = bits & 1 != 0;
-            machine.preds[1] = bits & 2 != 0;
-            machine.preds[2] = bits & 4 != 0;
+            machine.preds[0] = p0;
+            machine.preds[1] = p1;
+            machine.preds[2] = p2;
+            // The `P3` guard of the `VOTEU` reads `UP3`; `P3` is its opposite, so reading the
+            // wrong one fails.
+            machine.preds[3] = !up3;
+            machine.uniform_preds[3] = up3;
+            machine.preds[4] = !p1;
+            machine.uniform_preds[2] = !p1;
             machine.regs[3] = 7;
+            machine.regs[5] = 0xdead;
+            machine.uniform_regs[6] = 0xbeef;
             machine
                 .attributes
                 .insert((Attribute(0x20), 0), 1.25_f32.to_bits());
         });
-        let [p0, p1, p2] = [bits & 1 != 0, bits & 2 != 0, bits & 4 != 0];
         assert_eq!(machine.regs[2], if p0 { 5 } else { 0 }, "{bits}");
         let sum = if p1 { 2.5_f32.to_bits() } else { 7 };
         assert_eq!(machine.regs[3], sum, "{bits}");
@@ -621,6 +664,20 @@ fn guarded_instructions_of_every_group() {
             "{bits}"
         );
         assert_eq!(machine.regs[4], u32::from(!p1 && !p0), "{bits}");
+        // Lane 0's ballot is bit 0 where `P1` holds; the vote is `P1`.
+        let ballot = u32::from(p1);
+        assert_eq!(machine.regs[5], if p0 { ballot } else { 0xdead }, "{bits}");
+        assert_eq!(machine.preds[4], if p0 { p1 } else { !p1 }, "{bits}");
+        assert_eq!(
+            machine.uniform_regs[6],
+            if up3 { ballot } else { 0xbeef },
+            "{bits}"
+        );
+        assert_eq!(
+            machine.uniform_preds[2],
+            if up3 { p1 } else { !p1 },
+            "{bits}"
+        );
     }
     let tex = crate::decode::OpTex {
         dsts: [r(8), r(10)],
@@ -942,14 +999,365 @@ fn groups_of(op: Op) -> Vec<&'static str> {
     .collect()
 }
 
-proptest! {
-    #![proptest_config(config())]
+/// The shells: operations no word decodes to yet, each built by hand (a field added to one
+/// stops this compiling), as PR #4588's tables name them: the half and double group, the
+/// uniform group's `R2UR` and `UP2UR`, the control group's `JMX` and `BPT`, and the tensor
+/// group.
+fn shells() -> Vec<Op> {
+    use crate::decode::{
+        OpBpt, OpDAdd, OpDFma, OpDMul, OpDSetP, OpHAdd2, OpHFma2, OpHMnMx2, OpHMul2, OpHSet2,
+        OpHSetP2, OpImma, OpJmx, OpLdsm, OpMovm, OpR2UR, OpUP2UR,
+    };
+    vec![
+        Op::HAdd2(OpHAdd2 {}),
+        Op::HFma2(OpHFma2 {}),
+        Op::HMul2(OpHMul2 {}),
+        Op::HSet2(OpHSet2 {}),
+        Op::HSetP2(OpHSetP2 {}),
+        Op::HMnMx2(OpHMnMx2 {}),
+        Op::DAdd(OpDAdd {}),
+        Op::DMul(OpDMul {}),
+        Op::DFma(OpDFma {}),
+        Op::DSetP(OpDSetP {}),
+        Op::R2UR(OpR2UR {}),
+        Op::UP2UR(OpUP2UR {}),
+        Op::Jmx(OpJmx {}),
+        Op::Bpt(OpBpt {}),
+        Op::Hmma(OpHmma {}),
+        Op::Imma(OpImma {}),
+        Op::Ldsm(OpLdsm {}),
+        Op::Movm(OpMovm {}),
+    ]
+}
 
-    /// The groups are disjoint, and every decoded operation belongs to one of them, so the
-    /// dispatch order decides nothing and the fallback refusal is reached only by operations no
-    /// word decodes to yet.
-    #[test]
-    fn the_groups_are_disjoint(instr in any_instr()) {
-        prop_assert_eq!(groups_of(instr.op).len(), 1, "{}", instr);
+/// Decoded instructions that reach every operation a word decodes to, deterministically: each
+/// form's canonical word ([`canonical_word`]) and each word that differs from it in one of the
+/// form's known bits, where it decodes. Some operations are picked by a flag within a form
+/// (`IADD3.X`, `LEA.X`, `OUT.FINAL`), which the one-bit changes reach;
+/// `these_instructions_reach_every_decoded_operation` checks that every operation but the
+/// [`shells`] is reached. Shared with the control group's tests.
+pub(crate) fn decoded_samples() -> Vec<Instr> {
+    let mut samples = vec![];
+    for (opcode, known, _) in forms() {
+        let canonical = canonical_word(opcode);
+        let flips = (0..128_u32).filter(|bit| known >> bit & 1 != 0).map(Some);
+        for bit in std::iter::once(None).chain(flips) {
+            let word = bit.map_or(canonical, |bit| {
+                Instruction::from_bits(canonical.bits() ^ 1 << bit)
+            });
+            if let Ok(instr) = crate::decode::decode(word) {
+                samples.push(instr);
+            }
+        }
     }
+    samples
+}
+
+/// [`decoded_samples`] reaches every operation but the [`shells`], which it does not reach:
+/// between them they are every operation, each once.
+#[test]
+fn these_instructions_reach_every_decoded_operation() {
+    let reached: std::collections::BTreeSet<&str> = decoded_samples()
+        .iter()
+        .map(|instr| instr.op.mnemonic())
+        .collect();
+    let shells: std::collections::BTreeSet<&str> = shells().iter().map(Op::mnemonic).collect();
+    assert_eq!(shells.len(), 18);
+    assert!(reached.is_disjoint(&shells), "{reached:?}");
+    let all: std::collections::BTreeSet<&str> = crate::decode::MNEMONICS.iter().copied().collect();
+    assert_eq!(all.len(), crate::decode::MNEMONICS.len());
+    assert_eq!(
+        reached
+            .union(&shells)
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        all
+    );
+}
+
+/// The groups are disjoint, and every decoded operation (every one of [`decoded_samples`])
+/// belongs to exactly one of them, so the dispatch order decides nothing; a shell belongs to
+/// none but the control group's `JMX` and `BPT`, which it refuses by name, so the fallback
+/// refusal is reached only by the other shells.
+#[test]
+fn the_groups_are_disjoint() {
+    for instr in decoded_samples() {
+        assert_eq!(groups_of(instr.op).len(), 1, "{instr}");
+    }
+    for op in shells() {
+        let wanted: &[&str] = if matches!(op, Op::Jmx(_) | Op::Bpt(_)) {
+            &["control"]
+        } else {
+            &[]
+        };
+        assert_eq!(groups_of(op), wanted, "{op}");
+    }
+}
+
+/// A guarded instruction that is not pure and that flow analysis leaves in its block
+/// (`classify.h`'s `OpKind::Nop`: `NOP`, `DEPBAR`, `BREAK`, `WARPSYNC` with an immediate) is
+/// translated as is: its guard is not read and no block is made, as PR #4588's `Visitor::Run`
+/// reads a guard only for a pure instruction (`visitor.cpp`: `info.pure && !guard.Always()`).
+#[test]
+fn a_guarded_instruction_that_is_not_pure_reads_no_guard() {
+    let depbar = Instr::new(Op::DepBar(OpDepBar {
+        scoreboard: DEPBAR_REQUIRED_SCOREBOARD,
+        le: true,
+        count: 0,
+    }));
+    let warpsync = Instr::new(Op::WarpSync(OpWarpSync {
+        mask: AluSrc::Imm(FULL_WARP_MASK),
+        cond: PredSrc::TRUE,
+    }));
+    let words = [nop(), depbar, warpsync]
+        .map(|instr| assemble(&instr).expect("encodable"))
+        .into_iter()
+        .chain([canonical_word(BREAK_OPCODE)]);
+    for word in words {
+        assert_eq!(classify(opcode_of(word)).kind, crate::flow::OpKind::Nop);
+        for negated in [false, true] {
+            let guarded = word
+                .with_field(GUARD, 3)
+                .with_flag(crate::decode::GUARD_NOT, negated);
+            let code = [guarded, assemble(&exit()).expect("encodable")];
+            let graph = flow_graph(&code, &BranchTables::new(0)).expect("a graph");
+            assert!(
+                graph.blocks().iter().all(|block| !block.guard_tested),
+                "{word:?}"
+            );
+            let blocks = translated(VERTEX, &code);
+            assert_eq!(
+                blocks.function.to_string(),
+                "block0:\n    return\n",
+                "{negated} {word:?}"
+            );
+        }
+    }
+}
+
+/// The guard of every decodable pure form (`classify.h`'s `pure`) is read before the split:
+/// as the uniform predicate of the same number for a uniform one (of the decodable forms only
+/// `S2UR`, `0x9c3`, and `VOTEU`, `0x886`), as the predicate for the others, which come from the
+/// integer, float, attribute and memory groups. The instruction itself may be refused after
+/// (a canonical word is not always a form the group translates); the guard's read comes first.
+#[test]
+fn the_guard_of_every_pure_form_is_read_by_its_kind() {
+    let mut uniform = vec![];
+    let mut groups = std::collections::BTreeSet::new();
+    for (opcode, _, _) in forms() {
+        let info = classify(opcode);
+        if !info.pure {
+            continue;
+        }
+        let word = canonical_word(opcode)
+            .with_field(GUARD, 3)
+            .with_flag(crate::decode::GUARD_NOT, true);
+        let instr = crate::decode::decode(word).expect("a canonical word decodes");
+        let mut function = Function::new();
+        let entry = function.entry();
+        let outcome =
+            Driver::new(VERTEX, None).instruction(&mut function, entry, 0, instr, info, false);
+        assert!(
+            !matches!(outcome, Err(TranslateError::Build(_))),
+            "{instr}: {outcome:?}"
+        );
+        let read = if info.uniform {
+            uniform.push(opcode);
+            "GetUniformPred up3"
+        } else {
+            groups.extend(groups_of(instr.op));
+            "GetPred p3"
+        };
+        let text = function.to_string();
+        assert!(
+            text.starts_with(&format!(
+                "block0:\n    %0: u1 = {read}\n    %1: u1 = LogicalNot %0\n    branch %1, block1, block2\n"
+            )),
+            "{instr}: {text}"
+        );
+    }
+    assert_eq!(uniform, [0x9c3, 0x886]);
+    assert_eq!(
+        groups.into_iter().collect::<Vec<_>>(),
+        ["attribute", "float", "integer", "memory"]
+    );
+}
+
+/// A guarded `VOTE` (not pure: flow analysis's own block, `guard_tested`) and a guarded `VOTEU`
+/// (pure and uniform: the driver's split) each read their guard once, and run exactly where it
+/// holds: the control group is handed both as already guarded.
+#[test]
+fn guarded_votes_read_their_guard_once() {
+    let code = Program::default()
+        .op(under(p(0), vote_any(5, 4, p(1))))
+        .op(under(p(3), voteu_any(6, 2, p(1))))
+        .op(exit())
+        .build();
+    let blocks = translated(VERTEX, &code);
+    assert_eq!(
+        reads(&blocks.function, "GetPred p0"),
+        1,
+        "{}",
+        blocks.function
+    );
+    assert_eq!(
+        reads(&blocks.function, "GetUniformPred up3"),
+        1,
+        "{}",
+        blocks.function
+    );
+    assert_eq!(count(&blocks.function, Opcode::SelectU32), 0);
+    for bits in 0_u8..4 {
+        let [p0, up3] = [1, 2].map(|bit| bits & bit != 0);
+        let machine = run_both(&blocks, |machine| {
+            machine.preds[0] = p0;
+            machine.uniform_preds[3] = up3;
+            machine.preds[1] = true;
+            machine.regs[5] = 0xdead;
+            machine.uniform_regs[6] = 0xbeef;
+        });
+        assert_eq!(machine.regs[5], if p0 { 1 } else { 0xdead }, "{bits}");
+        assert_eq!(machine.preds[4], p0, "{bits}");
+        assert_eq!(
+            machine.uniform_regs[6],
+            if up3 { 1 } else { 0xbeef },
+            "{bits}"
+        );
+        assert_eq!(machine.uniform_preds[2], up3, "{bits}");
+    }
+}
+
+/// A guarded `FADD` is one conditional block: the driver reads the guard once and the float
+/// group, handed it as tested, does not split again.
+#[test]
+fn a_guarded_float_instruction_is_one_conditional_block() {
+    let code = Program::default()
+        .op(under(p(1), fadd(3, 1, 1)))
+        .op(exit())
+        .build();
+    let blocks = translated(VERTEX, &code);
+    assert_eq!(count(&blocks.function, Opcode::GetPred), 1);
+    assert_eq!(
+        blocks.function.to_string(),
+        "block0:\n\
+         \x20   %0: u1 = GetPred p1\n\
+         \x20   branch %0, block1, block2\n\
+         block1:\n\
+         \x20   %1: u32 = GetRegister r1\n\
+         \x20   %2: f32 = BitCastF32U32 %1\n\
+         \x20   %3: u32 = GetRegister r1\n\
+         \x20   %4: f32 = BitCastF32U32 %3\n\
+         \x20   %5: f32 = FPAdd32 %2, %4 {no_contraction, rn, fmz_none}\n\
+         \x20   %6: u32 = BitCastU32F32 %5\n\
+         \x20   %7 = SetRegister r3, %6\n\
+         \x20   jump block2\n\
+         block2:\n\
+         \x20   return\n"
+    );
+}
+
+/// The stage is checked before flow analysis: a compute program with no instructions is
+/// refused for its stage, though flow analysis would refuse its size.
+#[test]
+fn the_stage_is_checked_before_flow_analysis() {
+    let compute = Stage {
+        stage: GuestStage::Compute,
+        ..VERTEX
+    };
+    assert_eq!(
+        translate_flow(VERTEX, None, &[], &BranchTables::new(0)).map(|_| ()),
+        Err(TranslateError::Flow(FlowError::ProgramSize { len: 0 }))
+    );
+    assert_eq!(
+        translate_flow(compute, None, &[], &BranchTables::new(0)).map(|_| ()),
+        Err(TranslateError::Stage(Unsupported::Stage(
+            GuestStage::Compute
+        )))
+    );
+}
+
+/// Flow analysis comes before decoding: a program whose only instruction does not decode and
+/// whose control leaves the program after it is refused by flow analysis; with an `EXIT` after
+/// it, the same instruction is refused by the decoder.
+#[test]
+fn flow_analysis_is_checked_before_decoding() {
+    let unknown = Instruction::default();
+    let exit_word = assemble(&exit()).expect("encodable");
+    let refusal = |code: &[Instruction]| {
+        translate_flow(VERTEX, None, code, &BranchTables::new(0)).map(|_| ())
+    };
+    assert_eq!(
+        refusal(&[unknown, exit_word]),
+        Err(TranslateError::Decode {
+            index: 0,
+            error: DecodeError::UnknownOpcode { opcode: 0 }
+        })
+    );
+    assert_eq!(
+        refusal(&[unknown]),
+        Err(TranslateError::Flow(FlowError::TargetOutside {
+            index: 0,
+            target: 1
+        }))
+    );
+}
+
+/// The budget is charged before anything is decoded: an inlined program past the budget whose
+/// called function holds an instruction that does not decode is refused for its size; called
+/// fewer times, the same program is refused for that instruction.
+#[test]
+fn the_budget_is_checked_before_decoding() {
+    const BODY: u32 = 600;
+    let unknown = Instruction::default();
+    let program = |calls: u32| {
+        let mut program = Program::default();
+        for _ in 0..calls {
+            program
+                .item(Item::Link { dst: 20 })
+                .item(Item::Call { label: "f" });
+        }
+        program.op(exit()).label("f");
+        program.item(Item::Word(unknown));
+        for _ in 1..BODY {
+            program.op(nop());
+        }
+        let at = program.at("f");
+        (program.item(Item::Ret { reg: 20 }).build(), at)
+    };
+    let over =
+        u32::try_from(u64::from(MAX_TRANSLATED_INSTRUCTIONS) / u64::from(BODY) + 1).expect("fits");
+    let (code, _) = program(over);
+    assert_eq!(
+        translate_flow(VERTEX, None, &code, &BranchTables::new(0)).map(|_| ()),
+        Err(TranslateError::TooManyInstructions)
+    );
+    let (code, at) = program(4);
+    assert_eq!(
+        translate_flow(VERTEX, None, &code, &BranchTables::new(0)).map(|_| ()),
+        Err(TranslateError::Decode {
+            index: usize::try_from(at).expect("fits"),
+            error: DecodeError::UnknownOpcode { opcode: 0 }
+        })
+    );
+}
+
+/// An instruction a flow block holds that was not decoded, or whose index is past the program,
+/// is refused as a bug in the driver, with its own message.
+#[test]
+fn an_instruction_that_was_not_decoded_is_named() {
+    let word = assemble(&mov(0, 1)).expect("encodable");
+    let code = [word, word];
+    let decoded = [Some(mov(0, 1)), None];
+    assert_eq!(held(&code, &decoded, 0), Ok((0, word, mov(0, 1))));
+    for index in [1, 2, u32::MAX] {
+        assert_eq!(
+            held(&code, &decoded, index),
+            Err(TranslateError::NotDecoded { index })
+        );
+    }
+    assert_eq!(
+        TranslateError::NotDecoded { index: 1 }.to_string(),
+        "instruction 1, which a flow block holds, was not decoded (a bug in the translation \
+         driver)"
+    );
 }
