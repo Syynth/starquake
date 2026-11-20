@@ -258,7 +258,10 @@ pub struct GpuDeps {
     pub watch: Arc<WriteWatch>,
     /// The front thread's clock.
     pub front_clock: Arc<dyn FrontClock>,
-    /// The back thread's clock.
+    /// The back thread's clock. Its [`FenceClock::gpu_timestamp`] is what a 16-byte release
+    /// writes: in a run, guest time from the kernel's clock, which `starquake-core` passes here
+    /// (gpu-protocol, "Fenced completion"; the fence path's module docs, "Guesses and open
+    /// items").
     pub fence_clock: Arc<dyn FenceClock>,
 }
 
@@ -286,8 +289,11 @@ impl Default for GpuConfig {
 }
 
 /// The host clock as the back thread's: [`FenceClock::elapsed`] is the time since the clock was
-/// made, and the timestamp a 16-byte release writes is the same time in nanoseconds (a
-/// **guess** at the timestamp's unit, as the fence path's module docs list).
+/// made, and the timestamp a 16-byte release writes is the same time in nanoseconds. That
+/// timestamp is host time, not the guest time gpu-protocol asks for ("Fenced completion"), so
+/// a run does not use this clock for the back: `starquake-core` passes one that reads guest time
+/// ([`GpuDeps::fence_clock`]). It remains for a GPU that has no run's clock to read, such as
+/// this crate's tests and `core`'s graphics-server tests.
 impl FenceClock for HostClock {
     fn elapsed(&self) -> Duration {
         FrontClock::now(self)

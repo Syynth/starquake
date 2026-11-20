@@ -67,8 +67,9 @@ use crate::ring::{RING_WORDS, ring};
 use crate::syncpoint::Syncpoints;
 use crate::vm::{GpuVm, VmError};
 
-/// The timestamp the back's clock gives every release that writes one: a fixed value, so a
-/// capture is the same on every run.
+/// The timestamp the back's clock gives every release that writes one until
+/// [`CaptureBuilder::set_timestamp`] sets another: a fixed value, so a capture is the same on
+/// every run.
 pub const BUILDER_TIMESTAMP: u64 = 0x5147_4300_0000_0001;
 
 /// The most front turns one [`CaptureBuilder::run`] takes.
@@ -247,8 +248,12 @@ impl FrontClock for ManualClock {
     }
 }
 
-/// The back's clock in the builder: never moves, so no list closes for the time it recorded.
-struct StillClock;
+/// The back's clock in the builder: its elapsed time never moves, so no list closes for the
+/// time it recorded; its timestamp is the guest time the builder was last given
+/// ([`CaptureBuilder::set_timestamp`]; [`BUILDER_TIMESTAMP`] until then), a fake guest clock.
+struct StillClock {
+    timestamp: Arc<AtomicU64>,
+}
 
 impl FenceClock for StillClock {
     fn elapsed(&self) -> Duration {
@@ -256,7 +261,7 @@ impl FenceClock for StillClock {
     }
 
     fn gpu_timestamp(&self) -> u64 {
-        BUILDER_TIMESTAMP
+        self.timestamp.load(Ordering::SeqCst)
     }
 }
 
@@ -322,6 +327,7 @@ pub struct CaptureBuilder {
     waiters: Arc<WaiterTable>,
     wake: Arc<RecordingWake>,
     clock: Arc<ManualClock>,
+    timestamp: Arc<AtomicU64>,
     retired: Arc<Retired>,
     spaces: Vec<Space>,
     channels: Vec<CapturedChannel>,
@@ -369,6 +375,7 @@ impl CaptureBuilder {
             shared: Arc::clone(&shared),
             pending: Mutex::new(Vec::new()),
         });
+        let timestamp = Arc::new(AtomicU64::new(BUILDER_TIMESTAMP));
         let fences = Fences::new(
             Arc::<RecordingBackend>::clone(&backend),
             FenceEnv {
@@ -376,7 +383,9 @@ impl CaptureBuilder {
                 waiters: Arc::clone(&waiters),
                 completions: Arc::new(Discard),
                 clock: Arc::new(RecordingFenceClock::new(
-                    Arc::new(StillClock),
+                    Arc::new(StillClock {
+                        timestamp: Arc::clone(&timestamp),
+                    }),
                     Arc::clone(&recorder),
                 )),
                 front: Arc::<RecordingWake>::clone(&wake),
@@ -410,6 +419,7 @@ impl CaptureBuilder {
             waiters,
             wake,
             clock,
+            timestamp,
             retired,
             spaces: Vec::new(),
             channels: Vec::new(),
@@ -431,6 +441,13 @@ impl CaptureBuilder {
         self.executor
             .as_mut()
             .ok_or_else(|| BuildError::Ring("the back has stopped".to_owned()))
+    }
+
+    /// Sets the guest time the back's clock reads from now on: the timestamp every later 16-byte
+    /// release writes (and the capture records), until it is set again. A fake guest clock, in
+    /// the unit [`FenceClock::gpu_timestamp`] documents.
+    pub fn set_timestamp(&self, value: u64) {
+        self.timestamp.store(value, Ordering::SeqCst);
     }
 
     /// Adds address space `space`, mapping `gpu` onto guest memory at CPU address `cpu_va`. The
