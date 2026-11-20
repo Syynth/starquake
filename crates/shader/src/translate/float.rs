@@ -187,7 +187,7 @@ use crate::decode::{
 use crate::flow::read_pred;
 use crate::ir::{
     BuildError, Builder, Flags, FmzMode, FpControl, FpRounding, Function, Imm, Inst, Opcode,
-    Operand, Terminator,
+    Operand,
 };
 
 /// The number of constant-buffer banks a source may name: the PR refuses `cbuf_index >= 32`
@@ -429,22 +429,9 @@ pub fn translate_instr(
     guard_tested: bool,
 ) -> Result<(), FloatError> {
     check(&instr.op)?;
-    if guard_tested || instr.guard.is_true() {
-        return Emit { b: builder }.op(&instr.op);
-    }
-    let cond = read_pred(builder, instr.guard)?;
-    let then = builder.add_block()?;
-    let after = builder.add_block()?;
-    builder.terminate(Terminator::Branch {
-        cond,
-        then,
-        otherwise: after,
-    })?;
-    builder.switch_to(then)?;
-    Emit { b: builder }.op(&instr.op)?;
-    builder.terminate(Terminator::Jump(after))?;
-    builder.switch_to(after)?;
-    Ok(())
+    super::conditional_block(builder, instr.guard, guard_tested, |b| {
+        Emit { b }.op(&instr.op)
+    })
 }
 
 /// Whether `function` uses a quad operation of this group (`FSwizzleAdd`, from `FSWZADD`), so
