@@ -297,7 +297,10 @@ fn a_rejection_passes_its_reason_through() {
     let SetLookup::Rejected(reason) = rig.lookup(&[vertex(A), pixel(B)]) else {
         unreachable!("the pixel program is rejected");
     };
-    assert_eq!(*reason, Rejection::Translate(TranslateError::TooManyInstructions));
+    assert_eq!(
+        *reason,
+        Rejection::Translate(TranslateError::TooManyInstructions)
+    );
 }
 
 #[test]

@@ -651,6 +651,15 @@ fn guarded_instructions_of_every_group() {
     assert_eq!(count(&blocks.function, Opcode::GetPred), 1, "{text}");
 }
 
+/// Whether a structured tree holds a loop.
+fn has_loop(nodes: &[Node]) -> bool {
+    nodes.iter().any(|node| match node {
+        Node::Loop { .. } => true,
+        Node::If { body, .. } => has_loop(body),
+        _ => false,
+    })
+}
+
 /// The structurizer lays a conditional block out between its test and the code after it, so a
 /// guarded instruction becomes an `if`, not a loop.
 #[test]
@@ -665,13 +674,6 @@ fn a_guarded_instruction_structures_as_an_if() {
         .expect("structures")
         .blocks
         .function;
-    fn has_loop(nodes: &[Node]) -> bool {
-        nodes.iter().any(|node| match node {
-            Node::Loop { .. } => true,
-            Node::If { body, .. } => has_loop(body),
-            _ => false,
-        })
-    }
     let tree = structured.structure().expect("a tree");
     assert!(!has_loop(tree), "{structured}");
     assert!(tree.iter().any(|node| matches!(node, Node::If { .. })));
