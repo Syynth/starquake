@@ -21,7 +21,12 @@
 //!   [`Readback::Unknown`]), because a real backend does not move those bytes as they are
 //!   ([`texel`]'s "Buffer copies");
 //! - a clear makes its area known when the value's encoding is exact on every device
-//!   ([`texel`]'s rules), and unknown otherwise;
+//!   ([`texel`]'s rules), and unknown otherwise. A masked clear (`ClearDesc`'s colour and
+//!   stencil masks) writes only the bits its masks name: a byte it writes whole is known, one it
+//!   writes in part is known only when it was known before, and only the channels it writes
+//!   must be exact (when one is not, the whole area is unknown, the channels left out too). A
+//!   colour clear through an empty mask changes nothing, in a format [`texel`] does not model
+//!   too, and a stencil clear through an empty mask leaves a modelled stencil as it was;
 //! - a blit copies texels only when it is unscaled, between views of one integer colour format
 //!   (`uint` or `sint`), both with the identity swizzle; any other blit (scaled, converting,
 //!   swizzled, or of a normalised, sRGB, float, depth, stencil or compressed format, whose texels
@@ -423,9 +428,9 @@ impl State {
                 let (store, rows) = self.rows_mut(&to)?;
                 store.scatter(&rows, &packed)
             }
-            Op::Fill { to, texel } => {
+            Op::Fill { to, texel, written } => {
                 let (store, rows) = self.rows_mut(&to)?;
-                store.fill(&rows, &texel)
+                store.fill(&rows, &texel, &written)
             }
             Op::Forget(places) => {
                 for place in &places {

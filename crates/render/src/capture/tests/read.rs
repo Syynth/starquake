@@ -138,7 +138,7 @@ fn start_record() -> Vec<u8> {
 /// The header alone.
 fn header() -> Vec<u8> {
     let mut h = b"SQRC".to_vec();
-    h.push(0x02);
+    h.push(0x03);
     h
 }
 
@@ -152,10 +152,11 @@ fn version_1_is_refused_before_its_body() {
     assert_eq!(error, CaptureError::UnsupportedVersion { found: 1 });
     assert_eq!(
         error.to_string(),
-        "capture layout version 1 is not supported (this build reads 2)"
+        "capture layout version 1 is not supported (this build reads 3)"
     );
-    // Any other version, followed by nothing at all: the version is checked first.
-    for found in [0, 3, VERSION + 1, u32::MAX] {
+    // Any other version, followed by nothing at all: the version is checked first. Version 2
+    // is the layout before a clear had write masks (`capture` module docs).
+    for found in [0, 2, VERSION + 1, u32::MAX] {
         let mut file = b"SQRC".to_vec();
         file.extend(body(&found));
         assert_eq!(
@@ -264,7 +265,7 @@ impl io::Read for Failing {
 fn a_failing_input_is_an_io_error_and_sticky() {
     // The header reads, then the input fails.
     let mut reader =
-        CaptureReader::new(io::Read::chain(&b"SQRC\x02"[..], Failing), 100).expect("header");
+        CaptureReader::new(io::Read::chain(&b"SQRC\x03"[..], Failing), 100).expect("header");
     let expected = CaptureError::Io {
         kind: io::ErrorKind::Other,
         message: "the disk is unwell".to_owned(),

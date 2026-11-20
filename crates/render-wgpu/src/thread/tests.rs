@@ -2,6 +2,7 @@
 //! read's one copy and its unpadding, the scratch sizes of a list's clears, and the host table.
 
 use super::{HostTable, read_copy_layout, row_copies, scratch_sizes, unpad};
+use crate::clear::ClearHow;
 use crate::plan::{ClearOps, ClearStep, Layers, Rows, Step, TexelBox};
 use crate::rules::padded_read;
 use starquake_render::command::Rect;
@@ -213,6 +214,32 @@ fn a_texture_read_is_one_copy_with_padded_rows() {
 }
 
 fn clear(format: wgpu::TextureFormat, rect: Option<(u32, u32)>) -> Step {
+    let how = if rect.is_some() {
+        ClearHow::Scratch
+    } else {
+        ClearHow::Pass
+    };
+    clear_by(format, rect, how)
+}
+
+/// A rectangle clear of `format` drawn with the clear shader.
+fn drawn(format: wgpu::TextureFormat, rect: (u32, u32)) -> Step {
+    let how = ClearHow::Draw(crate::clear::DrawnClear {
+        key: crate::clear::PipelineKey {
+            format,
+            samples: 1,
+            target: crate::clear::DrawTarget::Color {
+                kind: crate::clear::ColorKind::Float,
+                mask: wgpu::ColorWrites::RED,
+            },
+        },
+        params: [0; 16],
+        stencil_reference: 0,
+    });
+    clear_by(format, Some(rect), how)
+}
+
+fn clear_by(format: wgpu::TextureFormat, rect: Option<(u32, u32)>, how: ClearHow) -> Step {
     Step::Clear(ClearStep {
         texture: TextureId::new(0, 0),
         format,
@@ -224,7 +251,9 @@ fn clear(format: wgpu::TextureFormat, rect: Option<(u32, u32)>) -> Step {
             width,
             height,
         }),
+        size: (64, 64),
         ops: ClearOps::Color(wgpu::Color::BLACK),
+        how,
     })
 }
 
@@ -244,8 +273,10 @@ fn a_lists_rectangle_clears_share_one_scratch_per_format() {
         clear(Rgba16Float, Some((4, 50))),
         clear(Rgba8Unorm, Some((9, 9))),
         clear(Rgba16Float, Some((12, 12))),
-        // Whole-level clears need no scratch.
+        // Whole-level clears need no scratch, and neither do drawn ones.
         clear(R8Unorm, None),
+        drawn(R8Unorm, (5, 5)),
+        drawn(Rgba8Unorm, (40, 40)),
     ];
     let sizes = scratch_sizes(&steps);
     assert_eq!(sizes.len(), 2);

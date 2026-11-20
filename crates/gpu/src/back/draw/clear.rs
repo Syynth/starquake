@@ -1,6 +1,7 @@
 //! Clears: the 3D engine's `CLEAR_SURFACE` turned into the render backend's
-//! [`Command::Clear`], or into a draw for a clear a clear command cannot express (gpu-protocol
-//! spec, "Clears" and slice G24; decided by the owner, 2026-11-19, ruling 9).
+//! [`Command::Clear`], with the write masks the guest asks for (gpu-protocol spec, "Clears" and
+//! slice G24; decided by the owner, 2026-11-19, rulings 9 and 6 of the two "Owner rulings"
+//! entries).
 //!
 //! The executor hands every word written to `CLEAR_SURFACE` to [`super::Draws::method`], which
 //! clears through [`Clears`]. A clear reads the register file the way a draw does: the target
@@ -12,8 +13,8 @@
 //!
 //! This is Eden-NX2's `RasterizerVulkan::Clear`, which Eden's `DrawManager::Clear` calls once
 //! `ShouldExecute` passes, with a layer count of 1. Steps 1 to 5 make its checks in its order;
-//! the checks it does not make (a slice or layer past the target, a NaN depth value, a failed
-//! pipeline) are listed under "Divergences from Eden-NX2" and "Guesses".
+//! the checks it does not make (a slice or layer past the target, a NaN depth value) are listed
+//! under "Divergences from Eden-NX2" and "Guesses".
 //!
 //! 1. **Conditional render**: a clear while the guest disabled rendering does nothing
 //!    ([`ClearSkip::RenderDisabled`]), as `DrawManager::Clear` tests `ShouldExecute` first.
@@ -37,16 +38,17 @@
 //!    `SET_CT_SELECT`'s count and its format is not `DISABLED` (Eden's `FindColorBuffer(index)`
 //!    and `HasAspectColorBit`); otherwise nothing ([`ClearSkip::NotBound`]). The value is
 //!    `SET_COLOR_CLEAR_VALUE(0..3)` as floats, converted for an integer format by Eden's
-//!    formula ([`color_value`]). All four channels: a [`Command::Clear`], unless the area is part
-//!    of a multisampled target ("Partial clears", below); some: a draw ([`Part::Drawn`], below),
-//!    as Eden's `blit_image.ClearColor`.
+//!    formula ([`color_value`]). The clear's colour mask is the channels asked
+//!    ([`ClearDesc::color_mask`]), all four or some, as Eden's `blit_image.ClearColor` writes
+//!    through them.
 //! 5. **Depth and stencil**: the depth target G18 binds (`SET_ZT_SELECT`'s count not 0, Eden's
 //!    `FindDepthBuffer`), the aspects asked that its format has (Eden's `HasAspectDepthBit`,
 //!    `HasAspectStencilBit`; none is [`ClearSkip::NoAspect`]). Depth is `SET_Z_CLEAR_VALUE`,
 //!    stencil `SET_STENCIL_CLEAR_VALUE`. A stencil clear whose `SET_STENCIL_MASK` is neither
-//!    `0xff` nor 0 is a draw writing through that mask, as Eden's `blit_image.ClearDepthStencil`
-//!    (with depth too when depth is asked); otherwise a [`Command::Clear`] when the area covers
-//!    the depth target, and a draw when it is part of it ("Partial clears", below).
+//!    `0xff` nor 0 writes through that mask ([`ClearDesc::stencil_mask`]), as Eden's
+//!    `blit_image.ClearDepthStencil`; otherwise it writes every stencil bit, as Eden's
+//!    `ClearAttachments` does (a mask of 0 is a full clear, as Eden's `stencil_partial` test
+//!    has it).
 //!
 //! Colour comes before depth and stencil in the list, as in Eden.
 //!
@@ -57,69 +59,40 @@
 //! Resolving a target marks it GPU-modified and uploads it first if guest memory is newer, as
 //! for a draw (`back::texture`, "Uses and uploads").
 //!
-//! # Partial clears
+//! # Masks and partial areas are the render backend's
 //!
-//! The wgpu render backend clears a depth, stencil or multisampled view only whole: a clear
-//! with a rectangle that does not cover such a view fails the whole list
-//! (`render-wgpu`'s `rules::check_clear_area` and its `WHOLE_CLEAR` message). So a clear whose
-//! area is part of a depth target, or part of a multisampled colour target, is drawn (below)
-//! instead of being a [`Command::Clear`] with a rectangle; the pixels are the same. Only a
-//! single-sampled colour target is cleared in part by a [`Command::Clear`] with a rectangle.
-//! `tests::golden_scissored_depth`, `tests::golden_depth_larger_than_the_render_area`,
+//! Every part that is not skipped is one [`Command::Clear`], whatever its masks and area:
+//! [`ClearDesc`] carries the colour channels and stencil bits a clear writes, and the render
+//! backend draws a clear its host API cannot perform as one (a partial mask, or a rectangle
+//! over a view it clears only whole, such as a depth, stencil or multisampled view under wgpu)
+//! with its own clear helper shader (render-backend, "Clears carry write masks"; decided by the
+//! owner, 2026-11-19). So this module draws no clear, makes no host object, and does not parse
+//! the render crate's `clear.wgsl`; a clear sets no render targets, and the next guest draw
+//! keeps the targets the draw path last set. `tests::golden_masked`,
+//! `tests::golden_masked_stencil`, `tests::golden_scissored_depth`,
 //! `tests::golden_scissored_msaa`.
 //!
-//! # The draw-based clear
-//!
-//! The render backend's [`ClearDesc`] has no write mask, so a masked clear, and a partial clear
-//! of a target a clear command clears only whole, is drawn with the render crate's clear shader
-//! ([`HostShader::Clear`], ported from the Eden shaders that `blit_image` draws with): one
-//! triangle covering the target, the clear area as the scissor, the value in a 16-byte uniform
-//! buffer, the pipeline of the target's own sample count, and
-//!
-//! - for colour, the target alone at colour slot 0, written through the channels asked
-//!   ([`ColorWrites`]), by the fragment entry point of the target's kind (float, signed or
-//!   unsigned integer);
-//! - for depth and stencil, the depth target alone, and depth written with the test `ALWAYS`
-//!   only when depth is asked (Eden's `FindOrEmplaceClearStencilPipeline`). When stencil is
-//!   asked, the stencil test is `ALWAYS` with `REPLACE` on pass, the reference the clear value,
-//!   the write mask `SET_STENCIL_MASK` when it is partial and `0xff` otherwise (a full clear
-//!   writes every bit), and the read mask [`STENCIL_READ_MASK`]; when it is not, the pipeline
-//!   has no stencil state, so the stencil is kept. The fragment stage writes the depth value
-//!   when the format has depth; a stencil-only target has no fragment stage
-//!   ([`host_shaders::clear::FRAGMENT_DEPTH`] says why).
-//!   `tests::a_partial_area_depth_stencil_draw_writes_only_the_aspects_asked`.
-//!
-//! The draw sets its own render targets ([`Command::SetRenderTargets`]), so the next guest draw
-//! sets the guest's again. Its pipelines are made through the backend and kept, at most
-//! [`MAX_CLEAR_PIPELINES`] of them (a **guess** bounding what a guest can make the back hold;
-//! past it a masked clear fails with [`DrawError::ClearPipelinesFull`]). A pipeline that failed
-//! to build skips its clears ([`ClearSkip::PipelineFailed`]). Every host object here is
-//! destroyed when the draw path is dropped, after its last submitted fence.
+//! The masks are set for every part, read or not: a colour clear writes every stencil bit and
+//! a depth and stencil clear every colour channel, which the backend does not read (the
+//! [`ClearDesc`] docs), so an unmasked part is [`ClearDesc::unmasked`]'s masks
+//! (`tests::an_unmasked_part_carries_full_masks`).
 //!
 //! # The spec's offline test
 //!
 //! gpu-protocol's slice table gives G24's test as "a whole-target clear of colour, depth and
-//! stencil each, and a masked and a scissored clear that become draws". Here a scissored clear
-//! of a single-sampled colour target with every channel is a [`Command::Clear`] with a
-//! rectangle, since the render backend's clear takes one ("colour, depth, stencil; whole or
-//! rect", render-backend, "Commands") and the wgpu backend clears part of such a view, as the
-//! spec's "Clears" paragraph allows ("a draw when the clear is masked or scissored in a way a
-//! render-pass clear cannot express") and issue #428 asks ("a clear rectangle where the backend
-//! can"). A masked clear is a draw, and so is a scissored or otherwise partial clear of a depth,
-//! stencil or multisampled target ("Partial clears"). An **owner question**: whether the
-//! table's wording should follow. `tests::golden_scissored`, `tests::golden_masked`,
-//! `tests::golden_scissored_depth`, `tests::golden_depth_larger_than_the_render_area`,
-//! `tests::golden_scissored_msaa`.
+//! stencil each, and a masked and a scissored clear", and since the owner's ruling a masked
+//! clear is "a `Command::Clear` with its write masks" (the table's G24 row). Here a masked
+//! clear and a scissored clear are each one [`Command::Clear`]: `tests::golden_masked`,
+//! `tests::golden_masked_stencil` and `tests::golden_scissored`.
 //!
 //! # Errors and what they leave
 //!
-//! Every check that can skip a part comes before the targets are resolved, except a failed
-//! pipeline ([`ClearSkip::PipelineFailed`]), which is known only once the part's target is
-//! resolved and its pipeline looked up. A part whose target, pipeline or staging memory cannot be
-//! had fails the clear ([`DrawError`]) before any clear or draw command is appended, so a clear
-//! appends its commands whole or not at all (`tests::a_failed_part_appends_no_part_of_the_clear`).
-//! What resolving did stays: uploads the texture cache appended, a target marked GPU-modified, a
-//! pipeline made, as for a draw (`back::draw`, "Errors and what they leave").
+//! Every check that can skip a part comes before the targets are resolved. A part whose target
+//! cannot be had fails the clear ([`DrawError`]) before any clear command is appended, so a
+//! clear appends its commands whole or not at all
+//! (`tests::a_failed_part_appends_no_part_of_the_clear`). What resolving did stays: uploads the
+//! texture cache appended and a target marked GPU-modified, as for a draw (`back::draw`,
+//! "Errors and what they leave").
 //!
 //! # Sources
 //!
@@ -172,13 +145,13 @@
 //!   extent, so a scissor whose end is below its start becomes a huge extent and clears from its
 //!   start to the edge of the render area; here such a span is empty, as G18's scissors
 //!   ([`super::fixed`]). `a_reversed_scissor_clears_nothing`.
-//! - **A masked colour clear writes through a write mask**, where Eden blends with the mask as
-//!   the blend constant (`ClearColor`'s `SetBlendConstants`), which wgpu cannot do for an
-//!   integer target; for a float target the pixels are the same.
-//!   `a_masked_colour_clear_is_a_draw_through_the_mask`.
-//! - **The masked colour draw writes the converted value** for an integer target, the same value
-//!   a full clear writes; Eden's colour clear shader writes the floats as they are.
-//!   `a_masked_integer_clear_draws_the_converted_value`.
+//! - **A masked colour clear carries a write mask**, where Eden draws with the mask as the blend
+//!   constant (`ClearColor`'s `SetBlendConstants`), which wgpu cannot do for an integer target;
+//!   the render backend writes through the mask, and for a float target the pixels are the
+//!   same. `a_masked_colour_clear_writes_through_its_mask`.
+//! - **A masked colour clear's value is the converted value** for an integer target, the same
+//!   value a full clear writes; Eden's colour clear shader writes the floats as they are.
+//!   `a_masked_integer_clear_writes_the_converted_value`.
 //! - **A depth clear value is clamped to 0 to 1, and NaN is skipped** ([`ClearSkip::DepthNotANumber`]).
 //!   Eden hands any value to Vulkan, which requires 0 to 1; the render backend refuses a value
 //!   outside it (render-backend, "Errors and untrusted input", decided by the owner,
@@ -194,18 +167,14 @@
 //!   settle the width. `stencil_registers_are_their_low_byte`.
 //! - **`SET_STENCIL_FUNC_MASK` is not read.** Eden's masked stencil clear sets it as the
 //!   pipeline's compare mask and keys its pipelines on it (`BlitDepthStencilPipelineKey`'s
-//!   `stencil_compare_mask`); with the compare `ALWAYS` the mask reads no bit, so here the read
-//!   mask is the fixed [`STENCIL_READ_MASK`] and a title's stencil-test state cannot multiply
-//!   clear pipelines toward [`MAX_CLEAR_PIPELINES`]. The pixels are the same.
-//!   `masked_stencil_clears_under_any_func_mask_share_one_pipeline`.
-//! - **A partial clear of a depth, stencil or multisampled target is a draw**, where Eden clears
-//!   the rectangle with `ClearAttachments` ("Partial clears"); the pixels are the same.
-//!   `golden_scissored_depth`, `golden_depth_larger_than_the_render_area`,
-//!   `golden_scissored_msaa`.
+//!   `stencil_compare_mask`); its compare is `ALWAYS`, which reads no bit, and a
+//!   [`ClearDesc`] has no compare mask, so a title's stencil-test state changes nothing in a
+//!   clear. The pixels are the same. `the_stencil_func_mask_changes_nothing_in_a_clear`.
 //! - **`SET_SURFACE_CLIP` does not bound the render area.** Eden's framebuffer starts its render
 //!   area at the surface clip's width and height (`render_targets.size` in
 //!   `UpdateRenderTargets`) before taking the minimum over its attachments; here only the
-//!   targets bound it, so a surface clip smaller than the targets clears more than Eden.
+//!   targets bound it, so a surface clip smaller than the targets clears more than Eden (a
+//!   listed divergence the owner kept, ruling 6 of 2026-11-19).
 //!   `the_surface_clip_does_not_bound_the_clear`.
 //!
 //! # Not read
@@ -228,41 +197,20 @@
 //! - **Integer clear values** ([`color_value`]): Eden-NX2 converts `SET_COLOR_CLEAR_VALUE`'s
 //!   floats with `u32(f32(bits << 1) * value)` and `s32(f32((bits - 1) << 1) * (value - 0.5))`.
 //!   Mesa's parser lists only `SET_Z_CLEAR_VALUE` as a float, which suggests the colour words
-//!   are raw bits for an integer target. Decision 10(c) follows the observed behaviour where the
-//!   header explains nothing; an **owner question** until a trace of an integer clear settles
-//!   it. `integer_clear_values_follow_edens_formula`.
+//!   are raw bits for an integer target. Eden's formula stays a **guess** until a trace of a
+//!   title clearing an integer target settles it (gpu-protocol, "Clears"; the owner's ruling 6
+//!   of 2026-11-19). `integer_clear_values_follow_edens_formula`.
 //! - **A 3D target deeper than one slice is skipped** ([`ClearSkip::VolumeTarget`]): which
 //!   slice `RT_ARRAY_INDEX` names, and how the backend would clear one slice, is not built.
 
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
 use starquake_layout::ImageDim;
 use starquake_render::caps::GUEST_COLOR_TARGETS;
-use starquake_render::command::{
-    Binding, BindingResource, BufferSlice, ClearDesc, ClearValue, CopyRegion, DrawDesc, DrawParams,
-    DynamicValues, Rect, RenderTargets, Viewport,
-};
-use starquake_render::format::FormatAspect;
-use starquake_render::host_shaders::{self, OUTPUT_LOCATION};
-use starquake_render::pipeline::{
-    BlendComponent, BlendFactor, BlendOperation, BlendState, ColorWrites, CullMode, DepthBias,
-    DepthStencilState, FrontFace, PolygonMode, RasterState, Stages, StencilFace, StencilOperation,
-    StencilState, TargetFormats, Topology, VertexLayout,
-};
-use starquake_render::resource::CompareFunction;
-use starquake_render::shader::{
-    InterfaceVariable, Interpolation, ScalarKind, ShaderDesc, ShaderInterface, ShaderRequirements,
-    ShaderSource, ShaderStage,
-};
-use starquake_render::{
-    Backend, BufferDesc, BufferId, BufferUsage, Command, CommandList, EmulationFlags, FenceValue,
-    GraphicsPipelineDesc, HostShader, PipelineId, PipelineStatus, PixelFormat, ResourceId,
-    ShaderId, StagingSlice, ViewId,
-};
+use starquake_render::command::{ALL_STENCIL_BITS, ClearDesc, ClearValue, Rect};
+use starquake_render::pipeline::ColorWrites;
+use starquake_render::{Command, PixelFormat};
 
 use super::{DrawContext, DrawError, fixed, targets};
 use crate::back::state::{COLOR_TARGETS, Mirror};
@@ -274,18 +222,8 @@ use crate::memory::GpuMemory;
 /// writes before them, as before a draw (`back::exec`, "Before each draw, dispatch and copy").
 pub const CLEAR_METHODS: [&Method; 1] = [&clc797::CLEAR_SURFACE];
 
-/// The most pipelines the draw-based clear keeps per draw path (module docs; a **guess**).
-pub const MAX_CLEAR_PIPELINES: usize = 256;
-
 /// The value of a full `SET_STENCIL_MASK`: Eden's `stencil_partial` test compares with `0xFF`.
 pub const FULL_STENCIL_MASK: u32 = 0xff;
-
-/// The draw-based stencil clear's read mask: its compare is `ALWAYS`, which reads no bit, so the
-/// mask is fixed rather than `SET_STENCIL_FUNC_MASK` (module docs, "Divergences").
-pub const STENCIL_READ_MASK: u32 = FULL_STENCIL_MASK;
-
-/// The clear shader's parameter block, in bytes, as an array length.
-const PARAMS_LEN: usize = host_shaders::clear::PARAMS_SIZE as usize;
 
 /// One word written to `CLEAR_SURFACE`, decoded (module docs, step 2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -403,8 +341,6 @@ pub enum ClearSkip {
     VolumeTarget,
     /// `SET_Z_CLEAR_VALUE` is NaN.
     DepthNotANumber,
-    /// The draw-based clear's pipeline failed to build.
-    PipelineFailed,
 }
 
 /// What became of one part (colour, or depth and stencil) of a clear.
@@ -412,8 +348,6 @@ pub enum ClearSkip {
 pub enum Part {
     /// A [`Command::Clear`] was appended.
     Cleared,
-    /// A draw was appended (module docs, "The draw-based clear").
-    Drawn,
     /// It was skipped.
     Skipped(ClearSkip),
 }
@@ -434,11 +368,6 @@ impl Cleared {
         depth_stencil: None,
     };
 
-    /// Whether a part was drawn, which sets render targets of its own.
-    pub fn drew(&self) -> bool {
-        self.color == Some(Part::Drawn) || self.depth_stencil == Some(Part::Drawn)
-    }
-
     /// Every part asked, skipped for `why`.
     fn skipped(surface: &ClearSurface, why: ClearSkip) -> Self {
         Self {
@@ -455,8 +384,6 @@ pub struct ClearCounters {
     pub words: u64,
     /// Parts done with a [`Command::Clear`].
     pub cleared: u64,
-    /// Parts done with a draw.
-    pub drawn: u64,
     /// Parts skipped ([`ClearSkip`]).
     pub skipped: u64,
     /// Words that asked for nothing.
@@ -476,7 +403,6 @@ impl ClearCounters {
                 for part in [cleared.color, cleared.depth_stencil].into_iter().flatten() {
                     match part {
                         Part::Cleared => bump(&mut self.cleared),
-                        Part::Drawn => bump(&mut self.drawn),
                         Part::Skipped(_) => bump(&mut self.skipped),
                     }
                 }
@@ -582,7 +508,7 @@ struct Values {
     color: [f32; 4],
     depth: f32,
     stencil: u32,
-    stencil_mask: u32,
+    stencil_mask: u8,
 }
 
 impl Values {
@@ -599,148 +525,26 @@ impl Values {
             stencil: mirror
                 .reg(&clc797::SET_STENCIL_CLEAR_VALUE, &[])?
                 .field(clc797::SET_STENCIL_CLEAR_VALUE_V)?,
-            stencil_mask: mirror
-                .reg(&clc797::SET_STENCIL_MASK, &[])?
-                .field(clc797::SET_STENCIL_MASK_V)?,
+            stencil_mask: u8::try_from(
+                mirror
+                    .reg(&clc797::SET_STENCIL_MASK, &[])?
+                    .field(clc797::SET_STENCIL_MASK_V)?,
+            )
+            .map_err(|_| DrawError::Internal("an 8-bit register field held more than 8 bits"))?,
         })
     }
 }
 
-/// The key of a draw-based clear's pipeline.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum PipelineKey {
-    /// A colour clear of one target through `mask` (a [`ColorWrites`] bit set).
-    Color {
-        format: PixelFormat,
-        mask: u32,
-        samples: u32,
-    },
-    /// A depth and stencil clear: depth written when `depth`, stencil through the write mask
-    /// `stencil` when it is `Some`. The stencil read mask is always [`STENCIL_READ_MASK`].
-    DepthStencil {
-        format: PixelFormat,
-        depth: bool,
-        stencil: Option<u32>,
-        samples: u32,
-    },
-}
-
-/// The clear shader's entry points (the vertex one, then the fragment ones by kind).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum Entry {
-    Vertex,
-    Float,
-    Sint,
-    Uint,
-    Depth,
-}
-
-impl Entry {
-    const COUNT: usize = 5;
-
-    fn index(self) -> usize {
-        match self {
-            Self::Vertex => 0,
-            Self::Float => 1,
-            Self::Sint => 2,
-            Self::Uint => 3,
-            Self::Depth => 4,
-        }
-    }
-
-    fn name(self) -> &'static str {
-        use host_shaders::clear as c;
-        match self {
-            Self::Vertex => c::VERTEX,
-            Self::Float => c::FRAGMENT_COLOR_FLOAT,
-            Self::Sint => c::FRAGMENT_COLOR_SINT,
-            Self::Uint => c::FRAGMENT_COLOR_UINT,
-            Self::Depth => c::FRAGMENT_DEPTH,
-        }
-    }
-
-    /// The colour entry point for a target of `format`.
-    fn for_color(format: PixelFormat) -> Self {
-        if !format.is_integer() {
-            Self::Float
-        } else if format.is_signed_integer() {
-            Self::Sint
-        } else {
-            Self::Uint
-        }
-    }
-
-    fn interface(self) -> ShaderInterface {
-        let output = |scalar| InterfaceVariable {
-            location: OUTPUT_LOCATION,
-            scalar,
-            components: 4,
-            interpolation: Interpolation::Perspective,
-        };
-        let (resources, outputs) = match self {
-            Self::Vertex => (Vec::new(), Vec::new()),
-            Self::Float => (
-                host_shaders::clear::RESOURCES.to_vec(),
-                vec![output(ScalarKind::Float)],
-            ),
-            Self::Sint => (
-                host_shaders::clear::RESOURCES.to_vec(),
-                vec![output(ScalarKind::Sint)],
-            ),
-            Self::Uint => (
-                host_shaders::clear::RESOURCES.to_vec(),
-                vec![output(ScalarKind::Uint)],
-            ),
-            Self::Depth => (host_shaders::clear::RESOURCES.to_vec(), Vec::new()),
-        };
-        ShaderInterface {
-            resources,
-            inputs: Vec::new(),
-            outputs,
-            requirements: ShaderRequirements::default(),
-        }
-    }
-}
-
-/// The host objects of the draw-based clear (module docs), made on first use.
+/// The clear path (module docs): what clears have done.
+#[derive(Debug, Default)]
 pub(crate) struct Clears {
-    backend: Arc<dyn Backend>,
-    shaders: [Option<ShaderId>; Entry::COUNT],
-    /// Made in this order, destroyed in this order.
-    made_shaders: Vec<ShaderId>,
-    params: Option<BufferId>,
-    pipelines: HashMap<PipelineKey, PipelineId>,
-    /// Made in this order, destroyed in this order.
-    made_pipelines: Vec<PipelineId>,
-    pipeline_limit: usize,
     counters: ClearCounters,
-}
-
-impl core::fmt::Debug for Clears {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Clears")
-            .field("pipelines", &self.made_pipelines.len())
-            .field("counters", &self.counters)
-            .finish_non_exhaustive()
-    }
-}
-
-/// How one part is done, once every check passed and its target is resolved.
-enum Plan {
-    Clear(ClearDesc),
-    Draw {
-        staging: StagingSlice,
-        targets: RenderTargets,
-        desc: Box<DrawDesc>,
-    },
 }
 
 /// What every part of one clear shares.
 struct Common {
     /// The clear area, clamped to the render area.
     area: Rect,
-    /// The clear values.
-    values: Values,
 }
 
 /// What a part needs to know of its target.
@@ -774,33 +578,12 @@ impl Target {
         };
         (area != whole).then_some(area)
     }
-
-    /// The target's samples per pixel.
-    fn samples(&self) -> u32 {
-        self.info.samples.samples()
-    }
-
-    /// Whether a [`Command::Clear`] of `area` can clear it: the area covers it, or it is a
-    /// single-sampled colour target (module docs, "Partial clears").
-    fn clearable(&self, area: Rect) -> bool {
-        self.rect(area).is_none()
-            || (self.info.format.aspect() == FormatAspect::Color && self.samples() == 1)
-    }
 }
 
 impl Clears {
-    /// No host objects yet; they are made through `backend`.
-    pub fn new(backend: Arc<dyn Backend>) -> Self {
-        Self {
-            backend,
-            shaders: [None; Entry::COUNT],
-            made_shaders: Vec::new(),
-            params: None,
-            pipelines: HashMap::new(),
-            made_pipelines: Vec::new(),
-            pipeline_limit: MAX_CLEAR_PIPELINES,
-            counters: ClearCounters::default(),
-        }
+    /// Nothing done yet.
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// What clears have done so far.
@@ -808,453 +591,136 @@ impl Clears {
         self.counters
     }
 
-    /// The pipelines the draw-based clear holds.
-    pub fn pipelines(&self) -> usize {
-        self.made_pipelines.len()
-    }
-
     /// One word `word` written to `CLEAR_SURFACE`, after `mirror` stored it (module docs).
-    /// `execute` is conditional rendering's answer; `last_targets` the render targets the draw
-    /// path last set, which a draw-based clear replaces with its own.
+    /// `execute` is conditional rendering's answer.
     pub(crate) fn clear<M: GpuMemory + ?Sized>(
         &mut self,
         ctx: &mut DrawContext<'_, M>,
         mirror: &Mirror,
         word: u32,
         execute: bool,
-        last_targets: &mut Option<RenderTargets>,
     ) -> Result<Cleared, DrawError> {
-        let outcome = self.run(ctx, mirror, word, execute, last_targets);
+        let outcome = run(ctx, mirror, word, execute);
         self.counters.count(&outcome);
         if let Err(error) = &outcome {
             tracing::debug!(%error, "a clear could not be done");
         }
         outcome
     }
+}
 
-    fn run<M: GpuMemory + ?Sized>(
-        &mut self,
-        ctx: &mut DrawContext<'_, M>,
-        mirror: &Mirror,
-        word: u32,
-        execute: bool,
-        last_targets: &mut Option<RenderTargets>,
-    ) -> Result<Cleared, DrawError> {
-        let surface = ClearSurface::decode(word);
-        // Step 1.
-        if !execute {
-            return Ok(Cleared::skipped(&surface, ClearSkip::RenderDisabled));
-        }
-        // Step 2.
-        let color_asked = !surface.color.is_empty();
-        let ds_asked = surface.depth || surface.stencil;
-        if !color_asked && !ds_asked {
-            return Ok(Cleared::NOTHING);
-        }
-        // Step 3.
-        let three_d = mirror.three_d()?;
-        let bound = Framebuffer::read(mirror)?;
-        let control =
-            ClearControl::from_word(mirror.reg(&clc797::SET_CLEAR_SURFACE_CONTROL, &[])?.word());
-        let scissor = if control.use_scissor0() {
-            fixed::guest_scissor(three_d, 0)?
-        } else {
-            WHOLE
-        };
-        let (width, height) = bound.render_area();
-        let Some(area) = clamp_to_area(scissor, width, height) else {
-            return Ok(Cleared::skipped(&surface, ClearSkip::EmptyArea));
-        };
-        let values = Values::read(mirror)?;
-
-        // Step 4: the checks, then the target.
-        let color = if color_asked {
-            Some(match bound.color_target(&surface) {
-                Ok(target) => {
-                    let value = color_value(target.info.format, values.color);
-                    Ok((target, value))
-                }
-                Err(skip) => Err(skip),
-            })
-        } else {
-            None
-        };
-        // Step 5: the checks.
-        let depth_stencil = if ds_asked {
-            Some(depth_stencil_part(&bound, &surface, &values))
-        } else {
-            None
-        };
-
-        // Every check passed or skipped; resolve and plan, appending no clear or draw.
-        let common = Common { area, values };
-        let mut plans: Vec<Plan> = Vec::with_capacity(2);
-        let outcome = Cleared {
-            color: match color {
-                None => None,
-                Some(Err(skip)) => Some(Part::Skipped(skip)),
-                Some(Ok((target, value))) => Some(self.plan_color(
-                    ctx,
-                    &mut plans,
-                    &target,
-                    value,
-                    surface.color,
-                    &common,
-                )?),
-            },
-            depth_stencil: match depth_stencil {
-                None => None,
-                Some(Err(skip)) => Some(Part::Skipped(skip)),
-                Some(Ok(part)) => Some(self.plan_depth_stencil(ctx, &mut plans, &part, &common)?),
-            },
-        };
-
-        // Nothing below can fail.
-        for plan in plans {
-            append(ctx.list, plan, self.params, last_targets);
-        }
-        Ok(outcome)
+/// [`Clears::clear`]'s steps (module docs).
+fn run<M: GpuMemory + ?Sized>(
+    ctx: &mut DrawContext<'_, M>,
+    mirror: &Mirror,
+    word: u32,
+    execute: bool,
+) -> Result<Cleared, DrawError> {
+    let surface = ClearSurface::decode(word);
+    // Step 1.
+    if !execute {
+        return Ok(Cleared::skipped(&surface, ClearSkip::RenderDisabled));
     }
-
-    /// Resolves the colour part's target and plans its clear or draw.
-    fn plan_color<M: GpuMemory + ?Sized>(
-        &mut self,
-        ctx: &mut DrawContext<'_, M>,
-        plans: &mut Vec<Plan>,
-        target: &Target,
-        value: ClearValue,
-        mask: ColorWrites,
-        common: &Common,
-    ) -> Result<Part, DrawError> {
-        let view = ctx
-            .textures
-            .render_target_layer(ctx.memory, &target.info, target.layer, ctx.list)?
-            .view;
-        if mask == ColorWrites::ALL && target.clearable(common.area) {
-            plans.push(Plan::Clear(ClearDesc {
-                target: view,
-                value,
-                rect: target.rect(common.area),
-            }));
-            return Ok(Part::Cleared);
-        }
-        let key = PipelineKey::Color {
-            format: target.info.format,
-            mask: mask.bits(),
-            samples: target.samples(),
-        };
-        self.push_draw(plans, &key, target, view, value_bits(value), common)
+    // Step 2.
+    let color_asked = !surface.color.is_empty();
+    let ds_asked = surface.depth || surface.stencil;
+    if !color_asked && !ds_asked {
+        return Ok(Cleared::NOTHING);
     }
+    // Step 3.
+    let three_d = mirror.three_d()?;
+    let bound = Framebuffer::read(mirror)?;
+    let control =
+        ClearControl::from_word(mirror.reg(&clc797::SET_CLEAR_SURFACE_CONTROL, &[])?.word());
+    let scissor = if control.use_scissor0() {
+        fixed::guest_scissor(three_d, 0)?
+    } else {
+        WHOLE
+    };
+    let (width, height) = bound.render_area();
+    let Some(area) = clamp_to_area(scissor, width, height) else {
+        return Ok(Cleared::skipped(&surface, ClearSkip::EmptyArea));
+    };
+    let values = Values::read(mirror)?;
 
-    /// Resolves the depth and stencil part's target and plans its clear or draw.
-    fn plan_depth_stencil<M: GpuMemory + ?Sized>(
-        &mut self,
-        ctx: &mut DrawContext<'_, M>,
-        plans: &mut Vec<Plan>,
-        part: &DepthStencilPart,
-        common: &Common,
-    ) -> Result<Part, DrawError> {
-        let target = &part.target;
-        let view = ctx
-            .textures
-            .render_target_layer(ctx.memory, &target.info, target.layer, ctx.list)?
-            .view;
-        if !part.partial && target.clearable(common.area) {
-            plans.push(Plan::Clear(ClearDesc {
-                target: view,
-                value: part.value(),
-                rect: target.rect(common.area),
-            }));
-            return Ok(Part::Cleared);
-        }
-        // A partial mask writes through it; an unmasked stencil (a mask of `0xff` or 0) writes
-        // every bit, as a clear command would.
-        let stencil = part.stencil.map(|_| {
-            if part.partial {
-                common.values.stencil_mask
-            } else {
-                FULL_STENCIL_MASK
-            }
-        });
-        let key = PipelineKey::DepthStencil {
-            format: target.info.format,
-            depth: part.depth.is_some(),
-            stencil,
-            samples: target.samples(),
-        };
-        let bits = [part.depth.unwrap_or(0.0).to_bits(), 0, 0, 0];
-        self.push_draw(plans, &key, target, view, bits, common)
-    }
-
-    /// Plans a draw-based clear ([`Clears::draw_plan`]) and says what became of the part.
-    fn push_draw(
-        &mut self,
-        plans: &mut Vec<Plan>,
-        key: &PipelineKey,
-        target: &Target,
-        view: ViewId,
-        bits: [u32; 4],
-        common: &Common,
-    ) -> Result<Part, DrawError> {
-        Ok(match self.draw_plan(key, target, view, bits, common)? {
-            Some(plan) => {
-                plans.push(plan);
-                Part::Drawn
-            }
-            None => Part::Skipped(ClearSkip::PipelineFailed),
+    // Step 4: the checks.
+    let color = color_asked.then(|| {
+        bound.color_target(&surface).map(|target| {
+            let value = color_value(target.info.format, values.color);
+            (target, value)
         })
-    }
+    });
+    // Step 5: the checks.
+    let depth_stencil = ds_asked.then(|| depth_stencil_part(&bound, &surface, &values));
 
-    /// A draw-based clear of `target` through `view` (module docs): its pipeline (made if new),
-    /// the parameter block holding `bits` in staging memory, and the draw; `None` when the
-    /// pipeline failed to build.
-    fn draw_plan(
-        &mut self,
-        key: &PipelineKey,
-        target: &Target,
-        view: ViewId,
-        bits: [u32; 4],
-        common: &Common,
-    ) -> Result<Option<Plan>, DrawError> {
-        let values = &common.values;
-        let pipeline = self.pipeline(key)?;
-        if self.backend.pipeline_status(pipeline) == PipelineStatus::Failed {
-            return Ok(None);
-        }
-        let buffer = self.params_buffer()?;
-        let mut staging = self
-            .backend
-            .staging(u64::from(host_shaders::clear::PARAMS_SIZE))
-            .map_err(DrawError::Render)?;
-        let mut bytes = [0u8; PARAMS_LEN];
-        for (chunk, word) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(bits) {
-            chunk.copy_from_slice(&word.to_le_bytes());
-        }
-        let Some(slot) = staging.bytes_mut().get_mut(..PARAMS_LEN) else {
-            return Err(DrawError::Internal(
-                "a staging slice is shorter than asked for",
-            ));
-        };
-        slot.copy_from_slice(&bytes);
-        let (targets, bindings, reference, write_mask) = match *key {
-            PipelineKey::Color { .. } => {
-                let mut colors = [None; GUEST_COLOR_TARGETS];
-                colors[0] = Some(view);
-                (
-                    RenderTargets {
-                        colors,
-                        depth_stencil: None,
-                    },
-                    vec![params_binding(buffer)],
-                    0,
-                    0,
-                )
-            }
-            PipelineKey::DepthStencil {
-                format, stencil, ..
-            } => (
-                RenderTargets {
-                    colors: [None; GUEST_COLOR_TARGETS],
-                    depth_stencil: Some(view),
-                },
-                if format.has_depth() {
-                    vec![params_binding(buffer)]
-                } else {
-                    Vec::new()
-                },
-                values.stencil,
-                stencil.unwrap_or(0),
-            ),
-        };
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "a target's extent is at most a 32-bit count; the viewport is a float"
-        )]
-        let viewport = Viewport {
-            x: 0.0,
-            y: 0.0,
-            width: target.info.width as f32,
-            height: target.info.height as f32,
-            min_depth: 0.0,
-            max_depth: 1.0,
-        };
-        let desc = DrawDesc {
-            pipeline,
-            bindings,
-            vertex_buffers: Vec::new(),
-            index_buffer: None,
-            dynamic: DynamicValues {
-                viewports: vec![viewport],
-                scissors: vec![common.area],
-                blend_constant: [0.0; 4],
-                stencil_reference: reference,
-                stencil_read_mask: STENCIL_READ_MASK,
-                stencil_write_mask: write_mask,
-                depth_bias: DepthBias::default(),
-                line_width: 1.0,
-            },
-            params: DrawParams::Direct {
-                vertex_count: host_shaders::clear::VERTEX_COUNT,
-                instance_count: 1,
-                first_vertex: 0,
-                first_instance: 0,
-            },
-        };
-        Ok(Some(Plan::Draw {
-            staging,
-            targets,
-            desc: Box::new(desc),
-        }))
-    }
+    // Every check passed or skipped; resolve the targets, appending no clear.
+    let common = Common { area };
+    let mut clears: Vec<ClearDesc> = Vec::with_capacity(2);
+    let outcome = Cleared {
+        color: match color {
+            None => None,
+            Some(Err(skip)) => Some(Part::Skipped(skip)),
+            Some(Ok((target, value))) => Some(plan_color(
+                ctx,
+                &mut clears,
+                &target,
+                value,
+                surface.color,
+                &common,
+            )?),
+        },
+        depth_stencil: match depth_stencil {
+            None => None,
+            Some(Err(skip)) => Some(Part::Skipped(skip)),
+            Some(Ok(part)) => Some(plan_depth_stencil(ctx, &mut clears, &part, &common)?),
+        },
+    };
 
-    /// The pipeline of `key`, made if new.
-    fn pipeline(&mut self, key: &PipelineKey) -> Result<PipelineId, DrawError> {
-        if let Some(&id) = self.pipelines.get(key) {
-            return Ok(id);
-        }
-        if self.made_pipelines.len() >= self.pipeline_limit {
-            return Err(DrawError::ClearPipelinesFull {
-                limit: self.pipeline_limit,
-            });
-        }
-        let vertex = self.shader(Entry::Vertex)?;
-        let desc = match *key {
-            PipelineKey::Color {
-                format,
-                mask,
-                samples,
-            } => {
-                let fragment = self.shader(Entry::for_color(format))?;
-                let mut blend = [DISABLED_BLEND; GUEST_COLOR_TARGETS];
-                blend[0].write_mask = ColorWrites::from_bits(mask).unwrap_or(ColorWrites::EMPTY);
-                let mut colors = [None; GUEST_COLOR_TARGETS];
-                colors[0] = Some(format);
-                pipeline_desc(
-                    vertex,
-                    Some(fragment),
-                    DepthStencilState {
-                        depth_test: None,
-                        depth_write: false,
-                        stencil: None,
-                    },
-                    blend,
-                    TargetFormats {
-                        colors,
-                        depth_stencil: None,
-                        sample_count: samples,
-                    },
-                )
-            }
-            PipelineKey::DepthStencil {
-                format,
-                depth,
-                stencil,
-                samples,
-            } => {
-                let fragment = if format.has_depth() {
-                    Some(self.shader(Entry::Depth)?)
-                } else {
-                    None
-                };
-                let face = StencilFace {
-                    compare: CompareFunction::Always,
-                    fail: StencilOperation::Keep,
-                    depth_fail: StencilOperation::Keep,
-                    pass: StencilOperation::Replace,
-                };
-                pipeline_desc(
-                    vertex,
-                    fragment,
-                    DepthStencilState {
-                        depth_test: depth.then_some(CompareFunction::Always),
-                        depth_write: depth,
-                        stencil: stencil.map(|write_mask| StencilState {
-                            front: face,
-                            back: face,
-                            read_mask: STENCIL_READ_MASK,
-                            write_mask,
-                        }),
-                    },
-                    [DISABLED_BLEND; GUEST_COLOR_TARGETS],
-                    TargetFormats {
-                        colors: [None; GUEST_COLOR_TARGETS],
-                        depth_stencil: Some(format),
-                        sample_count: samples,
-                    },
-                )
-            }
-        };
-        let id = self
-            .backend
-            .create_graphics_pipeline(desc)
-            .map_err(DrawError::Render)?;
-        self.pipelines.insert(*key, id);
-        self.made_pipelines.push(id);
-        Ok(id)
+    // Nothing below can fail.
+    for clear in clears {
+        ctx.list.push(Command::Clear(clear));
     }
+    Ok(outcome)
+}
 
-    /// The clear shader's entry point `entry`, made if new.
-    fn shader(&mut self, entry: Entry) -> Result<ShaderId, DrawError> {
-        if let Some(Some(id)) = self.shaders.get(entry.index()) {
-            return Ok(*id);
-        }
-        let (module, info) = clear_module()?;
-        let stage = if entry == Entry::Vertex {
-            ShaderStage::Vertex
-        } else {
-            ShaderStage::Fragment
-        };
-        let id = self
-            .backend
-            .create_shader(ShaderDesc {
-                stage,
-                entry: entry.name().to_owned(),
-                source: ShaderSource::Naga {
-                    module: Box::new(module),
-                    info: Box::new(info),
-                },
-                interface: entry.interface(),
-                origin: None,
-            })
-            .map_err(DrawError::Render)?;
-        if let Some(slot) = self.shaders.get_mut(entry.index()) {
-            *slot = Some(id);
-        }
-        self.made_shaders.push(id);
-        Ok(id)
-    }
+/// Resolves the colour part's target and plans its clear through `mask`.
+fn plan_color<M: GpuMemory + ?Sized>(
+    ctx: &mut DrawContext<'_, M>,
+    clears: &mut Vec<ClearDesc>,
+    target: &Target,
+    value: ClearValue,
+    mask: ColorWrites,
+    common: &Common,
+) -> Result<Part, DrawError> {
+    let view = ctx
+        .textures
+        .render_target_layer(ctx.memory, &target.info, target.layer, ctx.list)?
+        .view;
+    clears.push(ClearDesc {
+        color_mask: mask,
+        ..ClearDesc::unmasked(view, value, target.rect(common.area))
+    });
+    Ok(Part::Cleared)
+}
 
-    /// The parameter block's buffer, made on first use.
-    fn params_buffer(&mut self) -> Result<BufferId, DrawError> {
-        if let Some(id) = self.params {
-            return Ok(id);
-        }
-        let id = self
-            .backend
-            .create_buffer(&BufferDesc {
-                size: u64::from(host_shaders::clear::PARAMS_SIZE),
-                usage: BufferUsage::UNIFORM | BufferUsage::COPY_DST,
-            })
-            .map_err(DrawError::Render)?;
-        self.params = Some(id);
-        Ok(id)
-    }
-
-    /// Destroys every host object made here after `fence`: the pipelines, then the shaders,
-    /// then the parameter buffer, each in the order made.
-    pub fn destroy_all(&mut self, fence: FenceValue) {
-        for id in self.made_pipelines.drain(..) {
-            self.backend.destroy(ResourceId::Pipeline(id), fence);
-        }
-        self.pipelines.clear();
-        for id in self.made_shaders.drain(..) {
-            self.backend.destroy(ResourceId::Shader(id), fence);
-        }
-        self.shaders = [None; Entry::COUNT];
-        if let Some(id) = self.params.take() {
-            self.backend.destroy(ResourceId::Buffer(id), fence);
-        }
-    }
+/// Resolves the depth and stencil part's target and plans its clear: a partial stencil mask
+/// writes through it, and an unmasked stencil (a mask of `0xff` or 0) writes every bit.
+fn plan_depth_stencil<M: GpuMemory + ?Sized>(
+    ctx: &mut DrawContext<'_, M>,
+    clears: &mut Vec<ClearDesc>,
+    part: &DepthStencilPart,
+    common: &Common,
+) -> Result<Part, DrawError> {
+    let target = &part.target;
+    let view = ctx
+        .textures
+        .render_target_layer(ctx.memory, &target.info, target.layer, ctx.list)?
+        .view;
+    clears.push(ClearDesc {
+        stencil_mask: part.stencil_mask,
+        ..ClearDesc::unmasked(view, part.value(), target.rect(common.area))
+    });
+    Ok(Part::Cleared)
 }
 
 /// A scissor that does not bound the clear: Eden's `default_scissor`, the largest `i32` in each
@@ -1264,21 +730,6 @@ const WHOLE: Rect = Rect {
     y: 0,
     width: i32::MAX.unsigned_abs(),
     height: i32::MAX.unsigned_abs(),
-};
-
-/// A colour slot that blends nothing and writes nothing.
-const DISABLED_BLEND: BlendState = BlendState {
-    enabled: false,
-    color: NO_BLEND,
-    alpha: NO_BLEND,
-    write_mask: ColorWrites::EMPTY,
-};
-
-/// The equation of a slot whose blending is off.
-const NO_BLEND: BlendComponent = BlendComponent {
-    src: BlendFactor::One,
-    dst: BlendFactor::Zero,
-    op: BlendOperation::Add,
 };
 
 /// The targets a clear's render area spans (module docs, step 3), as Eden's framebuffer holds
@@ -1334,15 +785,16 @@ impl Framebuffer {
     }
 }
 
-/// The depth and stencil part's target, aspects and values, once its checks passed.
+/// The depth and stencil part's target, aspects, values and stencil mask, once its checks
+/// passed.
 struct DepthStencilPart {
     target: Target,
     /// The depth value, when depth is asked and the format has it.
     depth: Option<f32>,
     /// The stencil value, when stencil is asked and the format has it.
     stencil: Option<u32>,
-    /// Whether stencil is written through a partial mask (a draw).
-    partial: bool,
+    /// The stencil bits written ([`ClearDesc::stencil_mask`]).
+    stencil_mask: u8,
 }
 
 impl DepthStencilPart {
@@ -1380,121 +832,18 @@ fn depth_stencil_part(
         None
     };
     let target = Target::check(info, surface.layer)?;
-    let partial =
-        use_stencil && values.stencil_mask != FULL_STENCIL_MASK && values.stencil_mask != 0;
     Ok(DepthStencilPart {
         target,
         depth,
         stencil: use_stencil.then_some(values.stencil),
-        partial,
+        stencil_mask: stencil_write_mask(use_stencil, values.stencil_mask),
     })
 }
 
-/// The four 32-bit patterns of a colour value, as the clear shader takes them.
-fn value_bits(value: ClearValue) -> [u32; 4] {
-    match value {
-        ClearValue::Float(c) => c.map(f32::to_bits),
-        ClearValue::Sint(c) => c.map(i32::cast_unsigned),
-        ClearValue::Uint(c) => c,
-        ClearValue::Depth(d) | ClearValue::DepthStencil { depth: d, .. } => [d.to_bits(), 0, 0, 0],
-        ClearValue::Stencil(s) => [s, 0, 0, 0],
-    }
-}
-
-/// The parameter block's binding.
-fn params_binding(buffer: BufferId) -> Binding {
-    Binding {
-        group: host_shaders::clear::GROUP,
-        binding: host_shaders::clear::PARAMS_BINDING,
-        resource: BindingResource::Buffer(BufferSlice {
-            buffer,
-            offset: 0,
-            size: u64::from(host_shaders::clear::PARAMS_SIZE),
-        }),
-    }
-}
-
-/// A draw-based clear's pipeline: no vertex input, one triangle list, no culling.
-fn pipeline_desc(
-    vertex: ShaderId,
-    fragment: Option<ShaderId>,
-    depth_stencil: DepthStencilState,
-    blend: [BlendState; GUEST_COLOR_TARGETS],
-    targets: TargetFormats,
-) -> GraphicsPipelineDesc {
-    GraphicsPipelineDesc {
-        stages: Stages {
-            vertex,
-            tess_control: None,
-            tess_eval: None,
-            geometry: None,
-            fragment,
-        },
-        vertex_input: VertexLayout::default(),
-        topology: Topology::Triangles,
-        primitive_restart: false,
-        raster: RasterState {
-            cull: CullMode::None,
-            front_face: FrontFace::Ccw,
-            polygon_mode: PolygonMode::Fill,
-            depth_clamp: false,
-            depth_bias: DepthBias::default(),
-            line_width: 1.0,
-        },
-        depth_stencil,
-        blend,
-        logic_op: None,
-        targets,
-        emulation: EmulationFlags::EMPTY,
-    }
-}
-
-/// The render crate's clear shader as a validated naga module, parsed from its WGSL.
-fn clear_module() -> Result<(naga::Module, naga::valid::ModuleInfo), DrawError> {
-    let module = naga::front::wgsl::parse_str(HostShader::Clear.source()).map_err(|e| {
-        tracing::error!("the clear shader did not parse: {e}");
-        DrawError::Internal("the clear shader did not parse")
-    })?;
-    let info = naga::valid::Validator::new(
-        naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::empty(),
-    )
-    .validate(&module)
-    .map_err(|e| {
-        tracing::error!("the clear shader did not validate: {e}");
-        DrawError::Internal("the clear shader did not validate")
-    })?;
-    Ok((module, info))
-}
-
-/// Appends one planned part to `list`. A draw also sets its render targets and uploads its
-/// parameter block first, and becomes the draw path's last targets.
-fn append(
-    list: &mut CommandList,
-    plan: Plan,
-    params: Option<BufferId>,
-    last_targets: &mut Option<RenderTargets>,
-) {
-    match plan {
-        Plan::Clear(desc) => list.push(Command::Clear(desc)),
-        Plan::Draw {
-            staging,
-            targets,
-            desc,
-        } => {
-            if let Some(buffer) = params {
-                list.push(Command::Upload {
-                    from: staging,
-                    to: CopyRegion::Buffer(BufferSlice {
-                        buffer,
-                        offset: 0,
-                        size: u64::from(host_shaders::clear::PARAMS_SIZE),
-                    }),
-                });
-            }
-            list.push(Command::SetRenderTargets(targets));
-            *last_targets = Some(targets);
-            list.push(Command::Draw(*desc));
-        }
-    }
+/// The stencil bits a depth and stencil clear writes (module docs, step 5): a partial
+/// `SET_STENCIL_MASK` (neither [`FULL_STENCIL_MASK`] nor 0, Eden's `stencil_partial`) when
+/// stencil is written, and every bit otherwise.
+fn stencil_write_mask(use_stencil: bool, mask: u8) -> u8 {
+    let partial = use_stencil && u32::from(mask) != FULL_STENCIL_MASK && mask != 0;
+    if partial { mask } else { ALL_STENCIL_BITS }
 }

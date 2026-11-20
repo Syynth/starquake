@@ -28,7 +28,7 @@ pub(crate) use bounded::{check_nested, decoded_bytes};
 
 use crate::caps::GUEST_COLOR_TARGETS;
 use crate::id::{BufferId, PipelineId, ReadbackId, SamplerId, TextureId, ViewId};
-use crate::pipeline::DepthBias;
+use crate::pipeline::{ColorWrites, DepthBias};
 use crate::resource::{Extent3d, FilterMode, Origin3d};
 use serde::{Deserialize, Serialize};
 
@@ -171,7 +171,26 @@ pub enum ClearValue {
     },
 }
 
-/// A clear of a view, whole or within a rectangle.
+/// Every stencil bit: a [`ClearDesc::stencil_mask`] that writes the whole stencil value. Every
+/// stencil format this crate has stores 8 bits ([`crate::format::PixelFormat::has_stencil`]).
+pub const ALL_STENCIL_BITS: u8 = u8::MAX;
+
+/// A clear of a view, whole or within a rectangle, through write masks (render-backend,
+/// "Commands": "colour and stencil write masks"; decided by the owner, 2026-11-19).
+///
+/// The masks say what the clear writes, as the guest's `CLEAR_SURFACE` asks (gpu-protocol,
+/// "Clears"):
+///
+/// - [`ClearDesc::color_mask`] is read for a colour view only: the channels written. A channel
+///   it leaves out keeps its value; an empty mask writes nothing.
+/// - [`ClearDesc::stencil_mask`] is read only when the value writes stencil
+///   ([`ClearValue::Stencil`] or [`ClearValue::DepthStencil`]) to a view whose format has it:
+///   the stencil bits written, each from the value's bit of the same weight. A bit it leaves out
+///   keeps its value. Depth has no mask: a value with depth writes it.
+///
+/// A clear the host API cannot perform as a clear (a partial mask, or a rectangle over a view
+/// it clears only whole) is the backend's to draw, with the same pixels as a clear
+/// (`crate::host_shaders::clear`).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClearDesc {
     /// The view cleared.
@@ -180,6 +199,24 @@ pub struct ClearDesc {
     pub value: ClearValue,
     /// The area, or the whole view.
     pub rect: Option<Rect>,
+    /// The colour channels written (read for a colour view only).
+    pub color_mask: ColorWrites,
+    /// The stencil bits written (read only when the value writes stencil).
+    pub stencil_mask: u8,
+}
+
+impl ClearDesc {
+    /// A clear of `target` to `value` within `rect` that writes every channel and every
+    /// stencil bit.
+    pub const fn unmasked(target: ViewId, value: ClearValue, rect: Option<Rect>) -> Self {
+        Self {
+            target,
+            value,
+            rect,
+            color_mask: ColorWrites::ALL,
+            stencil_mask: ALL_STENCIL_BITS,
+        }
+    }
 }
 
 /// The views draws render into, until the next [`Command::SetRenderTargets`].

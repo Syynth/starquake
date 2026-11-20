@@ -73,7 +73,6 @@
 //! - a buffer side of a colour texture copy that does not start on a texel block;
 //! - a texture readback whose rows, padded to 256 bytes, would not fit the largest buffer (a
 //!   dumped frame in that case is not refused: its pixels are reported unknown);
-//! - a partial clear of a depth, stencil or multisampled view;
 //! - the texture shapes, view formats and border colours wgpu cannot make;
 //! - from slice R6, shaders and pipelines ([`pipeline`] gives each rule's reason and the order of
 //!   the checks): a shader that is not a naga module ([`pipeline::NAGA_ONLY`]), whose module has no
@@ -120,6 +119,7 @@
 mod adapter;
 mod backend;
 pub mod caps;
+pub mod clear;
 mod config;
 mod convert;
 pub mod draw;

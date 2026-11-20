@@ -55,11 +55,7 @@ fn rect(x: u32, y: u32, width: u32, height: u32) -> Rect {
 }
 
 fn clear(value: ClearValue, r: Option<Rect>) -> ClearDesc {
-    ClearDesc {
-        target: ViewId::new(0, 0),
-        value,
-        rect: r,
-    }
+    ClearDesc::unmasked(ViewId::new(0, 0), value, r)
 }
 
 fn invalid(text: &'static str) -> Result<(), RenderError> {

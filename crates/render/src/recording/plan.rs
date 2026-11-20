@@ -29,8 +29,9 @@ use super::{
 };
 use crate::caps::Caps;
 use crate::command::{
-    Binding, BindingResource, BlitDesc, BufferSlice, ClearDesc, Command, CommandList, CopyRegion,
-    DispatchParams, DrawDesc, DrawParams, PresentDesc, Rect, RenderTargets, TextureRegion,
+    Binding, BindingResource, BlitDesc, BufferSlice, ClearDesc, ClearValue, Command, CommandList,
+    CopyRegion, DispatchParams, DrawDesc, DrawParams, PresentDesc, Rect, RenderTargets,
+    TextureRegion,
 };
 use crate::error::RenderError;
 use crate::format::{FormatAspect, PixelFormat};
@@ -71,8 +72,13 @@ pub(super) enum Op<'a> {
     Upload { bytes: &'a [u8], to: Place },
     /// Bytes and their known flags moved.
     Copy { from: Place, to: Place },
-    /// One texel written over a box.
-    Fill { to: Place, texel: Vec<u8> },
+    /// One texel written over a box, through a write mask: for each byte of the texel, the
+    /// bits written (`store::Store::fill`).
+    Fill {
+        to: Place,
+        texel: Vec<u8>,
+        written: Vec<u8>,
+    },
     /// Bytes made unknown.
     Forget(Vec<Place>),
     /// Bytes read out under an id, from the place they come from when they can be read
@@ -270,10 +276,37 @@ fn clear_op<'a>(state: &State, clear: &ClearDesc) -> Result<Op<'a>, RenderError>
         mip: view.desc.base_mip,
         area: rect_blocks(view.desc.format, &rect, z, depth)?,
     };
-    Ok(match texel::encode_clear(view.desc.format, clear.value) {
-        Some(texel) => Op::Fill { to, texel },
+    if writes_nothing(view.desc.format, clear) {
+        return Ok(Op::Nothing);
+    }
+    let encoded = texel::encode_masked_clear(
+        view.desc.format,
+        clear.value,
+        clear.color_mask,
+        clear.stencil_mask,
+    );
+    Ok(match encoded {
+        Some(t) => Op::Fill {
+            to,
+            texel: t.bytes,
+            written: t.written,
+        },
         None => Op::Forget(vec![to]),
     })
+}
+
+/// Whether a clear of a view of `format` writes nothing at all, whatever the format: an empty
+/// colour mask on a colour view. Such a clear leaves even a format this backend does not model
+/// as it was (`ClearDesc`'s masks). A stencil value through an empty stencil mask needs no case
+/// here: the one stencil format modelled ([`texel`]) takes it, whatever the value, as a fill
+/// that writes no bit (`texel::encode_masked_clear` skips the channel before checking the value),
+/// and no byte of a two-aspect format is ever known.
+fn writes_nothing(format: PixelFormat, clear: &ClearDesc) -> bool {
+    matches!(
+        clear.value,
+        ClearValue::Float(_) | ClearValue::Uint(_) | ClearValue::Sint(_)
+    ) && format.aspect() == FormatAspect::Color
+        && clear.color_mask.is_empty()
 }
 
 fn draw_op<'a>(
