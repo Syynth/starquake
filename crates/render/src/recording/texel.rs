@@ -34,6 +34,11 @@
 //! - integers: a value representable in the channel's bits (Vulkan leaves others undefined);
 //! - depth: within 0..=1, under the float or normalised rule of the format; stencil: 0..=255.
 //!
+//! **Masks.** A clear writes only the channels its colour mask names and, for stencil, the bits
+//! its stencil mask names ([`encode_masked_clear`]); the bits it leaves out keep their value
+//! (`store::Store::fill`). Only the channels written must be exact: a masked-out channel's value
+//! is never encoded, so an inexact one does not make the texel unknown.
+//!
 //! **Buffer copies.** An upload, a readback and a copy between a buffer and a texture move bytes
 //! exactly for every format but these, for which the oracle claims nothing
 //! ([`buffer_copy_exact`]):

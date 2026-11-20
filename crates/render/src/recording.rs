@@ -25,8 +25,8 @@
 //!   stencil masks) writes only the bits its masks name: a byte it writes whole is known, one it
 //!   writes in part is known only when it was known before, and only the channels it writes
 //!   must be exact (when one is not, the whole area is unknown, the channels left out too). A
-//!   clear that writes nothing (an empty colour mask on a colour view, a stencil value through
-//!   an empty stencil mask) changes nothing, in a format [`texel`] does not model too;
+//!   colour clear through an empty mask changes nothing, in a format [`texel`] does not model
+//!   too, and a stencil clear through an empty mask leaves a modelled stencil as it was;
 //! - a blit copies texels only when it is unscaled, between views of one integer colour format
 //!   (`uint` or `sint`), both with the identity swizzle; any other blit (scaled, converting,
 //!   swizzled, or of a normalised, sRGB, float, depth, stencil or compressed format, whose texels

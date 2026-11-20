@@ -286,7 +286,6 @@ fn clear_op<'a>(state: &State, clear: &ClearDesc) -> Result<Op<'a>, RenderError>
         clear.stencil_mask,
     );
     Ok(match encoded {
-        Some(t) if t.written.iter().all(|m| *m == 0) => Op::Nothing,
         Some(t) => Op::Fill {
             to,
             texel: t.bytes,
@@ -297,16 +296,16 @@ fn clear_op<'a>(state: &State, clear: &ClearDesc) -> Result<Op<'a>, RenderError>
 }
 
 /// Whether a clear of a view of `format` writes nothing at all, whatever the format: an empty
-/// colour mask on a colour view, or a stencil-only value through an empty stencil mask. Such a
-/// clear leaves even a format this backend does not model as it was (`ClearDesc`'s masks).
+/// colour mask on a colour view. Such a clear leaves even a format this backend does not model
+/// as it was (`ClearDesc`'s masks). A stencil value through an empty stencil mask needs no case
+/// here: the one stencil format modelled ([`texel`]) takes it as a fill that writes no bit, and
+/// no byte of a two-aspect format is ever known.
 fn writes_nothing(format: PixelFormat, clear: &ClearDesc) -> bool {
-    match clear.value {
-        ClearValue::Float(_) | ClearValue::Uint(_) | ClearValue::Sint(_) => {
-            format.aspect() == FormatAspect::Color && clear.color_mask.is_empty()
-        }
-        ClearValue::Stencil(_) => clear.stencil_mask == 0,
-        ClearValue::Depth(_) | ClearValue::DepthStencil { .. } => false,
-    }
+    matches!(
+        clear.value,
+        ClearValue::Float(_) | ClearValue::Uint(_) | ClearValue::Sint(_)
+    ) && format.aspect() == FormatAspect::Color
+        && clear.color_mask.is_empty()
 }
 
 fn draw_op<'a>(
