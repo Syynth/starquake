@@ -1,12 +1,14 @@
 //! Interpreter equivalence: generated programs (assignments, comparisons, selects, uniform
 //! registers, predicates and flags, nested `if`s and counted loops) give the same machine
-//! before and after each pass of [`Pass::ORDER`], and every output verifies.
+//! before and after each pass of [`Pass::ORDER`], and every output verifies; as control-flow
+//! graphs, and structured by the structurizer first (slice 8b, Eden's order), when no goto or
+//! condition variable is left after the passes.
 //!
 //! Until dead code elimination the whole machine must match, guest registers included (the
-//! set operations stay); after it, the guest registers, predicates and flags are no longer
-//! written (nothing reads them after the SSA rewrite), so everything else must match. Each
-//! program ends by storing its data registers and predicates to output attributes, so their
-//! values stay observable.
+//! set operations stay); after it, the guest registers, predicates, flags and goto variables
+//! are no longer written (nothing reads them after the SSA rewrite), so everything else must
+//! match. Each program ends by storing its data registers and predicates to output
+//! attributes, so their values stay observable.
 
 use proptest::collection::vec;
 use proptest::prelude::*;
@@ -20,6 +22,7 @@ use crate::ir::{
     Attribute, Builder, Function, Imm, Opcode, Operand, Terminator, UniformPred, UniformReg,
 };
 use crate::opt::{Pass, run};
+use crate::structure::{MAX_STRUCTURE_WORK, structure};
 
 /// The data registers a program computes in: r0 to r4.
 const DATA_REGS: u8 = 5;
@@ -342,12 +345,13 @@ fn observable(machine: &Machine) -> Machine {
         uniform_regs: [0; UNIFORM_REG_SLOTS],
         uniform_preds: [false; UNIFORM_PRED_SLOTS],
         flags: ConditionCodes::default(),
+        goto_variables: std::collections::BTreeMap::new(),
         ..machine.clone()
     }
 }
 
 /// Runs every pass on `function`, checking each output verifies and keeps the result.
-fn check_equivalence(function: &Function, start: &Machine) -> Result<(), TestCaseError> {
+fn check_equivalence(function: &Function, start: &Machine) -> Result<Function, TestCaseError> {
     let reference = super::ran(function, start);
     let mut current = function.clone();
     for pass in Pass::ORDER {
@@ -371,6 +375,21 @@ fn check_equivalence(function: &Function, start: &Machine) -> Result<(), TestCas
             prop_assert_eq!(&machine, &reference, "{}: {}", pass, current);
         }
     }
+    Ok(current)
+}
+
+/// [`check_equivalence`] on `function` structured first, which must run as `function` does;
+/// the output names no goto variable.
+fn check_structured(function: &Function, start: &Machine) -> Result<(), TestCaseError> {
+    let structured = structure(function.clone(), MAX_STRUCTURE_WORK)
+        .map_err(|e| TestCaseError::fail(format!("structuring: {e}")))?
+        .function;
+    let reference = super::ran(function, start);
+    let machine = super::ran(&structured, start);
+    prop_assert_eq!(observable(&machine), observable(&reference));
+    let optimized = check_equivalence(&structured, start)?;
+    let text = optimized.to_string();
+    prop_assert!(!text.contains("GotoVariable"), "{}", text);
     Ok(())
 }
 
@@ -393,6 +412,14 @@ proptest! {
         let function = build(&stmts);
         prop_assert!(function.verify().is_ok());
         check_equivalence(&function, &start(&words))?;
+    }
+
+    #[test]
+    fn generated_programs_keep_their_results_structured(
+        stmts in vec(stmt(), 1..8),
+        words in vec(any::<u32>(), CBUF_WORDS as usize),
+    ) {
+        check_structured(&build(&stmts), &start(&words))?;
     }
 }
 
@@ -454,10 +481,18 @@ fn the_generator_makes_loops_ifs_and_phis() {
     let function = build(&program);
     for words in [[5, 100, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0]] {
         check_equivalence(&function, &start(&words)).expect("equivalent");
+        check_structured(&function, &start(&words)).expect("equivalent structured");
     }
     let mut ssa = function.clone();
     run(&mut ssa, Pass::SsaRewrite).expect("rewrites");
     assert!(ssa.to_string().contains("Phi"), "{ssa}");
+    // Structured, the rewrite places phis too, and the structurizer's loop is there.
+    let mut structured = structure(function, MAX_STRUCTURE_WORK)
+        .expect("structures")
+        .function;
+    run(&mut structured, Pass::SsaRewrite).expect("rewrites");
+    let text = structured.to_string();
+    assert!(text.contains("Phi") && text.contains("loop {"), "{text}");
 }
 
 #[test]
@@ -482,4 +517,5 @@ fn a_join_of_two_copies_of_one_value_verifies() {
         }],
     }];
     check_equivalence(&build(&program), &start(&[0; CBUF_WORDS as usize])).expect("equivalent");
+    check_structured(&build(&program), &start(&[0; CBUF_WORDS as usize])).expect("equivalent");
 }

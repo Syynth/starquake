@@ -115,12 +115,15 @@
 //!   uses a value ahead of its definition in one block (one that does not verify). Neither
 //!   has a test.
 
+mod tree;
+
 use std::collections::BTreeMap;
 
 use crate::ir::{BlockId, Function, Imm, Inst, Opcode, Operand, Phi, Terminator, Type, Value};
 
 use super::identity::Resolver;
-use super::{PassError, Work, block_order, identity_of, predecessors, reachable, slot};
+use super::{PassError, Work, block_order, identity_of, predecessors, slot};
+use tree::{Graph, Scopes};
 
 /// A variable the rewrite turns into SSA values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -273,6 +276,10 @@ impl Frame {
 struct Ssa<'f> {
     function: &'f mut Function,
     preds: Vec<Vec<BlockId>>,
+    /// The scopes values are visible in (one, in a control-flow graph).
+    scopes: Scopes,
+    /// The block that lists each value, by value index, as far as the rewrite knows it.
+    home: Vec<Option<BlockId>>,
     /// Each block's current definition of each variable (Eden's `DefTable`).
     defs: Vec<BTreeMap<Var, Operand>>,
     /// Each block's incomplete phis (Eden's `incomplete_phis`).
@@ -294,30 +301,48 @@ struct Ssa<'f> {
 
 /// Runs the rewrite (see the module docs).
 pub(super) fn run(function: &mut Function) -> Result<Work, PassError> {
-    if function.structure().is_some() {
-        return Err(PassError::Structured);
-    }
+    let structured = function.structure().is_some();
     let mut work = Work::default();
     let mut resolver = Resolver::new(function);
-    check(function, &mut resolver, &mut work)?;
-    split_entry(function, &mut work)?;
+    check(function, structured, &mut resolver, &mut work)?;
+    let Graph {
+        preds,
+        succs,
+        reachable,
+        scopes,
+    } = if structured {
+        tree::normalize(function, &mut work)?;
+        tree::structured(function, &mut work)
+    } else {
+        split_entry(function, &mut work)?;
+        Graph::of_graph(function, &mut work)
+    };
     let order = block_order(function, &mut work);
-    let reachable = reachable(function, &mut work);
-    let preds = predecessors(function);
     let count = function.block_count();
     // Take each block's list: instructions made below are appended to the emptied lists,
     // which the final placement replaces.
     let ids: Vec<BlockId> = function.blocks().map(|(id, _)| id).collect();
+    let mut home = vec![None; super::arena_len(function)];
     let mut original = Vec::with_capacity(count);
     for &id in &ids {
         let list = function
             .block_mut(id)
             .map_or_default(|block| std::mem::take(&mut block.insts));
+        for &value in &list {
+            if let Some(slot) = usize::try_from(value.index())
+                .ok()
+                .and_then(|index| home.get_mut(index))
+            {
+                *slot = Some(id);
+            }
+        }
         original.push(list);
     }
     let mut ssa = Ssa {
         function,
         preds,
+        scopes,
+        home,
         defs: vec![BTreeMap::new(); count],
         incomplete: vec![BTreeMap::new(); count],
         sealed: vec![false; count],
@@ -341,16 +366,7 @@ pub(super) fn run(function: &mut Function) -> Result<Work, PassError> {
         if let Some(done) = filled.get_mut(index) {
             *done = true;
         }
-        let successors: Vec<BlockId> = ssa
-            .function
-            .block(block)
-            .map_or_default(|b| b.terminator.successors().collect());
-        let mut previous = None;
-        for to in successors {
-            if previous == Some(to) {
-                continue;
-            }
-            previous = Some(to);
+        for &to in succs.get(index).map_or(&[][..], Vec::as_slice) {
             let Some(left) = slot(to).and_then(|i| waiting.get_mut(i)) else {
                 continue;
             };
@@ -428,6 +444,7 @@ impl Ssa<'_> {
         if let Some(list) = slot(block).and_then(|index| self.phis.get_mut(index)) {
             list.push(phi);
         }
+        self.note_home(phi, block);
         Ok(phi)
     }
 
@@ -458,8 +475,10 @@ impl Ssa<'_> {
                         if let Some(top) = stack.last_mut() {
                             top.result = Operand::Value(phi);
                         }
-                    } else if let [pred] = *self.preds_of(block) {
-                        // One predecessor: no phi needed.
+                    } else if let [pred] = *self.preds_of(block)
+                        && self.scopes.encloses(pred, block)
+                    {
+                        // One predecessor whose values are in scope here: no phi needed.
                         top.pc = Pc::SetValue;
                         stack.push(Frame::new(pred));
                         continue;
@@ -602,6 +621,11 @@ impl Ssa<'_> {
             return Ok(Operand::Value(phi));
         }
         let same = if let Some(same) = same {
+            if !self.visible(same, block) {
+                // The one value is out of scope here (it is defined in an `if` or loop body
+                // that has ended): the phi carries it out (see the module docs).
+                return Ok(Operand::Value(phi));
+            }
             same
         } else {
             // The phi has no operand but itself, as in the entry block, which has no
@@ -617,6 +641,36 @@ impl Ssa<'_> {
         Ok(same)
     }
 
+    /// Records that `value`, which the rewrite made, is listed in `block`.
+    fn note_home(&mut self, value: Value, block: BlockId) {
+        let Ok(index) = usize::try_from(value.index()) else {
+            return;
+        };
+        if self.home.len() <= index {
+            self.home.resize(index.saturating_add(1), None);
+        }
+        if let Some(slot) = self.home.get_mut(index) {
+            *slot = Some(block);
+        }
+    }
+
+    /// Whether `operand` is in scope in `block`: an immediate, or a value listed in a block
+    /// whose body encloses `block`'s (always, in a control-flow graph).
+    fn visible(&self, operand: Operand, block: BlockId) -> bool {
+        let Operand::Value(value) = operand else {
+            return true;
+        };
+        if self.scopes.is_flat() {
+            return true;
+        }
+        usize::try_from(value.index())
+            .ok()
+            .and_then(|index| self.home.get(index))
+            .copied()
+            .flatten()
+            .is_some_and(|home| self.scopes.encloses(home, block))
+    }
+
     /// A new `Undef` of `var`'s type in `block`, placed ahead of the block's own operations.
     fn new_undef(&mut self, var: Var, block: BlockId) -> Result<Value, PassError> {
         let undef = self.function.push(
@@ -626,6 +680,7 @@ impl Ssa<'_> {
         if let Some(list) = slot(block).and_then(|index| self.undefs.get_mut(index)) {
             list.push(undef);
         }
+        self.note_home(undef, block);
         Ok(undef)
     }
 
@@ -667,11 +722,19 @@ impl Ssa<'_> {
 /// instruction, that it exists ([`PassError::Missing`]), that a goto variable it names is named
 /// by an immediate ([`PassError::GotoIndex`]) and, for an `Identity`, that its chain ends at a
 /// value ([`PassError::Identity`]). The first fault met is returned.
-fn check(function: &Function, resolver: &mut Resolver, work: &mut Work) -> Result<(), PassError> {
+fn check(
+    function: &Function,
+    structured: bool,
+    resolver: &mut Resolver,
+    work: &mut Work,
+) -> Result<(), PassError> {
     for (_, block) in function.blocks() {
         for &value in &block.insts {
             work.step();
             let inst = function.inst(value).ok_or(PassError::Missing(value))?;
+            if structured && inst.is_phi() {
+                return Err(PassError::StructuredPhi(value));
+            }
             access(value, inst)?;
             if matches!(inst, Inst::Op(op) if op.opcode == Opcode::Identity) {
                 resolver.resolve(function, Operand::Value(value), work)?;

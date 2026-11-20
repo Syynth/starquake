@@ -1,0 +1,80 @@
+---
+source: crates/shader/src/opt/tests/structured.rs
+expression: text
+---
+block0:
+    %6: u32 = GetCbufU32 u32 0x0, u32 0x0
+    %0: u1 = INotEqual %6, u32 0x0
+block1:
+    %1 = SetRegister r1, u32 0x1
+block2:
+    %2 = SetRegister r1, u32 0x2
+block3:
+    %3: opaque = Identity %37
+    %4: f32 = BitCastF32U32 %3
+    %5 = SetAttribute a0x80, %4, u32 0x0
+block4:
+    %41: u32 = UndefU32
+    %40: opaque = Identity %41
+    %7 = Prologue
+    %8 = SetGotoVariable u32 0x3, u1 false
+    %9 = SetGotoVariable u32 0x2, u1 false
+    %10 = SetGotoVariable u32 0x1, u1 false
+    %11 = SetGotoVariable u32 0x4, u1 false
+    %12 = SetGotoVariable u32 0x0, u1 false
+    %13 = SetGotoVariable u32 0x0, u1 false
+block5:
+    %14 = SetGotoVariable u32 0x4, %0
+    %15: opaque = Identity %0
+    %16 = SetGotoVariable u32 0x1, %15
+    %17: opaque = Identity %15
+    %18: u1 = LogicalNot %17
+    %19: u1 = ConditionRef %18
+block6:
+    %20 = SetGotoVariable u32 0x2, u1 true
+block7:
+    %35: u1 = Phi [block5: u1 false], [block6: u1 true]
+    %34: opaque = Identity %0
+    %39: opaque = Identity %41
+    %21: opaque = Identity %0
+    %22: opaque = Identity %35
+    %23: u1 = LogicalNot %22
+    %24: u1 = LogicalOr %21, %23
+    %25: u1 = ConditionRef %24
+block8:
+    %26 = SetGotoVariable u32 0x1, u1 false
+block9:
+    %38: u32 = Phi [block1: u32 0x1], [block7: %41]
+    %36: opaque = Identity %35
+    %27: opaque = Identity %35
+    %28: u1 = LogicalNot u1 true
+    %29: u1 = LogicalOr %27, %28
+    %30: u1 = ConditionRef %29
+block10:
+    %31 = SetGotoVariable u32 0x2, u1 false
+block11:
+    %37: u32 = Phi [block2: u32 0x2], [block9: %38]
+    %32 = SetGotoVariable u32 0x3, u1 false
+block12:
+    %33 = Epilogue
+structure:
+    block4
+    block0
+    block5
+    if %19 {
+        block6
+    }
+    block7
+    if %25 {
+        block8
+        block1
+    }
+    block9
+    if %30 {
+        block10
+        block2
+    }
+    block11
+    block3
+    block12
+    return

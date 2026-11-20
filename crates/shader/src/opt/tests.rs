@@ -9,6 +9,7 @@ mod identity;
 mod linear;
 mod pipeline;
 mod ssa;
+mod structured;
 
 use super::{Pass, PassError, run};
 use crate::interp::Machine;
