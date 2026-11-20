@@ -107,6 +107,13 @@
 //!   draw looks it up with the learned ones.
 //!   `tests::stores_are_not_learned_from_a_waited_set`.
 //!
+//! The flipped viewport ([`viewport_flip`], [`constants_flip`]): the backend's `emulation()`
+//! reads how the first viewport handed to it flips, and sets `FLIPPED_VIEWPORT` when the host
+//! cannot set that viewport; the driver constants then carry the same flip for the vertex
+//! shader, and carry none without the flag, when the shader does not read them and the host
+//! sets the viewport as it is (render-backend, "Fixed-function state the host lacks"; owner's
+//! ruling 28 of 2026-11-19). `tests::each_viewport_flip_reaches_the_flag_and_the_constants`.
+//!
 //! The texture swizzles go in only when `Caps::view_swizzle` is false, keyed by binding order,
 //! which only a set's translation knows (slice 9's owner question). This slice therefore looks
 //! a set up first with the swizzles of the textures the previous answer for the same requests
@@ -121,6 +128,8 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use starquake_render::caps::GUEST_COLOR_TARGETS;
+use starquake_render::command::Viewport;
+use starquake_render::emulation::ViewportFlip;
 use starquake_render::format::NumericType;
 use starquake_render::pipeline::EmulationFlags;
 use starquake_render::shader::{
@@ -465,6 +474,24 @@ pub fn emulation_key(
         primitive_restart_rewrite: flags.contains(EmulationFlags::PRIMITIVE_RESTART_REWRITE),
         attribute_fetch: flags.contains(EmulationFlags::ATTRIBUTE_FETCH),
         typed_outputs: flags.contains(EmulationFlags::TYPED_OUTPUTS),
+        flipped_viewport: flags.contains(EmulationFlags::FLIPPED_VIEWPORT),
+    }
+}
+
+/// How the first of `viewports` (those handed to the backend) flips: what `emulation()` reads.
+/// None for no viewport, which the backend refuses anyway.
+pub fn viewport_flip(viewports: &[Viewport]) -> ViewportFlip {
+    viewports
+        .first()
+        .map_or(ViewportFlip::NONE, ViewportFlip::of)
+}
+
+/// The flip the driver constants carry: `flip` when `flags` has `FLIPPED_VIEWPORT`, else none.
+pub fn constants_flip(flags: EmulationFlags, flip: ViewportFlip) -> ViewportFlip {
+    if flags.contains(EmulationFlags::FLIPPED_VIEWPORT) {
+        flip
+    } else {
+        ViewportFlip::NONE
     }
 }
 

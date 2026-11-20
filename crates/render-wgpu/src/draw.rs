@@ -74,6 +74,26 @@
 //! (`Features::UNTYPED_FRAGMENT_OUTPUTS` is never set, `crate::caps`); pinned by
 //! `backend::tests::draws::an_integer_target_needs_a_typed_output`.
 //!
+//! # Flipped viewports
+//!
+//! wgpu-core 30.0.2's `set_viewport` (`src/command/render.rs`) refuses a negative width or
+//! height and a depth range that is reversed or outside 0..=1, and guest y-flips are common (a
+//! lower-left window origin flips every viewport). For a pipeline made with
+//! `EmulationFlags::FLIPPED_VIEWPORT`, whose vertex shader flips y and mirrors depth from the
+//! driver constants (shader-pipeline slice 17 lowers it), the check sets
+//! `starquake_render::emulation::host_viewport` of the draw's first viewport: a negative height
+//! made positive over the same rows and a reversed range swapped (decided by the owner,
+//! 2026-11-19; the render crate's `emulation` module docs give the arithmetic). What is still
+//! refused, with [`VIEWPORT`]: a flipped viewport for a pipeline without the flag (its shader
+//! does not flip, so drawing would land on the wrong rows), a negative width, a depth outside
+//! 0..=1 (whether the shader should remap one instead, as the spec's row says, is an open owner
+//! question: the render crate's `emulation` module docs, "A depth outside 0..=1"), and a size or
+//! position past the device's range after the flip. Pinned by
+//! `draw::tests::a_flipped_viewport_is_set_positive_only_for_a_flipped_pipeline` and, on a real
+//! GPU, `backend::tests::draws::a_flipped_viewport_draws_the_upright_pixels`; that the check
+//! reads the pipeline's own flag is pinned with no GPU by
+//! `draw::tests::graphics_info_reads_the_flipped_viewport_flag`.
+//!
 //! # The checks
 //!
 //! A draw is checked in this order, and the first refusal is the `Err` of `submit` (the module
@@ -91,7 +111,8 @@
 //! 6. the vertex buffers: every one the pipeline reads is bound ([`MISSING_VERTEX_BUFFER`]),
 //!    each from a 4-byte boundary ([`VERTEX_OFFSET`]); an indexed draw's index buffer from a
 //!    multiple of its index size, whether it is bound directly or rewritten ([`INDEX_OFFSET`]);
-//! 7. the viewport ([`VIEWPORT`]);
+//! 7. the viewport ([`VIEWPORT`]), after a pipeline with `EmulationFlags::FLIPPED_VIEWPORT` has
+//!    had its first viewport made positive (below, "Flipped viewports");
 //! 8. the counts: an indirect draw's parameters ([`INDIRECT_REWRITE`], [`INDIRECT_DRAWS`],
 //!    [`INDIRECT_STRIDE`], [`INDIRECT_RANGE`]); a direct draw's vertices, instances and indices
 //!    within their buffers ([`VERTEX_LIMIT`], [`INDEX_LIMIT`]); the rewrite's sizes
@@ -312,6 +333,9 @@ pub(crate) struct GraphicsInfo {
     pub(crate) vertex: Vec<rules::VertexStep>,
     /// The layout.
     pub(crate) layout: LayoutInfo,
+    /// Whether the pipeline has `EmulationFlags::FLIPPED_VIEWPORT` (module docs, "Flipped
+    /// viewports").
+    pub(crate) flipped_viewport: bool,
 }
 
 /// What the check knows of a pipeline, fixed at creation.

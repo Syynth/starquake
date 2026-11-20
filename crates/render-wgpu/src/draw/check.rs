@@ -31,8 +31,9 @@ use starquake_render::command::{
     Binding, BindingResource, BufferSlice, DispatchDesc, DispatchParams, DrawDesc, DrawParams,
     IndexFormat, RenderTargets,
 };
+use starquake_render::emulation::host_viewport;
 use starquake_render::format::FormatAspect;
-use starquake_render::pipeline::GraphicsPipelineDesc;
+use starquake_render::pipeline::{EmulationFlags, GraphicsPipelineDesc};
 use starquake_render::resource::TextureDimension;
 use starquake_render::{
     BufferId, BufferUsage, Caps, PipelineId, RenderError, TextureUsage, ViewId, validate,
@@ -122,13 +123,17 @@ impl ListDraws {
             .dynamic
             .viewports
             .first()
-            .copied()
             .ok_or(RenderError::OutOfRange {
                 what: "viewport count",
                 value: 0,
                 min: 1,
                 max: 1,
             })?;
+        let viewport = if info.flipped_viewport {
+            host_viewport(viewport)
+        } else {
+            *viewport
+        };
         rules::check_viewport(&viewport, limits.max_texture_dimension_2d)?;
         let scissor = rules::clamp_scissor(draw.dynamic.scissors.first(), size.0, size.1);
         let sizes: Vec<Option<u64>> = draw.vertex_buffers.iter().map(|s| Some(s.size)).collect();
@@ -907,5 +912,6 @@ pub(crate) fn graphics_info(
             })
             .collect(),
         layout,
+        flipped_viewport: desc.emulation.contains(EmulationFlags::FLIPPED_VIEWPORT),
     }
 }

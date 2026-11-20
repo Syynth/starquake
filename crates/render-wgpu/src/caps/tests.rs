@@ -191,6 +191,7 @@ fn each_feature_comes_from_its_own_source() {
         Features::DEPTH_RANGE_MINUS_ONE_TO_ONE,
         Features::PRIMITIVE_RESTART_OFF,
         Features::UNTYPED_FRAGMENT_OUTPUTS,
+        Features::FLIPPED_VIEWPORT,
     ] {
         assert!(!c.features.intersects(never), "{never:?}");
     }

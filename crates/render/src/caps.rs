@@ -146,6 +146,14 @@ flag_set! {
         /// validation does too is a guess, settled in slice R7, so until then a wgpu device
         /// leaves this out.
         UNTYPED_FRAGMENT_OUTPUTS = 13,
+        /// A viewport with a negative height (y runs up the target) or a reversed depth range
+        /// (the near plane's depth above the far plane's) as dynamic state. wgpu-core 30.0.2's
+        /// `set_viewport` (`src/command/render.rs`) refuses both, so a wgpu device leaves this
+        /// out, and [`crate::emulation::emulation`] then asks for the vertex shader's flip
+        /// (decided by the owner, 2026-11-19). That a direct Vulkan backend could set it (a
+        /// negative height with `VK_KHR_maintenance1`, a reversed range as Vulkan allows) is
+        /// a guess no backend checks yet.
+        FLIPPED_VIEWPORT = 14,
     }
 }
 

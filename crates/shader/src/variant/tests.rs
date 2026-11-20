@@ -77,14 +77,15 @@ fn golden_key() -> VariantKey {
         primitive_restart_rewrite: true,
         attribute_fetch: true,
         typed_outputs: true,
+        flipped_viewport: true,
     };
     key.texture_swizzles = TextureSwizzles::new(GOLDEN_SWIZZLES.to_vec()).expect("two");
     key
 }
 
 #[rustfmt::skip]
-const GOLDEN_BYTES: [u8; 200] = [
-    0x02, // version
+const GOLDEN_BYTES: [u8; 201] = [
+    0x03, // version
     // vertex attribute types
     1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1,
     2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2,
@@ -115,7 +116,8 @@ const GOLDEN_BYTES: [u8; 200] = [
     0x44, 0x43, 0x42, 0x41, 0x54, 0x53, 0x52, 0x51, 0x64, 0x63, 0x62, 0x61,
     0x74, 0x73, 0x72, 0x71, // shared-memory size
     0x07, // alpha test: greater or equal (6) plus one
-    0x01, 0x01, 0x01, 0x01, // depth range, primitive restart, attribute fetch, typed outputs
+    // depth range, primitive restart, attribute fetch, typed outputs, flipped viewport
+    0x01, 0x01, 0x01, 0x01, 0x01,
     0x02, // swizzle count
     4, 7, 2, 6, // swizzle 0: B, one (float), R, one (int)
     5, 3, 7, 4, // swizzle 1: A, G, one (float), B
@@ -123,7 +125,7 @@ const GOLDEN_BYTES: [u8; 200] = [
 
 #[test]
 fn layout_constants() {
-    assert_eq!(VARIANT_KEY_VERSION, 2);
+    assert_eq!(VARIANT_KEY_VERSION, 3);
     assert_eq!(VERTEX_ATTRIBUTES, 32);
     assert_eq!(MAX_TEXTURE_SWIZZLES, 192);
     assert_eq!(ATTRIBUTE_WORDS, 256);
@@ -131,8 +133,8 @@ fn layout_constants() {
     assert_eq!(FOLLOWING_STAGES, 4);
     assert_eq!(FollowingStage::ALL.len(), FOLLOWING_STAGES);
     assert_eq!(SWIZZLE_SIZE, 4);
-    assert_eq!(VARIANT_KEY_FIXED_SIZE, 192);
-    assert_eq!(VARIANT_KEY_MAX_SIZE, 192 + 192 * 4);
+    assert_eq!(VARIANT_KEY_FIXED_SIZE, 193);
+    assert_eq!(VARIANT_KEY_MAX_SIZE, 193 + 192 * 4);
 }
 
 #[test]
@@ -145,7 +147,7 @@ fn golden_bytes() {
 fn the_default_key_decodes_from_zeros() {
     // Hand-built: the version, then every field zero and no swizzles.
     let mut bytes = vec![0; VARIANT_KEY_FIXED_SIZE];
-    bytes[0] = 2;
+    bytes[0] = 3;
     assert_eq!(VariantKey::decode(&bytes), Ok(VariantKey::default()));
     assert_eq!(VariantKey::default().encode(), bytes);
 }
@@ -172,6 +174,7 @@ fn defaults() {
             primitive_restart_rewrite: false,
             attribute_fetch: false,
             typed_outputs: false,
+            flipped_viewport: false,
         }
     );
     assert_eq!(fresh.texture_swizzles.as_slice().len(), 0);
@@ -196,15 +199,16 @@ fn any_swizzle() -> impl Strategy<Value = Swizzle> {
 fn any_key() -> impl Strategy<Value = VariantKey> {
     let emulation = (
         prop::option::of(any_coded(CompareFunction::ALL)),
-        prop::array::uniform4(any::<bool>()),
+        prop::array::uniform5(any::<bool>()),
     )
         .prop_map(
-            |(alpha_test, [depth, restart, fetch, typed])| EmulationKey {
+            |(alpha_test, [depth, restart, fetch, typed, flipped])| EmulationKey {
                 alpha_test,
                 depth_range_rewrite: depth,
                 primitive_restart_rewrite: restart,
                 attribute_fetch: fetch,
                 typed_outputs: typed,
+                flipped_viewport: flipped,
             },
         );
     (
@@ -274,8 +278,9 @@ fn the_version_is_checked_first() {
             len: 0
         })
     );
-    // Another version with a truncated body: the version is reported.
-    for found in [0, 1, 3, u8::MAX] {
+    // Another version with a truncated body: the version is reported (1 is the version
+    // before the flipped-viewport switch, 2 the one before the previous stages' stores).
+    for found in [0, 1, 2, 4, u8::MAX] {
         assert_eq!(
             VariantKey::decode(&[found]),
             Err(KeyError::Version { found })
@@ -290,9 +295,7 @@ fn the_version_is_checked_first() {
     );
     assert_eq!(
         KeyError::Version { found: 1 }.to_string(),
-        format!(
-            "variant key version 1 is not supported; this build reads version {VARIANT_KEY_VERSION}"
-        )
+        "variant key version 1 is not supported; this build reads version 3"
     );
     // The right version with nothing after it.
     assert_eq!(
@@ -353,30 +356,31 @@ fn every_prefix_is_truncated_in_the_right_field() {
         (188, KeyField::PrimitiveRestartRewrite),
         (189, KeyField::AttributeFetch),
         (190, KeyField::TypedOutputs),
-        (191, KeyField::SwizzleCount),
+        (191, KeyField::FlippedViewport),
+        (192, KeyField::SwizzleCount),
         (
-            192,
+            193,
             KeyField::Swizzle {
                 binding: 0,
                 component: 0,
             },
         ),
         (
-            195,
+            196,
             KeyField::Swizzle {
                 binding: 0,
                 component: 3,
             },
         ),
         (
-            196,
+            197,
             KeyField::Swizzle {
                 binding: 1,
                 component: 0,
             },
         ),
         (
-            199,
+            200,
             KeyField::Swizzle {
                 binding: 1,
                 component: 3,
@@ -429,8 +433,9 @@ fn each_coded_field_accepts_its_last_code_and_refuses_the_next() {
         (188, KeyField::PrimitiveRestartRewrite, 1, 2),
         (189, KeyField::AttributeFetch, 1, 2),
         (190, KeyField::TypedOutputs, 1, 2),
+        (191, KeyField::FlippedViewport, 1, 2),
         (
-            192,
+            193,
             KeyField::Swizzle {
                 binding: 0,
                 component: 0,
@@ -439,7 +444,7 @@ fn each_coded_field_accepts_its_last_code_and_refuses_the_next() {
             8,
         ),
         (
-            199,
+            200,
             KeyField::Swizzle {
                 binding: 1,
                 component: 3,
@@ -493,11 +498,12 @@ fn the_codes_inside_each_set() {
         VariantKey::decode(&patched(186, 8)).map(|key| key.emulation.alpha_test),
         Ok(Some(CompareFunction::Always))
     );
-    let switches: [(usize, Read); 4] = [
+    let switches: [(usize, Read); 5] = [
         (187, |key| key.emulation.depth_range_rewrite),
         (188, |key| key.emulation.primitive_restart_rewrite),
         (189, |key| key.emulation.attribute_fetch),
         (190, |key| key.emulation.typed_outputs),
+        (191, |key| key.emulation.flipped_viewport),
     ];
     for (offset, read) in switches {
         assert_eq!(
@@ -511,7 +517,7 @@ fn the_codes_inside_each_set() {
         );
     }
     assert_eq!(
-        zero(192).map(|key| key.texture_swizzles.as_slice()[0].x),
+        zero(193).map(|key| key.texture_swizzles.as_slice()[0].x),
         Ok(SwizzleSource::Zero)
     );
     let field = KeyField::Swizzle {
@@ -519,7 +525,7 @@ fn the_codes_inside_each_set() {
         component: 0,
     };
     assert_eq!(
-        VariantKey::decode(&patched(192, 1)),
+        VariantKey::decode(&patched(193, 1)),
         Err(KeyError::InvalidValue { field, value: 1 })
     );
     assert_eq!(
@@ -532,7 +538,7 @@ fn the_codes_inside_each_set() {
 fn the_first_invalid_field_is_reported() {
     let mut bytes = patched(33, 3);
     bytes[187] = 2;
-    bytes[199] = 1;
+    bytes[200] = 1;
     assert_eq!(
         VariantKey::decode(&bytes),
         Err(KeyError::InvalidValue {
@@ -598,7 +604,7 @@ fn the_swizzle_cap_at_its_edge() {
 fn the_swizzle_count_is_checked_before_the_swizzles() {
     // A count past the cap and too few bytes for it: the count is reported.
     let count = u8::try_from(MAX_TEXTURE_SWIZZLES + 1).expect("fits");
-    let bytes = patched(191, count);
+    let bytes = patched(192, count);
     assert_eq!(
         VariantKey::decode(&bytes),
         Err(KeyError::TooManySwizzles {
@@ -607,7 +613,7 @@ fn the_swizzle_count_is_checked_before_the_swizzles() {
     );
     // A count within the cap and too few bytes: the swizzle it ends in.
     assert_eq!(
-        VariantKey::decode(&patched(191, 3)),
+        VariantKey::decode(&patched(192, 3)),
         Err(KeyError::Truncated {
             field: KeyField::Swizzle {
                 binding: 2,
@@ -618,7 +624,7 @@ fn the_swizzle_count_is_checked_before_the_swizzles() {
     );
     // A count below what follows: the rest is trailing.
     assert_eq!(
-        VariantKey::decode(&patched(191, 1)),
+        VariantKey::decode(&patched(192, 1)),
         Err(KeyError::TrailingBytes {
             end: GOLDEN_BYTES.len() - SWIZZLE_SIZE,
             len: GOLDEN_BYTES.len()
@@ -638,8 +644,8 @@ fn trailing_bytes_are_refused() {
         })
     );
     assert_eq!(
-        KeyError::TrailingBytes { end: 200, len: 201 }.to_string(),
-        "the variant key ends at byte 200, but 201 bytes were given"
+        KeyError::TrailingBytes { end: 201, len: 202 }.to_string(),
+        "the variant key ends at byte 201, but 202 bytes were given"
     );
 }
 
@@ -772,6 +778,7 @@ fn every_emulation_flag_has_a_key_field() {
             "PRIMITIVE_RESTART_REWRITE",
             "ATTRIBUTE_FETCH",
             "TYPED_OUTPUTS",
+            "FLIPPED_VIEWPORT",
         ]
     );
     // Each reader sees its own field and no other.
@@ -796,6 +803,10 @@ fn every_emulation_flag_has_a_key_field() {
             typed_outputs: true,
             ..EmulationKey::default()
         },
+        EmulationKey {
+            flipped_viewport: true,
+            ..EmulationKey::default()
+        },
     ];
     for (set, key) in only.iter().enumerate() {
         let seen: Vec<bool> = EmulationKey::MIRRORED
@@ -809,7 +820,7 @@ fn every_emulation_flag_has_a_key_field() {
         .iter()
         .map(|(_, read)| read(&EmulationKey::default()))
         .collect();
-    assert_eq!(none, [false; 5]);
+    assert_eq!(none, [false; 6]);
 }
 
 #[test]
@@ -854,6 +865,7 @@ fn key_field_names_are_plain_words() {
         ),
         (KeyField::AttributeFetch, "the attribute fetch switch"),
         (KeyField::TypedOutputs, "the typed outputs switch"),
+        (KeyField::FlippedViewport, "the flipped-viewport switch"),
         (KeyField::SwizzleCount, "the texture swizzle count"),
         (
             KeyField::Swizzle {

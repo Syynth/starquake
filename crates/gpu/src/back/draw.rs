@@ -56,7 +56,11 @@
 //!    (`SET_ALPHA_REF`'s bits as a float, as Eden's `bit_cast`), the viewport flip (Eden's
 //!    `y_negate`: the window origin is the lower left, `fixed_pipeline_state.cpp`), the render
 //!    area (the surface clip, or colour target 0's size when the clip is not set, as Eden-NX2's
-//!    `vk_graphics_pipeline.cpp`), and the draw's base vertex and instance.
+//!    `vk_graphics_pipeline.cpp`), the draw's base vertex and instance, and the first
+//!    viewport's y flip and depth reversal while the pipeline has `FLIPPED_VIEWPORT`
+//!    ([`shaders::constants_flip`]; the backend then sets that viewport positive), with the
+//!    clip range the vertex shader leaves (`starquake_render::emulation::clip_depth_range`), which
+//!    picks the depth mirror's offset (`tests::the_depth_mirror_follows_the_clip_range`).
 //! 8. **The draw**: a [`Command::SetRenderTargets`] when the targets' views changed since the
 //!    last one, then the [`Command::Draw`], with the first `min(Caps::limits.max_viewports, 16)`
 //!    viewports and scissors, as Eden sends `min(device.GetMaxViewports(), NumViewports)`
@@ -143,13 +147,14 @@ use starquake_render::command::{
     Binding, BindingResource, BufferSlice, CopyRegion, DrawDesc, DrawParams, DynamicValues,
     IndexBufferBinding, IndexFormat, RenderTargets,
 };
+use starquake_render::emulation::{ViewportFlip, clip_depth_range};
 use starquake_render::pipeline::{GraphicsPipelineDesc, RasterState, Stages};
 use starquake_render::validate::viewport_limit;
 use starquake_render::{
     Backend, BufferDesc, BufferId, BufferUsage, Command, CommandList, DepthRange, EmulationState,
     FenceValue, RenderError, ResourceId, emulation,
 };
-use starquake_shader::driver_constants::{DRIVER_CONSTANTS_SIZE, DriverConstants};
+use starquake_shader::driver_constants::{ClipDepth, DRIVER_CONSTANTS_SIZE, DriverConstants};
 use starquake_shader::lookup::{GuestStage, ProgramRequest};
 use starquake_shader::variant::{KeyError, PreviousStores, Swizzle, TextureSwizzles};
 use thiserror::Error;
@@ -808,6 +813,7 @@ impl Draws {
         let used = usize::try_from(viewport_limit(self.backend.caps())).unwrap_or(usize::MAX);
         viewports.truncate(used);
         scissors.truncate(used);
+        let viewport_flip = shaders::viewport_flip(&viewports);
         let alpha_on = mirror
             .reg(&clc797::SET_ALPHA_TEST, &[])?
             .field(clc797::SET_ALPHA_TEST_ENABLE)?
@@ -832,19 +838,21 @@ impl Draws {
         let requests = Self::requests(mirror, raster.raster_enable)?;
         // Step 4.
         let caps = self.backend.caps().clone();
+        let depth_range = if minus_one_to_one {
+            DepthRange::MinusOneToOne
+        } else {
+            DepthRange::ZeroToOne
+        };
         let flags = emulation(
             &caps,
             &EmulationState {
                 alpha_test: alpha_func,
-                depth_range: if minus_one_to_one {
-                    DepthRange::MinusOneToOne
-                } else {
-                    DepthRange::ZeroToOne
-                },
+                depth_range,
                 primitive_restart: raster.primitive_restart,
                 vertex_attributes: u32::try_from(vertex.layout.attributes.len())
                     .unwrap_or(u32::MAX),
                 color_targets: targets.formats.colors,
+                viewport: viewport_flip,
             },
         );
         let emulation_key = shaders::emulation_key(flags, alpha_func);
@@ -1087,7 +1095,9 @@ impl Draws {
         };
         // Step 7.
         if binds_constants {
-            let constants = driver_constants(mirror, alpha_ref, call)?;
+            let flip = shaders::constants_flip(flags, viewport_flip);
+            let clip = clip_depth_range(depth_range, flags);
+            let constants = driver_constants(mirror, alpha_ref, call, flip, clip)?;
             upload_constants(
                 ctx,
                 &self.roots,
@@ -1393,6 +1403,8 @@ fn driver_constants(
     mirror: &Mirror,
     alpha_reference: f32,
     call: &DrawCall,
+    flip: ViewportFlip,
+    clip: DepthRange,
 ) -> Result<DriverConstants, DrawError> {
     let three_d = mirror.three_d()?;
     let select = three_d.ct_select();
@@ -1416,5 +1428,11 @@ fn driver_constants(
         render_area_height: height as f32,
         base_vertex: call.base_vertex,
         base_instance: call.base_instance,
+        flip_y: flip.flip_y,
+        reverse_depth: flip.reverse_depth,
+        clip_depth: match clip {
+            DepthRange::ZeroToOne => ClipDepth::ZeroToW,
+            DepthRange::MinusOneToOne => ClipDepth::MinusWToW,
+        },
     })
 }
