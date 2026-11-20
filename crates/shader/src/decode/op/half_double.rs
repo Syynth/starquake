@@ -23,8 +23,8 @@
 //!
 //! From PR #4588 alone, and so **each needs an `nvdisasm` check** (spec, verification E2):
 //! `HFMA2`'s bit 86, which negates only the high half of `b` (`Visitor::HFMA2`:
-//! `negate_high_b = Take(86, 1)`; `lower_to_maxwell.h`: "H0_NH1: negate only the upper packed
-//! component"), and its bits 87..89, which hold 7 exactly when `.RELU` is set
+//! `negate_high_b = Take(86, 1)`; `lower_to_maxwell.h`: "`H0_NH1`: negate only the upper
+//! packed component"), and its bits 87..89, which hold 7 exactly when `.RELU` is set
 //! (`Require(Take(87, 4) == (relu ? 7U : 0U), "native half fused multiply-add mode")`: "The relu
 //! form carries a constant 7 in bits 87..90 (observed on every captured program)").
 //!
@@ -65,8 +65,8 @@
 //! | Bit 78 of every `HMUL2` form | Rejected: NAK's `.F32`, written false and marked "SM70-SM75"; PR #4588 refuses it (`Require(Take(78, 2) == 0, ..)`) | as above |
 //! | Bits 64..71 of every `DSETP` form | Rejected: the register slot, which `DSETP` does not use (NAK passes `None`); PR #4588 has no `DSETP` | as above |
 //! | The uniform-register forms of the packed-half instructions (`0xe30`, `0xc31`, `0xe31`, `0xc32`, `0xe33`, `0xe34`, `0xc40`) and a bindless constant buffer in their constant-buffer forms | Decoded (NAK encodes them: `encode_alu_ureg`, `set_src_cb`); PR #4588's translator refuses them (`Visitor::HalfSource`: `Require(form >= 1 && form <= 5, ..)`, `Require(Take(91, 1) == 0, "native bindless constant buffer")`) | `decode::tests::half_double::hand_built_words_of_each_form_decode` |
-//! | `HFMA2`'s `.fmz` (76), `.f32` (78) and `.bf16_v2` (85), `HMUL2`'s `.fmz` (76) and `.relu` (79), `HMNMX2`'s `.f32` (78), `.ftz` (80), `.nan` (81), `.xorsign` (82) and `.bf16_v2` (85) | Decoded (NAK names each); PR #4588's translator refuses them set | `decode::tests::half_double::hand_built_words_pin_each_modifier_bit` |
-//! | `HFMA2` with `.relu` and `.sat`; `HADD2.F32` with `.sat`, `.ftz` or a swizzle below 2 on `b` | Decoded; PR #4588's translator refuses them (`Require(!relu \|\| !saturate, ..)`, `Require(!ftz && !saturate, ..)`, `Require(b.swizzle >= 2, ..)`) | `hand_built_words_pin_each_modifier_bit` |
+//! | `HFMA2`'s `.fmz` (76), `.f32` (78) and `.bf16_v2` (85), `HMUL2`'s `.fmz` (76) and `.relu` (79), `HMNMX2`'s `.f32` (78), `.ftz` (80), `.nan` (81), `.xorsign` (82) and `.bf16_v2` (85) | Decoded (NAK names each); PR #4588's translator refuses them set | `decode::tests::half_double::hand_built_words_pin_each_arithmetic_modifier_bit`, `hand_built_words_pin_each_comparison_modifier_bit` |
+//! | `HFMA2` with `.relu` and `.sat`; `HADD2.F32` with `.sat`, `.ftz` or a swizzle below 2 on `b` | Decoded; PR #4588's translator refuses them (`Require(!relu \|\| !saturate, ..)`, `Require(!ftz && !saturate, ..)`, `Require(b.swizzle >= 2, ..)`) | `hand_built_words_pin_each_arithmetic_modifier_bit` |
 //!
 //! Every other row of a decoded form is matched exactly (`decode::tests::masks_match_the_reference_table`).
 //!
@@ -96,7 +96,7 @@ use super::float::{
 use super::{Named, Op, shells};
 #[cfg(test)]
 use {
-    super::super::fields::{SRC2, SRC2_HALF_ABS, SRC2_HALF_NEG, SRC2_HALF_SWIZZLE, SLOT_UNIFORM},
+    super::super::fields::{SLOT_UNIFORM, SRC2, SRC2_HALF_ABS, SRC2_HALF_NEG, SRC2_HALF_SWIZZLE},
     super::super::form::ReferenceRow,
     proptest::strategy::BoxedStrategy,
 };
@@ -246,6 +246,10 @@ const fn hadd2(form: AluForm) -> Form {
 
 /// `HFMA2 dst, a, b, c`: `a * b + c` on each half, fused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent one-bit field of the encoding, as in NAK's OpHFma2"
+)]
 pub struct OpHFma2 {
     /// The destination.
     pub dst: Gpr,
@@ -338,6 +342,10 @@ const fn hfma2(form: AluForm) -> Form {
 
 /// `HMUL2 dst, a, b`: `a * b` on each half.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent one-bit field of the encoding, as in NAK's OpHMul2"
+)]
 pub struct OpHMul2 {
     /// The destination.
     pub dst: Gpr,
@@ -545,6 +553,10 @@ const fn hsetp2(form: AluForm) -> Form {
 /// `HMNMX2 dst, a, b, min`: per half, the smaller of `a` and `b` where `min` is true, the
 /// larger where it is false.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent one-bit field of the encoding, as in NAK's OpHMnMx2"
+)]
 pub struct OpHMnMx2 {
     /// The destination.
     pub dst: Gpr,

@@ -373,7 +373,11 @@ pub(crate) const fn with_modifiers(src: AluSrc, abs: bool, neg: bool) -> AluSrc 
 
 /// Reads the modifier bits and swizzle in `fields` onto `src`, refusing swizzle 1
 /// ([`HalfSwizzle`]); without fields (an immediate) the source reads both halves as stored.
-fn half(reader: &mut Reader, src: AluSrc, fields: Option<HalfFields>) -> Result<HalfSrc, DecodeError> {
+fn half(
+    reader: &mut Reader,
+    src: AluSrc,
+    fields: Option<HalfFields>,
+) -> Result<HalfSrc, DecodeError> {
     let Some(fields) = fields else {
         return Ok(HalfSrc::new(src));
     };

@@ -72,8 +72,13 @@ pub(super) fn all() -> Vec<BoxedStrategy<Op>> {
 }
 
 fn hadd2() -> BoxedStrategy<Op> {
-    ((any_gpr(), any_half_reg(), any_half_src(), any::<[bool; 3]>()).prop_map(
-        |(dst, a, b, [saturate, f32, ftz])| {
+    ((
+        any_gpr(),
+        any_half_reg(),
+        any_half_src(),
+        any::<[bool; 3]>(),
+    )
+        .prop_map(|(dst, a, b, [saturate, f32, ftz])| {
             Op::HAdd2(OpHAdd2 {
                 dst,
                 srcs: [a, b],
@@ -81,8 +86,7 @@ fn hadd2() -> BoxedStrategy<Op> {
                 f32,
                 ftz,
             })
-        },
-    ))
+        }))
     .boxed()
 }
 
@@ -110,8 +114,13 @@ fn hfma2() -> BoxedStrategy<Op> {
 }
 
 fn hmul2() -> BoxedStrategy<Op> {
-    ((any_gpr(), any_half_reg(), any_half_src(), any::<[bool; 4]>()).prop_map(
-        |(dst, a, b, [saturate, ftz, dnz, relu])| {
+    ((
+        any_gpr(),
+        any_half_reg(),
+        any_half_src(),
+        any::<[bool; 4]>(),
+    )
+        .prop_map(|(dst, a, b, [saturate, ftz, dnz, relu])| {
             Op::HMul2(OpHMul2 {
                 dst,
                 srcs: [a, b],
@@ -120,8 +129,7 @@ fn hmul2() -> BoxedStrategy<Op> {
                 dnz,
                 relu,
             })
-        },
-    ))
+        }))
     .boxed()
 }
 
@@ -198,7 +206,7 @@ fn hmnmx2() -> BoxedStrategy<Op> {
 }
 
 fn dadd() -> BoxedStrategy<Op> {
-    ((any_gpr(), any_reg_src(), any_src(), any_rnd()))
+    (any_gpr(), any_reg_src(), any_src(), any_rnd())
         .prop_map(|(dst, a, b, rnd)| {
             Op::DAdd(OpDAdd {
                 dst,
@@ -210,7 +218,7 @@ fn dadd() -> BoxedStrategy<Op> {
 }
 
 fn dmul() -> BoxedStrategy<Op> {
-    ((any_gpr(), any_reg_src(), any_src(), any_rnd()))
+    (any_gpr(), any_reg_src(), any_src(), any_rnd())
         .prop_map(|(dst, a, b, rnd)| {
             Op::DMul(OpDMul {
                 dst,
@@ -227,7 +235,7 @@ fn dfma() -> BoxedStrategy<Op> {
         (any_reg_src(), any_wide_src(), any_reg_src()).prop_map(|(a, b, c)| [a, b, c]),
         (any_reg_src(), any_reg_src(), any_wide_src()).prop_map(|(a, b, c)| [a, b, c]),
     ];
-    ((any_gpr(), srcs, any_rnd()))
+    (any_gpr(), srcs, any_rnd())
         .prop_map(|(dst, srcs, rnd)| Op::DFma(OpDFma { dst, srcs, rnd }))
         .boxed()
 }

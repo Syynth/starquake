@@ -244,9 +244,7 @@ impl Display for HalfSrc {
         let swizzle = self.swizzle;
         match self.src {
             AluSrc::Reg { reg, abs, neg } => modified(f, &Swizzled(&reg, swizzle), abs, neg),
-            AluSrc::UniformReg { reg, abs, neg } => {
-                modified(f, &Swizzled(&reg, swizzle), abs, neg)
-            }
+            AluSrc::UniformReg { reg, abs, neg } => modified(f, &Swizzled(&reg, swizzle), abs, neg),
             AluSrc::CBuf { cbuf, abs, neg } => modified(f, &Swizzled(&cbuf, swizzle), abs, neg),
             AluSrc::Imm(bits) => write!(f, "{bits:#x}{swizzle}"),
         }
