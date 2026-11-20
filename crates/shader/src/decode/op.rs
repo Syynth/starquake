@@ -10,7 +10,7 @@
 //! | `integer` | 6a | `IADD3`, `IADD3.X`, `IMAD`, `IMAD.WIDE`, `LOP3`, `SHF`, `LEA`, `LEA.X`, `ISETP`, `IMNMX`, `PRMT`, `POPC`, `FLO`, `BREV`, `SGXT`, `BMSK`, `IABS`, `IDP4`, `MOV`, `SEL`, `PLOP3`, `P2R`, `R2P` |
 //! | `float` | 6b | `FADD`, `FMUL`, `FFMA`, `FMNMX`, `FSET`, `FSETP`, `FSEL`, `MUFU`, `FSWZADD`, `FRND`, `F2F`, `F2I`, `I2F`, `I2FP`, `F2FP` |
 //! | `half_double` | 6c | `HADD2`, `HFMA2`, `HMUL2`, `HSET2`, `HSETP2`, `HMNMX2`, `DADD`, `DMUL`, `DFMA`, `DSETP` |
-//! | `uniform` | 6d | `R2UR`, `UP2UR` |
+//! | `uniform` | 6d | `R2UR`, `UP2UR`, `UMOV`, `ULDC` (with `LDCG`), `UPLOP3`, and the uniform ALU forms (`UIADD3` and the others: `uniform`'s module docs) |
 //! | `memory` | 6e | `LD`/`ST` (every space), `LDC`, `ATOM` (with `ATOMS`, `ATOMG`, `RED`), `CCTL`, `MEMBAR`, `LDGSTS`, `LDGDEPBAR`, `ERRBAR`, `ATOMS.POPC` |
 //! | `texture` | 6f | `TEX`, `TLD`, `TLD4`, `TMML`, `TXD`, `TXQ`, `SULD`, `SUST`, `SUATOM` (with `SURED`) |
 //! | `attribute` | 6g | `ALD`, `AST`, `IPA`, `AL2P`, `S2R`, `CS2R`, `PIXLD`, `OUT`, `OUT.FINAL`, `ISBERD`, `ISBEWR`, `LDTRAM` |
@@ -66,6 +66,7 @@ pub use memory::{
     AtomCmpSrc, AtomDst, AtomOp, AtomType, CCtlOp, GlobalAccess, LdcMode, MemAddr, MemBarScope,
     MemEvictionPriority, MemOrder, MemScope, MemSpace, MemType, OffsetStride, UniformAddr,
 };
+pub use uniform::{ULdcSrc, UMovSrc, Uniform};
 pub use texture::{
     ChannelMask, ImageAccess, ImageDim, TexCBufRef, TexChannel, TexDim, TexLodMode, TexOffsetMode,
     TexQuery, TexRef,
@@ -129,7 +130,11 @@ macro_rules! op_list {
                 DSetP(OpDSetP),
             }
             uniform {
-                R2UR(OpR2UR), UP2UR(OpUP2UR),
+                R2UR(OpR2UR), UP2UR(OpUP2UR), UMov(OpUMov), ULdc(OpULdc), UPLop3(OpUPLop3),
+                UIAdd3(OpUIAdd3), UIAdd3X(OpUIAdd3X), ULea(OpULea), ULeaX(OpULeaX),
+                ULop3(OpULop3), UPrmt(OpUPrmt), UShf(OpUShf), UIMad(OpUIMad),
+                UIMad64(OpUIMad64), UISetP(OpUISetP), USel(OpUSel), USgxt(OpUSgxt),
+                UBMsk(OpUBMsk), UFlo(OpUFlo), UBRev(OpUBRev), UPopC(OpUPopC),
             }
             memory {
                 Ld(OpLd), St(OpSt), Ldc(OpLdc), Atom(OpAtom), CCtl(OpCCtl), MemBar(OpMemBar),

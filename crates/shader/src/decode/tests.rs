@@ -8,6 +8,7 @@ mod framework;
 mod integer;
 mod memory;
 mod texture;
+mod uniform;
 
 use proptest::prelude::*;
 

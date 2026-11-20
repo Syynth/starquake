@@ -144,7 +144,7 @@ pub(crate) use op::integer::{
 pub(crate) use op::texture;
 pub use op::*;
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) use op::{Named, attribute, control, float, integer, memory, op_list};
+pub(crate) use op::{Named, attribute, control, float, integer, memory, op_list, uniform};
 pub use operand::{
     AluSrc, CBuf, CBufRef, Gpr, Pred, PredSrc, RoundMode, UniformPred, UniformPredSrc, UniformReg,
 };
@@ -230,6 +230,9 @@ fn read(word: Instruction) -> Result<(u16, Instr, Reader), DecodeError> {
     let mut reader = Reader::new(word);
     let guard = reader.guard();
     let op = (form.decode)(&mut reader)?;
+    if let Some(fault) = reader.fault() {
+        return Err(fault);
+    }
     Ok((opcode, Instr { guard, op }, reader))
 }
 
