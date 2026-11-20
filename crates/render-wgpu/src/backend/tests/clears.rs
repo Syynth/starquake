@@ -105,6 +105,44 @@ fn masked_colour_clears_write_what_the_recording_backend_knows() {
 }
 
 #[test]
+fn an_empty_colour_mask_writes_nothing_whole_or_over_a_rectangle() {
+    bounded(|| {
+        let Some(gpu) = backend("empty_colour_mask") else {
+            return;
+        };
+        let mut p = Pair::new(gpu);
+        let format = PixelFormat::A8B8G8R8Unorm;
+        let value = ClearValue::Float([1.0, 0.0, 1.0, 0.0]);
+        let tex = p.texture(&texture_desc(
+            TextureDimension::D2,
+            format,
+            (8, 4, 1),
+            1,
+            TARGET,
+        ));
+        let view = p.view(tex, &whole_view(format, ViewDimension::D2, (0, 1)));
+        let whole = region(tex, 0, (0, 0, 0), (8, 4, 1));
+        // The whole level first: a clear wgpu could do with a render pass's load operation,
+        // which would write the value although the mask names no channel.
+        let list = vec![
+            upload(pattern(level_bytes(format), 31), whole),
+            masked(view, value, None, ColorWrites::EMPTY, ALL_STENCIL_BITS),
+            p.readback(whole),
+            masked(
+                view,
+                value,
+                Some(PART),
+                ColorWrites::EMPTY,
+                ALL_STENCIL_BITS,
+            ),
+            p.readback(whole),
+        ];
+        assert_eq!(p.run(list), Ok(()));
+        assert_eq!(p.matched, 2);
+    });
+}
+
+#[test]
 fn two_drawn_clears_in_one_list_each_write_their_value() {
     bounded(|| {
         let Some(gpu) = backend("two_drawn_clears") else {
