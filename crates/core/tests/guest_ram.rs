@@ -1,8 +1,8 @@
 //! The fit check of guest RAM (the program's whole application pool), at the exact edge, on
 //! both ways a program arrives: an NRO ([`System::new`]) and a NUP title ([`System::from_nup`]).
-//! A program that
-//! fits its console's application pool with no byte to spare loads and runs; one byte more is
-//! [`Error::OutOfRam`], found before the VM is made (`crates/core/src/system/ram.rs`).
+//! A program that fits its console's application pool with no byte to spare loads and runs;
+//! one byte more is [`Error::OutOfRam`], found before the VM is made
+//! (`crates/core/src/system/ram.rs`).
 //!
 //! The programs are synthetic: an NRO of one instruction, which exits, the same with a counter
 //! read before it (so that the program has counter trampolines), and a container built
