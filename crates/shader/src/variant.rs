@@ -53,8 +53,10 @@
 //! - **The vertex stage has no mask.** Eden sets every bit for a program with no previous
 //!   program (`info.previous_stage_stores.mask.set()`), which is always the vertex program:
 //!   Eden's loop over the programs starts at `VertexB` when `VertexA` is present (merged into it
-//!   by `MergeDualVertexPrograms`), and refuses a lone `VertexA` (`UNIMPLEMENTED_IF(index ==
-//!   0)`). Every bit set specialises on nothing, so the key holds no mask for it.
+//!   by `MergeDualVertexPrograms`), and asserts (soft) on a lone `VertexA` (`UNIMPLEMENTED_IF(index
+//!   == 0)`, an `ASSERT`, which logs `LOG_CRITICAL`, calls `AssertFailSoftImpl()` and continues:
+//!   `eden/src/common/assert.h`). Every bit set specialises on nothing, so the key holds no mask
+//!   for it.
 //! - **A passthrough geometry program's mask is not added.** Eden ORs
 //!   `previous_program->info.passthrough.mask` into the stores when the previous program is a
 //!   passthrough geometry program; the passthrough mask is not an input here (`GpPassthroughMask`

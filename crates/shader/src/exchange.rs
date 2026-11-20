@@ -52,7 +52,7 @@
 //! | `ReadInstruction` | the program's bytes, read through [`crate::lookup::ProgramMemory`] from [`crate::lookup::ProgramRequest::address`] | yes |
 //! | `ReadCbufValue` | [`Question::CbufWord`] | yes |
 //! | `ReadTextureType` | only whether the type is `Buffer`: [`TextureKind::buffer`] | **partly**; see below |
-//! | `ReadTexturePixelFormat` | [`TextureKind::format`] of a [`TextureUsage::Image`] question, the header's format bits rather than Eden's converted `TexturePixelFormat` | **partly**; see below |
+//! | `ReadTexturePixelFormat` | [`TextureKind::format`], the header's format bits rather than Eden's converted `TexturePixelFormat`; carried only by the answer to a [`TextureUsage::Image`] question, so Eden's one read (an `ImageFetch` from a SNORM buffer texture, a [`TextureUsage::Sampled`] use) gets [`TextureFormat::UNREAD`] | **partly**; see "Where Eden reads the format" |
 //! | `IsTexturePixelFormatInteger` | [`TextureKind::sampled`] (which also tells signed from unsigned) | yes |
 //! | `ReadViewportTransformState` | nothing | **no** |
 //! | `TextureBoundBuffer` | nothing | **no** |
@@ -71,9 +71,10 @@
 //! # Usage, and which answers carry the format
 //!
 //! [`Question::TextureKind`] says how the program uses the handle ([`TextureUsage`]), so a
-//! shader is specialised on the header's format bits only where its translation depends on
-//! them (spec, "Translation inputs: questions and answers"; decided by the owner, 2026-11-19,
-//! ruling 7). [`EngineState::texture_kind`] keeps the sketch's signature and reports the whole
+//! shader is specialised on the header's format bits only for a use that reads them as the
+//! spec says, image use (spec, "Translation inputs: questions and answers"; decided by the
+//! owner, 2026-11-19, ruling 7; Eden's one other read is below, under "Where Eden reads the
+//! format, and the divergences"). [`EngineState::texture_kind`] keeps the sketch's signature and reports the whole
 //! [`TextureKind`] whatever the usage; the exchange records it through [`TextureKind::for_usage`]:
 //!
 //! - [`TextureUsage::Sampled`]: the format is replaced by [`TextureFormat::UNREAD`], so two
@@ -85,13 +86,30 @@
 //! Both [`exchange`] and [`Answers::reanswer`] record through it, so a later draw's answers
 //! compare equal exactly when the first draw's would have.
 //!
-//! The two usages are the issue's ("sampled only, or read or written as an image"). Eden reads
-//! the format in one more place: an `ImageFetch` from a buffer texture on a host that cannot
-//! render to SNORM buffers is patched by format (`PatchTexelFetch` behind
-//! `ReadTexturePixelFormatCached`, `eden/src/shader_recompiler/ir_opt/texture_pass.cpp` @
-//! cf654052). Which usage such a fetch asks with is left to the texture pass (slice 13); asking
-//! with [`TextureUsage::Image`] gets the format. An **owner question** whether it needs a usage
-//! of its own.
+//! The two usages are the issue's ("sampled only, or read or written as an image").
+//!
+//! ## Where Eden reads the format, and the divergences
+//!
+//! In all three references (`eden` @ cf654052, `eden-nx2` @ 50fa86bb, `eden-pr4588` @
+//! e5fb3b97), the texture pass's only `ReadTexturePixelFormat` call is the SNORM buffer
+//! texel-fetch patch: `ReadTexturePixelFormatCached` before `PatchTexelFetch`, guarded by
+//! `!host_info.support_snorm_render_buffer && inst->GetOpcode() == IR::Opcode::ImageFetch &&
+//! flags.type == TextureType::Buffer` (`eden/src/shader_recompiler/ir_opt/texture_pass.cpp`).
+//! Eden's image descriptors (`ImageBufferDescriptor`, `ImageDescriptor`) take their format from
+//! the instruction (`.format = flags.image_format`), not from the header. So the usages diverge
+//! from Eden both ways:
+//!
+//! - **[`TextureUsage::Image`] carries the header's format bits**, which Eden never reads for an
+//!   image. This follows the spec (`TextureKind` carries "the format of a storage image used by
+//!   a formatted surface load or store (rows 83, 86)"), not Eden. Pinned by
+//!   `tests::a_format_change_changes_an_image_answer`.
+//! - **A fetch is a [`TextureUsage::Sampled`] use, so its answer carries
+//!   [`TextureFormat::UNREAD`]**, including the one fetch Eden reads the format for (an
+//!   `ImageFetch` from a buffer texture on a host that cannot render to SNORM buffers). Pinned
+//!   by `tests::a_format_change_keeps_a_sampled_answer`. **Owner question**: as it stands,
+//!   Eden's only format read is dropped by default; when the texture pass (slice 13) ports the
+//!   SNORM patch, that fetch has no format to read unless it asks with
+//!   [`TextureUsage::Image`] or with a usage of its own.
 //!
 //! No driver constant stands in for an `Environment` member: the driver constants hold values
 //! Eden takes from `RuntimeInfo` and the draw, not from `Environment`. [`TextureKind::depth`] and
@@ -177,12 +195,17 @@ pub enum Question {
 /// A handle used both ways is asked about once per usage: two questions, each answered once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TextureUsage {
-    /// Only sampled, fetched or queried through a texture instruction: the translation depends
-    /// on the kind (component type, depth, multisampled, buffer), not on the format bits, so
-    /// the answer carries [`TextureFormat::UNREAD`].
+    /// Only sampled, fetched or queried through a texture instruction: the answer carries the
+    /// kind (component type, depth, multisampled, buffer) and [`TextureFormat::UNREAD`] for the
+    /// format. One such use does depend on the format bits in Eden: an `ImageFetch` from a
+    /// buffer texture on a host that cannot render to SNORM buffers is patched by format, and
+    /// this usage drops it (module docs, "Where Eden reads the format, and the divergences";
+    /// an owner question).
     Sampled,
     /// Read or written as an image by a surface instruction, whose host storage image must
-    /// declare its format (rows 83 and 86): the answer carries the header's format bits.
+    /// declare its format (rows 83 and 86): the answer carries the header's format bits. This
+    /// follows the spec, not Eden, whose image descriptors take the format from the instruction
+    /// (a listed divergence, module docs, "Where Eden reads the format, and the divergences").
     Image,
 }
 
@@ -209,8 +232,10 @@ pub struct TextureFormat(u32);
 
 impl TextureFormat {
     /// The format recorded in the answer to a [`TextureUsage::Sampled`] question: no bits,
-    /// whatever the header holds, because that usage does not read them. It is told apart from
-    /// a header whose format bits are all zero by the question's usage, not by its value.
+    /// whatever the header holds, because that usage does not carry them (module docs, "Where
+    /// Eden reads the format, and the divergences", for the one fetch Eden reads them for). It
+    /// is told apart from a header whose format bits are all zero by the question's usage, not
+    /// by its value.
     pub const UNREAD: Self = Self(0);
 
     /// The format of a texture header whose first word is `word`; the bits outside
