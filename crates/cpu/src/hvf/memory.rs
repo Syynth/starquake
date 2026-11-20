@@ -192,7 +192,7 @@ impl HostRegion {
             .iter()
             .filter(|&&state| state & ffi::MINCORE_INCORE != 0)
             .count();
-        let bytes = resident.checked_mul(page).unwrap_or(usize::MAX);
+        let bytes = resident.saturating_mul(page);
         Ok(u64::try_from(bytes).unwrap_or(u64::MAX))
     }
 

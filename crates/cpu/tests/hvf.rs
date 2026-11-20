@@ -1115,12 +1115,20 @@ fn a_vm_with_ram_of_a_whole_application_pool_costs_only_the_pages_touched() {
     // address: five tables (the root, a level-2 and a level-3 for the code; a level-2 and a
     // level-3 in another level-1 slot for the data), pool pages 0 to 4: two host pages.
     let (code_va, data_va) = (0x4000_0000, 0x80_0000_0000 - 0x4000_0000);
-    let data_pa = ram.base() + (7 << 30);
+    let far_ram = ram.base() + (7 << 30);
     tables
-        .map(code_va, BackingRange::new(ram.base(), PAGE_SIZE).unwrap(), Perms::ReadExecute)
+        .map(
+            code_va,
+            BackingRange::new(ram.base(), PAGE_SIZE).unwrap(),
+            Perms::ReadExecute,
+        )
         .unwrap();
     tables
-        .map(data_va, BackingRange::new(data_pa, PAGE_SIZE).unwrap(), Perms::ReadWrite)
+        .map(
+            data_va,
+            BackingRange::new(far_ram, PAGE_SIZE).unwrap(),
+            Perms::ReadWrite,
+        )
         .unwrap();
     assert_eq!(tables.table_pages_in_use(), 5);
     assert_eq!(physical.table_pool_resident_bytes(), Ok(2 * host_page));
@@ -1137,7 +1145,7 @@ fn a_vm_with_ram_of_a_whole_application_pool_costs_only_the_pages_touched() {
     regs.x[1] = data_va + 8;
     vcpu.set_regs(&regs).unwrap();
     assert_eq!(vcpu.run().unwrap(), Exit::Svc(0));
-    assert_eq!(read_u64(&physical, data_pa + 8), 0x7a7a_5151_0f0f_e1e1);
+    assert_eq!(read_u64(&physical, far_ram + 8), 0x7a7a_5151_0f0f_e1e1);
     assert_eq!(physical.ram_resident_bytes(), Ok(2 * host_page));
     // The host writes the last byte of RAM: one more.
     physical.write(ram.end() - 1, &[0xee]).unwrap();

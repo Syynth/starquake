@@ -199,7 +199,7 @@ const MAX_VCPUS: usize = 64;
 const TABLE_POOL_BASE: u64 = 0xf_1000_0000;
 /// Size of the table pool: every table one 39-bit address space can hold at once
 /// ([`MAX_TABLE_PAGES`], 262,657 pages of 4 KiB), rounded up to a whole host page (262,660
-/// pages, 0x4020_4000 bytes). Backed lazily, so only the tables in use cost the host anything.
+/// pages, `0x4020_4000` bytes). Backed lazily, so only the tables in use cost the host anything.
 /// One address space's tables then run out only in the window [`MAX_TABLE_PAGES`] names:
 /// while tables an unmapping freed wait for its flush. Two address spaces sharing the pool (as
 /// the hardware tests' halves do) each get what their part holds.
@@ -230,6 +230,7 @@ const _: () = assert!(SCRATCH_OFFSET + PAGE <= SYSTEM_SIZE);
 const _: () = assert!(SYSTEM_BASE + SYSTEM_SIZE <= TABLE_POOL_BASE);
 const _: () = assert!(TABLE_POOL_SIZE.is_multiple_of(HOST_PAGE));
 const _: () = assert!(TABLE_POOL_SIZE >= MAX_TABLE_PAGES * PAGE);
+const _: () = assert!(TABLE_POOL_SIZE - HOST_PAGE < MAX_TABLE_PAGES * PAGE);
 const _: () = assert!(TABLE_POOL_BASE + TABLE_POOL_SIZE <= IPA_END);
 
 // EL1 configuration, from `Vcpu::new` in `tools/hvprobe/src/probe.rs` unless noted. Bit positions
@@ -1353,15 +1354,13 @@ mod tests {
     fn the_table_pool_holds_every_table_of_an_address_space_inside_the_ipa_space() {
         // 262,657 tables of 4 KiB (`MAX_TABLE_PAGES`: 1 + 512 + 512 * 512) is 0x4020_1000
         // bytes; rounded up to the 16 KiB host page, 0x4020_4000.
+        // That it holds every table, with less than a host page more, and fits the IPA space,
+        // are the module's `const` assertions.
         assert_eq!(TABLE_POOL_SIZE, 0x4020_4000);
         assert_eq!(TABLE_POOL_SIZE / PAGE, 262_660);
-        assert!(TABLE_POOL_SIZE / PAGE >= MAX_TABLE_PAGES);
-        assert!((TABLE_POOL_SIZE - HOST_PAGE) / PAGE < MAX_TABLE_PAGES);
         // Hypervisor.framework's 36-bit IPA space (`tools/hvprobe/README.md`).
         assert_eq!(IPA_END, 0x10_0000_0000);
-        assert!(TABLE_POOL_BASE + TABLE_POOL_SIZE <= IPA_END);
-        // Clear of the backend's own region below it, and of the largest RAM.
-        assert!(SYSTEM_BASE + SYSTEM_SIZE <= TABLE_POOL_BASE);
+        // Clear of the largest RAM below it.
         let largest = RamConfig::at_least(SYSTEM_BASE - DEFAULT_RAM_BASE).unwrap();
         assert!(largest.base + largest.size <= TABLE_POOL_BASE);
     }

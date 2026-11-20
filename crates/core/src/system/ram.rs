@@ -586,7 +586,10 @@ mod tests {
         // The host's page (16 KiB on Apple Silicon), the smallest RAM a `RamConfig` holds.
         let host_page = RamConfig::at_least(1).unwrap().size();
         let touched = size / step * PAGE_SIZE;
-        assert_eq!(physical.ram_resident_bytes(), Ok(touched.div_ceil(host_page) * host_page));
+        assert_eq!(
+            physical.ram_resident_bytes(),
+            Ok(touched.div_ceil(host_page) * host_page)
+        );
         for at in every() {
             let mut back = [0; 8];
             space.read(at, &mut back).unwrap();
@@ -604,7 +607,10 @@ mod tests {
         );
         let last = space.allocate_shared(rest).unwrap();
         assert_eq!((last.base(), last.end()), (ram.base() + touched, ram.end()));
-        assert_eq!(physical.ram_resident_bytes(), Ok(touched.div_ceil(host_page) * host_page));
+        assert_eq!(
+            physical.ram_resident_bytes(),
+            Ok(touched.div_ceil(host_page) * host_page)
+        );
         assert_eq!(
             space.allocate_shared(PAGE_SIZE),
             Err(SpaceError::OutOfRam {
