@@ -123,7 +123,7 @@ use crate::ir::{BlockId, Function, Imm, Inst, Opcode, Operand, Phi, Terminator, 
 
 use super::identity::Resolver;
 use super::{PassError, Work, block_order, identity_of, predecessors, slot};
-use tree::{Graph, Scopes};
+use tree::{Graph, Places, Scopes};
 
 /// A variable the rewrite turns into SSA values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -280,6 +280,11 @@ struct Ssa<'f> {
     scopes: Scopes,
     /// The block that lists each value, by value index, as far as the rewrite knows it.
     home: Vec<Option<BlockId>>,
+    /// A structured function's places, for the shortcut to the entry.
+    places: Option<Places>,
+    /// Each variable's first place in tree order where a block other than the entry writes it
+    /// (structured functions only).
+    first_write: BTreeMap<Var, usize>,
     /// Each block's current definition of each variable (Eden's `DefTable`).
     defs: Vec<BTreeMap<Var, Operand>>,
     /// Each block's incomplete phis (Eden's `incomplete_phis`).
@@ -310,6 +315,7 @@ pub(super) fn run(function: &mut Function) -> Result<Work, PassError> {
         succs,
         reachable,
         scopes,
+        places,
     } = if structured {
         tree::normalize(function, &mut work)?;
         tree::structured(function, &mut work)
@@ -318,6 +324,10 @@ pub(super) fn run(function: &mut Function) -> Result<Work, PassError> {
         Graph::of_graph(function, &mut work)
     };
     let order = block_order(function, &mut work);
+    let first_write = places
+        .as_ref()
+        .map(|places| first_writes(function, places, &mut work))
+        .unwrap_or_default();
     let count = function.block_count();
     // Take each block's list: instructions made below are appended to the emptied lists,
     // which the final placement replaces.
@@ -343,6 +353,8 @@ pub(super) fn run(function: &mut Function) -> Result<Work, PassError> {
         preds,
         scopes,
         home,
+        places,
+        first_write,
         defs: vec![BTreeMap::new(); count],
         incomplete: vec![BTreeMap::new(); count],
         sealed: vec![false; count],
@@ -466,6 +478,12 @@ impl Ssa<'_> {
                         if let Some(top) = stack.last_mut() {
                             top.result = Operand::Value(undef);
                         }
+                    } else if let Some(entry) = self.unwritten_since_entry(var, block) {
+                        // No block the entry's paths to here pass writes the variable (see
+                        // the module docs): its value is the entry's.
+                        top.pc = Pc::SetValue;
+                        stack.push(Frame::new(entry));
+                        continue;
                     } else if !self.is_sealed(block) {
                         // An incomplete control-flow graph.
                         let phi = self.new_phi(var, block)?;
@@ -641,6 +659,21 @@ impl Ssa<'_> {
         Ok(same)
     }
 
+    /// The entry, when `block` is not the entry and no block other than the entry writes `var`
+    /// at a place up to `block`'s reach (see the module docs, "Structured functions"); `None`
+    /// in a control-flow graph.
+    fn unwritten_since_entry(&self, var: Var, block: BlockId) -> Option<BlockId> {
+        let places = self.places.as_ref()?;
+        if block == places.entry {
+            return None;
+        }
+        let reach = places.place(block).and(places.reach(block))?;
+        match self.first_write.get(&var) {
+            Some(&first) if first <= reach => None,
+            _ => Some(places.entry),
+        }
+    }
+
     /// Records that `value`, which the rewrite made, is listed in `block`.
     fn note_home(&mut self, value: Value, block: BlockId) {
         let Ok(index) = usize::try_from(value.index()) else {
@@ -742,6 +775,33 @@ fn check(
         }
     }
     Ok(())
+}
+
+/// Each variable's first place in tree order where a block other than the entry writes it: one
+/// walk over the listed instructions, a step each.
+fn first_writes(function: &Function, places: &Places, work: &mut Work) -> BTreeMap<Var, usize> {
+    let mut first = BTreeMap::new();
+    for (block, listed) in function.blocks() {
+        if block == places.entry {
+            continue;
+        }
+        let Some(place) = places.place(block) else {
+            continue;
+        };
+        for &value in &listed.insts {
+            work.step();
+            let Some(inst) = function.inst(value) else {
+                continue;
+            };
+            if let Ok(Some(Access::Write(var, _))) = access(value, inst) {
+                first
+                    .entry(var)
+                    .and_modify(|at: &mut usize| *at = (*at).min(place))
+                    .or_insert(place);
+            }
+        }
+    }
+    first
 }
 
 /// Moves block 0's instructions and terminator to a new last block when other blocks jump to

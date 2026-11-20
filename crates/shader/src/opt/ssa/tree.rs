@@ -59,6 +59,34 @@ impl Scopes {
     }
 }
 
+/// Where a structured function's blocks are in its tree, for the rewrite's shortcut to the
+/// entry (the parent module's docs, "Structured functions").
+pub(super) struct Places {
+    /// The tree's first block.
+    pub(super) entry: BlockId,
+    /// Each block's place in tree order, by block index (`None` for a block the tree does not
+    /// place).
+    place: Vec<Option<usize>>,
+    /// Each block's reach: the last place inside the outermost loop around it, or its own
+    /// place when no loop is.
+    reach: Vec<usize>,
+}
+
+impl Places {
+    /// `block`'s place in tree order.
+    pub(super) fn place(&self, block: BlockId) -> Option<usize> {
+        slot(block)
+            .and_then(|index| self.place.get(index))
+            .copied()
+            .flatten()
+    }
+
+    /// `block`'s reach (see [`Places::reach`]'s field).
+    pub(super) fn reach(&self, block: BlockId) -> Option<usize> {
+        slot(block).and_then(|index| self.reach.get(index)).copied()
+    }
+}
+
 /// The edges the rewrite reads, each block's reachability and the scopes.
 pub(super) struct Graph {
     /// Each block's predecessors, each once.
@@ -69,6 +97,8 @@ pub(super) struct Graph {
     pub(super) reachable: Vec<bool>,
     /// The scopes values are visible in.
     pub(super) scopes: Scopes,
+    /// A structured function's places; `None` for a control-flow graph.
+    pub(super) places: Option<Places>,
 }
 
 impl Graph {
@@ -95,6 +125,7 @@ impl Graph {
             succs,
             reachable,
             scopes: Scopes::flat(function.block_count()),
+            places: None,
         }
     }
 }
@@ -193,11 +224,12 @@ enum Kind {
     /// An `if`: the blocks that can have run last before it, which are also last after it
     /// when its condition is false.
     If { before: Vec<BlockId> },
-    /// A loop: its first block, which the end of the body jumps back to, and the blocks
-    /// that can have run last at each `break`.
+    /// A loop: its first block, which the end of the body jumps back to, the blocks that
+    /// can have run last at each `break`, and its number in the walk's loop ends.
     Loop {
         header: Option<BlockId>,
         breaks: Vec<BlockId>,
+        number: usize,
     },
 }
 
@@ -246,6 +278,13 @@ pub(super) fn structured(function: &Function, work: &mut Work) -> Graph {
     }];
     // The frames that are loops, innermost last.
     let mut loops: Vec<usize> = Vec::new();
+    // Places: the next one, each block's, each loop's last, each block's outermost loop.
+    let mut next_place = 0_usize;
+    let mut place: Vec<Option<usize>> = vec![None; count];
+    let mut loop_ends: Vec<usize> = Vec::new();
+    let mut outermost: Vec<Option<usize>> = vec![None; count];
+    // The numbers of the loops open, outermost first.
+    let mut loop_numbers: Vec<usize> = Vec::new();
     while let Some(top) = stack.last_mut() {
         let first = !top.started;
         top.started = true;
@@ -261,8 +300,16 @@ pub(super) fn structured(function: &Function, work: &mut Work) -> Graph {
                     last.extend(before);
                     sort_dedup(&mut last);
                 }
-                Kind::Loop { header, breaks } => {
+                Kind::Loop {
+                    header,
+                    breaks,
+                    number,
+                } => {
                     loops.pop();
+                    loop_numbers.pop();
+                    if let Some(end) = loop_ends.get_mut(number) {
+                        *end = next_place.saturating_sub(1);
+                    }
                     if let Some(list) = header.and_then(slot).and_then(|index| preds.get_mut(index))
                     {
                         for &from in &last {
@@ -290,6 +337,13 @@ pub(super) fn structured(function: &Function, work: &mut Work) -> Graph {
                     if let Some(scope) = scopes.blocks.get_mut(index) {
                         *scope = body;
                     }
+                    if let Some(at) = place.get_mut(index) {
+                        *at = Some(next_place);
+                    }
+                    if let Some(outer) = outermost.get_mut(index) {
+                        *outer = loop_numbers.first().copied();
+                    }
+                    next_place = next_place.saturating_add(1);
                 }
                 if first && let Kind::Loop { header, .. } = &mut top.kind {
                     *header = Some(*block);
@@ -307,9 +361,12 @@ pub(super) fn structured(function: &Function, work: &mut Work) -> Graph {
                     }
                 } else {
                     loops.push(stack.len());
+                    loop_numbers.push(loop_ends.len());
+                    loop_ends.push(0);
                     Kind::Loop {
                         header: None,
                         breaks: Vec::new(),
+                        number: loop_ends.len().saturating_sub(1),
                     }
                 };
                 let index = scopes.bodies.len();
@@ -346,11 +403,27 @@ pub(super) fn structured(function: &Function, work: &mut Work) -> Graph {
         }
     }
     let reachable = reach(entry, &succs, count, work);
+    let reach = place
+        .iter()
+        .zip(&outermost)
+        .map(|(&own, &outer)| {
+            outer
+                .and_then(|number| loop_ends.get(number).copied())
+                .or(own)
+                .unwrap_or(usize::MAX)
+        })
+        .collect();
+    let places = entry.map(|entry| Places {
+        entry,
+        place,
+        reach,
+    });
     Graph {
         preds,
         succs,
         reachable,
         scopes,
+        places,
     }
 }
 

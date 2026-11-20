@@ -14,8 +14,8 @@ block3:
     %4: f32 = BitCastF32U32 %3
     %5 = SetAttribute a0x80, %4, u32 0x0
 block4:
-    %41: u32 = UndefU32
-    %40: opaque = Identity %41
+    %40: u32 = UndefU32
+    %39: opaque = Identity %40
     %7 = Prologue
     %8 = SetGotoVariable u32 0x3, u1 false
     %9 = SetGotoVariable u32 0x2, u1 false
@@ -35,7 +35,6 @@ block6:
 block7:
     %35: u1 = Phi [block5: u1 false], [block6: u1 true]
     %34: opaque = Identity %0
-    %39: opaque = Identity %41
     %21: opaque = Identity %0
     %22: opaque = Identity %35
     %23: u1 = LogicalNot %22
@@ -44,7 +43,7 @@ block7:
 block8:
     %26 = SetGotoVariable u32 0x1, u1 false
 block9:
-    %38: u32 = Phi [block1: u32 0x1], [block7: %41]
+    %38: u32 = Phi [block1: u32 0x1], [block7: %40]
     %36: opaque = Identity %35
     %27: opaque = Identity %35
     %28: u1 = LogicalNot u1 true

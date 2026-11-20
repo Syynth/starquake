@@ -11,7 +11,7 @@ block3:
     %4: f32 = BitCastF32U32 %37
     %5 = SetAttribute a0x80, %4, u32 0x0
 block4:
-    %41: u32 = UndefU32
+    %40: u32 = UndefU32
     %7 = Prologue
 block5:
     %18: u1 = LogicalNot %0
@@ -24,7 +24,7 @@ block7:
     %25: u1 = ConditionRef %24
 block8:
 block9:
-    %38: u32 = Phi [block1: u32 0x1], [block7: %41]
+    %38: u32 = Phi [block1: u32 0x1], [block7: %40]
     %28: opaque = Identity u1 false
     %29: u1 = LogicalOr %35, %28
     %30: u1 = ConditionRef %29
