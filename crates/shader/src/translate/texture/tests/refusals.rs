@@ -77,7 +77,8 @@ fn tex_refusals() {
         }),
         U::BindlessOperands,
     );
-    assert_refused_unencodable(
+    // `TEX.B.F16` encodes since the decoder reads bit 79 of `0x361`.
+    assert_refused(
         Op::Tex(OpTex {
             tex: TexRef::Bindless,
             f16: true,
