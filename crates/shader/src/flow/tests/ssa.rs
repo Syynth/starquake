@@ -93,11 +93,12 @@ enum Ending {
 
 /// Runs `function` from `machine` and says how it ended; any other error fails the test.
 fn ending(function: &Function, machine: &mut Machine) -> Ending {
-    match machine.run(function) {
-        Ok(_) => Ending::Returned,
-        Err(InterpError::ReachedUnreachable(_)) => Ending::Unreachable,
-        Err(error) => panic!("{error}\n{function}"),
+    let result = machine.run(function);
+    if let Err(InterpError::ReachedUnreachable(_)) = result {
+        return Ending::Unreachable;
     }
+    assert!(result.is_ok(), "{result:?}\n{function}");
+    Ending::Returned
 }
 
 /// The machine with constant buffer 0 holding `words`.
@@ -159,9 +160,9 @@ fn check(
 
 /// The path r20 holds after the flow blocks `blocks` ran, in order.
 fn path(blocks: &[u32]) -> u32 {
-    blocks
-        .iter()
-        .fold(0_u32, |path, &block| path.wrapping_mul(31).wrapping_add(block + 1))
+    blocks.iter().fold(0_u32, |path, &block| {
+        path.wrapping_mul(31).wrapping_add(block + 1)
+    })
 }
 
 /// The output the filled blocks store: the path's bits.
@@ -200,7 +201,11 @@ fn a_loop_runs_the_same_after_ssa() {
         .build();
     let tables = BranchTables::new(0);
     let (runs, optimized) = check(&code, &tables, &[[0, 0, 0], [2, 0, 0], [5, 0, 0]]);
-    let expected = [path(&[0, 1, 2]), path(&[0, 1, 2]), path(&[0, 1, 1, 1, 1, 2])];
+    let expected = [
+        path(&[0, 1, 2]),
+        path(&[0, 1, 2]),
+        path(&[0, 1, 1, 1, 1, 2]),
+    ];
     for ((ending, machine), expected) in runs.iter().zip(expected) {
         assert_eq!(*ending, Ending::Returned);
         assert_eq!(output(machine), expected);
@@ -248,7 +253,11 @@ fn nested_ifs_run_the_same_after_ssa() {
     distinct.sort_unstable();
     distinct.dedup();
     assert!(distinct.len() >= 3, "{outputs:?}");
-    assert!(has_phi(&optimized), "{:?}\n{optimized}", first_phi(&optimized));
+    assert!(
+        has_phi(&optimized),
+        "{:?}\n{optimized}",
+        first_phi(&optimized)
+    );
 }
 
 #[test]
@@ -309,5 +318,8 @@ fn an_indirect_branch_runs_the_same_after_ssa() {
     );
     assert_eq!(output(&runs[0].1), path(&[0, 1]));
     assert_eq!(output(&runs[1].1), path(&[0, 2]));
-    assert!(!optimized.to_string().contains("IndirectBranchVariable"), "{optimized}");
+    assert!(
+        !optimized.to_string().contains("IndirectBranchVariable"),
+        "{optimized}"
+    );
 }

@@ -19,20 +19,19 @@
 //!   one block that ends in `return` or `unreachable`, which lowers as that block followed by
 //!   the node of the same name. Any other control-flow graph is [`LowerError::ControlFlow`]:
 //!   it is to be structured first ([`crate::structure`]).
-//! - **Form.** The form the structurizer leaves: guest registers, predicates, uniform
+//! - **Form.** The form the structurizer leaves, or the SSA form the passes leave after it
+//!   (the owner's ruling of 2026-11-19, decision log, "Owner rulings on the wave 44 and 45
+//!   questions", row 3: Eden's order, the structurizer first and SSA after it, on the
+//!   structured function; slice 8b, `crate::opt`). Guest registers, predicates, uniform
 //!   registers and predicates, the four condition-code flags, the goto variables and the
-//!   indirect branch variable are read and written through their get and set opcodes, and each
-//!   becomes a local variable of the entry point, zero (or false) at entry, as the interpreter
-//!   reads an unwritten one ([`crate::interp`]). The owner's ruling of 2026-11-19 (decision
-//!   log, "Owner rulings on the wave 44 and 45 questions", row 3, as the owner corrected it
-//!   that day) follows Eden's order: the structurizer runs first and SSA after it, on the
-//!   structured function, which needs slice 8b (#467, not built yet: `opt::ssa` still refuses
-//!   structured functions). This slice's choice until then: the goto variables, the indirect
-//!   branch variable and the flags are lowered here as the zero-initialised locals above, and
-//!   this slice runs no SSA pass of its own after structuring. Phis are refused
-//!   ([`LowerError::Phi`]), a listed divergence (below): a structured phi can only come from an
-//!   SSA pass that runs on structured functions, which is not built yet; once slice 8b lands,
-//!   phis reach this lowering and need lowering.
+//!   indirect branch variable that are still read and written through their get and set
+//!   opcodes each become a local variable of the entry point, zero (or false) at entry, as the
+//!   interpreter reads an unwritten one ([`crate::interp`]); after the SSA rewrite and dead
+//!   code elimination none is left. Each phi becomes a local variable of its type, stored at
+//!   the end of each block it names and loaded at the start of its own block, which is the
+//!   structured-phi rule (the value comes from the block run last; "Structured control
+//!   flow"). A phi of a type with no naga type here (the 64-bit float types) is
+//!   [`LowerError::Phi`].
 //!
 //! # Structured control flow
 //!
@@ -42,7 +41,11 @@
 //! `if repeat {} else { break }`, so the repeat condition is read in the body's scope, after it,
 //! as the verifier checks it; a `break` is `if cond { break }` (naga's `If` is not a break
 //! target, so it leaves the innermost loop); `return` returns the output struct (or nothing);
-//! the entry point's body always ends with that return. **Divergence:** `unreachable` lowers as
+//! the entry point's body always ends with that return. A phi's incoming value is stored at
+//! the end of the block it names, where it must already be computed and in scope (an `if` or
+//! loop body's values leave scope when the body ends, as naga's do); the SSA rewrite only
+//! names such values (`opt::ssa`), and any other is [`LowerError::PhiIncoming`]
+//! (`tests::structured::a_phi_value_out_of_scope_is_refused`). **Divergence:** `unreachable` lowers as
 //! the same return. Eden emits `OpUnreachable` (`emit_spirv_control_flow.cpp`), whose
 //! behaviour is undefined when reached; naga has no such statement, and a return is defined.
 //! Pinned by `tests::structured::unreachable_returns`.
@@ -157,7 +160,7 @@
 //!    ([`LowerError::SharedMemory`]).
 //! 4. The control-flow form ([`LowerError::ControlFlow`]).
 //! 5. Each listed instruction, blocks in arena order, for what the interface and the variables
-//!    need: phis, name and attribute operands, stages, colour outputs.
+//!    need: phi types, name and attribute operands, stages, colour outputs.
 //! 6. The body, in tree order: unlowered operations and operand forms.
 //! 7. The requirements against the target ([`LowerError::Missing`]).
 //! 8. naga's validation ([`LowerError::Validation`], a bug in this module if it happens).
@@ -177,7 +180,8 @@
 //! | NaN handling (comparisons, NaN-aware minimum, maximum and clamp, NaN to 0 on conversion) | Written out with `isnan`: wgpu-hal 30.0.2's Metal backend leaves the Metal compiler's default fast math on, under which a plain comparison treats a NaN as an ordinary value (measured on an Apple GPU: two NaNs compared equal); `isnan` and selects on it gave the interpreter's results there. Other hosts are not measured | The interpreter's results | `tests::ops::float_operations_match_the_interpreter_on_the_gpu` |
 //! | `f32` and `f16` from an integer, no mode carried | naga's conversion, rounding as the host does (to nearest even on an Apple GPU, measured) | Round to nearest even (the interpreter) | `tests::ops::int_to_float_rounds_as_the_host_does_on_the_gpu` (the same module, by `tests::opcodes::conversions_lower_whatever_their_rounding`) |
 //! | NaN result bits of float arithmetic: `FPAdd32` of a NaN, `FPMul32` of infinity by 0, `FPSqrt` of -1, `FPMax32` of two NaNs, an `FPAdd16` NaN widened to f32 (the cases measured) | The host's bits, not canonicalised: an Apple GPU gave 0x7fc0_0000 for each | The interpreter's canonical NaN (the binary32 one is itself a guess, `interp::float`) | `tests::ops::nan_results_are_the_hosts_on_the_gpu` |
-//! | A phi in a structured function | Refused ([`LowerError::Phi`]): the structurizer's pre-SSA form is lowered (see "What it takes") | Eden lowers its phis (`emit_spirv.cpp` @ cf654052, `EmitPhi`) | `tests::structured::a_structured_phi_is_refused` |
+//! | A phi | A local variable: stored at the end of each block it names, loaded at the start of its block | Eden's `EmitPhi` (`emit_spirv.cpp` @ cf654052), an `OpPhi`, whose operands it patches in afterwards | `tests::structured::structured_phis_match_the_interpreter_on_the_gpu` |
+//! | A phi in the first block run (no block ran before it) | Reads its local variable's zero | The interpreter refuses it (`PhiAtStart`); Eden has no such phi (its first block has no predecessors, and its rewrite makes no phi there) | `tests::unlowered_forms_are_refused` |
 //! | A non-finite `f32` immediate | Its bits, reinterpreted: naga 30.0.1 refuses a NaN or infinite literal | A literal | `tests::opcodes::non_finite_immediates_are_bit_casts` |
 //! | Float to integer at or past 2^31 (2^32 unsigned) | Selects the maximum: naga's saturating conversion stops at the largest float below it (`naga_f2i32` gave 0x7fffff80, measured) | The interpreter saturates to the maximum | `tests::ops::conversions_and_variables_match_the_interpreter_on_the_gpu` |
 //! | Shared-memory word index | `offset >> 2`, logical | `OpShiftRightArithmetic` (`emit_spirv_shared_memory.cpp`), which differs only for offsets of 2^31 and up, all out of bounds here | `tests::memory::shared_offsets_at_and_past_the_end` |
@@ -210,8 +214,8 @@ use crate::host::{
 };
 use crate::ir::ATTRIBUTE_COMPONENTS as COMPONENTS;
 use crate::ir::{
-    Attribute, Function, Imm, Inst, Node, Opcode, Operand, Operation, Terminator, Type, Value,
-    VerifyError,
+    Attribute, BlockId, Function, Imm, Inst, Node, Opcode, Operand, Operation, Terminator, Type,
+    Value, VerifyError,
 };
 pub use crate::ir::{GENERIC_0_X, POSITION_X};
 use crate::translate::{COLOR_TARGETS, GuestStage};
@@ -292,9 +296,26 @@ pub enum LowerError {
         /// Its opcode.
         opcode: Opcode,
     },
-    /// A phi, which the lowering does not handle (see the module docs, "What it takes").
-    #[error("{0}: phis are not lowered")]
-    Phi(Value),
+    /// A phi of a type the lowering has no naga type for (see the module docs, "What it
+    /// takes").
+    #[error("{at}: a phi of type {ty} is not lowered")]
+    Phi {
+        /// The phi.
+        at: Value,
+        /// Its type.
+        ty: Type,
+    },
+    /// A phi names a value that is not computed, or not in scope, at the end of the block it
+    /// takes it from (see the module docs, "Structured control flow").
+    #[error("{at} takes {value} from {from}, where it is not in scope")]
+    PhiIncoming {
+        /// The phi.
+        at: Value,
+        /// The block it takes the value from.
+        from: BlockId,
+        /// The value.
+        value: Value,
+    },
     /// An argument the lowering needs as an immediate of a particular kind is something else.
     #[error("{at}: argument {index} is not an immediate the lowering handles")]
     Operand {
@@ -572,8 +593,16 @@ impl Interface {
         let vertex = stage == GuestStage::Vertex;
         let mut found = Self::default();
         for (at, inst) in function.listed() {
-            let Inst::Op(op) = inst else {
-                return Err(LowerError::Phi(at));
+            let op = match inst {
+                Inst::Op(op) => op,
+                Inst::Phi(phi) => {
+                    if naga_inner(phi.ty).is_none() {
+                        return Err(LowerError::Phi { at, ty: phi.ty });
+                    }
+                    found.requirements.f16 |= is_f16(phi.ty);
+                    found.requirements.i64 |= phi.ty == Type::U64;
+                    continue;
+                }
             };
             if let Some(var) = Var::of(at, op)? {
                 found.vars.insert(var);
@@ -763,6 +792,7 @@ pub fn lower_with(
     }
     lowering.declare_memory(&interface, inputs)?;
     lowering.values = vec![None; function.insts().count()];
+    lowering.declare_phis(function)?;
 
     let mut body = Block::new();
     lowering.nodes(function, &nodes, &mut body)?;
@@ -845,6 +875,12 @@ struct Lowering {
     /// Each IR value's expression, by value index.
     values: Vec<Option<Handle<Expression>>>,
     vars: BTreeMap<Var, Handle<LocalVariable>>,
+    /// Each phi's local variable.
+    phis: BTreeMap<Value, Handle<LocalVariable>>,
+    /// The stores at the end of each block: the phi, its local and the incoming value.
+    phi_stores: BTreeMap<BlockId, Vec<(Value, Handle<LocalVariable>, Operand)>>,
+    /// The values lowered, in order, so a body's can leave scope when it ends.
+    scope_log: Vec<Value>,
     input_args: BTreeMap<u8, u32>,
     lane_arg: Option<u32>,
     workgroup_id_arg: Option<u32>,
@@ -865,6 +901,9 @@ impl Lowering {
             types,
             values: Vec::new(),
             vars: BTreeMap::new(),
+            phis: BTreeMap::new(),
+            phi_stores: BTreeMap::new(),
+            scope_log: Vec::new(),
             input_args: BTreeMap::new(),
             lane_arg: None,
             workgroup_id_arg: None,
@@ -1114,6 +1153,85 @@ impl Lowering {
         );
         push(body, Statement::Store { pointer, value });
         Ok(())
+    }
+
+    /// Declares a local variable for each phi and records the stores each block ends with.
+    fn declare_phis(&mut self, function: &Function) -> Result<(), LowerError> {
+        for (at, inst) in function.listed() {
+            let Inst::Phi(phi) = inst else { continue };
+            let ty = self.ir_type(phi.ty)?;
+            let local = self.fb.local(&format!("phi{}", at.index()), ty);
+            self.phis.insert(at, local);
+            for &(from, operand) in &phi.incoming {
+                self.phi_stores
+                    .entry(from)
+                    .or_default()
+                    .push((at, local, operand));
+            }
+        }
+        Ok(())
+    }
+
+    /// Loads phi `at`'s local variable as its value.
+    pub(super) fn phi_load(&mut self, body: &mut Block, at: Value) -> Result<(), LowerError> {
+        let local = *self
+            .phis
+            .get(&at)
+            .ok_or_else(|| LowerError::Internal(format!("no variable for {at}")))?;
+        let pointer = self.expr(body, Expression::LocalVariable(local));
+        let value = self.expr(body, Expression::Load { pointer });
+        self.record(at, value)
+    }
+
+    /// Stores, at the end of `block`, each value a phi takes from it.
+    pub(super) fn phi_stores(
+        &mut self,
+        body: &mut Block,
+        block: BlockId,
+    ) -> Result<(), LowerError> {
+        let Some(stores) = self.phi_stores.get(&block).cloned() else {
+            return Ok(());
+        };
+        for (at, local, operand) in stores {
+            let value = match operand {
+                Operand::Value(value) => {
+                    self.value(value).map_err(|_| LowerError::PhiIncoming {
+                        at,
+                        from: block,
+                        value,
+                    })?
+                }
+                Operand::Imm(_) => self.operand(body, at, 0, operand)?,
+            };
+            let pointer = self.expr(body, Expression::LocalVariable(local));
+            push(body, Statement::Store { pointer, value });
+        }
+        Ok(())
+    }
+
+    /// Records the expression of instruction `at`, which is in scope until the body that
+    /// holds it ends ([`Lowering::end_scope`]).
+    pub(super) fn record(&mut self, at: Value, expr: Handle<Expression>) -> Result<(), LowerError> {
+        let slot = usize::try_from(at.index())
+            .ok()
+            .and_then(|slot| self.values.get_mut(slot))
+            .ok_or_else(|| LowerError::Internal(format!("{at} is outside the arena")))?;
+        *slot = Some(expr);
+        self.scope_log.push(at);
+        Ok(())
+    }
+
+    /// Takes the values recorded since `mark` out of scope (an `if` or loop body has ended).
+    pub(super) fn end_scope(&mut self, mark: usize) {
+        let ended: Vec<Value> = self.scope_log.drain(mark..).collect();
+        for value in ended {
+            if let Some(slot) = usize::try_from(value.index())
+                .ok()
+                .and_then(|slot| self.values.get_mut(slot))
+            {
+                *slot = None;
+            }
+        }
     }
 
     /// Ends the invocation: returns the output struct, or nothing.

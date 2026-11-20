@@ -87,10 +87,16 @@ fn a_loop_carries_its_value_in_a_header_phi_and_out_in_a_phi() {
     }
     let text = out.to_string();
     // The header merges the entry's 0 and the back edge's %3.
-    assert!(text.contains("Phi [block0: u32 0x0], [block1: %3]"), "{text}");
+    assert!(
+        text.contains("Phi [block0: u32 0x0], [block1: %3]"),
+        "{text}"
+    );
     // block2's one predecessor is block1, inside the loop body: %3 is out of scope after
     // the loop, so a phi of one operand carries it out.
-    assert!(text.contains("block2:\n    %9: u32 = Phi [block1: %3]\n"), "{text}");
+    assert!(
+        text.contains("block2:\n    %9: u32 = Phi [block1: %3]\n"),
+        "{text}"
+    );
     insta::assert_snapshot!("structured_count", text);
 }
 
@@ -332,9 +338,7 @@ fn the_first_fault_in_block_order_is_refused_in_a_structured_function() {
     let goto = "    %1: u32 = GetCbufU32 u32 0, u32 0\n    %2 = SetGotoVariable %1, u1 true\n";
     let phi = "    %4: u32 = Phi\n";
     let text = |first: &str, second: &str| {
-        format!(
-            "block0:\n{first}block1:\n{second}structure:\n    block0\n    block1\n    return\n"
-        )
+        format!("block0:\n{first}block1:\n{second}structure:\n    block0\n    block1\n    return\n")
     };
     for (first, second, expected) in [
         (goto, phi, PassError::GotoIndex(value(2))),
@@ -397,5 +401,89 @@ fn the_structurizers_variables_are_gone_after_ssa() {
         let after = ran(&optimized, &start);
         assert_eq!(after.outputs, before.outputs);
         assert_eq!(before.outputs.values().copied().collect::<Vec<_>>(), [r1]);
+    }
+}
+
+#[test]
+fn the_rewrites_work_on_the_structured_diamond() {
+    // The exact work of one fixed input (the parent module's "Cost"), counted from this code: a
+    // change is explained in its pull request. The shortcut to the entry keeps it here; walking
+    // every read back through the blocks, as Eden does, takes more.
+    let mut structured = structure(parse(GRAPH), MAX_STRUCTURE_WORK)
+        .expect("structures")
+        .function;
+    let work = run(&mut structured, Pass::SsaRewrite).expect("rewrites");
+    assert_eq!(work.steps(), 256);
+}
+
+/// A loop whose first block reads r0 and whose second block writes it: the write reaches the
+/// read along the back edge, though it comes later in the tree than the read.
+const LATER_WRITE: &str = "block0:
+    %0: u32 = GetCbufU32 u32 0, u32 0
+block1:
+    %1: u32 = GetRegister r0
+    %2: u32 = IAdd32 %1, u32 2
+    %3: u1 = ULessThan %2, %0
+block2:
+    %4 = SetRegister r0, %2
+block3:
+    %5: u32 = GetRegister r0
+    %6 = SetRegister r1, %5
+structure:
+    block0
+    loop {
+        block1
+        block2
+    } repeat %3
+    block3
+    return
+";
+
+#[test]
+fn a_write_later_in_a_loop_reaches_its_first_block() {
+    // The read in block1 is not past every write of r0 (block2's, later in the tree, reaches it
+    // round the loop), so it is not taken from the entry.
+    let starts = [machine(&[0]), machine(&[6]), machine(&[7])];
+    let out = rewrite_keeps_state(LATER_WRITE, &starts);
+    for (word, r1) in [(0, 2), (6, 6), (7, 8)] {
+        assert_eq!(ran(&out, &machine(&[word])).regs[1], r1);
+    }
+    let text = out.to_string();
+    assert!(text.contains("Phi [block0: %"), "{text}");
+}
+
+/// An inner loop reads r0, which the outer loop writes after the inner one: the write reaches
+/// the read round the outer loop, past the inner loop's end.
+const NESTED_LATER_WRITE: &str = "block0:
+    %0: u32 = GetCbufU32 u32 0, u32 0
+block1:
+    %1: u32 = GetRegister r0
+    %2: u32 = IAdd32 %1, u32 1
+    %7 = SetRegister r2, %2
+block2:
+    %8: u32 = GetRegister r2
+    %3 = SetRegister r0, %8
+    %4: u1 = ULessThan %8, %0
+block3:
+    %5: u32 = GetRegister r0
+    %6 = SetRegister r1, %5
+structure:
+    block0
+    loop {
+        loop {
+            block1
+        } repeat u1 false
+        block2
+    } repeat %4
+    block3
+    return
+";
+
+#[test]
+fn a_read_in_an_inner_loop_reaches_to_the_outermost_loops_end() {
+    let starts = [machine(&[0]), machine(&[3])];
+    let out = rewrite_keeps_state(NESTED_LATER_WRITE, &starts);
+    for (word, r1) in [(0, 1), (3, 3)] {
+        assert_eq!(ran(&out, &machine(&[word])).regs[1], r1);
     }
 }

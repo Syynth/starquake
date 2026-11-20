@@ -1,0 +1,126 @@
+---
+source: crates/shader/src/lower/tests/structured.rs
+expression: msl(&shader)
+---
+// language: metal2.4
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using metal::uint;
+
+
+[[max_total_threads_per_threadgroup(1)]] kernel void main_(
+) {
+    uint r0_ = {};
+    uint r1_ = {};
+    uint r2_ = {};
+    uint r3_ = {};
+    bool goto0_ = {};
+    bool goto1_ = {};
+    bool goto2_ = {};
+    bool goto3_ = {};
+    bool goto4_ = {};
+    bool goto5_ = {};
+    bool goto6_ = {};
+    bool goto7_ = {};
+    bool goto8_ = {};
+    bool goto9_ = {};
+    bool goto10_ = {};
+    bool goto11_ = {};
+    bool goto12_ = {};
+    uint phi77_ = {};
+    uint phi78_ = {};
+    uint phi79_ = {};
+    bool phi81_ = {};
+    uint phi83_ = {};
+    goto8_ = false;
+    goto12_ = false;
+    goto7_ = false;
+    goto11_ = false;
+    goto6_ = false;
+    goto5_ = false;
+    goto4_ = false;
+    goto3_ = false;
+    goto10_ = false;
+    goto2_ = false;
+    goto9_ = false;
+    goto1_ = false;
+    goto0_ = false;
+    goto0_ = false;
+    r0_ = 0u;
+    r1_ = 10u;
+    goto1_ = true;
+    phi77_ = 0u;
+    phi78_ = 10u;
+    uint2 loop_bound = uint2(4294967295u);
+    while(true) {
+        if (metal::all(loop_bound == uint2(0u))) { break; }
+        loop_bound -= uint2(loop_bound.y == 0u, 1u);
+        uint _e39 = phi77_;
+        uint _e41 = phi78_;
+        goto1_ = false;
+        uint _e44 = _e39 + _e41;
+        r0_ = _e44;
+        uint _e47 = _e41 - 1u;
+        r1_ = _e47;
+        bool _e50 = _e47 != 0u;
+        goto9_ = _e50;
+        goto1_ = _e50;
+        phi77_ = _e44;
+        phi78_ = _e47;
+        phi79_ = _e44;
+        if (_e50) {
+        } else {
+            break;
+        }
+    }
+    uint _e57 = phi79_;
+    goto2_ = false;
+    bool _e61 = _e57 > 50u;
+    goto10_ = _e61;
+    goto3_ = _e61;
+    phi81_ = false;
+    if (!(_e61)) {
+        goto4_ = true;
+        phi81_ = true;
+    }
+    bool _e72 = phi81_;
+    if (_e61 || !(_e72)) {
+        goto3_ = false;
+        r2_ = 1u;
+    }
+    if (_e72 || false) {
+        goto4_ = false;
+        r2_ = 2u;
+    }
+    goto5_ = false;
+    r3_ = 0u;
+    goto6_ = true;
+    phi83_ = 0u;
+    uint2 loop_bound_1 = uint2(4294967295u);
+    while(true) {
+        if (metal::all(loop_bound_1 == uint2(0u))) { break; }
+        loop_bound_1 -= uint2(loop_bound_1.y == 0u, 1u);
+        uint _e94 = phi83_;
+        goto6_ = false;
+        uint _e98 = _e94 + 1u;
+        r3_ = _e98;
+        bool _e101 = _e98 == 7u;
+        goto11_ = _e101;
+        goto8_ = _e101;
+        if (_e101) {
+            break;
+        }
+        goto7_ = false;
+        bool _e107 = _e98 < 100u;
+        goto12_ = _e107;
+        goto6_ = _e107;
+        phi83_ = _e98;
+        if (_e107) {
+        } else {
+            break;
+        }
+    }
+    goto8_ = false;
+    return;
+}

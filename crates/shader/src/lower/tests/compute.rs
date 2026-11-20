@@ -358,8 +358,11 @@ fn compute_errors_read_as_words() {
             "101377 bytes of shared memory are more than the 101376 the lowering allows".to_owned(),
         ),
         (
-            LowerError::Phi(value_at(&function, 0)),
-            "%0: phis are not lowered".to_owned(),
+            LowerError::Phi {
+                at: value_at(&function, 0),
+                ty: Type::F64,
+            },
+            "%0: a phi of type f64 is not lowered".to_owned(),
         ),
     ];
     for (error, text) in cases {

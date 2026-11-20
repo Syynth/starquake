@@ -14,6 +14,9 @@
 
 use crate::ir::{BlockId, Function, Node, Operand};
 
+#[cfg(test)]
+mod tests;
+
 use super::super::{PassError, Work, reachable, slot};
 
 /// The scopes of a structured tree: the root and each `if` or loop body, numbered in tree
@@ -223,7 +226,9 @@ enum Kind {
     Root,
     /// An `if`: the blocks that can have run last before it, which are also last after it
     /// when its condition is false.
-    If { before: Vec<BlockId> },
+    If {
+        before: Vec<BlockId>,
+    },
     /// A loop: its first block, which the end of the body jumps back to, the blocks that
     /// can have run last at each `break`, and its number in the walk's loop ends.
     Loop {
@@ -260,15 +265,7 @@ fn sort_dedup(list: &mut Vec<BlockId>) {
 /// any loop adds no edge (the verifier refuses one). Each predecessor list is sorted by block
 /// index, Eden's `OrderPhiArgs` order. The walk takes one step per node and one per edge.
 pub(super) fn structured(function: &Function, work: &mut Work) -> Graph {
-    let count = function.block_count();
-    let mut preds: Vec<Vec<BlockId>> = vec![Vec::new(); count];
-    let mut scopes = Scopes {
-        bodies: vec![(0, 0)],
-        blocks: vec![0; count],
-    };
-    let mut clock: u64 = 1;
-    let mut entry = None;
-    let mut last: Vec<BlockId> = Vec::new();
+    let mut walk = Walk::new(function.block_count());
     let tree = function.structure().unwrap_or(&[]);
     let mut stack = vec![Frame {
         nodes: tree.iter(),
@@ -276,159 +273,237 @@ pub(super) fn structured(function: &Function, work: &mut Work) -> Graph {
         body: 0,
         started: false,
     }];
-    // The frames that are loops, innermost last.
-    let mut loops: Vec<usize> = Vec::new();
-    // Places: the next one, each block's, each loop's last, each block's outermost loop.
-    let mut next_place = 0_usize;
-    let mut place: Vec<Option<usize>> = vec![None; count];
-    let mut loop_ends: Vec<usize> = Vec::new();
-    let mut outermost: Vec<Option<usize>> = vec![None; count];
-    // The numbers of the loops open, outermost first.
-    let mut loop_numbers: Vec<usize> = Vec::new();
     while let Some(top) = stack.last_mut() {
         let first = !top.started;
         top.started = true;
         let Some(node) = top.nodes.next() else {
-            let Some(frame) = stack.pop() else { break };
-            if let Some(interval) = scopes.bodies.get_mut(frame.body) {
-                interval.1 = clock;
-            }
-            clock = clock.saturating_add(1);
-            match frame.kind {
-                Kind::Root => {}
-                Kind::If { before } => {
-                    last.extend(before);
-                    sort_dedup(&mut last);
-                }
-                Kind::Loop {
-                    header,
-                    breaks,
-                    number,
-                } => {
-                    loops.pop();
-                    loop_numbers.pop();
-                    if let Some(end) = loop_ends.get_mut(number) {
-                        *end = next_place.saturating_sub(1);
-                    }
-                    if let Some(list) = header.and_then(slot).and_then(|index| preds.get_mut(index))
-                    {
-                        for &from in &last {
-                            work.step();
-                            list.push(from);
-                        }
-                    }
-                    last.extend(breaks);
-                    sort_dedup(&mut last);
-                }
+            if let Some(frame) = stack.pop() {
+                walk.close(frame, work);
             }
             continue;
         };
         work.step();
-        let body = top.body;
         match node {
             Node::Block(block) => {
-                if let Some(index) = slot(*block) {
-                    if let Some(list) = preds.get_mut(index) {
-                        for &from in &last {
-                            work.step();
-                            list.push(from);
-                        }
-                    }
-                    if let Some(scope) = scopes.blocks.get_mut(index) {
-                        *scope = body;
-                    }
-                    if let Some(at) = place.get_mut(index) {
-                        *at = Some(next_place);
-                    }
-                    if let Some(outer) = outermost.get_mut(index) {
-                        *outer = loop_numbers.first().copied();
-                    }
-                    next_place = next_place.saturating_add(1);
-                }
+                walk.block(*block, top.body, work);
                 if first && let Kind::Loop { header, .. } = &mut top.kind {
                     *header = Some(*block);
                 }
-                if entry.is_none() && first && matches!(top.kind, Kind::Root) {
-                    entry = Some(*block);
+                if walk.entry.is_none() && first && matches!(top.kind, Kind::Root) {
+                    walk.entry = Some(*block);
                 }
-                last.clear();
-                last.push(*block);
             }
             Node::If { body: inner, .. } | Node::Loop { body: inner, .. } => {
-                let kind = if matches!(node, Node::If { .. }) {
-                    Kind::If {
-                        before: last.clone(),
-                    }
-                } else {
-                    loops.push(stack.len());
-                    loop_numbers.push(loop_ends.len());
-                    loop_ends.push(0);
-                    Kind::Loop {
-                        header: None,
-                        breaks: Vec::new(),
-                        number: loop_ends.len().saturating_sub(1),
-                    }
-                };
-                let index = scopes.bodies.len();
-                scopes.bodies.push((clock, 0));
-                clock = clock.saturating_add(1);
-                stack.push(Frame {
-                    nodes: inner.iter(),
-                    kind,
-                    body: index,
-                    started: false,
-                });
+                let is_loop = matches!(node, Node::Loop { .. });
+                let frame = walk.open(inner, is_loop, stack.len());
+                stack.push(frame);
             }
             Node::Break { .. } => {
                 if let Some(Frame {
                     kind: Kind::Loop { breaks, .. },
                     ..
-                }) = loops.last().and_then(|&index| stack.get_mut(index))
+                }) = walk.loops.last().and_then(|&index| stack.get_mut(index))
                 {
-                    breaks.extend_from_slice(&last);
+                    breaks.extend_from_slice(&walk.last);
                 }
             }
-            Node::Return | Node::Unreachable => last.clear(),
+            Node::Return | Node::Unreachable => walk.last.clear(),
         }
     }
-    let ids: Vec<BlockId> = function.blocks().map(|(id, _)| id).collect();
-    let mut succs: Vec<Vec<BlockId>> = vec![Vec::new(); count];
-    for (list, &to) in preds.iter_mut().zip(&ids) {
-        sort_dedup(list);
-        for &from in list.iter() {
-            work.step();
-            if let Some(out) = slot(from).and_then(|from| succs.get_mut(from)) {
-                out.push(to);
+    walk.finish(function, work)
+}
+
+/// The state of [`structured`]'s walk.
+struct Walk {
+    preds: Vec<Vec<BlockId>>,
+    scopes: Scopes,
+    /// The count the scopes' intervals are taken from.
+    clock: u64,
+    /// The tree's first block.
+    entry: Option<BlockId>,
+    /// The blocks that can have run last.
+    last: Vec<BlockId>,
+    /// The frames that are loops, innermost last.
+    loops: Vec<usize>,
+    /// The numbers of the loops open, outermost first.
+    loop_numbers: Vec<usize>,
+    /// The next place in tree order.
+    next_place: usize,
+    /// Each block's place.
+    place: Vec<Option<usize>>,
+    /// Each loop's last place, by number.
+    loop_ends: Vec<usize>,
+    /// Each block's outermost loop, by number.
+    outermost: Vec<Option<usize>>,
+}
+
+impl Walk {
+    fn new(count: usize) -> Self {
+        Self {
+            preds: vec![Vec::new(); count],
+            scopes: Scopes {
+                bodies: vec![(0, 0)],
+                blocks: vec![0; count],
+            },
+            clock: 1,
+            entry: None,
+            last: Vec::new(),
+            loops: Vec::new(),
+            loop_numbers: Vec::new(),
+            next_place: 0,
+            place: vec![None; count],
+            loop_ends: Vec::new(),
+            outermost: vec![None; count],
+        }
+    }
+
+    /// Adds an edge from each of the blocks run last to `to`.
+    fn edges_to(&mut self, to: Option<BlockId>, work: &mut Work) {
+        if let Some(list) = to
+            .and_then(slot)
+            .and_then(|index| self.preds.get_mut(index))
+        {
+            for &from in &self.last {
+                work.step();
+                list.push(from);
             }
         }
     }
-    let reachable = reach(entry, &succs, count, work);
-    let reach = place
-        .iter()
-        .zip(&outermost)
-        .map(|(&own, &outer)| {
-            outer
-                .and_then(|number| loop_ends.get(number).copied())
-                .or(own)
-                .unwrap_or(usize::MAX)
-        })
-        .collect();
-    let places = entry.map(|entry| Places {
-        entry,
-        place,
-        reach,
-    });
-    Graph {
-        preds,
-        succs,
-        reachable,
-        scopes,
-        places,
+
+    /// Walks `block`, placed in body `body`: it follows the blocks run last, and is then the
+    /// only one.
+    fn block(&mut self, block: BlockId, body: usize, work: &mut Work) {
+        self.edges_to(Some(block), work);
+        if let Some(index) = slot(block) {
+            if let Some(scope) = self.scopes.blocks.get_mut(index) {
+                *scope = body;
+            }
+            if let Some(at) = self.place.get_mut(index) {
+                *at = Some(self.next_place);
+            }
+            if let Some(outer) = self.outermost.get_mut(index) {
+                *outer = self.loop_numbers.first().copied();
+            }
+            self.next_place = self.next_place.saturating_add(1);
+        }
+        self.last.clear();
+        self.last.push(block);
+    }
+
+    /// Opens the body `inner` of an `if` or a loop, whose frame will be at `depth`.
+    fn open<'t>(&mut self, inner: &'t [Node], is_loop: bool, depth: usize) -> Frame<'t> {
+        let kind = if is_loop {
+            self.loops.push(depth);
+            let number = self.loop_ends.len();
+            self.loop_numbers.push(number);
+            self.loop_ends.push(0);
+            Kind::Loop {
+                header: None,
+                breaks: Vec::new(),
+                number,
+            }
+        } else {
+            Kind::If {
+                before: self.last.clone(),
+            }
+        };
+        let body = self.scopes.bodies.len();
+        self.scopes.bodies.push((self.clock, 0));
+        self.clock = self.clock.saturating_add(1);
+        Frame {
+            nodes: inner.iter(),
+            kind,
+            body,
+            started: false,
+        }
+    }
+
+    /// Closes `frame`'s body: an `if` adds the blocks before it to those run last; a loop's
+    /// first block follows the end of its body, and the `break`s' blocks join those run last.
+    fn close(&mut self, frame: Frame<'_>, work: &mut Work) {
+        if let Some(interval) = self.scopes.bodies.get_mut(frame.body) {
+            interval.1 = self.clock;
+        }
+        self.clock = self.clock.saturating_add(1);
+        match frame.kind {
+            Kind::Root => {}
+            Kind::If { before } => {
+                self.last.extend(before);
+                sort_dedup(&mut self.last);
+            }
+            Kind::Loop {
+                header,
+                breaks,
+                number,
+            } => {
+                self.loops.pop();
+                self.loop_numbers.pop();
+                if let Some(end) = self.loop_ends.get_mut(number) {
+                    *end = self.next_place.saturating_sub(1);
+                }
+                self.edges_to(header, work);
+                self.last.extend(breaks);
+                sort_dedup(&mut self.last);
+            }
+        }
+    }
+
+    /// The graph: predecessor lists sorted, successors, reachability and places.
+    fn finish(self, function: &Function, work: &mut Work) -> Graph {
+        let Self {
+            mut preds,
+            scopes,
+            entry,
+            place,
+            loop_ends,
+            outermost,
+            ..
+        } = self;
+        let count = function.block_count();
+        let ids: Vec<BlockId> = function.blocks().map(|(id, _)| id).collect();
+        let mut succs: Vec<Vec<BlockId>> = vec![Vec::new(); count];
+        for (list, &to) in preds.iter_mut().zip(&ids) {
+            sort_dedup(list);
+            for &from in list.iter() {
+                work.step();
+                if let Some(out) = slot(from).and_then(|from| succs.get_mut(from)) {
+                    out.push(to);
+                }
+            }
+        }
+        let reachable = reach(entry, &succs, count, work);
+        let reach = place
+            .iter()
+            .zip(&outermost)
+            .map(|(&own, &outer)| {
+                outer
+                    .and_then(|number| loop_ends.get(number).copied())
+                    .or(own)
+                    .unwrap_or(usize::MAX)
+            })
+            .collect();
+        let places = entry.map(|entry| Places {
+            entry,
+            place,
+            reach,
+        });
+        Graph {
+            preds,
+            succs,
+            reachable,
+            scopes,
+            places,
+        }
     }
 }
 
 /// The blocks `entry` reaches along `succs`.
-fn reach(entry: Option<BlockId>, succs: &[Vec<BlockId>], count: usize, work: &mut Work) -> Vec<bool> {
+fn reach(
+    entry: Option<BlockId>,
+    succs: &[Vec<BlockId>],
+    count: usize,
+    work: &mut Work,
+) -> Vec<bool> {
     let mut seen = vec![false; count];
     let mut stack: Vec<BlockId> = Vec::new();
     if let Some(entry) = entry
@@ -438,7 +513,10 @@ fn reach(entry: Option<BlockId>, succs: &[Vec<BlockId>], count: usize, work: &mu
         stack.push(entry);
     }
     while let Some(block) = stack.pop() {
-        for &to in slot(block).and_then(|index| succs.get(index)).map_or(&[][..], Vec::as_slice) {
+        for &to in slot(block)
+            .and_then(|index| succs.get(index))
+            .map_or(&[][..], Vec::as_slice)
+        {
             work.step();
             if let Some(flag) = slot(to).and_then(|index| seen.get_mut(index))
                 && !*flag

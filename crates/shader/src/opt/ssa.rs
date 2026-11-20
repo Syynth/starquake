@@ -29,7 +29,80 @@
 //!   `constant` module), and a write to one is ignored. The verifier refuses both
 //!   (`ir`'s `ReservedName`), so a verified function has none.
 //!
-//! Where this pass departs from Eden's, each pinned by a test in `tests`:
+//! # Structured functions
+//!
+//! The rewrite runs after the structurizer, on the structured function, in Eden's order (the
+//! owner's ruling of 2026-11-19, decision log, "Owner rulings on the wave 44 and 45 questions",
+//! row 3: `frontend/maxwell/translate_program.cpp` @ cf654052 calls `BuildASL` at line 337 and
+//! `SsaRewritePass` at line 389). It also still takes a control-flow graph, as slice 8 built it
+//! (the departures below that name a graph are about that form). On a structured function:
+//!
+//! - **Predecessors come from the tree** (the `tree` submodule). Eden's structurizer records
+//!   them as it emits the tree (`frontend/maxwell/structured_control_flow.cpp`,
+//!   `TranslatePass::Visit`, each `AddBranch`), and its rewrite reads them
+//!   (`ImmPredecessors`). Here a structured block has no terminator, so the edges are derived
+//!   by the structured-phi rule the interpreter and the structurizer use (`crate::interp`: a
+//!   phi takes the value from the block run last): a block's predecessors are the blocks that
+//!   can have run last before it. An `if`'s condition may be false and a `break`'s may be
+//!   false, so both pass on the blocks before them; a loop's first block also follows the end
+//!   of its body; after a loop come the end of its body and every `break`'s blocks; after a
+//!   `return` or `unreachable` nothing has run. Immediate conditions are not looked at: an edge
+//!   that cannot be taken only adds a phi operand. The tree's first block is the entry
+//!   (`tests::structured::a_structured_if_merges_with_a_phi`,
+//!   `tests::structured::a_loop_carries_its_value_in_a_header_phi_and_out_in_a_phi`,
+//!   `tests::structured::a_break_and_the_repeat_both_reach_the_block_after_the_loop`,
+//!   `tests::structured::blocks_after_a_return_read_undef`).
+//! - **Blocks are added where paths meet** and the tree has none, where Eden's structurizer has
+//!   a block of its own: an empty block at the start of the tree when it does not start with
+//!   one (Eden's `PostOrder` throws "First node in abstract syntax list root is not a block"),
+//!   at the start of each loop body that does not start with one (Eden's loop header block),
+//!   and after each `if` and loop that is followed by anything but a block, a `return` or an
+//!   `unreachable`, or by nothing (Eden's merge block). So each phi has a block to go in, the
+//!   tree's first block is never a loop's, and predecessor lists stay short: without the merge
+//!   blocks, the k-th of a run of `if`s would have k predecessors
+//!   (`tests::structured::blocks_are_added_where_paths_meet`,
+//!   `tests::structured::a_return_or_unreachable_after_an_if_adds_no_block`,
+//!   `tests::structured::an_empty_loop_body_gets_a_header`,
+//!   `tests::linear::a_tree_with_no_block_where_paths_meet_costs_its_size`). Departure: Eden
+//!   adds these blocks always, its loop header goes ahead of the loop (its loop node does not
+//!   rerun it), and it also adds a continue block before each repeat and a skip block after
+//!   each `break`; here a block is added only where the tree lacks one, the header is the
+//!   body's first block (the IR's loop runs its whole body again), and the structurizer's own
+//!   condition blocks stand for the continue and skip blocks.
+//! - **Scope.** The verifier's structured scope rule (a value is in scope to the end of the
+//!   `if` or loop body that defines it, `ir` module docs) is stricter than the dominance Eden's
+//!   rewrite relies on. So a block takes its single predecessor's value without a phi only
+//!   when the predecessor's body encloses its own, and a trivial phi is removed only when its
+//!   one value is in scope in the phi's block. Otherwise the phi stays and carries the value
+//!   out: a phi of one operand after a loop
+//!   (`tests::structured::a_loop_carries_its_value_in_a_header_phi_and_out_in_a_phi`), or of
+//!   operands that are all one value (`tests::structured::a_break_and_the_repeat_both_reach_the_block_after_the_loop`).
+//!   Every value a read finds is so in scope at the end of the block it is read for, which is
+//!   where the lowering stores a phi's incoming value (`crate::lower`, "Structured control
+//!   flow"). Eden keeps neither rule (its verifier accepts a use past a body's end).
+//! - **The shortcut to the entry.** Eden's lookup walks back block by block. The structurizer
+//!   resets every goto variable at the start of the program and sets each again near its goto,
+//!   so a read on a path that skipped the goto walked back to the start: on a run of n `if`s
+//!   the rewrite took about n² steps. Here a read in a block other than the entry takes the
+//!   entry's value at once when no block other than the entry writes the variable at a place
+//!   in tree order up to the block's reach (the last place inside the outermost loop around the
+//!   block, or the block's own place). That is exact: edges go forward in tree order except a
+//!   loop's back edge, which stays inside the loop, so every path from the entry to the block
+//!   passes only blocks up to its reach. The output differs from Eden's only by the trivial
+//!   phis the walk would have made and removed, each an `Identity` of the same value
+//!   (`tests::linear::every_pass_does_work_in_proportion_to_the_structured_program`,
+//!   `tests::structured::the_rewrites_work_on_the_structured_diamond`,
+//!   `tests::structured::a_write_later_in_a_loop_reaches_its_first_block`).
+//! - **Phis are refused** ([`PassError::StructuredPhi`]): a phi names the blocks that can have
+//!   run last before its block, and the blocks added above change them. Eden's rewrite never
+//!   meets a phi before SSA, and the structurizer refuses one too (`StructureError::Phi`)
+//!   (`tests::structured::structured_phis_are_refused_before_anything_changes`).
+//!
+//! The rest of slice 8's passes run after the rewrite on the structured form, as before
+//! (`tests::equivalence::generated_programs_keep_their_results_structured`, which also checks
+//! that no goto variable is left, and `tests::structured::the_structurizers_variables_are_gone_after_ssa`).
+//!
+//! Where this pass departs from Eden's otherwise, each pinned by a test in `tests`:
 //!
 //! - **Sealing.** Eden seals each block right after visiting it, in reverse post order. On a
 //!   control-flow graph whose back edge leaves a block that writes the variable (a loop of one
@@ -39,10 +112,13 @@
 //!   its translators never write a register in, so Eden does not meet this. Here a block is
 //!   sealed once all its predecessors are filled, as Braun et al. require: before it is
 //!   filled when its predecessors already are, else as soon as the last one is
-//!   (`tests::ssa::a_self_loop_keeps_its_loop_carried_value`).
-//! - **Unreachable blocks.** Eden removes them first; this IR keeps them, so they are filled
-//!   after the reachable ones, in arena order, and a reachable block with an unreachable
-//!   predecessor is sealed then (`tests::ssa::unreachable_blocks_are_rewritten`). A read in a
+//!   (`tests::ssa::a_self_loop_keeps_its_loop_carried_value`). A structured loop's first block
+//!   is so sealed when the end of its body is filled.
+//! - **Unreachable blocks.** Eden removes them first; this IR keeps them, so in a graph they
+//!   are filled after the reachable ones, in arena order, and a reachable block with an
+//!   unreachable predecessor is sealed then (`tests::ssa::unreachable_blocks_are_rewritten`);
+//!   in a structured function every block is filled in tree order, the unreachable ones among
+//!   the rest (`tests::structured::blocks_after_a_return_read_undef`). A read in a
 //!   block the entry cannot reach looks only in that block: it takes the block's own earlier
 //!   write, else a new `Undef` of the variable's type in the block, and never a phi or a
 //!   predecessor's value (such a block never runs). Looking through its predecessors could
@@ -54,10 +130,10 @@
 //!   `tests::ssa::an_unreachable_two_block_cycle_reads_undef`). A reachable block's phi
 //!   takes such a predecessor's value the same way: its last write there, else an `Undef`
 //!   there.
-//! - **An entry with predecessors.** Eden's programs start with a block nothing jumps to; flow
-//!   analysis can make block 0 a loop header. A phi there would have no value on entry (the
-//!   interpreter's `PhiAtStart`), so when block 0 has predecessors its instructions and
-//!   terminator move to a new last block and block 0 jumps to it; terminators and phis that
+//! - **An entry with predecessors** (a graph only). Eden's programs start with a block nothing
+//!   jumps to; flow analysis can make block 0 a loop header. A phi there would have no value on
+//!   entry (the interpreter's `PhiAtStart`), so when block 0 has predecessors its instructions
+//!   and terminator move to a new last block and block 0 jumps to it; terminators and phis that
 //!   named block 0 name the new block. An input phi in such a block 0 is refused
 //!   ([`PassError::EntryPhi`]) before anything changes
 //!   (`tests::ssa::an_entry_loop_moves_to_its_own_block`, `tests::ssa::entry_phis_are_refused`).
@@ -81,39 +157,27 @@
 //!   reach (above): there every operand can be the block's own later value. In a reachable
 //!   block, one operand arrives along a path from the entry that does not pass through the
 //!   block. This is an argument, not a proof: the verifier run after the pass in tests and
-//!   debug builds checks it, and the equivalence proptest (`tests::equivalence`) exercises it
-//!   on generated loops and joins.
-//! - **Structured functions** are refused ([`PassError::Structured`]). This departs from the
-//!   approved spec (`docs/specs/shader-pipeline.md`) and waits on an owner ruling. The spec's
-//!   pipeline flowchart has `struct["Structurizer<br/>goto elimination"] --> ssa["SSA,
-//!   constant propagation,<br/>dead code"]`, so the rewrite runs on structured output; the
-//!   owner's decision of 2026-11-18 ("Shader and render slice plan errata") gives slice 11
-//!   "the structured IR the translators fill"; and the `ir` module docs expect the
-//!   structured form's scope rule to be checked "against the output of slices 8 (passes) and
-//!   11 (structurizer)". With this refusal the rewrite cannot run in the order the spec
-//!   draws. Eden also runs the rewrite after structuring, on predecessors its structurizer
-//!   records. Here a structured block has no terminator, so its predecessors would have to
-//!   come from the tree, and the scope rule (`ir` module docs) makes the structurizer
-//!   responsible for values that cross a body; so the rewrite runs on the control-flow graph
-//!   that slice 10 builds (`tests::ssa::structured_functions_are_refused`). Running it after
-//!   structuring, as the spec draws, needs predecessors taken from the tree.
+//!   debug builds checks it, and the equivalence proptests (`tests::equivalence`) exercise it
+//!   on generated loops and joins, as graphs and structured.
 //! - **Refusals come before any change.** Before anything is changed, one walk over the
 //!   blocks in arena order, and each block's instructions in list order, refuses the first
-//!   instruction that is missing ([`PassError::Missing`]), names a goto variable with a value
-//!   rather than an immediate ([`PassError::GotoIndex`]; Eden's `Arg(0).U32()` throws on
-//!   one), or is an `Identity` whose chain loops or ends without a value
-//!   ([`PassError::Identity`]; the rewrite follows such chains for trivial phis, and Eden
-//!   would loop forever). An entry phi ([`PassError::EntryPhi`]) is checked after that walk
-//!   (`tests::ssa::goto_indices_must_be_immediates`,
+//!   instruction that is missing ([`PassError::Missing`]), is a phi in a structured function
+//!   ([`PassError::StructuredPhi`]), names a goto variable with a value rather than an
+//!   immediate ([`PassError::GotoIndex`]; Eden's `Arg(0).U32()` throws on one), or is an
+//!   `Identity` whose chain loops or ends without a value ([`PassError::Identity`]; the
+//!   rewrite follows such chains for trivial phis, and Eden would loop forever), checked in
+//!   that order for each instruction. An entry phi ([`PassError::EntryPhi`], a graph only) is
+//!   checked after that walk (`tests::ssa::goto_indices_must_be_immediates`,
 //!   `tests::ssa::a_missing_listed_id_is_refused_before_anything_changes`,
 //!   `tests::ssa::a_broken_identity_chain_is_refused_before_anything_changes`,
-//!   `tests::ssa::the_first_fault_in_block_order_is_refused`). Two failures can still come
-//!   after the rewrite has begun, and leave the function partly changed as
-//!   [`run`](super::run) says: an instruction or block the arena cannot hold
-//!   ([`PassError::Build`]), and [`PassError::Identity`] for a chain the rewrite itself made
-//!   (a read becomes an `Identity` of the value found), which could loop on an input that
-//!   uses a value ahead of its definition in one block (one that does not verify). Neither
-//!   has a test.
+//!   `tests::ssa::the_first_fault_in_block_order_is_refused`,
+//!   `tests::structured::the_first_fault_in_block_order_is_refused_in_a_structured_function`).
+//!   Two failures can still come after the rewrite has begun, and leave the function partly
+//!   changed as [`run`](super::run) says: an instruction or block the arena cannot hold
+//!   ([`PassError::Build`]; the blocks added to a structured tree are the first change), and
+//!   [`PassError::Identity`] for a chain the rewrite itself made (a read becomes an
+//!   `Identity` of the value found), which could loop on an input that uses a value ahead of
+//!   its definition in one block (one that does not verify). Neither has a test.
 
 mod tree;
 
@@ -324,10 +388,9 @@ pub(super) fn run(function: &mut Function) -> Result<Work, PassError> {
         Graph::of_graph(function, &mut work)
     };
     let order = block_order(function, &mut work);
-    let first_write = places
-        .as_ref()
-        .map(|places| first_writes(function, places, &mut work))
-        .unwrap_or_default();
+    let first_write = places.as_ref().map_or_else(BTreeMap::new, |places| {
+        first_writes(function, places, &mut work)
+    });
     let count = function.block_count();
     // Take each block's list: instructions made below are appended to the emptied lists,
     // which the final placement replaces.

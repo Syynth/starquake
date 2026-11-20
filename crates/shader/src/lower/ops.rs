@@ -832,11 +832,7 @@ impl Lowering {
     /// Records the expression of instruction `at`, if it has one.
     fn done(&mut self, at: Value, expr: Option<Handle<Expression>>) -> Result<(), LowerError> {
         if let Some(expr) = expr {
-            let slot = usize::try_from(at.index())
-                .ok()
-                .and_then(|slot| self.values.get_mut(slot))
-                .ok_or_else(|| LowerError::Internal(format!("{at} is outside the arena")))?;
-            *slot = Some(expr);
+            self.record(at, expr)?;
         }
         Ok(())
     }

@@ -679,10 +679,16 @@ fn unlowered_forms_are_refused() {
         control,
         "control flow is checked before the instructions"
     );
-    // The entry has no predecessors, so a phi there has no incoming values.
+    // A phi of a type with no naga type is refused. One in the first block run takes no value
+    // (the interpreter refuses it, `PhiAtStart`); here it reads its local's zero (a divergence
+    // in the module docs).
+    assert_eq!(
+        refused(pixel, "block0:\n    %0: f64 = Phi\n    return\n"),
+        Some("%0: a phi of type f64 is not lowered".into())
+    );
     assert_eq!(
         refused(pixel, "block0:\n    %0: u32 = Phi\n    return\n"),
-        Some("%0: phis are not lowered".into())
+        None
     );
     let generic_0 = u32::from(GENERIC_0_X) * ATTRIBUTE_WORD_BYTES;
     assert_eq!(
