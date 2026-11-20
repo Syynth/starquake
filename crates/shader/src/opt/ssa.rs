@@ -82,8 +82,9 @@
 //!   flow"). Eden keeps neither rule (its verifier accepts a use past a body's end).
 //! - **The shortcut to the entry.** Eden's lookup walks back block by block. The structurizer
 //!   resets every goto variable at the start of the program and sets each again near its goto,
-//!   so a read on a path that skipped the goto walked back to the start: on a run of n `if`s
-//!   the rewrite took about n² steps. Here a read in a block other than the entry takes the
+//!   so a read on a path that skipped the goto walked back to the start: on `tests::linear`'s
+//!   run of n diamonds and loops, structured, the rewrite's steps grew as n² (88,216, 318,891
+//!   and 1,207,741 for 50, 100 and 200, measured while building this slice). Here a read in a block other than the entry takes the
 //!   entry's value at once when no block other than the entry writes the variable at a place
 //!   in tree order up to the block's reach (the last place inside the outermost loop around the
 //!   block, or the block's own place). That is exact: edges go forward in tree order except a

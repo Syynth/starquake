@@ -263,8 +263,8 @@ fn nested_ifs_run_the_same_after_ssa() {
 #[test]
 fn a_lifted_goto_runs_the_same_after_ssa() {
     // A guarded side effect whose guard is tested, then an EXIT: structuring this program lifts
-    // gotos into loops (counted by hand while building this slice), so the rewrite reads
-    // predecessors through the loops those lifts make.
+    // gotos into loops (seen by instrumenting the structurizer's lift while building this
+    // slice), so the rewrite reads predecessors through the loops those lifts make.
     let code = vec![
         assemble(&pure(1)).expect("encodable"),
         side_effect(p(1)),
