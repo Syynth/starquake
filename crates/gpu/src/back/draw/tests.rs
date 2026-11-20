@@ -4574,6 +4574,51 @@ fn the_pixel_stage_follows_vertex_b_when_vertex_a_is_enabled() {
 }
 
 #[test]
+fn a_geometry_stage_gets_the_vertex_stores_and_the_pixel_stage_none() {
+    // Slot 4 (geometry) enabled beside the basic VertexB and pixel programs. The set has no
+    // geometry shader, so `Draws::set_stores` finds none for that stage: the geometry stage
+    // gets the vertex shader's stores and the pixel stage the empty mask (module docs of
+    // `shaders`, "The previous stage's stores"). Finding a stage's shader by any guest stage
+    // rather than by that stage would give the pixel stage the vertex stores instead.
+    let mut rig = Rig::new(ready_with(
+        vertex_storing(&[2]),
+        host_shader(GuestStage::Pixel),
+    ));
+    rig.basic();
+    rig.set(
+        &clc797::SET_PIPELINE_SHADER,
+        &[4],
+        fields(&[(clc797::SET_PIPELINE_SHADER_ENABLE, 1)]),
+    );
+    rig.address(
+        &clc797::SET_PIPELINE_PROGRAM_ADDRESS_A,
+        &clc797::SET_PIPELINE_PROGRAM_ADDRESS_B,
+        &[4],
+        0x12_3456_7800,
+    );
+    assert_eq!(rig.draw(), Outcome::Drawn);
+    let stages: Vec<_> = rig.shaders.seen[0]
+        .requests
+        .iter()
+        .map(|r| r.stage)
+        .collect();
+    assert_eq!(
+        stages,
+        [GuestStage::Vertex, GuestStage::Geometry, GuestStage::Pixel]
+    );
+    let last = &rig.shaders.seen.last().expect("a lookup was made").key;
+    let stored = words(&[28, 29, 30, 31, 40, 41, 42, 43]);
+    assert_eq!(
+        last.previous_stage_stores,
+        PreviousStores::EMPTY.with(FollowingStage::Geometry, stored)
+    );
+    assert_eq!(
+        last.previous_stage_stores.get(FollowingStage::Pixel),
+        AttributeMask::EMPTY
+    );
+}
+
+#[test]
 fn swizzles_alone_cause_a_second_lookup() {
     // Without view swizzle, a known set whose stores stay the same but whose texture bindings
     // change is looked up again for the swizzles alone.
@@ -4689,6 +4734,17 @@ fn remembered_stores_are_capped() {
     assert_eq!(pixel_stores(&rig)[7..], [stored, restored, restored]);
     assert_eq!(rig.draws.counters().lookups, 10);
     assert_eq!(MAX_STORE_SETS, 4096);
+}
+
+#[test]
+fn the_remembered_stores_cap_defaults_to_max_store_sets() {
+    // `remembered_stores_are_capped` lowers the cap itself, so it cannot see the production
+    // default; a fresh `Draws` (built by `Draws::new`) must be capped at `MAX_STORE_SETS`.
+    let rig = Rig::new(ready_with(
+        vertex_storing(&[2]),
+        host_shader(GuestStage::Pixel),
+    ));
+    assert_eq!(rig.draws.previous_stores_limit, MAX_STORE_SETS);
 }
 
 // ---------------------------------------------------------------------------------------------

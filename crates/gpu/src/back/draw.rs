@@ -893,10 +893,13 @@ impl Draws {
         );
         self.counters.lookups = self.counters.lookups.saturating_add(1);
         if let SetLookup::Ready(set) = &lookup {
-            let mut swizzles = first_swizzles.clone();
-            if !caps.view_swizzle {
+            // With view swizzle `first_swizzles` is always empty, so its copy allocates
+            // nothing; without it the swizzles are computed once from the set's handles.
+            let swizzles = if caps.view_swizzle {
+                first_swizzles.clone()
+            } else {
                 let handles = Self::texture_handles(&requests, set);
-                swizzles = Self::swizzles(&answers, &handles);
+                let swizzles = Self::swizzles(&answers, &handles);
                 // A known set is updated in place; only a new one under the cap clones the
                 // request list for its key.
                 if let Some(known) = self.swizzle_handles.get_mut(&requests) {
@@ -904,7 +907,8 @@ impl Draws {
                 } else if self.swizzle_handles.len() < MAX_SWIZZLE_SETS {
                     self.swizzle_handles.insert(requests.clone(), handles);
                 }
-            }
+                swizzles
+            };
             // Learning the stores allocates nothing for a known set: `set_stores` allocates
             // nothing, and the remembered entry is updated in place. Only a new set under the
             // cap clones the request list for its key.
