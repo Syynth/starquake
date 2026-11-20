@@ -41,7 +41,11 @@
 //! - `map` needs every page of its range unmapped, `unmap` and `protect` need every page mapped;
 //!   otherwise they fail without writing anything. Before writing, `map` also counts the table
 //!   pages it will need and fails with [`MapError::OutOfTablePages`] if the pool lacks that many
-//!   reusable pages (see "TLB invalidation" for which freed pages are not yet reusable).
+//!   reusable pages (see "TLB invalidation" for which freed pages are not yet reusable). Then,
+//!   still before writing, it zeroes the never-used pool pages it will take: a pool page is
+//!   zeroed only when a table first needs it ([`Stage1Tables::new`] zeroes the root alone), so
+//!   a pool as large as [`MAX_TABLE_PAGES`] costs its memory only the pages tables have used,
+//!   and a fault while zeroing leaves the tables as they were.
 //! - A table page whose last valid descriptor is removed is unlinked at once, so the pages in use
 //!   ([`Stage1Tables::table_pages_in_use`]) are always the root, one level-2 table per level-1
 //!   slot that holds a mapping, and one level-3 table per level-2 slot that does. The page itself
@@ -97,6 +101,24 @@ const PAGE_LEN: usize = 1 << descriptor::PAGE_SHIFT;
 
 /// One past the highest translated virtual address: the space is 39 bits wide.
 pub const VA_SPACE_END: u64 = 1 << 39;
+
+/// The most table pages one set of tables can hold at once: every table of the tree for the
+/// whole 39-bit space, the root (level 1) included. Each table holds [`descriptor::ENTRIES`]
+/// (512) descriptors (Arm DDI 0487, 4 KiB granule), so there is one level-1 table, 512 level-2
+/// tables and 512 × 512 level-3 tables: 262,657 pages, a little over 1 GiB. A pool of this many
+/// pages never refuses a `map` for want of a table except while tables an `unmap` unlinked wait
+/// for their flush (see "TLB invalidation"): [`MapError::OutOfTablePages`] then needs the
+/// tables in use, the waiting ones and the ones the map needs to come to more than this.
+pub const MAX_TABLE_PAGES: u64 = tables_in_tree(START_LEVEL);
+
+/// How many tables a full tree from a table at `level` down to level 3 holds.
+const fn tables_in_tree(level: u8) -> u64 {
+    if level >= LEAF_LEVEL {
+        1
+    } else {
+        1 + descriptor::ENTRIES * tables_in_tree(level + 1)
+    }
+}
 
 /// One past the highest output address a descriptor holds: bits 47:12 (Arm DDI 0487, without
 /// the 52-bit output address extensions).
@@ -154,6 +176,9 @@ struct Pool {
     quarantine: Vec<u64>,
     /// The next never-used pool page.
     next: u64,
+    /// The first pool page not yet zeroed: every never-used page below it (from `next` up)
+    /// holds zeros. At least `next`; [`Stage1Tables::map`] raises it before it writes.
+    zeroed: u64,
     /// The table pages in use (linked, plus the root) and the level of each; the root is at
     /// [`START_LEVEL`]. The builder follows a table descriptor only to a page listed here.
     tables: BTreeMap<u64, u8>,
@@ -174,8 +199,11 @@ impl<M: GuestMemory> Stage1Tables<M> {
     /// Creates empty tables whose pages come from `pool`, a range of `memory`'s guest-physical
     /// addresses. The first pool page becomes the root.
     ///
-    /// Zeroes the whole pool, so a pool `memory` doesn't cover fails here, with the
-    /// [`MapError::Memory`] fault of the first page it refuses.
+    /// Zeroes the root page only, so a `memory` that does not hold it fails here with its
+    /// [`MapError::Memory`] fault. Every other pool page is zeroed when a `map` first needs it
+    /// for a table, before that map writes any descriptor ([`Translation::map`]), so a pool
+    /// costs its memory only the pages tables have used, and a pool page `memory` does not
+    /// hold fails the first map that needs it, with nothing written.
     pub fn new(memory: M, pool: BackingRange) -> Result<Self, MapError> {
         if pool.end() > OUTPUT_ADDRESS_END {
             return Err(MapError::PhysicalRange {
@@ -183,6 +211,7 @@ impl<M: GuestMemory> Stage1Tables<M> {
                 size: pool.size(),
             });
         }
+        let first_unused = pool.base().saturating_add(PAGE_SIZE);
         let tables = Self {
             memory,
             root: TableRoot::new(pool.base())?,
@@ -190,16 +219,13 @@ impl<M: GuestMemory> Stage1Tables<M> {
             state: Mutex::new(Pool {
                 free: Vec::new(),
                 quarantine: Vec::new(),
-                next: pool.base().saturating_add(PAGE_SIZE),
+                next: first_unused,
+                zeroed: first_unused,
                 tables: BTreeMap::from([(pool.base(), START_LEVEL)]),
                 pending: Vec::new(),
             }),
         };
-        let mut page = pool.base();
-        while page < pool.end() {
-            tables.zero(page)?;
-            page = page.saturating_add(PAGE_SIZE);
-        }
+        tables.zero(pool.base())?;
         Ok(tables)
     }
 
@@ -289,9 +315,30 @@ impl<M: GuestMemory> Stage1Tables<M> {
         self.memory.write(page, &ZEROES)
     }
 
-    /// Takes a pool page for a new table at `level`. It needs no zeroing: [`Self::new`] zeroed
-    /// every pool page, the builder invalidates a descriptor by writing 0, and a table is freed
-    /// only when none of its descriptors is valid, so a freed page holds only zeros.
+    /// Zeroes the never-used pool pages the next `needed` new tables will take, before anything
+    /// is written: [`Self::allocate`] takes freed pages first, then never-used ones from
+    /// `next` up, so these are the `needed` less the free ones from `next`. Pages zeroed
+    /// before are not zeroed again. A fault leaves `zeroed` at the page that faulted, so the
+    /// next attempt starts there.
+    fn zero_new_pages(&self, pool: &mut Pool, needed: u64) -> Result<(), MapError> {
+        let free = u64::try_from(pool.free.len()).unwrap_or(u64::MAX);
+        let fresh = needed.saturating_sub(free);
+        let end = fresh
+            .checked_mul(PAGE_SIZE)
+            .and_then(|bytes| pool.next.checked_add(bytes))
+            .filter(|&end| end <= self.pool.end())
+            .ok_or(MapError::OutOfTablePages)?;
+        while pool.zeroed < end {
+            self.zero(pool.zeroed)?;
+            pool.zeroed = pool.zeroed.saturating_add(PAGE_SIZE);
+        }
+        Ok(())
+    }
+
+    /// Takes a pool page for a new table at `level`. It needs no zeroing: a never-used page
+    /// was zeroed by [`Self::zero_new_pages`] before the map began writing, the builder
+    /// invalidates a descriptor by writing 0, and a table is freed only when none of its
+    /// descriptors is valid, so a freed page holds only zeros.
     fn allocate(&self, pool: &mut Pool, level: u8) -> Result<u64, MapError> {
         let page = if let Some(page) = pool.free.pop() {
             page
@@ -529,6 +576,8 @@ impl<M: GuestMemory> Translation for Stage1Tables<M> {
         if needed > self.reusable_pages(&pool) {
             return Err(MapError::OutOfTablePages);
         }
+        // The last step that can fail before a descriptor is written.
+        self.zero_new_pages(&mut pool, needed)?;
         self.write_map(
             &mut pool,
             root,
