@@ -326,21 +326,6 @@ fn an_entry_phi_with_no_predecessors_is_left_alone() {
     );
 }
 
-#[test]
-fn structured_functions_are_refused() {
-    let text = "block0:
-    %0: u32 = GetRegister r0
-structure:
-    block0
-    return
-";
-    assert_eq!(error(text, Pass::SsaRewrite), PassError::Structured);
-    assert_eq!(
-        PassError::Structured.to_string(),
-        "the SSA rewrite needs a control-flow graph, not a structured function"
-    );
-}
-
 /// Checks that the rewrite refuses `text` with `expected` and leaves it unchanged, and that
 /// `fixed`, the same function with the fault mended, then rewrites.
 fn refused_unchanged(text: &str, expected: PassError, fixed: &str) {

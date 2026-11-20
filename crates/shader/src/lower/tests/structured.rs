@@ -5,6 +5,7 @@ use naga::Statement;
 
 use super::run::{gpu_registers, interp_registers};
 use super::*;
+use crate::interp::{InterpError, Machine};
 use crate::opt::{Pass, run as run_pass};
 use crate::structure::{MAX_STRUCTURE_WORK, structure};
 
@@ -72,10 +73,10 @@ fn structured_loops_match_the_interpreter_on_the_gpu() {
     }
 }
 
-/// Identity removal and constant propagation run on the structured function (the SSA rewrite
-/// refuses one: `opt::ssa`'s module docs), and the result still lowers and computes the same
-/// registers. Dead code elimination is left out: before SSA it removes the register writes
-/// themselves, which only the registers' later reads (gone after SSA) keep alive.
+/// Identity removal and constant propagation run on the structured function before SSA, and
+/// the result still lowers and computes the same registers. Dead code elimination is left out:
+/// before SSA it removes the register writes themselves, which only the registers' later reads
+/// (gone after SSA) keep alive.
 #[test]
 fn the_structured_passes_keep_it_lowerable() {
     let mut function = structured(LOOPS);
@@ -274,26 +275,226 @@ fn demote_is_kill() {
     }
 }
 
-/// A phi in a structured function is refused (a divergence in the module docs: Eden lowers its
-/// phis, `EmitPhi`; here the structurizer's pre-SSA form is what is lowered, until the SSA pass
-/// on structured functions, slice 8b, makes phis that need lowering).
+/// [`LOOPS`] structured, then rewritten into SSA form, in Eden's order (slice 8b), with identity
+/// removal and constant propagation after it: the values its registers carried between blocks
+/// now cross in phis, which lower as local variables, and the GPU gives the interpreter's
+/// registers. Dead code elimination is left out, so the register writes the harness reads stay.
 #[test]
-fn a_structured_phi_is_refused() {
-    let function = ir("block0:
-    %0: u32 = GetRegister r0
-    %1: u1 = IEqual %0, u32 0
-block1:
-    %2: u32 = Phi [block0: %0]
-    %3 = SetRegister r1, %2
+fn structured_phis_match_the_interpreter_on_the_gpu() {
+    let mut function = structured(LOOPS);
+    for pass in [
+        Pass::SsaRewrite,
+        Pass::IdentityRemoval,
+        Pass::ConstantPropagation,
+    ] {
+        run_pass(&mut function, pass).expect("the pass runs on a structured function");
+    }
+    assert!(
+        function.listed().any(|(_, inst)| inst.is_phi()),
+        "{function}"
+    );
+    assert!(!function.to_string().contains("GetRegister"), "{function}");
+    let shader = lowered(GuestStage::Compute, &function, &LowerInputs::DEFAULT);
+    let expected = interp_registers(&function, &LOOP_REGS);
+    assert_eq!(expected, [55, 0, 1, 7], "the interpreter's own result");
+    if let Some(found) = gpu_registers("structured_phis", &shader, &LOOP_REGS) {
+        assert_eq!(found, expected);
+    }
+    insta::assert_snapshot!("structured_phis", msl(&shader));
+}
+
+/// A phi in the first block run, which no block ran before (`lower` module docs, the divergence
+/// table): the interpreter refuses it (`PhiAtStart`), and the lowering reads its local
+/// variable's zero. The phi plus 5 goes to r1, so the GPU gives 5 only if the phi read 0; the
+/// MSL (snapshot) zero-initialises the phi's local (`uint phi0_ = {};`).
+#[test]
+fn a_phi_in_the_first_block_run_reads_zero_on_the_gpu() {
+    const ADDED: u32 = 5;
+    let function = ir(&format!(
+        "block0:
+    %0: u32 = Phi
+    %1: u32 = IAdd32 %0, u32 {ADDED}
+    %2 = SetRegister r1, %1
 structure:
     block0
-    if %1 {
-        block1
+    return
+"
+    ));
+    assert_eq!(
+        Machine::new().run(&function).err(),
+        Some(InterpError::PhiAtStart(value_at(&function, 0))),
+        "the interpreter refuses it"
+    );
+    let shader = lowered(GuestStage::Compute, &function, &LowerInputs::DEFAULT);
+    let text = msl(&shader);
+    assert!(text.contains("uint phi0_ = {};"), "{text}");
+    if let Some(found) = gpu_registers("first_block_phi", &shader, &[1]) {
+        assert_eq!(found, [ADDED]);
     }
+    insta::assert_snapshot!("first_block_phi", text);
+}
+
+/// A function whose block3 has a phi taking `incoming`, with block1 inside an `if` defining %1.
+fn phi_taking(incoming: &str) -> Function {
+    ir(&format!(
+        "block0:
+    %0: u1 = IEqual u32 0, u32 0
+block1:
+    %1: u32 = IAdd32 u32 1, u32 2
+block2:
+    %2: u32 = IAdd32 u32 3, u32 4
+block3:
+    %3: u32 = Phi {incoming}
+    %4 = SetRegister r1, %3
+structure:
+    block0
+    if %0 {{
+        block1
+    }}
+    block2
+    block3
+    return
+"
+    ))
+}
+
+#[test]
+fn a_phi_value_out_of_scope_is_refused() {
+    // %1 is in scope at the end of block1, not yet computed at the end of block0, and out of
+    // scope at the end of block2 (the `if` body that holds it has ended).
+    for incoming in ["[block1: %1]", "[block2: %2]", "[block2: u32 9]"] {
+        lowered(
+            GuestStage::Compute,
+            &phi_taking(incoming),
+            &LowerInputs::DEFAULT,
+        );
+    }
+    for (incoming, from) in [("[block0: %1]", 0), ("[block2: %1]", 2)] {
+        let function = phi_taking(incoming);
+        let block = function
+            .blocks()
+            .nth(from)
+            .map(|(id, _)| id)
+            .expect("a block");
+        let error =
+            lower_with(GuestStage::Compute, &function, &LowerInputs::DEFAULT).expect_err("refused");
+        assert_eq!(
+            error,
+            LowerError::PhiIncoming {
+                at: value_at(&function, 3),
+                from: block,
+                value: value_at(&function, 1),
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            format!("%3 takes %1 from block{from}, where it is not in scope")
+        );
+    }
+}
+
+#[test]
+fn a_phi_of_a_type_with_no_naga_type_is_refused() {
+    let function = ir("block0:
+    %0: f64 = Phi
+structure:
+    block0
     return
 ");
+    let error =
+        lower_with(GuestStage::Compute, &function, &LowerInputs::DEFAULT).expect_err("refused");
+    assert_eq!(
+        error,
+        LowerError::Phi {
+            at: value_at(&function, 0),
+            ty: Type::F64,
+        }
+    );
+    assert_eq!(error.to_string(), "%0: a phi of type f64 is not lowered");
+}
+
+#[test]
+fn a_loop_bodys_value_leaves_scope_at_its_end() {
+    // %0 is in scope at the end of block1, in the loop body, and out of it at block2's.
+    let text = |from: &str| {
+        format!(
+            "block0:
+block1:
+    %0: u32 = IAdd32 u32 1, u32 2
+block2:
+block3:
+    %1: u32 = Phi [{from}: %0]
+    %2 = SetRegister r1, %1
+structure:
+    block0
+    loop {{
+        block1
+    }} repeat u1 false
+    block2
+    block3
+    return
+"
+        )
+    };
+    lowered(
+        GuestStage::Compute,
+        &ir(&text("block1")),
+        &LowerInputs::DEFAULT,
+    );
+    let function = ir(&text("block2"));
+    let block2 = function.blocks().nth(2).map(|(id, _)| id).expect("block2");
     assert_eq!(
         lower_with(GuestStage::Compute, &function, &LowerInputs::DEFAULT).err(),
-        Some(LowerError::Phi(value_at(&function, 2)))
+        Some(LowerError::PhiIncoming {
+            at: value_at(&function, 1),
+            from: block2,
+            value: value_at(&function, 0),
+        })
     );
+}
+
+#[test]
+fn a_half_phi_needs_f16() {
+    let function = ir("block0:
+    %0: f16 = Phi
+structure:
+    block0
+    return
+");
+    let without = LowerInputs {
+        caps: crate::host::HostCaps {
+            f16: false,
+            ..crate::host::HostCaps::ALL
+        },
+        ..LowerInputs::DEFAULT
+    };
+    assert_eq!(
+        lower_with(GuestStage::Compute, &function, &without).err(),
+        Some(LowerError::Missing(crate::host::Feature::Float16))
+    );
+    let shader = lowered(GuestStage::Compute, &function, &LowerInputs::DEFAULT);
+    assert!(shader.requirements.f16);
+}
+
+#[test]
+fn a_u64_phi_needs_i64() {
+    let function = ir("block0:
+    %0: u64 = Phi
+structure:
+    block0
+    return
+");
+    let without = LowerInputs {
+        caps: crate::host::HostCaps {
+            i64: false,
+            ..crate::host::HostCaps::ALL
+        },
+        ..LowerInputs::DEFAULT
+    };
+    assert_eq!(
+        lower_with(GuestStage::Compute, &function, &without).err(),
+        Some(LowerError::Missing(crate::host::Feature::Int64))
+    );
+    let shader = lowered(GuestStage::Compute, &function, &LowerInputs::DEFAULT);
+    assert!(shader.requirements.i64);
 }
