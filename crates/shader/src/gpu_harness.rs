@@ -42,6 +42,8 @@ pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
 pub(crate) struct TestDevice {
     /// The device.
     pub(crate) device: wgpu::Device,
+    /// Its queue, for tests that run work (the lowering's compute tests).
+    pub(crate) queue: wgpu::Queue,
     /// What the adapter is, for messages.
     pub(crate) adapter: wgpu::AdapterInfo,
 }
@@ -60,7 +62,7 @@ impl TestDevice {
                 }
             };
         let features = adapter.features() & wanted;
-        let (device, _queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some(test),
             required_features: features,
             required_limits: adapter.limits(),
@@ -69,6 +71,7 @@ impl TestDevice {
         .expect("the adapter's own features and limits must be accepted");
         Some(Self {
             device,
+            queue,
             adapter: adapter.get_info(),
         })
     }
@@ -80,7 +83,7 @@ impl TestDevice {
 
     /// Runs `work` inside validation and internal error scopes and returns the first error as
     /// text.
-    fn scoped<T>(&self, work: impl FnOnce(&wgpu::Device) -> T) -> Result<T, String> {
+    pub(crate) fn scoped<T>(&self, work: impl FnOnce(&wgpu::Device) -> T) -> Result<T, String> {
         let internal = self.device.push_error_scope(wgpu::ErrorFilter::Internal);
         let validation = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let value = work(&self.device);

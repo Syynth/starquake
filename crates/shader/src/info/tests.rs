@@ -1832,7 +1832,11 @@ fn capabilities_follow_each_requirement() {
     };
     assert_eq!(capabilities(Requirements::default()), Capabilities::empty());
     assert_eq!(only(|r| r.subgroup = true), Capabilities::SUBGROUP);
-    assert_eq!(only(|r| r.f16 = true), Capabilities::SHADER_FLOAT16);
+    // f16 grants `SHADER_FLOAT16_IN_FLOAT32` too, for the half packing (`lower::capabilities`).
+    assert_eq!(
+        only(|r| r.f16 = true),
+        Capabilities::SHADER_FLOAT16 | Capabilities::SHADER_FLOAT16_IN_FLOAT32
+    );
     assert_eq!(only(|r| r.f64 = true), Capabilities::FLOAT64);
     assert_eq!(only(|r| r.i64 = true), Capabilities::SHADER_INT64);
     assert_eq!(
