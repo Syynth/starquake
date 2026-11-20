@@ -511,6 +511,24 @@ mod tests {
         assert_eq!(u64::try_from(two.len()).unwrap(), 2 * HOST_PAGE);
     }
 
+    #[test]
+    fn dropping_a_region_gives_its_address_space_back() {
+        // 64 regions of 4 TiB, one after another: 256 TiB in all, more address space than a
+        // process has, so this passes only if each drop gives its reservation back. Writing
+        // the last byte of each makes sure the whole range was reserved; it commits one page.
+        // (`mincore` on the dropped range cannot tell a leak from a release on macOS.)
+        let len: u64 = 4 << 40;
+        for n in 0..64 {
+            let region = HostRegion::new(len, Kind::Ram)
+                .map_err(|error| format!("region {n}: {error}"))
+                .unwrap();
+            region.write(len - 1, &[0x5a]).unwrap();
+            let mut back = [0];
+            region.read(len - 1, &mut back).unwrap();
+            assert_eq!(back, [0x5a], "region {n}");
+        }
+    }
+
     /// The host's page size: the unit [`HostRegion::resident_bytes`] counts in.
     fn host_page() -> u64 {
         // SAFETY: `getpagesize` reads a constant of the host.
