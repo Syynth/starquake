@@ -7,7 +7,7 @@
 //! after the `SM70Encoder` helper that writes them.
 
 use super::instruction::Field;
-use super::operand::{Gpr, Pred, UniformReg};
+use super::operand::{Gpr, HalfSwizzle, Pred, UniformReg};
 
 /// The 12-bit opcode of every instruction (`set_opcode`: bits 0..12). PR #4588 indexes its
 /// decode table by these twelve bits (`frontend/ampere/isa.h`, `IsaTable`).
@@ -63,6 +63,23 @@ pub(crate) const SRC2: Field = Field::new(64, Gpr::BITS);
 pub(crate) const SRC2_ABS: Field = Field::bit(74);
 /// ALU source 2's negation bit (32-bit sources).
 pub(crate) const SRC2_NEG: Field = Field::bit(75);
+
+/// Source 0's swizzle when its type is a packed pair of 16-bit floats (`encode_alu_src0`:
+/// `set_alu_reg(24..32, 73, 72, 74..76, ..)`, which calls `set_swizzle(74..76, ..)` for an fp16
+/// source; slice 6c, `op::half_double`).
+pub(crate) const SRC0_SWIZZLE: Field = Field::new(74, HalfSwizzle::BITS);
+/// The wide slot's swizzle for a packed-half source (`encode_alu_reg`, `encode_alu_cb` and
+/// `encode_alu_ureg`: `set_swizzle(60..62, ..)` for an fp16 source).
+pub(crate) const SLOT_SWIZZLE: Field = Field::new(60, HalfSwizzle::BITS);
+/// The register slot's swizzle for a packed-half source (`encode_alu_src2`: `set_alu_reg(64..72,
+/// 83, 84, 81..83, ..)` when the source type is fp16).
+pub(crate) const SRC2_HALF_SWIZZLE: Field = Field::new(81, HalfSwizzle::BITS);
+/// The register slot's absolute-value bit for a packed-half source (`encode_alu_src2`: `if
+/// src_type.is_fp16() { 83 } else { 74 }`).
+pub(crate) const SRC2_HALF_ABS: Field = Field::bit(83);
+/// The register slot's negation bit for a packed-half source (`encode_alu_src2`: `if
+/// src_type.is_fp16() { 84 } else { 75 }`).
+pub(crate) const SRC2_HALF_NEG: Field = Field::bit(84);
 
 /// The bits every form explains: opcode, guard and scheduling.
 pub(crate) const COMMON: u128 = OPCODE.mask() | GUARD.mask() | GUARD_NOT.mask() | SCHEDULING.mask();

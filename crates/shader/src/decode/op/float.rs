@@ -499,21 +499,8 @@ fn half_source(f: &mut Formatter<'_>, src: AluSrc, high: bool) -> fmt::Result {
 /// `FADD`'s 9-bit opcode (`impl SM70Op for OpFAdd`: `encode_alu(0x021, ..)`).
 pub(crate) const FADD_OPCODE: u16 = 0x021;
 /// `FADD`'s operand forms: its second operand in the wide slot, as source 1 when it is a
-/// register and as source 2 otherwise.
-pub(crate) const FADD_FORMS: [AluForm; 4] = [
-    AluForm::Reg,
-    AluForm::ImmSrc2,
-    AluForm::CBufSrc2,
-    AluForm::UniformSrc2,
-];
-
-/// Where `FADD`'s second operand is in `form`.
-const fn fadd_source(form: AluForm) -> Source {
-    match form {
-        AluForm::Reg | AluForm::ImmSrc1 | AluForm::CBufSrc1 | AluForm::UniformSrc1 => Source::One,
-        AluForm::ImmSrc2 | AluForm::CBufSrc2 | AluForm::UniformSrc2 => Source::Two,
-    }
-}
+/// register and as source 2 otherwise (`alu::WIDE_OPERAND_FORMS`).
+pub(crate) const FADD_FORMS: [AluForm; 4] = alu::WIDE_OPERAND_FORMS;
 
 /// `FADD dst, a, b`: `a + b` in 32-bit float.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -554,7 +541,7 @@ fn decode_fadd(reader: &mut Reader) -> Result<Op, DecodeError> {
         dst: reader.gpr(DST),
         srcs: [
             alu::src0(reader, true),
-            alu::src(reader, form, fadd_source(form), true),
+            alu::src(reader, form, alu::wide_operand_source(form), true),
         ],
         ignored: reader.gpr(SRC2),
         saturate: reader.flag(SAT),
@@ -565,7 +552,7 @@ fn decode_fadd(reader: &mut Reader) -> Result<Op, DecodeError> {
 
 /// `FADD` in `form`.
 const fn fadd(form: AluForm) -> Form {
-    let sources = match fadd_source(form) {
+    let sources = match alu::wide_operand_source(form) {
         Source::One => SOURCES_0_1,
         Source::Two => Sources {
             src0: true,
@@ -914,8 +901,17 @@ const fn fset_has_set_op(form: AluForm) -> bool {
 
 /// Reads a combine operation, refusing 3.
 fn read_set_op(reader: &mut Reader) -> Result<PredSetOp, DecodeError> {
-    let bits = reader.field(SET_OP);
-    PredSetOp::from_bits(bits).ok_or_else(|| reader.unknown_value(SET_OP, bits))
+    read_pred_set_op(reader, SET_OP)
+}
+
+/// Reads a combine operation in `field`, refusing 3 (NAK's `PredSetOp` encodes 0 to 2; PR
+/// #4588: `Require(set_op <= 2)`); shared with the half and double group (`op::half_double`).
+pub(crate) fn read_pred_set_op(
+    reader: &mut Reader,
+    field: Field,
+) -> Result<PredSetOp, DecodeError> {
+    let bits = reader.field(field);
+    PredSetOp::from_bits(bits).ok_or_else(|| reader.unknown_value(field, bits))
 }
 
 /// `FSET.BF dst, a, b, accum`: 1.0 where the comparison, combined with `accum`, is true, else

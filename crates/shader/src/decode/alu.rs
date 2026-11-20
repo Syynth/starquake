@@ -23,15 +23,22 @@
 //! which [`fixed`] makes a fixed bit of their forms. In the constant-buffer forms bit 91 picks a
 //! bindless buffer, whose handle is in a uniform register (`set_src_cb`). These are the forms of
 //! the vector datapath; the uniform datapath's (NAK's `encode_ualu_base`) are slice 6d's.
+//!
+//! A packed-half source (NAK's `SM70SrcType::F16v2`, slice 6c) sits in the same places with a
+//! two-bit swizzle beside its modifier bits, and in the register slot its modifier bits move
+//! (`set_alu_reg`, `encode_alu_src2`): source 0's swizzle at 74..76, the wide slot's at 60..62
+//! (not for an immediate), and the register slot's at 81..83 with its absolute value at 83 and
+//! negation at 84 instead of 74 and 75 ([`half_known`], [`half_src0`], [`half_src`]).
 
 use super::DecodeError;
 use super::fields::{
     ALU_FORM, CBUF_INDEX, CBUF_OFFSET, SLOT_ABS, SLOT_IMM, SLOT_NEG, SLOT_REG, SLOT_UNIFORM,
     SLOT_UNIFORM_REG, SRC0, SRC0_ABS, SRC0_NEG, SRC2, SRC2_ABS, SRC2_NEG, mask_of,
 };
+use super::fields::{SLOT_SWIZZLE, SRC0_SWIZZLE, SRC2_HALF_ABS, SRC2_HALF_NEG, SRC2_HALF_SWIZZLE};
 use super::form::Reader;
 use super::instruction::Field;
-use super::operand::{AluSrc, CBuf, CBufRef};
+use super::operand::{AluSrc, CBuf, CBufRef, HalfSrc, HalfSwizzle};
 
 /// An ALU operand form (`encode_alu_base`'s `form` values).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -264,4 +271,136 @@ pub(crate) fn src(
             AluSrc::Reg { reg, abs, neg }
         }
     }
+}
+
+/// The forms of an instruction that keeps its second operand in the wide slot: as source 1 when
+/// it is a register (form 1), as source 2 otherwise (forms 2, 3 and 7). NAK picks between
+/// `encode_alu(.., a, b, None)` and `encode_alu(.., a, None, b)` by `src_is_zero_or_gpr(b)` in
+/// `OpFAdd`, `OpHAdd2`, `OpHSet2`, `OpHSetP2` and `OpDSetP` (`sm70_encode.rs` @ 52238762).
+pub(crate) const WIDE_OPERAND_FORMS: [AluForm; 4] = [
+    AluForm::Reg,
+    AluForm::ImmSrc2,
+    AluForm::CBufSrc2,
+    AluForm::UniformSrc2,
+];
+
+/// Where an instruction of [`WIDE_OPERAND_FORMS`] keeps its second operand in `form`: source 1
+/// in the forms that put source 1 in the wide slot, source 2 in the others.
+pub(crate) const fn wide_operand_source(form: AluForm) -> Source {
+    match form {
+        AluForm::Reg | AluForm::ImmSrc1 | AluForm::CBufSrc1 | AluForm::UniformSrc1 => Source::One,
+        AluForm::ImmSrc2 | AluForm::CBufSrc2 | AluForm::UniformSrc2 => Source::Two,
+    }
+}
+
+/// The modifier and swizzle fields of a packed-half source in one place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HalfFields {
+    /// The absolute-value bit.
+    pub(crate) abs: Field,
+    /// The negation bit.
+    pub(crate) neg: Field,
+    /// The swizzle.
+    pub(crate) swizzle: Field,
+}
+
+/// Source 0's packed-half fields (`encode_alu_src0`: `set_alu_reg(24..32, 73, 72, 74..76, ..)`).
+pub(crate) const HALF_SRC0: HalfFields = HalfFields {
+    abs: SRC0_ABS,
+    neg: SRC0_NEG,
+    swizzle: SRC0_SWIZZLE,
+};
+
+/// The packed-half fields of a source in `slot`: the wide slot's at 62, 63 and 60..62
+/// (`encode_alu_reg`, `encode_alu_cb`, `encode_alu_ureg`), the register slot's at 83, 84 and
+/// 81..83 (`encode_alu_src2`), none for an immediate (`encode_alu_imm` writes only the value).
+pub(crate) const fn half_fields(slot: Slot) -> Option<HalfFields> {
+    match slot {
+        Slot::Imm => None,
+        Slot::Reg => Some(HalfFields {
+            abs: SRC2_HALF_ABS,
+            neg: SRC2_HALF_NEG,
+            swizzle: SRC2_HALF_SWIZZLE,
+        }),
+        Slot::WideReg | Slot::CBuf | Slot::UniformReg => Some(HalfFields {
+            abs: SLOT_ABS,
+            neg: SLOT_NEG,
+            swizzle: SLOT_SWIZZLE,
+        }),
+    }
+}
+
+/// The bits of `fields`.
+const fn half_fields_known(fields: HalfFields) -> u128 {
+    mask_of(&[fields.abs, fields.neg, fields.swizzle])
+}
+
+/// The bits of a packed-half source in `slot`: the slot without its 32-bit modifier bits, and
+/// the packed-half fields.
+const fn half_slot_known(slot: Slot) -> u128 {
+    let fields = match half_fields(slot) {
+        Some(fields) => half_fields_known(fields),
+        None => 0,
+    };
+    slot_known(slot, false) | fields
+}
+
+/// The bits the packed-half sources of an instruction in `form` occupy, with their modifier and
+/// swizzle fields.
+pub(crate) const fn half_known(form: AluForm, sources: Sources) -> u128 {
+    let mut mask = 0;
+    if sources.src0 {
+        mask |= SRC0.mask() | half_fields_known(HALF_SRC0);
+    }
+    if sources.src1 {
+        mask |= half_slot_known(form.slot(Source::One));
+    }
+    if sources.src2 {
+        mask |= half_slot_known(form.slot(Source::Two));
+    }
+    mask
+}
+
+/// `src` with the modifier bits `abs` and `neg`; an immediate has none and is returned as it is.
+pub(crate) const fn with_modifiers(src: AluSrc, abs: bool, neg: bool) -> AluSrc {
+    match src {
+        AluSrc::Reg { reg, .. } => AluSrc::Reg { reg, abs, neg },
+        AluSrc::UniformReg { reg, .. } => AluSrc::UniformReg { reg, abs, neg },
+        AluSrc::CBuf { cbuf, .. } => AluSrc::CBuf { cbuf, abs, neg },
+        AluSrc::Imm(imm) => AluSrc::Imm(imm),
+    }
+}
+
+/// Reads the modifier bits and swizzle in `fields` onto `src`, refusing swizzle 1
+/// ([`HalfSwizzle`]); without fields (an immediate) the source reads both halves as stored.
+fn half(reader: &mut Reader, src: AluSrc, fields: Option<HalfFields>) -> Result<HalfSrc, DecodeError> {
+    let Some(fields) = fields else {
+        return Ok(HalfSrc::new(src));
+    };
+    let abs = reader.flag(fields.abs);
+    let neg = reader.flag(fields.neg);
+    let bits = reader.field(fields.swizzle);
+    let swizzle =
+        HalfSwizzle::from_bits(bits).ok_or_else(|| reader.unknown_value(fields.swizzle, bits))?;
+    Ok(HalfSrc {
+        src: with_modifiers(src, abs, neg),
+        swizzle,
+    })
+}
+
+/// Reads source 0 of a packed-half instruction, a register.
+pub(crate) fn half_src0(reader: &mut Reader) -> Result<HalfSrc, DecodeError> {
+    let reg = reader.gpr(SRC0);
+    half(reader, AluSrc::reg(reg), Some(HALF_SRC0))
+}
+
+/// Reads `source` of a packed-half instruction in `form`.
+pub(crate) fn half_src(
+    reader: &mut Reader,
+    form: AluForm,
+    source: Source,
+) -> Result<HalfSrc, DecodeError> {
+    let slot = form.slot(source);
+    let plain = src(reader, form, source, false);
+    half(reader, plain, half_fields(slot))
 }

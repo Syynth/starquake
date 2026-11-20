@@ -34,12 +34,15 @@
 //! `tld`, `tld4`, `tmml`, `txd` and `txq` with `.scr`, `.b`, every level-of-detail mode,
 //! `tld4`'s `.g` and offset modes, `.ef` and `.nodep`, in that order, the operands
 //! `p0, r2, r0, r1, r3, 2d, 0x7`, and the three `txq` queries; that module's docs list what of
-//! its text is a guess.
+//! its text is a guess. Of the half and double group (`op::half_double`), `test_hfma2` pins
+//! `hfma2` with three register sources under every combination of `-` and `|..|`; the rest of
+//! that group's text is a guess its module docs list.
 //! **Everything else is a guess** in `nvdisasm`'s usual style that a developer with
 //! `nvdisasm` should check (spec, "`nvdisasm` cross-check"): `urz` and `upt`, the `.rm`/`.rp`
 //! rounding names (taken from NAK's own `FRndMode` printer), `.fmz` for the `dnz` bit, float
-//! immediates other than small integers, `-`/`|..|` source modifiers (on registers, uniform
-//! registers and constant buffers alike), the guard prefix `@p0 `/`@!p0 `, `MOV`'s hex immediate
+//! immediates other than small integers, `-`/`|..|` source modifiers on uniform registers and
+//! constant buffers and outside `hfma2` (only `test_hfma2` pins them, on registers), the guard
+//! prefix `@p0 `/`@!p0 `, `MOV`'s hex immediate
 //! and lane mask, the `ALD`/`AST` operand syntax and width suffixes, `EXIT`'s modifiers and
 //! predicate, the special-register names, the text of every other attribute instruction
 //! (`IPA`'s modes, `CS2R`'s `.32`, `S2UR`, `PIXLD`, `OUT`, `LDTRAM`, `AL2P`),
@@ -57,6 +60,7 @@ use super::op::Instr;
 use super::operand::{
     AluSrc, CBuf, CBufRef, Gpr, Pred, PredSrc, RoundMode, UniformPred, UniformPredSrc, UniformReg,
 };
+use super::operand::{HalfSrc, HalfSwizzle};
 
 /// Writes `text` if `on`: a modifier that is either present or absent.
 pub(crate) fn flag(f: &mut Formatter<'_>, on: bool, text: &str) -> fmt::Result {
@@ -207,6 +211,44 @@ impl Display for IntOperand {
             AluSrc::UniformReg { reg, abs, neg } => modified(f, &reg, abs, neg),
             AluSrc::CBuf { cbuf, abs, neg } => modified(f, &cbuf, abs, neg),
             AluSrc::Imm(bits) => write!(f, "{bits:#x}"),
+        }
+    }
+}
+
+impl Display for HalfSwizzle {
+    /// Eden's Maxwell `Swizzle` names lower-cased, `.h0_h0` and `.h1_h1`, nothing for both
+    /// halves as stored (a guess; NAK's own printer writes `.xx` and `.yy`).
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::H1H0 => "",
+            Self::H0H0 => ".h0_h0",
+            Self::H1H1 => ".h1_h1",
+        })
+    }
+}
+
+/// An operand with a swizzle after it.
+struct Swizzled<'a>(&'a dyn Display, HalfSwizzle);
+
+impl Display for Swizzled<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}{}", self.0, self.1)
+    }
+}
+
+impl Display for HalfSrc {
+    /// The source under its modifiers with the swizzle inside them, as NAK's `Src` printer
+    /// places it (`-|r1.h0_h0|`); an immediate, which holds two halves, prints in hexadecimal (a
+    /// guess).
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let swizzle = self.swizzle;
+        match self.src {
+            AluSrc::Reg { reg, abs, neg } => modified(f, &Swizzled(&reg, swizzle), abs, neg),
+            AluSrc::UniformReg { reg, abs, neg } => {
+                modified(f, &Swizzled(&reg, swizzle), abs, neg)
+            }
+            AluSrc::CBuf { cbuf, abs, neg } => modified(f, &Swizzled(&cbuf, swizzle), abs, neg),
+            AluSrc::Imm(bits) => write!(f, "{bits:#x}{swizzle}"),
         }
     }
 }

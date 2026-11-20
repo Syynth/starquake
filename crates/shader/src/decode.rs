@@ -114,6 +114,8 @@ use thiserror::Error;
 pub(crate) use alu::AluForm;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use alu::{Slot, Source};
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use alu::{HALF_SRC0, half_fields, with_modifiers};
 pub(crate) use fields::*;
 #[cfg(test)]
 pub(crate) use form::{Form, GROUP_HOOKS, GROUPS, ReferenceRow};
@@ -145,9 +147,12 @@ pub(crate) use op::texture;
 pub use op::*;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use op::{Named, attribute, control, float, integer, memory, op_list};
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use op::half_double;
 pub use operand::{
     AluSrc, CBuf, CBufRef, Gpr, Pred, PredSrc, RoundMode, UniformPred, UniformPredSrc, UniformReg,
 };
+pub use operand::{HalfSrc, HalfSwizzle};
 
 use form::{Reader, lookup};
 

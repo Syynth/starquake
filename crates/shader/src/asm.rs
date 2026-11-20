@@ -31,6 +31,7 @@ use crate::decode::{
     SLOT_UNIFORM_REG, SRC0, SRC0_ABS, SRC0_NEG, SRC2, SRC2_ABS, SRC2_NEG, Slot, Source,
     UniformPredSrc, UniformReg, op_list,
 };
+use crate::decode::{HALF_SRC0, HalfSrc, HalfSwizzle, half_fields, with_modifiers};
 
 /// Why an [`Instr`] has no encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -274,6 +275,46 @@ impl Writer {
             self.slot(form.slot(Source::Two), src, modifiers)?;
         }
         self.opcode(form.opcode(base));
+        Ok(())
+    }
+
+    /// Encodes the packed-half sources of an ALU instruction with 9-bit opcode `base`
+    /// (`encode_fp16v2_alu`): each source placed as [`Writer::alu`] places it, then its modifier
+    /// bits and swizzle where `decode::alu::half_fields` puts them for its slot. An immediate has
+    /// no swizzle bits, so one with a swizzle other than [`HalfSwizzle::H1H0`] is refused.
+    pub(crate) fn half_alu(
+        &mut self,
+        mnemonic: &'static str,
+        base: u16,
+        sources: [Option<HalfSrc>; 3],
+    ) -> Result<(), EncodeError> {
+        let plain = sources.map(|src| src.map(|src| with_modifiers(src.src, false, false)));
+        self.alu(mnemonic, base, plain, false)?;
+        let [_, src1, src2] = plain;
+        let form = choose_form(src1, src2).ok_or(EncodeError::TwoWideSources { mnemonic })?;
+        let fields = [
+            Some(HALF_SRC0),
+            half_fields(form.slot(Source::One)),
+            half_fields(form.slot(Source::Two)),
+        ];
+        for (src, fields) in sources.into_iter().zip(fields) {
+            let Some(src) = src else { continue };
+            match fields {
+                Some(fields) => {
+                    let (abs, neg) = src.src.modifiers();
+                    self.flag(fields.abs, abs);
+                    self.flag(fields.neg, neg);
+                    self.set(fields.swizzle, src.swizzle.bits());
+                }
+                None if src.swizzle != HalfSwizzle::H1H0 => {
+                    return Err(EncodeError::NoBits {
+                        mnemonic,
+                        what: "a swizzle on an immediate",
+                    });
+                }
+                None => {}
+            }
+        }
         Ok(())
     }
 
