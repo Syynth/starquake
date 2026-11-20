@@ -447,8 +447,8 @@ const fn reads_negation(op: &Op) -> [bool; 3] {
 }
 
 /// The first successor of `block` with a phi naming `block`: the guard's split would leave that
-/// phi naming a block that no longer jumps to it.
-fn successor_phi(function: &Function, block: BlockId) -> Option<BlockId> {
+/// phi naming a block that no longer jumps to it. Shared with the memory translator (slice 12e).
+pub(super) fn successor_phi(function: &Function, block: BlockId) -> Option<BlockId> {
     let terminator = function.block(block)?.terminator;
     terminator.successors().find(|successor| {
         function.block(*successor).is_some_and(|next| {

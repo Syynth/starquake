@@ -9,6 +9,9 @@
 //! - [`integer`]: the integer ALU group (slice 12a), `MOV` included;
 //! - [`float`]: the 32-bit float and conversion group (slice 12b);
 //! - [`texture`]: the texture and surface group (slice 12f);
+//! - [`memory`]: the memory group (slice 12e), which translates one instruction on its own but
+//!   is not joined to the driver yet: the driver refuses its operations by name ([`driver`]'s
+//!   module docs, "Dispatch");
 //! - `attribute`: the attribute and system-value group (slice 12g: `ALD`, `AST`, `IPA`, `AL2P`,
 //!   `S2R`, `CS2R`, `PIXLD`, and the deferred `OUT`, `ISBERD` and `ISBEWR`), joined through
 //!   `GROUPS`;
@@ -43,6 +46,7 @@ pub mod control;
 pub mod driver;
 pub mod float;
 pub mod integer;
+pub mod memory;
 pub(crate) mod source;
 #[cfg(test)]
 mod tests;
