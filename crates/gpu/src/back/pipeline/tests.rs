@@ -574,6 +574,9 @@ fn fixed_changes() -> Vec<(&'static str, ShaderChange)> {
         ("typed outputs", |d, _| {
             d.emulation = EmulationFlags::TYPED_OUTPUTS;
         }),
+        ("flipped viewport", |d, _| {
+            d.emulation = EmulationFlags::FLIPPED_VIEWPORT;
+        }),
     ];
     changes
 }

@@ -64,10 +64,13 @@
 //!
 //! The instruction groups' translators (port slices 12a to 12h) each have a module here that
 //! translates one instruction of a flow block (slice 10) at a time: [`control`] for the
-//! control and warp group, whose instructions [`translate`] keeps refusing, [`integer`] for
-//! the integer ALU group (slice 12a) and [`memory`] for the memory group (slice 12e). The
-//! attribute group (`attribute`) is joined to
-//! [`translate`] through `GROUPS` instead.
+//! control and warp group, whose instructions [`translate`] keeps refusing, and [`integer`] for
+//! the integer ALU group (slice 12a), [`float`] for the 32-bit float and conversion group
+//! (slice 12b), [`memory`] for the memory group (slice 12e) and [`texture`] for the texture and
+//! surface group (slice 12f). The attribute
+//! group (`attribute`) is joined to [`translate`] through `GROUPS` instead. `conditional_block`
+//! is the guard helper [`float`] and [`texture`] share: both turn a guarded instruction into a
+//! conditional block with it, rather than each building its own.
 //!
 //! Slice 1 handles linear flow only (spec, port slice 1). Where starquake is stricter than the
 //! PR, because the PR resolves the case in a part not built yet:
@@ -93,6 +96,7 @@ pub mod integer;
 pub mod memory;
 #[cfg(test)]
 mod tests;
+pub mod texture;
 
 use std::fmt::{self, Display, Formatter};
 
@@ -414,6 +418,36 @@ const fn imm32(bits: u32) -> Operand {
     Operand::Imm(Imm::U32(bits))
 }
 
+/// Appends `body` at the end of `builder`'s block under `guard`, for the groups whose guarded
+/// instructions become conditional blocks ([`float`], [`texture`]): unless `guard_tested` (the
+/// block already runs only where the guard holds, flow analysis's `guard_tested`) or the guard
+/// is `PT`, the block reads the guard and branches to a new block holding `body`'s IR or past
+/// it, and `builder` is left in the block after, where translation continues. `@!PT` makes a
+/// block that never runs.
+pub(crate) fn conditional_block<E: From<BuildError>>(
+    builder: &mut Builder<'_>,
+    guard: PredSrc,
+    guard_tested: bool,
+    body: impl FnOnce(&mut Builder<'_>) -> Result<(), E>,
+) -> Result<(), E> {
+    if guard_tested || guard.is_true() {
+        return body(builder);
+    }
+    let cond = crate::flow::read_pred(builder, guard)?;
+    let then = builder.add_block()?;
+    let after = builder.add_block()?;
+    builder.terminate(Terminator::Branch {
+        cond,
+        then,
+        otherwise: after,
+    })?;
+    builder.switch_to(then)?;
+    body(builder)?;
+    builder.terminate(Terminator::Jump(after))?;
+    builder.switch_to(after)?;
+    Ok(())
+}
+
 /// Whether an instruction under `guard` never runs: `@!PT` (PR #4588's `Guard::Never`,
 /// `flow.h`: `index == 7 && negated`).
 const fn never_runs(guard: PredSrc) -> bool {
@@ -634,8 +668,12 @@ impl Translator<'_> {
     /// target order over the targets with any component written, one register per component
     /// whether that component is written or not (`ops_attr.cpp`, `EXIT`). At most
     /// `COLOR_TARGETS * 4` = 32 registers are read, so the PR's `src_reg < 255` check cannot
-    /// fail here and is not repeated. Sample mask and depth outputs come with the SPH parser
-    /// (slice 2).
+    /// fail here and is not repeated. With the pixel program's header
+    /// ([`translate_with_header`]), the sample mask (`OMAP_SAMPLE_MASK`) is the register after
+    /// the colours and the depth (`OMAP_DEPTH`) the one after that, whether the sample mask is
+    /// written or not, as both references read them (`ops_attr.cpp`, `EXIT`: `X(src_reg)` and
+    /// `F(src_reg + 1)`; Eden's `exit_program.cpp`, `ExitFragment`, the same); at most register
+    /// 33, so the PR's two register checks cannot fail either (slice 15).
     fn exit(&mut self, op: OpExit) -> Result<(), Failure> {
         require(!op.keep_ref_count && !op.no_at_exit, Unsupported::ExitMode)?;
         require(op.pred.is_true(), Unsupported::ConditionalExit)?;
@@ -662,6 +700,17 @@ impl Translator<'_> {
                 }
                 reg = reg.saturating_add(1);
             }
+        }
+        let Some(header) = self.header else {
+            return Ok(());
+        };
+        if header.writes_sample_mask {
+            let mask = self.get(Gpr::new(reg))?;
+            self.op(Opcode::SetSampleMask, &[mask])?;
+        }
+        if header.writes_depth {
+            let depth = self.get_f32(Gpr::new(reg.saturating_add(1)))?;
+            self.op(Opcode::SetFragDepth, &[depth.into()])?;
         }
         Ok(())
     }

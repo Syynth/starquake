@@ -453,6 +453,10 @@ flag_set! {
         ATTRIBUTE_FETCH = 3,
         /// The fragment shader's outputs are typed to match integer render targets.
         TYPED_OUTPUTS = 4,
+        /// The guest's viewport flips y or reverses depth, which the host cannot set: the
+        /// vertex shader flips y and remaps depth from the driver constants, and the backend
+        /// sets the host viewport positive ([`crate::emulation::host_viewport`]).
+        FLIPPED_VIEWPORT = 5,
     }
 }
 

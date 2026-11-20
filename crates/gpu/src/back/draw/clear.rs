@@ -255,8 +255,8 @@ use starquake_render::pipeline::{
 };
 use starquake_render::resource::CompareFunction;
 use starquake_render::shader::{
-    InterfaceVariable, Interpolation, ScalarKind, ShaderDesc, ShaderInterface, ShaderSource,
-    ShaderStage,
+    InterfaceVariable, Interpolation, ScalarKind, ShaderDesc, ShaderInterface, ShaderRequirements,
+    ShaderSource, ShaderStage,
 };
 use starquake_render::{
     Backend, BufferDesc, BufferId, BufferUsage, Command, CommandList, EmulationFlags, FenceValue,
@@ -697,6 +697,7 @@ impl Entry {
             resources,
             inputs: Vec::new(),
             outputs,
+            requirements: ShaderRequirements::default(),
         }
     }
 }

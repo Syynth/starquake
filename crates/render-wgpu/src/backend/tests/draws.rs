@@ -18,7 +18,7 @@ use starquake_render::pipeline::{
 };
 use starquake_render::shader::{ResourceBinding, ResourceKind, SampleKind, ShaderInterface};
 use starquake_render::{
-    CompileJob, CompilePool, ComputePipelineDesc, GraphicsPipelineDesc, ShaderStage,
+    CompileJob, CompilePool, ComputePipelineDesc, EmulationFlags, GraphicsPipelineDesc, ShaderStage,
 };
 
 /// The target's side, in pixels.
@@ -173,6 +173,7 @@ fn uniform_at_zero() -> ShaderInterface {
             group: 0,
             binding: 0,
             kind: ResourceKind::UniformBuffer,
+            count: None,
         }],
         ..ShaderInterface::default()
     }
@@ -798,6 +799,7 @@ fn a_dispatch_writes_its_storage_buffer() {
                         group: 0,
                         binding: 0,
                         kind: ResourceKind::StorageBuffer { writable: true },
+                        count: None,
                     }],
                     ..ShaderInterface::default()
                 },
@@ -986,11 +988,13 @@ fn writer_shader(gpu: &WgpuBackend) -> ShaderId {
                     group: 0,
                     binding: 0,
                     kind: ResourceKind::UniformBuffer,
+                    count: None,
                 },
                 ResourceBinding {
                     group: 0,
                     binding: 1,
                     kind: ResourceKind::StorageBuffer { writable: true },
+                    count: None,
                 },
             ],
             ..ShaderInterface::default()
@@ -1274,11 +1278,13 @@ fn sampling_shader(gpu: &WgpuBackend, filterable: bool) -> ShaderId {
                         sample: SampleKind::Float { filterable },
                         multisampled: false,
                     },
+                    count: None,
                 },
                 ResourceBinding {
                     group: 0,
                     binding: 1,
                     kind: ResourceKind::Sampler { comparison: false },
+                    count: None,
                 },
             ],
             ..ShaderInterface::default()
@@ -1322,4 +1328,87 @@ fn sampled_draw(
             first_instance: 0,
         },
     })
+}
+
+/// [`VERTEX`] followed by what shader-pipeline slice 17 will lower for a pipeline with
+/// `EmulationFlags::FLIPPED_VIEWPORT` (the shader crate's driver-constants docs, "The flipped
+/// viewport"): y scaled and z scaled and offset by `w`, from a uniform holding the y scale, the
+/// z scale and the z offset. A stand-in until slice 17 exists.
+const FLIPPING_VERTEX: &str = "
+    @group(0) @binding(1) var<uniform> flip: vec4<f32>;
+    @vertex fn main(@location(0) p: vec2<f32>) -> @builtin(position) vec4<f32> {
+        let pos = vec4(p.x / 4.0 - 1.0, 1.0 - p.y / 4.0, 0.0, 1.0);
+        return vec4(pos.x, pos.y * flip.x, pos.z * flip.y + pos.w * flip.z, pos.w);
+    }";
+
+/// A flipped viewport on a real GPU: the guest's viewport flips y (a negative height) and
+/// reverses depth, which wgpu refuses; a pipeline with `FLIPPED_VIEWPORT` and the flipping
+/// vertex shader draws the pixels a host that could set that viewport would (the rectangle
+/// mirrored top to bottom: window y is `8 - p.y` under `y = 8, height = -8`), with no host
+/// error. An upright draw through the same shader with the constants at rest draws the
+/// rectangle where it is.
+#[test]
+fn a_flipped_viewport_draws_the_upright_pixels() {
+    bounded(|| {
+        let Some(mut s) = scene("flipped_viewport") else {
+            return;
+        };
+        let interface = ShaderInterface {
+            resources: vec![ResourceBinding {
+                group: 0,
+                binding: 1,
+                kind: ResourceKind::UniformBuffer,
+                count: None,
+            }],
+            ..ShaderInterface::default()
+        };
+        let vs = s
+            .gpu
+            .create_shader(shader_desc(
+                ShaderStage::Vertex,
+                "main",
+                wgsl(FLIPPING_VERTEX),
+                interface,
+            ))
+            .expect("vertex shader");
+        let mut desc = positions(vs, s.fs, Topology::Triangles);
+        desc.emulation = EmulationFlags::FLIPPED_VIEWPORT;
+        let pipeline = s.pipeline(desc);
+        let flipped = Viewport {
+            x: 0.0,
+            y: float(SIDE),
+            width: float(SIDE),
+            height: -float(SIDE),
+            min_depth: 1.0,
+            max_depth: 0.0,
+        };
+        // (viewport, y scale, z scale, z offset, the rectangle drawn)
+        let (x0, y0, x1, y1) = RECT;
+        let side = float(SIDE);
+        let cases = [
+            (dynamic().viewports[0], [1.0, 1.0, 0.0], RECT),
+            (flipped, [-1.0, -1.0, 1.0], (x0, side - y1, x1, side - y0)),
+        ];
+        for (viewport, words, rect) in cases {
+            let mut draws = s.draw_with(pipeline, &triangles(RECT), &Feed::Direct, MAGENTA);
+            let (flip, up) = s.buffer(UNIFORMS, &floats(&[words[0], words[1], words[2], 0.0]));
+            let Some(Command::Draw(mut draw)) = draws.pop() else {
+                unreachable!("the last command is the draw");
+            };
+            draw.dynamic.viewports = vec![viewport];
+            draw.bindings.push(Binding {
+                group: 0,
+                binding: 1,
+                resource: BindingResource::Buffer(BufferSlice {
+                    buffer: flip,
+                    offset: 0,
+                    size: 16,
+                }),
+            });
+            draws.push(up);
+            draws.push(Command::Draw(draw));
+            assert_eq!(s.pixels(draws), image(&[(rect, MAGENTA)]), "{viewport:?}");
+        }
+        assert_eq!(s.gpu.host_errors(), 0);
+    });
 }

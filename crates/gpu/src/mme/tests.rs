@@ -725,43 +725,173 @@ fn loop_repeats_its_body() {
 }
 
 #[test]
-fn loop_with_a_zero_count_runs_the_body_once() {
-    // Mesa: MAX2(1, x) - 1 extra passes. Eden-NX2 skips the body; see the interpreter docs.
+fn a_loop_runs_its_body_exactly_count_times() {
+    // The edge at zero, from both sides: a count of 0 skips the body (Eden-NX2; see the
+    // interpreter docs), 1 runs it once, 2 twice. Every instruction of a three-instruction body
+    // counts its own passes, and the instruction after the body runs once whatever the count.
+    for count in [0_u32, 1, 2] {
+        let program = vec![
+            mov_reg(0, Reg::Load0),
+            inst01(
+                alu(AluOp::Add, r(1), Reg::Zero, Reg::Zero),
+                alu(AluOp::Add, r(2), Reg::Zero, Reg::Zero),
+            ),
+            inst01(
+                alu(AluOp::Add, r(3), Reg::Zero, Reg::Zero),
+                alu(AluOp::Add, r(4), Reg::Zero, Reg::Zero),
+            ),
+            loop_(r(0), 3),
+            add_imm(1, 1),
+            add_imm(2, 1),
+            add_imm(3, 1),
+            add_imm(4, 1),
+            store(1, 1),
+            store(2, 2),
+            store(3, 3),
+            store(4, 4),
+        ];
+        let (ram, _) = go(program, &[count]);
+        assert_eq!(
+            (word(&ram, 1), word(&ram, 2), word(&ram, 3), word(&ram, 4)),
+            (count, count, count, 1),
+            "count {count}"
+        );
+    }
+}
+
+#[test]
+fn a_zero_count_loop_loads_none_of_its_bodys_parameters() {
+    // The shape the native SDK's macros have (Eden-NX2, `macro_turing.h`: "The native SDK emits
+    // zero-count loops around FIFO reads"): a count parameter, a loop whose body emits two
+    // parameters per pass, then a parameter read after the loop. A caller that passes a count
+    // of 0 passes no words for the body, so running the body once would take the word meant for
+    // the read after it and then run the FIFO dry.
+    let select = with_imm(
+        with_out(Instruction::default(), 0, OutOp::Imm0, OutOp::None),
+        0x1040,
+        0,
+    );
+    let body = Instruction {
+        out: [
+            Out {
+                mthd: OutOp::None,
+                emit: OutOp::Load0,
+            },
+            Out {
+                mthd: OutOp::None,
+                emit: OutOp::Load1,
+            },
+        ],
+        ..Instruction::default()
+    };
+    let program = || {
+        vec![
+            select,
+            mov_reg(0, Reg::Load0),
+            loop_(r(0), 1),
+            body,
+            mov_reg(1, Reg::Load0),
+            store(0, 1),
+        ]
+    };
+    let (ram, host) = go(program(), &[0, 77]);
+    assert_eq!(word(&ram, 0), 77);
+    assert_eq!(host.calls, []);
+    assert_eq!(host.loads, 2);
+    // The other side: a count of 2 emits two pairs, and the read after the loop gets the next.
+    let (ram, host) = go(program(), &[2, 10, 11, 12, 13, 77]);
+    assert_eq!(word(&ram, 0), 77);
+    assert_eq!(host.calls, [(0x40, 10), (0x41, 11), (0x42, 12), (0x43, 13)]);
+}
+
+#[test]
+fn a_zero_count_loop_runs_the_rest_of_its_own_instruction() {
+    // Only the body is skipped: the other ALU slot and both outputs of the `LOOP` instruction
+    // itself still run, in either slot order.
+    for loop_slot in 0..2 {
+        let looping = alu(AluOp::Loop, Reg::Zero, r(0), Reg::Zero);
+        let other = alu(AluOp::Add, r(1), Reg::Imm, Reg::Zero);
+        let mut inst = if loop_slot == 0 {
+            inst01(looping, other)
+        } else {
+            inst01(other, looping)
+        };
+        // The loop's length field (a one-instruction body) and the other slot's immediate.
+        inst.imm[loop_slot] = 2;
+        inst.imm[1 - loop_slot] = 9;
+        inst.out[0] = Out {
+            mthd: OutOp::None,
+            emit: if loop_slot == 0 {
+                OutOp::Imm1
+            } else {
+                OutOp::Imm0
+            },
+        };
+        let program = vec![
+            mov(0, 0),
+            mov(2, 5),
+            inst,
+            add_imm(2, 1),
+            store(0, 1),
+            store(1, 2),
+        ];
+        let (ram, host) = go(program, &[]);
+        assert_eq!((word(&ram, 0), word(&ram, 1)), (9, 5), "slot {loop_slot}");
+        assert_eq!(host.calls, [(0, 9)], "slot {loop_slot}");
+    }
+}
+
+#[test]
+fn a_zero_count_loop_at_the_end_of_the_program_runs_off_it() {
+    // The skip goes to the instruction after the body whether or not there is one; with no
+    // end marker before it, that is an instruction outside the program.
     let program = vec![
-        mov_reg(0, Reg::Load0),
-        mov(1, 0),
-        loop_(r(0), 1),
-        add_imm(1, 1),
+        mov(0, 0),
+        loop_(r(0), 2),
         Instruction::default(),
-        store(0, 1),
+        Instruction::default(),
     ];
-    let (ram, _) = go(program, &[0]);
-    assert_eq!(word(&ram, 0), 1);
+    assert_eq!(
+        run_program(&program, &[]).err().unwrap(),
+        MacroError::PcOutOfRange { pc: program.len() }
+    );
 }
 
 #[test]
 fn a_loop_inside_a_loop_is_an_error() {
-    let program = vec![
-        mov(0, 3),
-        loop_(r(0), 3),
-        loop_(r(0), 1),
-        Instruction::default(),
-        Instruction::default(),
-    ];
-    assert_eq!(fails(program, &[]), MacroError::NestedLoop { pc: 2 });
+    // Whatever the inner loop's count: a count of zero is refused before it is skipped.
+    for inner in [3, 0] {
+        let program = vec![
+            mov(0, 3),
+            mov(1, inner),
+            loop_(r(0), 3),
+            loop_(r(1), 1),
+            Instruction::default(),
+            Instruction::default(),
+        ];
+        assert_eq!(
+            fails(program, &[]),
+            MacroError::NestedLoop { pc: 3 },
+            "inner count {inner}"
+        );
+    }
 }
 
 #[test]
 fn a_loop_needs_a_body_of_at_least_one_instruction() {
-    for length in [0, 1] {
-        let program = vec![
-            mov(0, 3),
-            with_imm(inst0(AluOp::Loop, Reg::Zero, r(0), Reg::Zero), length, 0),
-        ];
-        assert_eq!(
-            fails(program, &[]),
-            MacroError::InvalidLoop { pc: 1, length }
-        );
+    // Whatever its count: a count of zero is refused before it is skipped.
+    for count in [3, 0] {
+        for length in [0, 1] {
+            let program = vec![
+                mov(0, count),
+                with_imm(inst0(AluOp::Loop, Reg::Zero, r(0), Reg::Zero), length, 0),
+            ];
+            assert_eq!(
+                fails(program, &[]),
+                MacroError::InvalidLoop { pc: 1, length },
+                "count {count}"
+            );
+        }
     }
 }
 

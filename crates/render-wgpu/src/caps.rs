@@ -23,7 +23,9 @@
 //!   (`DownlevelFlags::INDIRECT_EXECUTION`, which `RenderPass::multi_draw_indirect` needs; wgpu 30
 //!   has no feature flag for it). Never: logic ops, mirror-clamp-to-edge, min/max sampler
 //!   reduction, a −1..1 depth range, turning primitive restart off and untyped fragment outputs
-//!   (none is in wgpu 30; render-backend decision 1's table), and the two robust-access features
+//!   (none is in wgpu 30; render-backend decision 1's table), a flipped viewport (wgpu-core's
+//!   `set_viewport` refuses a negative height and a reversed depth range; `crate::draw`,
+//!   "Flipped viewports"), and the two robust-access features
 //!   (wgpu bounds-checks shaders itself, but does not promise "read zero, drop writes"; claiming
 //!   less is the safe side).
 //! - **Stages**: none beyond vertex, fragment and compute (wgpu has no geometry or tessellation

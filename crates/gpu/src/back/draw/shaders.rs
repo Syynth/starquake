@@ -69,6 +69,13 @@
 //! [`VariantKey::next_stage_reads`] stays empty: slice 9 leaves it to the side that has
 //! translated the fragment program (an owner question in `starquake_shader::variant`).
 //!
+//! The flipped viewport ([`viewport_flip`], [`constants_flip`]): the backend's `emulation()`
+//! reads how the first viewport handed to it flips, and sets `FLIPPED_VIEWPORT` when the host
+//! cannot set that viewport; the driver constants then carry the same flip for the vertex
+//! shader, and carry none without the flag, when the shader does not read them and the host
+//! sets the viewport as it is (render-backend, "Fixed-function state the host lacks"; owner's
+//! ruling 28 of 2026-11-19). `tests::each_viewport_flip_reaches_the_flag_and_the_constants`.
+//!
 //! The texture swizzles go in only when `Caps::view_swizzle` is false, keyed by binding order,
 //! which only a set's translation knows (slice 9's owner question). This slice therefore looks
 //! a set up first with the swizzles of the textures the previous answer for the same requests
@@ -79,18 +86,23 @@
 //! shader's texture uses in set order, then in resource-table order.
 
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use starquake_render::caps::GUEST_COLOR_TARGETS;
+use starquake_render::command::Viewport;
+use starquake_render::emulation::ViewportFlip;
 use starquake_render::format::NumericType;
 use starquake_render::pipeline::EmulationFlags;
 use starquake_render::shader::{
     InterfaceVariable, Interpolation, ResourceBinding, ResourceKind, ScalarKind, ShaderDesc,
-    ShaderInterface, ShaderSource, ShaderStage,
+    ShaderInterface, ShaderRequirements, ShaderSource, ShaderStage,
 };
 use starquake_render::{Backend, FenceValue, PixelFormat, ResourceId, ShaderId};
 use starquake_shader::exchange::{SampledType, TextureFormat, TextureKind};
-use starquake_shader::host::{HostCode, HostShader, HostStage, SlotBinding, SlotType};
+use starquake_shader::host::{
+    HostCode, HostShader, HostStage, Requirements, SlotBinding, SlotType,
+};
 use starquake_shader::lookup::{
     EngineState, GuestStage, ProgramMemory, ProgramRequest, Rejection, ShaderSet, Ticket, Unmapped,
     VariantKey,
@@ -154,6 +166,12 @@ pub struct ResourceUse {
     pub slot: Slot,
     /// What the module declares there.
     pub kind: ResourceKind,
+    /// The module's binding-array size there: `None` for one resource, `Some(n)` for a binding
+    /// array of `n` ([`ResourceBinding::count`], which [`shader_desc`] copies it to; decided by
+    /// the owner, 2026-11-19, ruling 20). The draw and compute paths bind one resource per row
+    /// and no lookup answers a row with a count yet: binding arrays are bound with the slices
+    /// that add them to the shader crate's resource table (13 and 16).
+    pub count: Option<NonZeroU32>,
     /// What fills it.
     pub source: ResourceSource,
 }
@@ -414,6 +432,24 @@ pub fn emulation_key(
         primitive_restart_rewrite: flags.contains(EmulationFlags::PRIMITIVE_RESTART_REWRITE),
         attribute_fetch: flags.contains(EmulationFlags::ATTRIBUTE_FETCH),
         typed_outputs: flags.contains(EmulationFlags::TYPED_OUTPUTS),
+        flipped_viewport: flags.contains(EmulationFlags::FLIPPED_VIEWPORT),
+    }
+}
+
+/// How the first of `viewports` (those handed to the backend) flips: what `emulation()` reads.
+/// None for no viewport, which the backend refuses anyway.
+pub fn viewport_flip(viewports: &[Viewport]) -> ViewportFlip {
+    viewports
+        .first()
+        .map_or(ViewportFlip::NONE, ViewportFlip::of)
+}
+
+/// The flip the driver constants carry: `flip` when `flags` has `FLIPPED_VIEWPORT`, else none.
+pub fn constants_flip(flags: EmulationFlags, flip: ViewportFlip) -> ViewportFlip {
+    if flags.contains(EmulationFlags::FLIPPED_VIEWPORT) {
+        flip
+    } else {
+        ViewportFlip::NONE
     }
 }
 
@@ -455,6 +491,7 @@ pub const fn host_stage(stage: HostStage) -> ShaderStage {
     match stage {
         HostStage::Vertex => ShaderStage::Vertex,
         HostStage::Fragment => ShaderStage::Fragment,
+        HostStage::Compute => ShaderStage::Compute,
     }
 }
 
@@ -478,10 +515,31 @@ fn variable(binding: SlotBinding, ty: SlotType) -> Option<InterfaceVariable> {
     })
 }
 
+/// The render crate's requirements for a translated shader's, field by field (shader-pipeline,
+/// "What the render backend (#14) gets": the interface "also carries `requirements`"; decided
+/// by the owner, 2026-11-19, ruling 20).
+pub const fn requirements(requirements: Requirements) -> ShaderRequirements {
+    let Requirements {
+        subgroup,
+        f16,
+        f64,
+        i64,
+        i64_atomics,
+    } = requirements;
+    ShaderRequirements {
+        subgroup,
+        f16,
+        f64,
+        i64,
+        i64_atomics,
+    }
+}
+
 /// The one conversion from a translated shader to the render crate's description (render-backend
 /// spec, "Interfaces": "that conversion is one function (G18), which the replay's
 /// `ShaderResolver` also calls"): the naga module as [`ShaderSource::Naga`], the slots at
-/// locations as inputs and outputs, and `resources` as the resource table.
+/// locations as inputs and outputs, `resources` as the resource table with each row's array
+/// count, and the shader's requirements ([`requirements`]).
 pub fn shader_desc(shader: &HostShader, resources: &[ResourceUse]) -> ShaderDesc {
     let HostCode::Naga { module, info } = &shader.code;
     let slots = |list: &[starquake_shader::host::InterfaceSlot]| {
@@ -503,10 +561,12 @@ pub fn shader_desc(shader: &HostShader, resources: &[ResourceUse]) -> ShaderDesc
                     group: r.slot.group,
                     binding: r.slot.binding,
                     kind: r.kind,
+                    count: r.count,
                 })
                 .collect(),
             inputs: slots(&shader.inputs),
             outputs: slots(&shader.outputs),
+            requirements: requirements(shader.requirements),
         },
         origin: None,
     }

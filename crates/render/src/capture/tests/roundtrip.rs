@@ -21,9 +21,13 @@ use crate::resource::{
     AddressMode, BorderColor, BufferDesc, BufferUsage, Extent3d, FilterMode, ReductionMode,
     SamplerDesc, Swizzle, TextureDesc, TextureDimension, TextureUsage, ViewDesc, ViewDimension,
 };
-use crate::shader::{InterfaceVariable, Interpolation, ScalarKind, ShaderInterface, ShaderStage};
+use crate::shader::{
+    InterfaceVariable, Interpolation, ResourceBinding, ResourceKind, ScalarKind, ShaderInterface,
+    ShaderRequirements, ShaderStage,
+};
 use proptest::prelude::*;
 use proptest::test_runner::{Config, RngSeed};
+use std::num::NonZeroU32;
 
 /// One generated step: a kind and the numbers its record is made from.
 #[derive(Clone, Debug)]
@@ -241,7 +245,13 @@ fn kept(s: &Step, made: &mut Kept) -> Record {
             stage: ShaderStage::TessEval,
             entry: text(s),
             interface: ShaderInterface {
-                resources: Vec::new(),
+                resources: vec![ResourceBinding {
+                    group: s.c,
+                    binding: s.b,
+                    kind: ResourceKind::Sampler { comparison: s.made },
+                    // `None` when `a % 64` is zero; the golden file holds both forms.
+                    count: NonZeroU32::new(u32::try_from(s.a % 64).expect("small")),
+                }],
                 inputs: vec![InterfaceVariable {
                     location: s.b,
                     scalar: ScalarKind::Float,
@@ -249,6 +259,13 @@ fn kept(s: &Step, made: &mut Kept) -> Record {
                     interpolation: Interpolation::Perspective,
                 }],
                 outputs: Vec::new(),
+                requirements: ShaderRequirements {
+                    subgroup: !s.made,
+                    f16: s.a.is_multiple_of(2),
+                    f64: s.b.is_multiple_of(2),
+                    i64: s.c.is_multiple_of(2),
+                    i64_atomics: s.made,
+                },
             },
             code: match (made.sources, s.a % 4) {
                 (n, 0) if n > 0 => ShaderCode::Origin {

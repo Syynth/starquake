@@ -788,15 +788,13 @@ fn conversion_sizes() {
         Op::F2I(f2i(r(0), reg(1), int(3, false), RoundMode::Zero)),
         U::F2iDestinationSize(int(3, false)),
     );
-    for src_type in [FloatType::F8, FloatType::F64] {
-        assert_refused(
-            Op::F2I(OpF2I {
-                src_type,
-                ..f2i(r(0), reg(1), IntType::S32, RoundMode::Zero)
-            }),
-            U::F2iSourceSize(src_type),
-        );
-    }
+    assert_refused(
+        Op::F2I(OpF2I {
+            src_type: FloatType::F64,
+            ..f2i(r(0), reg(1), IntType::S32, RoundMode::Zero)
+        }),
+        U::F2iSourceSize(FloatType::F64),
+    );
     // I2F and I2FP: sources up to 32 bits, a 32-bit destination only.
     for size in 0..=2 {
         translated(&[Instr::new(Op::I2F(i2f(
@@ -860,6 +858,103 @@ fn conversion_sizes() {
                 ..f2f(r(0), reg(1), RoundMode::Zero)
             }),
             U::F2fDestinationSize(dst_type),
+        );
+    }
+}
+
+/// A 16-bit operand's high half in the constant-buffer and uniform forms, which the decoder
+/// reads since slice 4b: `MUFU.F16` and `F2I` from a half refuse an operand that is not a
+/// register before they read the half.
+#[test]
+fn high_halves_beyond_registers_are_refused() {
+    use FloatUnsupported as U;
+    for src in [cbuf(1, 8), ureg(4)] {
+        assert_refused(
+            Op::MuFu(OpMuFu {
+                f16: true,
+                high: true,
+                ..mufu(r(0), MuFuOp::Rcp, src)
+            }),
+            U::HalfMufuSource,
+        );
+        assert_refused(
+            Op::F2I(OpF2I {
+                src_type: FloatType::F16,
+                high: true,
+                ..f2i(r(0), src, IntType::S32, RoundMode::Zero)
+            }),
+            U::HalfF2iSource,
+        );
+    }
+}
+
+/// `F2F` and `FRND` with a half's high half (decoded since slice 4b, in each form that has the
+/// bit) are refused by their source-size checks, the PR's `Take(84, 2) == 2`.
+#[test]
+fn f2f_and_frnd_high_halves_are_refused() {
+    use FloatUnsupported as U;
+    for src in [reg(1), cbuf(1, 8), ureg(4)] {
+        assert_refused(
+            Op::F2F(OpF2F {
+                src_type: FloatType::F16,
+                high: true,
+                ..f2f(r(0), src, RoundMode::Zero)
+            }),
+            U::F2fSourceSize(FloatType::F16),
+        );
+        assert_refused(
+            Op::FRnd(OpFRnd {
+                src_type: FloatType::F16,
+                high: true,
+                ..frnd(r(0), src, RoundMode::Zero)
+            }),
+            U::FrndSourceSize(FloatType::F16),
+        );
+    }
+}
+
+/// A hand-made 32-bit operand with `high` set, which no decoded word carries, is read as its
+/// whole word by `MUFU`, `F2I`, `F2F` and `FRND`: the same function as without it.
+#[test]
+fn a_32_bit_operand_ignores_high() {
+    let pairs = [
+        (
+            Op::MuFu(mufu(r(0), MuFuOp::Rcp, reg(1))),
+            Op::MuFu(OpMuFu {
+                high: true,
+                ..mufu(r(0), MuFuOp::Rcp, reg(1))
+            }),
+        ),
+        (
+            Op::F2I(f2i(r(0), reg(1), IntType::S32, RoundMode::Zero)),
+            Op::F2I(OpF2I {
+                high: true,
+                ..f2i(r(0), reg(1), IntType::S32, RoundMode::Zero)
+            }),
+        ),
+        (
+            Op::F2F(f2f(r(0), reg(1), RoundMode::Zero)),
+            Op::F2F(OpF2F {
+                high: true,
+                ..f2f(r(0), reg(1), RoundMode::Zero)
+            }),
+        ),
+        (
+            Op::FRnd(frnd(r(0), reg(1), RoundMode::Zero)),
+            Op::FRnd(OpFRnd {
+                high: true,
+                ..frnd(r(0), reg(1), RoundMode::Zero)
+            }),
+        ),
+    ];
+    for (whole, high) in pairs {
+        let instr = Instr::new(high);
+        let decoded = assemble(&instr).ok().map(decode);
+        assert_ne!(decoded, Some(Ok(instr)), "{instr}");
+        assert_eq!(
+            translate_raw(&[instr]),
+            Ok(translated(&[Instr::new(whole)])),
+            "{instr}"
         );
     }
 }

@@ -195,6 +195,18 @@ CPU writes"):
 Titles reserve far more address space than they use. A reservation creates address-space
 bookkeeping but no stage-1 entries; backing pages are allocated on first touch (fault).
 
+**How much guest RAM a run has** (decided by the owner, 2026-11-19). Guest RAM is sized from the
+console's memory arrangement that the program's metadata names: what the title may map, its
+application pool (`MemoryArrangement::application_pool_size`, 3285 MiB for a Switch 1 program and
+9809 MiB for a Switch 2 one), less the charge of its system resource. It is reserved whole and
+backed lazily: a host page is committed only when the guest first touches it, so a run costs the
+host what the title touches, not what it may map. This replaces `WORKING_RAM`, a fixed 16 MiB guess
+added to the program image (`crates/core/src/system/ram.rs`), which the first retail title brought
+up used up early in its start-up; its replacement is the pool itself, the size
+`GuestRam::for_program` gives every program that fits. The backend's translation table pool, fixed
+at 4 MiB (about 2 GiB of scattered 2 MiB windows), then bounds what a title can touch until it is
+sized with the address space.
+
 GPU-only memory (the graphics server's sparse regions, two of about 5.7 GiB in one title) is not
 guest memory at all: the CPU never maps it. The GPU crate backs it lazily on the host, the first
 time the GPU writes a part of it, and it is never charged to the title's pools

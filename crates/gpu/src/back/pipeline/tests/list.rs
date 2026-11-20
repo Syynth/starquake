@@ -256,7 +256,7 @@ fn golden() -> Vec<u8> {
         0x01, 0x0C, 0x00, 0x01, 0x27, 0x00, 0x00, 0x00, 0x00, 0x00, //
         0x01, 0x6D, // depth/stencil: D24UnormS8Uint (109)
         0x04, // four samples
-        0x1F, // every emulation flag
+        0x3F, // every emulation flag
         // Key 1: compute, its stamp as a 128-bit varint.
         0x01, 0xD5, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
         0x04, //
@@ -897,7 +897,7 @@ fn case() -> impl Strategy<Value = (GraphicsPipelineDesc, StageStamps, DynamicSt
             LogicOp::Xor,
             LogicOp::Set,
         ])),
-        0u32..32,
+        0..=EmulationFlags::ALL.bits(),
         0u32..8,
         any::<bool>(),
         prop::sample::select(&TOPOLOGIES[..]),
