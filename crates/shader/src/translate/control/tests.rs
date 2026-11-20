@@ -1990,4 +1990,27 @@ proptest! {
             Err(other) => prop_assert!(false, "{}", other),
         }
     }
+
+    /// [`in_group`], the translation driver's test for this group, names exactly the operations
+    /// [`translate_control`] takes as its own: every decoded operation but those it refuses as
+    /// another group's.
+    #[test]
+    fn in_group_matches_the_dispatch(instr in crate::testing::any_instr()) {
+        let mut function = Function::new();
+        let entry = function.entry();
+        // Unguarded: an instruction under `!PT` becomes nothing in every group.
+        let instr = Instr {
+            guard: PredSrc::TRUE,
+            ..instr
+        };
+        let result = translate_control(&mut function, entry, VERTEX, 0, instr, true);
+        let other_group = matches!(
+            result,
+            Err(TranslateError::Unsupported {
+                what: Unsupported::Control(ControlUnsupported::OtherGroup(_)),
+                ..
+            })
+        );
+        prop_assert_eq!(in_group(&instr.op), !other_group, "{}", instr);
+    }
 }
