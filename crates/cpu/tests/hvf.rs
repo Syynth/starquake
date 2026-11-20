@@ -1090,6 +1090,62 @@ fn a_flush_on_one_vcpu_stops_another_that_never_leaves_the_guest() {
 }
 
 #[test]
+fn a_vm_with_ram_of_a_whole_application_pool_costs_only_the_pages_touched() {
+    if std::env::var_os("CI").is_some() {
+        return;
+    }
+    let _lock = support::VM_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    // 10 GiB: more than the larger console's application pool (9809 MiB on a Switch 2,
+    // `starquake_kernel::memory::MemoryArrangement::application_pool_size`).
+    let backend = HvfBackend::new(RamConfig::at_least(10 << 30).unwrap()).expect("create the VM");
+    let physical = backend.physical();
+    let (ram, pool) = (backend.ram(), backend.table_pool());
+    // The unit the host commits in: its page, which is also the stage-2 page (16 KiB on Apple
+    // Silicon), the smallest RAM a `RamConfig` holds.
+    let host_page = RamConfig::at_least(1).unwrap().size();
+    // Made and mapped into the VM, neither RAM nor the table pool costs anything.
+    assert_eq!(physical.ram_resident_bytes(), Ok(0));
+    assert_eq!(physical.table_pool_resident_bytes(), Ok(0));
+    // Tables over the whole pool zero their root page, and nothing else.
+    let tables = Stage1Tables::new(physical.clone(), pool).unwrap();
+    assert_eq!(physical.table_pool_resident_bytes(), Ok(host_page));
+    // A code page at the start of RAM and a data page 7 GiB in, each at its own virtual
+    // address: five tables (the root, a level-2 and a level-3 for the code; a level-2 and a
+    // level-3 in another level-1 slot for the data), pool pages 0 to 4: two host pages.
+    let (code_va, data_va) = (0x4000_0000, 0x80_0000_0000 - 0x4000_0000);
+    let data_pa = ram.base() + (7 << 30);
+    tables
+        .map(code_va, BackingRange::new(ram.base(), PAGE_SIZE).unwrap(), Perms::ReadExecute)
+        .unwrap();
+    tables
+        .map(data_va, BackingRange::new(data_pa, PAGE_SIZE).unwrap(), Perms::ReadWrite)
+        .unwrap();
+    assert_eq!(tables.table_pages_in_use(), 5);
+    assert_eq!(physical.table_pool_resident_bytes(), Ok(2 * host_page));
+    // The host writes the code: one page of RAM.
+    let code = [0xf900_0020_u32, SVC_0]; // str x0, [x1]; svc #0
+    let bytes: Vec<u8> = code.iter().flat_map(|word| word.to_le_bytes()).collect();
+    physical.write(ram.base(), &bytes).unwrap();
+    assert_eq!(physical.ram_resident_bytes(), Ok(host_page));
+    // The guest stores 7 GiB into RAM through stage 2: one page more.
+    let mut vcpu = support::new_vcpu(&backend, tables.root());
+    let mut regs = vcpu.regs().unwrap();
+    regs.pc = code_va;
+    regs.x[0] = 0x7a7a_5151_0f0f_e1e1;
+    regs.x[1] = data_va + 8;
+    vcpu.set_regs(&regs).unwrap();
+    assert_eq!(vcpu.run().unwrap(), Exit::Svc(0));
+    assert_eq!(read_u64(&physical, data_pa + 8), 0x7a7a_5151_0f0f_e1e1);
+    assert_eq!(physical.ram_resident_bytes(), Ok(2 * host_page));
+    // The host writes the last byte of RAM: one more.
+    physical.write(ram.end() - 1, &[0xee]).unwrap();
+    assert_eq!(physical.ram_resident_bytes(), Ok(3 * host_page));
+    drop(vcpu);
+}
+
+#[test]
 fn an_access_that_runs_past_the_end_of_ram_or_the_table_pool_faults_at_that_end() {
     let Some(guest) = Guest::new() else { return };
     let physical = guest.backend.physical();

@@ -87,7 +87,13 @@
 //! | `0xf_0000_0000`, 16 KiB | the EL1 shim | read, execute |
 //! | `0xf_0000_4000`, 16 KiB | the shim's own translation tables | read |
 //! | `0xf_0000_8000`, 16 KiB | per-vCPU scratch slots (`SP_EL1`) | read, write |
-//! | `0xf_1000_0000`, 4 MiB | the table pool: where guest translation tables live | read |
+//! | `0xf_1000_0000`, a little over 1 GiB (`TABLE_POOL_SIZE`) | the table pool: where guest translation tables live | read |
+//!
+//! RAM and the table pool are reserved whole and backed lazily: the host commits a page of
+//! either only when it is first touched (`memory`, "Lazy backing"). The table pool holds every
+//! table of one 39-bit address space ([`starquake_memory::stage1::MAX_TABLE_PAGES`]), so it is
+//! sized with the address space rather than with how scattered a guest's pages are, and
+//! `Stage1Tables` zeroes a pool page only when a table first needs it.
 //!
 //! [`HvfBackend::physical`] reads and writes RAM and the table pool by guest-physical address.
 //! Stage 2 is the last line of defence, not the mechanism: the tables and the shim are read-only
@@ -148,7 +154,7 @@ mod tables;
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use starquake_memory::stage1::{FlushRange, Stage1Tables, TableRoot};
+use starquake_memory::stage1::{FlushRange, MAX_TABLE_PAGES, Stage1Tables, TableRoot};
 use starquake_memory::{BackingRange, GuestMemory};
 
 use crate::{
@@ -191,9 +197,17 @@ const MAX_VCPUS: usize = 64;
 
 /// Guest-physical base of the table pool. Provisional, like [`SYSTEM_BASE`].
 const TABLE_POOL_BASE: u64 = 0xf_1000_0000;
-/// Size of the table pool: 1024 table pages, enough to map about 2 GiB of scattered 2 MiB
-/// windows. Starquake's own number, provisional until the kernel sizes address spaces.
-const TABLE_POOL_SIZE: u64 = 4 << 20;
+/// Size of the table pool: every table one 39-bit address space can hold at once
+/// ([`MAX_TABLE_PAGES`], 262,657 pages of 4 KiB), rounded up to a whole host page (262,660
+/// pages, 0x4020_4000 bytes). Backed lazily, so only the tables in use cost the host anything.
+/// One address space's tables then run out only in the window [`MAX_TABLE_PAGES`] names:
+/// while tables an unmapping freed wait for its flush. Two address spaces sharing the pool (as
+/// the hardware tests' halves do) each get what their part holds.
+const TABLE_POOL_SIZE: u64 = (MAX_TABLE_PAGES * PAGE).next_multiple_of(HOST_PAGE);
+/// One past the highest guest-physical address: Hypervisor.framework's default (and largest)
+/// IPA space is 36 bits, 64 GiB (`tools/hvprobe/README.md`, "Guest IPA (physical address)
+/// space").
+const IPA_END: u64 = 1 << 36;
 
 /// First address of the upper half of the address space: with `TCR_EL1.T1SZ` = 25 its
 /// addresses have their top 25 bits set.
@@ -215,6 +229,8 @@ const _: () = assert!(SYSTEM_TABLES_OFFSET + SYSTEM_TABLES as u64 * PAGE <= SCRA
 const _: () = assert!(SCRATCH_OFFSET + PAGE <= SYSTEM_SIZE);
 const _: () = assert!(SYSTEM_BASE + SYSTEM_SIZE <= TABLE_POOL_BASE);
 const _: () = assert!(TABLE_POOL_SIZE.is_multiple_of(HOST_PAGE));
+const _: () = assert!(TABLE_POOL_SIZE >= MAX_TABLE_PAGES * PAGE);
+const _: () = assert!(TABLE_POOL_BASE + TABLE_POOL_SIZE <= IPA_END);
 
 // EL1 configuration, from `Vcpu::new` in `tools/hvprobe/src/probe.rs` unless noted. Bit positions
 // are from the Arm Architecture Reference Manual (DDI 0487).
@@ -1331,6 +1347,23 @@ mod tests {
         );
         // A size that cannot be rounded up without overflowing.
         assert_eq!(RamConfig::at_least(u64::MAX), Err(LayoutError::OutOfRange));
+    }
+
+    #[test]
+    fn the_table_pool_holds_every_table_of_an_address_space_inside_the_ipa_space() {
+        // 262,657 tables of 4 KiB (`MAX_TABLE_PAGES`: 1 + 512 + 512 * 512) is 0x4020_1000
+        // bytes; rounded up to the 16 KiB host page, 0x4020_4000.
+        assert_eq!(TABLE_POOL_SIZE, 0x4020_4000);
+        assert_eq!(TABLE_POOL_SIZE / PAGE, 262_660);
+        assert!(TABLE_POOL_SIZE / PAGE >= MAX_TABLE_PAGES);
+        assert!((TABLE_POOL_SIZE - HOST_PAGE) / PAGE < MAX_TABLE_PAGES);
+        // Hypervisor.framework's 36-bit IPA space (`tools/hvprobe/README.md`).
+        assert_eq!(IPA_END, 0x10_0000_0000);
+        assert!(TABLE_POOL_BASE + TABLE_POOL_SIZE <= IPA_END);
+        // Clear of the backend's own region below it, and of the largest RAM.
+        assert!(SYSTEM_BASE + SYSTEM_SIZE <= TABLE_POOL_BASE);
+        let largest = RamConfig::at_least(SYSTEM_BASE - DEFAULT_RAM_BASE).unwrap();
+        assert!(largest.base + largest.size <= TABLE_POOL_BASE);
     }
 
     #[test]

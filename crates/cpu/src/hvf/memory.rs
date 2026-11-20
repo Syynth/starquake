@@ -20,8 +20,20 @@
 //! (`the_path_of_an_access_is_fixed_for_every_kind_and_shape`) is what pins the atomic path: on
 //! this host a byte-wise copy of one aligned word is most likely a single store as well, so no
 //! test on a real vCPU can tell the two apart.
+//!
+//! # Lazy backing
+//!
+//! Every region is an anonymous private host mapping (`mmap` with `MAP_ANON`), which reads as
+//! zeros and which the host commits a page at a time, the first time the page is touched, by
+//! the guest through stage 2 or by the host. Making a region and mapping it into the VM
+//! (`hv_vm_map`) commit nothing (`tests/hvf.rs`,
+//! `a_vm_with_ram_of_a_whole_application_pool_costs_only_the_pages_touched`). So guest RAM as
+//! large as a console's application pool, and a table pool as large as every table of the
+//! address space, cost the host what is touched, not what is reserved
+//! (`docs/specs/execution-model.md`, "Sparse and lazy memory").
+//! [`PhysicalMemory::ram_resident_bytes`] and [`PhysicalMemory::table_pool_resident_bytes`]
+//! count what each costs now, in whole host pages (`mincore`).
 
-use std::alloc::Layout;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -78,10 +90,11 @@ pub(super) const fn path(kind: Kind, whole_words: bool) -> Path {
     }
 }
 
-/// Host memory with the alignment HVF needs, zeroed, freed on drop.
+/// Host memory with the alignment HVF needs, zeroed, backed lazily (see the module docs),
+/// given back on drop.
 pub(super) struct HostRegion {
     ptr: NonNull<u8>,
-    layout: Layout,
+    len: usize,
     kind: Kind,
 }
 
@@ -93,24 +106,94 @@ unsafe impl Send for HostRegion {}
 unsafe impl Sync for HostRegion {}
 
 impl HostRegion {
+    /// Reserves `len` bytes of zeroed memory, which must be a whole number of host pages, that
+    /// the host commits a page at a time on first touch.
     pub(super) fn new(len: u64, kind: Kind) -> Result<Self, Error> {
         let too_big = |_| Error::Host(format!("cannot allocate {len:#x} bytes of guest memory"));
         let size = usize::try_from(len).map_err(too_big)?;
-        let align = usize::try_from(HOST_PAGE).map_err(too_big)?;
-        let layout = Layout::from_size_align(size, align)
-            .map_err(|_| Error::Host(format!("bad guest memory layout: {len:#x} bytes")))?;
         if size == 0 {
             return Err(Error::Host("guest memory region is empty".into()));
         }
-        // SAFETY: the layout has a non-zero size (checked above).
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-        let ptr = NonNull::new(ptr)
-            .ok_or_else(|| Error::Host(format!("out of memory allocating {len:#x} bytes")))?;
-        Ok(Self { ptr, layout, kind })
+        if !len.is_multiple_of(HOST_PAGE) {
+            return Err(Error::Host(format!(
+                "guest memory of {len:#x} bytes is not a whole number of {HOST_PAGE:#x}-byte host \
+                 pages"
+            )));
+        }
+        // SAFETY: an anonymous private mapping at an address the host picks: it aliases no
+        // memory Rust knows of. The result is checked before use.
+        let raw = unsafe {
+            ffi::mmap(
+                std::ptr::null_mut(),
+                size,
+                ffi::PROT_READ | ffi::PROT_WRITE,
+                ffi::MAP_PRIVATE | ffi::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if raw == ffi::MAP_FAILED {
+            return Err(Error::Host(format!(
+                "out of memory reserving {len:#x} bytes of guest memory"
+            )));
+        }
+        let ptr = NonNull::new(raw.cast::<u8>())
+            .ok_or_else(|| Error::Host(format!("out of memory reserving {len:#x} bytes")))?;
+        let region = Self {
+            ptr,
+            len: size,
+            kind,
+        };
+        // Stage-2 mappings need host-page alignment; the host's own pages on Apple Silicon are
+        // 16 KiB, so `mmap` gives it. Checked rather than assumed, after `region` owns the
+        // mapping, so it is given back on this path too.
+        let aligned = u64::try_from(region.ptr.as_ptr().addr())
+            .is_ok_and(|address| address.is_multiple_of(HOST_PAGE));
+        if !aligned {
+            return Err(Error::Host(format!(
+                "the host placed guest memory at an address not aligned to {HOST_PAGE:#x}"
+            )));
+        }
+        Ok(region)
     }
 
     pub(super) fn len(&self) -> usize {
-        self.layout.size()
+        self.len
+    }
+
+    /// How many bytes of the region the host holds in memory now, in whole host pages: what
+    /// it costs the host. A page never touched is never counted. A page touched and since
+    /// compressed or paged out by the host is not counted either, so this is at most what was
+    /// touched, and equal to it until the host reclaims memory.
+    pub(super) fn resident_bytes(&self) -> Result<u64, Error> {
+        // SAFETY: `getpagesize` reads a constant of the host.
+        let page = unsafe { ffi::getpagesize() };
+        let page = usize::try_from(page)
+            .ok()
+            .filter(|&page| page != 0)
+            .ok_or_else(|| Error::Host(format!("the host reports a page size of {page}")))?;
+        let mut pages = vec![0; self.len.div_ceil(page)];
+        // SAFETY: `ptr..ptr + len` is the live mapping this region owns, and `pages` has one
+        // byte for each host page of it, as `mincore` writes.
+        let status = unsafe {
+            ffi::mincore(
+                self.ptr.as_ptr().cast_const().cast(),
+                self.len,
+                pages.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(Error::Host(format!(
+                "mincore failed on {:#x} bytes of guest memory",
+                self.len
+            )));
+        }
+        let resident = pages
+            .iter()
+            .filter(|&&state| state & ffi::MINCORE_INCORE != 0)
+            .count();
+        let bytes = resident.checked_mul(page).unwrap_or(usize::MAX);
+        Ok(u64::try_from(bytes).unwrap_or(u64::MAX))
     }
 
     /// The host address of byte `offset`, for mapping part of the region into the VM; `None`
@@ -211,8 +294,9 @@ impl HostRegion {
 
 impl Drop for HostRegion {
     fn drop(&mut self) {
-        // SAFETY: `ptr` came from `alloc_zeroed` with this same layout and is freed only here.
-        unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) };
+        // SAFETY: `ptr..ptr + len` came from `mmap` and is given back only here. A failure
+        // cannot be reported from a drop; it would leave the range reserved, never reused.
+        unsafe { ffi::munmap(self.ptr.as_ptr().cast(), self.len) };
     }
 }
 
@@ -254,6 +338,18 @@ pub struct PhysicalMemory {
 }
 
 impl PhysicalMemory {
+    /// How many bytes of guest RAM the host holds in memory now: the host pages the guest or
+    /// the host has touched, less any the host has since compressed or paged out (see the
+    /// module docs, "Lazy backing"). An [`Error::Host`] if the host cannot say.
+    pub fn ram_resident_bytes(&self) -> Result<u64, Error> {
+        self.vm.ram.region.resident_bytes()
+    }
+
+    /// As [`Self::ram_resident_bytes`], for the table pool.
+    pub fn table_pool_resident_bytes(&self) -> Result<u64, Error> {
+        self.vm.table_pool.region.resident_bytes()
+    }
+
     /// The extent an access of `len` bytes at `pa` falls in and its offset there, or the fault.
     fn locate(&self, pa: u64, len: usize) -> Result<(&Extent, u64), Fault> {
         let extent = [&self.vm.ram, &self.vm.table_pool]
@@ -395,5 +491,55 @@ mod tests {
             HostRegion::new(0, Kind::Ram),
             Err(Error::Host(message)) if message == "guest memory region is empty"
         ));
+    }
+
+    #[test]
+    fn a_region_that_is_not_whole_host_pages_is_refused() {
+        for len in [HOST_PAGE - 1, HOST_PAGE + 1, 2 * HOST_PAGE - 4096] {
+            assert!(
+                matches!(
+                    HostRegion::new(len, Kind::Ram),
+                    Err(Error::Host(ref message)) if *message == format!(
+                        "guest memory of {len:#x} bytes is not a whole number of \
+                         {HOST_PAGE:#x}-byte host pages"
+                    )
+                ),
+                "{len:#x}"
+            );
+        }
+        let two = HostRegion::new(2 * HOST_PAGE, Kind::Ram).unwrap();
+        assert_eq!(u64::try_from(two.len()).unwrap(), 2 * HOST_PAGE);
+    }
+
+    /// The host's page size: the unit [`HostRegion::resident_bytes`] counts in.
+    fn host_page() -> u64 {
+        // SAFETY: `getpagesize` reads a constant of the host.
+        u64::try_from(unsafe { ffi::getpagesize() }).unwrap()
+    }
+
+    #[test]
+    fn a_region_costs_the_host_only_the_pages_written() {
+        // 64 MiB: far more than a page, and nothing of it is committed when it is made.
+        let len = 64 << 20;
+        let host_page = host_page();
+        for kind in [Kind::Ram, Kind::Tables, Kind::System] {
+            let region = HostRegion::new(len, kind).unwrap();
+            assert_eq!(region.resident_bytes(), Ok(0), "{kind:?}");
+            // One byte in one page: that page.
+            let middle = len / 2 + 5;
+            region.write(middle, &[0x5a]).unwrap();
+            assert_eq!(region.resident_bytes(), Ok(host_page), "{kind:?}");
+            // Again in the same page: still one.
+            region.write(middle + 8, &[0xa5; 8]).unwrap();
+            assert_eq!(region.resident_bytes(), Ok(host_page), "{kind:?}");
+            // The first and the last byte of the region: two pages more.
+            region.write(0, &[1]).unwrap();
+            region.write(len - 1, &[2]).unwrap();
+            assert_eq!(region.resident_bytes(), Ok(3 * host_page), "{kind:?}");
+            // What was written reads back, and the bytes around it read as zero.
+            let mut back = [0xff; 10];
+            region.read(middle - 1, &mut back).unwrap();
+            assert_eq!(back, [0, 0x5a, 0, 0, 0, 0, 0, 0, 0, 0xa5], "{kind:?}");
+        }
     }
 }
