@@ -96,8 +96,9 @@ fn hfma2() -> BoxedStrategy<Op> {
         (any_half_reg(), any_half_wide(), any_half_reg()).prop_map(|(a, b, c)| [a, b, c]),
         (any_half_reg(), any_half_reg(), any_half_wide()).prop_map(|(a, b, c)| [a, b, c]),
     ];
-    ((any_gpr(), srcs, any::<[bool; 7]>()).prop_map(|(dst, srcs, flags)| {
-        let [saturate, f32, ftz, dnz, relu, bf16, neg_high_b] = flags;
+    let relu = proptest::option::of(any_pred_src());
+    ((any_gpr(), srcs, relu, any::<[bool; 6]>()).prop_map(|(dst, srcs, relu, flags)| {
+        let [saturate, f32, ftz, dnz, bf16, neg_high_b] = flags;
         Op::HFma2(OpHFma2 {
             dst,
             srcs,

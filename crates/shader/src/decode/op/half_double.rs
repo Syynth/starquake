@@ -11,22 +11,35 @@
 //! `.F32`, `.NAN` and `.XORSIGN`, `HSET2`'s `.BF`, the second destination of `DSETP`), the op
 //! carries it as a field so the decoder can read any value of it. Masks are PR #4588's rows
 //! (`eden-pr4588/src/shader_recompiler/frontend/ampere/ampere_isa_table.h` @ e5fb3b97), and
-//! the fields NAK does not write are read where PR #4588's translator reads them
-//! (`ops_half.cpp` @ e5fb3b97). PR #4588's translator has no double-precision instruction, so
-//! `DADD`, `DMUL`, `DFMA` and `DSETP` come from NAK alone.
+//! the fields NAK does not write are read where PR #4588 reads them. PR #4588 has two paths for
+//! these instructions, both in `eden-pr4588/src/shader_recompiler/frontend/ampere/` @ e5fb3b97:
+//! the native translator (`ops_half.cpp`, `Visitor::HADD2`, `HFMA2`, `HMUL2`, `HMNMX2` and
+//! `HSETP2`, with `visitor.cpp`'s `CheckConsumed` refusing any bit no `Take` read; it has no
+//! `HSET2`) and the lowering to Maxwell (`lower_to_maxwell.h`, whose cases are `HADD2`
+//! `0x230`, `0x430`, `0x630`, `HFMA2` `0x231`, `0x431`, `0x631`, `0x831`, `0xa31`, `HMUL2`
+//! `0x232`, `0x832`, `0xa32`, `HSET2` `0x233`, `0x433`, `0x633`, `HSETP2` `0x434` and `HMNMX2`
+//! `0x240`, `0x840`, every other opcode failing as "unsupported native opcode"). Where the two
+//! disagree, the lowering is followed: PR #4588 runs titles through it by default, so its
+//! reading is the one a title ran on (graphics-server decision 8; owner's ruling, 2026-11-20).
+//! PR #4588 has no double-precision instruction, so `DADD`, `DMUL`, `DFMA` and `DSETP` come
+//! from NAK alone.
 //!
 //! The packed-half sources (`HalfSrc`) are NAK's `F16v2` sources (`encode_fp16v2_alu`): each
 //! has a two-bit swizzle beside its modifier bits, and in the register slot those bits move to
-//! 81..85 (`decode::alu`'s module docs). PR #4588's rows already mark every swizzle bit NAK
-//! writes in these forms, so no form adds a bit to its row (slice 4b's known bits are not
-//! needed here).
+//! bits 81 to 84 (`decode::alu`'s module docs). PR #4588's rows already mark every swizzle bit
+//! NAK writes in these forms.
 //!
 //! From PR #4588 alone, and so **each needs an `nvdisasm` check** (spec, verification E2):
-//! `HFMA2`'s bit 86, which negates only the high half of `b` (`Visitor::HFMA2`:
-//! `negate_high_b = Take(86, 1)`; `lower_to_maxwell.h`: "`H0_NH1`: negate only the upper
-//! packed component"), and its bits 87..89, which hold 7 exactly when `.RELU` is set
-//! (`Require(Take(87, 4) == (relu ? 7U : 0U), "native half fused multiply-add mode")`: "The relu
-//! form carries a constant 7 in bits 87..90 (observed on every captured program)").
+//!
+//! - `HFMA2`'s bit 86, which negates only the high half of `b` (`Visitor::HFMA2`:
+//!   `negate_high_b = Take(86, 1)`; `lower_to_maxwell.h`: "`H0_NH1`: negate only the upper
+//!   packed component");
+//! - `HFMA2`'s bits 87 to 90 with `.RELU`, a predicate (index in bits 87 to 89, negation in bit
+//!   90) under which the clamped result is kept: the lowering ends `HFMA2.RELU` with a Maxwell
+//!   `SEL` of the clamped and unclamped results on `insn.Bits(87, 4) << 39`, skipped for 7
+//!   (`PT`), the always-true case. Bit 90 is beyond PR #4588's rows, a slice-4b known bit
+//!   (`HFMA2_ADDED`, `tests::framework::added_bits_are_the_listed_cases`);
+//! - swizzle 1 (`HalfSwizzle::F32`), Maxwell's `F32`, whose meaning on SM86 is a guess.
 //!
 //! # Forms
 //!
@@ -40,44 +53,56 @@
 //!
 //! # Decisions taken here
 //!
-//! - **Swizzle 1 is refused** (`HalfSwizzle`): NAK writes it only for a single `F16` source,
-//!   PR #4588's translator refuses it for every packed-half source.
-//! - **`HFMA2`'s bits 87..89** are read as PR #4588 requires them: 7 with `.RELU`, 0 without;
-//!   any other value is [`DecodeError::UnknownValue`]. The op has no field for them (the
-//!   assembler writes 7 with `.RELU`), and bit 90, which PR #4588's `Take(87, 4)` also covers
-//!   but its row leaves out, stays unknown, so it is refused at step 2 as PR #4588 refuses it
-//!   (its required values 0 and 7 have bit 90 clear).
+//! - **Swizzle 1 is decoded** as `HalfSwizzle::F32`, in every packed-half source. NAK writes it
+//!   only for a single `F16` source. PR #4588's native translator refuses it for every
+//!   packed-half source (`Visitor::HalfLanes`: `Require(operand.swizzle != 1, ..)`); its
+//!   lowering passes it into Maxwell's `HADD2`, `HMUL2`, `HFMA2` and `HSET2` unchanged and
+//!   refuses it only in `HMNMX2` and `HSETP2` `0x434`. The lowering wins (decision 8), and the
+//!   refusal in `HMNMX2` and `HSETP2` is left to the translator (divergence table).
+//! - **`HFMA2`'s bits 87 to 90** are `.RELU`'s predicate with `.RELU` (`OpHFma2::relu`), any
+//!   value, as the lowering reads them; the native translator requires 7 there ("The relu form
+//!   carries a constant 7 in bits 87..90 (observed on every captured program)"). Without
+//!   `.RELU` both paths require them clear (the lowering: `relu ? Bits(77, 1) : Bits(87, 4) !=
+//!   0`; the native translator: `Take(87, 4) == 0`), and any other value is
+//!   [`DecodeError::UnknownValue`] for the four-bit field `HFMA2_RELU_PRED`.
 //! - **The printer** is a guess but for `test_hfma2`'s cases: immediates of both kinds print in
 //!   hexadecimal (a packed pair of halves, or the 32 bits of a double's immediate), and the
 //!   modifiers' order and names (`.f32`, `.bf16_v2`, `.ftz`, `.fmz` for the `dnz` bit as in the
-//!   float group, `.sat`, `.relu`, `.bf`, `.h_and`, `.nan`, `.xorsign`, `.h0_nh1` after `b`)
-//!   follow `nvdisasm`'s usual style.
+//!   float group, `.sat`, `.relu` with its predicate as the last operand, `.bf`, `.h_and`,
+//!   `.nan`, `.xorsign`, `.h0_nh1` after `b`, `.f32` after a source for swizzle 1) follow
+//!   `nvdisasm`'s usual style.
 //!
-//! # Divergences from PR #4588's table and translator
+//! # Divergences from PR #4588's table and translators
+//!
+//! "Native" is `ops_half.cpp` with `visitor.cpp`'s `CheckConsumed`; "lowering" is
+//! `lower_to_maxwell.h`.
 //!
 //! | Rows | What this decoder does | Pinned by |
 //! |---|---|---|
-//! | `HADD2` forms 4, 5, 6 (`0x830`, `0xa30`, `0xc30`), `HSET2` and `HSETP2` forms 4, 5, 6 (`0x833`, `0xa33`, `0xc33`, `0x834`, `0xa34`, `0xc34`), `DSETP` and `DADD` forms 4, 5, 6 (`0x82a`, `0xa2a`, `0xc2a`, `0x829`, `0xa29`, `0xc29`) | Unknown opcodes: NAK never puts their second operand in source 1 when it is not a register. PR #4588's translator accepts `HSETP2` forms 4 and 5 (`Visitor::HalfSource` reads source 1 from the wide slot there) | `decode::tests::half_double::half_double_rows_left_undecoded_are_unknown_opcodes` |
+//! | `HADD2` forms 4, 5, 6 (`0x830`, `0xa30`, `0xc30`), `HSET2` and `HSETP2` forms 4, 5, 6 (`0x833`, `0xa33`, `0xc33`, `0x834`, `0xa34`, `0xc34`), `DSETP` and `DADD` forms 4, 5, 6 (`0x82a`, `0xa2a`, `0xc2a`, `0x829`, `0xa29`, `0xc29`) | Unknown opcodes: NAK never puts their second operand in source 1 when it is not a register. The native translator accepts `HSETP2` forms 4 and 5 (`Visitor::HalfSource` reads source 1 from the wide slot there); the lowering has no case for any of them | `decode::tests::half_double::half_double_rows_left_undecoded_are_unknown_opcodes` |
 //! | `HMUL2`, `HMNMX2` and `DMUL` forms 2, 3, 7 (`0x432`, `0x632`, `0xe32`, `0x440`, `0x640`, `0xe40`, `0x428`, `0x628`, `0xe28`) | Unknown opcodes: NAK puts their second operand in source 1, which only forms 1, 4, 5 and 6 hold | as above |
-//! | Bits 64..71 and 81..84 of every `HADD2` form | Rejected: the register slot, which `HADD2` does not use (NAK passes `None` for it, so writes nothing; PR #4588's `Visitor::HADD2` does not take the bits, and `lower_to_maxwell.h` requires 81..90 clear) | `decode::tests::half_double::half_double_rows_drop_exactly_the_listed_bits` |
-//! | Bits 64, 66..68 and 81..84 of every `HSET2` form, bits 64 and 66..68 of every `HSETP2` form | Rejected: what is left of the unused register slot beside the fields (NAK writes nothing there; PR #4588's `Visitor::HSETP2` does not take them, and `lower_to_maxwell.h` requires `HSET2`'s 64..68 and 81..86 clear) | as above |
-//! | Bit 65 of every `HSET2` and `HSETP2` form, bit 85 of every `HADD2` and `HMUL2` form | Rejected: NAK's `.BF16_V2`, written false and marked SM 9.0 and later ("SM90+"), which SM86 predates (as the float group's `FMNMX` `.IS_A`); PR #4588 refuses or does not take them | as above |
-//! | Bit 78 of every `HMUL2` form | Rejected: NAK's `.F32`, written false and marked "SM70-SM75"; PR #4588 refuses it (`Require(Take(78, 2) == 0, ..)`) | as above |
-//! | Bits 64..71 of every `DSETP` form | Rejected: the register slot, which `DSETP` does not use (NAK passes `None`); PR #4588 has no `DSETP` | as above |
-//! | The uniform-register forms of the packed-half instructions (`0xe30`, `0xc31`, `0xe31`, `0xc32`, `0xe33`, `0xe34`, `0xc40`) and a bindless constant buffer in their constant-buffer forms | Decoded (NAK encodes them: `encode_alu_ureg`, `set_src_cb`); PR #4588's translator refuses them (`Visitor::HalfSource`: `Require(form >= 1 && form <= 5, ..)`, `Require(Take(91, 1) == 0, "native bindless constant buffer")`) | `decode::tests::half_double::hand_built_words_of_each_form_decode` |
-//! | `HFMA2`'s `.fmz` (76), `.f32` (78) and `.bf16_v2` (85), `HMUL2`'s `.fmz` (76) and `.relu` (79), `HMNMX2`'s `.f32` (78), `.ftz` (80), `.nan` (81), `.xorsign` (82) and `.bf16_v2` (85) | Decoded (NAK names each); PR #4588's translator refuses them set | `decode::tests::half_double::hand_built_words_pin_each_arithmetic_modifier_bit`, `hand_built_words_pin_each_comparison_modifier_bit` |
-//! | `HFMA2` with `.relu` and `.sat`; `HADD2.F32` with `.sat`, `.ftz` or a swizzle below 2 on `b` | Decoded; PR #4588's translator refuses them (`Require(!relu \|\| !saturate, ..)`, `Require(!ftz && !saturate, ..)`, `Require(b.swizzle >= 2, ..)`) | `hand_built_words_pin_each_arithmetic_modifier_bit` |
+//! | Bits 64 to 71 and 81 to 84 of every `HADD2` form | Rejected: the register slot, which `HADD2` does not use (NAK passes `None` for it, so writes nothing). Native refuses them (`Visitor::HADD2` takes neither); the lowering requires bits 81 to 90 clear but ignores bits 64 to 71, where this decoder is stricter (strict decoding, decision 4) | `decode::tests::half_double::half_double_rows_drop_exactly_the_listed_bits` |
+//! | Bits 64, 66 to 68 and 81 to 84 of every `HSET2` form, bits 64 and 66 to 68 of every `HSETP2` form | Rejected: what is left of the unused register slot beside the fields (NAK writes nothing there). For `HSET2` the lowering requires bits 64 to 68 and 81 to 86 clear (native has no `HSET2`); for `HSETP2` form 1 native refuses them (`Visitor::HSETP2` does not take them) and the lowering has no case; for `HSETP2` forms 2 and 3, the next row | as above |
+//! | `HSETP2` forms 2 and 3 (`0x434`, `0x634`): where `b` is | **Conflict**, the lowering wins (decision 8): `b` is source 2, in the wide slot (an immediate or a constant buffer), as NAK encodes it (`OpHSetP2`'s `src_is_zero_or_gpr` choice) and as the lowering reads it (case `0x434`: `half_source(2)`). Native reads `b` there from the register slot (`Visitor::HSETP2`: `HalfSource(1)`, where `upper` is true for forms 2 and 3: register bits 64 to 71, swizzle 81 and 82, absolute value 83, negation 84), bits that overlap `.BF16_V2` (65), the combine operation (69 and 70), `.H_AND` (71) and both destinations | `decode::tests::half_double::hsetp2_immediate_form_reads_b_from_the_wide_slot`, `hand_built_words_of_each_form_decode` |
+//! | Bit 65 of every `HSET2` and `HSETP2` form, bit 85 of every `HADD2` and `HMUL2` form | Rejected: NAK's `.BF16_V2`, written false and marked SM 9.0 and later ("SM90+"), which SM86 predates (as the float group's `FMNMX` `.IS_A`). Bit 65: the lowering refuses it in `HSET2` (`Bits(64, 5)`) and `HSETP2` `0x434` (its fixed `words[2]`), native in `HSETP2` (`Require(Take(65, 1) == 0, ..)`). Bit 85: the lowering refuses it (`Bits(81, 10)`), native does not take it | as above |
+//! | Bit 78 of every `HMUL2` form | Rejected: NAK's `.F32`, written false and marked "SM70-SM75"; both paths refuse it (native: `Require(Take(78, 2) == 0, ..)`; lowering: `insn.Bits(78, 2)`) | as above |
+//! | Bits 64 to 71 of every `DSETP` form | Rejected: the register slot, which `DSETP` does not use (NAK passes `None`); PR #4588 has no `DSETP` | as above |
+//! | The uniform-register forms of the packed-half instructions (`0xe30`, `0xc31`, `0xe31`, `0xc32`, `0xe33`, `0xe34`, `0xc40`) and a bindless constant buffer in their constant-buffer forms | Decoded (NAK encodes them: `encode_alu_ureg`, `set_src_cb`). Native refuses both (`Visitor::HalfSource`: `Require(form >= 1 && form <= 5, ..)`, `Require(Take(91, 1) == 0, "native bindless constant buffer")`); the lowering has no case for the uniform-register forms and refuses bit 91 in every case it has (`insn.Bits(91, 1)`, or `HSETP2` `0x434`'s fixed `words[2]`) | `decode::tests::half_double::hand_built_words_of_each_form_decode` |
+//! | `HFMA2`'s `.fmz` (76) and `HMUL2`'s `.fmz` (76) | Decoded (NAK names each), as the lowering reads them (`precision = insn.Bits(76, 1) ? 2 : ..`); native refuses them (`HFMA2`: `Require(Take(76, 1) == 0, ..)`; `HMUL2`: `Require(!multiply_zero, ..)`) | `decode::tests::half_double::hand_built_words_pin_each_arithmetic_modifier_bit`, `hand_built_words_pin_each_comparison_modifier_bit` |
+//! | `HFMA2`'s `.f32` (78) and `.bf16_v2` (85), `HMUL2`'s `.relu` (79), `HMNMX2`'s `.f32` (78), `.ftz` (80), `.nan` (81), `.xorsign` (82) and `.bf16_v2` (85) | Decoded (NAK names each); both paths refuse them set (`HFMA2`: native `Require(Take(78, 1) == 0, ..)` and `Require(Take(85, 1) == 0, ..)`, lowering `insn.Bits(78, 1)` and `insn.Bits(85, 1)`; `HMUL2`: native `Take(78, 2)`, lowering `insn.Bits(78, 2)`; `HMNMX2`: native `Take(76, 11)`, lowering `insn.Bits(76, 11)`) | as above |
+//! | `HFMA2` with `.relu` and `.sat`; `HADD2.F32` with `.sat`, `.ftz` or a swizzle below 2 on `b` | Decoded; both paths refuse them (`HFMA2`: native `Require(!relu \|\| !saturate, ..)`, lowering `relu ? insn.Bits(77, 1) != 0 : ..`; `HADD2`: native `Require(!ftz && !saturate, ..)` and `Require(b.swizzle >= 2, ..)`, lowering `b.swizzle < 2 \|\| insn.Bits(77, 1) \|\| insn.Bits(80, 1)`) | `hand_built_words_pin_each_arithmetic_modifier_bit` |
+//! | Swizzle 1 in `HMNMX2` (`a` or `b`) and in `HSETP2` | Decoded (`HalfSwizzle::F32`); both paths refuse it there (native: `Visitor::HalfLanes`; lowering: `HMNMX2`'s `a.swizzle == 1 \|\| b.swizzle == 1`, `HSETP2` `0x434`'s bits 74 and 75 0 or 2, other `HSETP2` forms no case). The decoder reads the swizzle field the same way in every instruction and leaves the refusal to the translator | `decode::tests::half_double::swizzle_1_decodes_as_f32` |
+//! | `HFMA2.RELU` with bits 87 to 90 other than 7 | Decoded as the predicate the lowering reads; native refuses them (`Take(87, 4) == (relu ? 7U : 0U)`) | `decode::tests::half_double::hfma2_relu_predicate_follows_relu` |
 //!
 //! Every other row of a decoded form is matched exactly (`decode::tests::masks_match_the_reference_table`).
 //!
 //! # Values the decoder refuses
 //!
-//! A field whose value names nothing is [`DecodeError::UnknownValue`]: swizzle 1 in any of the
-//! three swizzle fields (60..62, 74..76, 81..83) of a packed-half source; the combine operation
-//! 3 of `HSET2`, `HSETP2` (bits 69..71) and `DSETP` (74..76), as in the float group; and
-//! `HFMA2`'s bits 87..89 other than 7 with `.RELU` and 0 without. A decode function reads its
-//! fields in this order, so of two such values the earlier is reported: the combine operation,
-//! then source 0's swizzle, then the second and third sources', then `HFMA2`'s bits 87..89
+//! A field whose value names nothing is [`DecodeError::UnknownValue`]: the combine operation 3
+//! of `HSET2`, `HSETP2` (bits 69 and 70) and `DSETP` (bits 74 and 75), as in the float group;
+//! and `HFMA2`'s bits 87 to 90 other than 0 without `.RELU`. Every swizzle value names a
+//! swizzle. Each instruction has at most one of these checks, so there is no order between them
+//! to report; the framework's steps 2 and 3 come first
 //! (`decode::tests::half_double::half_double_checks_run_in_the_documented_order`).
 
 use std::fmt::{self, Display, Formatter};
@@ -97,7 +122,7 @@ use super::{Named, Op, shells};
 #[cfg(test)]
 use {
     super::super::fields::{SLOT_UNIFORM, SRC2, SRC2_HALF_ABS, SRC2_HALF_NEG, SRC2_HALF_SWIZZLE},
-    super::super::form::ReferenceRow,
+    super::super::form::{Namer, ReferenceRow},
     proptest::strategy::BoxedStrategy,
 };
 
@@ -136,11 +161,10 @@ pub(crate) const RELU: Field = Field::bit(79);
 pub(crate) const BF16_V2: Field = Field::bit(85);
 /// `HFMA2`'s negation of `b`'s high half only (PR #4588 alone: `negate_high_b = Take(86, 1)`).
 pub(crate) const HFMA2_NEG_HIGH_B: Field = Field::bit(86);
-/// `HFMA2`'s bits 87..89, which hold [`HFMA2_RELU_MODE_VALUE`] exactly with `.RELU` (PR #4588
-/// alone: `Take(87, 4)`, of which its row knows these three bits; module docs).
-pub(crate) const HFMA2_RELU_MODE: Field = Field::new(87, 3);
-/// The value of [`HFMA2_RELU_MODE`] with `.RELU` (PR #4588: `relu ? 7U : 0U`).
-pub(crate) const HFMA2_RELU_MODE_VALUE: u64 = 7;
+/// `HFMA2`'s bits 87 to 90, `.RELU`'s predicate: its index in [`COND`] and its negation in
+/// [`COND_NOT`], read as one field where they must be clear (PR #4588 alone: the lowering's
+/// `Bits(87, 4)`, the native translator's `Take(87, 4)`; module docs).
+pub(crate) const HFMA2_RELU_PRED: Field = Field::new(COND.start, COND.width + COND_NOT.width);
 /// The combine operation of `HSET2` and `HSETP2` (NAK: `set_pred_set_op(69..71, ..)`; PR #4588
 /// `HSETP2`: `Take(69, 2)`).
 pub(crate) const HALF_SET_OP: Field = Field::new(69, PredSetOp::BITS);
@@ -220,8 +244,8 @@ impl Display for OpHAdd2 {
 
 fn decode_hadd2(reader: &mut Reader) -> Result<Op, DecodeError> {
     let form = alu::form(reader)?;
-    let a = alu::half_src0(reader)?;
-    let b = alu::half_src(reader, form, alu::wide_operand_source(form))?;
+    let a = alu::half_src0(reader);
+    let b = alu::half_src(reader, form, alu::wide_operand_source(form));
     Ok(Op::HAdd2(OpHAdd2 {
         dst: reader.gpr(DST),
         srcs: [a, b],
@@ -263,8 +287,10 @@ pub struct OpHFma2 {
     pub ftz: bool,
     /// NAK's `dnz` bit, printed `.fmz` as for `FFMA`.
     pub dnz: bool,
-    /// `.RELU` (NAK writes it false).
-    pub relu: bool,
+    /// `.RELU` (NAK writes it false) with the predicate under which the clamped result is kept,
+    /// [`PredSrc::TRUE`] for always (PR #4588's lowering alone; module docs); `None` without
+    /// `.RELU`.
+    pub relu: Option<PredSrc>,
     /// `.BF16_V2` (NAK writes it false).
     pub bf16: bool,
     /// Negate only `b`'s high half (PR #4588 alone; module docs).
@@ -277,7 +303,7 @@ impl Named for OpHFma2 {
 
 impl Display for OpHFma2 {
     /// NAK's `test_hfma2`: `hfma2` and three register operands with their modifiers; the
-    /// modifier names and order are guesses.
+    /// modifier names and order, and `.relu`'s predicate as a last operand, are guesses.
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str("hfma2")?;
         flag(f, self.f32, ".f32")?;
@@ -285,25 +311,32 @@ impl Display for OpHFma2 {
         flag(f, self.ftz, ".ftz")?;
         flag(f, self.dnz, ".fmz")?;
         flag(f, self.saturate, ".sat")?;
-        flag(f, self.relu, ".relu")?;
+        flag(f, self.relu.is_some(), ".relu")?;
         let [a, b, c] = self.srcs;
         write!(f, " {}, {a}, {b}", self.dst)?;
         flag(f, self.neg_high_b, ".h0_nh1")?;
-        write!(f, ", {c}")
+        write!(f, ", {c}")?;
+        match self.relu {
+            Some(pred) => write!(f, ", {pred}"),
+            None => Ok(()),
+        }
     }
 }
 
 fn decode_hfma2(reader: &mut Reader) -> Result<Op, DecodeError> {
     let form = alu::form(reader)?;
-    let a = alu::half_src0(reader)?;
-    let b = alu::half_src(reader, form, Source::One)?;
-    let c = alu::half_src(reader, form, Source::Two)?;
-    let relu = reader.flag(RELU);
-    let mode = reader.field(HFMA2_RELU_MODE);
-    let expected = if relu { HFMA2_RELU_MODE_VALUE } else { 0 };
-    if mode != expected {
-        return Err(reader.unknown_value(HFMA2_RELU_MODE, mode));
-    }
+    let a = alu::half_src0(reader);
+    let b = alu::half_src(reader, form, Source::One);
+    let c = alu::half_src(reader, form, Source::Two);
+    let relu = if reader.flag(RELU) {
+        Some(reader.pred_src(COND, COND_NOT))
+    } else {
+        let bits = reader.field(HFMA2_RELU_PRED);
+        if bits != 0 {
+            return Err(reader.unknown_value(HFMA2_RELU_PRED, bits));
+        }
+        None
+    };
     Ok(Op::HFma2(OpHFma2 {
         dst: reader.gpr(DST),
         srcs: [a, b, c],
@@ -330,7 +363,8 @@ const fn hfma2(form: AluForm) -> Form {
             FTZ,
             BF16_V2,
             HFMA2_NEG_HIGH_B,
-            HFMA2_RELU_MODE,
+            COND,
+            COND_NOT,
         ]) | alu::half_known(form, SOURCES_ALL),
         decode_hfma2,
     )
@@ -379,8 +413,8 @@ impl Display for OpHMul2 {
 
 fn decode_hmul2(reader: &mut Reader) -> Result<Op, DecodeError> {
     let form = alu::form(reader)?;
-    let a = alu::half_src0(reader)?;
-    let b = alu::half_src(reader, form, Source::One)?;
+    let a = alu::half_src0(reader);
+    let b = alu::half_src(reader, form, Source::One);
     Ok(Op::HMul2(OpHMul2 {
         dst: reader.gpr(DST),
         srcs: [a, b],
@@ -444,8 +478,8 @@ impl Display for OpHSet2 {
 fn decode_hset2(reader: &mut Reader) -> Result<Op, DecodeError> {
     let form = alu::form(reader)?;
     let set_op = read_pred_set_op(reader, HALF_SET_OP)?;
-    let a = alu::half_src0(reader)?;
-    let b = alu::half_src(reader, form, alu::wide_operand_source(form))?;
+    let a = alu::half_src0(reader);
+    let b = alu::half_src(reader, form, alu::wide_operand_source(form));
     Ok(Op::HSet2(OpHSet2 {
         dst: reader.gpr(DST),
         cmp: FloatCmpOp::from_bits(reader.field(CMP_OP)),
@@ -513,8 +547,8 @@ impl Display for OpHSetP2 {
 fn decode_hsetp2(reader: &mut Reader) -> Result<Op, DecodeError> {
     let form = alu::form(reader)?;
     let set_op = read_pred_set_op(reader, HALF_SET_OP)?;
-    let a = alu::half_src0(reader)?;
-    let b = alu::half_src(reader, form, alu::wide_operand_source(form))?;
+    let a = alu::half_src0(reader);
+    let b = alu::half_src(reader, form, alu::wide_operand_source(form));
     Ok(Op::HSetP2(OpHSetP2 {
         // Cannot fail for a three-bit field.
         dst: Pred::new(reader.byte(PRED_DST)).unwrap_or(Pred::PT),
@@ -595,8 +629,8 @@ impl Display for OpHMnMx2 {
 
 fn decode_hmnmx2(reader: &mut Reader) -> Result<Op, DecodeError> {
     let form = alu::form(reader)?;
-    let a = alu::half_src0(reader)?;
-    let b = alu::half_src(reader, form, Source::One)?;
+    let a = alu::half_src0(reader);
+    let b = alu::half_src(reader, form, Source::One);
     Ok(Op::HMnMx2(OpHMnMx2 {
         dst: reader.gpr(DST),
         srcs: [a, b],
@@ -920,18 +954,23 @@ pub(crate) const HADD2_DROPPED: u128 = HALF_REGISTER_SLOT | BF16_V2.mask();
 #[cfg(test)]
 pub(crate) const HMUL2_DROPPED: u128 = mask_of(&[HALF_F32, BF16_V2]);
 /// The bits PR #4588's `HSETP2` rows mark known that the forms reject: the part of the unused
-/// register slot (64..72) that holds no field of `HSETP2` (69..72 hold the combine operation and
-/// `.H_AND`), bit 65 included.
+/// register slot (bits 64 to 71) that holds no field of `HSETP2` (bits 69 to 71 hold the
+/// combine operation and `.H_AND`), bit 65 included.
 #[cfg(test)]
 pub(crate) const HSETP2_DROPPED: u128 = SRC2.mask() & !mask_of(&[HALF_SET_OP, HSETP2_H_AND]);
 /// The bits PR #4588's `HSET2` rows mark known that the forms reject: as for `HSETP2`, and the
-/// register slot's swizzle and modifier bits (81..85), which `HSET2` has no field in.
+/// register slot's swizzle and modifier bits (bits 81 to 84), which `HSET2` has no field in.
 #[cfg(test)]
 pub(crate) const HSET2_DROPPED: u128 =
     HSETP2_DROPPED | mask_of(&[SRC2_HALF_SWIZZLE, SRC2_HALF_ABS, SRC2_HALF_NEG]);
 /// The bits PR #4588's `DSETP` rows mark known that the forms reject: the unused register slot.
 #[cfg(test)]
 pub(crate) const DSETP_DROPPED: u128 = SRC2.mask();
+/// The bit `HFMA2`'s forms know beyond PR #4588's rows: bit 90, the negation of `.RELU`'s
+/// predicate (the lowering's `insn.Bits(87, 4) << 39` into Maxwell's `SEL`; the native
+/// translator reads it in `Take(87, 4)`; module docs).
+#[cfg(test)]
+pub(crate) const HFMA2_ADDED: u128 = COND_NOT.mask();
 
 // Bit 65 is inside the dropped register slot of `HSET2` and `HSETP2`.
 #[cfg(test)]
@@ -953,14 +992,21 @@ pub(crate) const REFERENCE_ROWS: &[ReferenceRow] = &[
         .dropping(HADD2_DROPPED)
         .fixing(SLOT_UNIFORM.mask()),
     // HFMA2.
-    ReferenceRow::new(0x231, [0xffff_ffff, 0xf000_00ff, 0x03ff_ffff, 0xffff_fe00]),
-    ReferenceRow::new(0x431, [0xffff_ffff, 0xffff_ffff, 0x03ff_ffff, 0xffff_fe00]),
-    ReferenceRow::new(0x631, [0xffff_ffff, 0xf7ff_ffff, 0x0bff_ffff, 0xffff_fe00]),
-    ReferenceRow::new(0x831, [0xffff_ffff, 0xffff_ffff, 0x03ff_ffff, 0xffff_fe00]),
-    ReferenceRow::new(0xa31, [0xffff_ffff, 0xf7ff_ffff, 0x0bff_ffff, 0xffff_fe00]),
+    ReferenceRow::new(0x231, [0xffff_ffff, 0xf000_00ff, 0x03ff_ffff, 0xffff_fe00])
+        .adding(HFMA2_ADDED, Namer::Pr4588Translator),
+    ReferenceRow::new(0x431, [0xffff_ffff, 0xffff_ffff, 0x03ff_ffff, 0xffff_fe00])
+        .adding(HFMA2_ADDED, Namer::Pr4588Translator),
+    ReferenceRow::new(0x631, [0xffff_ffff, 0xf7ff_ffff, 0x0bff_ffff, 0xffff_fe00])
+        .adding(HFMA2_ADDED, Namer::Pr4588Translator),
+    ReferenceRow::new(0x831, [0xffff_ffff, 0xffff_ffff, 0x03ff_ffff, 0xffff_fe00])
+        .adding(HFMA2_ADDED, Namer::Pr4588Translator),
+    ReferenceRow::new(0xa31, [0xffff_ffff, 0xf7ff_ffff, 0x0bff_ffff, 0xffff_fe00])
+        .adding(HFMA2_ADDED, Namer::Pr4588Translator),
     ReferenceRow::new(0xc31, [0xffff_ffff, 0xf000_003f, 0x0bff_ffff, 0xffff_fe00])
+        .adding(HFMA2_ADDED, Namer::Pr4588Translator)
         .fixing(SLOT_UNIFORM.mask()),
     ReferenceRow::new(0xe31, [0xffff_ffff, 0xf000_003f, 0x0bff_ffff, 0xffff_fe00])
+        .adding(HFMA2_ADDED, Namer::Pr4588Translator)
         .fixing(SLOT_UNIFORM.mask()),
     // HMUL2.
     ReferenceRow::new(0x232, [0xffff_ffff, 0xf000_00ff, 0x0021_ff00, 0xffff_fe00])

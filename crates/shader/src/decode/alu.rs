@@ -371,39 +371,30 @@ pub(crate) const fn with_modifiers(src: AluSrc, abs: bool, neg: bool) -> AluSrc 
     }
 }
 
-/// Reads the modifier bits and swizzle in `fields` onto `src`, refusing swizzle 1
-/// ([`HalfSwizzle`]); without fields (an immediate) the source reads both halves as stored.
-fn half(
-    reader: &mut Reader,
-    src: AluSrc,
-    fields: Option<HalfFields>,
-) -> Result<HalfSrc, DecodeError> {
+/// Reads the modifier bits and swizzle in `fields` onto `src` (every two-bit value names a
+/// [`HalfSwizzle`]); without fields (an immediate) the source reads both halves as stored.
+fn half(reader: &mut Reader, src: AluSrc, fields: Option<HalfFields>) -> HalfSrc {
     let Some(fields) = fields else {
-        return Ok(HalfSrc::new(src));
+        return HalfSrc::new(src);
     };
     let abs = reader.flag(fields.abs);
     let neg = reader.flag(fields.neg);
-    let bits = reader.field(fields.swizzle);
-    let swizzle =
-        HalfSwizzle::from_bits(bits).ok_or_else(|| reader.unknown_value(fields.swizzle, bits))?;
-    Ok(HalfSrc {
+    // Cannot fall back: every value of a two-bit field names a swizzle.
+    let swizzle = HalfSwizzle::from_bits(reader.field(fields.swizzle)).unwrap_or(HalfSwizzle::H1H0);
+    HalfSrc {
         src: with_modifiers(src, abs, neg),
         swizzle,
-    })
+    }
 }
 
 /// Reads source 0 of a packed-half instruction, a register.
-pub(crate) fn half_src0(reader: &mut Reader) -> Result<HalfSrc, DecodeError> {
+pub(crate) fn half_src0(reader: &mut Reader) -> HalfSrc {
     let reg = reader.gpr(SRC0);
     half(reader, AluSrc::reg(reg), Some(HALF_SRC0))
 }
 
 /// Reads `source` of a packed-half instruction in `form`.
-pub(crate) fn half_src(
-    reader: &mut Reader,
-    form: AluForm,
-    source: Source,
-) -> Result<HalfSrc, DecodeError> {
+pub(crate) fn half_src(reader: &mut Reader, form: AluForm, source: Source) -> HalfSrc {
     let slot = form.slot(source);
     let plain = src(reader, form, source, false);
     half(reader, plain, half_fields(slot))

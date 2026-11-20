@@ -257,15 +257,29 @@ impl AluSrc {
 /// translate/impl/half_floating_point_helper.h` @ cf654052c416: `H1_H0`, `F32`, `H0_H0`,
 /// `H1_H1`).
 ///
-/// Value 1 names nothing here: NAK writes it only for a single `F16` source (`Yy`), never for a
-/// packed pair, and PR #4588's translator refuses it (`ops_half.cpp`, `Visitor::HalfLanes`:
-/// `Require(operand.swizzle != 1, "native half source read as float")`), so the decoder refuses
-/// it. Maxwell's `F32` (a 32-bit float operand) is the guess for what it means on SM86, for an
+/// Value 1 is decoded as [`Self::F32`]. NAK writes it only for a single `F16` source (`Yy`),
+/// never for a packed pair, and the two paths of PR #4588 (`eden-pr4588/src/shader_recompiler/
+/// frontend/ampere/` @ e5fb3b97) disagree on it:
+///
+/// - the native translator refuses it for every packed-half source (`ops_half.cpp`,
+///   `Visitor::HalfLanes`: `Require(operand.swizzle != 1, "native half source read as float")`);
+/// - the lowering (`lower_to_maxwell.h`) passes it unchanged into Maxwell's `HADD2`, `HMUL2`,
+///   `HFMA2` and `HSET2` (`a.swizzle << 47`, `b.swizzle << 28`, `c.swizzle << 35`), where 1 is
+///   Maxwell's `F32`, and handles it explicitly for `HFMA2`'s `a` (`a.swizzle == 1 ?
+///   0x7fffffffU : 0x7fff7fffU`); only its `HMNMX2` case (`a.swizzle == 1 || b.swizzle == 1`)
+///   and its `HSETP2` case `0x434` (bits 74..75 0 or 2) refuse it.
+///
+/// The lowering is the path a title ran on (graphics-server decision 8; owner's ruling,
+/// 2026-11-20), so the decoder accepts 1 everywhere and leaves any refusal to the translator.
+/// That Maxwell's meaning (a 32-bit float operand) holds on SM86 is a **guess**, for an
 /// `nvdisasm` check (verification E2) to settle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum HalfSwizzle {
     /// 0: both halves as stored (NAK's `None`).
     H1H0,
+    /// 1: the operand read as one 32-bit float (Maxwell's `F32`; a guess for SM86, see the
+    /// type's docs).
+    F32,
     /// 2: the low half in both lanes (NAK's `Xx`).
     H0H0,
     /// 3: the high half in both lanes (NAK's `Yy`).
@@ -274,7 +288,7 @@ pub enum HalfSwizzle {
 
 impl HalfSwizzle {
     /// Every swizzle, in encoding order.
-    pub const ALL: [Self; 3] = [Self::H1H0, Self::H0H0, Self::H1H1];
+    pub const ALL: [Self; 4] = [Self::H1H0, Self::F32, Self::H0H0, Self::H1H1];
     /// The width of a swizzle field (`set_swizzle` asserts `range.len() == 2`).
     pub const BITS: u32 = 2;
 
@@ -282,16 +296,18 @@ impl HalfSwizzle {
     pub const fn bits(self) -> u64 {
         match self {
             Self::H1H0 => 0,
+            Self::F32 => 1,
             Self::H0H0 => 2,
             Self::H1H1 => 3,
         }
     }
 
-    /// The swizzle an encoding names: none for 1 (see the type's docs), nor for a value wider
+    /// The swizzle an encoding names: every two-bit value names one; none for a value wider
     /// than the field.
     pub const fn from_bits(bits: u64) -> Option<Self> {
         match bits {
             0 => Some(Self::H1H0),
+            1 => Some(Self::F32),
             2 => Some(Self::H0H0),
             3 => Some(Self::H1H1),
             _ => None,

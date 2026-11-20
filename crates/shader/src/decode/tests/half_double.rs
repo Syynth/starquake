@@ -79,7 +79,7 @@ fn hfma2_text_matches_nak_nvdisasm_cases() {
                     f32: false,
                     ftz: false,
                     dnz: false,
-                    relu: false,
+                    relu: None,
                     bf16: false,
                     neg_high_b: false,
                 }));
@@ -363,7 +363,7 @@ fn hand_built_words_pin_each_arithmetic_modifier_bit() {
             (&[(77, 1)], "hadd2.sat r1, r2, r3;"),
             (&[(78, 1)], "hadd2.f32 r1, r2, r3;"),
             (&[(80, 1)], "hadd2.ftz r1, r2, r3;"),
-            // `.F32` with `.sat` or `.ftz`, which PR #4588's translator refuses.
+            // `.F32` with `.sat` or `.ftz`, which both of PR #4588's paths refuse.
             (&[(78, 1), (77, 1)], "hadd2.f32.sat r1, r2, r3;"),
             (&[(78, 1), (80, 1)], "hadd2.f32.ftz r1, r2, r3;"),
         ],
@@ -383,14 +383,14 @@ fn hand_built_words_pin_each_arithmetic_modifier_bit() {
             (&[(76, 1)], "hfma2.fmz r1, r2, r3, r4;"),
             (&[(77, 1)], "hfma2.sat r1, r2, r3, r4;"),
             (&[(78, 1)], "hfma2.f32 r1, r2, r3, r4;"),
-            (&[(79, 1), (87, 7)], "hfma2.relu r1, r2, r3, r4;"),
+            (&[(79, 1), (87, 7)], "hfma2.relu r1, r2, r3, r4, pt;"),
             (&[(80, 1)], "hfma2.ftz r1, r2, r3, r4;"),
             (&[(85, 1)], "hfma2.bf16_v2 r1, r2, r3, r4;"),
             (&[(86, 1)], "hfma2 r1, r2, r3.h0_nh1, r4;"),
-            // `.relu` with `.sat`, which PR #4588's translator refuses.
+            // `.relu` with `.sat`, which both of PR #4588's paths refuse.
             (
                 &[(79, 1), (87, 7), (77, 1)],
-                "hfma2.sat.relu r1, r2, r3, r4;",
+                "hfma2.sat.relu r1, r2, r3, r4, pt;",
             ),
         ],
     );
@@ -447,6 +447,11 @@ fn hand_built_words_pin_each_comparison_modifier_bit() {
         &[
             (&[], "hsetp2.lt.and p1, pt, r2, r3, pt;"),
             (&[(71, 1)], "hsetp2.lt.h_and.and p1, pt, r2, r3, pt;"),
+            // `.h_and` before `.ftz`.
+            (
+                &[(71, 1), (80, 1)],
+                "hsetp2.lt.h_and.ftz.and p1, pt, r2, r3, pt;",
+            ),
             (&[(69, 1)], "hsetp2.lt.or p1, pt, r2, r3, pt;"),
             (&[(80, 1)], "hsetp2.lt.ftz.and p1, pt, r2, r3, pt;"),
             (&[(90, 1)], "hsetp2.lt.and p1, pt, r2, r3, !pt;"),
@@ -541,10 +546,10 @@ fn hand_built_words_pin_each_double_modifier_bit() {
 
 /// Every swizzle value in each of the three swizzle fields, in `HFMA2`'s register form, which
 /// has all three (source 0's at 74, `b`'s in the wide slot at 60, `c`'s in the register slot at
-/// 81), with the bits on both sides of the field clear and set: values 0, 2 and 3 decode to
-/// their halves and leave the neighbours' meaning alone, 1 is refused with the field's exact
-/// position. Bit 59, below the wide slot's field, is in no register form (the register is
-/// 32..40), so only the bit above it, `b`'s absolute value at 62, is a neighbour there.
+/// 81), with the bits on both sides of the field clear and set: each of the four values decodes
+/// to its swizzle (1 to `.f32`, a guess; `HalfSwizzle`'s docs) and leaves the neighbours'
+/// meaning alone. Bit 59, below the wide slot's field, is in no register form (the register is
+/// bits 32 to 39), so only the bit above it, `b`'s absolute value at 62, is a neighbour there.
 #[test]
 fn every_swizzle_value_at_both_edges_of_its_field() {
     type Neighbours<'a> = &'a [(&'a [(u32, u128)], &'a str)];
@@ -578,7 +583,7 @@ fn every_swizzle_value_at_both_edges_of_its_field() {
             ],
         ),
     ];
-    let names = [(0, ""), (2, ".h0_h0"), (3, ".h1_h1")];
+    let names = [(0, ""), (1, ".f32"), (2, ".h0_h0"), (3, ".h1_h1")];
     let mut checked = 0;
     for (start, neighbours) in fields {
         for (extra, template) in neighbours {
@@ -593,16 +598,9 @@ fn every_swizzle_value_at_both_edges_of_its_field() {
                 );
                 checked += 1;
             }
-            let mut refused = fields.clone();
-            refused.push((start, 1));
-            assert_eq!(
-                decode(word(0x231, &refused)),
-                unknown_value(0x231, start, 2, 1),
-                "bit {start}"
-            );
         }
     }
-    assert_eq!(checked, (4 + 2 + 4) * 3);
+    assert_eq!(checked, (4 + 2 + 4) * 4);
     // The other wide-slot kinds read the same swizzle field: a constant buffer and a uniform
     // register, and in `HMUL2`'s form 5 a swizzle beside a bindless buffer.
     assert_eq!(
@@ -626,75 +624,126 @@ fn every_swizzle_value_at_both_edges_of_its_field() {
         )),
         "hmul2 r1, r2, cx[ur5][0x8].h1_h1;"
     );
-    // An immediate's bits 60..62 are part of the value, not a swizzle.
+    // An immediate's bits 60 and 61 are part of the value, not a swizzle.
     assert_eq!(
         text(word(0x832, &[(16, 1), (24, 2), (32, 0x1000_0000)])),
         "hmul2 r1, r2, 0x10000000;"
     );
 }
 
-/// Swizzle 1 is refused in each field of each packed-half instruction that has it, with the
-/// exact error and message.
+/// Swizzle 1 decodes as `.f32` in each field of each packed-half instruction that has it, as
+/// PR #4588's lowering passes it into Maxwell's swizzle for `HADD2`, `HMUL2`, `HFMA2` and
+/// `HSET2` (graphics-server decision 8); in `HMNMX2` and in `HSETP2` (its lowering's `0x434`
+/// case and the native translator refuse it there) it decodes too, a listed divergence that
+/// leaves the refusal to the translator.
 #[test]
-fn swizzle_1_is_refused() {
-    let cases: [(u16, Fields<'_>, u32); 10] = [
-        (0x230, &[(74, 1)][..], 74),
-        (0x230, &[(60, 1)][..], 60),
-        (0x231, &[(81, 1)][..], 81),
-        (0x232, &[(60, 1)][..], 60),
-        (0x233, &[(74, 1)][..], 74),
-        (0x234, &[(60, 1)][..], 60),
-        (0x240, &[(74, 1)][..], 74),
-        (0x431, &[(81, 1)][..], 81),
-        (0x630, &[(60, 1), (54, 1)][..], 60),
-        (0xe34, &[(60, 1), (91, 1)][..], 60),
+fn swizzle_1_decodes_as_f32() {
+    let cases: [(u16, Fields<'_>, &str); 12] = [
+        (0x230, &[(74, 1)][..], "hadd2 r0, r0.f32, r0;"),
+        (0x230, &[(60, 1)][..], "hadd2 r0, r0, r0.f32;"),
+        (0x231, &[(81, 1)][..], "hfma2 r0, r0, r0, r0.f32;"),
+        (0x232, &[(60, 1)][..], "hmul2 r0, r0, r0.f32;"),
+        (0x233, &[(74, 1)][..], "hset2.f.and r0, r0.f32, r0, p0;"),
+        (
+            0x234,
+            &[(60, 1)][..],
+            "hsetp2.f.and p0, p0, r0, r0.f32, p0;",
+        ),
+        (
+            0x434,
+            &[(74, 1)][..],
+            "hsetp2.f.and p0, p0, r0.f32, 0x0, p0;",
+        ),
+        (0x240, &[(74, 1)][..], "hmnmx2 r0, r0.f32, r0, p0;"),
+        (0x240, &[(60, 1)][..], "hmnmx2 r0, r0, r0.f32, p0;"),
+        (0x431, &[(81, 1)][..], "hfma2 r0, r0, r0.f32, 0x0;"),
+        (
+            0x630,
+            &[(60, 1), (54, 1)][..],
+            "hadd2 r0, r0, c[0x1][0x0].f32;",
+        ),
+        (
+            0xe34,
+            &[(60, 1), (91, 1)][..],
+            "hsetp2.f.and p0, p0, r0, ur0.f32, p0;",
+        ),
     ];
-    for (opcode, fields, bit) in cases {
+    for (opcode, fields, expected) in cases {
         assert_eq!(
-            decode(word(u128::from(opcode), fields)),
-            unknown_value(opcode, bit, 2, 1),
+            text(word(u128::from(opcode), fields)),
+            expected,
             "{opcode:#x}"
         );
     }
-    assert_eq!(
-        text(word(0x231, &[(74, 1)])),
-        "error: opcode 0x231 has the value 1 in its 2-bit field at bit 74, which its form does \
-         not define"
-    );
 }
 
 // ---------------------------------------------------------------------------------------------
 // Values refused, and the order of the checks.
 
-/// `HFMA2`'s bits 87..89 hold 7 exactly with `.RELU` and 0 without (PR #4588); every other
-/// value is refused with the exact field, and bit 90, which PR #4588 also requires clear, is
-/// unknown.
+/// `HFMA2`'s bits 87 to 90 with `.RELU` are its predicate, index and negation, as PR #4588's
+/// lowering reads them (`insn.Bits(87, 4) << 39` into Maxwell's `SEL`; 7, `PT`, the
+/// always-true case); every one of the 16 values decodes, the negation bit 90 included. Without
+/// `.RELU` both of PR #4588's paths require them clear (the lowering's `Bits(87, 4) != 0`, the
+/// native translator's `Take(87, 4) == 0`): 0 decodes and every other value is refused with the
+/// whole field.
 #[test]
-fn hfma2_relu_mode_follows_relu() {
+fn hfma2_relu_predicate_follows_relu() {
     let base = [(16, 1), (24, 2), (32, 3), (64, 4)];
-    for relu in [0, 1] {
-        for mode in 0..8_u64 {
-            let mut fields = base.to_vec();
-            fields.extend([(79, relu), (87, u128::from(mode))]);
-            let decoded = decode(word(0x231, &fields));
-            let expected = if relu == 1 { 7 } else { 0 };
-            if mode == expected {
-                assert!(decoded.is_ok(), "relu {relu} mode {mode}");
-            } else {
-                assert_eq!(decoded, unknown_value(0x231, 87, 3, mode), "relu {relu}");
-            }
+    for value in 0..16_u64 {
+        let index = u8::try_from(value & 7).expect("three bits");
+        let pred = PredSrc {
+            reg: Pred::new(index).expect("a predicate"),
+            negated: value & 8 != 0,
+        };
+        let mut fields = base.to_vec();
+        fields.extend([(79, 1), (87, u128::from(value))]);
+        assert_eq!(
+            text(word(0x231, &fields)),
+            format!("hfma2.relu r1, r2, r3, r4, {pred};"),
+            "value {value}"
+        );
+        let mut fields = base.to_vec();
+        fields.push((87, u128::from(value)));
+        let decoded = decode(word(0x231, &fields));
+        if value == 0 {
+            assert_eq!(text(word(0x231, &fields)), "hfma2 r1, r2, r3, r4;");
+        } else {
+            assert_eq!(decoded, unknown_value(0x231, 87, 4, value), "value {value}");
         }
     }
+    // Bit 90 alone, the negation, without `.RELU`; with it, `!pt`.
     assert_eq!(
-        decode(word(0x231, &[(79, 1), (87, 7), (90, 1)])),
-        Err(DecodeError::UnknownBit {
-            opcode: 0x231,
-            bit: 90
-        })
+        decode(word(0x231, &[(90, 1)])),
+        unknown_value(0x231, 87, 4, 8)
+    );
+    assert_eq!(
+        text(word(0x231, &[(90, 1)])),
+        "error: opcode 0x231 has the value 8 in its 4-bit field at bit 87, which its form does \
+         not define"
+    );
+    assert_eq!(
+        text(word(0x231, &[(79, 1), (87, 7), (90, 1)])),
+        "hfma2.relu r0, r0, r0, r0, !pt;"
     );
 }
 
-/// The combine operation 3 of `HSET2`, `HSETP2` (bits 69..71) and `DSETP` (74..76) is refused
+/// `HSETP2`'s form 2 reads `b` from the wide slot (an immediate), as NAK encodes it and PR
+/// #4588's lowering reads it (case `0x434`: `half_source(2)`), not from the register slot as
+/// its native translator does (`Visitor::HSETP2`: `HalfSource(1)`), whose bits overlap the
+/// combine operation (69 and 70) and `.H_AND` (71): with both set, they keep their meaning and
+/// `b` stays the immediate.
+#[test]
+fn hsetp2_immediate_form_reads_b_from_the_wide_slot() {
+    assert_eq!(
+        text(word(
+            0x434,
+            &with(PREDICATE_BASE, &[(32, HALVES), (69, 1), (71, 1)])
+        )),
+        "hsetp2.lt.h_and.or p1, pt, r2, 0x3c004000, pt;"
+    );
+}
+
+/// The combine operation 3 of `HSET2`, `HSETP2` (bits 69 and 70) and `DSETP` (74 and 75) is refused
 /// in every form, with the exact field.
 #[test]
 fn combine_operation_3_is_refused() {
@@ -715,37 +764,32 @@ fn combine_operation_3_is_refused() {
     }
 }
 
-/// The decode functions read their fields in the documented order, so of two values that name
-/// nothing the earlier read is reported, whatever their bit positions; and the framework's
-/// steps 2 and 3 come before them.
+/// The framework's steps 2 and 3 come before the group's step-4 checks. Each instruction has at
+/// most one step-4 check (the combine operation, or `HFMA2`'s bits 87 to 90 without `.RELU`),
+/// and a swizzle names something in every value, so a swizzle of 1 beside either check leaves
+/// the check's error unchanged (in `HSET2` and `HSETP2`, whose combine operation is read before
+/// the sources, and in `HFMA2`, whose bits are read after them).
 #[test]
 fn half_double_checks_run_in_the_documented_order() {
-    // The combine operation before source 0's swizzle.
+    // The combine operation, with source 0's swizzle 1 beside it.
+    assert_eq!(
+        decode(word(0x233, &[(69, 3), (74, 1)])),
+        unknown_value(0x233, 69, 2, 3)
+    );
     assert_eq!(
         decode(word(0x234, &[(69, 3), (74, 1)])),
         unknown_value(0x234, 69, 2, 3)
     );
-    // Source 0's swizzle (74) before the wide slot's (60), though 60 is the lower bit.
-    assert_eq!(
-        decode(word(0x231, &[(74, 1), (60, 1)])),
-        unknown_value(0x231, 74, 2, 1)
-    );
-    // `b` before `c`: in form 3, `b`'s swizzle is in the register slot (81) and `c`'s in the
-    // wide slot (60).
-    assert_eq!(
-        decode(word(0x631, &[(81, 1), (60, 1), (54, 1)])),
-        unknown_value(0x631, 81, 2, 1)
-    );
-    // The swizzles before HFMA2's bits 87..89.
+    // HFMA2's bits 87 to 90 without `.RELU`, with `c`'s swizzle 1 beside them.
     assert_eq!(
         decode(word(0x231, &[(81, 1), (87, 1)])),
-        unknown_value(0x231, 81, 2, 1)
+        unknown_value(0x231, 87, 4, 1)
     );
     // Step 2 (an unknown bit) before step 4.
     assert_eq!(
-        decode(word(0x230, &[(74, 1), (64, 1)])),
+        decode(word(0x233, &[(69, 3), (64, 1)])),
         Err(DecodeError::UnknownBit {
-            opcode: 0x230,
+            opcode: 0x233,
             bit: 64
         })
     );
@@ -788,7 +832,8 @@ fn half_double_uniform_forms_require_bit_91() {
 // Divergences.
 
 /// Each of the group's rows drops exactly the bits the module docs list, written out, and each
-/// dropped bit set alone in an otherwise valid word is refused, naming it.
+/// dropped bit set alone in an otherwise valid word is refused, naming it; only `HFMA2`'s rows
+/// add a bit (90).
 #[test]
 fn half_double_rows_drop_exactly_the_listed_bits() {
     let range = |start: u32, end: u32| (start..end).fold(0_u128, |bits, bit| bits | 1 << bit);
@@ -811,7 +856,9 @@ fn half_double_rows_drop_exactly_the_listed_bits() {
     for (form, row) in half_double::FORMS.iter().zip(half_double::REFERENCE_ROWS) {
         let opcode = form.opcode;
         assert_eq!(row.dropped, expected(opcode), "{opcode:#x}");
-        assert_eq!(row.added(), 0, "{opcode:#x}");
+        // HFMA2 adds bit 90, `.RELU`'s predicate negation; no other form adds a bit.
+        let added = if opcode & 0x1ff == 0x031 { 1 << 90 } else { 0 };
+        assert_eq!(row.added(), added, "{opcode:#x}");
         if row.dropped != 0 {
             dropping += 1;
         }
@@ -895,7 +942,7 @@ fn unencodable_half_sources_are_refused() {
             f32: false,
             ftz: false,
             dnz: false,
-            relu: false,
+            relu: None,
             bf16: false,
             neg_high_b: false,
         })))
@@ -927,7 +974,8 @@ fn unencodable_half_sources_are_refused() {
 
 /// The assembler writes each packed-half source's modifiers and swizzle where its slot keeps
 /// them: source 0's at 72, 73 and 74; the wide slot's at 62, 63 and 60; the register slot's at
-/// 83, 84 and 81 (not the 32-bit positions 74 and 75); HFMA2's bits 87..89 hold 7 with `.relu`.
+/// 83, 84 and 81 (not the 32-bit positions 74 and 75); HFMA2's `.relu` predicate goes to bits
+/// 87 to 90.
 #[test]
 fn assembled_words_place_each_half_field() {
     let src = |index, abs, neg, swizzle| HalfSrc {
@@ -949,7 +997,10 @@ fn assembled_words_place_each_half_field() {
         f32: false,
         ftz: false,
         dnz: false,
-        relu: true,
+        relu: Some(PredSrc {
+            reg: p(2),
+            negated: true,
+        }),
         bf16: false,
         neg_high_b: false,
     };
@@ -969,7 +1020,8 @@ fn assembled_words_place_each_half_field() {
             (84, 1),
             (81, 2),
             (79, 1),
-            (87, 7),
+            (87, 2),
+            (90, 1),
         ],
     );
     assert_eq!(assembled.bits(), expected.bits());
@@ -1045,7 +1097,7 @@ fn half_double_fields_match_the_references() {
         (RELU, (79, 1)),
         (BF16_V2, (85, 1)),
         (HFMA2_NEG_HIGH_B, (86, 1)),
-        (HFMA2_RELU_MODE, (87, 3)),
+        (HFMA2_RELU_PRED, (87, 4)),
         (HALF_SET_OP, (69, 2)),
         (HSET2_BF, (71, 1)),
         (HSETP2_H_AND, (71, 1)),
@@ -1060,15 +1112,18 @@ fn half_double_fields_match_the_references() {
     for (shipping, (start, width)) in fields {
         assert_eq!((shipping.start, shipping.width), (start, width));
     }
-    assert_eq!(HFMA2_RELU_MODE_VALUE, 7);
+    // `.RELU`'s predicate is the accumulator's fields, read together.
+    assert_eq!(HFMA2_RELU_PRED.mask(), COND.mask() | COND_NOT.mask());
 }
 
 /// The swizzle encodings against NAK's `set_swizzle` for an `F16v2` source (`None` 0, `Xx` 2,
-/// `Yy` 3), and 1, which names nothing; the field is two bits wide.
+/// `Yy` 3) and Eden's Maxwell `Swizzle` (`F32` 1); a value wider than the field names nothing,
+/// and the field is two bits wide.
 #[test]
 fn half_swizzle_encodings_match_the_references() {
     let swizzles = [
         (HalfSwizzle::H1H0, 0),
+        (HalfSwizzle::F32, 1),
         (HalfSwizzle::H0H0, 2),
         (HalfSwizzle::H1H1, 3),
     ];
@@ -1077,7 +1132,6 @@ fn half_swizzle_encodings_match_the_references() {
         assert_eq!(swizzle.bits(), bits);
         assert_eq!(HalfSwizzle::from_bits(bits), Some(swizzle));
     }
-    assert_eq!(HalfSwizzle::from_bits(1), None);
     assert_eq!(HalfSwizzle::from_bits(4), None);
     assert_eq!(HalfSwizzle::BITS, 2);
     assert_eq!(HalfSrc::new(AluSrc::Imm(5)).swizzle, HalfSwizzle::H1H0);
@@ -1108,8 +1162,8 @@ proptest! {
     }
 
     /// The group's words alone: a word decodes and re-assembles to itself (scheduling bits
-    /// aside), or is refused for a bit only another layout reads, or for a swizzle of 1, a
-    /// combine operation of 3 or `HFMA2` bits 87..89 that do not match its `.RELU`.
+    /// aside), or is refused for a bit only another layout reads, for a combine operation of 3,
+    /// or for `HFMA2` bits 87 to 90 set without `.RELU`.
     #[test]
     fn half_double_decode_then_assemble_round_trips(
         word in any_word_of(half_double::FORMS),
@@ -1126,13 +1180,12 @@ proptest! {
             }
             Err(DecodeError::UnknownValue { opcode, bit, width, value }) => {
                 let base = opcode & 0x1ff;
-                let swizzle = matches!(bit, 60 | 74 | 81) && width == 2 && value == 1;
                 let set_op = width == 2
                     && value == 3
                     && ((matches!(base, HSET2_OPCODE | HSETP2_OPCODE) && bit == 69)
                         || (base == DSETP_OPCODE && bit == 74));
-                let relu = base == HFMA2_OPCODE && bit == 87 && width == 3;
-                prop_assert!(swizzle || set_op || relu, "{opcode:#x} bit {bit}");
+                let relu = base == HFMA2_OPCODE && bit == 87 && width == 4 && value != 0;
+                prop_assert!(set_op || relu, "{opcode:#x} bit {bit}");
             }
             Err(error) => prop_assert!(false, "{error}"),
         }

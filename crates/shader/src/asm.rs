@@ -363,6 +363,19 @@ pub(crate) fn choose_form(src1: Option<AluSrc>, src2: Option<AluSrc>) -> Option<
     }
 }
 
+/// The sources of an instruction that keeps its second operand `b` in the wide slot
+/// (`decode::alu::WIDE_OPERAND_FORMS`): as source 1 when `b_is_reg`, else as source 2. NAK picks
+/// between `encode_alu(.., a, b, None)` and `encode_alu(.., a, None, b)` by
+/// `src_is_zero_or_gpr(b)` in `OpFAdd`, `OpHAdd2`, `OpHSet2`, `OpHSetP2` and `OpDSetP`
+/// (`sm70_encode.rs` @ 52238762); the register slot `b` leaves is not written here.
+pub(crate) const fn wide_operand<T: Copy>(a: T, b: T, b_is_reg: bool) -> [Option<T>; 3] {
+    if b_is_reg {
+        [Some(a), Some(b), None]
+    } else {
+        [Some(a), None, Some(b)]
+    }
+}
+
 /// An operation's encoding: NAK's `impl SM70Op` for it. A shell keeps the default, which
 /// refuses.
 pub(crate) trait Encode: Named {

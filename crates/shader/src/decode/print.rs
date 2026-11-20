@@ -216,11 +216,12 @@ impl Display for IntOperand {
 }
 
 impl Display for HalfSwizzle {
-    /// Eden's Maxwell `Swizzle` names lower-cased, `.h0_h0` and `.h1_h1`, nothing for both
-    /// halves as stored (a guess; NAK's own printer writes `.xx` and `.yy`).
+    /// Eden's Maxwell `Swizzle` names lower-cased, `.f32`, `.h0_h0` and `.h1_h1`, nothing for
+    /// both halves as stored (a guess; NAK's own printer writes `.xx` and `.yy`).
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::H1H0 => "",
+            Self::F32 => ".f32",
             Self::H0H0 => ".h0_h0",
             Self::H1H1 => ".h1_h1",
         })

@@ -4,30 +4,18 @@
 //! Collabora, Ltd.), with the fields NAK writes as constants taken from the op, and the inverse
 //! of the decoder for `HFMA2`'s bits from PR #4588 alone (`decode::op::half_double`).
 
-use super::{Encode, EncodeError, Writer};
+use super::{Encode, EncodeError, Writer, wide_operand};
 use crate::decode::control::{COND, COND_NOT, PRED_DST};
 use crate::decode::float::{CMP_OP, DNZ, FSETP_DST1, FTZ, RND, SAT, SET_OP};
 use crate::decode::half_double::{
     BF16_V2, DADD_OPCODE, DFMA_OPCODE, DMUL_OPCODE, DSETP_OPCODE, HADD2_OPCODE, HALF_F32,
-    HALF_SET_OP, HFMA2_NEG_HIGH_B, HFMA2_OPCODE, HFMA2_RELU_MODE, HFMA2_RELU_MODE_VALUE,
-    HMNMX2_NAN, HMNMX2_OPCODE, HMNMX2_XORSIGN, HMUL2_OPCODE, HSET2_BF, HSET2_OPCODE, HSETP2_H_AND,
-    HSETP2_OPCODE, RELU,
+    HALF_SET_OP, HFMA2_NEG_HIGH_B, HFMA2_OPCODE, HMNMX2_NAN, HMNMX2_OPCODE, HMNMX2_XORSIGN,
+    HMUL2_OPCODE, HSET2_BF, HSET2_OPCODE, HSETP2_H_AND, HSETP2_OPCODE, RELU,
 };
 use crate::decode::{
     AluSrc, DST, HalfSrc, Named, OpDAdd, OpDFma, OpDMul, OpDSetP, OpHAdd2, OpHFma2, OpHMnMx2,
     OpHMul2, OpHSet2, OpHSetP2,
 };
-
-/// The sources of an instruction that keeps its second operand `b` in the wide slot: as source
-/// 1 when it is a register, else as source 2 (NAK's `src_is_zero_or_gpr` choice; the register
-/// slot `b` leaves is not written).
-fn wide_operand<T>(a: T, b: T, b_is_reg: bool) -> [Option<T>; 3] {
-    if b_is_reg {
-        [Some(a), Some(b), None]
-    } else {
-        [Some(a), None, Some(b)]
-    }
-}
 
 /// [`wide_operand`] for packed-half sources.
 fn half_wide_operand(srcs: [HalfSrc; 2]) -> [Option<HalfSrc>; 3] {
@@ -47,20 +35,20 @@ impl Encode for OpHAdd2 {
 }
 
 impl Encode for OpHFma2 {
-    /// NAK's encoder, with `.RELU` and `.BF16_V2` from the op, and PR #4588's bit 86 and its
-    /// bits 87..89, 7 with `.RELU`.
+    /// NAK's encoder, with `.RELU` and `.BF16_V2` from the op, and PR #4588's bit 86 and
+    /// `.RELU`'s predicate in bits 87 to 90 (clear without `.RELU`).
     fn encode(&self, writer: &mut Writer) -> Result<(), EncodeError> {
         writer.half_alu(Self::MNEMONIC, HFMA2_OPCODE, self.srcs.map(Some))?;
         writer.gpr(DST, self.dst);
         writer.flag(DNZ, self.dnz);
         writer.flag(SAT, self.saturate);
         writer.flag(HALF_F32, self.f32);
-        writer.flag(RELU, self.relu);
+        writer.flag(RELU, self.relu.is_some());
         writer.flag(FTZ, self.ftz);
         writer.flag(BF16_V2, self.bf16);
         writer.flag(HFMA2_NEG_HIGH_B, self.neg_high_b);
-        if self.relu {
-            writer.set(HFMA2_RELU_MODE, HFMA2_RELU_MODE_VALUE);
+        if let Some(pred) = self.relu {
+            writer.pred_src(COND, COND_NOT, pred);
         }
         Ok(())
     }
