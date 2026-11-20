@@ -75,8 +75,11 @@
 //! logs [`FELL_BACK`] at warning level, with the reason, or the run ends as an emulator error
 //! with [`WGPU_UNAVAILABLE`] and the reason (both pinned by
 //! `an_unavailable_wgpu_backend_falls_back_or_ends_the_run_as_chosen`, in `gpu/tests.rs`). A
-//! window that cannot be presented into always ends the run: a window is only ever shown by a
-//! wgpu backend that ends the run when it cannot be opened (`RenderSetup::windowed`).
+//! window that cannot be presented into ([`Unopened::Window`]) always ends the run, with the
+//! window's own words (`wgpu_backend::WINDOW_FAILED` and the reason; pinned on a real GPU by
+//! `a_window_the_backend_refuses_ends_the_run_with_the_window_s_words`, in
+//! `hle/tests/graphics/present.rs`). The local GPU test of the whole path is
+//! `the_wgpu_backend_dumps_the_same_frame_as_the_recording_backend`, there too.
 //!
 //! **The shader cache shares no pool yet.** The compile pool a wgpu run makes implements the
 //! shader crate's executor trait as well as the render crate's (`crate::compile_pool`), so the
@@ -153,9 +156,9 @@ use crate::hle::graphics::{FrontMode, GpuParts};
 use crate::renderer::{Choice, IfUnavailable, PRESENT_TARGET_WAIT, RenderSetup};
 use crate::report::{EnvSource, GraphicsReport};
 
-mod wgpu_backend;
+pub(crate) mod wgpu_backend;
 
-pub(crate) use wgpu_backend::WgpuOpener;
+pub(crate) use wgpu_backend::{Unopened, WgpuOpener};
 
 /// What a run logs at warning level, with the reason, when the wgpu backend it chose by default
 /// cannot be opened and it renders with the recording backend instead (module docs, "The wgpu
@@ -467,13 +470,14 @@ pub(crate) fn graphics_opening<C: HostClock + 'static>(
     );
     let backend = match (attempt, if_unavailable) {
         (Ok(backend), _) => backend,
-        (Err(reason), IfUnavailable::UseRecording) => {
+        (Err(Unopened::Backend(reason)), IfUnavailable::UseRecording) => {
             tracing::warn!(%reason, "{FELL_BACK}");
             recording_backend(&ring, &keeper)
         }
-        (Err(reason), IfUnavailable::EndRun) => {
+        (Err(Unopened::Backend(reason)), IfUnavailable::EndRun) => {
             return Err(format!("{WGPU_UNAVAILABLE}: {reason}"));
         }
+        (Err(Unopened::Window(message)), _) => return Err(message),
     };
     let graphics = start_gpu(
         ring,

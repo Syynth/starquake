@@ -192,8 +192,7 @@ impl WgpuOpener {
 
     /// Opens the wgpu backend for a run (module docs): built with `wake` and the GPU crate's
     /// `setting`, dumping into `keeper`, and presenting into `window` if there is one, whose
-    /// surface is made on the frontend's main thread within `present_wait`. The error is the
-    /// reason, in words.
+    /// surface is made on the frontend's main thread within `present_wait`.
     #[cfg(feature = "wgpu")]
     pub(crate) fn open(
         &self,
@@ -202,14 +201,16 @@ impl WgpuOpener {
         keeper: &Arc<FrameKeeper>,
         window: Option<&WindowTarget>,
         present_wait: Duration,
-    ) -> Result<Arc<dyn Backend>, String> {
-        let backend = built::open(&*self.open, wake, while_compiling(setting), keeper)?;
+    ) -> Result<Arc<dyn Backend>, Unopened> {
+        let backend = built::open(&*self.open, wake, while_compiling(setting), keeper)
+            .map_err(Unopened::Backend)?;
         if let Some(window) = window {
             let target = Arc::clone(&backend);
             let handles = window.handles().clone();
             present_on_main(window.main().as_ref(), present_wait, move || {
                 target.set_present_target(starquake_render::PresentTarget::Window(handles))
-            })?;
+            })
+            .map_err(Unopened::Window)?;
         }
         Ok(backend)
     }
@@ -223,9 +224,24 @@ impl WgpuOpener {
         _keeper: &Arc<FrameKeeper>,
         _window: Option<&WindowTarget>,
         _present_wait: Duration,
-    ) -> Result<Arc<dyn Backend>, String> {
-        Err(self.missing.to_owned())
+    ) -> Result<Arc<dyn Backend>, Unopened> {
+        Err(Unopened::Backend(self.missing.to_owned()))
     }
+}
+
+/// Why [`WgpuOpener::open`] gave no backend.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Unopened {
+    /// The backend could not be opened: why, in words. What the run does then is its choice's
+    /// (`crate::renderer::IfUnavailable`).
+    Backend(String),
+    /// The backend opened, but the window could not be made its present target: the words the
+    /// run ends with ([`WINDOW_FAILED`], then why). A run with a window always ends then.
+    #[cfg_attr(
+        not(feature = "wgpu"),
+        expect(dead_code, reason = "only the wgpu backend presents into a window")
+    )]
+    Window(String),
 }
 
 #[cfg(test)]

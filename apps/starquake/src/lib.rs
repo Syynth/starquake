@@ -10,7 +10,7 @@
 //!
 //! ```text
 //! starquake run <program> [--until timeout=<n>s | frames=<n>] [--artifacts <folder>]
-//!                          [--date <seconds>]
+//!                          [--date <seconds>] [--backend recording|wgpu] [--window]
 //! starquake inspect <title.nup>
 //! starquake verify <title.nup>
 //! starquake gpu-replay <capture> [--until present=<n>] [--dump ring|render|writes]
@@ -49,8 +49,18 @@
 //! depends on host timing; for presents with no fence it does not
 //! (`starquake_core::hle::graphics`, "Frames").
 //!
-//! PROVISIONAL (walking skeleton, #74). Of the contract's flags only `--until` and `--artifacts`
-//! exist; `--script`, `--clock`, `--seed`, `--record`, `--snapshot-every` and the `trace=`
+//! The render backend a run draws with is `starquake_core::renderer::choose_backend`'s choice
+//! ([`render_choice`]): the wgpu backend where this build has it (the `wgpu` feature, on by
+//! default), falling back to the recording backend, with a warning in `log.txt`, on a host
+//! with no GPU adapter; or the backend `--backend recording|wgpu` names, which is starquake's own
+//! flag on `run` (the contract names it for `render-replay` only; an owner question listed in
+//! `starquake_core::renderer`). `--window` shows the frames in a plain window while the program
+//! runs ([`window`], render-backend decision 11); it needs the wgpu backend and changes nothing
+//! the program sees. A combination the choice refuses is a usage error, reported after a missing
+//! program.
+//!
+//! PROVISIONAL (walking skeleton, #74). Of the contract's flags only `--until`, `--artifacts`
+//! and `--window` exist; `--script`, `--clock`, `--seed`, `--record`, `--snapshot-every` and the `trace=`
 //! condition of `--until` are refused by name, so a script that uses one finds out. The stop
 //! condition of a run is the guest calling `ExitProcess`, or the frames `--until frames=<n>`
 //! asks for.
@@ -77,6 +87,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use starquake_core::host_log::{HostLog, HostLogError};
 use starquake_core::loader::read_at::{Positional, ReadAt};
+use starquake_core::renderer::{
+    BackendFlag, Choice, ChoiceError, RenderSetup, WGPU_BUILT, choose_backend,
+};
 use starquake_core::title::{self as title_api, RomFs};
 use starquake_core::{
     ExitReason, FIRST_RTC_AT_BOOT, LAST_RTC_AT_BOOT, RtcAtBoot, RunOptions, RunReport, System,
@@ -85,11 +98,13 @@ use starquake_core::{
 
 pub mod gpu_replay;
 pub mod title;
+pub mod window;
 
 /// What `starquake` prints for `--help`, and after a command line it can't parse.
 pub const USAGE: &str = "\
 usage: starquake run <program> [--until timeout=<n>s | frames=<n>]
                      [--artifacts <folder>] [--date <seconds>]
+                     [--backend recording|wgpu] [--window]
        starquake inspect <title.nup>
        starquake verify <title.nup>
        starquake gpu-replay <capture> [--until present=<n>]
@@ -105,6 +120,10 @@ is made under the system's temporary folder and its path is printed. Without
 date is the host's, read once as the run starts, unless --date pins one:
 whole seconds since 1970-01-01T00:00:00 UTC, from -9223372036 to 9223372036,
 as in --date 1672531200. summary.json says which date the run used.
+The run draws with the wgpu backend where this build has it, or with the
+recording backend on a host with no GPU (log.txt says so); --backend names
+the backend instead. --window shows the frames in a window while the program
+runs; it needs the wgpu backend and changes nothing the program sees.
 exit codes: 0 the program exited or presented its frames, 1 the guest crashed,
 2 emulator error, 3 timeout
 
@@ -145,6 +164,16 @@ pub struct RunArgs {
     pub artifacts: Option<PathBuf>,
     /// `--date <seconds>`: the date the run pins. `None`: the host's.
     pub date: Option<UnixSeconds>,
+    /// `--backend recording|wgpu`. `None`: the default ([`render_choice`]).
+    pub backend: Option<BackendFlag>,
+    /// `--window`.
+    pub window: bool,
+}
+
+/// The render backend the run `args` asks for draws with: `starquake_core::renderer`'s
+/// [`choose_backend`] of this build ([`WGPU_BUILT`]), `--backend` and `--window`.
+pub fn render_choice(args: &RunArgs) -> Result<Choice, ChoiceError> {
+    choose_backend(WGPU_BUILT, args.backend, args.window)
 }
 
 /// A parsed command line.
@@ -224,6 +253,16 @@ pub enum UsageError {
         last = LAST_RTC_AT_BOOT
     )]
     BadDate(String),
+    /// `--backend` with something other than a backend's name.
+    #[error("`--backend {0}` is not a backend: write `recording` or `wgpu`")]
+    BadBackend(String),
+    /// A flag that takes no value was given one (`--window=yes`).
+    #[error("`{0}` takes no value")]
+    TakesNoValue(&'static str),
+    /// `--backend` and `--window` together ask for what the backend choice refuses
+    /// (`starquake_core::renderer`, "The choice").
+    #[error(transparent)]
+    Backend(#[from] ChoiceError),
 }
 
 /// An argument as text, with anything that is not UTF-8 replaced (for flags and messages; a
@@ -298,6 +337,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, UsageError> {
     }
 
     let (mut program, mut until, mut artifacts, mut date) = (None, None, None, None);
+    let (mut backend, mut window) = (None, false);
     let mut rest = rest.iter();
     while let Some(arg) = rest.next() {
         let shown = text(arg);
@@ -334,6 +374,21 @@ pub fn parse(args: &[OsString]) -> Result<Command, UsageError> {
                     return Err(UsageError::Repeated("--date"));
                 }
             }
+            "--backend" => {
+                let value = text(&value("--backend")?);
+                let flag = BackendFlag::from_name(&value).ok_or(UsageError::BadBackend(value))?;
+                if backend.replace(flag).is_some() {
+                    return Err(UsageError::Repeated("--backend"));
+                }
+            }
+            "--window" => {
+                if inline.is_some() {
+                    return Err(UsageError::TakesNoValue("--window"));
+                }
+                if std::mem::replace(&mut window, true) {
+                    return Err(UsageError::Repeated("--window"));
+                }
+            }
             flag if UNSUPPORTED_FLAGS.contains(&flag) => {
                 return Err(UsageError::UnsupportedFlag(flag.to_owned()));
             }
@@ -347,7 +402,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, UsageError> {
             }
         }
     }
-    Ok(Command::Run(RunArgs {
+    let run = RunArgs {
         program: program.ok_or(UsageError::MissingProgram)?,
         timeout: match until {
             Some(Until::Timeout(timeout)) => Some(timeout),
@@ -359,7 +414,11 @@ pub fn parse(args: &[OsString]) -> Result<Command, UsageError> {
         },
         artifacts,
         date,
-    }))
+        backend,
+        window,
+    };
+    render_choice(&run)?;
+    Ok(Command::Run(run))
 }
 
 /// Parses the arguments of `inspect` or `verify` (`command`): one file, which `make` turns into
@@ -502,9 +561,19 @@ fn run(
     stderr: &mut dyn Write,
 ) -> u8 {
     let started = Instant::now();
-    let mut report = match load(&args.program) {
-        Err(message) => RunReport::emulator_error(message, started.elapsed()),
-        Ok(Loaded { system, romfs }) => system.run(&run_options(args, command_line, romfs)),
+    let mut report = match (load(&args.program), render_choice(args)) {
+        (Err(message), _) => RunReport::emulator_error(message, started.elapsed()),
+        // Not reached from `execute`: `parse` refuses every combination the choice refuses. It
+        // keeps such a refusal an emulator error rather than a run with another backend.
+        (Ok(_), Err(refused)) => RunReport::emulator_error(refused.to_string(), started.elapsed()),
+        (Ok(Loaded { system, romfs }), Ok(choice)) => {
+            let options = run_options(args, command_line, romfs);
+            if args.window {
+                window::run(system, options, started)
+            } else {
+                system.run_rendering(&options, RenderSetup::headless(choice))
+            }
+        }
     };
     if let Some(log) = HOST_LOG.get() {
         (report.host_log, report.host_log_dropped) = log.take();
@@ -634,6 +703,8 @@ mod tests {
             frames: None,
             artifacts: artifacts.map(PathBuf::from),
             date: date.map(UnixSeconds),
+            backend: None,
+            window: false,
         })
     }
 
@@ -975,6 +1046,8 @@ mod tests {
                 frames: NonZeroU64::new(n),
                 artifacts: artifacts.map(PathBuf::from),
                 date: None,
+                backend: None,
+                window: false,
             })
         };
         let cases = [
