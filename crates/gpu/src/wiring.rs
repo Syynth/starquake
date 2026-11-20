@@ -156,8 +156,8 @@
 //! - The real shader cache: shader-pipeline slice 19 builds it, and an adapter from it to G18's
 //!   seam ([`ShaderCache`]) is the caller's to give, in [`GpuDeps::shaders`].
 //! - Choosing the render backend, and writing `gpu.txt` and the counters into a run's
-//!   artifacts: `core` does both. It builds a `Gpu` over the recording backend for a live run
-//!   (issue #386); render-backend slice R12 adds the choice of the wgpu backend.
+//!   artifacts: `core` does both. It builds a `Gpu` for a live run (issue #386) over the backend
+//!   the run chose, the wgpu backend or the recording backend (render-backend slice R12).
 //! - Frame dumps: `core` asks for them with the executor's setting in [`GpuConfig::exec`]
 //!   ([`crate::back::exec::FrameDumps`]), and installs the frame sink on the backend it builds.
 

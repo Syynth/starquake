@@ -59,6 +59,7 @@ fn stalled_gpu_run(
         }),
         recorder: Arc::new(Recorder::new()),
         gpu_memory: Some(stand_in_memory()),
+        render: crate::renderer::RenderSetup::recording(),
     };
     let env = session.environment();
     let (dispatcher, _) = boot(guest.address_space(), &guest.placed, space, &*env).unwrap();

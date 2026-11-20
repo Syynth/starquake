@@ -390,6 +390,7 @@ fn finished_gpu_machine(
         }),
         recorder: Arc::new(Recorder::new()),
         gpu_memory: Some(stand_in_memory()),
+        render: crate::renderer::RenderSetup::recording(),
     };
     let env = session.environment();
     let (dispatcher, _) = boot(guest.address_space(), &guest.placed, space, &*env).unwrap();
@@ -488,6 +489,7 @@ fn a_dead_gpu_thread_ends_the_run() {
         }),
         recorder: Arc::new(Recorder::new()),
         gpu_memory: Some(stand_in_memory()),
+        render: crate::renderer::RenderSetup::recording(),
     };
     let env = session.environment();
     let (dispatcher, _) = boot(guest.address_space(), &guest.placed, space, &*env).unwrap();
