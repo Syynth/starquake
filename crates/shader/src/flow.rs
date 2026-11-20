@@ -139,8 +139,8 @@ use std::ops::Range;
 use thiserror::Error;
 
 pub use analysis::{Analysis, analyze};
-pub(crate) use classify::{OpInfo, classify};
-pub(crate) use ir_build::read_pred;
+pub(crate) use analysis::{is_never, opcode_of};
+pub(crate) use classify::classify;
 pub use ir_build::{BlockSource, IrBlocks};
 pub use jump_tables::{
     JumpTable, JumpTableQuestions, MAX_TABLE_ENTRIES, ResolvedTable, ResolvedTables,

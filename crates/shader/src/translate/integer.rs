@@ -122,13 +122,14 @@ mod tests;
 
 use thiserror::Error;
 
+use super::source;
 use crate::decode::{
     AluSrc, CBuf, CBufRef, DecodeError, Gpr, IMadMode, Instr, Instruction, IntCmpOp, Op, OpBRev,
     OpFlo, OpIAbs, OpIAdd3, OpIAdd3X, OpIDp4, OpIMad, OpIMad64, OpIMnMx, OpISetP, OpLea, OpLeaX,
     OpLop3, OpMov, OpP2R, OpPLop3, OpPopC, OpPrmt, OpR2P, OpSel, OpSgxt, OpShf, PLop3Src, Pred,
     PredSetOp, PredSrc, PrmtMode, ShfType, UniformPredSrc, UniformReg, decode,
 };
-use crate::ir::{BlockId, BuildError, Builder, Function, Imm, Inst, Opcode, Operand, Terminator};
+use crate::ir::{BlockId, BuildError, Builder, Function, Imm, Inst, Opcode, Operand};
 
 /// How [`translate_integer`] treats an instruction's guard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -285,9 +286,9 @@ const SHF_WIDE: u32 = 64;
 /// The width in bits of `SHF`'s 32-bit types (`I32`, `U32`).
 const SHF_NARROW: u32 = 32;
 
-/// The bytes of one constant-buffer word: the unit of `GetCbufU32` and the distance from an
-/// `IMAD.WIDE` addend's low word to its high word.
-const WORD_BYTES: u32 = 4;
+/// The bytes of one constant-buffer word: the distance from an `IMAD.WIDE` addend's low word to
+/// its high word (the shared reader's unit).
+const WORD_BYTES: u32 = source::CBUF_WORD_BYTES;
 
 /// Whether `op` belongs to this group.
 pub const fn is_integer(op: &Op) -> bool {
@@ -521,6 +522,12 @@ struct Emitter<'b, 'f> {
     join: Option<BlockId>,
 }
 
+impl source::Emit for Emitter<'_, '_> {
+    fn emit_op(&mut self, opcode: Opcode, args: &[Operand]) -> Result<Operand, BuildError> {
+        self.op(opcode, args)
+    }
+}
+
 impl Emitter<'_, '_> {
     /// Appends an operation, after the guard's split if it is still pending.
     fn op(&mut self, opcode: Opcode, args: &[Operand]) -> Result<Operand, BuildError> {
@@ -530,35 +537,12 @@ impl Emitter<'_, '_> {
         Ok(self.b.op(opcode, args)?.into())
     }
 
-    /// Makes the conditional block: the current block tests `guard` and branches to a new
-    /// block, which jumps to a second new block that takes the current block's terminator.
+    /// Makes the conditional block with the shared guard helper ([`super::split_for_guard`]):
+    /// the current block tests `guard` and branches to a new block, which jumps to a second new
+    /// block that takes the current block's terminator.
     fn split(&mut self, guard: PredSrc) -> Result<(), BuildError> {
-        let here = self.b.block();
-        let mut cond: Operand = self
-            .b
-            .op(Opcode::GetPred, &[Operand::Imm(Imm::Pred(guard.reg))])?
-            .into();
-        if guard.negated {
-            cond = self.b.op(Opcode::LogicalNot, &[cond])?.into();
-        }
-        let old = self
-            .b
-            .function()
-            .block(here)
-            .map(|block| block.terminator)
-            .ok_or(BuildError::NoBlock(here))?;
-        let then = self.b.add_block()?;
-        let join = self.b.add_block()?;
-        self.b.terminate(Terminator::Branch {
-            cond,
-            then,
-            otherwise: join,
-        })?;
-        self.b.switch_to(join)?;
-        self.b.terminate(old)?;
-        self.b.switch_to(then)?;
-        self.b.terminate(Terminator::Jump(join))?;
-        self.join = Some(join);
+        let cond = source::pred(self.b, guard)?;
+        self.join = Some(super::split_for_guard(self.b, cond)?);
         Ok(())
     }
 
@@ -571,12 +555,9 @@ impl Emitter<'_, '_> {
         Ok(())
     }
 
-    /// Reads a register's bits; `RZ` reads zero (`Visitor::X`).
+    /// Reads a register's bits; `RZ` reads zero (`Visitor::X`, the shared reader).
     fn get(&mut self, reg: Gpr) -> Result<Operand, BuildError> {
-        if reg.is_zero() {
-            return Ok(imm32(0));
-        }
-        self.op(Opcode::GetRegister, &[Operand::Imm(Imm::Reg(reg))])
+        source::reg(self, reg)
     }
 
     /// Writes a register; a write to `RZ` is dropped (`Visitor::X`).
@@ -587,31 +568,15 @@ impl Emitter<'_, '_> {
         Ok(())
     }
 
-    /// Reads a predicate source; `PT` reads true (`Visitor::Pred`).
+    /// Reads a predicate source; `PT` reads true (`Visitor::Pred`, the shared reader).
     fn pred(&mut self, src: PredSrc) -> Result<Operand, BuildError> {
-        if src.reg.is_true() {
-            return Ok(imm1(!src.negated));
-        }
-        let value = self.op(Opcode::GetPred, &[Operand::Imm(Imm::Pred(src.reg))])?;
-        if src.negated {
-            return self.op(Opcode::LogicalNot, &[value]);
-        }
-        Ok(value)
+        source::pred(self, src)
     }
 
-    /// Reads a uniform predicate source; `UPT` reads true (`Visitor::UPred`).
+    /// Reads a uniform predicate source; `UPT` reads true (`Visitor::UPred`, the shared
+    /// reader).
     fn uniform_pred(&mut self, src: UniformPredSrc) -> Result<Operand, BuildError> {
-        if src.reg.is_true() {
-            return Ok(imm1(!src.negated));
-        }
-        let value = self.op(
-            Opcode::GetUniformPred,
-            &[Operand::Imm(Imm::UniformPred(src.reg))],
-        )?;
-        if src.negated {
-            return self.op(Opcode::LogicalNot, &[value]);
-        }
-        Ok(value)
+        source::uniform_pred(self, src)
     }
 
     /// Writes a predicate; a write to `PT` is dropped (`Visitor::SetPred`).
@@ -622,54 +587,22 @@ impl Emitter<'_, '_> {
         Ok(())
     }
 
-    /// A source's bits, without its modifier (the caller applies it). A bindless constant
-    /// buffer is refused before any instruction is translated, so it reads zero here.
+    /// A source's bits, without its modifier (the caller applies it; the shared reader). A
+    /// bindless constant buffer is refused before any instruction is translated, so it reads
+    /// zero here.
     fn src(&mut self, src: AluSrc) -> Result<Operand, BuildError> {
-        match src {
-            AluSrc::Reg { reg, .. } => self.get(reg),
-            AluSrc::Imm(bits) => Ok(imm32(bits)),
-            AluSrc::UniformReg { reg, .. } => self.uniform(reg),
-            AluSrc::CBuf {
-                cbuf:
-                    CBufRef {
-                        buf: CBuf::Binding(bank),
-                        offset,
-                    },
-                ..
-            } => self.cbuf(bank, u32::from(offset)),
-            AluSrc::CBuf { .. } => Ok(imm32(0)),
-        }
+        Ok(source::alu_bits(self, src)?.unwrap_or(imm32(0)))
     }
 
-    /// Reads a uniform register; `URZ` reads zero (`Visitor::UR`).
+    /// Reads a uniform register; `URZ` reads zero (`Visitor::UR`, the shared reader).
     fn uniform(&mut self, reg: UniformReg) -> Result<Operand, BuildError> {
-        if reg.is_zero() {
-            return Ok(imm32(0));
-        }
-        self.op(
-            Opcode::GetUniformRegister,
-            &[Operand::Imm(Imm::UniformReg(reg))],
-        )
+        source::uniform_reg(self, reg)
     }
 
-    /// The 32 bits at byte `offset` of constant buffer `bank`: one aligned read, or the tail
-    /// of one word and the head of the next for an unaligned offset (`Visitor::Cbuf`).
+    /// The 32 bits at byte `offset` of constant buffer `bank` (`Visitor::Cbuf`, the shared
+    /// reader).
     fn cbuf(&mut self, bank: u8, offset: u32) -> Result<Operand, BuildError> {
-        let bank = imm32(u32::from(bank));
-        let skew = offset % WORD_BYTES;
-        let aligned = offset - skew;
-        if skew == 0 {
-            return self.op(Opcode::GetCbufU32, &[bank, imm32(aligned)]);
-        }
-        let low = self.op(Opcode::GetCbufU32, &[bank, imm32(aligned)])?;
-        // Cannot overflow: `offset` came from a 16-bit field.
-        let high = self.op(
-            Opcode::GetCbufU32,
-            &[bank, imm32(aligned.saturating_add(WORD_BYTES))],
-        )?;
-        let low = self.op(Opcode::ShiftRightLogical32, &[low, imm32(8 * skew)])?;
-        let high = self.op(Opcode::ShiftLeftLogical32, &[high, imm32(32 - 8 * skew)])?;
-        self.op(Opcode::BitwiseOr32, &[low, high])
+        source::cbuf_word(self, bank, offset)
     }
 
     fn select(&mut self, cond: Operand, a: Operand, b: Operand) -> Result<Operand, BuildError> {

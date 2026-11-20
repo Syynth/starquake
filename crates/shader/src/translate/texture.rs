@@ -191,7 +191,7 @@ use std::fmt::{self, Display, Formatter};
 
 use thiserror::Error;
 
-use super::{REGISTER_LIMIT, conditional_block};
+use super::{REGISTER_LIMIT, conditional_block, source};
 use crate::decode::{
     AtomOp, AtomType, ChannelMask, Gpr, ImageAccess, ImageDim, Instr, MemType, Op, OpSuAtom,
     OpSuLd, OpSuSt, OpTex, OpTld, OpTld4, OpTmml, OpTxd, OpTxq, Pred, TexDim, TexLodMode,
@@ -1367,12 +1367,9 @@ impl Emit<'_, '_> {
         Ok(self.b.op_with(opcode, args, Flags::Texture(info))?.into())
     }
 
-    /// A register's raw bits; `RZ` reads zero (`Visitor::X`).
+    /// A register's raw bits; `RZ` reads zero (`Visitor::X`, the shared reader).
     fn get(&mut self, reg: Gpr) -> Result<Operand, BuildError> {
-        if reg.is_zero() {
-            return Ok(imm32(0));
-        }
-        self.op(Opcode::GetRegister, &[Operand::Imm(Imm::Reg(reg))])
+        source::reg(self.b, reg)
     }
 
     /// A register as a float (`Visitor::F`).
