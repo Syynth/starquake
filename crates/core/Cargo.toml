@@ -10,6 +10,13 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Builds the wgpu render backend into runs (docs/specs/render-backend.md, "Where the backend
+# sits": "`core` picks a backend by `cfg` and Cargo features"; slice R12). Off here, on in the
+# command-line app's default features: where it is built, a run renders with it by default
+# (`renderer`). Without it a run has the recording backend only.
+wgpu = ["dep:starquake-render-wgpu"]
+
 [dependencies]
 starquake-memory.workspace = true
 starquake-cpu.workspace = true
@@ -19,6 +26,7 @@ starquake-loader.workspace = true
 starquake-services.workspace = true
 starquake-shader.workspace = true
 starquake-render.workspace = true
+starquake-render-wgpu = { workspace = true, optional = true }
 starquake-gpu.workspace = true
 starquake-gsv.workspace = true
 starquake-trace.workspace = true

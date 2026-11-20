@@ -228,6 +228,7 @@ use crate::crash::{Backtrace, CrashReport, Exception};
 use crate::frames::FrameKeeper;
 use crate::hle::{FspHost, Graphics, HostFolder, Reads};
 use crate::image::{PAGE, Placement};
+use crate::renderer::RenderSetup;
 use crate::report::{
     ExitReason, GUEST_LOG_BYTES, GraphicsReport, Mapping, RunDate, RunOptions, RunReport, ThreadPc,
     empty_dump,
@@ -525,6 +526,9 @@ struct Session<'a, C> {
     /// The same guest memory as `memory`, shared, for the GPU's threads ([`GuestProgram`]'s
     /// field of the same name; `machine/gpu.rs`). `None`: the run has no GPU.
     gpu_memory: Option<Arc<dyn GuestMemory>>,
+    /// The render backend the run's GPU draws with, and its window (`crate::renderer`;
+    /// `machine/gpu.rs`, "The wgpu backend").
+    render: RenderSetup,
 }
 
 impl<C: HostClock + Clone> Session<'_, C> {
@@ -852,7 +856,9 @@ pub(crate) struct GuestProgram<'a, V> {
 /// Runs the loaded program `guest` on `vcpus` until it exits, crashes or times out, and
 /// reports what happened. `started` is when the run began, for the report's duration. `time` is
 /// the process's counter rate, which must be the rate the program's counter reads were patched
-/// for, and the host clock guest time is counted from.
+/// for, and the host clock guest time is counted from. Its GPU draws with the recording backend:
+/// the tests' runs.
+#[cfg(test)]
 pub(crate) fn run<V: Vcpu, C: HostClock + Clone + 'static>(
     vcpus: Vcpus<'_, V>,
     guest: GuestProgram<'_, V>,
@@ -863,7 +869,27 @@ pub(crate) fn run<V: Vcpu, C: HostClock + Clone + 'static>(
     run_within(vcpus, guest, options, started, time, Limits::DEFAULT)
 }
 
-/// [`run`], keeping no more of the run in memory than `limits` allows.
+/// [`run`], its GPU drawing with the backend `render` chose (`crate::renderer`): a real run's.
+pub(crate) fn run_rendering<V: Vcpu, C: HostClock + Clone + 'static>(
+    vcpus: Vcpus<'_, V>,
+    guest: GuestProgram<'_, V>,
+    options: &RunOptions,
+    (started, time): (Instant, Timebase<C>),
+    render: RenderSetup,
+) -> RunReport {
+    run_serving_rendering(
+        vcpus,
+        guest,
+        options,
+        (started, time),
+        (Limits::DEFAULT, &real_services),
+        render,
+    )
+}
+
+/// [`run`], keeping no more of the run in memory than `limits` allows, with the recording
+/// backend: the tests' runs.
+#[cfg(test)]
 pub(crate) fn run_within<V: Vcpu, C: HostClock + Clone + 'static>(
     vcpus: Vcpus<'_, V>,
     guest: GuestProgram<'_, V>,
@@ -884,11 +910,7 @@ pub(crate) fn run_within<V: Vcpu, C: HostClock + Clone + 'static>(
 
 /// [`run_within`], with the services `install` puts in front of the kernel instead of a real
 /// run's.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the run from boot to report in order; the GPU's memory and report are one field \
-              each among the others"
-)]
+#[cfg(test)]
 pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
     vcpus: Vcpus<'_, V>,
     guest: GuestProgram<'_, V>,
@@ -896,6 +918,30 @@ pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
     (started, time): (Instant, Timebase<C>),
     limits: Limits,
     install: &Install,
+) -> RunReport {
+    run_serving_rendering(
+        vcpus,
+        guest,
+        options,
+        (started, time),
+        (limits, install),
+        RenderSetup::recording(),
+    )
+}
+
+/// [`run_serving`], its GPU drawing with the backend `render` chose (`crate::renderer`).
+#[expect(
+    clippy::too_many_lines,
+    reason = "the run from boot to report in order; the GPU's memory and report are one field \
+              each among the others"
+)]
+fn run_serving_rendering<V: Vcpu, C: HostClock + Clone + 'static>(
+    vcpus: Vcpus<'_, V>,
+    guest: GuestProgram<'_, V>,
+    options: &RunOptions,
+    (started, time): (Instant, Timebase<C>),
+    (limits, install): (Limits, &Install),
+    render: RenderSetup,
 ) -> RunReport {
     let GuestProgram {
         space,
@@ -910,6 +956,7 @@ pub(crate) fn run_serving<V: Vcpu, C: HostClock + Clone + 'static>(
         clock: RunClock::new(time.clone()),
         recorder: Arc::new(Recorder::new()),
         gpu_memory,
+        render,
     };
     let text = Arc::new(TextSink::with_limit(limits.trace_events));
     let flight = Arc::new(FlightRecorder::new(
@@ -1186,12 +1233,11 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
         });
         let bell = Arc::new(timer::Bell::default());
         let wake: Arc<dyn starquake_gsv::completion::Wake> = Arc::<timer::Bell>::clone(&bell);
-        let built = gpu::graphics(
+        let built = gpu::graphics_rendering(
             &session.options.environment,
             session.gpu_memory.as_ref(),
-            session.options.until_frames,
-            wake,
-            session.clock.for_gpu(),
+            (session.options.until_frames, wake, session.clock.for_gpu()),
+            &session.render,
         );
         let (graphics, dumps) = match built {
             Ok(built) => built,

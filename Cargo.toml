@@ -24,6 +24,9 @@ starquake-layout = { path = "crates/layout" }
 starquake-loader = { path = "crates/loader" }
 starquake-memory = { path = "crates/memory" }
 starquake-render = { path = "crates/render" }
+# The wgpu render backend, which `core` builds into a run behind its `wgpu` feature
+# (docs/specs/render-backend.md, slice R12).
+starquake-render-wgpu = { path = "crates/render-wgpu" }
 starquake-services = { path = "crates/services" }
 starquake-shader = { path = "crates/shader" }
 starquake-testkit = { path = "crates/testkit" }
@@ -65,6 +68,13 @@ thiserror = "2.0.21"
 twox-hash = { version = "2.1.5", default-features = false, features = ["xxhash3_128"] }
 toml = { version = "1.2.1", default-features = false, features = ["std", "parse", "serde"] }
 tracing = "0.1.44"
+# The plain window of `starquake run --window` (docs/specs/render-backend.md, decision 11: "a
+# `--window` flag, as recommended"; slice R12), in `apps/` only. 0.30.13 is the latest release
+# (0.31 is in beta). Pure Rust: X11 and Wayland are loaded at run time (`x11-dl`,
+# `wayland-dlopen`), so building needs no C toolchain. Without default features: `rwh_06` gives
+# the window the `raw-window-handle` 0.6 traits the render crate takes, and the client-side
+# decorations of Wayland windows (`wayland-csd-adwaita`, a font renderer) are left out.
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
 
 # Dev-only
 # A second ASTC decoder, for the render crate's tests to compare its CPU decoder with

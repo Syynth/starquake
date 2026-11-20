@@ -880,6 +880,7 @@ fn the_environments_recording_moves_to_the_kept_recording_as_it_is_made() {
         clock: RunClock::new(timebase()),
         recorder: Arc::new(Recorder::new()),
         gpu_memory: None,
+        render: crate::renderer::RenderSetup::recording(),
     };
     let env = session.environment();
     // The most the environment held, unmoved, each time the guest ran: after the first call,

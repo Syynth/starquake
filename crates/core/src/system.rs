@@ -31,6 +31,7 @@ pub use ram::{THREAD_LOCAL_RAM, WORKING_RAM};
 use std::time::Instant;
 
 use crate::image::{LoadError, Program};
+use crate::renderer::RenderSetup;
 use crate::report::{RunOptions, RunReport};
 use crate::space::SpaceError;
 
@@ -98,10 +99,22 @@ impl System {
     ///
     /// The vCPU is created on, and runs on, the calling thread. Hypervisor.framework allows one
     /// VM per process, so a second `run` in the same process waits for the first to finish.
+    ///
+    /// The run's GPU draws with the recording backend ([`RenderSetup::recording`]), the gate's
+    /// (`crate::renderer`, "The choice"); [`System::run_rendering`] takes another.
     #[must_use]
     pub fn run(&self, options: &RunOptions) -> RunReport {
+        self.run_rendering(options, RenderSetup::recording())
+    }
+
+    /// [`System::run`], the run's GPU drawing with the backend `render` chose, and showing its
+    /// frames in `render`'s window if it has one (`crate::renderer`). A run with a window waits
+    /// for the frontend's main thread to make the window's surface, so it must be called on
+    /// another thread while the main thread takes the jobs the window posts.
+    #[must_use]
+    pub fn run_rendering(&self, options: &RunOptions, render: RenderSetup) -> RunReport {
         let started = Instant::now();
-        host::run(&self.program, options, started).unwrap_or_else(|error| {
+        host::run(&self.program, options, started, render).unwrap_or_else(|error| {
             tracing::error!(%error, "the run could not start");
             RunReport::emulator_error(error.to_string(), started.elapsed())
         })
@@ -126,6 +139,7 @@ pub(crate) mod host {
     use crate::image::{IMAGE_BASE, LoadError, Loaded, Program, load_placed, place};
     use crate::machine::{self, GuestProgram, GuestSpace, Vcpus};
 
+    use crate::renderer::RenderSetup;
     use crate::report::{RunOptions, RunReport};
     use crate::space::{AddressSpace, MapSink, SpaceMapper, Touch};
 
@@ -177,6 +191,7 @@ pub(crate) mod host {
         program: &Program,
         options: &RunOptions,
         started: Instant,
+        render: RenderSetup,
     ) -> Result<RunReport, Error> {
         // One rate and one zero point for guest time (kernel spec, "Guest time"): the patcher
         // rescales the backend's counter to the rate of the console the program's description
@@ -238,7 +253,13 @@ pub(crate) mod host {
             first: &mut vcpu,
             make: &make,
         };
-        Ok(machine::run(vcpus, guest, options, started, time))
+        Ok(machine::run_rendering(
+            vcpus,
+            guest,
+            options,
+            (started, time),
+            render,
+        ))
     }
 }
 
@@ -249,12 +270,14 @@ mod host {
 
     use super::Error;
     use crate::image::Program;
+    use crate::renderer::RenderSetup;
     use crate::report::{RunOptions, RunReport};
 
     pub(super) fn run(
         _program: &Program,
         _options: &RunOptions,
         _started: Instant,
+        _render: RenderSetup,
     ) -> Result<RunReport, Error> {
         Err(Error::NoCpuBackend)
     }

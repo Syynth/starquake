@@ -15,9 +15,11 @@
 //!
 //! # The GPU's parts
 //!
-//! - **The render backend** is the recording backend ([`RecordingBackend`], render-backend "The
-//!   recording backend": "the `null` backend for runs that need no pixels"), built with the
-//!   ring's completion wake, with [`recording_caps`] and [`RECORDING_MEMORY`] as its budget, and
+//! - **The render backend** is the one the run's [`RenderSetup`] chose
+//!   (`crate::renderer`, "The choice"; slice R12): the recording backend, or the wgpu backend
+//!   ("The wgpu backend", below). The recording backend ([`RecordingBackend`], render-backend
+//!   "The recording backend": "the `null` backend for runs that need no pixels") is built with
+//!   the ring's completion wake, with [`recording_caps`] and [`RECORDING_MEMORY`] as its budget, and
 //!   without its call log ([`RecordingBackend::without_call_log`]): it keeps no submitted list
 //!   (so none of an upload's staging bytes), no record of a create, destroy or present target,
 //!   and no present feedback, none of which the run reads. What it holds for the run is then the
@@ -27,8 +29,7 @@
 //!   (`the_run_s_backend_holds_no_more_after_fifty_presents_than_after_one`, in
 //!   `hle/tests/graphics/present.rs`). Keeping no log departs from render-backend's "It keeps
 //!   every submitted list and every resource description" (an owner question, listed in the
-//!   render crate's `recording` module docs). Choosing the wgpu backend is render-backend slice
-//!   R12's.
+//!   render crate's `recording` module docs).
 //! - **Frame dumps**: the GPU is asked to dump every present
 //!   ([`FrameDumps::Every`] in `GpuConfig::exec`, the setting through which `core` asks for
 //!   dumps), and the backend hands them to the run's [`FrameKeeper`] (`crate::frames`).
@@ -61,6 +62,28 @@
 //!   `n`th reading, not the time the kernel last read (pinned by
 //!   `the_gpu_s_copy_of_a_fixed_clock_starts_where_the_loop_s_copy_is`).
 //! - The GPU's other settings are `GpuConfig`'s defaults ([`gpu_config`]).
+//!
+//! # The wgpu backend
+//!
+//! A run whose setup chose the wgpu backend opens it through [`WgpuOpener`] (the
+//! `wgpu_backend` module: the shared compile pool, the GPU crate's wait setting and the ring's
+//! completion wake at construction, the frame keeper as its frame sink, and the window as its
+//! present target, made on the frontend's main thread). Its other parts are the recording
+//! backend's: the same frame dumps, shader cache, guest memory, write watch, clocks and
+//! settings. When it cannot be opened, the choice says what happens
+//! ([`crate::renderer::IfUnavailable`]): the run renders with the recording backend instead and
+//! logs [`FELL_BACK`] at warning level, with the reason, or the run ends as an emulator error
+//! with [`WGPU_UNAVAILABLE`] and the reason (both pinned by
+//! `an_unavailable_wgpu_backend_falls_back_or_ends_the_run_as_chosen`, in `gpu/tests.rs`). A
+//! window that cannot be presented into always ends the run: a window is only ever shown by a
+//! wgpu backend that ends the run when it cannot be opened (`RenderSetup::windowed`).
+//!
+//! **The shader cache shares no pool yet.** The compile pool a wgpu run makes implements the
+//! shader crate's executor trait as well as the render crate's (`crate::compile_pool`), so the
+//! shader cache can take the same pool; but the run's shader cache is still [`NoShaders`], since
+//! no translator exists to build the real one with (shader-pipeline slice 19's `ShaderCache`
+//! takes a `Translator`, which slice 17 builds). A run with the recording backend makes no pool:
+//! the recording backend builds no pipelines, and nothing else would use it.
 //!
 //! **Departure: the clock is not in `GpuConfig`.** gpu-protocol says the timestamp is guest time
 //! "which `core` passes through the `Gpu`'s config". `GpuConfig` is a plain settings value
@@ -118,7 +141,7 @@ use starquake_kernel::time::gpu_ticks_at;
 use starquake_memory::{GuestMemory, PageRange, WriteWatch};
 use starquake_render::caps::{DynamicState, StageSupport};
 use starquake_render::{
-    Caps, Features, FormatFeatures, FormatTable, Limits, RecordingBackend, SampleCounts,
+    Backend, Caps, Features, FormatFeatures, FormatTable, Limits, RecordingBackend, SampleCounts,
 };
 use starquake_shader::lookup::{EngineState, ProgramMemory, ProgramRequest, Ticket, VariantKey};
 use starquake_trace::HostClock;
@@ -127,7 +150,22 @@ use super::Ending;
 use crate::frames::FrameKeeper;
 use crate::hle::Graphics;
 use crate::hle::graphics::{FrontMode, GpuParts};
+use crate::renderer::{Choice, IfUnavailable, PRESENT_TARGET_WAIT, RenderSetup};
 use crate::report::{EnvSource, GraphicsReport};
+
+mod wgpu_backend;
+
+pub(crate) use wgpu_backend::WgpuOpener;
+
+/// What a run logs at warning level, with the reason, when the wgpu backend it chose by default
+/// cannot be opened and it renders with the recording backend instead (module docs, "The wgpu
+/// backend").
+pub(crate) const FELL_BACK: &str =
+    "the wgpu backend could not be opened; the run renders with the recording backend";
+
+/// The words a run ends with when the wgpu backend it asked for cannot be opened (module docs,
+/// "The wgpu backend"), before the reason.
+pub(crate) const WGPU_UNAVAILABLE: &str = "the wgpu backend could not be opened";
 
 /// The memory budget the run's recording backend reports: starquake's own number. The recording
 /// backend keeps a copy of every resource in host memory; the GPU's caches evict to stay within
@@ -283,7 +321,9 @@ pub(crate) fn gpu_config() -> GpuConfig {
 /// no more than `frame_limit` frames, and the frame keeper its GPU dumps into when it has one.
 /// A GPU's release timestamps read `clock`, a copy of the run's clock, as guest time (module
 /// docs, "The GPU's clocks"). The error is the words the run ends with when the GPU's threads
-/// cannot be started.
+/// cannot be started. Always the recording backend: a run builds its graphics server with
+/// [`graphics_rendering`], which takes the backend the run chose.
+#[cfg(test)]
 pub(crate) fn graphics<C: HostClock + 'static>(
     environment: &EnvSource,
     memory: Option<&Arc<dyn GuestMemory>>,
@@ -316,26 +356,131 @@ pub(crate) fn graphics_and_backend<C: HostClock + 'static>(
         let graphics = Graphics::new(FrontMode::Live, Some(wake)).with_frame_limit(frame_limit);
         return Ok((graphics, None));
     };
-    let ring = GpuRing::standard().map_err(|error| format!("the GPU's ring: {error}"))?;
+    let ring = standard_ring()?;
+    let keeper = Arc::new(FrameKeeper::default());
+    let backend = recording_backend(&ring, &keeper);
+    let dyn_backend: Arc<dyn Backend> = Arc::<RecordingBackend>::clone(&backend);
+    let graphics = start_gpu(ring, dyn_backend, memory, (wake, frame_limit, clock))?;
+    Ok((graphics, Some((keeper, backend))))
+}
+
+/// The ring a run's GPU is built over.
+fn standard_ring() -> Result<GpuRing, String> {
+    GpuRing::standard().map_err(|error| format!("the GPU's ring: {error}"))
+}
+
+/// The run's recording backend (module docs, "The GPU's parts"), built with `ring`'s completion
+/// wake and dumping into `keeper`.
+fn recording_backend(ring: &GpuRing, keeper: &Arc<FrameKeeper>) -> Arc<RecordingBackend> {
     let backend = Arc::new(RecordingBackend::without_call_log(
         recording_caps(),
         RECORDING_MEMORY,
         ring.completion_wake(),
     ));
-    let keeper = Arc::new(FrameKeeper::default());
-    backend.set_frame_sink(Some(Arc::<FrameKeeper>::clone(&keeper)));
+    backend.set_frame_sink(Some(Arc::<FrameKeeper>::clone(keeper)));
+    backend
+}
+
+/// Starts the run's GPU over `ring` and `backend` (module docs, "The GPU's parts"), rung
+/// through `wake`, handing its front no more than `frame_limit` frames, its release timestamps
+/// read from `clock`.
+fn start_gpu<C: HostClock + 'static>(
+    ring: GpuRing,
+    backend: Arc<dyn Backend>,
+    memory: &Arc<dyn GuestMemory>,
+    (wake, frame_limit, clock): (Arc<dyn Wake>, Option<NonZeroU64>, C),
+) -> Result<Graphics, String> {
     let parts = GpuParts {
         ring,
-        backend: Arc::<RecordingBackend>::clone(&backend),
+        backend,
         shaders: Box::new(NoShaders),
         guest: Arc::clone(memory),
         watch: Arc::new(WriteWatch::new()),
         config: gpu_config(),
         fence_clock: Arc::new(GuestTimeClock::new(clock)),
     };
-    let graphics = Graphics::with_gpu(Some(wake), parts)
+    Ok(Graphics::with_gpu(Some(wake), parts)
         .map_err(|error| format!("the GPU could not be started: {error}"))?
-        .with_frame_limit(frame_limit);
+        .with_frame_limit(frame_limit))
+}
+
+/// The frame keeper a run's GPU dumps into, and the render backend it was built over, as the
+/// GPU takes it.
+pub(crate) type KeeperAndDynBackend = (Arc<FrameKeeper>, Arc<dyn Backend>);
+
+/// [`graphics`], with the render backend `render` chose (module docs, "The GPU's parts" and "The
+/// wgpu backend"): what `Machine::start` builds.
+pub(crate) fn graphics_rendering<C: HostClock + 'static>(
+    environment: &EnvSource,
+    memory: Option<&Arc<dyn GuestMemory>>,
+    (frame_limit, wake, clock): (Option<NonZeroU64>, Arc<dyn Wake>, C),
+    render: &RenderSetup,
+) -> Result<(Graphics, Option<Arc<FrameKeeper>>), String> {
+    let (graphics, built) = graphics_opening(
+        environment,
+        memory,
+        (frame_limit, wake, clock),
+        render,
+        &WgpuOpener::host(),
+    )?;
+    Ok((graphics, built.map(|(keeper, _)| keeper)))
+}
+
+/// [`graphics_rendering`], opening the wgpu backend with `opener` (the host's in a run; one that
+/// fails in the tests), with the backend the GPU was built over when it has one.
+pub(crate) fn graphics_opening<C: HostClock + 'static>(
+    environment: &EnvSource,
+    memory: Option<&Arc<dyn GuestMemory>>,
+    (frame_limit, wake, clock): (Option<NonZeroU64>, Arc<dyn Wake>, C),
+    render: &RenderSetup,
+    opener: &WgpuOpener,
+) -> Result<(Graphics, Option<KeeperAndDynBackend>), String> {
+    let if_unavailable = match render.choice() {
+        Choice::Recording => {
+            let (graphics, built) =
+                graphics_and_backend(environment, memory, frame_limit, wake, clock)?;
+            let built = built.map(|(keeper, backend)| {
+                let backend: Arc<dyn Backend> = backend;
+                (keeper, backend)
+            });
+            return Ok((graphics, built));
+        }
+        Choice::Wgpu(if_unavailable) => if_unavailable,
+    };
+    let shared = if builds_gpu(environment, memory.is_some()) {
+        memory
+    } else {
+        None
+    };
+    let Some(memory) = shared else {
+        let graphics = Graphics::new(FrontMode::Live, Some(wake)).with_frame_limit(frame_limit);
+        return Ok((graphics, None));
+    };
+    let ring = standard_ring()?;
+    let keeper = Arc::new(FrameKeeper::default());
+    let attempt = opener.open(
+        ring.completion_wake(),
+        gpu_config().exec.setting,
+        &keeper,
+        render.window(),
+        PRESENT_TARGET_WAIT,
+    );
+    let backend = match (attempt, if_unavailable) {
+        (Ok(backend), _) => backend,
+        (Err(reason), IfUnavailable::UseRecording) => {
+            tracing::warn!(%reason, "{FELL_BACK}");
+            recording_backend(&ring, &keeper)
+        }
+        (Err(reason), IfUnavailable::EndRun) => {
+            return Err(format!("{WGPU_UNAVAILABLE}: {reason}"));
+        }
+    };
+    let graphics = start_gpu(
+        ring,
+        Arc::clone(&backend),
+        memory,
+        (wake, frame_limit, clock),
+    )?;
     Ok((graphics, Some((keeper, backend))))
 }
 

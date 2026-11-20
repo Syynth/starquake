@@ -45,6 +45,18 @@ pub mod artifacts;
     )
 )]
 mod clock;
+#[cfg_attr(
+    not(any(
+        test,
+        all(feature = "wgpu", target_os = "macos", target_arch = "aarch64")
+    )),
+    expect(
+        dead_code,
+        reason = "only a run with the wgpu backend makes a compile pool, and only a CPU backend \
+                  runs one"
+    )
+)]
+mod compile_pool;
 pub mod crash;
 pub mod frames;
 pub mod gpu_replay;
@@ -66,6 +78,7 @@ mod image;
     )
 )]
 mod machine;
+pub mod renderer;
 pub mod report;
 pub mod services_report;
 #[cfg_attr(
