@@ -5,7 +5,7 @@
 //! table and the module docs; `every_combination` then checks that each flag follows its own
 //! rows whatever the rest of the device and the guest state are.
 
-use super::{DepthRange, EmulationState, ViewportFlip, emulation, host_viewport};
+use super::{DepthRange, EmulationState, ViewportFlip, clip_depth_range, emulation, host_viewport};
 use crate::caps::{
     Caps, DynamicState, Features, FormatFeatures, FormatTable, GUEST_COLOR_TARGETS,
     GUEST_VERTEX_ATTRIBUTES, Limits, SampleCounts, StageSupport,
@@ -528,15 +528,38 @@ fn window_y(viewport: &Viewport, y_ndc: f32, s: f32) -> f32 {
     viewport.y + f32::midpoint(1.0, s * y_ndc) * viewport.height
 }
 
-/// Depth of clip-space `z` at `w` through `viewport`.
-fn window_depth(viewport: &Viewport, z: f32, w: f32) -> f32 {
-    viewport.min_depth + z / w * (viewport.max_depth - viewport.min_depth)
+/// Depth of clip-space `z` at `w` through `viewport`, for a host whose clip-space z covers
+/// `clip` (0..w, or -w..w on a host that takes -1..1 natively).
+fn window_depth(viewport: &Viewport, z: f32, w: f32, clip: DepthRange) -> f32 {
+    let unit = match clip {
+        DepthRange::ZeroToOne => z / w,
+        DepthRange::MinusOneToOne => f32::midpoint(z / w, 1.0),
+    };
+    viewport.min_depth + unit * (viewport.max_depth - viewport.min_depth)
 }
 
-/// The module docs' claim, worked through: for each flip, the host viewport and the shader's
-/// change (y negated, z made `w - z`) put every clip-space point on the guest's window y and
-/// depth, for either sign of the host's y axis, and clip z where the guest clips it. Every value
-/// is a short binary fraction, so the comparisons are exact.
+/// Whether clip-space `z` at `w` is clipped on a host whose clip-space z covers `clip`.
+fn clipped(z: f32, w: f32, clip: DepthRange) -> bool {
+    let low = match clip {
+        DepthRange::ZeroToOne => 0.0,
+        DepthRange::MinusOneToOne => -w,
+    };
+    !(low..=w).contains(&z)
+}
+
+/// The shader's depth mirror for a clip range (module docs, "The flipped viewport"): `w - z` for
+/// 0..w, `-z` for -w..w. The driver constants' words for each are pinned in the shader crate.
+fn mirror(z: f32, w: f32, clip: DepthRange) -> f32 {
+    match clip {
+        DepthRange::ZeroToOne => w - z,
+        DepthRange::MinusOneToOne => -z,
+    }
+}
+
+/// The module docs' claim, worked through: for each flip and each clip range, the host viewport
+/// and the shader's change (y negated, z mirrored for the clip range) put every clip-space point
+/// on the guest's window y and depth, for either sign of the host's y axis, and clip z where the
+/// guest clips it. Every value is a short binary fraction, so the comparisons are exact.
 #[test]
 fn a_flipped_viewport_lands_on_the_guests_pixels_and_depths() {
     let guests = [
@@ -559,17 +582,92 @@ fn a_flipped_viewport_lands_on_the_guests_pixels_and_depths() {
                 );
             }
         }
-        for z in [-0.5, 0.0, 0.5, 1.5, 2.0, 2.5] {
-            let shaded = if flip.reverse_depth { w - z } else { z };
-            let clipped = |z: f32| !(0.0..=w).contains(&z);
-            assert_eq!(clipped(shaded), clipped(z), "{guest:?} z {z}");
-            if !clipped(z) {
-                assert_eq!(
-                    window_depth(&host, shaded, w),
-                    window_depth(&guest, z, w),
-                    "{guest:?} z {z}"
-                );
+        for clip in [DepthRange::ZeroToOne, DepthRange::MinusOneToOne] {
+            for z in [-2.5, -2.0, -1.5, -0.5, 0.0, 0.5, 1.5, 2.0, 2.5] {
+                let shaded = if flip.reverse_depth {
+                    mirror(z, w, clip)
+                } else {
+                    z
+                };
+                let case = format!("{guest:?} {clip:?} z {z}");
+                assert_eq!(clipped(shaded, w, clip), clipped(z, w, clip), "{case}");
+                if !clipped(z, w, clip) {
+                    assert_eq!(
+                        window_depth(&host, shaded, w, clip),
+                        window_depth(&guest, z, w, clip),
+                        "{case}"
+                    );
+                }
             }
         }
     }
+}
+
+/// The clip range each depth mode and rewrite flag leaves: only the rewrite changes it, and only
+/// from -1..1. Every other flag, set or not, leaves it alone.
+#[test]
+fn the_clip_range_is_the_guests_unless_rewritten() {
+    let others = EmulationFlags::ALL.difference(EmulationFlags::DEPTH_RANGE_REWRITE);
+    for rest in [EmulationFlags::EMPTY, others] {
+        for (range, rewrite, clip) in [
+            (DepthRange::ZeroToOne, false, DepthRange::ZeroToOne),
+            (DepthRange::ZeroToOne, true, DepthRange::ZeroToOne),
+            (DepthRange::MinusOneToOne, false, DepthRange::MinusOneToOne),
+            (DepthRange::MinusOneToOne, true, DepthRange::ZeroToOne),
+        ] {
+            let flags = rest | flag_if(rewrite, EmulationFlags::DEPTH_RANGE_REWRITE);
+            assert_eq!(clip_depth_range(range, flags), clip, "{range:?} {flags:?}");
+        }
+    }
+}
+
+/// The combination the `w - z` mirror alone gets wrong: a device that takes -1..1 natively but
+/// cannot set a flipped viewport, a guest in the -1..1 mode with a reversed range. `emulation`
+/// asks for the flip and not the rewrite, so clip-space z stays in -w..w, and the mirror is `-z`:
+/// it lands on the guest's depths and clips where the guest clips, while `w - z` would clip
+/// `z = -w` and shift the depths. On a device lacking the -1..1 feature too, the rewrite makes
+/// the clip range 0..w and the mirror `w - z`.
+#[test]
+fn a_native_minus_one_to_one_range_is_mirrored_about_zero() {
+    let state = EmulationState {
+        depth_range: DepthRange::MinusOneToOne,
+        viewport: flip(false, true),
+        ..PLAIN
+    };
+    let guest = vp(0.0, 0.0, 8.0, 8.0, 0.75, 0.25);
+    let host = host_viewport(&guest);
+    let w = 2.0;
+    let native = Features::ALL.difference(Features::FLIPPED_VIEWPORT);
+    let flags = emulation(&device(native, GUEST_VERTEX_ATTRIBUTES), &state);
+    assert!(flags.contains(EmulationFlags::FLIPPED_VIEWPORT));
+    assert!(!flags.contains(EmulationFlags::DEPTH_RANGE_REWRITE));
+    let clip = clip_depth_range(state.depth_range, flags);
+    assert_eq!(clip, DepthRange::MinusOneToOne);
+    for z in [-2.0, -1.0, 0.0, 0.5, 2.0] {
+        assert!(!clipped(z, w, clip), "z {z}");
+        let mirrored = mirror(z, w, clip);
+        assert_eq!(mirrored, -z, "z {z}");
+        assert!(!clipped(mirrored, w, clip), "z {z}");
+        assert_eq!(
+            window_depth(&host, mirrored, w, clip),
+            window_depth(&guest, z, w, clip),
+            "z {z}"
+        );
+    }
+    // The 0..w mirror is wrong here: `z = -w` becomes `2w`, which is clipped, and `z = 0`
+    // lands on the host's far plane instead of the guest's middle depth.
+    assert!(clipped(w - -w, w, clip));
+    assert_ne!(
+        window_depth(&host, w - 0.0, w, clip),
+        window_depth(&guest, 0.0, w, clip)
+    );
+    // Without the -1..1 feature, the rewrite applies and the clip range is 0..w.
+    let lacking = native.difference(Features::DEPTH_RANGE_MINUS_ONE_TO_ONE);
+    let flags = emulation(&device(lacking, GUEST_VERTEX_ATTRIBUTES), &state);
+    assert!(flags.contains(EmulationFlags::FLIPPED_VIEWPORT));
+    assert!(flags.contains(EmulationFlags::DEPTH_RANGE_REWRITE));
+    assert_eq!(
+        clip_depth_range(state.depth_range, flags),
+        DepthRange::ZeroToOne
+    );
 }

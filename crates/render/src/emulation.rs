@@ -46,29 +46,56 @@
 //! A guest viewport whose height is negative, or whose depth range is reversed (the near
 //! plane's depth above the far plane's), is one wgpu refuses. With
 //! [`EmulationFlags::FLIPPED_VIEWPORT`] the pipeline's vertex shader and the backend share the
-//! work so the draw covers the same pixels at the same depths:
+//! work so the draw covers the same pixels and, for a depth range inside 0..=1, the same depths
+//! (the exact condition is below):
 //!
 //! - **The backend** sets [`host_viewport`]: a negative height `h` at `y` becomes `-h` at
 //!   `y + h` (the same rows), and a reversed range is swapped.
 //! - **The vertex shader** (shader-pipeline slice 17 lowers it) negates clip-space y when
-//!   [`ViewportFlip::flip_y`] is set, and replaces clip-space z with `w - z` when
-//!   [`ViewportFlip::reverse_depth`] is set, after the -1..1 depth-range rewrite where that
-//!   applies (the rewrite yields a 0..1 z, which the reversal then mirrors). The GPU crate
-//!   carries both in the driver constants.
+//!   [`ViewportFlip::flip_y`] is set, and mirrors clip-space z when
+//!   [`ViewportFlip::reverse_depth`] is set. The mirror depends on the range clip-space z covers
+//!   once the shader is done with it ([`clip_depth_range`]): `w - z` when that is 0..w (the
+//!   guest's 0..1 depth mode, or its -1..1 mode after the [`EmulationFlags::DEPTH_RANGE_REWRITE`]
+//!   rewrite, which yields a 0..w z), and `-z` when it is -w..w (the guest's -1..1 depth mode
+//!   on a device with [`Features::DEPTH_RANGE_MINUS_ONE_TO_ONE`], where no rewrite is asked
+//!   for). The GPU crate carries the flips and the clip range in the driver constants.
 //!
 //! Window y is affine in clip-space y, `y + (1 + s * y_ndc) / 2 * h` for the host's sign `s`,
-//! so `y + h` and `-h` with `y_ndc` negated give the same value; depth is
-//! `near + z / w * (far - near)`, and `far + (w - z) / w * (near - far)` is the same value,
-//! while `0 <= w - z <= w` clips exactly where `0 <= z <= w` does. Pinned by
-//! `tests::a_flipped_viewport_lands_on_the_guests_pixels_and_depths`.
+//! so `y + h` and `-h` with `y_ndc` negated give the same value. With a 0..w clip range, depth
+//! is `near + z / w * (far - near)`, `far + (w - z) / w * (near - far)` is the same value, and
+//! `0 <= w - z <= w` clips exactly where `0 <= z <= w` does. With a -w..w clip range, depth is
+//! `near + (z / w + 1) / 2 * (far - near)`, `far + (-z / w + 1) / 2 * (near - far)` is the
+//! same value, and `-w <= -z <= w` clips exactly where `-w <= z <= w` does; `w - z` there would
+//! shift every depth and clip `z = -w`. Pinned by
+//! `tests::a_flipped_viewport_lands_on_the_guests_pixels_and_depths` (both clip ranges) and
+//! `tests::a_native_minus_one_to_one_range_is_mirrored_about_zero` (the device with the -1..1
+//! feature and without [`Features::FLIPPED_VIEWPORT`]).
 //!
 //! Only the first viewport is read: a wgpu render pass has one, and the driver constants carry
 //! one flip. A host with several viewports and without [`Features::FLIPPED_VIEWPORT`] would
 //! need a flip per viewport; no such backend exists. A negative width (a negative x scale) is not
 //! flipped: Eden hands one to Vulkan as it is, which allows only the height to be negative, and
-//! the backend still refuses it. A depth outside 0..=1 does not reach the backend from the GPU crate,
-//! which clamps both depths as Eden does without `VK_EXT_depth_range_unrestricted`
-//! (`GetViewportState`); a backend still refuses one from elsewhere.
+//! the backend still refuses it.
+//!
+//! ## A depth outside 0..=1: an open owner question
+//!
+//! The approved spec's row (render-backend, "Fixed-function state the host lacks") reads: "Guest
+//! y-flip (negative viewport height); reversed or out-of-range depth range | wgpu refuses a
+//! negative viewport height and a depth range that is reversed or outside 0..1 | An
+//! `EmulationFlags` field and a driver constant: the vertex shader flips y and remaps depth".
+//! This module does not remap an out-of-range depth: the GPU crate clamps both depths to 0..=1
+//! before the backend sees them, as Eden does without `VK_EXT_depth_range_unrestricted`
+//! (`GetViewportState`, `eden/src/video_core/renderer_vulkan/vk_rasterizer.cpp`), so
+//! [`ViewportFlip`] never sees one from the GPU crate and a backend still refuses one from
+//! elsewhere. A clamp and a remap give different depths: the clamp compresses the part of the
+//! range past 0..=1 onto its edge, where a remap would keep the guest's depths and clip what
+//! falls outside. Which to keep is **open for the owner**, with two options: (1) keep Eden's
+//! clamp, and narrow the spec row to the reversed range; or (2) remap in the vertex shader (a
+//! z scale and offset from the guest's range, which the driver constants' position words leave
+//! room for) and clip there, as the row says. Until the owner rules, this is a departure from
+//! the row, pinned by the backend's own test that a flipped pipeline still refuses a depth
+//! outside 0..=1 (`starquake_render_wgpu`'s
+//! `draw::tests::a_flipped_viewport_is_set_positive_only_for_a_flipped_pipeline`).
 //!
 //! # What the primitive restart flag does not look at
 //!
@@ -162,6 +189,19 @@ pub fn host_viewport(guest: &Viewport) -> Viewport {
         host.max_depth = guest.min_depth;
     }
     host
+}
+
+/// The range clip-space z covers when the vertex shader hands the position on, for a guest
+/// whose depth mode is `depth_range` under a pipeline with `flags`: the guest's own range, except
+/// that [`EmulationFlags::DEPTH_RANGE_REWRITE`] rewrites -1..1 to 0..1. The depth mirror of
+/// [`EmulationFlags::FLIPPED_VIEWPORT`] is `w - z` for 0..1 and `-z` for -1..1 (module docs,
+/// "The flipped viewport").
+pub fn clip_depth_range(depth_range: DepthRange, flags: EmulationFlags) -> DepthRange {
+    if flags.contains(EmulationFlags::DEPTH_RANGE_REWRITE) {
+        DepthRange::ZeroToOne
+    } else {
+        depth_range
+    }
 }
 
 /// What the shaders (and, for primitive restart, the indices) must emulate for `state` on a

@@ -12,6 +12,7 @@ const VALUES: DriverConstants = DriverConstants {
     base_instance: 0x0102_0304,
     flip_y: true,
     reverse_depth: true,
+    clip_depth: ClipDepth::ZeroToW,
 };
 
 #[test]
@@ -52,6 +53,20 @@ fn golden_bytes() {
     let mut expected = VALUES.encode();
     expected[28..36].copy_from_slice(&[0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x00]);
     assert_eq!(forward.encode(), expected);
+    // A -w..w clip range turns the reversal's offset to 0.0 and leaves every other word.
+    let symmetric = DriverConstants {
+        clip_depth: ClipDepth::MinusWToW,
+        ..VALUES
+    };
+    let mut expected = VALUES.encode();
+    expected[32..36].copy_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    assert_eq!(symmetric.encode(), expected);
+    // Without a reversal the clip range changes nothing.
+    let forward_symmetric = DriverConstants {
+        clip_depth: ClipDepth::MinusWToW,
+        ..forward
+    };
+    assert_eq!(forward_symmetric.encode(), forward.encode());
 }
 
 #[test]
@@ -136,6 +151,7 @@ fn defaults() {
     // No flip: the position passes through unchanged.
     assert!(!fresh.flip_y);
     assert!(!fresh.reverse_depth);
+    assert_eq!(fresh.clip_depth, ClipDepth::ZeroToW);
     assert_eq!(
         fresh.word(DriverConstant::PositionYScale),
         1.0_f32.to_bits()
@@ -166,23 +182,60 @@ fn shaded(constants: &DriverConstants, [x, y, z, w]: [f32; 4]) -> [f32; 4] {
 }
 
 /// What each switch does to a position through the module docs' formula: y negated, z mirrored
-/// within 0..w, and nothing at all with both off.
+/// within 0..w (`w - z`) or, with a -w..w clip range, about zero (`-z`), and nothing at all with
+/// both flips off whatever the clip range.
 #[test]
 fn the_position_words_flip_and_mirror() {
     let position = [0.5, 0.25, 0.75, 2.0];
-    let with = |flip_y, reverse_depth| DriverConstants {
+    let with = |flip_y, reverse_depth, symmetric: bool| DriverConstants {
         flip_y,
         reverse_depth,
+        clip_depth: if symmetric {
+            ClipDepth::MinusWToW
+        } else {
+            ClipDepth::ZeroToW
+        },
         ..DriverConstants::default()
     };
-    assert_eq!(shaded(&with(false, false), position), position);
+    for symmetric in [false, true] {
+        assert_eq!(shaded(&with(false, false, symmetric), position), position);
+        assert_eq!(
+            shaded(&with(true, false, symmetric), position),
+            [0.5, -0.25, 0.75, 2.0]
+        );
+    }
     assert_eq!(
-        shaded(&with(true, false), position),
-        [0.5, -0.25, 0.75, 2.0]
+        shaded(&with(false, true, false), position),
+        [0.5, 0.25, 1.25, 2.0]
     );
-    assert_eq!(shaded(&with(false, true), position), [0.5, 0.25, 1.25, 2.0]);
-    assert_eq!(shaded(&with(true, true), position), [0.5, -0.25, 1.25, 2.0]);
+    assert_eq!(
+        shaded(&with(true, true, false), position),
+        [0.5, -0.25, 1.25, 2.0]
+    );
+    assert_eq!(
+        shaded(&with(false, true, true), position),
+        [0.5, 0.25, -0.75, 2.0]
+    );
+    assert_eq!(
+        shaded(&with(true, true, true), position),
+        [0.5, -0.25, -0.75, 2.0]
+    );
     // The ends of 0..w swap.
-    assert_eq!(shaded(&with(false, true), [0.0, 0.0, 0.0, 2.0])[2], 2.0);
-    assert_eq!(shaded(&with(false, true), [0.0, 0.0, 2.0, 2.0])[2], 0.0);
+    assert_eq!(
+        shaded(&with(false, true, false), [0.0, 0.0, 0.0, 2.0])[2],
+        2.0
+    );
+    assert_eq!(
+        shaded(&with(false, true, false), [0.0, 0.0, 2.0, 2.0])[2],
+        0.0
+    );
+    // The ends of -w..w swap.
+    assert_eq!(
+        shaded(&with(false, true, true), [0.0, 0.0, -2.0, 2.0])[2],
+        2.0
+    );
+    assert_eq!(
+        shaded(&with(false, true, true), [0.0, 0.0, 2.0, 2.0])[2],
+        -2.0
+    );
 }

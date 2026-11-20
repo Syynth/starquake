@@ -16,7 +16,7 @@
 //! | 20 | base instance | `u32` | Eden reads `BaseInstance` as an unsigned word (same file) |
 //! | 24 | position y scale: -1.0 when the guest viewport flips y, else 1.0 | `f32` | starquake's own (below) |
 //! | 28 | position z scale: -1.0 when the guest viewport's depth range is reversed, else 1.0 | `f32` | starquake's own (below) |
-//! | 32 | position z offset, in units of w: 1.0 when the depth range is reversed, else 0.0 | `f32` | starquake's own (below) |
+//! | 32 | position z offset, in units of w: 1.0 when the depth range is reversed and clip-space z covers 0..w, else 0.0 | `f32` | starquake's own (below) |
 //! | 36 | padding, zero | | |
 //!
 //! Every value is a 32-bit little-endian word at a 4-byte-aligned offset, and the block is
@@ -55,10 +55,26 @@
 //! the written position `(x, y, z, w)` becomes
 //! `(x, y * PositionYScale, z * PositionZScale + w * PositionZOffset, w)`, after the -1..1
 //! depth-range rewrite where that flag is set too. The GPU crate fills the three words from the
-//! draw's first viewport: [`DriverConstants::flip_y`] and [`DriverConstants::reverse_depth`].
-//! The words are a scale and an offset rather than two switches so a later remap (a depth range
-//! outside 0..1, should a host take one) needs no layout change; that is a guess at what such a
-//! remap needs. No reference does this: Eden hands the flipped viewport to Vulkan as it is.
+//! draw's first viewport and the clip range: [`DriverConstants::flip_y`],
+//! [`DriverConstants::reverse_depth`] and [`DriverConstants::clip_depth`].
+//!
+//! The depth mirror keeps the guest's depths only for the range clip-space z covers when the
+//! shader is done with it: `w - z` (scale -1.0, offset 1.0) when that is 0..w (the guest's 0..1
+//! depth mode, or its -1..1 mode after the rewrite), and `-z` (scale -1.0, offset 0.0) when it
+//! is -w..w (the guest's -1..1 mode on a host that takes it natively, so no rewrite is asked
+//! for). `w - z` there would clip `z = -w` and shift every depth. Pinned by
+//! `tests::the_position_words_flip_and_mirror` and, for the clip range each device and depth
+//! mode leaves, the render crate's
+//! `emulation::tests::a_native_minus_one_to_one_range_is_mirrored_about_zero`.
+//!
+//! A guest depth range outside 0..1 is not remapped here, although the approved spec's row
+//! says the vertex shader "remaps depth" for "a reversed or out-of-range depth range": the GPU
+//! crate clamps both depths to 0..1 as Eden does, which gives different depths than a remap.
+//! That is an **open owner question** (keep Eden's clamp, or remap and clip in the shader),
+//! stated with both options in the render crate's `emulation` module docs ("A depth outside
+//! 0..=1: an open owner question"). The words are a scale and an offset rather than two switches
+//! so such a remap would need no layout change; that is a guess at what it needs. No reference
+//! does any of this: Eden hands the flipped viewport to Vulkan as it is.
 //!
 //! Where the GPU crate takes each value from (the render area from the surface clip or colour
 //! target 0, as Eden-NX2's `vk_graphics_pipeline.cpp` does, and the base vertex and instance from
@@ -195,10 +211,26 @@ pub struct DriverConstants {
     /// Whether the vertex shader negates the position's y (the guest viewport's height is
     /// negative); written as a y scale of -1.0, else 1.0 (module docs, "The flipped viewport").
     pub flip_y: bool,
-    /// Whether the vertex shader mirrors the position's z within 0..w (the guest viewport's
-    /// depth range is reversed); written as a z scale of -1.0 and offset of 1.0, else 1.0 and
-    /// 0.0.
+    /// Whether the vertex shader mirrors the position's z (the guest viewport's depth range is
+    /// reversed); written as a z scale of -1.0, else 1.0, with the offset that
+    /// [`DriverConstants::clip_depth`] picks; without a reversal the offset is 0.0.
     pub reverse_depth: bool,
+    /// The range clip-space z covers once the vertex shader is done with it, which picks the
+    /// reversal's z offset (module docs, "The flipped viewport").
+    pub clip_depth: ClipDepth,
+}
+
+/// The range clip-space z covers once the vertex shader is done with it: what the depth
+/// reversal mirrors within (module docs, "The flipped viewport").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ClipDepth {
+    /// 0..w: the guest's 0..1 depth mode, or its -1..1 mode after the `DEPTH_RANGE_REWRITE`
+    /// rewrite. The reversal is `w - z`, a z offset of 1.0.
+    #[default]
+    ZeroToW,
+    /// -w..w: the guest's -1..1 depth mode without the rewrite (the host takes it natively). The
+    /// reversal is `-z`, a z offset of 0.0.
+    MinusWToW,
 }
 
 impl DriverConstants {
@@ -216,7 +248,12 @@ impl DriverConstants {
             DriverConstant::PositionYScale => sign(self.flip_y).to_bits(),
             DriverConstant::PositionZScale => sign(self.reverse_depth).to_bits(),
             DriverConstant::PositionZOffset => {
-                if self.reverse_depth { 1.0_f32 } else { 0.0_f32 }.to_bits()
+                if self.reverse_depth && self.clip_depth == ClipDepth::ZeroToW {
+                    1.0_f32
+                } else {
+                    0.0_f32
+                }
+                .to_bits()
             }
         }
     }

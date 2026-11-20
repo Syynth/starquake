@@ -1827,9 +1827,16 @@ fn uploaded_constants(rig: &Rig) -> DriverConstants {
     let minus_one = (-1.0_f32).to_bits();
     let flip_y = word(DriverConstant::PositionYScale).to_bits() == minus_one;
     let reverse_depth = word(DriverConstant::PositionZScale).to_bits() == minus_one;
+    // A reversal with a zero offset is the -w..w clip range's mirror.
+    let clip_depth = if reverse_depth && word(DriverConstant::PositionZOffset).to_bits() == 0 {
+        ClipDepth::MinusWToW
+    } else {
+        ClipDepth::ZeroToW
+    };
     let decoded = DriverConstants {
         flip_y,
         reverse_depth,
+        clip_depth,
         ..DriverConstants::default()
     };
     // The words are exactly what those switches encode to.
@@ -1916,6 +1923,55 @@ fn each_viewport_flip_reaches_the_flag_and_the_constants() {
                 "{case}: {last}"
             );
         }
+    }
+}
+
+/// The depth mirror follows the clip range the shader leaves. A reversed range in the -1..1 depth
+/// mode on a device that takes -1..1 natively but cannot set a flipped viewport keeps clip-space
+/// z in -w..w (no `DEPTH_RANGE_REWRITE`), so the z offset word is 0.0 (the mirror `-z`); on a
+/// device lacking the -1..1 feature too the rewrite makes it 0..w and the offset 1.0 (`w - z`),
+/// as it is in the 0..1 depth mode on either device. The z scale is -1.0 in every case.
+#[test]
+fn the_depth_mirror_follows_the_clip_range() {
+    let native = Features::ALL.difference(Features::FLIPPED_VIEWPORT);
+    let lacking = native.difference(Features::DEPTH_RANGE_MINUS_ONE_TO_ONE);
+    let minus_w = clc797::SET_VIEWPORT_Z_CLIP_RANGE_NEGATIVE_W_TO_POSITIVE_W;
+    let zero = clc797::SET_VIEWPORT_Z_CLIP_RANGE_ZERO_TO_POSITIVE_W;
+    // (features, clip register, rewrite expected, z offset word)
+    let cases = [
+        (native, minus_w, false, 0.0_f32),
+        (lacking, minus_w, true, 1.0),
+        (native, zero, false, 1.0),
+        (lacking, zero, false, 1.0),
+    ];
+    for (features, range, rewrite, offset) in cases {
+        let case = format!("features {features:?}, clip range {range}");
+        let mut rig = Rig::with(
+            caps(true, features, 16),
+            WaitWhileCompiling::Wait,
+            ready(vec![], vec![driver_use(0, 0)]),
+        );
+        rig.basic();
+        rig.set(&clc797::SET_VIEWPORT_Z_CLIP, &[], range);
+        rig.set(&clc797::SET_VIEWPORT_SCALE_Z, &[0], (-0.5f32).to_bits());
+        assert_eq!(rig.draw(), Outcome::Drawn, "{case}");
+        let viewport = rig.last_draw().dynamic.viewports[0];
+        assert!(ViewportFlip::of(&viewport).reverse_depth, "{case}");
+        let key = rig.shaders.seen.last().unwrap().key.emulation;
+        assert!(key.flipped_viewport, "{case}");
+        assert_eq!(key.depth_range_rewrite, rewrite, "{case}");
+        let constants = uploaded_constants(&rig);
+        assert!(constants.reverse_depth, "{case}");
+        assert_eq!(
+            constants.word(DriverConstant::PositionZScale),
+            (-1.0_f32).to_bits(),
+            "{case}"
+        );
+        assert_eq!(
+            constants.word(DriverConstant::PositionZOffset),
+            offset.to_bits(),
+            "{case}"
+        );
     }
 }
 
@@ -2486,7 +2542,8 @@ fn driver_constants_take_their_sources() {
         flip_y: true,
         reverse_depth: false,
     };
-    let constants = driver_constants(&rig.mirror, 0.25, &call, flip).unwrap();
+    let constants =
+        driver_constants(&rig.mirror, 0.25, &call, flip, DepthRange::ZeroToOne).unwrap();
     assert_eq!(constants.alpha_reference, 0.25);
     assert!(constants.y_negate);
     assert!(constants.flip_y);
@@ -2495,9 +2552,16 @@ fn driver_constants_take_their_sources() {
         flip_y: false,
         reverse_depth: true,
     };
-    let constants = driver_constants(&rig.mirror, 0.25, &call, flip).unwrap();
+    let constants =
+        driver_constants(&rig.mirror, 0.25, &call, flip, DepthRange::ZeroToOne).unwrap();
     assert!(!constants.flip_y);
     assert!(constants.reverse_depth);
+    assert_eq!(constants.clip_depth, ClipDepth::ZeroToW);
+    // The clip range is the one handed in: -1..1 is the symmetric mirror.
+    let symmetric =
+        driver_constants(&rig.mirror, 0.25, &call, flip, DepthRange::MinusOneToOne).unwrap();
+    assert!(symmetric.reverse_depth);
+    assert_eq!(symmetric.clip_depth, ClipDepth::MinusWToW);
     assert_eq!(
         (constants.render_area_width, constants.render_area_height),
         (8.0, 8.0)
@@ -2510,7 +2574,14 @@ fn driver_constants_take_their_sources() {
     rig.set(&clc797::SET_SURFACE_CLIP_HORIZONTAL, &[], 0);
     rig.set(&clc797::SET_COLOR_TARGET_WIDTH, &[0], 32);
     rig.set(&clc797::SET_COLOR_TARGET_HEIGHT, &[0], 16);
-    let constants = driver_constants(&rig.mirror, 0.25, &call, ViewportFlip::NONE).unwrap();
+    let constants = driver_constants(
+        &rig.mirror,
+        0.25,
+        &call,
+        ViewportFlip::NONE,
+        DepthRange::ZeroToOne,
+    )
+    .unwrap();
     assert_eq!(
         (constants.render_area_width, constants.render_area_height),
         (32.0, 16.0)
