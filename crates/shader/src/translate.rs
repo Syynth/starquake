@@ -65,8 +65,11 @@
 //! The instruction groups' translators (port slices 12a to 12h) each have a module here that
 //! translates one instruction of a flow block (slice 10) at a time: [`control`] for the
 //! control and warp group, whose instructions [`translate`] keeps refusing, and [`integer`] for
-//! the integer ALU group (slice 12a). The attribute group (`attribute`) is joined to
-//! [`translate`] through `GROUPS` instead.
+//! the integer ALU group (slice 12a), [`float`] for the 32-bit float and conversion group
+//! (slice 12b) and [`texture`] for the texture and surface group (slice 12f). The attribute
+//! group (`attribute`) is joined to [`translate`] through `GROUPS` instead. `conditional_block`
+//! is the guard helper [`float`] and [`texture`] share: both turn a guarded instruction into a
+//! conditional block with it, rather than each building its own.
 //!
 //! Slice 1 handles linear flow only (spec, port slice 1). Where starquake is stricter than the
 //! PR, because the PR resolves the case in a part not built yet:
