@@ -56,8 +56,10 @@
 //!   order the kernel's readings do not fix, and no replay builds the GPU ("Which front"). A
 //!   GPU capture records each one (`starquake_gpu::capture`, the `timestamp` record), and its
 //!   replay writes the recorded value. With a clock that counts its own readings (`--clock
-//!   fixed`), the GPU's copy counts its own: the `n`th timestamp is the clock's `n`th reading,
-//!   not the time the kernel last read.
+//!   fixed`), the GPU's copy counts its own, starting from the state of the loop's copy when
+//!   `Machine::start` builds the GPU (`RunClock::for_gpu`): the `n`th timestamp is that copy's
+//!   `n`th reading, not the time the kernel last read (pinned by
+//!   `the_gpu_s_copy_of_a_fixed_clock_starts_where_the_loop_s_copy_is`).
 //! - The GPU's other settings are `GpuConfig`'s defaults ([`gpu_config`]).
 //!
 //! **Departure: the clock is not in `GpuConfig`.** gpu-protocol says the timestamp is guest time

@@ -463,3 +463,37 @@ fn a_run_s_gpu_writes_guest_time_after_a_release_s_payload() {
     assert!(run.reads() >= 1);
     graphics.gpu().unwrap().stop().unwrap();
 }
+
+/// The hand-off `Machine::start` makes ([`crate::machine::RunClock::for_gpu`]; module docs,
+/// "The GPU's clocks"): under `--clock fixed` the GPU's copy starts from the run clock's state.
+/// The loop has read the clock `READ` times, so the GPU's first timestamp is the guest GPU
+/// timer's reading of the clock's next reading, `START + READ * STEP`; its second is one step on.
+#[test]
+fn the_gpu_s_copy_of_a_fixed_clock_starts_where_the_loop_s_copy_is() {
+    use starquake_trace::{FixedClock, HostNanos};
+
+    use crate::clock::{NRO_CONSOLE, Timebase};
+    use crate::machine::RunClock;
+
+    // Not a whole number of GPU ticks, so a reading off by a step or by the zero shows.
+    const START: u64 = 1_000_000_007;
+    const STEP: u64 = 1_000_003;
+    const READ: u64 = 3;
+
+    let run = RunClock::new(Timebase {
+        console: NRO_CONSOLE,
+        clock: FixedClock::new(START, STEP),
+    });
+    for _ in 0..READ {
+        let _ = run.now();
+    }
+    let clock = GuestTimeClock::new(run.for_gpu());
+    let next = START + READ * STEP;
+    assert_eq!(clock.gpu_timestamp(), gpu_ticks_at(HostNanos(next)).0);
+    assert_eq!(
+        clock.gpu_timestamp(),
+        gpu_ticks_at(HostNanos(next + STEP)).0
+    );
+    // The copy is the GPU's own: reading it does not move the loop's copy.
+    assert_eq!(run.host_now(), HostNanos(next));
+}
