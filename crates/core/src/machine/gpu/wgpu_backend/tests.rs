@@ -177,7 +177,7 @@ fn the_run_s_sink_keeps_each_frame_with_or_without_its_backend() {
     use starquake_render::frame::RGBA8_BYTES;
     use starquake_render::{Frame, FramePixels, FrameSink};
 
-    let keeper = Arc::new(FrameKeeper::default());
+    let keeper = Arc::new(crate::machine::gpu::RunFrames::default());
     // A backend already gone: the sink still keeps the frame, and has nothing to drain.
     let sink = RunSink {
         keeper: Arc::clone(&keeper),
@@ -192,6 +192,9 @@ fn the_run_s_sink_keeps_each_frame_with_or_without_its_backend() {
             pixels: FramePixels::Rgba8(vec![0x5a; RGBA8_BYTES]),
         });
     }
+    // Each frame the sink is handed is counted, for `finish`'s wait (the parent module's "At
+    // the end").
+    assert_eq!(keeper.received(), 2);
     let kept = keeper.take();
     assert_eq!(
         kept.files.iter().map(|file| file.frame).collect::<Vec<_>>(),

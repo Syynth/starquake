@@ -225,7 +225,6 @@ use starquake_trace::{
 
 use crate::clock::Timebase;
 use crate::crash::{Backtrace, CrashReport, Exception};
-use crate::frames::FrameKeeper;
 use crate::hle::{FspHost, Graphics, HostFolder, Reads};
 use crate::image::{PAGE, Placement};
 use crate::renderer::RenderSetup;
@@ -795,7 +794,7 @@ struct Machine<'a, V: Vcpu, C> {
     /// The graphics server, whose turns the timer thread runs (`machine/timer.rs`).
     graphics: Arc<Graphics>,
     /// Where the GPU's frame dumps go, when the run has a GPU (`machine/gpu.rs`).
-    dumps: Option<Arc<FrameKeeper>>,
+    dumps: Option<Arc<gpu::RunFrames>>,
     /// The program counter of each thread a core's vCPU held when the core stopped, with the
     /// core, by the thread's id as the guest knows it (`core_loop`'s `Core::leave`).
     held: Mutex<BTreeMap<u64, (u8, u64)>>,

@@ -44,7 +44,7 @@ use std::time::Duration;
 use starquake_gpu::back::draw::WaitWhileCompiling;
 use starquake_render::{Backend, CompletionWake, RenderError, WhileCompiling};
 
-use crate::frames::FrameKeeper;
+use super::RunFrames;
 use crate::renderer::{MainThread, WindowTarget};
 
 /// Why a run's wgpu backend could not be opened on a build without it.
@@ -113,7 +113,7 @@ mod built {
     };
     use starquake_render_wgpu::{NewError, WgpuBackend, WgpuConfig};
 
-    use crate::frames::FrameKeeper;
+    use super::super::RunFrames;
 
     /// How a run opens the wgpu backend: `WgpuBackend::with_compile_pool` in a run, a stand-in
     /// that fails in the tests of what a run does when it cannot.
@@ -126,11 +126,12 @@ mod built {
         + Send
         + Sync;
 
-    /// The run's frame sink on the wgpu backend: the frame keeper, and the drain of the
-    /// backend's present feedback (module docs, "Present feedback").
+    /// The run's frame sink on the wgpu backend: the run's frames, which count each frame
+    /// handed over (the parent module's "At the end"), and the drain of the backend's present
+    /// feedback (module docs, "Present feedback").
     #[derive(Debug)]
     pub(crate) struct RunSink {
-        pub(crate) keeper: Arc<FrameKeeper>,
+        pub(crate) keeper: Arc<RunFrames>,
         pub(crate) backend: Weak<WgpuBackend>,
     }
 
@@ -148,7 +149,7 @@ mod built {
         open: &Open,
         wake: CompletionWake,
         setting: WhileCompiling,
-        keeper: &Arc<FrameKeeper>,
+        keeper: &Arc<RunFrames>,
     ) -> Result<Arc<WgpuBackend>, String> {
         let pool = crate::compile_pool::CompileWorkers::for_host()
             .map_err(|error| format!("the compile pool could not be started: {error}"))?;
@@ -198,7 +199,7 @@ impl WgpuOpener {
         &self,
         wake: CompletionWake,
         setting: WaitWhileCompiling,
-        keeper: &Arc<FrameKeeper>,
+        keeper: &Arc<RunFrames>,
         window: Option<&WindowTarget>,
         present_wait: Duration,
     ) -> Result<Arc<dyn Backend>, Unopened> {
@@ -221,7 +222,7 @@ impl WgpuOpener {
         &self,
         _wake: CompletionWake,
         _setting: WaitWhileCompiling,
-        _keeper: &Arc<FrameKeeper>,
+        _keeper: &Arc<RunFrames>,
         _window: Option<&WindowTarget>,
         _present_wait: Duration,
     ) -> Result<Arc<dyn Backend>, Unopened> {

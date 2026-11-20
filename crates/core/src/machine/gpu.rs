@@ -32,7 +32,9 @@
 //!   render crate's `recording` module docs).
 //! - **Frame dumps**: the GPU is asked to dump every present
 //!   ([`FrameDumps::Every`] in `GpuConfig::exec`, the setting through which `core` asks for
-//!   dumps), and the backend hands them to the run's [`FrameKeeper`] (`crate::frames`).
+//!   dumps), and the backend hands them to the run's [`RunFrames`]: its frame keeper
+//!   ([`FrameKeeper`], `crate::frames`) and a count of the frames handed over, which [`finish`]
+//!   compares with the GPU's presents ("At the end").
 //! - **The shader cache** behind G18's seam is [`NoShaders`] until shader-pipeline slice 19
 //!   builds the real one: every lookup is pending and never finishes, so every draw and
 //!   dispatch is skipped and counted (the draw path's `ShaderPending` skip).
@@ -67,12 +69,14 @@
 //!
 //! A run whose setup chose the wgpu backend opens it through [`WgpuOpener`] (the
 //! `wgpu_backend` module: the shared compile pool, the GPU crate's wait setting and the ring's
-//! completion wake at construction, the frame keeper as its frame sink, and the window as its
+//! completion wake at construction, the run's frames as its frame sink, and the window as its
 //! present target, made on the frontend's main thread). Its other parts are the recording
 //! backend's: the same frame dumps, shader cache, guest memory, write watch, clocks and
 //! settings. When it cannot be opened, the choice says what happens
-//! ([`crate::renderer::IfUnavailable`]): the run renders with the recording backend instead and
-//! logs [`FELL_BACK`] at warning level, with the reason, or the run ends as an emulator error
+//! ([`crate::renderer::IfUnavailable`]): the run renders with the recording backend instead,
+//! dumping into the same run's frames
+//! (`a_run_that_falls_back_to_the_recording_backend_dumps_into_its_own_frames`, in
+//! `hle/tests/graphics/present.rs`), and logs [`FELL_BACK`] at warning level, with the reason, or the run ends as an emulator error
 //! with [`WGPU_UNAVAILABLE`] and the reason (both pinned by
 //! `an_unavailable_wgpu_backend_falls_back_or_ends_the_run_as_chosen`, in `gpu/tests.rs`). A
 //! window that cannot be presented into ([`Unopened::Window`]) always ends the run, with the
@@ -104,11 +108,26 @@
 //! # At the end
 //!
 //! Once every core and the timer thread have stopped, [`finish`] waits for the GPU to be idle
-//! ([`Gpu::is_idle`]), at most [`GPU_DRAIN_WAIT`], so that the presents handed to it before the
-//! end reach the frame keeper; a GPU still busy then is logged at warning level and stopped all
-//! the same, and what it had not done is not in the dumps. It then stops the GPU
+//! ([`Gpu::is_idle`]), so that the GPU records the presents handed to it before the end; a GPU
+//! still busy at [`GPU_DRAIN_WAIT`] is logged at warning level and stopped all the same, and
+//! what it had not done is not in the dumps. An idle GPU is not yet enough for the frame
+//! keeper: the wgpu backend's render thread stores a list's completion and calls the completion
+//! wake before it hands that list's frame to the run's sink (render-wgpu's `backend` module
+//! docs, "Fences and the completion wake"), so the GPU can be idle while the last frame is still
+//! on its way. The recording backend hands its frames over inside `submit`, before the GPU's back
+//! thread goes on. So, once the GPU is idle, `finish` also waits until the run's frames
+//! ([`RunFrames`]) have been handed a frame for every present the GPU recorded
+//! (`GpuCounters::presents`; every present is dumped, [`FrameDumps::Every`]), within the same
+//! [`GPU_DRAIN_WAIT`] counted from the start of the drain. A frame still missing then (a
+//! readback the backend could not finish, for one) is logged at warning level as
+//! [`FRAMES_MISSING`], with the frames received and the presents, and is not in the dumps; the
+//! run ends all the same. Both are pinned with a backend double that hands its frame over after
+//! the GPU is idle: `finishing_waits_for_a_frame_handed_over_after_the_gpu_is_idle` and
+//! `a_frame_that_never_comes_is_logged_and_left_out`, in `hle/tests/graphics/present.rs`. A GPU
+//! still busy at the end is not waited for again: its warning says the dumps may be short. It
+//! then stops the GPU
 //! ([`Gpu::stop`]) and reads its counters ([`Gpu::counters`], `summary.json`'s `gpu`), its
-//! flight recorder ([`Gpu::flight_recorder`], `gpu.txt`) and the frame keeper. A GPU thread that
+//! flight recorder ([`Gpu::flight_recorder`], `gpu.txt`) and the run's frames. A GPU thread that
 //! failed makes a run that otherwise reached its stop condition an emulator error
 //! ([`GPU_FAILED`]); a crash, a timeout or an emulator error keeps its own reason, which matters
 //! more, and the failure is logged (`after_stop`, tested for every ending with and without a
@@ -123,14 +142,16 @@
 //! (`every_ending_keeps_the_gpu_report_and_the_kept_frames` and
 //! `a_crashed_or_timed_out_run_keeps_its_graphics_report`, in `machine/tests/graphics/frames.rs`).
 //!
-//! **No test pins the wait itself.** Removing it leaves every test here passing: whether the
-//! GPU's front has read a request by the time it is stopped (which drops what it has not read,
-//! `starquake_gpu::wiring`, "Shutdown") depends on host timing, and in the tests' runs the last
-//! present is handed long enough before the end that the front has always read it. The warning
-//! for a GPU still busy is not pinned either: no test can make the GPU stay busy for
-//! [`GPU_DRAIN_WAIT`] without a backend that never completes, which the run does not build.
+//! **No test pins the wait for the GPU to be idle** (the wait for the frames, above, is pinned).
+//! Removing it leaves every test here passing: whether the GPU's front has read a request by the
+//! time it is stopped (which drops what it has not read, `starquake_gpu::wiring`, "Shutdown")
+//! depends on host timing, and in the tests' runs the last present is handed long enough before
+//! the end that the front has always read it. The warning for a GPU still busy is not pinned
+//! either: no test can make the GPU stay busy for [`GPU_DRAIN_WAIT`] without a backend that never
+//! completes, which the run does not build.
 
 use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -144,13 +165,14 @@ use starquake_kernel::time::gpu_ticks_at;
 use starquake_memory::{GuestMemory, PageRange, WriteWatch};
 use starquake_render::caps::{DynamicState, StageSupport};
 use starquake_render::{
-    Backend, Caps, Features, FormatFeatures, FormatTable, Limits, RecordingBackend, SampleCounts,
+    Backend, Caps, Features, FormatFeatures, FormatTable, Frame, FrameSink, Limits,
+    RecordingBackend, SampleCounts,
 };
 use starquake_shader::lookup::{EngineState, ProgramMemory, ProgramRequest, Ticket, VariantKey};
 use starquake_trace::HostClock;
 
 use super::Ending;
-use crate::frames::FrameKeeper;
+use crate::frames::{DumpedFrames, FrameKeeper};
 use crate::hle::Graphics;
 use crate::hle::graphics::{FrontMode, GpuParts};
 use crate::renderer::{Choice, IfUnavailable, PRESENT_TARGET_WAIT, RenderSetup};
@@ -181,6 +203,12 @@ pub(crate) const GPU_DRAIN_WAIT: Duration = IDLE_POLL_WAIT.saturating_mul(100);
 
 /// How long [`finish`] sleeps between two looks at the GPU's idleness.
 const DRAIN_LOOK: Duration = Duration::from_millis(1);
+
+/// What [`finish`] logs at warning level, with the counts, when the render backend has not
+/// handed over a frame for every present the GPU recorded within [`GPU_DRAIN_WAIT`] (module
+/// docs, "At the end").
+pub(crate) const FRAMES_MISSING: &str = "the render backend had not handed over a frame for \
+     every present when the run ended; the missing frames are not in the frame dumps";
 
 /// How a run ends when a GPU thread ended during it (module docs, "During the run"), before
 /// the thread's error.
@@ -237,6 +265,40 @@ pub(crate) fn recording_caps() -> Caps {
         sample_counts: SampleCounts::X1.union(SampleCounts::X4),
         view_swizzle: true,
         formats: FormatTable::uniform(FormatFeatures::ALL),
+    }
+}
+
+/// The run's frame dumps as its render backend hands them over (module docs, "The GPU's parts"
+/// and "At the end"): the frame keeper, and how many frames it has been handed, which [`finish`]
+/// compares with the GPU's presents before it reads the keeper. Both backends hand their frames
+/// here: the recording backend directly, the wgpu backend through its run sink
+/// (`wgpu_backend`'s `RunSink`).
+#[derive(Debug, Default)]
+pub(crate) struct RunFrames {
+    keeper: FrameKeeper,
+    /// Frames handed over, each counted once the keeper has it.
+    received: AtomicU64,
+}
+
+impl RunFrames {
+    /// The frames handed over so far.
+    pub(crate) fn received(&self) -> u64 {
+        self.received.load(Ordering::Acquire)
+    }
+
+    /// What the keeper holds ([`FrameKeeper::take`]); the keeper is left empty.
+    #[must_use]
+    pub(crate) fn take(&self) -> DumpedFrames {
+        self.keeper.take()
+    }
+}
+
+impl FrameSink for RunFrames {
+    /// Keeps `frame`, then counts it: a count that [`RunFrames::received`] shows is a frame
+    /// already in the keeper.
+    fn frame(&self, frame: Frame) {
+        self.keeper.frame(frame);
+        self.received.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -321,7 +383,7 @@ pub(crate) fn gpu_config() -> GpuConfig {
 }
 
 /// A run's graphics server (module docs, "Which front"), rung through `wake`, handing its front
-/// no more than `frame_limit` frames, and the frame keeper its GPU dumps into when it has one.
+/// no more than `frame_limit` frames, and the frames its GPU dumps into when it has one.
 /// A GPU's release timestamps read `clock`, a copy of the run's clock, as guest time (module
 /// docs, "The GPU's clocks"). The error is the words the run ends with when the GPU's threads
 /// cannot be started. Always the recording backend: a run builds its graphics server with
@@ -333,13 +395,13 @@ pub(crate) fn graphics<C: HostClock + 'static>(
     frame_limit: Option<NonZeroU64>,
     wake: Arc<dyn Wake>,
     clock: C,
-) -> Result<(Graphics, Option<Arc<FrameKeeper>>), String> {
+) -> Result<(Graphics, Option<Arc<RunFrames>>), String> {
     let (graphics, gpu) = graphics_and_backend(environment, memory, frame_limit, wake, clock)?;
     Ok((graphics, gpu.map(|(keeper, _)| keeper)))
 }
 
-/// The frame keeper a run's GPU dumps into, and the render backend it was built over.
-pub(crate) type KeeperAndBackend = (Arc<FrameKeeper>, Arc<RecordingBackend>);
+/// The frames a run's GPU dumps into, and the render backend it was built over.
+pub(crate) type KeeperAndBackend = (Arc<RunFrames>, Arc<RecordingBackend>);
 
 /// [`graphics`], with the render backend the GPU was built over when it has one, so that a test
 /// can look at what the backend holds (module docs, "The GPU's parts").
@@ -360,7 +422,7 @@ pub(crate) fn graphics_and_backend<C: HostClock + 'static>(
         return Ok((graphics, None));
     };
     let ring = standard_ring()?;
-    let keeper = Arc::new(FrameKeeper::default());
+    let keeper = Arc::new(RunFrames::default());
     let backend = recording_backend(&ring, &keeper);
     let dyn_backend: Arc<dyn Backend> = Arc::<RecordingBackend>::clone(&backend);
     let graphics = start_gpu(ring, dyn_backend, memory, (wake, frame_limit, clock))?;
@@ -374,13 +436,13 @@ fn standard_ring() -> Result<GpuRing, String> {
 
 /// The run's recording backend (module docs, "The GPU's parts"), built with `ring`'s completion
 /// wake and dumping into `keeper`.
-fn recording_backend(ring: &GpuRing, keeper: &Arc<FrameKeeper>) -> Arc<RecordingBackend> {
+fn recording_backend(ring: &GpuRing, keeper: &Arc<RunFrames>) -> Arc<RecordingBackend> {
     let backend = Arc::new(RecordingBackend::without_call_log(
         recording_caps(),
         RECORDING_MEMORY,
         ring.completion_wake(),
     ));
-    backend.set_frame_sink(Some(Arc::<FrameKeeper>::clone(keeper)));
+    backend.set_frame_sink(Some(Arc::<RunFrames>::clone(keeper)));
     backend
 }
 
@@ -407,9 +469,27 @@ fn start_gpu<C: HostClock + 'static>(
         .with_frame_limit(frame_limit))
 }
 
-/// The frame keeper a run's GPU dumps into, and the render backend it was built over, as the
-/// GPU takes it.
-pub(crate) type KeeperAndDynBackend = (Arc<FrameKeeper>, Arc<dyn Backend>);
+/// A run's GPU over the recording backend (module docs, "The GPU's parts"), whose frames go to
+/// the sink `sink` makes of the run's frames instead of to the frames themselves: for the tests
+/// of a backend that hands its frames over late ("At the end"). The GPU, rung through `wake`,
+/// its release timestamps read from `clock`, and the run's frames.
+#[cfg(test)]
+pub(crate) fn graphics_with_sink<C: HostClock + 'static>(
+    memory: &Arc<dyn GuestMemory>,
+    (wake, clock): (Arc<dyn Wake>, C),
+    sink: impl FnOnce(Arc<RunFrames>) -> Arc<dyn FrameSink>,
+) -> Result<(Graphics, Arc<RunFrames>), String> {
+    let ring = standard_ring()?;
+    let frames = Arc::new(RunFrames::default());
+    let backend = recording_backend(&ring, &frames);
+    backend.set_frame_sink(Some(sink(Arc::clone(&frames))));
+    let graphics = start_gpu(ring, backend, memory, (wake, None, clock))?;
+    Ok((graphics, frames))
+}
+
+/// The frames a run's GPU dumps into, and the render backend it was built over, as the GPU
+/// takes it.
+pub(crate) type KeeperAndDynBackend = (Arc<RunFrames>, Arc<dyn Backend>);
 
 /// [`graphics`], with the render backend `render` chose (module docs, "The GPU's parts" and "The
 /// wgpu backend"): what `Machine::start` builds.
@@ -418,7 +498,7 @@ pub(crate) fn graphics_rendering<C: HostClock + 'static>(
     memory: Option<&Arc<dyn GuestMemory>>,
     (frame_limit, wake, clock): (Option<NonZeroU64>, Arc<dyn Wake>, C),
     render: &RenderSetup,
-) -> Result<(Graphics, Option<Arc<FrameKeeper>>), String> {
+) -> Result<(Graphics, Option<Arc<RunFrames>>), String> {
     let (graphics, built) = graphics_opening(
         environment,
         memory,
@@ -460,7 +540,7 @@ pub(crate) fn graphics_opening<C: HostClock + 'static>(
         return Ok((graphics, None));
     };
     let ring = standard_ring()?;
-    let keeper = Arc::new(FrameKeeper::default());
+    let keeper = Arc::new(RunFrames::default());
     let attempt = opener.open(
         ring.completion_wake(),
         gpu_config().exec.setting,
@@ -518,11 +598,25 @@ fn after_stop(ending: Ending, stopped: &Result<(), WiringError>) -> Ending {
     }
 }
 
-/// Waits at most `wait` for `gpu` to be idle; whether it was.
-fn drain(gpu: &Gpu, wait: Duration) -> bool {
-    let started = Instant::now();
+/// Waits until `wait` has passed since `started` for `gpu` to be idle; whether it was.
+fn drain(gpu: &Gpu, started: Instant, wait: Duration) -> bool {
     loop {
         if gpu.is_idle() {
+            return true;
+        }
+        if started.elapsed() >= wait {
+            return false;
+        }
+        std::thread::sleep(DRAIN_LOOK);
+    }
+}
+
+/// Waits until `wait` has passed since `started` for `frames` to have been handed a frame for
+/// every present `gpu` recorded (module docs, "At the end"); whether they were. Each look reads
+/// the GPU's present count again.
+fn frames_arrive(gpu: &Gpu, frames: &RunFrames, started: Instant, wait: Duration) -> bool {
+    loop {
+        if frames.received() >= gpu.counters().presents {
             return true;
         }
         if started.elapsed() >= wait {
@@ -537,7 +631,7 @@ fn drain(gpu: &Gpu, wait: Duration) -> bool {
 /// run that reached its stop condition.
 pub(crate) fn finish(
     graphics: &Graphics,
-    keeper: Option<&FrameKeeper>,
+    keeper: Option<&RunFrames>,
     ending: &mut Ending,
 ) -> GraphicsReport {
     let mut report = GraphicsReport {
@@ -546,11 +640,22 @@ pub(crate) fn finish(
     };
     if let Some(gpu) = graphics.gpu() {
         // A GPU whose threads have ended is never idle again: there is nothing to wait for.
-        if gpu.is_running() && !drain(gpu, GPU_DRAIN_WAIT) {
-            tracing::warn!(
-                "the GPU was still busy when the run ended; what it had not done is not in the \
-                 frame dumps"
-            );
+        if gpu.is_running() {
+            let started = Instant::now();
+            if !drain(gpu, started, GPU_DRAIN_WAIT) {
+                tracing::warn!(
+                    "the GPU was still busy when the run ended; what it had not done is not in \
+                     the frame dumps"
+                );
+            } else if let Some(frames) = keeper
+                && !frames_arrive(gpu, frames, started, GPU_DRAIN_WAIT)
+            {
+                tracing::warn!(
+                    received = frames.received(),
+                    presents = gpu.counters().presents,
+                    "{FRAMES_MISSING}"
+                );
+            }
         }
         let stopped = gpu.stop();
         if let Err(error) = &stopped {
