@@ -5,20 +5,23 @@
 //! that stand for the console's RAM, split into Horizon's pools; "Sparse and lazy memory"), and
 //! `docs/specs/kernel.md`, "Address space" (pool accounting: what an application may use is its
 //! console's application pool). PROVISIONAL until the backing pools replace the one RAM region
-//! (`crate::space`): a run's guest RAM stands for the part of the application pool the program
-//! uses, sized from the program rather than the whole pool.
+//! (`crate::space`): a run's guest RAM stands for the program's application pool, as one region.
 //!
-//! # What is counted
+//! # How much RAM a run has
 //!
-//! [`GuestRam::for_program`] adds up what loading the program and starting its process back
-//! with RAM (`needed`), then gives it room to run:
-//!
-//! | Part | Bytes | Where it comes from |
-//! |---|---|---|
-//! | the program | `Layout::extent`: the counter trampolines and every module with its `.bss`, from the first page to the last | `crate::image`, "Placement" |
-//! | the main thread's stack | the description's stack size, rounded up to a page | `starquake_kernel::memory::AddressSpace::create_main_thread_stack` (Eden's `KProcess::Run`) |
-//! | the main thread's thread-local page | [`THREAD_LOCAL_RAM`], one page | `starquake_kernel::process::run` takes the thread's region from a new page (`ThreadLocalPages::reserve`) and writes it |
-//! | working RAM | [`WORKING_RAM`], or what the maximum leaves of it | a guess: see the constant |
+//! As the owner decided (decision log, 2026-11-19, "Owner rulings on the wave 44 and 45
+//! questions and the first title bring-up", ruling 13; execution model, "Sparse and lazy
+//! memory"): what the program may use, its console's application pool
+//! (`starquake_kernel::memory::MemoryArrangement::application_pool_size`, through
+//! `crate::image::memory_arrangement`: 3285 MiB for a Switch 1 program, 9809 MiB for a
+//! Switch 2 one), less the charge of its system resource (`available`; zero when the charge is
+//! more than the pool). [`GuestRam::for_program`] gives every program that fits all of it
+//! (`size`), whatever the program needs: RAM is reserved whole and backed lazily, so a run costs
+//! the host what the guest touches, not what it may map (the backend's host memory is an
+//! anonymous mapping the host commits a page at a time, `starquake_cpu::hvf`, "Guest-physical
+//! memory"; `crate::space` hands RAM out a page at a time, as pages are first touched). This
+//! replaces a fixed 16 MiB allowance on top of what loading needs, which the first retail title
+//! brought up used up about 0.4 s into its start-up.
 //!
 //! The process's system resource (`META` 0x14, `ProcessDescription::system_resource`) is counted
 //! against the pool but given no guest RAM. Eden makes it a `KSecureSystemResource` for the
@@ -26,46 +29,45 @@
 //! the code and the stack, and so does the kernel here
 //! (`starquake_kernel::memory::AddressSpace::with_system_resource`, which charges
 //! `SystemResource::required_secure_memory_size`: its size, or nothing in the applet pool). So
-//! the fit check takes that charge off the pool before comparing (`available` below), and
-//! working RAM is cut to what the pool leaves after it. Nothing is allocated from the
-//! resource: the translation tables live in the backend's own table pool, outside guest RAM
-//! (`starquake_cpu::hvf`, "Guest-physical memory"; the limit that pool sets is below). GPU-only
-//! memory is never guest memory (execution model, "Sparse and lazy memory").
+//! the charge comes off the pool, both for the fit check and for the RAM made. Nothing is
+//! allocated from the resource: the translation tables live in the backend's own table pool,
+//! outside guest RAM (`starquake_cpu::hvf`, "Guest-physical memory"; "The table pool", below).
+//! GPU-only memory is never guest memory (execution model, "Sparse and lazy memory").
 //!
-//! # The maximum and the fit check
-//!
-//! The maximum is the application pool of the console the program is built for
-//! (`starquake_kernel::memory::MemoryArrangement::application_pool_size`, through
-//! `crate::image::memory_arrangement`): 3285 MiB for a Switch 1 program, 9809 MiB for a
-//! Switch 2 one, less the system resource's charge (`available`; zero when the charge is more
-//! than the pool). A program whose `needed` is above it is [`Error::OutOfRam`], before a VM is
-//! made. A program that fits has RAM for every page loading writes (the trampolines and the
-//! modules' bytes, all inside the counted extent), so loading it does not run out of RAM (the
-//! tables that map them are another matter: "The table pool", below); a
-//! guest that touches more than its RAM once it runs still ends as an emulator error
-//! (`crate::space`).
-//!
-//! A program that fits gets `needed` plus [`WORKING_RAM`], or the maximum if that is less: a
-//! program that fits with no byte to spare loads, with no working RAM. The backend rounds the
-//! size up to its own pages (`starquake_cpu::hvf::RamConfig::at_least`, 16 KiB), which never
-//! passes the pool: both pool sizes are whole 16 KiB pages
+//! The backend rounds the size up to its own pages (`starquake_cpu::hvf::RamConfig::at_least`,
+//! 16 KiB), which never passes the pool: both pool sizes are whole 16 KiB pages
 //! (`both_maximums_are_whole_host_pages`). It can pass `available` by less than 16 KiB only
 //! for a charge that is not whole 16 KiB pages, which no metadata Horizon's loader takes has
 //! (its sizes are whole 2 MiB blocks, `crate::image::MEMORY_BLOCK_UNIT_SIZE`).
 //!
-//! # The table pool: a second limit, not counted
+//! # What is counted, and the fit check
 //!
-//! Guest RAM is not the only memory a program's pages need. The backend maps guest RAM through
+//! [`GuestRam::for_program`] adds up what loading the program and starting its process back
+//! with RAM (`needed`):
+//!
+//! | Part | Bytes | Where it comes from |
+//! |---|---|---|
+//! | the program | `Layout::extent`: the counter trampolines and every module with its `.bss`, from the first page to the last | `crate::image`, "Placement" |
+//! | the main thread's stack | the description's stack size, rounded up to a page | `starquake_kernel::memory::AddressSpace::create_main_thread_stack` (Eden's `KProcess::Run`) |
+//! | the main thread's thread-local page | [`THREAD_LOCAL_RAM`], one page | `starquake_kernel::process::run` takes the thread's region from a new page (`ThreadLocalPages::reserve`) and writes it |
+//!
+//! A program whose `needed` is above `available` is [`Error::OutOfRam`], before a VM is made.
+//! A program that fits has RAM for every page loading writes (the trampolines and the modules'
+//! bytes, all inside the counted extent), so loading it does not run out of RAM; a guest that
+//! touches more than its RAM once it runs (more pages than the pool, counting the ones loading
+//! wrote) still ends as an emulator error (`crate::space`).
+//!
+//! # The table pool
+//!
+//! Guest RAM is not the only memory a program's pages need: the backend maps it through
 //! translation tables taken from its own table pool (`starquake_cpu::hvf`, `TABLE_POOL_SIZE`),
-//! whose size is fixed (4 MiB, 1024 table pages; by its own doc, enough to map about 2 GiB of
-//! scattered 2 MiB windows) and is not sized with guest RAM, which can now be up to 3285 or
-//! 9809 MiB. The fit check does not count table pages. So a program that fits here, but whose
-//! loaded bytes or the pages it touches need more tables than the pool holds, fails when the
-//! tables run out, on the mapper's error rather than [`Error::OutOfRam`]: while loading, a
-//! module's bytes are written through the guest's mappings and that surfaces as a guest write
-//! fault (`LoadError::Write`), the failure this check exists to rule out; once running, as an
-//! emulator error. PROVISIONAL until the kernel sizes address spaces and the table pool with
-//! them.
+//! which the fit check does not count. That pool holds every table one address space can have
+//! at once (`starquake_memory::stage1::MAX_TABLE_PAGES`, a little over 1 GiB, backed lazily
+//! too), so it is sized with the address space, not with how scattered a program's pages are.
+//! A map is refused for want of a table only in the window that constant's docs name: while
+//! tables an unmapping freed wait for their flush, and the tables in use, the waiting ones and
+//! the ones the map needs come to more than every table of the space. Loading unmaps nothing,
+//! so it cannot run out of tables.
 //!
 //! # Divergence from Eden
 //!
@@ -101,25 +103,14 @@ use crate::image::{Layout, LoadError, memory_arrangement};
 /// and writes when it starts the process (see the module docs).
 pub const THREAD_LOCAL_RAM: u64 = PAGE_SIZE;
 
-/// Guest RAM a run gives a program beyond what loading and starting it back: room for what it
-/// maps and touches once it runs (its heap, more threads' stacks and thread-local pages, memory
-/// a service shares with it). The kernel specs reserve none of this up front: the heap is set
-/// at run time (`SetHeapSize`), and a libnx program asks for gigabytes of it and touches a few
-/// pages (`crate::space`).
-///
-/// Guess: 16 MiB, the fixed guest RAM every run had before RAM was sized from the program (the
-/// backend's default), within which the homebrew tests run. A program that touches more ends
-/// its run as an emulator error, naming the page that could not be backed. A trace of a
-/// retail title's start-up would show what it touches.
-pub const WORKING_RAM: u64 = 16 << 20;
-
 /// The guest RAM a run gives a program (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GuestRam {
     /// What loading the program and starting its process back: a whole number of pages, at
-    /// most the maximum.
+    /// most `size`.
     pub(crate) needed: u64,
-    /// The RAM to make: `needed` plus [`WORKING_RAM`], or the maximum if that is less.
+    /// The RAM to make: the program's application pool less its system resource's charge,
+    /// whatever `needed` is.
     pub(crate) size: u64,
 }
 
@@ -150,9 +141,11 @@ impl GuestRam {
         if needed > available {
             return Err(Error::OutOfRam { needed, available });
         }
-        // `needed` is at most `available`, so the room left cannot underflow.
-        let size = needed + WORKING_RAM.min(available - needed);
-        Ok(Self { needed, size })
+        // The whole of what the program may use, reserved and backed lazily (module docs).
+        Ok(Self {
+            needed,
+            size: available,
+        })
     }
 }
 
@@ -237,7 +230,7 @@ mod tests {
             ram(&counter),
             Ok(GuestRam {
                 needed,
-                size: needed + WORKING_RAM
+                size: nro_pool()
             })
         );
         // Without trampolines the program's pages start at its module.
@@ -337,34 +330,33 @@ mod tests {
             e.npdm.acid.layout = AcidLayout::Switch2;
         });
         assert_eq!(switch2.description().console, Console::Switch2);
+        // The Switch 2 program gets its own console's pool, all of it.
         assert_eq!(
             ram(&switch2),
             Ok(GuestRam {
                 needed,
-                size: needed + WORKING_RAM
+                size: twelve
             })
         );
-        assert!(needed + WORKING_RAM < twelve);
+        assert_ne!(four, twelve);
     }
 
     #[test]
-    fn working_ram_is_given_in_full_up_to_the_maximum_and_cut_at_it() {
+    fn the_ram_is_the_whole_pool_whatever_the_program_needs() {
+        // The pool as the console's memory arrangement gives it, written out: 3285 MiB for the
+        // console an NRO runs as (a Switch 1), from
+        // `starquake_kernel::memory::MemoryArrangement::application_pool_size`.
         let pool = nro_pool();
+        assert_eq!(pool, 3285 << 20);
         let base = ram(&nro(0)).unwrap().needed;
-        // `.bss` that leaves the pool `left` bytes past `needed`.
+        // `.bss` that leaves the pool `left` bytes past `needed`: from far more room than the
+        // 16 MiB allowance this replaced to none at all, the RAM made is the pool.
         let with_room = |left: u64| ram(&nro(u32::try_from(pool - base - left).unwrap())).unwrap();
-        // A page more room than working RAM: working RAM in full, a page short of the pool.
-        let roomy = with_room(WORKING_RAM + PAGE_SIZE);
-        assert_eq!(roomy.size, roomy.needed + WORKING_RAM);
-        assert_eq!(roomy.size, pool - PAGE_SIZE);
-        // Exactly working RAM's room: in full, and the whole pool.
-        let exact = with_room(WORKING_RAM);
-        assert_eq!(exact.size, exact.needed + WORKING_RAM);
-        assert_eq!(exact.size, pool);
-        // A page less: cut to the pool.
-        let short = with_room(WORKING_RAM - PAGE_SIZE);
-        assert_eq!(short.size, pool);
-        assert_eq!(short.size - short.needed, WORKING_RAM - PAGE_SIZE);
+        for left in [pool - base, 64 << 20, 16 << 20, PAGE_SIZE, 0] {
+            let ram = with_room(left);
+            assert_eq!(ram.needed, pool - left, "{left:#x}");
+            assert_eq!(ram.size, pool, "{left:#x}");
+        }
     }
 
     #[test]
@@ -474,23 +466,32 @@ mod tests {
     }
 
     #[test]
-    fn working_ram_is_cut_to_what_the_resource_leaves() {
-        // A resource that leaves the program exactly working RAM's room, then a page less.
+    fn the_ram_is_the_pool_less_the_resources_charge() {
+        // Resources of one 2 MiB block and of sixteen: the RAM made is the pool less each
+        // charge, with the same `needed`.
         let program = nro(0);
         let layout = place(&program, IMAGE_BASE, Some(RESCALE)).unwrap();
         let mut description = program.description().clone();
         let needed = GuestRam::for_program(&layout, &description).unwrap().needed;
         let pool = nro_pool();
-        let roomy = pool - needed - WORKING_RAM;
-        description.system_resource_size = u32::try_from(roomy).unwrap();
+        for blocks in [1, 16] {
+            description.system_resource_size = blocks * MEMORY_BLOCK_UNIT_SIZE;
+            let charge = description.system_resource().required_secure_memory_size();
+            assert_eq!(charge, u64::from(blocks * MEMORY_BLOCK_UNIT_SIZE));
+            assert_eq!(
+                GuestRam::for_program(&layout, &description),
+                Ok(GuestRam {
+                    needed,
+                    size: pool - charge
+                }),
+                "{blocks}"
+            );
+        }
+        // In the applet pool the resource charges nothing, and the RAM is the whole pool.
+        description.pool = Pool::Applet;
         assert_eq!(
-            GuestRam::for_program(&layout, &description).unwrap().size,
-            needed + WORKING_RAM
-        );
-        description.system_resource_size += u32::try_from(PAGE_SIZE).unwrap();
-        assert_eq!(
-            GuestRam::for_program(&layout, &description).unwrap().size,
-            needed + WORKING_RAM - PAGE_SIZE
+            GuestRam::for_program(&layout, &description),
+            Ok(GuestRam { needed, size: pool })
         );
     }
 
@@ -546,5 +547,98 @@ mod tests {
             let pool = arrangement.application_pool_size();
             assert_eq!(RamConfig::at_least(pool).unwrap().size(), pool);
         }
+    }
+
+    /// The guest RAM a run makes for `program`, as `crate::system::host::run` makes it, with
+    /// an address space over it; then touched far past the 16 MiB the old allowance gave,
+    /// filled to its last byte, and measured by the backing's own counter.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn touch_and_fill(program: &Program, pool: u64) {
+        use std::sync::PoisonError;
+
+        use starquake_cpu::hvf::{HvfBackend, PhysicalMemory, RamConfig};
+        use starquake_memory::{GuestMemory, Perms};
+
+        use crate::space::{AddressSpace, SpaceError};
+        use crate::system::host::ONE_VM;
+
+        let guest = ram(program).unwrap();
+        assert_eq!(guest.size, pool);
+        let _one_vm = ONE_VM.lock().unwrap_or_else(PoisonError::into_inner);
+        let backend =
+            HvfBackend::new(RamConfig::at_least(guest.size).unwrap()).expect("create the VM");
+        let physical = backend.physical();
+        let ram = backend.ram();
+        assert_eq!(ram.size(), pool);
+        // The whole pool, reserved: nothing of it costs the host yet.
+        assert_eq!(physical.ram_resident_bytes(), Ok(0));
+        let space =
+            AddressSpace::<PhysicalMemory>::new(physical.clone(), ram, backend.table_pool())
+                .unwrap();
+        // A 256 MiB mapping, a doubleword written every 16 MiB of it: sixteen pages backed, the
+        // first sixteen pages of RAM in the order they were touched, four host pages of 16 KiB.
+        let (va, size, step): (u64, u64, u64) = (0x10_0000_0000, 256 << 20, 16 << 20);
+        let every = || (va..va + size).step_by(usize::try_from(step).unwrap());
+        space.map(va, size, Perms::ReadWrite).unwrap();
+        for at in every() {
+            space.write(at, &at.to_le_bytes()).unwrap();
+        }
+        // The host's page (16 KiB on Apple Silicon), the smallest RAM a `RamConfig` holds.
+        let host_page = RamConfig::at_least(1).unwrap().size();
+        let touched = size / step * PAGE_SIZE;
+        assert_eq!(
+            physical.ram_resident_bytes(),
+            Ok(touched.div_ceil(host_page) * host_page)
+        );
+        for at in every() {
+            let mut back = [0; 8];
+            space.read(at, &mut back).unwrap();
+            assert_eq!(u64::from_le_bytes(back), at);
+        }
+        // The pool's edge: the rest of RAM is one run that ends exactly at the pool's size;
+        // a page more is refused with what is left, and handing out the rest costs nothing.
+        let rest = ram.size() - touched;
+        assert_eq!(
+            space.allocate_shared(rest + PAGE_SIZE),
+            Err(SpaceError::OutOfRam {
+                size: rest + PAGE_SIZE,
+                available: rest
+            })
+        );
+        let last = space.allocate_shared(rest).unwrap();
+        assert_eq!((last.base(), last.end()), (ram.base() + touched, ram.end()));
+        assert_eq!(
+            physical.ram_resident_bytes(),
+            Ok(touched.div_ceil(host_page) * host_page)
+        );
+        assert_eq!(
+            space.allocate_shared(PAGE_SIZE),
+            Err(SpaceError::OutOfRam {
+                size: PAGE_SIZE,
+                available: 0
+            })
+        );
+        // Its last byte is guest RAM's last byte: written, it costs one host page more.
+        physical.write(ram.end() - 1, &[0xee]).unwrap();
+        assert_eq!(
+            physical.ram_resident_bytes(),
+            Ok(touched.div_ceil(host_page) * host_page + host_page)
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn a_runs_guest_ram_is_its_whole_pool_and_costs_the_host_only_what_is_touched() {
+        if std::env::var_os("CI").is_some() {
+            return;
+        }
+        // An NRO, a Switch 1 program; and an ExeFS built for a Switch 2.
+        touch_and_fill(&nro(0), nro_pool());
+        let switch2 = exefs(|e| e.npdm.acid.layout = AcidLayout::Switch2);
+        assert_eq!(switch2.description().console, Console::Switch2);
+        touch_and_fill(
+            &switch2,
+            MemoryArrangement::TwelveGb.application_pool_size(),
+        );
     }
 }

@@ -46,6 +46,13 @@ fn image(t: &Stage1Tables<FlatMemory>) -> Vec<u8> {
     bytes
 }
 
+/// The first `n` pool pages of `memory`, raw.
+fn image_of(memory: &impl GuestMemory, n: u64) -> Vec<u8> {
+    let mut bytes = vec![0; usize::try_from(pages(n)).unwrap()];
+    memory.read(POOL_BASE, &mut bytes).unwrap();
+    bytes
+}
+
 fn put(t: &Stage1Tables<FlatMemory>, at: u64, value: u64) {
     t.memory().write(at, &value.to_le_bytes()).unwrap();
 }
@@ -782,13 +789,31 @@ fn a_write_fault_part_way_through_protect_still_records_the_flush() {
 
 #[test]
 fn new_checks_the_pool() {
-    // The memory covers two of the pool's three pages: the first refused page is reported.
+    // The memory covers two of the pool's three pages. `new` zeroes only the root, so it
+    // succeeds; the first map that needs the third page reports it, and writes nothing.
     let memory = FlatMemory::new(POOL_BASE, usize::try_from(pages(2)).unwrap());
+    let short = Stage1Tables::new(memory, backing(POOL_BASE, 3)).unwrap();
+    let before = image_of(short.memory(), 2);
     assert_eq!(
-        Stage1Tables::new(memory, backing(POOL_BASE, 3)).map(|_| ()),
+        short.map(0, backing(0x10_0000, 1), Perms::Read),
         Err(MapError::Memory(Fault {
             address: POOL_BASE + pages(2)
         }))
+    );
+    assert_eq!(image_of(short.memory(), 2), before);
+    assert_eq!(short.table_pages_in_use(), 1);
+    assert_eq!(
+        short.walk(0),
+        Err(WalkError::Unmapped {
+            va: 0,
+            level: START_LEVEL
+        })
+    );
+    // A memory that does not hold even the root fails `new`, at the root.
+    let none = FlatMemory::new(POOL_BASE + pages(1), usize::try_from(pages(1)).unwrap());
+    assert_eq!(
+        Stage1Tables::new(none, backing(POOL_BASE, 2)).map(|_| ()),
+        Err(MapError::Memory(Fault { address: POOL_BASE }))
     );
     // A pool ending exactly at the output address limit is fine; one page further is not.
     let top = OUTPUT_ADDRESS_END - PAGE_SIZE;
@@ -1061,4 +1086,190 @@ proptest! {
             check_against_model(&t, &model);
         }
     }
+}
+
+#[test]
+fn the_most_tables_the_space_can_hold_is_every_table_of_the_tree() {
+    // Arm DDI 0487, 4 KiB granule with a 39-bit space walked from level 1 (`T0SZ` = 25): one
+    // level-1 table of 512 entries, each naming a level-2 table of 512 entries, each naming a
+    // level-3 table.
+    assert_eq!(MAX_TABLE_PAGES, 1 + 512 + 512 * 512);
+    // The builder's own count agrees: mapping the whole space from empty tables needs every
+    // table but the root.
+    let t = tables(1);
+    let pool = t.lock();
+    assert_eq!(
+        t.tables_needed(&pool, t.root().pa(), START_LEVEL, 0, VA_SPACE_END),
+        Ok(MAX_TABLE_PAGES - 1)
+    );
+}
+
+/// A memory of `n` pool pages whose bytes are all `0xff`, as reused host memory may be.
+fn dirty_pool(n: u64) -> FlatMemory {
+    let len = usize::try_from(pages(n)).unwrap();
+    let memory = FlatMemory::new(POOL_BASE, len);
+    memory.write(POOL_BASE, &vec![0xff; len]).unwrap();
+    memory
+}
+
+/// Pool page `n` of `memory`, raw.
+fn pool_page(memory: &impl GuestMemory, n: u64) -> Vec<u8> {
+    let mut bytes = vec![0; usize::try_from(PAGE_SIZE).unwrap()];
+    memory.read(POOL_BASE + pages(n), &mut bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn a_pool_page_is_zeroed_only_when_a_table_first_needs_it() {
+    let dirty = vec![0xff_u8; usize::try_from(PAGE_SIZE).unwrap()];
+    let zero = vec![0_u8; usize::try_from(PAGE_SIZE).unwrap()];
+    // `new` zeroes the root and nothing else.
+    let t = Stage1Tables::new(dirty_pool(5), backing(POOL_BASE, 5)).unwrap();
+    assert_eq!(pool_page(t.memory(), 0), zero);
+    for n in 1..5 {
+        assert_eq!(pool_page(t.memory(), n), dirty, "page {n} after new");
+    }
+    // A mapping needs a level-2 and a level-3 table: pages 1 and 2, zeroed before they are
+    // linked, so the only valid descriptors in them are the ones the map wrote.
+    t.map(0, backing(0x10_0000, 1), Perms::Read).unwrap();
+    assert_eq!(t.walk(0).map(|r| r.pa), Ok(0x10_0000));
+    let unmapped = |va: u64, level: u8| Err(WalkError::Unmapped { va, level });
+    assert_eq!(
+        t.walk(PAGE_SIZE).map(|r| r.pa),
+        unmapped(PAGE_SIZE, LEAF_LEVEL)
+    );
+    let next_slot = va_of(0, 1, 0);
+    assert_eq!(t.walk(next_slot).map(|r| r.pa), unmapped(next_slot, 2));
+    let next_gib = va_of(1, 0, 0);
+    assert_eq!(
+        t.walk(next_gib).map(|r| r.pa),
+        unmapped(next_gib, START_LEVEL)
+    );
+    // Pages 3 and 4 are still as they were.
+    assert_eq!(pool_page(t.memory(), 3), dirty);
+    assert_eq!(pool_page(t.memory(), 4), dirty);
+    // The level-3 table, freed by an unmap and handed back by the flush, is reused as it was
+    // left (empty) for the next level-2 slot, and page 3 stays as it was; a new level-1 slot
+    // then takes pages 3 and 4, zeroed first.
+    t.unmap(0, PAGE_SIZE).unwrap();
+    t.take_pending_flushes();
+    t.map(next_slot, backing(0x20_0000, 1), Perms::Read)
+        .unwrap();
+    assert_eq!(t.table_pages_in_use(), 3);
+    assert_eq!(pool_page(t.memory(), 3), dirty);
+    t.map(next_gib, backing(0x30_0000, 1), Perms::Read).unwrap();
+    assert_eq!(t.table_pages_in_use(), 5);
+    assert_eq!(t.walk(next_slot).map(|r| r.pa), Ok(0x20_0000));
+    assert_eq!(t.walk(next_gib).map(|r| r.pa), Ok(0x30_0000));
+    assert_eq!(
+        t.walk(next_gib + PAGE_SIZE).map(|r| r.pa),
+        unmapped(next_gib + PAGE_SIZE, LEAF_LEVEL)
+    );
+    assert_eq!(
+        t.walk(va_of(1, 1, 0)).map(|r| r.pa),
+        unmapped(va_of(1, 1, 0), 2)
+    );
+}
+
+#[test]
+fn a_fault_zeroing_a_new_table_page_writes_no_descriptor_and_the_next_map_succeeds() {
+    // A mapping across a level-2 boundary in empty tables needs three new tables (a level-2
+    // and two level-3s): pages 1, 2 and 3, all zeroed before any descriptor is written.
+    let memory = FaultingMemory {
+        inner: dirty_pool(4),
+        writes_left: std::sync::atomic::AtomicU64::new(u64::MAX),
+    };
+    let t = Stage1Tables::new(memory, backing(POOL_BASE, 4)).unwrap();
+    let root_before = pool_page(t.memory(), 0);
+    let edge = va_of(0, 1, 0) - PAGE_SIZE;
+    // Two writes succeed: the third page's zeroing is refused.
+    t.memory().fail_after(2);
+    assert_eq!(
+        t.map(edge, backing(0x10_0000, 2), Perms::Read),
+        Err(MapError::Memory(Fault {
+            address: POOL_BASE + pages(3)
+        }))
+    );
+    assert_eq!(pool_page(t.memory(), 0), root_before);
+    assert_eq!(t.table_pages_in_use(), 1);
+    assert_eq!(t.take_pending_flushes(), []);
+    // With the memory working again the same map succeeds.
+    t.memory().fail_after(u64::MAX);
+    t.map(edge, backing(0x10_0000, 2), Perms::Read).unwrap();
+    assert_eq!(t.walk(edge).map(|r| r.pa), Ok(0x10_0000));
+    assert_eq!(t.walk(edge + PAGE_SIZE).map(|r| r.pa), Ok(0x10_1000));
+    assert_eq!(t.table_pages_in_use(), 4);
+    assert_eq!(
+        t.walk(edge - PAGE_SIZE).map(|r| r.pa),
+        Err(WalkError::Unmapped {
+            va: edge - PAGE_SIZE,
+            level: LEAF_LEVEL
+        })
+    );
+    // Every descriptor the map did not write is zero, in all four table pages, the one whose
+    // zeroing faulted included: one in the root (to the level-2 table), two in the level-2
+    // table (to the two level-3 tables) and one page descriptor in each level-3 table.
+    let written = 1 + 2 + 2;
+    let valid: usize = (0..4)
+        .map(|n| {
+            pool_page(t.memory(), n)
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .filter(|word| word.iter().any(|&byte| byte != 0))
+                .count()
+        })
+        .sum();
+    assert_eq!(valid, written);
+}
+
+#[test]
+fn allocate_zeroes_a_never_used_page_the_map_did_not_zero() {
+    // `map` zeroes the pages it counted before it writes; `allocate` alone must still never
+    // hand out a never-used page holding what the memory held before.
+    let dirty = vec![0xff_u8; usize::try_from(PAGE_SIZE).unwrap()];
+    let zero = vec![0_u8; usize::try_from(PAGE_SIZE).unwrap()];
+    let t = Stage1Tables::new(
+        FaultingMemory {
+            inner: dirty_pool(4),
+            writes_left: std::sync::atomic::AtomicU64::new(u64::MAX),
+        },
+        backing(POOL_BASE, 4),
+    )
+    .unwrap();
+    let mut pool = t.lock();
+    assert_eq!(
+        (pool.next, pool.zeroed),
+        (POOL_BASE + pages(1), POOL_BASE + pages(1))
+    );
+    // A fault zeroing the page takes nothing.
+    t.memory().fail_after(0);
+    assert_eq!(
+        t.allocate(&mut pool, 2),
+        Err(MapError::Memory(Fault {
+            address: POOL_BASE + pages(1)
+        }))
+    );
+    assert_eq!(
+        (pool.next, pool.zeroed),
+        (POOL_BASE + pages(1), POOL_BASE + pages(1))
+    );
+    assert_eq!(pool.tables.len(), 1);
+    t.memory().fail_after(u64::MAX);
+    // The page exactly at `zeroed` is zeroed, and `zeroed` moves past it.
+    assert_eq!(t.allocate(&mut pool, 2), Ok(POOL_BASE + pages(1)));
+    assert_eq!(
+        (pool.next, pool.zeroed),
+        (POOL_BASE + pages(2), POOL_BASE + pages(2))
+    );
+    assert_eq!(pool_page(t.memory(), 1), zero);
+    // A page below `zeroed` is taken as it is: `zero_new_pages` zeroed it already. Here it
+    // was dirtied after, so reading it back as dirty shows `allocate` did not write it again.
+    t.zero_new_pages(&mut pool, 2).unwrap();
+    assert_eq!(pool.zeroed, POOL_BASE + pages(4));
+    t.memory().write(POOL_BASE + pages(2), &dirty).unwrap();
+    assert_eq!(t.allocate(&mut pool, 3), Ok(POOL_BASE + pages(2)));
+    assert_eq!(pool_page(t.memory(), 2), dirty);
+    assert_eq!(pool.zeroed, POOL_BASE + pages(4));
+    assert_eq!(pool_page(t.memory(), 3), zero);
 }
