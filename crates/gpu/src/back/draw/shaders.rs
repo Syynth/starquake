@@ -45,7 +45,12 @@
 //!   `eden-pr4588/src/video_core/shader_environment.cpp`);
 //! - a texture handle is a header index in bits 19:0 and a sampler index in 31:20, or the whole
 //!   word for both when `SET_SAMPLER_BINDING` is `VIA_HEADER_BINDING` (Eden's `TexturePair`,
-//!   `eden/src/video_core/textures/texture.h`), and the header is the pool entry at that index.
+//!   `eden/src/video_core/textures/texture.h`), and the header is the pool entry at that index;
+//! - a texture kind carries the header's format bits whatever the question's usage: the shader
+//!   crate's exchange drops them from the answer to a sampled-only question
+//!   (`TextureKind::for_usage`; owner's ruling 7 of 2026-11-19), so a format change that keeps
+//!   the kind does not change a sampled answer
+//!   (`tests::a_format_change_keeps_a_sampled_answer_through_engine_state`).
 //!
 //! Where it differs from Eden, each pinned by the test named:
 //!
@@ -66,8 +71,41 @@
 //! set (`tests::every_emulation_flag_reaches_the_key_field_it_mirrors`, and through a whole
 //! draw `tests::every_emulation_flag_reaches_the_key_through_a_draw`). The compute fields are
 //! zero for a draw.
-//! [`VariantKey::next_stage_reads`] stays empty: slice 9 leaves it to the side that has
-//! translated the fragment program (an owner question in `starquake_shader::variant`).
+//!
+//! # The previous stage's stores
+//!
+//! Each stage that follows another is specialised on what the stage before it stores
+//! ([`VariantKey::previous_stage_stores`]; shader-pipeline, "Pipeline-state specialisation";
+//! decided by the owner, 2026-11-19, ruling 8), as Eden's `MakeRuntimeInfo` sets
+//! `previous_stage_stores = previous_program->info.stores`
+//! (`eden/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp` @ cf654052). What a stage
+//! stores is a fact of its program's translation, not of a register, so the draw path learns it
+//! from a ready set: [`stored_words`] reads a translated shader's outputs, and
+//! [`previous_stage_stores`] gives each following stage of the requests the stores of the
+//! request before it. Like the swizzles below, the draw path looks a set up first with the
+//! stores the previous answer for the same requests gave (none for a set never seen), and once
+//! more when the ready set's differ (`tests::the_previous_stages_stores_reach_the_key`).
+//!
+//! Where this differs from Eden, each pinned by the test named:
+//!
+//! - **Whole slots, not components.** A shader's outputs name a whole slot (the position, a
+//!   generic), so every word of a stored slot is in the mask, where Eden's `info.stores` has the
+//!   components the program writes. Eden's SPIR-V backend reads the mask a slot at a time
+//!   (`previous_stage_stores.Generic(index)`,
+//!   `eden/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp` @ cf654052), so the key
+//!   loses nothing it uses; its GLSL backend reads it a component at a time
+//!   (`Generic(index, element)`, `backend/glsl/emit_glsl_context_get_set.cpp`).
+//!   `tests::stored_words_are_whole_slots`.
+//! - **A previous stage with no shader in the set stores nothing.** The set's shaders are a
+//!   vertex and a pixel shader ([`starquake_shader::host::HostStage`] has no tessellation or
+//!   geometry stage yet), so a following stage whose previous request is a tessellation or
+//!   geometry stage gets the empty mask. A **guess** until those stages are translated.
+//!   `tests::previous_stage_stores_follow_the_request_order`.
+//! - **Learned from a first lookup's ready set only**, as the swizzles are: a set first given
+//!   by a wait is drawn with the stores its key carried (none for a set never seen; Eden's
+//!   SPIR-V backend declares no generic input the previous stage does not store), and the next
+//!   draw looks it up with the learned ones.
+//!   `tests::stores_are_not_learned_from_a_waited_set`.
 //!
 //! The flipped viewport ([`viewport_flip`], [`constants_flip`]): the backend's `emulation()`
 //! reads how the first viewport handed to it flips, and sets `FLIPPED_VIEWPORT` when the host
@@ -101,16 +139,19 @@ use starquake_render::shader::{
 use starquake_render::{Backend, FenceValue, PixelFormat, ResourceId, ShaderId};
 use starquake_shader::exchange::{SampledType, TextureFormat, TextureKind};
 use starquake_shader::host::{
-    HostCode, HostShader, HostStage, Requirements, SlotBinding, SlotType,
+    GuestSlot, HostCode, HostShader, HostStage, InterfaceSlot, Requirements, SlotBinding, SlotType,
 };
+use starquake_shader::ir::{ATTRIBUTE_COMPONENTS, GENERIC_0_X, POSITION_X};
 use starquake_shader::lookup::{
     EngineState, GuestStage, ProgramMemory, ProgramRequest, Rejection, ShaderSet, Ticket, Unmapped,
     VariantKey,
 };
+use starquake_shader::lower::GENERICS;
 use starquake_shader::translate::COLOR_TARGETS as SHADER_COLOR_TARGETS;
 use starquake_shader::variant::{
-    AttributeType, ColorType, CompareFunction as KeyCompare, EmulationKey, Swizzle, SwizzleSource,
-    TextureSwizzles, VERTEX_ATTRIBUTES as KEY_ATTRIBUTES,
+    AttributeMask, AttributeType, ColorType, CompareFunction as KeyCompare, EmulationKey,
+    FollowingStage, PreviousStores, Swizzle, SwizzleSource, TextureSwizzles,
+    VERTEX_ATTRIBUTES as KEY_ATTRIBUTES,
 };
 
 use super::DrawError;
@@ -462,12 +503,55 @@ pub fn color_type(format: Option<PixelFormat>) -> ColorType {
     }
 }
 
+/// The attribute words a translated shader stores, from its outputs (module docs, "The previous
+/// stage's stores"): every word of the position (`POSITION_X` to `POSITION_W`) and of each
+/// generic `n` below [`GENERICS`] (`GENERIC_0_X + 4n` to `+ 3`). Colour targets and the lane id
+/// are not attribute words; a generic at or past [`GENERICS`] names none.
+pub fn stored_words(outputs: &[InterfaceSlot]) -> AttributeMask {
+    outputs.iter().fold(AttributeMask::EMPTY, |mask, slot| {
+        let first = match slot.guest {
+            GuestSlot::Position => Some(POSITION_X),
+            GuestSlot::Generic(n) if u16::from(n) < GENERICS => {
+                GENERIC_0_X.checked_add(u16::from(n).saturating_mul(ATTRIBUTE_COMPONENTS))
+            }
+            GuestSlot::Generic(_) | GuestSlot::RenderTarget(_) | GuestSlot::LaneId => None,
+        };
+        let Some(first) = first else {
+            return mask;
+        };
+        (0..ATTRIBUTE_COMPONENTS)
+            .filter_map(|component| u8::try_from(first.checked_add(component)?).ok())
+            .fold(mask, AttributeMask::with)
+    })
+}
+
+/// The previous stages' stores of `requests` (module docs, "The previous stage's stores"): each
+/// following stage gets `stores_of` the request before it, in request order (pipeline order),
+/// or the empty mask when that stage's stores are unknown. A stage not among the requests keeps
+/// the empty mask.
+pub fn previous_stage_stores(
+    requests: &[ProgramRequest],
+    stores_of: impl Fn(GuestStage) -> Option<AttributeMask>,
+) -> PreviousStores {
+    requests.iter().zip(requests.iter().skip(1)).fold(
+        PreviousStores::EMPTY,
+        |stores, (previous, request)| match FollowingStage::of(request.stage) {
+            Some(stage) => stores.with(
+                stage,
+                stores_of(previous.stage).unwrap_or(AttributeMask::EMPTY),
+            ),
+            None => stores,
+        },
+    )
+}
+
 /// The variant key of a draw (module docs, "The variant key").
 pub fn variant_key(
     attributes: &[AttributeType; KEY_ATTRIBUTES],
     targets: &[Option<PixelFormat>; GUEST_COLOR_TARGETS],
     dual_source_blend: bool,
     emulation: EmulationKey,
+    previous_stage_stores: PreviousStores,
     texture_swizzles: TextureSwizzles,
 ) -> VariantKey {
     let mut color_targets = [ColorType::Float; SHADER_COLOR_TARGETS];
@@ -478,7 +562,7 @@ pub fn variant_key(
         vertex_attributes: *attributes,
         color_targets,
         dual_source_blend,
-        next_stage_reads: starquake_shader::variant::AttributeMask::EMPTY,
+        previous_stage_stores,
         workgroup_size: [0; 3],
         shared_memory_size: 0,
         emulation,

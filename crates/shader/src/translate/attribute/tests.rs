@@ -16,10 +16,24 @@ use crate::sph::{Components, PixelIo};
 use crate::testing::{
     any_gpr, any_pred, any_pred_src, any_uniform_reg, any_unmodified_src, config,
 };
+use crate::translate::driver::translate_instrs;
 use crate::translate::{
     COLOR_TARGETS, ColorOutputs, GuestStage, REGISTER_LIMIT, Stage, TranslateError,
-    translate as translate_program, translate_with_header,
 };
+
+/// `program` through the translation driver, with no header.
+fn translate_program(stage: Stage, program: &[Instr]) -> Result<Function, TranslateError> {
+    translate_instrs(stage, None, program)
+}
+
+/// `program` through the translation driver, with the pixel program's `header`.
+fn translate_with_header(
+    stage: Stage,
+    header: &PixelIo,
+    program: &[Instr],
+) -> Result<Function, TranslateError> {
+    translate_instrs(stage, Some(header), program)
+}
 
 fn r(index: u8) -> Gpr {
     Gpr::new(index)

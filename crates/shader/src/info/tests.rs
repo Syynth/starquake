@@ -20,9 +20,7 @@ use crate::sph::encode::encode_bytes;
 use crate::sph::{
     Common, ComponentMask, HeaderError, PixelIo, SystemValuesAb, SystemValuesC, VtgIo, VtgStage,
 };
-use crate::translate::{
-    COLOR_TARGETS, COMPONENT_MASK, TranslateError, Unsupported, translate_with_header,
-};
+use crate::translate::{COLOR_TARGETS, COMPONENT_MASK, TranslateError, Unsupported};
 
 fn r(index: u8) -> Gpr {
     Gpr::new(index)
@@ -772,7 +770,7 @@ fn exit_ir(targets: [u8; COLOR_TARGETS], sample_mask: bool, depth: bool) -> Stri
         stage: GuestStage::Pixel,
         color_outputs: io.color_outputs(),
     };
-    translate_with_header(stage, &io, &[exit()])
+    crate::translate::driver::translate_instrs(stage, Some(&io), &[exit()])
         .expect("translates")
         .to_string()
 }

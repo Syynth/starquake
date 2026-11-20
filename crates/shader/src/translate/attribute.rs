@@ -63,13 +63,13 @@
 //! | What | Here | Reference | Pinned by |
 //! |---|---|---|---|
 //! | `IPA.OFFSET` (location 2), with its offset register | `InterpolateAtOffset` of the attribute at the register's bits, and of the position's W at the same offset for a perspective input (a guess, after NAK's `load_frag_w` at the same offset, `nak_nir_lower_fs_inputs.c`); the spec has the mode carried in the IR for the lowering ("Interpolation at an offset or a sample", the gap table) | Rejected: "native IPA sample location" (`Take(76, 2) <= 1`) and "native IPA offset register" | `tests::ipa_offset_is_carried_in_the_ir` |
-//! | `IPA` of a generic attribute without the header | Rejected, [`AttributeRejection::IpaNoHeader`] ([`super::translate`] takes no header; [`super::translate_with_header`] does) | Always has the header (`env.SPH()`) | `tests::ipa_of_a_generic_needs_the_header` |
+//! | `IPA` of a generic attribute without the header | Rejected, [`AttributeRejection::IpaNoHeader`] ([`super::translate_flow`] takes the header as an option) | Always has the header (`env.SPH()`) | `tests::ipa_of_a_generic_needs_the_header` |
 //! | `ISBERD`, `ISBEWR` | Rejected by name (decision 11) | Translated: `ISBERD` from global memory, an indexed input or the map; `ISBEWR` only as `.o.attr.32` | `tests::deferred_instructions_are_rejected_by_name` |
 //! | `AL2P` | Translated from Eden's Maxwell `AL2P`; the output bit is read and has no effect, as Eden reads none | No translator: rejected | `tests::al2p_adds_the_offset_register` |
 //! | `PIXLD` | `.MY_INDEX` translated from Eden's Maxwell `PIXLD` | No translator: rejected | `tests::pixld_my_index_reads_the_sample_id` |
 //! | `IPA`'s attribute address | Checked as `ALD` and `AST` check theirs, for one word: not word aligned, or starting at or past `0x400`, is [`Unsupported::AttributeAddress`]. The decoder's byte address (an 8-bit word number times four) cannot fail it; `OpIpa`'s public fields can | No check: the PR reads an 8-bit word number (`Take(64, 8)`), which cannot leave the attribute space | `tests::ipa_addresses_outside_the_attribute_space_are_rejected` |
 //! | `AL2P`'s address | Unsigned, the 10-bit SM70 field the decoder reads (NAK `sm70_encode.rs` @ 52238762, `impl SM70Op for OpAL2P`: `set_field(40..50, self.addr)`), so at most `0x3ff` and never negative | Eden's Maxwell `AL2P` reads an 11-bit signed field (`BitField<20, 11, s64> offset`) and adds it sign-extended (`Imm32(static_cast<u32>(al2p.offset.Value()))`); the PR has no `AL2P` | `tests::al2p_adds_the_offset_register` (address `0x3ff`) |
-//! | `S2UR` under a guard | The guard reads a uniform predicate (`GetUniformPred`), as the PR's `classify.h` says of `S2UR` ("its guard predicate is a uniform predicate"), and the uniform register selects on its old value | The same, through `UPred` and `Visitor::UR` | `super::tests::a_guard_on_each_pure_uniform_op_reads_a_uniform_predicate` |
+//! | `S2UR` under a guard | The guard reads a uniform predicate (`GetUniformPred`), as the PR's `classify.h` says of `S2UR` ("its guard predicate is a uniform predicate"), and the instruction is a conditional block (the translation driver's "Guards") | The guard read through `UPred`, and the uniform register selecting on its old value (`Visitor::UR`) | `super::driver::tests::a_guard_on_a_uniform_instruction_reads_a_uniform_predicate` |
 //! | `S2UR` | Writes the uniform register class (`SetUniformRegister`) | Writes the uniform register packed into Maxwell's register file (`native.h`, `UniformLayout`) | `tests::s2r_and_s2ur_read_each_special_register` |
 //!
 //! The port follows the PR's native translator (`ops_attr.cpp`, `ops_misc.cpp`), not its
@@ -91,10 +91,9 @@ use std::fmt::{self, Display, Formatter};
 use thiserror::Error;
 
 use super::{ATTRIBUTE_SPACE_END, Failure, Translator, Unsupported, imm32, register_run, require};
-use crate::decode::attribute::{AL2P_OPCODE, AST_OPCODE, PIXLD_OPCODE};
 use crate::decode::{
-    ALD_OPCODE, CS2R_OPCODE, Gpr, IPA_OPCODE, InterpFreq, InterpLoc, Op, OpAL2P, OpALd, OpASt,
-    OpCS2R, OpIpa, OpPixLd, OpS2R, PixVal, Pred, S2R_OPCODE, S2RDst, S2UR_OPCODE, SpecialReg,
+    Gpr, InterpFreq, InterpLoc, Op, OpAL2P, OpALd, OpASt, OpCS2R, OpIpa, OpPixLd, OpS2R, PixVal,
+    Pred, S2RDst, SpecialReg,
 };
 use crate::info::attribute;
 use crate::ir::{
@@ -261,31 +260,6 @@ fn generic_is_perspective(map: [PixelImap; 4]) -> bool {
         .find(|&imap| imap != PixelImap::Unused)
         .unwrap_or(PixelImap::Unused);
     matches!(first, PixelImap::Perspective | PixelImap::Unused)
-}
-
-/// The 12-bit opcode the decoder reads `op` from, for the operations of the group that
-/// [`translate`] translates (each constant is the decoder's, from NAK's encoder); `None` for the
-/// ones it rejects whatever their fields (`OUT`, `OUT.FINAL`, `ISBERD`, `ISBEWR`, `LDTRAM`) and
-/// for every other operation. The translator classifies a guard by it (`super`'s module docs,
-/// "Guards").
-pub(super) fn opcode(op: Op) -> Option<u16> {
-    Some(match op {
-        Op::ALd(_) => ALD_OPCODE,
-        Op::ASt(_) => AST_OPCODE,
-        Op::Ipa(_) => IPA_OPCODE,
-        Op::AL2P(_) => AL2P_OPCODE,
-        Op::S2R(OpS2R {
-            dst: S2RDst::Reg(_),
-            ..
-        }) => S2R_OPCODE,
-        Op::S2R(OpS2R {
-            dst: S2RDst::Uniform(_),
-            ..
-        }) => S2UR_OPCODE,
-        Op::CS2R(_) => CS2R_OPCODE,
-        Op::PixLd(_) => PIXLD_OPCODE,
-        _ => return None,
-    })
 }
 
 /// The group's translator: translates `op` when it is one of the group's, else `None`.

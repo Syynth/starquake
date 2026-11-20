@@ -21,9 +21,9 @@
 //!    (`tests::models::the_models_agree_on_structured_programs`) and on the synthetic programs
 //!    the walk's tests run under both (`tests::analysis`'s `accepted` and `refusal` helpers).
 //! 3. **Blocks**: each reachable leader starts a block that runs to the next leader or to a
-//!    control instruction; a guarded instruction that cannot be kept as a select, a `KILL`, a
-//!    guarded `CALL` and a conditional `EXIT` get their own block behind a test of their guard
-//!    (PR #4588's virtual blocks).
+//!    control instruction; a guarded instruction that is not pure (`classify.h`'s `pure`), a
+//!    `KILL`, a guarded `CALL` and a conditional `EXIT` get their own block behind a test of
+//!    their guard (PR #4588's virtual blocks).
 //! 4. **Inlining**: each `CALL` target is a function, inlined at every call site, so the
 //!    [`FlowGraph`] is one function. Recursion is refused ([`FlowError::Recursion`]), calls nest
 //!    at most [`MAX_INLINE_DEPTH`] deep and the inlined graph has at most [`MAX_FLOW_BLOCKS`]
@@ -56,10 +56,12 @@
 //! `BMOV` is a plain instruction). An instruction whose guard is `!PT` never runs and is
 //! skipped. When [`FlowBlock::guard_tested`] is set the block holds one instruction whose
 //! guard the graph has already tested, so the translator ignores that guard; any other
-//! guarded instruction in a block is a pure one (`classify.h`, `pure`). Its translator keeps
-//! the guard as a select, except for the float and conversion group, which
-//! [`crate::translate::float`] makes a conditional block of its own (spec, "Instruction
-//! translation"; that module's "Guards").
+//! guarded instruction in a block is a pure one (`classify.h`, `pure`) or one of the
+//! `OpKind::Nop` instructions above (`NOP`, `DEPBAR`, `BREAK`, `WARPSYNC` with an immediate),
+//! which write no IR. The translation driver makes a guarded pure one a conditional block of
+//! its own (spec, "Instruction translation", "Guards"; the owner's ruling of 2026-11-19, row
+//! 2), where PR #4588 keeps the guard as a select, and translates the others as they are
+//! ([`crate::translate::driver`]'s "Guards").
 //!
 //! A `KILL` gets a conditional block of its own that holds it and ends in [`BlockEnd::Kill`]:
 //! the discard is that end, not the instruction, as in PR #4588, where the block's end class
@@ -139,8 +141,10 @@ use std::ops::Range;
 use thiserror::Error;
 
 pub use analysis::{Analysis, analyze};
+pub(crate) use analysis::{is_never, opcode_of};
+#[cfg(test)]
+pub(crate) use classify::OpKind;
 pub(crate) use classify::{OpInfo, classify};
-pub(crate) use ir_build::read_pred;
 pub use ir_build::{BlockSource, IrBlocks};
 pub use jump_tables::{
     JumpTable, JumpTableQuestions, MAX_TABLE_ENTRIES, ResolvedTable, ResolvedTables,

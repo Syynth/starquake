@@ -125,7 +125,7 @@ fn a_late_result_for_a_settled_entry_changes_nothing() {
     let first = ready(rig.lookup(&[vertex(A)]));
     // A second result for the same stamp, as a duplicate post would bring.
     let settle = super::super::jobs::Settle::new(Arc::clone(&rig.cache.inbox), first[0].0);
-    settle.post(Err(no_exit()));
+    settle.post(Err(too_large()));
     let again = ready(rig.lookup(&[vertex(A)]));
     assert!(Arc::ptr_eq(&again[0].1, &first[0].1));
     assert_eq!(again[0].1.hash, hash);

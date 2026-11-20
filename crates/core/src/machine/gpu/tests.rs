@@ -497,3 +497,202 @@ fn the_gpu_s_copy_of_a_fixed_clock_starts_where_the_loop_s_copy_is() {
     // The copy is the GPU's own: reading it does not move the loop's copy.
     assert_eq!(run.host_now(), HostNanos(next));
 }
+
+/// The live memory a GPU is built over in the tests of the backend choice.
+fn choice_memory() -> Arc<dyn GuestMemory> {
+    Arc::new(FlatMemory::new(0x8000_0000, 0x1000))
+}
+
+/// [`graphics_opening`] for a live run over `memory`, with `render` and `opener`: whether it
+/// built a GPU, and the backend it built it over. The GPU is stopped before returning.
+fn opened(
+    memory: Option<&Arc<dyn GuestMemory>>,
+    render: &RenderSetup,
+    opener: &WgpuOpener,
+) -> Result<(bool, Option<Arc<dyn Backend>>), String> {
+    let (graphics, built) = graphics_opening(
+        &EnvSource::Live,
+        memory,
+        (None, Arc::new(NoWake), SystemClock::new()),
+        render,
+        opener,
+    )?;
+    let has_gpu = graphics.gpu().is_some();
+    assert_eq!(built.is_some(), has_gpu);
+    if let Some(gpu) = graphics.gpu() {
+        gpu.stop().unwrap();
+    }
+    Ok((has_gpu, built.map(|(_, backend)| backend)))
+}
+
+/// An opener that fails as a host with no GPU adapter does, and counts its calls.
+#[cfg(feature = "wgpu")]
+fn no_adapter(calls: &Arc<std::sync::atomic::AtomicUsize>) -> WgpuOpener {
+    let calls = Arc::clone(calls);
+    WgpuOpener::with(Box::new(move |_, _, _, _| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Err(starquake_render_wgpu::NewError::NoAdapter(
+            "none on the test's host".to_owned(),
+        ))
+    }))
+}
+
+/// The recording choice builds the recording backend and never asks for the wgpu backend.
+#[cfg(feature = "wgpu")]
+#[test]
+fn the_recording_choice_never_opens_the_wgpu_backend() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let memory = choice_memory();
+    let (gpu, backend) = opened(
+        Some(&memory),
+        &RenderSetup::recording(),
+        &no_adapter(&calls),
+    )
+    .unwrap();
+    assert!(gpu);
+    assert_eq!(*backend.unwrap().caps(), recording_caps());
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+/// A wgpu backend that cannot be opened: the default choice falls back to the recording backend
+/// and logs [`FELL_BACK`] with the reason at warning level; a choice that asked for it ends the
+/// run with [`WGPU_UNAVAILABLE`] and the reason (module docs, "The wgpu backend").
+#[cfg(feature = "wgpu")]
+#[test]
+fn an_unavailable_wgpu_backend_falls_back_or_ends_the_run_as_chosen() {
+    use crate::host_log::HostLog;
+    use crate::renderer::{Choice, IfUnavailable};
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let memory = choice_memory();
+    let opener = no_adapter(&calls);
+
+    let fallback = RenderSetup::headless(Choice::Wgpu(IfUnavailable::UseRecording));
+    let log = HostLog::new();
+    let built = tracing::subscriber::with_default(log.clone(), || {
+        opened(Some(&memory), &fallback, &opener)
+    });
+    let (gpu, backend) = built.unwrap();
+    assert!(gpu, "the run still has its GPU");
+    assert_eq!(
+        *backend.unwrap().caps(),
+        recording_caps(),
+        "over the recording backend"
+    );
+    let (lines, dropped) = log.take();
+    assert_eq!(dropped, 0);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("WARN"), "{lines:?}");
+    assert!(lines[0].contains(FELL_BACK), "{lines:?}");
+    assert!(
+        lines[0].contains("no GPU adapter on this host: none on the test's host"),
+        "{lines:?}"
+    );
+
+    let asked = RenderSetup::headless(Choice::Wgpu(IfUnavailable::EndRun));
+    let log = HostLog::new();
+    let ended =
+        tracing::subscriber::with_default(log.clone(), || opened(Some(&memory), &asked, &opener));
+    assert_eq!(
+        ended.err(),
+        Some(
+            "the wgpu backend could not be opened: no GPU adapter on this host: none on the \
+             test's host"
+                .to_owned()
+        )
+    );
+    assert_eq!(
+        log.take().0,
+        Vec::<String>::new(),
+        "nothing logged: the run ends"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+}
+
+/// A run with no GPU (no shared memory, or a replay) has the null front whatever it chose, and
+/// opens no backend.
+#[cfg(feature = "wgpu")]
+#[test]
+fn a_run_with_no_gpu_opens_no_wgpu_backend() {
+    use crate::renderer::{Choice, IfUnavailable};
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let opener = no_adapter(&calls);
+    let memory = choice_memory();
+    for if_unavailable in [IfUnavailable::UseRecording, IfUnavailable::EndRun] {
+        let render = RenderSetup::headless(Choice::Wgpu(if_unavailable));
+        assert!(matches!(opened(None, &render, &opener), Ok((false, None))));
+        let (graphics, built) = graphics_opening(
+            &EnvSource::Replay(Vec::new()),
+            Some(&memory),
+            (None, Arc::new(NoWake), SystemClock::new()),
+            &render,
+            &opener,
+        )
+        .unwrap();
+        assert!(graphics.gpu().is_none() && built.is_none());
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+/// On a build without the wgpu backend, a setup that chose it anyway (`RenderSetup::headless`;
+/// `choose_backend` never does) is told the build leaves it out.
+#[cfg(not(feature = "wgpu"))]
+#[test]
+fn a_build_without_the_wgpu_backend_cannot_open_it() {
+    use crate::renderer::{Choice, IfUnavailable};
+
+    let memory = choice_memory();
+    let asked = RenderSetup::headless(Choice::Wgpu(IfUnavailable::EndRun));
+    assert_eq!(
+        opened(Some(&memory), &asked, &WgpuOpener::host()).err(),
+        Some(
+            "the wgpu backend could not be opened: this build of starquake leaves the wgpu \
+             backend out"
+                .to_owned()
+        )
+    );
+    let fallback = RenderSetup::headless(Choice::Wgpu(IfUnavailable::UseRecording));
+    let (gpu, backend) = opened(Some(&memory), &fallback, &WgpuOpener::host()).unwrap();
+    assert!(gpu);
+    assert_eq!(*backend.unwrap().caps(), recording_caps());
+}
+
+/// The wiring end to end, through the production path (`System::run_rendering`, the hypervisor
+/// backend and `Machine::start`): a run whose setup has a window its main thread will not make
+/// ends with the window's words before the guest runs, and the same program with the recording
+/// setup runs to its end. A Mac test with a GPU: it skips itself only when `CI` is set, or, with
+/// a notice, where the host has no GPU adapter.
+#[cfg(all(feature = "wgpu", target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn a_run_renders_with_the_setup_it_is_given() {
+    use crate::machine::gpu::wgpu_backend::WINDOW_FAILED;
+    use crate::renderer::MainThreadGone;
+    use crate::renderer::tests::{Gone, no_window};
+    use crate::report::{ExitReason, RunOptions};
+
+    if std::env::var_os("CI").is_some() {
+        eprintln!("skipping a_run_renders_with_the_setup_it_is_given: it needs a VM and a GPU");
+        return;
+    }
+    let system = crate::System::new(&starquake_testkit::programs::hello().unwrap()).unwrap();
+    let options = RunOptions {
+        timeout: Some(Duration::from_secs(30)),
+        ..RunOptions::default()
+    };
+    let windowed = RenderSetup::windowed(no_window(64, 48, Arc::new(Gone)));
+    let report = system.run_rendering(&options, windowed);
+    let ExitReason::EmulatorError(message) = report.exit else {
+        unreachable!("the run went on: {:?}", report.exit);
+    };
+    if message.starts_with(&format!("{WGPU_UNAVAILABLE}: no GPU adapter on this host")) {
+        eprintln!("skipping a_run_renders_with_the_setup_it_is_given: {message}");
+        return;
+    }
+    assert_eq!(message, format!("{WINDOW_FAILED}: {MainThreadGone}"));
+    assert_eq!(report.guest_log.len(), 0, "the guest never ran");
+
+    let recorded = system.run_rendering(&options, RenderSetup::recording());
+    assert_eq!(recorded.exit, ExitReason::ProcessExited);
+    assert_ne!(recorded.guest_log.len(), 0);
+}

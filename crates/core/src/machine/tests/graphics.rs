@@ -831,6 +831,7 @@ fn on_a_machine(check: impl FnOnce(&Machine<'_, ScriptedVcpu, FixedClock>)) {
         }),
         recorder: Arc::new(Recorder::new()),
         gpu_memory: None,
+        render: crate::renderer::RenderSetup::recording(),
     };
     let env = session.environment();
     let (dispatcher, _) = boot(guest.address_space(), &guest.placed, space, &*env).unwrap();
