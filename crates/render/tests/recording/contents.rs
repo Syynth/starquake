@@ -6,7 +6,7 @@ use super::fixtures::{
     upload, view,
 };
 use starquake_render::command::{
-    BlitDesc, ClearDesc, ClearValue, CopyDesc, PresentDesc, PresentTransform,
+    ALL_STENCIL_BITS, BlitDesc, ClearDesc, ClearValue, CopyDesc, PresentDesc, PresentTransform,
 };
 use starquake_render::pipeline::ColorWrites;
 use starquake_render::resource::{
@@ -596,7 +596,7 @@ fn an_empty_mask_writes_nothing_even_in_a_format_not_modelled() {
     assert_eq!(read(&b, texel), bytes(vec![1, 2, 3, 4]));
     submit(&b, vec![masked(v, value, None, ColorWrites::RED, 0xff)]);
     assert_eq!(read(&b, texel), Readback::Unknown);
-    // A stencil value through an empty mask, likewise, on a two-aspect format.
+    // A stencil value through an empty stencil mask, likewise, on the one-aspect `S8_UINT`.
     let f = PixelFormat::S8Uint;
     let (t, v) = one(&b, f, (1, 1));
     let texel = region(t, 0, (0, 0, 0), (1, 1, 1));
@@ -608,6 +608,37 @@ fn an_empty_mask_writes_nothing_even_in_a_format_not_modelled() {
         ],
     );
     assert_eq!(read(&b, texel), bytes(vec![7]));
+}
+
+#[test]
+fn a_stencil_value_wider_than_the_format_through_an_empty_mask_writes_nothing() {
+    let b = backend();
+    let f = PixelFormat::S8Uint;
+    // One past the 8 stencil bits every stencil format stores (`ALL_STENCIL_BITS`): not exact
+    // when written, but an empty stencil mask writes no bit of it, so it is never encoded.
+    let wide = u32::from(ALL_STENCIL_BITS) + 1;
+    let (t, v) = one(&b, f, (1, 1));
+    let texel = region(t, 0, (0, 0, 0), (1, 1, 1));
+    submit(
+        &b,
+        vec![
+            upload(&[7], texel),
+            masked(v, ClearValue::Stencil(wide), None, ColorWrites::ALL, 0),
+        ],
+    );
+    assert_eq!(read(&b, texel), bytes(vec![7]));
+    // Through a mask that writes a bit, the same value makes the texel unknown.
+    submit(
+        &b,
+        vec![masked(
+            v,
+            ClearValue::Stencil(wide),
+            None,
+            ColorWrites::ALL,
+            1,
+        )],
+    );
+    assert_eq!(read(&b, texel), Readback::Unknown);
 }
 
 fn blit(

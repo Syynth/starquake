@@ -298,8 +298,9 @@ fn clear_op<'a>(state: &State, clear: &ClearDesc) -> Result<Op<'a>, RenderError>
 /// Whether a clear of a view of `format` writes nothing at all, whatever the format: an empty
 /// colour mask on a colour view. Such a clear leaves even a format this backend does not model
 /// as it was (`ClearDesc`'s masks). A stencil value through an empty stencil mask needs no case
-/// here: the one stencil format modelled ([`texel`]) takes it as a fill that writes no bit, and
-/// no byte of a two-aspect format is ever known.
+/// here: the one stencil format modelled ([`texel`]) takes it, whatever the value, as a fill
+/// that writes no bit (`texel::encode_masked_clear` skips the channel before checking the value),
+/// and no byte of a two-aspect format is ever known.
 fn writes_nothing(format: PixelFormat, clear: &ClearDesc) -> bool {
     matches!(
         clear.value,

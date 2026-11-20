@@ -172,8 +172,8 @@ pub(super) struct ClearTexel {
 /// into one texel of `format`, or `None` when a channel it writes is not exact on every device or
 /// the format is not modelled (module docs). A channel it does not write is neither encoded nor
 /// checked, so a masked-out channel's value does not matter. A colour channel is written whole
-/// when `color_mask` names it; a stencil channel through `stencil_mask`, bit by bit; a depth
-/// channel whole. A value whose kind does not suit the format gives `None`; the validation
+/// when `color_mask` names it; a stencil channel through `stencil_mask`, bit by bit (and not at
+/// all, so not checked, when the mask names none of its bits); a depth channel whole. A value whose kind does not suit the format gives `None`; the validation
 /// refuses those first.
 pub(super) fn encode_masked_clear(
     format: PixelFormat,
@@ -194,7 +194,15 @@ pub(super) fn encode_masked_clear(
                 }
                 max_unsigned(bits)
             }
-            (ClearValue::Stencil(_), _) => u64::from(stencil_mask) & max_unsigned(bits),
+            (ClearValue::Stencil(_), _) => {
+                // A stencil channel the mask writes no bit of is not encoded either, so a value
+                // too wide for it does not make the texel unknown.
+                let written = u64::from(stencil_mask) & max_unsigned(bits);
+                if written == 0 {
+                    continue;
+                }
+                written
+            }
             _ => max_unsigned(bits),
         };
         let encoded = match (value, numeric) {
