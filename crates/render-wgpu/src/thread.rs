@@ -74,7 +74,7 @@
 mod pass;
 
 use crate::backend::Shared;
-use crate::clear::{Area, ClearHow, Drawer};
+use crate::clear::{Area, ClearHow, Drawer, DrawnClear};
 use crate::convert::TextureSpec;
 use crate::draw::DrawLimits;
 use crate::draw::RewriteScratch;
@@ -876,23 +876,11 @@ impl Render {
         };
         let end = first.saturating_add(count);
         if let ClearHow::Draw(drawn) = &step.how {
-            if self.clears.is_none() {
-                self.clears = Drawer::new(&self.device);
-            }
-            let Some(drawer) = self.clears.as_mut() else {
-                self.shared.host_error(&"the clear shader did not parse");
-                return;
-            };
-            self.queue.write_buffer(drawer.params(), 0, &drawn.params);
-            let area = Area {
-                size: step.size,
-                rect: step.rect,
-            };
-            for z in first..end {
+            let targets = (first..end).map(|z| {
                 let (layer, slice) = if sliced { (0, Some(z)) } else { (z, None) };
-                let target = view(texture, layer, step.mip);
-                drawer.draw(&self.device, encoder, (&target, slice), drawn, area);
-            }
+                (view(texture, layer, step.mip), slice)
+            });
+            self.draw_clear(encoder, step, drawn, targets);
             return;
         }
         let Some(rect) = step.rect else {
@@ -962,6 +950,33 @@ impl Render {
                 },
                 size,
             );
+        }
+    }
+
+    /// Draws `drawn` into each of `targets` (a view of one layer or slice, and the slice of a 3D
+    /// view) with the clear shader ([`crate::clear`]), after writing its value: the encode loop
+    /// has submitted what came before (module docs).
+    fn draw_clear(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        step: &ClearStep,
+        drawn: &DrawnClear,
+        targets: impl Iterator<Item = (wgpu::TextureView, Option<u32>)>,
+    ) {
+        if self.clears.is_none() {
+            self.clears = Drawer::new(&self.device);
+        }
+        let Some(drawer) = self.clears.as_mut() else {
+            self.shared.host_error(&"the clear shader did not parse");
+            return;
+        };
+        self.queue.write_buffer(drawer.params(), 0, &drawn.params);
+        let area = Area {
+            size: step.size,
+            rect: step.rect,
+        };
+        for (target, slice) in targets {
+            drawer.draw(&self.device, encoder, (&target, slice), drawn, area);
         }
     }
 

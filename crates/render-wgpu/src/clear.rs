@@ -174,7 +174,7 @@ fn params(value: ClearValue) -> [u8; PARAMS_LEN] {
     let offset = shader::VALUE_OFFSET as usize;
     let words = value_patterns(value);
     if let Some(slot) = bytes.get_mut(offset..) {
-        for (chunk, word) in slot.chunks_exact_mut(4).zip(words) {
+        for (chunk, word) in slot.as_chunks_mut::<4>().0.iter_mut().zip(words) {
             chunk.copy_from_slice(&word.to_le_bytes());
         }
     }

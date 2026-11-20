@@ -287,8 +287,9 @@ fn clear_value(v: &ClearValue) -> String {
 /// as it did before clears had masks: the colour channels written by their initials, the
 /// stencil bits in hex.
 fn clear_masks(d: &ClearDesc) -> String {
-    let mut out = String::new();
-    if d.color_mask != ColorWrites::ALL {
+    let color = if d.color_mask == ColorWrites::ALL {
+        String::new()
+    } else {
         let channels: String = [
             (ColorWrites::RED, 'r'),
             (ColorWrites::GREEN, 'g'),
@@ -299,12 +300,14 @@ fn clear_masks(d: &ClearDesc) -> String {
         .filter(|(bit, _)| d.color_mask.contains(*bit))
         .map(|(_, c)| c)
         .collect();
-        out.push_str(&format!(" writing colour [{channels}]"));
-    }
-    if d.stencil_mask != ALL_STENCIL_BITS {
-        out.push_str(&format!(" writing stencil {:#04x}", d.stencil_mask));
-    }
-    out
+        format!(" writing colour [{channels}]")
+    };
+    let stencil = if d.stencil_mask == ALL_STENCIL_BITS {
+        String::new()
+    } else {
+        format!(" writing stencil {:#04x}", d.stencil_mask)
+    };
+    color + &stencil
 }
 
 /// One command.

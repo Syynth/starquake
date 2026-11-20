@@ -24,10 +24,10 @@ fn desc(value: ClearValue, color_mask: ColorWrites, stencil_mask: u8) -> ClearDe
 }
 
 fn drawn(how: ClearHow) -> DrawnClear {
-    match how {
-        ClearHow::Draw(d) => d,
-        other => panic!("not drawn: {other:?}"),
-    }
+    let ClearHow::Draw(d) = how else {
+        unreachable!("not drawn: {how:?}")
+    };
+    d
 }
 
 const FLOAT: ClearValue = ClearValue::Float([1.0, 0.0, 1.0, 0.0]);
@@ -52,23 +52,21 @@ fn a_colour_clear_is_drawn_for_a_partial_mask_or_a_multisampled_rectangle() {
         (ColorWrites::EMPTY, 4, false, Some(ClearHow::Nothing)),
     ] {
         let how = clear_how(RGBA, RGBA_HOST, samples, whole, &desc(FLOAT, mask, 0xff));
-        match expect {
-            Some(expect) => assert_eq!(how, expect, "{mask:?} {samples} {whole}"),
-            None => {
-                let d = drawn(how);
-                assert_eq!(
-                    d.key,
-                    PipelineKey {
-                        format: RGBA_HOST,
-                        samples,
-                        target: DrawTarget::Color {
-                            kind: ColorKind::Float,
-                            mask: host_color_writes(mask),
-                        },
+        if let Some(expect) = expect {
+            assert_eq!(how, expect, "{mask:?} {samples} {whole}");
+        } else {
+            assert_eq!(
+                drawn(how).key,
+                PipelineKey {
+                    format: RGBA_HOST,
+                    samples,
+                    target: DrawTarget::Color {
+                        kind: ColorKind::Float,
+                        mask: host_color_writes(mask),
                     },
-                    "{mask:?} {samples} {whole}"
-                );
-            }
+                },
+                "{mask:?} {samples} {whole}"
+            );
         }
     }
 }
