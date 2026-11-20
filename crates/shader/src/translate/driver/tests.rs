@@ -882,6 +882,31 @@ fn an_instruction_no_group_takes_is_refused_by_its_mnemonic() {
     );
 }
 
+/// A decoded operation of the half and double group, whose translator is not joined yet, is
+/// refused by its mnemonic, one of each operation that [`decoded_samples`] reaches.
+#[test]
+fn a_decoded_half_double_instruction_is_refused_by_its_mnemonic() {
+    let mut seen = std::collections::BTreeSet::new();
+    for instr in decoded_samples() {
+        if !is_half_double(&instr.op) || !seen.insert(instr.op.mnemonic()) {
+            continue;
+        }
+        let mut function = Function::new();
+        let entry = function.entry();
+        let mut driver = Driver::new(VERTEX, None);
+        assert_eq!(
+            driver.dispatch(&mut function, entry, 5, instr),
+            Err(TranslateError::Unsupported {
+                index: 5,
+                instr,
+                what: Unsupported::Instruction(instr.op.mnemonic()),
+            }),
+            "{instr}"
+        );
+    }
+    assert_eq!(seen.len(), 10, "{seen:?}");
+}
+
 /// The translation budget: a count of exactly the cap is accepted, one past it refused, whether
 /// the count comes from one block or several; and the production cap is four per instruction
 /// of a program at the capture's cap.
@@ -1000,25 +1025,11 @@ fn groups_of(op: Op) -> Vec<&'static str> {
 }
 
 /// The shells: operations no word decodes to yet, each built by hand (a field added to one
-/// stops this compiling), as PR #4588's tables name them: the half and double group, the
-/// uniform group's `R2UR` and `UP2UR`, the control group's `JMX` and `BPT`, and the tensor
-/// group.
+/// stops this compiling), as PR #4588's tables name them: the uniform group's `R2UR` and
+/// `UP2UR`, the control group's `JMX` and `BPT`, and the tensor group.
 fn shells() -> Vec<Op> {
-    use crate::decode::{
-        OpBpt, OpDAdd, OpDFma, OpDMul, OpDSetP, OpHAdd2, OpHFma2, OpHMnMx2, OpHMul2, OpHSet2,
-        OpHSetP2, OpImma, OpJmx, OpLdsm, OpMovm, OpR2UR, OpUP2UR,
-    };
+    use crate::decode::{OpBpt, OpImma, OpJmx, OpLdsm, OpMovm, OpR2UR, OpUP2UR};
     vec![
-        Op::HAdd2(OpHAdd2 {}),
-        Op::HFma2(OpHFma2 {}),
-        Op::HMul2(OpHMul2 {}),
-        Op::HSet2(OpHSet2 {}),
-        Op::HSetP2(OpHSetP2 {}),
-        Op::HMnMx2(OpHMnMx2 {}),
-        Op::DAdd(OpDAdd {}),
-        Op::DMul(OpDMul {}),
-        Op::DFma(OpDFma {}),
-        Op::DSetP(OpDSetP {}),
         Op::R2UR(OpR2UR {}),
         Op::UP2UR(OpUP2UR {}),
         Op::Jmx(OpJmx {}),
@@ -1062,7 +1073,7 @@ fn these_instructions_reach_every_decoded_operation() {
         .map(|instr| instr.op.mnemonic())
         .collect();
     let shells: std::collections::BTreeSet<&str> = shells().iter().map(Op::mnemonic).collect();
-    assert_eq!(shells.len(), 18);
+    assert_eq!(shells.len(), 8);
     assert!(reached.is_disjoint(&shells), "{reached:?}");
     let all: std::collections::BTreeSet<&str> = crate::decode::MNEMONICS.iter().copied().collect();
     assert_eq!(all.len(), crate::decode::MNEMONICS.len());
@@ -1075,15 +1086,43 @@ fn these_instructions_reach_every_decoded_operation() {
     );
 }
 
+/// Whether `op` is of the half and double group, which words decode to (slice 6c) but whose
+/// translator is not joined yet, so no group takes it and the dispatch refuses it by its
+/// mnemonic.
+const fn is_half_double(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::HAdd2(_)
+            | Op::HFma2(_)
+            | Op::HMul2(_)
+            | Op::HSet2(_)
+            | Op::HSetP2(_)
+            | Op::HMnMx2(_)
+            | Op::DAdd(_)
+            | Op::DMul(_)
+            | Op::DFma(_)
+            | Op::DSetP(_)
+    )
+}
+
 /// The groups are disjoint, and every decoded operation (every one of [`decoded_samples`])
-/// belongs to exactly one of them, so the dispatch order decides nothing; a shell belongs to
-/// none but the control group's `JMX` and `BPT`, which it refuses by name, so the fallback
-/// refusal is reached only by the other shells.
+/// belongs to exactly one of them, but for the half and double group's ([`is_half_double`]),
+/// which belong to none, so the dispatch order decides nothing; a shell belongs to none but the
+/// control group's `JMX` and `BPT`, which it refuses by name, so the fallback refusal is reached
+/// only by the half and double group and the other shells.
 #[test]
 fn the_groups_are_disjoint() {
+    let mut half_double = 0;
     for instr in decoded_samples() {
-        assert_eq!(groups_of(instr.op).len(), 1, "{instr}");
+        let wanted = if is_half_double(&instr.op) {
+            half_double += 1;
+            0
+        } else {
+            1
+        };
+        assert_eq!(groups_of(instr.op).len(), wanted, "{instr}");
     }
+    assert!(half_double > 0);
     for op in shells() {
         let wanted: &[&str] = if matches!(op, Op::Jmx(_) | Op::Bpt(_)) {
             &["control"]
