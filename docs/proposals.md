@@ -702,6 +702,26 @@ Wave 44 landed shader slices 8 (SSA and the first passes, #361, PR #441) and 11 
 | decided (decision log, 2026-11-19, "Owner rulings on the wave 44 and 45 questions and the first title bring-up") | **Guest RAM (blocker 4):** about 0.4 s further on, the run ends because guest RAM is used up: `WORKING_RAM` (`crates/core/src/system/ram.rs`) is a 16 MiB guess on top of the program image. Recommendation: size it from the console's memory arrangement in the program's metadata (what the title may map), backed lazily, rather than a fixed allowance | title bring-up | execution model |
 | decided (decision log, 2026-11-19, "Owner rulings on the wave 44 and 45 questions and the first title bring-up") | **A per-package build step in the gate:** the workspace-wide clippy and nextest unify `test-support`, so a package that does not build on its own passed the gate (PR #446). Recommendation: add `cargo check -p starquake` (and `cargo clippy -p` per crate) to `cargo xtask ci` | PR #446 | CI |
 
+### From wave 46 (ledger: #22)
+
+Landed: shader slices 15 (inputs, outputs and collect info, #374, PR #450), 16 (lowering to naga, #375, PR #452), 19 (the shader cache, #378, PR #462), 12f (texture translation, #369, PR #463) and 4b (known bits, #430, PR #448); the guest-time release timestamp (#435, PR #464); `ShaderInterface` requirements and array counts (#434, PR #465); y-flip and depth-remap emulation (#438, PR #469). #432 (PR #468) was parked when the Mac slept during its fix step, and 12e (#368) was built but stopped before its checks; wave 47 resumes both. Outside the wave: the title bring-up's first two fixes (PRs #449, #451) and two flaky tests (PRs #466, and the log-capture fix inside #451) merged.
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| awaiting the owner | **Warp operations and derivatives have no lowering slice:** votes, ballots, lane masks, shuffles, quad operations, `FSwizzleAdd` and derivatives are refused by slice 16, and no slice in the table owns them. Pixel programs use derivatives and quad operations often. Recommendation: a slice 16b after 16, lowering them to naga's subgroup and derivative operations | #375 | shader-pipeline |
+| awaiting the owner | **Vertex-output interpolation under wgpu:** wgpu refuses a pipeline whose vertex outputs and fragment inputs differ in interpolation, and only the pixel program's header gives the mode, so under the previous-stage ruling the vertex program cannot learn it. Recommendation: the vertex stage's variant key carries the paired pixel header's interpolation modes (the GPU crate reads that header when it builds the draw), as a named exception to ruling 8 | #374 | shader-pipeline |
+| awaiting the owner | **Metal fast math:** wgpu-hal 30.0.2 leaves Metal's fast math on, which breaks plain NaN comparisons, and naga's float-to-integer conversion saturates to 0x7fffff80. Slice 16 routes comparisons and conversions through `lower/ops.rs`. Recommendation: make that the rule for every lowering slice, and record the measured behaviour in render-backend | #375 | shader-pipeline, render-backend |
+| awaiting the owner | **Shared atomics and narrow shared stores** need an atomic shared array (Eden uses a compare-and-swap loop) and are refused. Recommendation: whoever lowers 12e's memory atomics owns them (slice 16b or a 16c) | #375 | shader-pipeline |
+| awaiting the owner | **12e follows PR #4588's lowering where it and the native translator disagree** (decision 8): bit 76 of the uniform LDG/STG is a memory descriptor, LDGSTS takes any enable predicate; strong ordering (`.STRONG.SM`) is ignored as the native translator does. Recommendation: accept as built | #368 | shader-pipeline |
+| awaiting the owner | **The release timestamp's unit** is GPU ticks at 614.4 MHz (Eden's `GPUTickFreq`), a guess for Switch 2; the clock goes through `GpuParts::fence_clock` rather than `GpuConfig` (which is `Copy + Eq`). Recommendation: accept both and name the unit in gpu-protocol | #435 | gpu-protocol |
+| awaiting the owner | **R6 keeps a naga cross-check in production** (wgpu does not compare a binding array's size with the layout); a quad-only shader that declares `subgroup` is now refused where size 32 is not met. Recommendation: keep the cross-check; give the shader crate a narrower "needs subgroup size 32" flag | #434 | render-backend |
+| awaiting the owner | **`DESCRIPTOR_BUFFERS` = 18** (PR #4588's bound) against the spec's 32 constant-buffer slots; the `TEX.B` operand layout where PR #4588 and NAK disagree | #369 | shader-pipeline |
+| proposed | **Run wiring for real shaders:** core still wires `NoShaders`; wiring `CachedShaders` needs slice 17 and core implementing the shader cache's `Executor` over the shared compile pool (R12). G18 still logs rejections per set (`SetLookup::Rejected` needs the program). Nothing registers `tracked_ranges` with `WriteWatch`. Two `ShaderStamp` types exist | #378 | area:shader, area:core |
+| proposed | **Stores learned only after translation:** a set never seen costs an extra lookup and a wasted first translation; slice 19 could expose a program's stores from its decoded program | #432 | area:shader |
+| proposed | **Translator wiring left for 12i and 13:** one `DescriptorBuffer` per program; the `ABSENT` convention for empty image arguments; the local-memory bound in slice 16; an indexed constant-buffer read; the uniform RED/LDS/STS forms PR #4588's lowering accepts | #369, #368 | area:shader |
+| proposed | **TLD4 `.F16`** is not added (no reference names it on SM 7.0+); TLD's `.F16` and `.CL` come from NAK comments only | #430 | area:shader (M4) |
+| proposed | **A negative viewport width** is still refused; a multi-viewport host without a native flip would need one flip per viewport | #438 | area:render |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
@@ -1014,3 +1034,10 @@ passed to build agents as a provisional rule for the next wave.
 - An operation the production backend refuses in some configuration is routed to its fallback in the producing layer, tested against the production backend's rules.
 - A cache key holds only state that can change the output.
 - Items used only by tests or test-support code carry the same cfg, so each package builds on its own.
+
+### From wave 46 (ledger: #22)
+
+- Each agent writes scratch files only in its own named subfolder and never runs another agent's script.
+- After a ruling lands, the PR's docs and body are re-read against it; settled questions lose their "open" wording.
+- A table of rows gets a test over every row with distinct values.
+- A cache never evicts its own just-resolved members, and a refusal names the cap that bound.
