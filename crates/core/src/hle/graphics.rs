@@ -53,9 +53,9 @@
 //!   [`GpuParts`] (gpu-protocol, "Graphics server sessions (#11)": "`core` creates the `Gpu`
 //!   ... and hands it to gsv"). Always a run ([`FrontMode::Live`]): the GPU completes its work
 //!   on its own (`a_run_with_the_gpu_completes_what_waits_on_it`, in `hle/tests/graphics.rs`).
-//!   A live run builds it over the recording backend when its guest memory can be shared with
-//!   the GPU's threads (`crate::machine`'s `gpu` module, issue #386); render-backend slice R12
-//!   adds the choice of the wgpu backend.
+//!   A live run builds it, over the render backend the run chose (`crate::renderer`, slice R12:
+//!   the wgpu backend or the recording backend), when its guest memory can be shared with the
+//!   GPU's threads (`crate::machine`'s `gpu` module, issue #386).
 //! - **The null front** ([`NullFront`], [`Graphics::new`]): for a run with no GPU back end, and
 //!   for every replay (`crate::machine`'s `gpu` module says when a run has neither).
 //!

@@ -4,7 +4,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use starquake::window::{NO_WINDOW, NOT_MAIN_THREAD, may_open};
+use starquake::window::{NOT_MAIN_THREAD, may_open};
 use starquake::{Command, RunArgs, USAGE, UsageError, execute, parse, render_choice};
 use starquake_core::artifacts::SUMMARY_FILE;
 use starquake_core::exit_code;
@@ -196,27 +196,35 @@ fn only_the_main_thread_may_open_the_window() {
     );
 }
 
-/// An empty scratch folder for the test called `name`.
-fn scratch(name: &str) -> PathBuf {
-    let folder = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("window")
-        .join(name);
-    if folder.exists() {
-        std::fs::remove_dir_all(&folder).unwrap();
+/// Helpers, in a `cfg(test)` module so they may unwrap like the tests do.
+#[cfg(test)]
+mod support {
+    use super::*;
+
+    /// An empty scratch folder for the test called `name`.
+    pub(crate) fn scratch(name: &str) -> PathBuf {
+        let folder = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join("window")
+            .join(name);
+        if folder.exists() {
+            std::fs::remove_dir_all(&folder).unwrap();
+        }
+        std::fs::create_dir_all(&folder).unwrap();
+        folder
     }
-    std::fs::create_dir_all(&folder).unwrap();
-    folder
+
+    /// The emulator error `summary.json` in `artifacts` gives.
+    pub(crate) fn summary_error(artifacts: &Path) -> String {
+        let summary: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(artifacts.join(SUMMARY_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(summary["exit_reason"], "emulator_error", "{summary}");
+        assert_eq!(summary["exit_code"], 2);
+        summary["message"].as_str().unwrap().to_owned()
+    }
 }
 
-/// The emulator error `summary.json` in `artifacts` gives.
-fn summary_error(artifacts: &Path) -> String {
-    let summary: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(artifacts.join(SUMMARY_FILE)).unwrap())
-            .unwrap();
-    assert_eq!(summary["exit_reason"], "emulator_error", "{summary}");
-    assert_eq!(summary["exit_code"], 2);
-    summary["message"].as_str().unwrap().to_owned()
-}
+use support::{scratch, summary_error};
 
 /// `run --window` from a thread that is not the process's main thread (a test's) is refused
 /// before anything runs, as an emulator error with the exact words, exit code 2 and the
@@ -254,11 +262,13 @@ fn a_window_off_the_main_thread_is_refused_before_the_run() {
 }
 
 /// A Linux host with no X11 or Wayland display cannot make a window: `run --window`, on the
-/// process's main thread (a child process), ends before the run with [`NO_WINDOW`] and winit's
+/// process's main thread (a child process), ends before the run with `NO_WINDOW` and winit's
 /// reason, which is winit's own words and not pinned here.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_host_with_no_display_ends_the_run_before_it_starts() {
+    use starquake::window::NO_WINDOW;
+
     if !WGPU_BUILT {
         return;
     }

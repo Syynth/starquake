@@ -748,13 +748,13 @@ fn gpu_test_runs<T>(test: &str, result: &Result<T, String>) -> bool {
     }
 }
 
-/// What one present of the image the guest wrote dumps through the backend `render` chose, by
+/// What one present of the image the guest wrote dumps through the backend `setup` chose, by
 /// the run's own path (`gpu::graphics_opening` with the host's opener, the vsync tick's latch,
 /// `gpu::finish`): the frame's decoded pixels, and the backend. `Err`: the words the run would
 /// end with when the backend cannot be opened.
 #[cfg(feature = "wgpu")]
 fn frame_dumped_with(
-    render: &crate::renderer::RenderSetup,
+    setup: &crate::renderer::RenderSetup,
 ) -> Result<(Vec<u8>, Arc<dyn starquake_render::Backend>), String> {
     use crate::machine::{Ending, gpu};
     use crate::report::EnvSource;
@@ -764,7 +764,7 @@ fn frame_dumped_with(
         &EnvSource::Live,
         Some(&shared),
         (None, Arc::new(NoWake), SystemClock::new()),
-        render,
+        setup,
         &gpu::WgpuOpener::host(),
     )?;
     let (keeper, backend) = built.unwrap();
@@ -812,7 +812,7 @@ fn the_wgpu_backend_dumps_the_same_frame_as_the_recording_backend() {
     assert!(!wgpu_backend.caps().view_swizzle);
     assert!(recording_backend.caps().view_swizzle);
     // The run's sink took the wgpu backend's present feedback as the frame came.
-    assert!(wgpu_backend.take_present_feedback().is_empty());
+    assert_eq!(wgpu_backend.take_present_feedback().len(), 0);
 }
 
 /// Hands each job to a thread of its own: a main thread that is not the process's.

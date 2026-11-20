@@ -35,6 +35,10 @@
 //! - [`services_report`]: what the services leave behind for the report (requests by command,
 //!   stubbed commands, unknown service names), read from the servers once the run is over.
 //! - [`host_log`]: the emulator's own warnings during a run, kept for the run's `log.txt`.
+//! - [`renderer`]: which render backend a run's GPU draws with (the wgpu backend, behind this
+//!   crate's `wgpu` feature, or the recording backend) and the window it shows frames in; a run
+//!   with the wgpu backend builds it with the run's one compile pool (`compile_pool`), which the
+//!   shader cache will share once it is built into runs.
 
 pub mod artifacts;
 #[cfg_attr(

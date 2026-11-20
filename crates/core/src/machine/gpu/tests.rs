@@ -690,9 +690,9 @@ fn a_run_renders_with_the_setup_it_is_given() {
         return;
     }
     assert_eq!(message, format!("{WINDOW_FAILED}: {MainThreadGone}"));
-    assert!(report.guest_log.is_empty(), "the guest never ran");
+    assert_eq!(report.guest_log.len(), 0, "the guest never ran");
 
     let recorded = system.run_rendering(&options, RenderSetup::recording());
     assert_eq!(recorded.exit, ExitReason::ProcessExited);
-    assert!(!recorded.guest_log.is_empty());
+    assert_ne!(recorded.guest_log.len(), 0);
 }
