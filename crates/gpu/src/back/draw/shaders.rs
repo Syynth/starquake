@@ -79,6 +79,7 @@
 //! shader's texture uses in set order, then in resource-table order.
 
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use starquake_render::caps::GUEST_COLOR_TARGETS;
@@ -86,11 +87,13 @@ use starquake_render::format::NumericType;
 use starquake_render::pipeline::EmulationFlags;
 use starquake_render::shader::{
     InterfaceVariable, Interpolation, ResourceBinding, ResourceKind, ScalarKind, ShaderDesc,
-    ShaderInterface, ShaderSource, ShaderStage,
+    ShaderInterface, ShaderRequirements, ShaderSource, ShaderStage,
 };
 use starquake_render::{Backend, FenceValue, PixelFormat, ResourceId, ShaderId};
 use starquake_shader::exchange::{SampledType, TextureFormat, TextureKind};
-use starquake_shader::host::{HostCode, HostShader, HostStage, SlotBinding, SlotType};
+use starquake_shader::host::{
+    HostCode, HostShader, HostStage, Requirements, SlotBinding, SlotType,
+};
 use starquake_shader::lookup::{
     EngineState, GuestStage, ProgramMemory, ProgramRequest, Rejection, ShaderSet, Ticket, Unmapped,
     VariantKey,
@@ -154,6 +157,12 @@ pub struct ResourceUse {
     pub slot: Slot,
     /// What the module declares there.
     pub kind: ResourceKind,
+    /// The module's binding-array size there: `None` for one resource, `Some(n)` for a binding
+    /// array of `n` ([`ResourceBinding::count`], which [`shader_desc`] copies it to; decided by
+    /// the owner, 2026-11-19, ruling 20). The draw and compute paths bind one resource per row
+    /// and no lookup answers a row with a count yet: binding arrays are bound with the slices
+    /// that add them to the shader crate's resource table (13 and 16).
+    pub count: Option<NonZeroU32>,
     /// What fills it.
     pub source: ResourceSource,
 }
@@ -479,10 +488,31 @@ fn variable(binding: SlotBinding, ty: SlotType) -> Option<InterfaceVariable> {
     })
 }
 
+/// The render crate's requirements for a translated shader's, field by field (shader-pipeline,
+/// "What the render backend (#14) gets": the interface "also carries `requirements`"; decided
+/// by the owner, 2026-11-19, ruling 20).
+pub const fn requirements(requirements: Requirements) -> ShaderRequirements {
+    let Requirements {
+        subgroup,
+        f16,
+        f64,
+        i64,
+        i64_atomics,
+    } = requirements;
+    ShaderRequirements {
+        subgroup,
+        f16,
+        f64,
+        i64,
+        i64_atomics,
+    }
+}
+
 /// The one conversion from a translated shader to the render crate's description (render-backend
 /// spec, "Interfaces": "that conversion is one function (G18), which the replay's
 /// `ShaderResolver` also calls"): the naga module as [`ShaderSource::Naga`], the slots at
-/// locations as inputs and outputs, and `resources` as the resource table.
+/// locations as inputs and outputs, `resources` as the resource table with each row's array
+/// count, and the shader's requirements ([`requirements`]).
 pub fn shader_desc(shader: &HostShader, resources: &[ResourceUse]) -> ShaderDesc {
     let HostCode::Naga { module, info } = &shader.code;
     let slots = |list: &[starquake_shader::host::InterfaceSlot]| {
@@ -504,10 +534,12 @@ pub fn shader_desc(shader: &HostShader, resources: &[ResourceUse]) -> ShaderDesc
                     group: r.slot.group,
                     binding: r.slot.binding,
                     kind: r.kind,
+                    count: r.count,
                 })
                 .collect(),
             inputs: slots(&shader.inputs),
             outputs: slots(&shader.outputs),
+            requirements: requirements(shader.requirements),
         },
         origin: None,
     }

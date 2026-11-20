@@ -213,6 +213,7 @@ fn uniform_bank(bank: u8, size: u32) -> ResourceUse {
             binding: 0,
         },
         kind: ResourceKind::UniformBuffer,
+        count: None,
         source: ResourceSource::ConstantBuffer { bank, size },
     }
 }

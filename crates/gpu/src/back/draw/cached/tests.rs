@@ -46,6 +46,7 @@ fn resources(stage: GuestStage) -> Vec<ResourceUse> {
             binding: 3,
         },
         kind: ResourceKind::UniformBuffer,
+        count: None,
         source: ResourceSource::ConstantBuffer {
             bank: 1,
             size: 0x40,
