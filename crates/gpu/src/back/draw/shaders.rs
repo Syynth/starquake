@@ -139,8 +139,7 @@ use starquake_render::shader::{
 use starquake_render::{Backend, FenceValue, PixelFormat, ResourceId, ShaderId};
 use starquake_shader::exchange::{SampledType, TextureFormat, TextureKind};
 use starquake_shader::host::{
-    GuestSlot, HostCode, HostShader, HostStage, InterfaceSlot, Requirements, SlotBinding,
-    SlotType,
+    GuestSlot, HostCode, HostShader, HostStage, InterfaceSlot, Requirements, SlotBinding, SlotType,
 };
 use starquake_shader::ir::{ATTRIBUTE_COMPONENTS, GENERIC_0_X, POSITION_X};
 use starquake_shader::lookup::{
