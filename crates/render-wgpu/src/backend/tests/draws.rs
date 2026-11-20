@@ -1358,6 +1358,7 @@ fn a_flipped_viewport_draws_the_upright_pixels() {
                 group: 0,
                 binding: 1,
                 kind: ResourceKind::UniformBuffer,
+                count: None,
             }],
             ..ShaderInterface::default()
         };
