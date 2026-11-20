@@ -859,6 +859,8 @@ fn twin_text_marks_exactly_the_register_operands() {
         [9, 13, 18, 23, 29, 34, 38, 48]
     );
     assert_eq!(starts("x r p q pz rr r1x p12 r255"), [18, 22]);
+    // A modifier that reads as a register (`.rz`, `.p1`) or a register inside a word is not one.
+    assert_eq!(starts("f2f.rz.p1 r1, x_r2, 1r3"), [10]);
     let rc8 = word(
         0x296,
         &[(16, 1), (24, 2), (32, 3), (64, 4), (72, 3), (91, 1)],
