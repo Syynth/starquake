@@ -40,6 +40,10 @@
 //! `self_controller.cpp` (`ISelfController` 14), with `lifecycle_manager.h`
 //! (`SetResumeNotificationEnabled`). `ISelfController` 2400 is ported from PR #4588 @ e5fb3b97
 //! alone (`eden-pr4588/src/core/hle/service/am/service/self_controller.cpp`).
+//! `IApplicationFunctions` 1 is ported from Eden @ cf654052, whose handler Eden-NX2 @ 50fa86bb
+//! and PR #4588 @ e5fb3b97 share: `application_functions.cpp` (`PopLaunchParameter`), with
+//! `am_types.h` (`LaunchParameterKind`), `am_results.h` (`ResultNoDataInChannel`) and what
+//! `applet_manager.cpp` puts in the channels at launch (see "The launch parameter").
 //!
 //! # Commands
 //!
@@ -54,8 +58,10 @@
 //! next to 320 and 321 in PR's table (see "The title's start-up commands"), and the three
 //! commands whose state 320 reads (see "Screenshots and recording"), and the five a Switch 2
 //! title sends after those (`IApplicationFunctions` 21 and 210, `ICommonStateGetter` 66,
-//! `ISelfController` 14 and 2400; see "The title's later start-up commands"); every other command
-//! of these interfaces is left out and answered by the server's unknown-command policy.
+//! `ISelfController` 14 and 2400; see "The title's later start-up commands"), and
+//! `IApplicationFunctions` 1, which a Switch 2 title sends next, for its preselected user (see
+//! "The launch parameter"); every other command of these interfaces is left out and answered by
+//! the server's unknown-command policy.
 //!
 //! | Interface | Id | Command | In | Out |
 //! |---|---|---|---|---|
@@ -90,7 +96,8 @@
 //! | | 2400 | `SetRtcScreenSharingAudioEnabled` (Switch 2) | `bool` | nothing |
 //! | [`IWindowController`] | 1 | `GetAppletResourceUserId` | nothing | `u64` the applet resource user id |
 //! | | 10 | `AcquireForegroundRights` | nothing | nothing |
-//! | [`IApplicationFunctions`] | 21 | `GetDesiredLanguage` | nothing | `u64` language code: [`DESIRED_LANGUAGE_CODE`] |
+//! | [`IApplicationFunctions`] | 1 | `PopLaunchParameter` | `u32` [`LaunchParameterKind`], any word | nothing: [`NO_DATA_IN_CHANNEL`] |
+//! | | 21 | `GetDesiredLanguage` | nothing | `u64` language code: [`DESIRED_LANGUAGE_CODE`] |
 //! | | 40 | `NotifyRunning` | nothing | `bool` (a byte): true |
 //! | | 65 | `IsGamePlayRecordingSupported` | nothing | `bool` (a byte): [`GAME_PLAY_RECORDING_SUPPORTED`] |
 //! | | 67 | `SetGamePlayRecordingState` | `u32` [`GamePlayRecordingState`] | nothing |
@@ -120,6 +127,14 @@
 //!   `GetGpuErrorDetectedSystemEvent`: libnx `_appletCmdGetEvent` (one copied handle); Eden
 //!   `OutCopyHandle<KReadableEvent>`. `GetUnknownEvent210`: no libnx client; Eden
 //!   `OutCopyHandle<KReadableEvent>`.
+//! - `PopLaunchParameter`: libnx `appletPopLaunchParameter` (`serviceDispatchIn(.., 1, tmp,
+//!   .out_num_objects = 1)`, `tmp` the kind as a `u32`); Eden `(Out<SharedPointer<IStorage>>,
+//!   LaunchParameterKind)`, a `u32` enum at offset 0. The failure reply here holds the result
+//!   and no object. Eden's serializer lays the reply out the same way whatever the result
+//!   (`eden/src/core/hle/service/cmif_serialization.h`, `CmifReplyWrapImpl`: the out-object slot
+//!   is written after the result, here an empty pointer); libnx returns a failed result before
+//!   it reads any object (`libnx/nx/include/switch/sf/cmif.h`, `cmifParseResponse`: `if
+//!   (R_FAILED(hdr->result)) return hdr->result;`), so the two read the same to the client.
 //! - `GetDesiredLanguage`: libnx `appletGetDesiredLanguage` (`_appletCmdNoInOutU64`); Eden
 //!   `Out<u64>`.
 //! - `SetCpuBoostMode`: libnx `appletSetCpuBoostMode` (`_appletCmdInU32NoOut`); Eden hands the
@@ -362,6 +377,10 @@
 //!   (`open_application_proxy_needs_the_process_id_and_the_process_handle`). libnx sends both.
 //!   The handle is not otherwise used: Eden keeps it for the display layer manager, which is not
 //!   ported.
+//! - **No preselected user.** `PopLaunchParameter` answers [`NO_DATA_IN_CHANNEL`] for the
+//!   preselected user's kind, and for every word Eden reads as that kind, where Eden's first call
+//!   returns the user Eden pushed at launch; see "The launch parameter", which lists this and
+//!   the command's other two divergences with their tests.
 //!
 //! # The Switch 2 additions
 //!
@@ -514,6 +533,54 @@
 //! `the_later_commands_refuse_a_payload_too_short_and_change_nothing` (0 to 3 bytes for 66, and
 //! none for 14 and 2400, with libnx's exact domain `size`, refused; the whole argument accepted).
 //!
+//! # The launch parameter
+//!
+//! After those, a Switch 2 title asks `IApplicationFunctions` 1 (`PopLaunchParameter`) for its
+//! preselected user. The auto-stub's zeroed reply made the SDK dereference a null pointer; the
+//! owner's ruling (decision log, 2026-11-19, "Owner rulings on the wave 44 and 45 questions and
+//! the first title bring-up", item 12) is that command 1 answers Eden's "no data in channel"
+//! result for both kinds, as a listed divergence, until accounts are designed.
+//!
+//! Eden keeps two channels per applet, each a stack of byte strings, and pops the one the kind
+//! names: the user channel for kind 1, and the preselected user's for any other word
+//! ([`LaunchParameterKind::channel_for`]). When that channel is empty it answers
+//! `ResultNoDataInChannel` ([`NO_DATA_IN_CHANNEL`]); otherwise it takes the last entry and
+//! returns it in a new `IStorage`. Here no channel holds anything, so every well-formed request
+//! answers [`NO_DATA_IN_CHANNEL`] with no object, and nothing in the applet changes. Against
+//! Eden (`eden/src/core/hle/service/am/applet_manager.cpp` @ cf654052,
+//! `AppletManager::SetWindowSystem`'s launch of the pending application; the same in Eden-NX2 @
+//! 50fa86bb and PR #4588 @ e5fb3b97):
+//!
+//! - **The user channel (kind 1) agrees.** Eden fills it at launch only for an application
+//!   another application started (`if (params.launch_type == LaunchType::ApplicationInitiated)`,
+//!   with what that one left in the system's user channel). A run here has one application and
+//!   nothing before it, which in Eden is a frontend launch (`LaunchType::FrontendInitiated`),
+//!   whose user channel is left empty, so Eden answers the same
+//!   (`pop_launch_parameter_answers_no_data_in_channel_for_both_kinds`).
+//! - **The preselected user (kind 2) differs: no user is preselected.** At every launch Eden
+//!   pushes one `LaunchParameterAccountPreselectedUser` (0x88 bytes: the magic `0xC79497CA`,
+//!   `is_account_selected` 1, and the current user's UUID from its profile manager) onto the
+//!   preselected user's channel, so the title's first call returns it in a storage and only a
+//!   later call answers [`NO_DATA_IN_CHANNEL`]. Here the first call answers
+//!   [`NO_DATA_IN_CHANNEL`] already, as the owner ruled: starquake has no accounts to take a user
+//!   from (`pop_launch_parameter_answers_no_data_in_channel_for_both_kinds`). Answering Eden's
+//!   storage needs `IStorage` and a user, which wait for the design of accounts.
+//! - **An unknown kind answers as the preselected user's.** Eden has no check on the word: any
+//!   word but 1, libnx's `Unknown` 3 included, pops the preselected user's channel, so its first
+//!   call returns the pushed user. Here it answers [`NO_DATA_IN_CHANNEL`], as kind 2 does: the
+//!   same divergence as kind 2's
+//!   (`pop_launch_parameter_answers_an_unknown_kind_as_the_preselected_user_s`, and
+//!   `eden_pops_the_user_channel_for_kind_1_and_the_preselected_user_s_for_any_other_word` for
+//!   the routing).
+//! - **A payload too short for the kind** is refused with [`INVALID_CMIF_REQUEST`] and changes
+//!   nothing, where Eden reads past the argument whatever the message's size: the same
+//!   divergence, with the same session rule, as "The Switch 2 additions" lists for 10 and 1050
+//!   (`pop_launch_parameter_refuses_a_payload_too_short`: 0 to 3 bytes refused, with libnx's
+//!   exact domain `size`; the whole word accepted). A too-short payload is refused before the
+//!   channel is looked at, so it answers [`INVALID_CMIF_REQUEST`], not [`NO_DATA_IN_CHANNEL`].
+//!
+//! The scoping doc has no row for the command.
+//!
 //! # The graphics server
 //!
 //! `ISelfController` 2000 returns a session to the graphics server's root, which the title then
@@ -597,6 +664,56 @@ pub const AM_MODULE: u32 = 128;
 /// `R_VALUE(rc) == 0x680`, and `appletGetMessage` checks `MAKERESULT(128, 3)`
 /// (`libnx/nx/source/services/applet.c`).
 pub const NO_MESSAGES: ResultCode = code(AM_MODULE, 3);
+
+/// `ResultNoDataInChannel` (`eden/src/core/hle/service/am/am_results.h` @ cf654052: `constexpr
+/// Result ResultNoDataInChannel{ErrorModule::AM, 2}`; the same in Eden-NX2 @ 50fa86bb and Eden
+/// PR #4588 @ e5fb3b97), which `PopLaunchParameter` answers when the channel it pops is empty
+/// (`application_functions.cpp`: `if (channel.empty()) { .. R_THROW(AM::ResultNoDataInChannel);
+/// }`), and here answers for every kind (module docs, "The launch parameter").
+pub const NO_DATA_IN_CHANNEL: ResultCode = code(AM_MODULE, 2);
+
+/// A launch-parameter kind, as `IApplicationFunctions::PopLaunchParameter` reads it: one `u32`
+/// (`eden/src/core/hle/service/am/am_types.h` @ cf654052: `enum class LaunchParameterKind : u32
+/// { UserChannel = 1, AccountPreselectedUser = 2 }`; the same in Eden-NX2 @ 50fa86bb and Eden
+/// PR #4588 @ e5fb3b97). libnx's `AppletLaunchParameterKind` gives these two the same values and
+/// names a third, `Unknown = 3`, "Unknown if used by anything?"; Eden has no variant for it, and
+/// pops the preselected user's channel for it ([`LaunchParameterKind::channel_for`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchParameterKind {
+    /// `UserChannel = 1`: the data a previous application left for this one.
+    UserChannel,
+    /// `AccountPreselectedUser = 2`: the user picked before the application started.
+    AccountPreselectedUser,
+}
+
+impl LaunchParameterKind {
+    /// Every kind, in Eden's declaration order (which is also the order of their words).
+    pub const ALL: [Self; 2] = [Self::UserChannel, Self::AccountPreselectedUser];
+
+    /// The kind's word: the one place each value is written down.
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        match self {
+            Self::UserChannel => 1,
+            Self::AccountPreselectedUser => 2,
+        }
+    }
+
+    /// The channel Eden pops for the word `raw`: the user channel for exactly
+    /// [`LaunchParameterKind::UserChannel`]'s word, and the preselected user's for every other
+    /// word, libnx's `Unknown` 3 included (`application_functions.cpp` @ cf654052,
+    /// `PopLaunchParameter`: `launch_parameter_kind == LaunchParameterKind::UserChannel ?
+    /// m_applet->user_channel_launch_parameter : m_applet->preselected_user_launch_parameter`;
+    /// the same in Eden-NX2 @ 50fa86bb and Eden PR #4588 @ e5fb3b97).
+    #[must_use]
+    pub const fn channel_for(raw: u32) -> Self {
+        if raw == Self::UserChannel.raw() {
+            Self::UserChannel
+        } else {
+            Self::AccountPreselectedUser
+        }
+    }
+}
 
 /// The flags `OpenApplicationProxyWithFlags` accepts (module docs, "The Switch 2 additions"):
 /// Eden PR #4588 (`eden-pr4588/src/core/hle/service/am/service/application_proxy_service.cpp` @
@@ -1760,6 +1877,12 @@ pub mod command {
 
     /// `IApplicationFunctions`' commands (`IApplicationFunctions::IApplicationFunctions`).
     pub mod application_functions {
+        /// `{1, D<&IApplicationFunctions::PopLaunchParameter>, "PopLaunchParameter"}`, the same
+        /// row in Eden @ cf654052, Eden-NX2 @ 50fa86bb and Eden PR #4588 @ e5fb3b97
+        /// (`src/core/hle/service/am/service/application_functions.cpp` in each); libnx
+        /// `appletPopLaunchParameter` sends 1 to `IApplicationFunctions` with the kind as one
+        /// `u32` and one out object. The scoping doc has no row for it.
+        pub const POP_LAUNCH_PARAMETER: u32 = 1;
         /// `{40, D<&IApplicationFunctions::NotifyRunning>, "NotifyRunning"}`.
         pub const NOTIFY_RUNNING: u32 = 40;
         /// `{65, D<&IApplicationFunctions::IsGamePlayRecordingSupported>,
@@ -1887,6 +2010,7 @@ commands! {
 
 commands! {
     impl IApplicationFunctions {
+        application_functions::POP_LAUNCH_PARAMETER => pop_launch_parameter,
         application_functions::GET_DESIRED_LANGUAGE => get_desired_language,
         application_functions::NOTIFY_RUNNING => notify_running,
         application_functions::IS_GAME_PLAY_RECORDING_SUPPORTED =>
@@ -2399,6 +2523,28 @@ impl IApplicationFunctions {
     ) -> Outcome {
         reply.payload().write_u8(u8::from(true));
         reply.ok()
+    }
+
+    /// `PopLaunchParameter`. in: `u32` kind, any word. out: nothing; always
+    /// [`NO_DATA_IN_CHANNEL`], Eden's answer for an empty channel, whichever channel Eden would
+    /// pop for the word ([`LaunchParameterKind::channel_for`]): no channel holds data here (module
+    /// docs, "The launch parameter"). The channel changes only what is logged: the log line is
+    /// log-only, and no test captures it, so a mutation of the logged channel is equivalent under
+    /// the tests; `channel_for` itself is pinned by its own test.
+    fn pop_launch_parameter(
+        _: &mut Self,
+        _cx: &mut Context<'_>,
+        req: &Request<'_>,
+        _reply: &mut Reply,
+    ) -> Outcome {
+        let kind = req.payload().read_u32()?;
+        let channel = LaunchParameterKind::channel_for(kind).raw();
+        tracing::warn!(
+            kind,
+            channel,
+            "appletOE: PopLaunchParameter found no data in its channel"
+        );
+        Err(NO_DATA_IN_CHANNEL.into())
     }
 
     /// `GetDesiredLanguage`. out: `u64` language code, [`DESIRED_LANGUAGE_CODE`].
