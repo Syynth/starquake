@@ -107,8 +107,10 @@
 //!   high word of an 8-byte release is latched by that word
 //!   (`a_wide_release_latches_a_waiter_on_its_high_word`).
 //! - A release whose memory access fails ([`GpuFault`]) writes nothing that the memory refused,
-//!   latches nothing, and is logged at warning level and listed in [`Report::failed`]; the
-//!   actions after it are still performed.
+//!   latches nothing, and is logged at the level its action names ([`FailureLog`]: warning
+//!   level, or debug level for the repeats the executor marks), counted
+//!   ([`FenceCounters::failed_releases`]) and listed in [`Report::failed`]; the actions after it
+//!   are still performed.
 //! - **An increment** of count `n` calls [`Syncpoints::increment_by`] once: one wrapping
 //!   addition of `n` to the counter, as `n` of Eden's increments would leave it (the
 //!   `std::atomic<u32>` `fetch_add(1)` of `SyncpointManager::Increment` in
@@ -235,11 +237,16 @@
 //! - A reduction with a timestamp writes the 16-byte structure with the reduced value; no
 //!   reference performs one. A trace of a `SEM_EXECUTE` reduction with `RELEASE_TIMESTAMP` set
 //!   would settle it.
-//! - The timestamp's source and unit are [`FenceClock`]'s; the spec's deferred queries take it
-//!   "from guest time". The wiring (slice G21, `crate::wiring`) gives the host's monotonic clock,
-//!   nanoseconds since the GPU was made: a **guess**, and not guest time, an open question for
-//!   the owner. It is not recorded, so a replay that does not supply the same clock writes
-//!   different timestamps.
+//! - The timestamp is [`FenceClock::gpu_timestamp`]'s: guest time from the kernel's clock,
+//!   which `core` passes in (gpu-protocol, "Fenced completion": "the timestamp is guest time
+//!   from the kernel's clock, which `core` passes through the `Gpu`'s config, so a replay writes
+//!   the same value"; the owner's ruling of 2026-11-19, row 29). Its unit is the guest GPU
+//!   timer's ticks, 614.4 MHz, counted from guest time's zero; the kernel owns that conversion
+//!   (`starquake_kernel::time::gpu_ticks_at`; the rate is a **guess** for the Switch 2 GPU,
+//!   listed there). This crate does not depend on the kernel, so it takes the reading as a
+//!   `u64` and converts nothing. A GPU capture records every reading
+//!   ([`crate::capture::RecordingFenceClock`], the `timestamp` record) and a replay writes the
+//!   recorded value (`capture::tests::timestamps`).
 //! - Releases to the syncpoint shim (gpu-protocol, "Semaphore acquires") go through the
 //!   release's [`GpuMemory`] like any other; the production memory
 //!   ([`crate::memory::VmMemory`], slice G22), which is the one that translates addresses, turns
@@ -287,7 +294,9 @@ pub trait FenceClock: Send + Sync {
     /// [`CLOSE_AFTER`] on it.
     fn elapsed(&self) -> Duration;
 
-    /// The timestamp a 16-byte release writes after its value (module docs, "Guesses").
+    /// The timestamp a 16-byte release writes after its value: guest time now, as the guest
+    /// GPU's timer counts it (`starquake_kernel::time::GpuTicks`; module docs, "Guesses and open
+    /// items").
     fn gpu_timestamp(&self) -> u64;
 }
 
@@ -322,6 +331,16 @@ pub struct VmChange {
     pub update: VmUpdate,
 }
 
+/// The level at which a fenced release that fails is logged (module docs, "Completion").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureLog {
+    /// Warning level: every release but the repeats below.
+    Warn,
+    /// Debug level: a report semaphore release to GPU address 0 after the first of its channel
+    /// (`back::exec`, "Report semaphores"), which the native SDK may write at every flush.
+    Debug,
+}
+
 /// An action performed only after the host GPU has finished the work recorded before it.
 #[derive(Clone)]
 pub enum FencedAction {
@@ -333,6 +352,8 @@ pub enum FencedAction {
         space: AsId,
         /// What to write.
         release: Release,
+        /// The level at which a failure to perform it is logged; it is counted either way.
+        failure: FailureLog,
     },
     /// `count` increments of a syncpoint, added at once (module docs, "Completion").
     Increment {
@@ -1026,6 +1047,7 @@ impl Fences {
                 memory,
                 space,
                 release,
+                failure: level,
             } => match write_release(&*memory, &release, &*self.env.clock) {
                 Ok(written) => {
                     report.released = report.released.saturating_add(1);
@@ -1041,7 +1063,10 @@ impl Fences {
                         address: release.address,
                         fault,
                     };
-                    tracing::warn!(%failure, "fenced release failed");
+                    match level {
+                        FailureLog::Warn => tracing::warn!(%failure, "fenced release failed"),
+                        FailureLog::Debug => tracing::debug!(%failure, "fenced release failed"),
+                    }
                     self.counters.failed_releases = self.counters.failed_releases.saturating_add(1);
                     report.failed.push(failure);
                 }

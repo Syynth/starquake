@@ -27,7 +27,9 @@ use starquake_render::caps::{
 use starquake_render::recording::RecordingBackend;
 
 use super::*;
-use crate::back::fence::{CloseReason, FenceClock, FenceEnv, FencedAction, Fences, Mode};
+use crate::back::fence::{
+    CloseReason, FailureLog, FenceClock, FenceEnv, FencedAction, Fences, Mode,
+};
 use crate::classes::{clc76f, clc797};
 use crate::fifo::{GpEntry, MethodMode, PushBuffer, Sync};
 use crate::interface::{
@@ -199,6 +201,7 @@ impl Back {
                         memory: Arc::<Memory>::clone(&self.memory),
                         space: SPACE,
                         release: *release,
+                        failure: FailureLog::Warn,
                     };
                     self.fences.attach(action).unwrap();
                 }

@@ -1,0 +1,184 @@
+---
+source: crates/shader/src/lower/tests/ops.rs
+expression: msl(&shader)
+---
+// language: metal2.4
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using metal::uint;
+
+uint naga_div(uint lhs, uint rhs) {
+    return lhs / metal::select(rhs, 1u, rhs == 0u);
+}
+
+int naga_div(int lhs, int rhs) {
+    return lhs / metal::select(rhs, 1, (lhs == (-2147483647 - 1) & rhs == -1) | (rhs == 0));
+}
+
+
+[[max_total_threads_per_threadgroup(1)]] kernel void main_(
+) {
+    uint r0_ = {};
+    uint r1_ = {};
+    uint r2_ = {};
+    uint r3_ = {};
+    uint r4_ = {};
+    uint r5_ = {};
+    uint r6_ = {};
+    uint r7_ = {};
+    uint r8_ = {};
+    uint r9_ = {};
+    uint r10_ = {};
+    uint r11_ = {};
+    uint r12_ = {};
+    uint r13_ = {};
+    uint r14_ = {};
+    uint r15_ = {};
+    uint r16_ = {};
+    uint r17_ = {};
+    uint r18_ = {};
+    uint r19_ = {};
+    uint r20_ = {};
+    uint r21_ = {};
+    uint r22_ = {};
+    uint r23_ = {};
+    uint r24_ = {};
+    uint r25_ = {};
+    uint r26_ = {};
+    uint r27_ = {};
+    uint r28_ = {};
+    uint r29_ = {};
+    uint r30_ = {};
+    uint r31_ = {};
+    uint r32_ = {};
+    uint r33_ = {};
+    uint r34_ = {};
+    uint r35_ = {};
+    uint r36_ = {};
+    uint r37_ = {};
+    uint r38_ = {};
+    uint r39_ = {};
+    uint r40_ = {};
+    uint r41_ = {};
+    uint r42_ = {};
+    uint r43_ = {};
+    uint r44_ = {};
+    uint r45_ = {};
+    uint r46_ = {};
+    uint r47_ = {};
+    uint r48_ = {};
+    uint r49_ = {};
+    uint r50_ = {};
+    uint r51_ = {};
+    uint r52_ = {};
+    uint r53_ = {};
+    uint r54_ = {};
+    uint r55_ = {};
+    uint r56_ = {};
+    uint r57_ = {};
+    uint r58_ = {};
+    uint r59_ = {};
+    uint r60_ = {};
+    uint r61_ = {};
+    uint r62_ = {};
+    r0_ = 4294967295u + 2u;
+    r1_ = 1u - 2u;
+    r2_ = 65537u * 65537u;
+    r3_ = 0u - 5u;
+    r4_ = (as_type<int>(2147483648u) < as_type<int>(0u)) ? (0u - 2147483648u) : 2147483648u;
+    r5_ = (as_type<int>(4294967291u) < as_type<int>(0u)) ? (0u - 4294967291u) : 4294967291u;
+    r6_ = (31u >= 32u) ? 0u : (2147483649u << metal::min(31u, 31u));
+    r7_ = (32u >= 32u) ? 0u : (2147483649u << metal::min(32u, 31u));
+    r8_ = (33u >= 32u) ? 0u : (2147483649u << metal::min(33u, 31u));
+    r9_ = (4294967295u >= 32u) ? 0u : (1u << metal::min(4294967295u, 31u));
+    r10_ = (31u >= 32u) ? 0u : (2147483649u >> metal::min(31u, 31u));
+    r11_ = (32u >= 32u) ? 0u : (2147483649u >> metal::min(32u, 31u));
+    r12_ = as_type<uint>(as_type<int>(2147483648u) >> metal::min(31u, 31u));
+    r13_ = as_type<uint>(as_type<int>(2147483648u) >> metal::min(32u, 31u));
+    r14_ = as_type<uint>(as_type<int>(1073741824u) >> metal::min(100u, 31u));
+    bool _e119 = 0u == 0u;
+    r15_ = _e119 ? 4294967295u : naga_div(7u, _e119 ? 1u : 0u);
+    bool _e129 = 2u == 0u;
+    r16_ = _e129 ? 4294967295u : naga_div(7u, _e129 ? 1u : 2u);
+    bool _e139 = 0u == 0u;
+    r17_ = _e139 ? 4294967295u : as_type<uint>(naga_div(as_type<int>(7u), as_type<int>(_e139 ? 1u : 0u)));
+    bool _e152 = 4294967295u == 0u;
+    r18_ = _e152 ? 4294967295u : as_type<uint>(naga_div(as_type<int>(2147483648u), as_type<int>(_e152 ? 1u : 4294967295u)));
+    bool _e165 = 2u == 0u;
+    r19_ = _e165 ? 4294967295u : as_type<uint>(naga_div(as_type<int>(4294967289u), as_type<int>(_e165 ? 1u : 2u)));
+    r20_ = 65280u & 4080u;
+    r21_ = 65280u | 4080u;
+    r22_ = 65280u ^ 4080u;
+    r23_ = ~(65280u);
+    uint _e194 = metal::min(4u, 32u);
+    r24_ = metal::extract_bits(4042322160u, metal::min(_e194, 32u), metal::min(metal::min(8u, 32u - _e194), 32u - metal::min(_e194, 32u)));
+    uint _e203 = metal::min(30u, 32u);
+    r25_ = metal::extract_bits(4026531840u, metal::min(_e203, 32u), metal::min(metal::min(4u, 32u - _e203), 32u - metal::min(_e203, 32u)));
+    uint _e212 = metal::min(32u, 32u);
+    r26_ = metal::extract_bits(4294967295u, metal::min(_e212, 32u), metal::min(metal::min(4u, 32u - _e212), 32u - metal::min(_e212, 32u)));
+    uint _e221 = metal::min(0u, 32u);
+    r27_ = metal::extract_bits(305419896u, metal::min(_e221, 32u), metal::min(metal::min(33u, 32u - _e221), 32u - metal::min(_e221, 32u)));
+    uint _e230 = metal::min(4u, 32u);
+    r28_ = metal::extract_bits(4294967295u, metal::min(_e230, 32u), metal::min(metal::min(0u, 32u - _e230), 32u - metal::min(_e230, 32u)));
+    uint _e239 = metal::min(31u, 32u);
+    uint _e244 = metal::min(4u, 32u);
+    uint _e247 = metal::min(32u - _e244, 31u);
+    r29_ = (_e244 == 0u) ? 0u : as_type<uint>(as_type<int>(metal::extract_bits(2147483648u, metal::min(_e239, 32u), metal::min(metal::min(4u, 32u - _e239), 32u - metal::min(_e239, 32u))) << _e247) >> _e247);
+    uint _e260 = metal::min(4u, 32u);
+    uint _e265 = metal::min(4u, 32u);
+    uint _e268 = metal::min(32u - _e265, 31u);
+    r30_ = (_e265 == 0u) ? 0u : as_type<uint>(as_type<int>(metal::extract_bits(240u, metal::min(_e260, 32u), metal::min(metal::min(4u, 32u - _e260), 32u - metal::min(_e260, 32u))) << _e268) >> _e268);
+    uint _e281 = metal::min(0u, 32u);
+    uint _e286 = metal::min(0u, 32u);
+    uint _e289 = metal::min(32u - _e286, 31u);
+    r31_ = (_e286 == 0u) ? 0u : as_type<uint>(as_type<int>(metal::extract_bits(4294967295u, metal::min(_e281, 32u), metal::min(metal::min(0u, 32u - _e281), 32u - metal::min(_e281, 32u))) << _e289) >> _e289);
+    uint _e302 = metal::min(0u, 32u);
+    uint _e307 = metal::min(32u, 32u);
+    uint _e310 = metal::min(32u - _e307, 31u);
+    r32_ = (_e307 == 0u) ? 0u : as_type<uint>(as_type<int>(metal::extract_bits(2147483648u, metal::min(_e302, 32u), metal::min(metal::min(32u, 32u - _e302), 32u - metal::min(_e302, 32u))) << _e310) >> _e310);
+    uint _e323 = metal::min(4u, 32u);
+    uint _e328 = metal::min(40u, 32u);
+    uint _e331 = metal::min(32u - _e328, 31u);
+    r33_ = (_e328 == 0u) ? 0u : as_type<uint>(as_type<int>(metal::extract_bits(240u, metal::min(_e323, 32u), metal::min(metal::min(40u, 32u - _e323), 32u - metal::min(_e323, 32u))) << _e331) >> _e331);
+    uint _e345 = metal::min(4u, 32u);
+    r34_ = metal::insert_bits(4294967295u, 0u, metal::min(_e345, 32u), metal::min(metal::min(8u, 32u - _e345), 32u - metal::min(_e345, 32u)));
+    uint _e355 = metal::min(28u, 32u);
+    r35_ = metal::insert_bits(0u, 255u, metal::min(_e355, 32u), metal::min(metal::min(8u, 32u - _e355), 32u - metal::min(_e355, 32u)));
+    uint _e365 = metal::min(32u, 32u);
+    r36_ = metal::insert_bits(0u, 255u, metal::min(_e365, 32u), metal::min(metal::min(8u, 32u - _e365), 32u - metal::min(_e365, 32u)));
+    uint _e375 = metal::min(0u, 32u);
+    r37_ = metal::insert_bits(0u, 4294967295u, metal::min(_e375, 32u), metal::min(metal::min(40u, 32u - _e375), 32u - metal::min(_e375, 32u)));
+    r38_ = metal::reverse_bits(1u);
+    r39_ = metal::popcount(61680u);
+    r40_ = metal::select(31 - metal::clz(0u), uint(-1), 0u == 0);
+    r41_ = metal::select(31 - metal::clz(2147483648u), uint(-1), 2147483648u == 0);
+    int _e393 = as_type<int>(0u);
+    r42_ = as_type<uint>(metal::select(31 - metal::clz(metal::select(_e393, ~_e393, _e393 < 0)), int(-1), _e393 == 0 || _e393 == -1));
+    int _e398 = as_type<int>(4294967295u);
+    r43_ = as_type<uint>(metal::select(31 - metal::clz(metal::select(_e398, ~_e398, _e398 < 0)), int(-1), _e398 == 0 || _e398 == -1));
+    int _e403 = as_type<int>(2147483648u);
+    r44_ = as_type<uint>(metal::select(31 - metal::clz(metal::select(_e403, ~_e403, _e403 < 0)), int(-1), _e403 == 0 || _e403 == -1));
+    int _e408 = as_type<int>(5u);
+    r45_ = as_type<uint>(metal::select(31 - metal::clz(metal::select(_e408, ~_e408, _e408 < 0)), int(-1), _e408 == 0 || _e408 == -1));
+    r46_ = as_type<uint>(metal::min(as_type<int>(4294967295u), as_type<int>(1u)));
+    r47_ = as_type<uint>(metal::max(as_type<int>(4294967295u), as_type<int>(1u)));
+    r48_ = metal::min(4294967295u, 1u);
+    r49_ = metal::max(4294967295u, 1u);
+    r50_ = as_type<uint>(metal::min(metal::max(as_type<int>(4294967291u), as_type<int>(4294967293u)), as_type<int>(10u)));
+    r51_ = metal::min(metal::max(5u, 10u), 3u);
+    r52_ = (as_type<int>(4294967295u) < as_type<int>(1u)) ? 1u : 0u;
+    r53_ = (4294967295u < 1u) ? 1u : 0u;
+    r54_ = (as_type<int>(2147483648u) <= as_type<int>(2147483648u)) ? 1u : 0u;
+    r55_ = (as_type<int>(1u) > as_type<int>(4294967295u)) ? 1u : 0u;
+    r56_ = (1u >= 4294967295u) ? 1u : 0u;
+    r57_ = (4294967295u <= 1u) ? 1u : 0u;
+    r58_ = (as_type<int>(4294967295u) >= as_type<int>(1u)) ? 1u : 0u;
+    r59_ = (4294967295u > 1u) ? 1u : 0u;
+    r60_ = (3u == 3u) ? 1u : 0u;
+    r61_ = (3u != 3u) ? 1u : 0u;
+    bool _e530 = false || true;
+    bool _e532 = _e530 != true;
+    r62_ = ((!(_e532) && _e530) ? _e532 : _e530) ? 1u : 2u;
+    return;
+}

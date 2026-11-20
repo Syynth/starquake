@@ -2424,3 +2424,4 @@ fn a_present_with_no_space_and_a_bad_format_is_no_present_space() {
 
 // Clears through the executor (slice G24).
 mod clear;
+mod report;

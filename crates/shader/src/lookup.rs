@@ -1,14 +1,16 @@
 //! What the GPU crate's back thread uses to ask for shaders (`docs/specs/shader-pipeline.md`,
 //! "What the GPU front/back protocol and engine state (#12) gets"; port slice 9).
 //!
-//! The shader cache that takes these, `ShaderCache` with its `lookup`, `invalidate` and
-//! `tracked_ranges`, is port slice 19 and is not built yet. This module defines only the types
-//! GPU slice G18 compiles against, with the names of the spec's sketch: [`GuestStage`],
+//! The shader cache that takes these, [`crate::cache::ShaderCache`] with its `lookup`, `wait`,
+//! `invalidate` and `tracked_ranges`, is port slice 19; its lookups answer
+//! [`crate::cache::CacheLookup`], shaped after G18's seam (owner's ruling 11 of 2026-11-19).
+//! This module defines the types GPU slice G18 compiles against, with the names of the spec's
+//! sketch: [`GuestStage`],
 //! [`ProgramRequest`], [`ProgramMemory`], the answering side [`EngineState`] (defined with the
 //! exchange in [`crate::exchange`] and re-exported here), the variant key [`VariantKey`]
 //! ([`crate::variant`]), and the result of a lookup, [`Lookup`]: [`Lookup::Ready`] with a
 //! [`ShaderSet`], [`Lookup::Pending`] with a [`Ticket`], or [`Lookup::Rejected`] with a
-//! [`Rejection`]. Until slice 19, G18 drives a fake cache that returns these.
+//! [`Rejection`]. G18's fake cache returns these.
 
 use std::sync::Arc;
 

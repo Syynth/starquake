@@ -7,7 +7,7 @@ use proptest::test_runner::{Config, RngSeed};
 
 use crate::decode::{
     AluSrc, CBuf, CBufRef, Form, GROUP_HOOKS, GROUPS, Gpr, Instr, Instruction, OPCODE, Pred,
-    PredSrc, UniformReg,
+    PredSrc, ReferenceRow, UniformReg,
 };
 
 /// A fixed seed keeps every property test deterministic.
@@ -27,6 +27,27 @@ pub(crate) fn forms() -> Vec<(u16, u128, u128)> {
         .flat_map(|group| group.iter())
         .map(|form| (form.opcode, form.known, form.fixed))
         .collect()
+}
+
+/// The form of `opcode` and PR #4588's row for it, from the group that lists the form (each
+/// group's rows are in its `FORMS` order: `forms_have_distinct_opcodes_and_lookup_finds_each`).
+pub(crate) fn form_and_row(opcode: u16) -> (&'static Form, &'static ReferenceRow) {
+    GROUPS
+        .iter()
+        .zip(&GROUP_HOOKS)
+        .find_map(|(forms, hooks)| {
+            let index = forms.iter().position(|form| form.opcode == opcode)?;
+            Some((forms.get(index)?, hooks.reference_rows.get(index)?))
+        })
+        .expect("a decoded form's opcode")
+}
+
+/// The canonical word of the form of `opcode`: the opcode, the form's fixed bits, and the
+/// fields its row's [`ReferenceRow::canonical`] sets. Every form decodes its canonical word
+/// (`decode::tests::framework::canonical_words_decode`).
+pub(crate) fn canonical_word(opcode: u16) -> Instruction {
+    let (form, row) = form_and_row(opcode);
+    Instruction::from_bits(form.fixed | row.canonical).with_field(OPCODE, u64::from(opcode))
 }
 
 /// A word of one of the [`forms`]: its opcode and fixed bits, random bits wherever the form

@@ -31,6 +31,9 @@
 //!
 //! - [`cb_load`]: constant-buffer loads (slice G25): `LOAD_CONSTANT_BUFFER` words written to
 //!   guest memory at the selected buffer's address plus the upload offset.
+//!
+//! - [`report`]: the 3D class's report semaphore: a `SET_REPORT_SEMAPHORE_D` write that reports
+//!   no counter releases its payload, as a fenced release.
 
 pub mod buffer;
 pub mod cb_load;
@@ -41,5 +44,6 @@ pub mod fence;
 pub mod pipeline;
 pub mod qmd;
 pub mod readback;
+pub mod report;
 pub mod state;
 pub mod texture;

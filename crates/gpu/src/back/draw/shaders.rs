@@ -464,6 +464,7 @@ pub const fn host_stage(stage: HostStage) -> ShaderStage {
     match stage {
         HostStage::Vertex => ShaderStage::Vertex,
         HostStage::Fragment => ShaderStage::Fragment,
+        HostStage::Compute => ShaderStage::Compute,
     }
 }
 
