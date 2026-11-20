@@ -258,53 +258,53 @@ mod support {
         assert_eq!(summary["exit_code"], 2);
         summary["message"].as_str().unwrap().to_owned()
     }
+
+    /// How long a test here waits for a `run --window` it started on a thread of its own.
+    const REFUSAL_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// `run --window` of the hello program in the scratch folder `name`, by `execute` on a thread
+    /// named `thread` (not the process's main thread in either test harness), is refused before
+    /// anything runs, as an emulator error with the exact words, exit code 2 and the artifacts
+    /// written.
+    pub(crate) fn assert_refused_off_the_main_thread(name: &str, thread: &str) {
+        let folder = scratch(name);
+        let hello = folder.join("hello.nro");
+        std::fs::write(&hello, programs::hello().unwrap()).unwrap();
+        let artifacts = folder.join("artifacts");
+        let line: Vec<OsString> = vec![
+            "starquake".into(),
+            "run".into(),
+            hello.into(),
+            "--window".into(),
+            "--artifacts".into(),
+            artifacts.clone().into(),
+        ];
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name(thread.to_owned())
+            .spawn(move || {
+                let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+                let code = execute(&line, &mut stdout, &mut stderr);
+                done.send((code, stdout)).unwrap();
+            })
+            .unwrap();
+        // A run that panicked drops the sender: `recv_timeout` then fails at once.
+        let (code, stdout) = finished.recv_timeout(REFUSAL_WAIT).unwrap();
+        let stdout = String::from_utf8(stdout).unwrap();
+        assert_eq!(code, exit_code::EMULATOR_ERROR, "{stdout}");
+        assert_eq!(
+            stdout,
+            format!(
+                "starquake: emulator error: {NOT_MAIN_THREAD} (exit code 2); artifacts in {}\n",
+                artifacts.display()
+            )
+        );
+        assert_eq!(summary_error(&artifacts), NOT_MAIN_THREAD);
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
 }
 
-use support::{scratch, summary_error};
-
-/// How long a test here waits for a `run --window` it started on a thread of its own.
-const REFUSAL_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// `run --window` of the hello program in the scratch folder `name`, by `execute` on a thread
-/// named `thread` (not the process's main thread in either test harness), is refused before
-/// anything runs, as an emulator error with the exact words, exit code 2 and the artifacts
-/// written.
-fn assert_refused_off_the_main_thread(name: &str, thread: &str) {
-    let folder = scratch(name);
-    let hello = folder.join("hello.nro");
-    std::fs::write(&hello, programs::hello().unwrap()).unwrap();
-    let artifacts = folder.join("artifacts");
-    let line: Vec<OsString> = vec![
-        "starquake".into(),
-        "run".into(),
-        hello.into(),
-        "--window".into(),
-        "--artifacts".into(),
-        artifacts.clone().into(),
-    ];
-    let (done, finished) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
-        .name(thread.to_owned())
-        .spawn(move || {
-            let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-            let code = execute(&line, &mut stdout, &mut stderr);
-            done.send((code, stdout)).unwrap();
-        })
-        .unwrap();
-    // A run that panicked drops the sender: `recv_timeout` then fails at once.
-    let (code, stdout) = finished.recv_timeout(REFUSAL_WAIT).unwrap();
-    let stdout = String::from_utf8(stdout).unwrap();
-    assert_eq!(code, exit_code::EMULATOR_ERROR, "{stdout}");
-    assert_eq!(
-        stdout,
-        format!(
-            "starquake: emulator error: {NOT_MAIN_THREAD} (exit code 2); artifacts in {}\n",
-            artifacts.display()
-        )
-    );
-    assert_eq!(summary_error(&artifacts), NOT_MAIN_THREAD);
-    std::fs::remove_dir_all(&folder).unwrap();
-}
+use support::assert_refused_off_the_main_thread;
 
 /// `run --window` from a thread that is not the process's main thread (a test's) is refused
 /// before anything runs. It needs no VM, so it runs on every host.
@@ -336,6 +336,7 @@ fn a_thread_named_main_is_still_refused_the_window() {
 #[test]
 fn a_host_with_no_display_ends_the_run_before_it_starts() {
     use starquake::window::NO_WINDOW;
+    use support::{scratch, summary_error};
 
     if !WGPU_BUILT {
         return;
