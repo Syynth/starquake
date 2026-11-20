@@ -1,0 +1,120 @@
+---
+source: crates/shader/src/lower/tests/ops.rs
+expression: msl(&shader)
+---
+// language: metal2.4
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using metal::uint;
+
+
+[[max_total_threads_per_threadgroup(1)]] kernel void main_(
+) {
+    uint r0_ = {};
+    uint r1_ = {};
+    uint r2_ = {};
+    uint r3_ = {};
+    uint r4_ = {};
+    uint r5_ = {};
+    uint r6_ = {};
+    uint r7_ = {};
+    uint r8_ = {};
+    uint r9_ = {};
+    uint r10_ = {};
+    uint r11_ = {};
+    uint r12_ = {};
+    uint r13_ = {};
+    uint r14_ = {};
+    uint r15_ = {};
+    uint r16_ = {};
+    uint r17_ = {};
+    uint r18_ = {};
+    uint r19_ = {};
+    uint r20_ = {};
+    uint r21_ = {};
+    uint r22_ = {};
+    uint r23_ = {};
+    uint r24_ = {};
+    uint r25_ = {};
+    uint r26_ = {};
+    uint r27_ = {};
+    uint r28_ = {};
+    uint r29_ = {};
+    uint r30_ = {};
+    uint r31_ = {};
+    uint r32_ = {};
+    uint r33_ = {};
+    uint r34_ = {};
+    uint r35_ = {};
+    uint r36_ = {};
+    uint r37_ = {};
+    uint r38_ = {};
+    uint r39_ = {};
+    uint r40_ = {};
+    uint r41_ = {};
+    uint r42_ = {};
+    uint r43_ = {};
+    uint r44_ = {};
+    r0_ = as_type<uint>(1.5 + 2.25);
+    r1_ = as_type<uint>(1.5 * -2.0);
+    r2_ = as_type<uint>(metal::fma(2.0, 3.0, 1.0));
+    r3_ = as_type<uint>(-(2.0));
+    r4_ = as_type<uint>(metal::abs(-2.0));
+    r5_ = as_type<uint>(metal::isnan(2.0) ? 1.0 : (metal::isnan(1.0) ? 2.0 : metal::max(1.0, 2.0)));
+    r6_ = as_type<uint>(metal::isnan(2.0) ? 1.0 : (metal::isnan(1.0) ? 2.0 : metal::min(1.0, 2.0)));
+    float _e43 = as_type<float>(2143289344u);
+    r7_ = as_type<uint>(metal::isnan(1.0) ? _e43 : (metal::isnan(_e43) ? 1.0 : metal::max(_e43, 1.0)));
+    float _e54 = as_type<float>(2143289344u);
+    r8_ = as_type<uint>(metal::isnan(_e54) ? 1.0 : (metal::isnan(1.0) ? _e54 : metal::min(1.0, _e54)));
+    float _e69 = metal::isnan(0.0) ? 5.0 : (metal::isnan(5.0) ? 0.0 : metal::max(5.0, 0.0));
+    r9_ = as_type<uint>(metal::isnan(1.0) ? _e69 : (metal::isnan(_e69) ? 1.0 : metal::min(_e69, 1.0)));
+    float _e78 = as_type<float>(2143289344u);
+    float _e85 = metal::isnan(0.25) ? _e78 : (metal::isnan(_e78) ? 0.25 : metal::max(_e78, 0.25));
+    r10_ = as_type<uint>(metal::isnan(1.0) ? _e85 : (metal::isnan(_e85) ? 1.0 : metal::min(_e85, 1.0)));
+    r11_ = as_type<uint>(metal::saturate(2.0));
+    r12_ = as_type<uint>(1.0 / 2.0);
+    r13_ = as_type<uint>(1.0 / 0.0);
+    r14_ = as_type<uint>(metal::sqrt(4.0));
+    r15_ = as_type<uint>(metal::rsqrt(4.0));
+    r16_ = as_type<uint>(metal::exp2(3.0));
+    r17_ = as_type<uint>(metal::log2(8.0));
+    r18_ = as_type<uint>(metal::sin(0.0));
+    r19_ = as_type<uint>(metal::cos(0.0));
+    r20_ = as_type<uint>(metal::rint(2.5));
+    r21_ = as_type<uint>(metal::rint(3.5));
+    r22_ = as_type<uint>(metal::floor(-1.5));
+    r23_ = as_type<uint>(metal::ceil(-1.5));
+    r24_ = as_type<uint>(metal::trunc(-1.5));
+    r25_ = (!((metal::isnan(1.0) || metal::isnan(1.0))) && (1.0 == 1.0)) ? 1u : 0u;
+    float _e164 = as_type<float>(2143289344u);
+    float _e166 = as_type<float>(2143289344u);
+    r26_ = (!((metal::isnan(_e164) || metal::isnan(_e166))) && (_e164 == _e166)) ? 1u : 0u;
+    float _e178 = as_type<float>(2143289344u);
+    r27_ = ((metal::isnan(_e178) || metal::isnan(1.0)) || (_e178 == 1.0)) ? 1u : 0u;
+    float _e190 = as_type<float>(2143289344u);
+    r28_ = (!((metal::isnan(_e190) || metal::isnan(1.0))) && (_e190 != 1.0)) ? 1u : 0u;
+    r29_ = (!((metal::isnan(2.0) || metal::isnan(1.0))) && (2.0 != 1.0)) ? 1u : 0u;
+    float _e215 = as_type<float>(2143289344u);
+    r30_ = ((metal::isnan(_e215) || metal::isnan(1.0)) || (_e215 != 1.0)) ? 1u : 0u;
+    r31_ = ((metal::isnan(1.0) || metal::isnan(1.0)) || (1.0 != 1.0)) ? 1u : 0u;
+    r32_ = (!((metal::isnan(1.0) || metal::isnan(2.0))) && (1.0 < 2.0)) ? 1u : 0u;
+    float _e250 = as_type<float>(2143289344u);
+    r33_ = (!((metal::isnan(_e250) || metal::isnan(2.0))) && (_e250 < 2.0)) ? 1u : 0u;
+    float _e263 = as_type<float>(2143289344u);
+    r34_ = ((metal::isnan(_e263) || metal::isnan(2.0)) || (_e263 < 2.0)) ? 1u : 0u;
+    r35_ = ((metal::isnan(3.0) || metal::isnan(2.0)) || (3.0 < 2.0)) ? 1u : 0u;
+    float _e287 = as_type<float>(2143289344u);
+    r36_ = ((metal::isnan(1.0) || metal::isnan(_e287)) || (1.0 > _e287)) ? 1u : 0u;
+    r37_ = (!((metal::isnan(2.0) || metal::isnan(2.0))) && (2.0 <= 2.0)) ? 1u : 0u;
+    float _e310 = as_type<float>(2143289344u);
+    r38_ = ((metal::isnan(_e310) || metal::isnan(2.0)) || (_e310 <= 2.0)) ? 1u : 0u;
+    r39_ = (!((metal::isnan(1.0) || metal::isnan(2.0))) && (1.0 >= 2.0)) ? 1u : 0u;
+    float _e334 = as_type<float>(2143289344u);
+    r40_ = ((metal::isnan(_e334) || metal::isnan(2.0)) || (_e334 >= 2.0)) ? 1u : 0u;
+    r41_ = (!((metal::isnan(3.0) || metal::isnan(2.0))) && (3.0 > 2.0)) ? 1u : 0u;
+    r42_ = metal::isnan(as_type<float>(2143289344u)) ? 1u : 0u;
+    r43_ = metal::isnan(1.0) ? 1u : 0u;
+    r44_ = as_type<uint>(true ? 1.0 : 2.0);
+    return;
+}

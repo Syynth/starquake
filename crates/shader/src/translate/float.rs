@@ -106,9 +106,26 @@
 //! `tests::more_conversion_refusals_report_in_the_prs_order`,
 //! `tests::i2f_source_size_comes_before_the_select` and `tests::the_bank_is_checked_last`;
 //! each instruction's bank check refusing on its own, with the bank one below accepted, by
-//! `tests::each_bank_check_refuses_on_its_own`. Two of the PR's checks cannot fail on a decoded
+//! `tests::each_bank_check_refuses_on_its_own`. Three of the PR's checks cannot fail on a decoded
 //! instruction and are not repeated: `Require(set_op <= 2)` of `FSET` and `FSETP`
-//! ([`PredSetOp`] has three variants), and `F2I`'s `Ignore(77, 1)` is not a check.
+//! ([`PredSetOp`] has three variants), `FMUL`'s `Require(scale >= 1 && scale <= 7)` ("native
+//! FMUL scale": [`FMulScale`] has no scale 0, which the decoder refuses since slice 4b), and
+//! the conversions' size checks for a size of 0 ([`FloatType`] has none, refused by the decoder
+//! likewise); `F2I`'s `Ignore(77, 1)` is not a check.
+//!
+//! # High halves
+//!
+//! The decoder sets an operation's `high` (bit 60, NAK's swizzle; slice 4b) only for a 16-bit
+//! operand. `MUFU.F16` and `F2I` from a half read it as the PR reads `Take(60, 1)`
+//! (`ops_float.cpp`, `MUFU`; `ops_convert.cpp`, `F2I`), in every form that has the bit: the
+//! register form translates it, and the constant-buffer and uniform forms are refused by
+//! [`FloatUnsupported::HalfMufuSource`] and [`FloatUnsupported::HalfF2iSource`] before it is
+//! read (`tests::convert::high_halves_beyond_registers_are_refused`). `F2F` and `FRND` refuse a
+//! 16-bit source by their source-size checks (the PR's `Take(84, 2) == 2`), so their `high` is
+//! never translated (`tests::convert::f2f_and_frnd_high_halves_are_refused`). A hand-made
+//! 32-bit operand with `high` set, which the decoder never produces, is read as its whole word
+//! by all four, as the PR reads one (it takes bit 60 only for a half;
+//! `tests::convert::a_32_bit_operand_ignores_high`).
 //!
 //! # Divergences from PR #4588
 //!
@@ -138,9 +155,13 @@
 //! range instead would be a listed divergence.
 //!
 //! Where the decoder reads more than the PR translates, this module refuses what the PR
-//! refuses, as a listed choice: `FMUL`'s scale 0 ([`FloatUnsupported::FmulScale`]), the 8-bit
-//! float size ([`FloatUnsupported::F2iSourceSize`] and its siblings), the 64-bit conversion
-//! opcodes, which `Visitor::Run` sends to no translator ([`FloatUnsupported::WideConversion`]),
+//! refuses, as a listed choice: the float sizes the PR does not convert, which are 64 bits and
+//! some 16-bit sizes (an `F2I` source of 64 bits, [`FloatUnsupported::F2iSourceSize`]; an
+//! `FRND` source or destination of 16 or 64 bits, [`FloatUnsupported::FrndSourceSize`] and
+//! [`FloatUnsupported::FrndDestinationSize`]; an `F2F` source of 16 or 64 bits or destination
+//! of 32 or 64 bits, [`FloatUnsupported::F2fSourceSize`] and
+//! [`FloatUnsupported::F2fDestinationSize`]; an `I2F` destination of 16 or 64 bits,
+//! [`FloatUnsupported::I2fDestinationSize`]), the 64-bit conversion opcodes, which `Visitor::Run` sends to no translator ([`FloatUnsupported::WideConversion`]),
 //! `MUFU`'s immediate form `0x908`, which it sends nowhere either
 //! ([`FloatUnsupported::MufuImmediate`]), `MUFU.RCP64H`, `.RSQ64H` and `.TANH`, and the
 //! `FSWZADD` operations other than the PR's two
@@ -166,7 +187,7 @@ use crate::decode::{
 use crate::flow::read_pred;
 use crate::ir::{
     BuildError, Builder, Flags, FmzMode, FpControl, FpRounding, Function, Imm, Inst, Opcode,
-    Operand, Terminator,
+    Operand,
 };
 
 /// The number of constant-buffer banks a source may name: the PR refuses `cbuf_index >= 32`
@@ -249,10 +270,6 @@ pub enum FloatUnsupported {
     /// `FMUL`'s multiply-by-zero mode (`ops_float.cpp`: "native FMUL multiply-zero mode").
     #[error("fmul's multiply-by-zero mode")]
     FmulMultiplyZero,
-    /// An `FMUL` scale outside 1 to 7 (`ops_float.cpp`: "native FMUL scale", `scale >= 1 &&
-    /// scale <= 7`): only scale 0.
-    #[error("fmul scale {0}")]
-    FmulScale(FMulScale),
     /// A scaled `FMUL` without `.FTZ` or with a rounding other than to nearest
     /// (`ops_float.cpp`: "native FMUL scale with non-FTZ or non-RN modifiers").
     #[error("a scaled fmul without ftz or with a rounding mode")]
@@ -412,22 +429,9 @@ pub fn translate_instr(
     guard_tested: bool,
 ) -> Result<(), FloatError> {
     check(&instr.op)?;
-    if guard_tested || instr.guard.is_true() {
-        return Emit { b: builder }.op(&instr.op);
-    }
-    let cond = read_pred(builder, instr.guard)?;
-    let then = builder.add_block()?;
-    let after = builder.add_block()?;
-    builder.terminate(Terminator::Branch {
-        cond,
-        then,
-        otherwise: after,
-    })?;
-    builder.switch_to(then)?;
-    Emit { b: builder }.op(&instr.op)?;
-    builder.terminate(Terminator::Jump(after))?;
-    builder.switch_to(after)?;
-    Ok(())
+    super::conditional_block(builder, instr.guard, guard_tested, |b| {
+        Emit { b }.op(&instr.op)
+    })
 }
 
 /// Whether `function` uses a quad operation of this group (`FSwizzleAdd`, from `FSWZADD`), so
@@ -534,10 +538,6 @@ fn check(op: &Op) -> Result<(), FloatUnsupported> {
         Op::FMul(op) => {
             check_sources(&op.srcs)?;
             require(!op.dnz, FloatUnsupported::FmulMultiplyZero)?;
-            require(
-                op.scale != FMulScale::D16,
-                FloatUnsupported::FmulScale(op.scale),
-            )?;
             require(
                 op.scale == FMulScale::None || (op.ftz && op.rnd == RoundMode::NearestEven),
                 FloatUnsupported::FmulScaleModifiers,

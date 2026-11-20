@@ -265,10 +265,12 @@ fn resources(module: &Module, info: &ModuleInfo) -> Vec<ResourceBinding> {
             },
             other => unreachable!("no helper shader binds {other:?} yet: teach this test the kind"),
         };
+        // A binding array's type is none of the kinds above, so every row found is one resource.
         found.push(ResourceBinding {
             group: binding.group,
             binding: binding.binding,
             kind,
+            count: None,
         });
     }
     found

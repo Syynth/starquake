@@ -7,7 +7,7 @@
 //! the E1 table), and one rule for every pipeline keeps the layouts the GPU crate's bindings
 //! (slice R7) are made against in one place.
 //!
-//! # From the interface, with two facts from the module
+//! # From the interface, with one fact from the module
 //!
 //! Each resource row becomes one layout entry at its group and binding, visible to every stage
 //! whose interface lists it. Its type follows the row's kind:
@@ -20,9 +20,12 @@
 //! | `StorageTexture { dimension, format, writable }` | storage texture of that dimension and format: read-only unless `writable`; write-only when the module declares the global store-only, read-write otherwise ([`super::scan`]) |
 //! | `Sampler { comparison }` | comparison sampler, or a filtering sampler unless one of its stages samples a texture that cannot be filtered with it (below) |
 //!
-//! A row whose global the module declares as a binding array gets the array's size as the
-//! entry's `count` ([`super::scan`]); a binding array whose size is not a constant is refused
-//! ([`UNSIZED_BINDING_ARRAY`]). A 1D-array texture binding is refused ([`ONE_D_ARRAY`]: wgpu has
+//! Each row's array count ([`starquake_render::ResourceBinding::count`]) is the entry's `count`:
+//! the interface carries it, so the layout does not read it from the module (render-backend,
+//! "Shader emission"; decided by the owner, 2026-11-19, ruling 20). The pipeline checks that the
+//! module agrees before planning (`crate::pipeline::agreement`, which refuses a binding array
+//! whose size is not a constant with [`UNSIZED_BINDING_ARRAY`]). A 1D-array texture binding is
+//! refused ([`ONE_D_ARRAY`]: wgpu has
 //! no such view, as `crate::convert::view_dimension` says), and so is a storage texture whose
 //! format has no wgpu form ([`STORAGE_FORMAT`]), which the shared checks refuse first on a device
 //! built from wgpu's own format support.
@@ -54,7 +57,7 @@
 //! - A storage texture format's read-write support: a read-write entry in a format the device
 //!   cannot read and write fails the pipeline the same way.
 
-use super::scan::{ArrayCount, ModuleFacts};
+use super::scan::ModuleFacts;
 use crate::convert::view_dimension;
 use crate::format::texture_format;
 use starquake_render::RenderError;
@@ -66,7 +69,8 @@ use wgpu::naga;
 /// Two stages of a pipeline bind one group and binding as different resources.
 pub const STAGE_CONFLICT: &str =
     "two stages of a pipeline bind one group and binding as different resources";
-/// A binding array whose size is not a constant.
+/// A binding array whose size is not a constant, in a shader's module (refused by the pipeline's
+/// interface check, `crate::pipeline::agreement`).
 pub const UNSIZED_BINDING_ARRAY: &str =
     "the wgpu backend needs a binding array's size to be a constant";
 /// A 1D-array texture binding.
@@ -74,7 +78,8 @@ pub const ONE_D_ARRAY: &str = "wgpu has no 1D array texture bindings";
 /// A storage texture in a format with no wgpu form.
 pub const STORAGE_FORMAT: &str = "a storage texture's format has no wgpu form";
 
-/// One stage's part of a pipeline: where it runs, its interface and what its module says.
+/// One stage's part of a pipeline: where it runs, its interface and what its module says (the
+/// layout reads only each storage texture's access from it).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Stage<'a> {
     /// The wgpu stage.
@@ -154,21 +159,18 @@ fn binding_type(kind: ResourceKind, write_only: bool) -> Result<wgpu::BindingTyp
     })
 }
 
-/// Merges the stages' interfaces into layouts (module docs). Rows are taken stage by stage, each
-/// in table order; the first refusal found is returned.
+/// Merges the stages' interfaces into layouts (module docs). Rows are merged stage by stage, each
+/// in table order, and a conflict between stages ([`STAGE_CONFLICT`]) is refused as it is
+/// found; then each merged row's binding type is made in group and binding order, and the first
+/// that cannot be ([`ONE_D_ARRAY`], [`STORAGE_FORMAT`]) is refused. The caller has checked each
+/// stage's interface against its module (`crate::pipeline::agreement`).
 pub(crate) fn plan(stages: &[Stage<'_>]) -> Result<LayoutPlan, RenderError> {
     let mut rows: BTreeMap<(u32, u32), Row> = BTreeMap::new();
     for stage in stages {
         for r in &stage.interface.resources {
             let slot = (r.group, r.binding);
             let facts = stage.facts.bindings.get(&slot);
-            let count = match facts.map(|f| f.count) {
-                None | Some(ArrayCount::Single) => None,
-                Some(ArrayCount::Sized(n)) => Some(n),
-                Some(ArrayCount::Unsized) => {
-                    return Err(RenderError::Unsupported(UNSIZED_BINDING_ARRAY));
-                }
-            };
+            let count = r.count;
             let write_only = facts.is_some_and(|f| f.write_only);
             match rows.get_mut(&slot) {
                 Some(row) if row.kind == r.kind && row.count == count => {

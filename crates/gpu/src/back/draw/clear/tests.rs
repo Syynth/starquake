@@ -455,6 +455,35 @@ const ONLY_DEPTH_STENCIL: Cleared = Cleared {
     depth_stencil: Some(Part::Cleared),
 };
 
+/// The clear shaders need nothing beyond the baseline: the clear module validates with no naga
+/// capabilities (so it needs none of the capabilities `ShaderRequirements` mirrors, such as
+/// `Capabilities::SUBGROUP`), and every entry point's interface says so. A subgroup requirement
+/// set here would have every clear pipeline refused for the subgroup size on a device that
+/// cannot promise 32.
+#[test]
+fn the_clear_shaders_require_nothing_beyond_the_baseline() {
+    assert!(
+        clear_module().is_ok(),
+        "the clear module needs no capability"
+    );
+    let entries = [
+        Entry::Vertex,
+        Entry::Float,
+        Entry::Sint,
+        Entry::Uint,
+        Entry::Depth,
+    ];
+    assert_eq!(entries.len(), Entry::COUNT);
+    for entry in entries {
+        assert_eq!(
+            entry.interface().requirements,
+            ShaderRequirements::default(),
+            "{}",
+            entry.name()
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Registers and decoding.
 

@@ -502,9 +502,17 @@ impl<C: HostClock + Clone> RunClock<C> {
         self.rate.ticks_at(self.host_now())
     }
 
-    /// The other copy of the clock, for the environment.
+    /// Another copy of the clock, sharing its zero, for the environment.
     fn for_environment(&self) -> C {
         lock(&self.clock).clone()
+    }
+
+    /// Another copy of the clock, sharing its zero, for the GPU's release timestamps
+    /// (`machine/gpu.rs`, "The GPU's clocks"): a clock that counts its own readings starts from
+    /// this copy's state. [`Machine::start`] hands it to the GPU.
+    #[must_use]
+    pub(crate) fn for_gpu(&self) -> C {
+        self.for_environment()
     }
 }
 
@@ -1183,6 +1191,7 @@ impl<'a, V: Vcpu, C: HostClock + Clone> Machine<'a, V, C> {
             session.gpu_memory.as_ref(),
             session.options.until_frames,
             wake,
+            session.clock.for_gpu(),
         );
         let (graphics, dumps) = match built {
             Ok(built) => built,

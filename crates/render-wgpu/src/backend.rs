@@ -596,7 +596,7 @@ impl WgpuBackend {
     }
 
     /// Whether the device runs subgroup operations in vertex shaders
-    /// (`wgpu::Features::SUBGROUP_VERTEX`), so a pipeline whose vertex shader uses subgroups is
+    /// (`wgpu::Features::SUBGROUP_VERTEX`), so a pipeline whose vertex shader requires subgroups is
     /// accepted (`crate::pipeline`, "Requirements").
     pub fn honours_vertex_subgroups(&self) -> bool {
         self.subgroups.vertex
@@ -875,6 +875,7 @@ impl Backend for WgpuBackend {
             .map(|id| shader(&state, id))
             .transpose()?;
         let shaders = || std::iter::once(&*vertex).chain(fragment.as_deref());
+        pipelines::check_interfaces(shaders())?;
         pipelines::check_requirements(shaders(), self.subgroups)?;
         let layout = pipelines::plan_layout(shaders())?;
         let plan = pipelines::state::graphics(&desc)?;
@@ -921,6 +922,7 @@ impl Backend for WgpuBackend {
                 .ok_or(RenderError::Invalid(validate::NO_SHADER))
         })?;
         let shader = shader.ok_or(RenderError::Invalid(validate::NO_SHADER))?;
+        pipelines::check_interfaces([&*shader])?;
         pipelines::check_requirements([&*shader], self.subgroups)?;
         let layout = pipelines::plan_layout([&*shader])?;
         let info = PipelineInfo::Compute(layout_info(&layout, &[&*shader]));

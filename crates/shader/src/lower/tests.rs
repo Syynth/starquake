@@ -1,7 +1,15 @@
 //! Lowering tests: the synthetic vertex/pixel pair end to end (golden tables, validation with
 //! this crate's flags and wgpu's, acceptance on a wgpu device), and each lowering error.
 
+mod compute;
+mod memory;
+mod opcodes;
+mod ops;
+mod run;
+mod structured;
+
 use naga::valid::{ValidationFlags, Validator};
+use naga::{ScalarKind, UnaryOperator};
 
 use super::*;
 use crate::asm::assemble_program;
@@ -208,7 +216,14 @@ fn pair_golden_tables() {
             GuestSlot::RenderTarget(0)
         )]
     );
-    assert_eq!(pixel.requirements, Requirements { subgroup: true });
+    assert_eq!(
+        pixel.requirements,
+        Requirements {
+            subgroup: true,
+            ..Requirements::default()
+        }
+    );
+    assert_eq!((vertex.workgroup_size, pixel.workgroup_size), (None, None));
 }
 
 /// The tables describe the module: each argument and output member has the binding its slot
@@ -527,6 +542,46 @@ fn ir(text: &str) -> Function {
     Function::parse(text).expect("parses")
 }
 
+/// The id of the `index`th listed instruction of `function`.
+fn value_at(function: &Function, index: usize) -> Value {
+    function
+        .listed()
+        .nth(index)
+        .map(|(value, _)| value)
+        .expect("listed")
+}
+
+/// Lowers `function` with `inputs`, and checks that the module validates with exactly the
+/// capabilities its requirements name, both with this crate's flags and with wgpu's (every
+/// flag, experiment E1).
+fn lowered(stage: GuestStage, function: &Function, inputs: &LowerInputs) -> HostShader {
+    let shader = lower_with(stage, function, inputs).expect("lowers");
+    let caps = capabilities(shader.requirements);
+    for flags in [validation_flags(), ValidationFlags::all()] {
+        Validator::new(flags, caps)
+            .validate(naga_module(&shader))
+            .expect("valid with this crate's flags and with every flag");
+    }
+    shader
+}
+
+/// The module written as MSL by naga's own writer (what wgpu writes on a Mac), for snapshots.
+fn msl(shader: &HostShader) -> String {
+    let HostCode::Naga { module, info } = &shader.code;
+    let options = naga::back::msl::Options {
+        lang_version: (2, 4),
+        ..naga::back::msl::Options::default()
+    };
+    let (text, _) = naga::back::msl::write_string(
+        module,
+        info,
+        &options,
+        &naga::back::msl::PipelineOptions::default(),
+    )
+    .expect("naga writes the module as MSL");
+    text
+}
+
 /// A pixel function that writes colour output `target`.`component` from a constant.
 fn colour_from_imm(target: u32, component: u32) -> Function {
     ir(&format!(
@@ -590,31 +645,31 @@ fn malformed_or_misplaced_ir_is_refused() {
     );
 }
 
-/// The lowering takes one block that returns: a second block, a structured function or a
-/// return-less block is refused, and so is any operation, phi or argument form it does not
-/// handle yet.
+/// A control-flow graph lowers only as one block that returns or is unreachable; a phi, an
+/// unlowered operation and an argument form the lowering does not handle are refused.
 #[test]
 fn unlowered_forms_are_refused() {
     let refused = |stage, text: &str| lower(stage, &ir(text)).err().map(|error| error.to_string());
     let pixel = GuestStage::Pixel;
-    // The same straight-line body is accepted when it is one block that returns.
+    // One block that returns, or that is unreachable, and the same body structured.
     assert!(lower(pixel, &ir("block0:\n    return\n")).is_ok());
-    let control = Some("control flow other than one block that returns is not lowered yet".into());
+    assert!(lower(pixel, &ir("block0:\n    unreachable\n")).is_ok());
+    assert!(lower(pixel, &ir("block0:\nstructure:\n    block0\n    return\n")).is_ok());
+    let control = Some(
+        "a control-flow graph other than one block that returns must be structured first".into(),
+    );
     assert_eq!(
         refused(pixel, "block0:\n    jump block1\nblock1:\n    return\n"),
         control
     );
-    assert_eq!(refused(pixel, "block0:\n    unreachable\n"), control);
-    assert_eq!(
-        refused(pixel, "block0:\nstructure:\n    block0\n    return\n"),
-        control
-    );
+    // One block that jumps to itself is not one that returns.
+    assert_eq!(refused(pixel, "block0:\n    jump block0\n"), control);
     assert_eq!(
         refused(
             pixel,
-            "block0:\n    %0: f32 = FPAdd32 f32 1.0, f32 2.0\n    return\n"
+            "block0:\n    %0: f64 = FPAdd64 f64 1.0, f64 2.0\n    return\n"
         ),
-        Some("%0: FPAdd32 is not lowered yet".into())
+        Some("%0: FPAdd64 is not lowered yet".into())
     );
     assert_eq!(
         refused(
@@ -627,7 +682,7 @@ fn unlowered_forms_are_refused() {
     // The entry has no predecessors, so a phi there has no incoming values.
     assert_eq!(
         refused(pixel, "block0:\n    %0: u32 = Phi\n    return\n"),
-        Some("%0: phis are not lowered yet".into())
+        Some("%0: phis are not lowered".into())
     );
     let generic_0 = u32::from(GENERIC_0_X) * ATTRIBUTE_WORD_BYTES;
     assert_eq!(
@@ -648,7 +703,7 @@ fn unlowered_forms_are_refused() {
         Some("%1: argument 2 is not an immediate the lowering handles".into())
     );
     // The verifier refuses a value in a name slot, so a register access always names its
-    // register with an immediate; `Identity` itself is not lowered.
+    // register with an immediate; an `Identity` of a name has no value to lower.
     assert_eq!(
         refused(
             GuestStage::Vertex,
@@ -664,7 +719,7 @@ fn unlowered_forms_are_refused() {
             GuestStage::Vertex,
             "block0:\n    %0: opaque = Identity r1\n    return\n"
         ),
-        Some("%0: Identity is not lowered yet".into())
+        Some("%0: argument 0 is not an immediate the lowering handles".into())
     );
     let lane_target = "block0:\n    %0: u32 = LaneId\n    %1: f32 = BitCastF32U32 %0\n";
     assert_eq!(
@@ -887,7 +942,7 @@ fn lower_errors_read_as_words() {
         ),
         (
             LowerError::ControlFlow,
-            "control flow other than one block that returns is not lowered yet",
+            "a control-flow graph other than one block that returns must be structured first",
         ),
         (
             LowerError::Validation("why".into()),

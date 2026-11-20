@@ -180,6 +180,7 @@ pub mod present {
             group: GROUP,
             binding: PARAMS_BINDING,
             kind: ResourceKind::UniformBuffer,
+            count: None,
         },
         ResourceBinding {
             group: GROUP,
@@ -189,11 +190,13 @@ pub mod present {
                 sample: SampleKind::Float { filterable: true },
                 multisampled: false,
             },
+            count: None,
         },
         ResourceBinding {
             group: GROUP,
             binding: SAMPLER_BINDING,
             kind: ResourceKind::Sampler { comparison: false },
+            count: None,
         },
     ];
 
@@ -291,6 +294,7 @@ pub mod clear {
         group: GROUP,
         binding: PARAMS_BINDING,
         kind: ResourceKind::UniformBuffer,
+        count: None,
     }];
 
     /// Vertices of the covering triangle: the draw's vertex count.
