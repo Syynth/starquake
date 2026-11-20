@@ -1917,8 +1917,7 @@ fn clears_are_counted() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Partial-area clears the render backend clears only whole, the render area's targets, and the
-// draw-based clear's keys.
+// Partial-area clears the render backend clears only whole, and the render area's targets.
 
 /// The caps of [`caps`] with four samples allowed too.
 fn msaa_caps() -> Caps {
