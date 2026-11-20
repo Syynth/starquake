@@ -657,3 +657,42 @@ fn a_build_without_the_wgpu_backend_cannot_open_it() {
     assert!(gpu);
     assert_eq!(*backend.unwrap().caps(), recording_caps());
 }
+
+/// The wiring end to end, through the production path (`System::run_rendering`, the hypervisor
+/// backend and `Machine::start`): a run whose setup has a window its main thread will not make
+/// ends with the window's words before the guest runs, and the same program with the recording
+/// setup runs to its end. A Mac test with a GPU: it skips itself only when `CI` is set, or, with
+/// a notice, where the host has no GPU adapter.
+#[cfg(all(feature = "wgpu", target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn a_run_renders_with_the_setup_it_is_given() {
+    use crate::machine::gpu::wgpu_backend::WINDOW_FAILED;
+    use crate::renderer::MainThreadGone;
+    use crate::renderer::tests::{Gone, no_window};
+    use crate::report::{ExitReason, RunOptions};
+
+    if std::env::var_os("CI").is_some() {
+        eprintln!("skipping a_run_renders_with_the_setup_it_is_given: it needs a VM and a GPU");
+        return;
+    }
+    let system = crate::System::new(&starquake_testkit::programs::hello().unwrap()).unwrap();
+    let options = RunOptions {
+        timeout: Some(Duration::from_secs(30)),
+        ..RunOptions::default()
+    };
+    let windowed = RenderSetup::windowed(no_window(64, 48, Arc::new(Gone)));
+    let report = system.run_rendering(&options, windowed);
+    let ExitReason::EmulatorError(message) = report.exit else {
+        unreachable!("the run went on: {:?}", report.exit);
+    };
+    if message.starts_with(&format!("{WGPU_UNAVAILABLE}: no GPU adapter on this host")) {
+        eprintln!("skipping a_run_renders_with_the_setup_it_is_given: {message}");
+        return;
+    }
+    assert_eq!(message, format!("{WINDOW_FAILED}: {MainThreadGone}"));
+    assert!(report.guest_log.is_empty(), "the guest never ran");
+
+    let recorded = system.run_rendering(&options, RenderSetup::recording());
+    assert_eq!(recorded.exit, ExitReason::ProcessExited);
+    assert!(!recorded.guest_log.is_empty());
+}
