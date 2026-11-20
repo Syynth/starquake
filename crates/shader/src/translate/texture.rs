@@ -92,20 +92,22 @@
 //!
 //! # Refusals
 //!
-//! Each `Require` the PR makes on these forms is a named [`TextureUnsupported`] whose doc
-//! quotes the PR's message, checked in the PR's order, all before the first instruction is
-//! appended, so a refusal leaves the function and the [`DescriptorBuffer`] as they were.
-//! An instruction or form the PR does not translate is refused by name
-//! ([`TextureUnsupported::HandleForm`] for the `.B` forms of `TLD`, `TLD4`, `TMML`, `TXD` and
-//! `TXQ`, which `Visitor::Run` does not dispatch). The PR's checks that cannot fail on a decoded
-//! instruction are not repeated: the fixed handle bits 59 and 91 (the decoder's forms fix
-//! them), "native texture dimension" and "native surface dimension" (the decoder refuses
-//! dimension 6, and 7 for surfaces), `TLD4`'s "native gather offset" (the decoder refuses offset
-//! mode 3), `TXQ`'s bits 60 and 61 (unknown bits of its forms), `SUATOM`'s `atom_op <= 8` for
-//! a decoded operation field (four bits, values 9 to 15 refused by the decoder), and `TEX`'s
-//! "native texture operand count" (`count <= 6`): a list holds at most six operands, four
-//! coordinates of a cube array with a level and a reference, or three coordinates with the
-//! clamp word, a bias and a reference.
+//! Each `Require` the PR makes on these forms is a named [`TextureUnsupported`] whose doc quotes
+//! the PR's message, checked in the PR's order, all before the first instruction is appended, so a
+//! refusal leaves the function and the [`DescriptorBuffer`] as they were. An instruction or form
+//! the PR does not translate is refused by name ([`TextureUnsupported::HandleForm`] for the `.B`
+//! forms of `TLD`, `TLD4`, `TMML`, `TXD` and `TXQ`, which `Visitor::Run` does not dispatch, and
+//! [`TextureUnsupported::SurfaceCompareAndSwap`] for `SUATOM.CAS`), before any of the PR's checks
+//! on that instruction: `SUATOM.CAS` with `.BA` set is refused as a compare-and-swap, not as the
+//! atomic mode (`tests::refusals::surface_checks_come_in_the_prs_order`). The PR's checks that
+//! cannot fail on a decoded instruction are not repeated: the fixed handle bits 59 and 91 (the
+//! decoder's forms fix them), "native texture dimension" and "native surface dimension" (the
+//! decoder refuses dimension 6, and 7 for surfaces), `TLD4`'s "native gather offset" (the decoder
+//! refuses offset mode 3), `TXQ`'s bits 60 and 61 (unknown bits of its forms), `SUATOM`'s `atom_op
+//! <= 8` for a decoded operation field (four bits, values 9 to 15 refused by the decoder), and
+//! `TEX`'s "native texture operand count" (`count <= 6`): a list holds at most six operands, four
+//! coordinates of a cube array with a level and a reference, or three coordinates with the clamp
+//! word, a bias and a reference.
 //!
 //! # Level-of-detail clamp
 //!
@@ -166,7 +168,7 @@
 //! | `TEX.LC`, `TEX.LB.LC` with a constant-buffer or uniform handle | refused ("native texture clamp mode") | translated, the clamp carried (see "Level-of-detail clamp") | `tests::sample::lod_clamp_is_carried` |
 //! | `TLD4.PTP` | one gather with both offset registers | four gathers (see "Per-texel gather offsets") | `tests::gather::per_texel_offsets_take_four_gathers` |
 //! | The surface forms with a register handle (`0x998` to `0x99e`, `0x394`, `0x3a0`) | not dispatched by `Visitor::Run` | translated (see "Surfaces") | `tests::surface::formatted_loads`, `binary_loads`, `stores`, `atomics`, `reductions_discard_the_old_value` |
-//! | `SUATOM.CAS` (`0x396`) | not dispatched | refused by name ([`TextureUnsupported::SurfaceCompareAndSwap`]) | `tests::refusals::surface_store_and_atomic_refusals` |
+//! | `SUATOM.CAS` (`0x396`) | not dispatched | refused by name ([`TextureUnsupported::SurfaceCompareAndSwap`]), before the `.BA` check | `tests::refusals::surface_store_and_atomic_refusals`, `tests::refusals::surface_checks_come_in_the_prs_order` |
 //! | The descriptor buffer's conflict check | per program, set at the first handle even if the instruction is then refused (the program fails anyway) | the same per [`DescriptorBuffer`], which is set only when the instruction translates | `tests::refusals::a_refusal_leaves_the_descriptor_buffer` |
 //!
 //! The PR's `env.TextureBoundBuffer() == cbuf_index` check, made when it translates without a
@@ -1294,11 +1296,13 @@ const fn atom_op_name(op: AtomOp) -> &'static str {
 
 fn plan_suatom(op: OpSuAtom) -> Result<SuAtomPlan, TextureUnsupported> {
     let (_, coordinates) = image_dimension(op.dim);
-    require(!op.ba, TextureUnsupported::SurfaceAtomicMode)?;
+    // The untranslated form is refused by name first, as `handle_form` refuses the `.B` forms
+    // before any of the PR's checks: the PR never dispatches `SUATOM.CAS`, so it gives no order.
     require(
         !matches!(op.atom_op, AtomOp::CmpExch(_)),
         TextureUnsupported::SurfaceCompareAndSwap,
     )?;
+    require(!op.ba, TextureUnsupported::SurfaceAtomicMode)?;
     let signed = op.atom_type == AtomType::I32;
     let opcode = match atomic_opcode(op.atom_op, signed) {
         Some(opcode) if matches!(op.atom_type, AtomType::U32 | AtomType::I32) => opcode,

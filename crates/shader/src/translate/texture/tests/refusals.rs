@@ -1308,7 +1308,8 @@ fn txq_checks_come_in_the_prs_order() {
     ]);
 }
 
-/// The surface instructions' checks come in the PR's order: two faults at once give the first.
+/// The surface instructions' checks come in the PR's order, after the refusal of the untranslated
+/// `SUATOM.CAS` by name: two faults at once give the first.
 #[test]
 fn surface_checks_come_in_the_prs_order() {
     assert_first_faults(vec![
@@ -1336,10 +1337,19 @@ fn surface_checks_come_in_the_prs_order() {
             }),
             U::SurfaceChannelMask(mask(0x2)),
         ),
+        // The untranslated `SUATOM.CAS` form is refused by name before the PR's `.BA` check.
         (
             Op::SuAtom(OpSuAtom {
                 ba: true,
                 atom_op: AtomOp::CmpExch(AtomCmpSrc::Packed),
+                ..suatom()
+            }),
+            U::SurfaceCompareAndSwap,
+        ),
+        (
+            Op::SuAtom(OpSuAtom {
+                ba: true,
+                atom_type: AtomType::F32,
                 ..suatom()
             }),
             U::SurfaceAtomicMode,
