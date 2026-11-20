@@ -1206,4 +1206,70 @@ fn a_fault_zeroing_a_new_table_page_writes_no_descriptor_and_the_next_map_succee
             level: LEAF_LEVEL
         })
     );
+    // Every descriptor the map did not write is zero, in all four table pages, the one whose
+    // zeroing faulted included: one in the root (to the level-2 table), two in the level-2
+    // table (to the two level-3 tables) and one page descriptor in each level-3 table.
+    let written = 1 + 2 + 2;
+    let valid: usize = (0..4)
+        .map(|n| {
+            pool_page(t.memory(), n)
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .filter(|word| word.iter().any(|&byte| byte != 0))
+                .count()
+        })
+        .sum();
+    assert_eq!(valid, written);
+}
+
+#[test]
+fn allocate_zeroes_a_never_used_page_the_map_did_not_zero() {
+    // `map` zeroes the pages it counted before it writes; `allocate` alone must still never
+    // hand out a never-used page holding what the memory held before.
+    let dirty = vec![0xff_u8; usize::try_from(PAGE_SIZE).unwrap()];
+    let zero = vec![0_u8; usize::try_from(PAGE_SIZE).unwrap()];
+    let t = Stage1Tables::new(
+        FaultingMemory {
+            inner: dirty_pool(4),
+            writes_left: std::sync::atomic::AtomicU64::new(u64::MAX),
+        },
+        backing(POOL_BASE, 4),
+    )
+    .unwrap();
+    let mut pool = t.lock();
+    assert_eq!(
+        (pool.next, pool.zeroed),
+        (POOL_BASE + pages(1), POOL_BASE + pages(1))
+    );
+    // A fault zeroing the page takes nothing.
+    t.memory().fail_after(0);
+    assert_eq!(
+        t.allocate(&mut pool, 2),
+        Err(MapError::Memory(Fault {
+            address: POOL_BASE + pages(1)
+        }))
+    );
+    assert_eq!(
+        (pool.next, pool.zeroed),
+        (POOL_BASE + pages(1), POOL_BASE + pages(1))
+    );
+    assert_eq!(pool.tables.len(), 1);
+    t.memory().fail_after(u64::MAX);
+    // The page exactly at `zeroed` is zeroed, and `zeroed` moves past it.
+    assert_eq!(t.allocate(&mut pool, 2), Ok(POOL_BASE + pages(1)));
+    assert_eq!(
+        (pool.next, pool.zeroed),
+        (POOL_BASE + pages(2), POOL_BASE + pages(2))
+    );
+    assert_eq!(pool_page(t.memory(), 1), zero);
+    // A page below `zeroed` is taken as it is: `zero_new_pages` zeroed it already. Here it
+    // was dirtied after, so reading it back as dirty shows `allocate` did not write it again.
+    t.zero_new_pages(&mut pool, 2).unwrap();
+    assert_eq!(pool.zeroed, POOL_BASE + pages(4));
+    t.memory().write(POOL_BASE + pages(2), &dirty).unwrap();
+    assert_eq!(t.allocate(&mut pool, 3), Ok(POOL_BASE + pages(2)));
+    assert_eq!(pool_page(t.memory(), 2), dirty);
+    assert_eq!(pool.zeroed, POOL_BASE + pages(4));
+    assert_eq!(pool_page(t.memory(), 3), zero);
 }

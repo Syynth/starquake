@@ -335,15 +335,24 @@ impl<M: GuestMemory> Stage1Tables<M> {
         Ok(())
     }
 
-    /// Takes a pool page for a new table at `level`. It needs no zeroing: a never-used page
-    /// was zeroed by [`Self::zero_new_pages`] before the map began writing, the builder
-    /// invalidates a descriptor by writing 0, and a table is freed only when none of its
-    /// descriptors is valid, so a freed page holds only zeros.
+    /// Takes a pool page for a new table at `level`, zeroed. A freed page needs no zeroing: the
+    /// builder invalidates a descriptor by writing 0, and a table is freed only when none of its
+    /// descriptors is valid, so a freed page holds only zeros. A never-used page below `zeroed`
+    /// was zeroed by [`Self::zero_new_pages`] before the map began writing. A never-used page at
+    /// or above `zeroed` is zeroed here before it is taken, so the walker never follows bytes
+    /// the memory held before as descriptors: `map` counts its tables
+    /// ([`Self::tables_needed`]) so that this never happens, and the zeroing here only guards
+    /// against an undercount. A fault zeroing it here takes nothing, but comes after the map
+    /// began writing (`allocate_zeroes_a_never_used_page_the_map_did_not_zero`).
     fn allocate(&self, pool: &mut Pool, level: u8) -> Result<u64, MapError> {
         let page = if let Some(page) = pool.free.pop() {
             page
         } else if pool.next < self.pool.end() {
             let page = pool.next;
+            if page >= pool.zeroed {
+                self.zero(page)?;
+                pool.zeroed = page.saturating_add(PAGE_SIZE);
+            }
             pool.next = page.saturating_add(PAGE_SIZE);
             page
         } else {
