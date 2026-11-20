@@ -98,6 +98,7 @@ mod support {
             "timeout=30s".into(),
         ];
         line.extend(common::pinned_date());
+        line.extend(common::recording_backend());
         let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
         let code = starquake::execute(&line, &mut stdout, &mut stderr);
         let ran = Ran {

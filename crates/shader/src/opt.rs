@@ -49,7 +49,7 @@ mod dce;
 mod identity;
 mod ssa;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::fmt::{self, Display, Formatter};
 
@@ -106,9 +106,10 @@ impl Display for Pass {
 /// Why a pass failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum PassError {
-    /// The SSA rewrite was given a structured function (see the `ssa` module docs).
-    #[error("the SSA rewrite needs a control-flow graph, not a structured function")]
-    Structured,
+    /// The SSA rewrite was given a structured function that has a phi (see the `ssa` module
+    /// docs, "Structured functions").
+    #[error("{0} is a phi in a structured function, which the SSA rewrite takes before SSA")]
+    StructuredPhi(crate::ir::Value),
     /// The entry block has predecessors and a phi, which the SSA rewrite cannot give a value on
     /// entry (see the `ssa` module docs).
     #[error("{0} is a phi in the entry block, which other blocks jump to")]

@@ -28,18 +28,22 @@ impl Lowering {
                     for &at in &block.insts {
                         match function.inst(at) {
                             Some(Inst::Op(op)) => self.inst(body, at, op)?,
-                            // `Interface::collect` refuses phis before the body is lowered.
-                            Some(Inst::Phi(_)) => return Err(LowerError::Phi(at)),
+                            // Phis come first in a block (the verifier checks), so every load
+                            // happens before any store: they take their values together.
+                            Some(Inst::Phi(_)) => self.phi_load(body, at)?,
                             None => {
                                 return Err(LowerError::Internal(format!("{at} is missing")));
                             }
                         }
                     }
+                    self.phi_stores(body, *id)?;
                 }
                 Node::If { cond, body: inner } => {
                     let condition = self.condition(body, *cond)?;
                     let mut accept = Block::new();
+                    let mark = self.scope_log.len();
                     self.nodes(function, inner, &mut accept)?;
+                    self.end_scope(mark);
                     push(
                         body,
                         Statement::If {
@@ -54,9 +58,11 @@ impl Lowering {
                     repeat,
                 } => {
                     let mut looped = Block::new();
+                    let mark = self.scope_log.len();
                     self.nodes(function, inner, &mut looped)?;
                     // The repeat condition is read after the body, in its scope.
                     let condition = self.condition(&mut looped, *repeat)?;
+                    self.end_scope(mark);
                     push(
                         &mut looped,
                         Statement::If {

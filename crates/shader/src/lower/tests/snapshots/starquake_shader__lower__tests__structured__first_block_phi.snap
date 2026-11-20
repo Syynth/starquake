@@ -1,0 +1,19 @@
+---
+source: crates/shader/src/lower/tests/structured.rs
+expression: text
+---
+// language: metal2.4
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using metal::uint;
+
+
+[[max_total_threads_per_threadgroup(1)]] kernel void main_(
+) {
+    uint r1_ = {};
+    uint phi0_ = {};
+    uint _e1 = phi0_;
+    r1_ = _e1 + 5u;
+    return;
+}

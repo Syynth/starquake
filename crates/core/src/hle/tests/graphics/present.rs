@@ -612,6 +612,167 @@ fn a_presented_image_is_dumped_as_a_png_of_its_pixels() {
     assert_eq!(report.graphics.frames, 1);
 }
 
+/// A backend double's frame sink that holds each frame it is handed until the test lets it go,
+/// and then hands it to the run's frames: a backend whose frame comes after its completion is
+/// visible, as the wgpu backend's render thread stores the completion and calls the completion
+/// wake before it hands the frame to the run's sink (render-wgpu's `thread` module, `settle`).
+#[derive(Debug)]
+struct LateSink {
+    frames: Arc<crate::machine::gpu::RunFrames>,
+    held: Mutex<Vec<starquake_render::Frame>>,
+}
+
+impl LateSink {
+    /// The frames held back so far.
+    fn held(&self) -> usize {
+        self.held.lock().unwrap().len()
+    }
+
+    /// Hands every frame held back to the run's frames.
+    fn release(&self) {
+        let held = std::mem::take(&mut *self.held.lock().unwrap());
+        for frame in held {
+            starquake_render::FrameSink::frame(&*self.frames, frame);
+        }
+    }
+}
+
+impl starquake_render::FrameSink for LateSink {
+    fn frame(&self, frame: starquake_render::Frame) {
+        self.held.lock().unwrap().push(frame);
+    }
+}
+
+/// One present of the image through a GPU over the recording backend whose frames go through a
+/// [`LateSink`], with the GPU idle and the frame still held back: the graphics server, the run's
+/// frames and the sink.
+fn presented_late() -> (Graphics, Arc<crate::machine::gpu::RunFrames>, Arc<LateSink>) {
+    use crate::machine::gpu;
+
+    let shared: Arc<dyn GuestMemory> = image_memory(&linear_image());
+    let mut late = None;
+    let (graphics, frames) =
+        gpu::graphics_with_sink(&shared, (Arc::new(NoWake), SystemClock::new()), |frames| {
+            let sink = Arc::new(LateSink {
+                frames,
+                held: Mutex::default(),
+            });
+            late = Some(Arc::clone(&sink));
+            sink
+        })
+        .unwrap_or_else(|error| unreachable!("{error}"));
+    let late = late.unwrap();
+    map_the_image(&graphics);
+    let rig = rig_with(&graphics);
+    assert_eq!(present_and_latch(&rig, &graphics, 1), [1]);
+    wait_for_presents(graphics.gpu().unwrap(), 1);
+    // The GPU is idle and has recorded the present, and its frame has not been handed over.
+    assert_eq!((late.held(), frames.received()), (1, 0));
+    (graphics, frames, late)
+}
+
+/// How long [`LateSink`]'s frame is held back after the GPU is idle in
+/// `finishing_waits_for_a_frame_handed_over_after_the_gpu_is_idle`: well inside
+/// `gpu::GPU_DRAIN_WAIT`.
+const HELD_BACK: Duration = Duration::from_millis(100);
+
+/// `gpu::finish` waits for the frame of every present the GPU recorded before it reads the
+/// run's frames (`crate::machine`'s `gpu` module, "At the end"), so a frame a backend hands over
+/// after its completion is visible, and so after the GPU is idle, is still dumped, with nothing
+/// logged.
+#[test]
+fn finishing_waits_for_a_frame_handed_over_after_the_gpu_is_idle() {
+    use crate::host_log::HostLog;
+    use crate::machine::{Ending, gpu};
+
+    let (graphics, frames, late) = presented_late();
+    let releaser = {
+        let late = Arc::clone(&late);
+        std::thread::spawn(move || {
+            std::thread::sleep(HELD_BACK);
+            late.release();
+        })
+    };
+    let log = HostLog::new();
+    let mut ending = Ending::Exited;
+    let report = tracing::subscriber::with_default(log.clone(), || {
+        gpu::finish(&graphics, Some(&frames), &mut ending)
+    });
+    releaser.join().unwrap();
+    assert!(matches!(ending, Ending::Exited));
+    assert_eq!(report.dumps.files.len(), 1);
+    assert_eq!(report.dumps.files[0].frame, 0);
+    assert_eq!(frames.received(), 1);
+    assert_eq!(log.take(), (Vec::new(), 0));
+}
+
+/// A frame that never comes: `gpu::finish` waits at most `gpu::GPU_DRAIN_WAIT` for it, logs
+/// `gpu::FRAMES_MISSING` at warning level with the counts, and reports the run without it.
+#[test]
+fn a_frame_that_never_comes_is_logged_and_left_out() {
+    use crate::host_log::HostLog;
+    use crate::machine::{Ending, gpu};
+
+    let (graphics, frames, late) = presented_late();
+    let log = HostLog::new();
+    let mut ending = Ending::Exited;
+    let started = std::time::Instant::now();
+    let report = tracing::subscriber::with_default(log.clone(), || {
+        gpu::finish(&graphics, Some(&frames), &mut ending)
+    });
+    let waited = started.elapsed();
+    assert!(waited >= gpu::GPU_DRAIN_WAIT / 2, "{waited:?}");
+    assert!(matches!(ending, Ending::Exited));
+    assert_eq!(report.dumps, crate::frames::DumpedFrames::default());
+    assert_eq!(late.held(), 1);
+    let (lines, dropped) = log.take();
+    assert_eq!(dropped, 0);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("WARN"), "{lines:?}");
+    assert!(lines[0].contains(gpu::FRAMES_MISSING), "{lines:?}");
+    assert!(lines[0].contains("received=0 presents=1"), "{lines:?}");
+}
+
+/// A run whose default choice of the wgpu backend falls back to the recording backend on a host
+/// with no GPU adapter (`gpu::graphics_opening`, `IfUnavailable::UseRecording`) still dumps its
+/// presents into the frames the run reads: one present, one dump in the report `gpu::finish`
+/// returns.
+#[cfg(feature = "wgpu")]
+#[test]
+fn a_run_that_falls_back_to_the_recording_backend_dumps_into_its_own_frames() {
+    use crate::machine::{Ending, gpu};
+    use crate::renderer::{Choice, IfUnavailable, RenderSetup};
+    use crate::report::EnvSource;
+
+    let opener = gpu::WgpuOpener::with(Box::new(|_, _, _, _| {
+        Err(starquake_render_wgpu::NewError::NoAdapter(
+            "none on the test's host".to_owned(),
+        ))
+    }));
+    let setup = RenderSetup::headless(Choice::Wgpu(IfUnavailable::UseRecording));
+    let shared: Arc<dyn GuestMemory> = image_memory(&linear_image());
+    let (graphics, built) = gpu::graphics_opening(
+        &EnvSource::Live,
+        Some(&shared),
+        (None, Arc::new(NoWake), SystemClock::new()),
+        &setup,
+        &opener,
+    )
+    .unwrap_or_else(|error| unreachable!("{error}"));
+    let (frames, backend) = built.unwrap();
+    assert_eq!(*backend.caps(), gpu::recording_caps(), "fell back");
+    map_the_image(&graphics);
+    let rig = rig_with(&graphics);
+    assert_eq!(present_and_latch(&rig, &graphics, 1), [1]);
+    wait_for_presents(graphics.gpu().unwrap(), 1);
+    let mut ending = Ending::Exited;
+    let report = gpu::finish(&graphics, Some(&frames), &mut ending);
+    assert!(matches!(ending, Ending::Exited));
+    assert_eq!(report.dumps.files.len(), 1);
+    assert_eq!(report.dumps.files[0].frame, 0);
+    assert_eq!((report.dumps.unknown, report.dumps.dropped), (0, 0));
+}
+
 /// What the run's render backend holds after `count` presents of the image, each latched and
 /// handed to the GPU before the next, alternating between two slots: the snapshot's length, the
 /// lists it kept, the present feedback waiting, and the bytes of its live resources.
@@ -725,4 +886,143 @@ fn a_gpu_thread_that_failed_turns_a_clean_ending_into_an_emulator_error() {
         assert!(report.gpu.is_some());
         assert_eq!(report.frames, 1);
     }
+}
+
+/// The wgpu backend's tests here run on a real GPU (render-backend slice R12, "Tests"): they
+/// skip themselves, with a notice, in CI and where the host has no adapter, and stay local-only
+/// until verification 3 shows wgpu runs cleanly on lavapipe (decision 9; `CLAUDE.md`, "Tests").
+/// `true` when `test` should run; `result` is what opening the backend gave.
+#[cfg(feature = "wgpu")]
+fn gpu_test_runs<T>(test: &str, result: &Result<T, String>) -> bool {
+    use crate::machine::gpu::WGPU_UNAVAILABLE;
+    if std::env::var_os("CI").is_some() {
+        eprintln!("skipping {test}: GPU tests are local-only until verification 3 (decision 9)");
+        return false;
+    }
+    let no_adapter = format!("{WGPU_UNAVAILABLE}: no GPU adapter on this host");
+    match result {
+        Err(message) if message.starts_with(&no_adapter) => {
+            eprintln!("skipping {test}: {message}");
+            false
+        }
+        _ => true,
+    }
+}
+
+/// What one present of the image the guest wrote dumps through the backend `setup` chose, by
+/// the run's own path (`gpu::graphics_opening` with the host's opener, the vsync tick's latch,
+/// `gpu::finish`): the frame's decoded pixels, and the backend. `Err`: the words the run would
+/// end with when the backend cannot be opened.
+#[cfg(feature = "wgpu")]
+fn frame_dumped_with(
+    setup: &crate::renderer::RenderSetup,
+) -> Result<(Vec<u8>, Arc<dyn starquake_render::Backend>), String> {
+    use crate::machine::{Ending, gpu};
+    use crate::report::EnvSource;
+
+    let shared: Arc<dyn GuestMemory> = image_memory(&linear_image());
+    let (graphics, built) = gpu::graphics_opening(
+        &EnvSource::Live,
+        Some(&shared),
+        (None, Arc::new(NoWake), SystemClock::new()),
+        setup,
+        &gpu::WgpuOpener::host(),
+    )?;
+    let (keeper, backend) = built.unwrap();
+    map_the_image(&graphics);
+    let rig = rig_with(&graphics);
+    assert_eq!(present_and_latch(&rig, &graphics, 1), [1]);
+    let gpu = Arc::clone(graphics.gpu().unwrap());
+    wait_for_presents(&gpu, 1);
+    let mut ending = Ending::Exited;
+    let report = gpu::finish(&graphics, Some(&keeper), &mut ending);
+    assert!(matches!(ending, Ending::Exited));
+    assert_eq!(report.dumps.files.len(), 1);
+    assert_eq!((report.dumps.unknown, report.dumps.dropped), (0, 0));
+    let decoder = png::Decoder::new(std::io::Cursor::new(&report.dumps.files[0].png));
+    let mut reader = decoder.read_info().unwrap();
+    let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+    let info = reader.next_frame(&mut pixels).unwrap();
+    pixels.truncate(info.buffer_size());
+    assert_eq!((info.width, info.height), (16, 16));
+    Ok((pixels, backend))
+}
+
+/// Slice R12's local GPU test: a run with the wgpu backend writes the same frame as a run with
+/// the recording backend for an uploaded image (the image's own pixels), and keeps no present
+/// feedback (`machine/gpu/wgpu_backend.rs`, "Present feedback").
+#[cfg(feature = "wgpu")]
+#[test]
+fn the_wgpu_backend_dumps_the_same_frame_as_the_recording_backend() {
+    use crate::renderer::{Choice, IfUnavailable, RenderSetup};
+
+    let wgpu = frame_dumped_with(&RenderSetup::headless(Choice::Wgpu(IfUnavailable::EndRun)));
+    if !gpu_test_runs(
+        "the_wgpu_backend_dumps_the_same_frame_as_the_recording_backend",
+        &wgpu,
+    ) {
+        return;
+    }
+    let (wgpu_pixels, wgpu_backend) = wgpu.unwrap();
+    let (recording_pixels, recording_backend) =
+        frame_dumped_with(&RenderSetup::recording()).unwrap();
+    assert_eq!(wgpu_pixels, linear_image());
+    assert_eq!(wgpu_pixels, recording_pixels);
+    // Each is the backend it was asked for: wgpu has no view swizzle, the recording backend
+    // claims one (`crate::machine`'s `gpu` module, `recording_caps`).
+    assert!(!wgpu_backend.caps().view_swizzle);
+    assert!(recording_backend.caps().view_swizzle);
+    // The run's sink took the wgpu backend's present feedback as the frame came.
+    assert_eq!(wgpu_backend.take_present_feedback().len(), 0);
+}
+
+/// Hands each job to a thread of its own: a main thread that is not the process's.
+#[cfg(feature = "wgpu")]
+struct OtherThread;
+
+#[cfg(feature = "wgpu")]
+impl crate::renderer::MainThread for OtherThread {
+    fn post(&self, job: crate::renderer::MainJob) -> Result<(), crate::renderer::MainThreadGone> {
+        std::thread::spawn(job);
+        Ok(())
+    }
+}
+
+/// A window's present target goes through the wgpu backend's own checks, on the thread the
+/// frontend's main thread runs it on, and a refusal ends the run with the window's words
+/// (`machine/gpu.rs`, "The wgpu backend"). The test's "main thread" is not the process's, and
+/// its window has no handles: on macOS the backend refuses the thread, elsewhere the surface.
+#[cfg(feature = "wgpu")]
+#[test]
+fn a_window_the_backend_refuses_ends_the_run_with_the_window_s_words() {
+    use crate::machine::{gpu, gpu::wgpu_backend::WINDOW_FAILED};
+    use crate::renderer::RenderSetup;
+    use crate::report::EnvSource;
+
+    let render = RenderSetup::windowed(crate::renderer::tests::no_window(
+        320,
+        240,
+        Arc::new(OtherThread),
+    ));
+    let shared: Arc<dyn GuestMemory> = image_memory(&linear_image());
+    let ended = gpu::graphics_opening(
+        &EnvSource::Live,
+        Some(&shared),
+        (None, Arc::new(NoWake), SystemClock::new()),
+        &render,
+        &gpu::WgpuOpener::host(),
+    )
+    .map(|_| ());
+    if !gpu_test_runs(
+        "a_window_the_backend_refuses_ends_the_run_with_the_window_s_words",
+        &ended,
+    ) {
+        return;
+    }
+    let refusal = if cfg!(target_os = "macos") {
+        starquake_render_wgpu::NOT_MAIN_THREAD
+    } else {
+        starquake_render_wgpu::NO_SURFACE
+    };
+    assert_eq!(ended, Err(format!("{WINDOW_FAILED}: {refusal}")));
 }

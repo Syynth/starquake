@@ -78,6 +78,7 @@ mod support {
             artifacts.clone().into(),
         ];
         args.extend(common::pinned_date());
+        args.extend(common::recording_backend());
         args.extend(extra.iter().map(OsString::from));
         (starquake(&args.iter().collect::<Vec<_>>()), artifacts)
     }
@@ -408,6 +409,8 @@ fn a_run_without_a_date_reads_the_hosts_and_its_summary_says_which() {
         artifacts.clone().into(),
         "--until".into(),
         "timeout=30s".into(),
+        "--backend".into(),
+        "recording".into(),
     ];
     let before = host_seconds();
     let ran = starquake(&args.iter().collect::<Vec<_>>());
@@ -593,6 +596,7 @@ fn the_process_exit_status_is_the_runs_exit_code() {
         .args(["--until", "timeout=30s", "--artifacts"])
         .arg(&artifacts)
         .args(common::pinned_date())
+        .args(common::recording_backend())
         .output()
         .unwrap();
     assert_eq!(

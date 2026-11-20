@@ -60,7 +60,10 @@
 //! `guard_select` does for a uniform instruction; an instruction that becomes no IR ignores
 //! it; and the others (`BAR`, `VOTE`, `SHFL`, `REDUX`, `MATCH`) are refused,
 //! [`ControlUnsupported::UntestedGuard`], since flow analysis gives each such instruction a
-//! conditional block of its own and the translator does not build blocks. Then the PR's
+//! conditional block of its own and the translator does not build blocks. The translation
+//! driver ([`super::driver`]) never hands this module an untested guard: it makes a guarded
+//! `VOTEU` a conditional block first (the owner's ruling of 2026-11-19, row 2), so the select
+//! is this entry's own behaviour when called directly. Then the PR's
 //! checks run, each instruction's in the PR's order, every one before any IR is written, so a
 //! refused instruction leaves its block as it was.
 //!
@@ -113,12 +116,12 @@ use thiserror::Error;
 
 use super::{
     ColorOutputs, Failure, GuestStage, Stage, TranslateError, Translator, Unsupported, imm32,
+    source,
 };
 use crate::decode::{
     AluSrc, BarMode, BarRed, Gpr, Instr, MatchOp, Op, OpBar, OpMatch, OpRedux, OpShfl, OpVote,
     OpWarpSync, Pred, PredSrc, ReduxOp, ShflOp, ShflSrc, UniformPred, UniformReg, VoteDst, VoteOp,
 };
-use crate::flow::read_pred;
 use crate::ir::{BlockId, BuildError, Builder, Function, Imm, Inst, Opcode, Operand, WARP_SIZE};
 
 /// The lane mask `WARPSYNC` must name: every lane of the warp (`visitor.cpp`, case `0x948`:
@@ -206,6 +209,36 @@ pub enum ControlUnsupported {
     OtherGroup(&'static str),
 }
 
+/// Whether `op` is one of this group's instructions: the operations [`translate_control`]
+/// translates or refuses as its own (every one but [`ControlUnsupported::OtherGroup`]'s), the
+/// translation driver's test for this group. `EXIT` is not: slice 1's `EXIT` translator in
+/// [`super`] handles it. Pinned against the dispatch by `tests::in_group_matches_the_dispatch`.
+pub const fn in_group(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Kill(_)
+            | Op::Call(_)
+            | Op::Ret(_)
+            | Op::Brx(_)
+            | Op::BSSy(_)
+            | Op::BSync(_)
+            | Op::Break(_)
+            | Op::Nop(_)
+            | Op::WarpSync(_)
+            | Op::DepBar(_)
+            | Op::Bra(_)
+            | Op::Bar(_)
+            | Op::Vote(_)
+            | Op::Shfl(_)
+            | Op::Redux(_)
+            | Op::Match(_)
+            | Op::BMov(_)
+            | Op::Nanosleep(_)
+            | Op::Jmx(_)
+            | Op::Bpt(_)
+    )
+}
+
 /// What translating one instruction recorded besides its IR.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[must_use]
@@ -290,7 +323,6 @@ pub fn translate_control(
             color_outputs: ColorOutputs::default(),
         },
         header: None,
-        select: None,
     };
     match t.control(instr, guard_tested) {
         Ok(()) => {}
@@ -387,7 +419,7 @@ impl Translator<'_> {
     }
 
     fn pred(&mut self, src: PredSrc) -> Result<Operand, Failure> {
-        Ok(read_pred(&mut self.b, src)?)
+        Ok(source::pred(&mut self.b, src)?)
     }
 
     /// `BAR` (`Visitor::BAR`): bits 32..63, 64..79 and 81..95 zero, so `bar.sync 0x0` with
@@ -464,20 +496,9 @@ impl Translator<'_> {
     }
 
     /// A uniform instruction's guard, read as the uniform predicate of the same number
-    /// (`Visitor::Run`: `UPred(guard.index, guard.negated)`).
+    /// (`Visitor::Run`: `UPred(guard.index, guard.negated)`; the shared reader).
     fn uniform_guard(&mut self, guard: PredSrc) -> Result<Operand, Failure> {
-        let Some(reg) = UniformPred::new(guard.reg.index()).filter(|reg| !reg.is_true()) else {
-            return Ok(imm1(!guard.negated));
-        };
-        let value = self.op(
-            Opcode::GetUniformPred,
-            &[Operand::Imm(Imm::UniformPred(reg))],
-        )?;
-        if guard.negated {
-            Ok(self.op(Opcode::LogicalNot, &[value.into()])?.into())
-        } else {
-            Ok(value.into())
-        }
+        Ok(source::uniform_guard(&mut self.b, guard)?)
     }
 
     /// `SHFL` (`Visitor::SHFL`; see the module docs).

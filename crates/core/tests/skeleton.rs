@@ -20,7 +20,7 @@ use starquake_core::crash::{
     BacktraceEnd, Exception, FRAME_POINTER_REGISTER, FRAME_RECORD_RETURN, FRAME_RECORD_SIZE,
     LINK_REGISTER, Location,
 };
-use starquake_core::system::{THREAD_LOCAL_RAM, WORKING_RAM};
+use starquake_core::system::THREAD_LOCAL_RAM;
 use starquake_core::{
     Error, ExitReason, LoadError, Mapping, RunReport, ThreadPc, ThreadPcState, exit_code,
 };
@@ -1305,8 +1305,9 @@ fn the_first_word_after_a_heap_and_a_heap_that_was_freed_are_not_there() {
 
 #[test]
 fn a_large_bss_is_backed_as_it_is_touched_and_all_of_it_fits_the_ram_sized_for_it() {
-    // More `.bss` than the working RAM a run adds to what is loaded; a whole number of pages.
-    let bss = u32::try_from(4 * WORKING_RAM).unwrap();
+    // 64 MiB of `.bss`, a whole number of pages: four times the fixed 16 MiB allowance guest
+    // RAM had on top of what is loaded before it was the whole application pool.
+    let bss: u32 = 64 << 20;
     let crash_text = |report: &RunReport| {
         report
             .crash()
@@ -1322,7 +1323,8 @@ fn a_large_bss_is_backed_as_it_is_touched_and_all_of_it_fits_the_ram_sized_for_i
         "{:?}",
         crash_text(&report)
     );
-    // So is touching every page: guest RAM is sized from what is loaded, `.bss` included.
+    // So is touching every page: guest RAM is the whole pool, which holds what is loaded,
+    // `.bss` included.
     let pages = bss / u32::try_from(PAGE_SIZE).unwrap();
     let report = run(&memory_calls::touches_bss(bss, pages), GENEROUS).unwrap();
     assert_eq!(
@@ -1334,14 +1336,17 @@ fn a_large_bss_is_backed_as_it_is_touched_and_all_of_it_fits_the_ram_sized_for_i
 }
 
 #[test]
-fn a_heap_touched_past_the_working_ram_runs_out_of_guest_ram_as_an_emulator_error() {
-    // Twice the working RAM a run adds to what is loaded: more than all of guest RAM for a
-    // program of one page with the default stack.
-    let heap = 2 * WORKING_RAM;
+fn a_heap_touched_far_past_the_old_allowance_runs() {
+    // 64 MiB of heap, every page touched: four times the fixed 16 MiB allowance guest RAM had
+    // on top of what is loaded, which ran out after 16 MiB of it (the test this replaces
+    // pinned that a program touching 32 MiB of heap ended as an emulator error). Guest RAM is
+    // now the whole application pool, backed as it is touched.
+    let heap: u64 = 64 << 20;
     assert!(heap.is_multiple_of(starquake_kernel::svc::memory::HEAP_SIZE_ALIGNMENT));
-    let working_pages = WORKING_RAM / PAGE_SIZE;
-    // Touching as many pages of it as the working RAM holds is fine.
-    let Some(report) = run(&memory_calls::touches_heap(heap, working_pages), GENEROUS) else {
+    let Some(report) = run(
+        &memory_calls::touches_heap(heap, heap / PAGE_SIZE),
+        GENEROUS,
+    ) else {
         return;
     };
     assert_eq!(
@@ -1352,35 +1357,8 @@ fn a_heap_touched_past_the_working_ram_runs_out_of_guest_ram_as_an_emulator_erro
             .crash()
             .map(starquake_core::crash::CrashReport::to_text)
     );
-
-    // Touching all of it runs out of guest RAM, which is the emulator's failure (PROVISIONAL:
-    // the kernel's accounting lets an application use far more than the run backs). The run
-    // names the page that could not be backed: one of the heap, on a page boundary, past the
-    // pages the working RAM holds.
-    let report = run(
-        &memory_calls::touches_heap(heap, heap / PAGE_SIZE),
-        GENEROUS,
-    )
-    .unwrap();
-    assert_eq!(report.exit_code(), exit_code::EMULATOR_ERROR);
-    let ExitReason::EmulatorError(message) = &report.exit else {
-        unreachable!("{:?}", report.exit);
-    };
-    let out_of_ram = starquake_core::SpaceError::OutOfRam {
-        size: PAGE_SIZE,
-        available: 0,
-    };
-    let address = message
-        .strip_prefix("guest memory at 0x")
-        .and_then(|rest| rest.strip_suffix(&format!(" could not be backed: {out_of_ram}")))
-        .and_then(|digits| u64::from_str_radix(digits, 16).ok())
-        .unwrap_or_else(|| unreachable!("{message}"));
-    let start = heap_region_start(&report);
-    assert!(
-        (start + WORKING_RAM..start + heap).contains(&address),
-        "{address:#x}"
-    );
-    assert!(address.is_multiple_of(PAGE_SIZE), "{address:#x}");
+    assert_eq!(report.exit_code(), exit_code::STOP_CONDITION);
+    assert_eq!(report.system_calls.get("SetHeapSize"), Some(&1));
 }
 
 #[test]

@@ -95,7 +95,7 @@ impl Translator for Fake {
 
     fn program(&self, capture: &Capture) -> Result<Program, Rejection> {
         if capture.header().first() == Some(&REJECTED_HEADER) {
-            return Err(Rejection::Translate(TranslateError::NoExit));
+            return Err(Rejection::Translate(TranslateError::TooManyInstructions));
         }
         Ok(Program)
     }
@@ -297,7 +297,10 @@ fn a_rejection_passes_its_reason_through() {
     let SetLookup::Rejected(reason) = rig.lookup(&[vertex(A), pixel(B)]) else {
         unreachable!("the pixel program is rejected");
     };
-    assert_eq!(*reason, Rejection::Translate(TranslateError::NoExit));
+    assert_eq!(
+        *reason,
+        Rejection::Translate(TranslateError::TooManyInstructions)
+    );
 }
 
 #[test]
