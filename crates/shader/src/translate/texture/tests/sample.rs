@@ -352,8 +352,33 @@ fn depth_comparison() {
     assert_eq!(machine.regs[..3], [result, f(1.0), 7]);
 }
 
+/// The 8.8 clamp is read unsigned: a clamp word with bit 31 set is 0xffff / 256, not a negative
+/// level.
+#[test]
+fn lod_clamp_is_read_unsigned() {
+    sample_rgba(
+        OpTex {
+            lod_mode: TexLodMode::Clamp,
+            ..tex()
+        },
+        &[(10, 0xffff_0000), (11, X), (20, Y)],
+        Opcode::ImageSampleImplicitLod,
+        TextureInfo {
+            has_lod_clamp: true,
+            ..info(TextureType::Color2D)
+        },
+        vec![
+            HANDLE,
+            Val::F32x2([X, Y]),
+            Val::F32(f(f32::from(u16::MAX) * LOD_FIXED_UNIT)),
+            NONE,
+        ],
+    );
+}
+
 /// `.AOFFI` reads two signed 4-bit offsets at bits 0 and 4 of `B` (or `B + 1` after an explicit
-/// level), the coordinates from the even pair at `A`; bits above the fields are ignored.
+/// level), the coordinates from the even pair at `A`; bits above the fields are ignored, and
+/// each of x and y is sign-extended on its own (one case has x negative, another y).
 #[test]
 fn offsets() {
     // x = 0xd (-3), y = 5, and noise above bit 8.
@@ -382,6 +407,23 @@ fn offsets() {
         Opcode::ImageSampleExplicitLod,
         info(TextureType::Color2D),
         vec![HANDLE, Val::F32x2([X, Y]), Val::F32(level), offset],
+    );
+    // The y field is signed too: x = 2, y = 0xd (-3).
+    let op = OpTex {
+        offset: true,
+        ..tex()
+    };
+    sample_rgba(
+        op,
+        &[(10, X), (11, Y), (20, 0xd2)],
+        Opcode::ImageSampleImplicitLod,
+        info(TextureType::Color2D),
+        vec![
+            HANDLE,
+            Val::F32x2([X, Y]),
+            NONE,
+            Val::U32x2([2, 0xffff_fffd]),
+        ],
     );
 }
 
