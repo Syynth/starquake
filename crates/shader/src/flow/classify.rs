@@ -1,5 +1,7 @@
 //! What flow analysis needs to know of each opcode: whether it changes control flow, and, for
-//! straight-line instructions, whether a guard can be kept as a select on its results.
+//! straight-line instructions, whether a guard on it needs no block of its own from flow
+//! analysis (the reference keeps such a guard as a select on its results; the translation
+//! driver makes the instruction a conditional block, `crate::translate::driver`'s "Guards").
 //!
 //! Ported from PR #4588: `eden-pr4588/src/shader_recompiler/frontend/ampere/classify.h` @
 //! e5fb3b97 (GPL-3.0-or-later, Copyright 2026 Eden Emulator Project), `Classify`, `FormOf` and
@@ -118,8 +120,9 @@ pub(crate) enum OpKind {
 pub(crate) struct OpInfo {
     /// What it does to control flow.
     pub kind: OpKind,
-    /// Whether it only writes registers and predicates and cannot fault, so that a guard on it
-    /// is kept as a select on its results instead of splitting the block.
+    /// Whether it only writes registers and predicates and cannot fault, so that flow analysis
+    /// leaves it in its block under a guard (the reference keeps the guard as a select on its
+    /// results; the translation driver makes the instruction a conditional block).
     pub pure: bool,
     /// Whether it is a uniform datapath instruction, whose guard is a uniform predicate.
     pub uniform: bool,

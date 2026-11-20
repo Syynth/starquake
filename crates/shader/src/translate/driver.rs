@@ -14,11 +14,12 @@
 //! # Sources
 //!
 //! Ported by behaviour from PR #4588 (`eden-pr4588/src/shader_recompiler/frontend/ampere/` @
-//! e5fb3b97, GPL-3.0-or-later, Copyright 2026 Eden Emulator Project): `translate.cpp` (the
-//! per-block walk over the control-flow builder's blocks) and `visitor.cpp` (`Visitor::Run`: the
-//! `guard.Never()` return, the dispatch by operation); cross-checked with Eden's
-//! `frontend/maxwell/translate/translate.cpp` @ cf654052 (`Translate`: each block's instructions
-//! in address order).
+//! e5fb3b97, GPL-3.0-or-later, Copyright 2026 Eden Emulator Project): `translate.cpp`
+//! (`Translate`: a block's instructions from its first to its last, `Visitor::Run` on each,
+//! called for each block of the control-flow builder's graph) and `visitor.cpp` (`Visitor::Run`:
+//! the `guard.Never()` return, the dispatch by operation); cross-checked with Eden's
+//! `frontend/maxwell/translate/translate.cpp` @ cf654052 (`Translate`: the same walk over a
+//! block's locations).
 //!
 //! # The order of the checks
 //!
@@ -44,8 +45,8 @@
 //! Any other guarded instruction is a pure one flow analysis left in its block, and becomes a
 //! conditional block (the owner's ruling of 2026-11-19, row 2, where PR #4588 keeps a select,
 //! `guard_select`): the driver reads the guard (a uniform predicate of the same number for a
-//! uniform datapath instruction, `classify.h`'s `uniform`: `S2UR`, `VOTEU` and the uniform ALU
-//! forms; a predicate for the others), splits the block with the shared guard helper
+//! uniform datapath instruction, `classify.h`'s `uniform` list, as `Visitor::Run` reads it with
+//! `UPred`; a predicate for the others, `Pred`), splits the block with the shared guard helper
 //! ([`super::split_for_guard`]), translates the instruction into the new block as if
 //! unguarded, and carries on in the block after it. Every group's translator is so handed its
 //! instruction with the guard already handled.
@@ -69,10 +70,11 @@
 //! Inlining copies a function's blocks to every call site (slice 10), so a program's inlined
 //! graph can hold far more instructions than the program: a function of 2^15 instructions
 //! called from 2^15 sites would be 2^30 translations. [`MAX_TRANSLATED_INSTRUCTIONS`] bounds the
-//! count before anything is decoded or translated; the IR the translators write is bounded by
-//! it times the most IR one instruction writes (a `REDUX`'s 32 shuffles are the largest). The
-//! decoded instructions are kept once per instruction of the program, at most
-//! [`crate::capture::MAX_INSTRUCTIONS`].
+//! count before anything is decoded or translated, and the IR the translators write grows with
+//! it: each instruction's translator writes an amount of IR fixed by its form (a `REDUX`, for
+//! one, a shuffle for each of the warp's 32 lanes), plus a guard's read and split. The decoded
+//! instructions are kept once per instruction of the program, which flow analysis holds to
+//! [`crate::flow::MAX_PROGRAM`].
 //!
 //! # Divergences from PR #4588
 //!
@@ -80,8 +82,8 @@
 //! |---|---|---|---|
 //! | A guarded pure instruction | A conditional block (the owner's ruling of 2026-11-19) | A select of each value it writes (`guard_select`) | `tests::a_guarded_pure_instruction_becomes_a_conditional_block` |
 //! | The instructions translated | At most [`MAX_TRANSLATED_INSTRUCTIONS`], counted over the inlined graph (a **guess**, four per instruction of a program at the capture's cap, as [`crate::flow::MAX_FLOW_BLOCKS`] is four blocks per instruction) | No bound | `tests::the_translation_budget_at_its_edge` |
-//! | Which undecodable instruction is refused | The lowest-numbered one any flow block holds, after flow analysis | The first its flow walk meets (`LookupRow`, `FirstUnknownBit`), in walk order | `tests::the_lowest_undecodable_instruction_is_refused` |
-//! | Stages | Vertex and pixel only | Every stage | `tests::only_vertex_and_pixel_stages_translate` |
+//! | Which undecodable instruction is refused | The lowest-numbered one any flow block holds, after flow analysis's own refusals and before any translation | The first its flow walk meets (`flow.cpp`: `LookupRow`, `FirstUnknownBit`, before `guard.Never()`), in walk order, among the walk's other refusals | `tests::the_lowest_undecodable_instruction_is_refused` |
+//! | Stages | Vertex and pixel only, slice 1's restriction (compute comes with slice 16's lowering) | No stage check in `Translate` | `tests::only_vertex_and_pixel_stages_translate` |
 
 use super::control::{self, Emitted};
 use super::float::{self, FloatError};

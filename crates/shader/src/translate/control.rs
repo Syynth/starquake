@@ -60,7 +60,10 @@
 //! `guard_select` does for a uniform instruction; an instruction that becomes no IR ignores
 //! it; and the others (`BAR`, `VOTE`, `SHFL`, `REDUX`, `MATCH`) are refused,
 //! [`ControlUnsupported::UntestedGuard`], since flow analysis gives each such instruction a
-//! conditional block of its own and the translator does not build blocks. Then the PR's
+//! conditional block of its own and the translator does not build blocks. The translation
+//! driver ([`super::driver`]) never hands this module an untested guard: it makes a guarded
+//! `VOTEU` a conditional block first (the owner's ruling of 2026-11-19, row 2), so the select
+//! is this entry's own behaviour when called directly. Then the PR's
 //! checks run, each instruction's in the PR's order, every one before any IR is written, so a
 //! refused instruction leaves its block as it was.
 //!
