@@ -293,6 +293,7 @@ pub(super) fn frnd(dst: Gpr, src: AluSrc, rnd: RoundMode) -> OpFRnd {
         src_type: FloatType::F32,
         rnd,
         ftz: false,
+        high: false,
         wide: false,
     }
 }
@@ -305,6 +306,7 @@ pub(super) fn f2f(dst: Gpr, src: AluSrc, rnd: RoundMode) -> OpF2F {
         src_type: FloatType::F32,
         rnd,
         ftz: false,
+        high: false,
         wide: false,
     }
 }
@@ -565,7 +567,7 @@ fn guarded_predicate_writes() {
 #[test]
 fn never_guarded_instructions_are_checked() {
     let refused = Op::FMul(OpFMul {
-        scale: FMulScale::D16,
+        dnz: true,
         ..fmul(r(0), reg(1), reg(2))
     });
     let instr = encodable(Instr {
@@ -574,7 +576,7 @@ fn never_guarded_instructions_are_checked() {
     });
     assert_eq!(
         translate_raw(&[instr]),
-        refusal(instr, FloatUnsupported::FmulScale(FMulScale::D16))
+        refusal(instr, FloatUnsupported::FmulMultiplyZero)
     );
     let instr = Instr {
         guard: NOT_PT,
@@ -717,7 +719,6 @@ fn refusals_read_as_words() {
         (U::MufuImmediate, "an immediate mufu operand"),
         (U::FfmaMultiplyZero, "ffma's multiply-by-zero mode"),
         (U::FmulMultiplyZero, "fmul's multiply-by-zero mode"),
-        (U::FmulScale(FMulScale::D16), "fmul scale .d16"),
         (
             U::FmulScaleModifiers,
             "a scaled fmul without ftz or with a rounding mode",
@@ -744,7 +745,7 @@ fn refusals_read_as_words() {
             U::F2iDestinationSize(int(3, true)),
             "an f2i destination of 64 bits",
         ),
-        (U::F2iSourceSize(FloatType::F8), "an f2i source of 8 bits"),
+        (U::F2iSourceSize(FloatType::F64), "an f2i source of 64 bits"),
         (
             U::HalfF2iSource,
             "a 16-bit f2i operand that is not a register",
@@ -951,14 +952,6 @@ fn refusal_cases() -> Vec<(Op, FloatUnsupported)> {
         ),
         (
             Op::FMul(OpFMul {
-                scale: FMulScale::D16,
-                ftz: true,
-                ..fmul(r(0), reg(1), reg(2))
-            }),
-            U::FmulScale(FMulScale::D16),
-        ),
-        (
-            Op::FMul(OpFMul {
                 scale: FMulScale::M2,
                 ..fmul(r(0), reg(1), reg(2))
             }),
@@ -1001,10 +994,10 @@ fn conversion_refusal_cases() -> Vec<(Op, FloatUnsupported)> {
         ),
         (
             Op::F2I(OpF2I {
-                src_type: FloatType::F8,
+                src_type: FloatType::F64,
                 ..f2i(r(0), reg(1), IntType::S32, RoundMode::Zero)
             }),
-            U::F2iSourceSize(FloatType::F8),
+            U::F2iSourceSize(FloatType::F64),
         ),
         (
             Op::F2I(OpF2I {
@@ -1033,10 +1026,10 @@ fn conversion_refusal_cases() -> Vec<(Op, FloatUnsupported)> {
         ),
         (
             Op::FRnd(OpFRnd {
-                src_type: FloatType::F8,
+                src_type: FloatType::F64,
                 ..frnd(r(0), reg(1), RoundMode::Zero)
             }),
-            U::FrndSourceSize(FloatType::F8),
+            U::FrndSourceSize(FloatType::F64),
         ),
         (
             Op::F2F(OpF2F {
@@ -1078,56 +1071,49 @@ fn each_refusal_through_translate() {
     }
 }
 
-/// The forms the decoder reads and the PR refuses are refused here, as listed choices: `FMUL`
-/// scale 0, every 8-bit float size, the 64-bit opcodes of `FRND`, `F2F`, `F2I` and `I2F`,
-/// `MUFU`'s immediate form and its three functions the PR has no case for, and the `FSWZADD`
-/// operation bytes other than the PR's two.
+/// The forms the decoder reads and the PR refuses are refused here, as listed choices: every
+/// 64-bit float size, the 64-bit opcodes of `FRND`, `F2F`, `F2I` and `I2F`, `MUFU`'s immediate
+/// form and its three functions the PR has no case for, and the `FSWZADD` operation bytes other
+/// than the PR's two. `FMUL`'s scale 0 and a float size of 0, which the PR also refuses, the
+/// decoder refuses (slice 4b), so every decoded scale is translated.
 #[test]
 fn decoded_forms_the_pr_refuses_are_refused() {
     use FloatUnsupported as U;
-    assert_refused(
-        Op::FMul(OpFMul {
-            scale: FMulScale::D16,
-            ftz: true,
-            ..fmul(r(0), reg(1), reg(2))
-        }),
-        U::FmulScale(FMulScale::D16),
-    );
-    // Every other scale is translated, with FTZ and to-nearest where it scales.
-    for scale in FMulScale::ALL.into_iter().skip(1) {
+    // Every scale is translated, with FTZ and to-nearest where it scales.
+    for scale in FMulScale::ALL {
         translated(&[Instr::new(Op::FMul(OpFMul {
             scale,
             ftz: true,
             ..fmul(r(0), reg(1), reg(2))
         }))]);
     }
-    let f8 = FloatType::F8;
+    let f64 = FloatType::F64;
     assert_refused(
         Op::F2I(OpF2I {
-            src_type: f8,
+            src_type: f64,
             ..f2i(r(0), reg(1), IntType::S32, RoundMode::Zero)
         }),
-        U::F2iSourceSize(f8),
+        U::F2iSourceSize(f64),
     );
     assert_refused(
         Op::I2F(crate::decode::OpI2F {
-            dst_type: f8,
+            dst_type: f64,
             ..i2f(r(0), reg(1), IntType::S32, RoundMode::Zero)
         }),
-        U::I2fDestinationSize(f8),
+        U::I2fDestinationSize(f64),
     );
     assert_refused(
         Op::I2FP(OpI2FP {
-            dst_type: f8,
+            dst_type: f64,
             ..i2fp(r(0), reg(1), IntType::S32, RoundMode::Zero)
         }),
-        U::I2fDestinationSize(f8),
+        U::I2fDestinationSize(f64),
     );
-    for (dst_type, src_type) in [(f8, FloatType::F32), (FloatType::F32, f8)] {
-        let what = if dst_type == f8 {
-            U::FrndDestinationSize(f8)
+    for (dst_type, src_type) in [(f64, FloatType::F32), (FloatType::F32, f64)] {
+        let what = if dst_type == f64 {
+            U::FrndDestinationSize(f64)
         } else {
-            U::FrndSourceSize(f8)
+            U::FrndSourceSize(f64)
         };
         assert_refused(
             Op::FRnd(OpFRnd {
@@ -1139,8 +1125,8 @@ fn decoded_forms_the_pr_refuses_are_refused() {
         );
     }
     for (dst_type, src_type, what) in [
-        (f8, FloatType::F32, U::F2fDestinationSize(f8)),
-        (FloatType::F16, f8, U::F2fSourceSize(f8)),
+        (f64, FloatType::F32, U::F2fDestinationSize(f64)),
+        (FloatType::F16, f64, U::F2fSourceSize(f64)),
     ] {
         assert_refused(
             Op::F2F(OpF2F {
@@ -1258,21 +1244,14 @@ fn refusals_report_in_the_prs_order() {
             }),
             U::BindlessConstantBuffer,
         ),
-        // FMUL: multiply-by-zero, then the scale, then the scale's modifiers.
+        // FMUL: multiply-by-zero, then the scale's modifiers.
         (
             Op::FMul(OpFMul {
                 dnz: true,
-                scale: FMulScale::D16,
+                scale: FMulScale::M2,
                 ..fmul(r(0), reg(1), reg(2))
             }),
             U::FmulMultiplyZero,
-        ),
-        (
-            Op::FMul(OpFMul {
-                scale: FMulScale::D16,
-                ..fmul(r(0), reg(1), reg(2))
-            }),
-            U::FmulScale(FMulScale::D16),
         ),
     ];
     for (op, what) in encoded {
@@ -1324,21 +1303,21 @@ fn conversion_refusals_report_in_the_prs_order() {
         (
             Op::F2I(OpF2I {
                 wide: true,
-                src_type: FloatType::F8,
+                src_type: FloatType::F64,
                 ..f2i(r(0), bindless, int(3, true), RoundMode::Zero)
             }),
             U::WideConversion("f2i"),
         ),
         (
             Op::F2I(OpF2I {
-                src_type: FloatType::F8,
+                src_type: FloatType::F64,
                 ..f2i(r(0), bindless, int(3, true), RoundMode::Zero)
             }),
             U::BindlessConstantBuffer,
         ),
         (
             Op::F2I(OpF2I {
-                src_type: FloatType::F8,
+                src_type: FloatType::F64,
                 ..f2i(r(0), reg(1), int(3, true), RoundMode::Zero)
             }),
             U::F2iDestinationSize(int(3, true)),

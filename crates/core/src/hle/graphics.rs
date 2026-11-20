@@ -251,6 +251,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use starquake_gpu::back::exec::ShaderCache;
+use starquake_gpu::back::fence::FenceClock;
 use starquake_gpu::channel::ChannelError;
 use starquake_gpu::front::HostClock;
 use starquake_gpu::interface::{
@@ -449,6 +450,10 @@ pub struct GpuParts {
     pub watch: Arc<WriteWatch>,
     /// The GPU's settings.
     pub config: GpuConfig,
+    /// The GPU back thread's clock, whose timestamp a 16-byte semaphore release writes: in a
+    /// run, guest time from the kernel's clock (`crate::machine`'s `gpu` module, "The GPU's
+    /// clocks"). The front thread's clock is the host's.
+    pub fence_clock: Arc<dyn FenceClock>,
 }
 
 /// What [`Graphics::idleness`] found (module docs, "Telling a stalled run").
@@ -548,6 +553,7 @@ impl Graphics {
             guest,
             watch,
             config,
+            fence_clock,
         } = parts;
         let gpu = Arc::new(Gpu::new(
             GpuDeps {
@@ -559,7 +565,7 @@ impl Graphics {
                 guest,
                 watch,
                 front_clock: Arc::new(HostClock::new()),
-                fence_clock: Arc::new(HostClock::new()),
+                fence_clock,
             },
             config,
         )?);

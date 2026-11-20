@@ -58,7 +58,7 @@ use crate::back::draw::shaders::{
     GuestPrograms, HostShaders, ResourceSource, ResourceUse, SetLookup,
 };
 use crate::back::draw::{DrawError, WaitWhileCompiling};
-use crate::back::fence::{FenceError, FencedAction, Fences};
+use crate::back::fence::{FailureLog, FenceError, FencedAction, Fences};
 use crate::back::pipeline::{Lookup as PipelineLookup, PipelineCache, PipelineCacheError};
 use crate::back::qmd::{ConstantBuffer, Dispatch, Outcome, Program, QmdSink};
 use crate::back::texture::TextureCache;
@@ -346,6 +346,7 @@ impl QmdSink for ComputeSink<'_> {
             memory: Arc::clone(self.memory),
             space: self.space,
             release,
+            failure: FailureLog::Warn,
         };
         if let Err(error) = self.fences.attach(action) {
             self.failed(error);
