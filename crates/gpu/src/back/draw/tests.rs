@@ -21,6 +21,7 @@ use starquake_render::{
 };
 use starquake_shader::asm::assemble_program;
 use starquake_shader::decode::{Instr, Op, OpExit, PredSrc};
+use starquake_shader::driver_constants::DriverConstant;
 use starquake_shader::exchange::{SampledType, TextureFormat};
 use starquake_shader::host::HostShader;
 use starquake_shader::lookup::{
@@ -1698,7 +1699,8 @@ fn every_emulation_flag_reaches_the_key_through_a_draw() {
     let lacking = Features::ALL
         .difference(Features::DEPTH_RANGE_MINUS_ONE_TO_ONE)
         .difference(Features::PRIMITIVE_RESTART_OFF)
-        .difference(Features::UNTYPED_FRAGMENT_OUTPUTS);
+        .difference(Features::UNTYPED_FRAGMENT_OUTPUTS)
+        .difference(Features::FLIPPED_VIEWPORT);
     let mut rig = Rig::with(
         caps(true, lacking, 1),
         WaitWhileCompiling::Wait,
@@ -1722,7 +1724,9 @@ fn every_emulation_flag_reaches_the_key_through_a_draw() {
             ..EmulationKey::default()
         }
     );
-    // Alpha test, -1..1 depth, a second attribute and an integer target.
+    // Alpha test, -1..1 depth, a second attribute, an integer target and a lower-left origin
+    // (which flips the viewport).
+    lower_left(&mut rig);
     rig.set(&clc797::SET_ALPHA_TEST, &[], 1);
     rig.set(
         &clc797::SET_ALPHA_FUNC,
@@ -1760,6 +1764,7 @@ fn every_emulation_flag_reaches_the_key_through_a_draw() {
             primitive_restart_rewrite: true,
             attribute_fetch: true,
             typed_outputs: true,
+            flipped_viewport: true,
         }
     );
     assert_eq!(seen.key.vertex_attributes[0], AttributeType::Float);
@@ -1770,7 +1775,7 @@ fn every_emulation_flag_reaches_the_key_through_a_draw() {
     // The pipeline gets the same flags. With the second attribute past the device's one, the
     // backend refuses the pipeline (the fetch-from-buffer path is not built: every attribute is
     // still in the vertex layout), so that draw is skipped; without it the pipeline is made with
-    // the other four flags.
+    // the other five flags.
     assert_eq!(
         rig.draw(),
         Outcome::Skipped(Skip::PipelineFailed { newly: false })
@@ -1780,9 +1785,251 @@ fn every_emulation_flag_reaches_the_key_through_a_draw() {
     let snapshot = rig.submit();
     assert!(
         snapshot.contains(
-            "emulation ALPHA_TEST|DEPTH_RANGE_REWRITE|PRIMITIVE_RESTART_REWRITE|TYPED_OUTPUTS"
+            "emulation ALPHA_TEST|DEPTH_RANGE_REWRITE|PRIMITIVE_RESTART_REWRITE|TYPED_OUTPUTS|FLIPPED_VIEWPORT"
         ),
         "{snapshot}"
+    );
+}
+
+/// The driver constants of the last upload of the draw path's constants buffer, decoded.
+fn uploaded_constants(rig: &Rig) -> DriverConstants {
+    let draw = rig.last_draw();
+    let driver = draw
+        .bindings
+        .iter()
+        .find_map(|b| match b.resource {
+            BindingResource::Buffer(slice) if slice.offset == DRIVER_CONSTANTS_OFFSET => {
+                Some(slice)
+            }
+            _ => None,
+        })
+        .unwrap();
+    let bytes = rig
+        .list
+        .commands
+        .iter()
+        .rev()
+        .find_map(|c| match c {
+            Command::Upload {
+                from,
+                to: CopyRegion::Buffer(to),
+            } if to.buffer == driver.buffer => Some(from.bytes().to_vec()),
+            _ => None,
+        })
+        .unwrap();
+    let at = usize::try_from(DRIVER_CONSTANTS_OFFSET).unwrap();
+    let block = &bytes[at..at + DRIVER_CONSTANTS_SIZE];
+    // Decode the three position words; every other field is checked elsewhere.
+    let word = |constant: DriverConstant| {
+        let at = constant.offset();
+        f32::from_le_bytes(block[at..at + 4].try_into().unwrap())
+    };
+    let minus_one = (-1.0_f32).to_bits();
+    let flip_y = word(DriverConstant::PositionYScale).to_bits() == minus_one;
+    let reverse_depth = word(DriverConstant::PositionZScale).to_bits() == minus_one;
+    // A reversal with a zero offset is the -w..w clip range's mirror.
+    let clip_depth = if reverse_depth && word(DriverConstant::PositionZOffset).to_bits() == 0 {
+        ClipDepth::MinusWToW
+    } else {
+        ClipDepth::ZeroToW
+    };
+    let decoded = DriverConstants {
+        flip_y,
+        reverse_depth,
+        clip_depth,
+        ..DriverConstants::default()
+    };
+    // The words are exactly what those switches encode to.
+    for constant in [
+        DriverConstant::PositionYScale,
+        DriverConstant::PositionZScale,
+        DriverConstant::PositionZOffset,
+    ] {
+        assert_eq!(
+            word(constant).to_bits(),
+            decoded.word(constant),
+            "{constant:?}"
+        );
+    }
+    decoded
+}
+
+/// Each case of the first viewport (upright, y flipped by a lower-left origin, depth reversed
+/// by a negative z scale, both) on a device without `FLIPPED_VIEWPORT`: the flag reaches the
+/// key and the pipeline exactly when something flips, the driver constants carry that flip, and
+/// the draw hands the backend the guest's viewport as it is (the backend makes it positive). On a
+/// device with the feature nothing is emulated and the constants carry no flip. A flip of
+/// viewport 1 alone is not read.
+#[test]
+fn each_viewport_flip_reaches_the_flag_and_the_constants() {
+    let lacking = Features::ALL.difference(Features::FLIPPED_VIEWPORT);
+    for native in [false, true] {
+        let features = if native { Features::ALL } else { lacking };
+        let mut rig = Rig::with(
+            caps(true, features, 16),
+            WaitWhileCompiling::Wait,
+            ready(vec![], vec![driver_use(0, 0)]),
+        );
+        rig.basic();
+        rig.set(
+            &clc797::SET_VIEWPORT_Z_CLIP,
+            &[],
+            clc797::SET_VIEWPORT_Z_CLIP_RANGE_ZERO_TO_POSITIVE_W,
+        );
+        // Viewport 1 flips both ways; only viewport 0 is read.
+        rig.set(&clc797::SET_VIEWPORT_SCALE_Y, &[1], (-4.0f32).to_bits());
+        rig.set(&clc797::SET_VIEWPORT_SCALE_Z, &[1], (-0.5f32).to_bits());
+        let cases = [(false, false), (true, false), (false, true), (true, true)];
+        for (flip_y, reverse_depth) in cases {
+            let origin = if flip_y {
+                clc797::SET_WINDOW_ORIGIN_MODE_LOWER_LEFT
+            } else {
+                clc797::SET_WINDOW_ORIGIN_MODE_UPPER_LEFT
+            };
+            rig.set(
+                &clc797::SET_WINDOW_ORIGIN,
+                &[],
+                fields(&[(clc797::SET_WINDOW_ORIGIN_MODE, origin)]),
+            );
+            let scale_z: f32 = if reverse_depth { -0.5 } else { 0.5 };
+            rig.set(&clc797::SET_VIEWPORT_SCALE_Z, &[0], scale_z.to_bits());
+            assert_eq!(rig.draw(), Outcome::Drawn);
+            let case = format!("native {native}, flip y {flip_y}, reverse depth {reverse_depth}");
+            let viewport = rig.last_draw().dynamic.viewports[0];
+            let guest = ViewportFlip {
+                flip_y,
+                reverse_depth,
+            };
+            assert_eq!(ViewportFlip::of(&viewport), guest, "{case}");
+            let emulated = !native && guest.any();
+            let key = rig.shaders.seen.last().unwrap().key.emulation;
+            assert_eq!(key.flipped_viewport, emulated, "{case}");
+            let carried = if emulated { guest } else { ViewportFlip::NONE };
+            let constants = uploaded_constants(&rig);
+            assert_eq!(
+                (constants.flip_y, constants.reverse_depth),
+                (carried.flip_y, carried.reverse_depth),
+                "{case}"
+            );
+            let snapshot = rig.submit();
+            let last = snapshot
+                .lines()
+                .rfind(|line| line.contains("emulation"))
+                .unwrap()
+                .to_owned();
+            assert_eq!(
+                last.contains("FLIPPED_VIEWPORT"),
+                emulated,
+                "{case}: {last}"
+            );
+        }
+    }
+}
+
+/// The depth mirror follows the clip range the shader leaves. A reversed range in the -1..1 depth
+/// mode on a device that takes -1..1 natively but cannot set a flipped viewport keeps clip-space
+/// z in -w..w (no `DEPTH_RANGE_REWRITE`), so the z offset word is 0.0 (the mirror `-z`); on a
+/// device lacking the -1..1 feature too the rewrite makes it 0..w and the offset 1.0 (`w - z`),
+/// as it is in the 0..1 depth mode on either device. The z scale is -1.0 in every case.
+#[test]
+fn the_depth_mirror_follows_the_clip_range() {
+    let native = Features::ALL.difference(Features::FLIPPED_VIEWPORT);
+    let lacking = native.difference(Features::DEPTH_RANGE_MINUS_ONE_TO_ONE);
+    let minus_w = clc797::SET_VIEWPORT_Z_CLIP_RANGE_NEGATIVE_W_TO_POSITIVE_W;
+    let zero = clc797::SET_VIEWPORT_Z_CLIP_RANGE_ZERO_TO_POSITIVE_W;
+    // (features, clip register, rewrite expected, z offset word)
+    let cases = [
+        (native, minus_w, false, 0.0_f32),
+        (lacking, minus_w, true, 1.0),
+        (native, zero, false, 1.0),
+        (lacking, zero, false, 1.0),
+    ];
+    for (features, range, rewrite, offset) in cases {
+        let case = format!("features {features:?}, clip range {range}");
+        let mut rig = Rig::with(
+            caps(true, features, 16),
+            WaitWhileCompiling::Wait,
+            ready(vec![], vec![driver_use(0, 0)]),
+        );
+        rig.basic();
+        rig.set(&clc797::SET_VIEWPORT_Z_CLIP, &[], range);
+        rig.set(&clc797::SET_VIEWPORT_SCALE_Z, &[0], (-0.5f32).to_bits());
+        assert_eq!(rig.draw(), Outcome::Drawn, "{case}");
+        let viewport = rig.last_draw().dynamic.viewports[0];
+        assert!(ViewportFlip::of(&viewport).reverse_depth, "{case}");
+        let key = rig.shaders.seen.last().unwrap().key.emulation;
+        assert!(key.flipped_viewport, "{case}");
+        assert_eq!(key.depth_range_rewrite, rewrite, "{case}");
+        let constants = uploaded_constants(&rig);
+        assert!(constants.reverse_depth, "{case}");
+        assert_eq!(
+            constants.word(DriverConstant::PositionZScale),
+            (-1.0_f32).to_bits(),
+            "{case}"
+        );
+        assert_eq!(
+            constants.word(DriverConstant::PositionZOffset),
+            offset.to_bits(),
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn constants_carry_a_flip_only_with_the_flag() {
+    let both = ViewportFlip {
+        flip_y: true,
+        reverse_depth: true,
+    };
+    for flags in [EmulationFlags::EMPTY, EmulationFlags::ALL] {
+        let expected = if flags == EmulationFlags::ALL {
+            both
+        } else {
+            ViewportFlip::NONE
+        };
+        assert_eq!(shaders::constants_flip(flags, both), expected);
+        assert_eq!(
+            shaders::constants_flip(flags, ViewportFlip::NONE),
+            ViewportFlip::NONE
+        );
+    }
+    // The flag alone is enough; every other flag without it carries nothing.
+    assert_eq!(
+        shaders::constants_flip(EmulationFlags::FLIPPED_VIEWPORT, both),
+        both
+    );
+    assert_eq!(
+        shaders::constants_flip(
+            EmulationFlags::ALL.difference(EmulationFlags::FLIPPED_VIEWPORT),
+            both
+        ),
+        ViewportFlip::NONE
+    );
+    // No viewport is no flip; the first of several is the one read.
+    assert_eq!(shaders::viewport_flip(&[]), ViewportFlip::NONE);
+    let upright = starquake_render::command::Viewport {
+        x: 0.0,
+        y: 0.0,
+        width: 8.0,
+        height: 8.0,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    };
+    let flipped = starquake_render::command::Viewport {
+        y: 8.0,
+        height: -8.0,
+        ..upright
+    };
+    assert_eq!(
+        shaders::viewport_flip(&[upright, flipped]),
+        ViewportFlip::NONE
+    );
+    assert_eq!(
+        shaders::viewport_flip(&[flipped, upright]),
+        ViewportFlip {
+            flip_y: true,
+            reverse_depth: false
+        }
     );
 }
 
@@ -2290,9 +2537,31 @@ fn driver_constants_take_their_sources() {
         base_instance: 5,
         base_vertex: 0xffff_fffe,
     };
-    let constants = driver_constants(&rig.mirror, 0.25, &call).unwrap();
+    // The viewport flip is the one handed in, each switch on its own field.
+    let flip = ViewportFlip {
+        flip_y: true,
+        reverse_depth: false,
+    };
+    let constants =
+        driver_constants(&rig.mirror, 0.25, &call, flip, DepthRange::ZeroToOne).unwrap();
     assert_eq!(constants.alpha_reference, 0.25);
     assert!(constants.y_negate);
+    assert!(constants.flip_y);
+    assert!(!constants.reverse_depth);
+    let flip = ViewportFlip {
+        flip_y: false,
+        reverse_depth: true,
+    };
+    let constants =
+        driver_constants(&rig.mirror, 0.25, &call, flip, DepthRange::ZeroToOne).unwrap();
+    assert!(!constants.flip_y);
+    assert!(constants.reverse_depth);
+    assert_eq!(constants.clip_depth, ClipDepth::ZeroToW);
+    // The clip range is the one handed in: -1..1 is the symmetric mirror.
+    let symmetric =
+        driver_constants(&rig.mirror, 0.25, &call, flip, DepthRange::MinusOneToOne).unwrap();
+    assert!(symmetric.reverse_depth);
+    assert_eq!(symmetric.clip_depth, ClipDepth::MinusWToW);
     assert_eq!(
         (constants.render_area_width, constants.render_area_height),
         (8.0, 8.0)
@@ -2305,7 +2574,14 @@ fn driver_constants_take_their_sources() {
     rig.set(&clc797::SET_SURFACE_CLIP_HORIZONTAL, &[], 0);
     rig.set(&clc797::SET_COLOR_TARGET_WIDTH, &[0], 32);
     rig.set(&clc797::SET_COLOR_TARGET_HEIGHT, &[0], 16);
-    let constants = driver_constants(&rig.mirror, 0.25, &call).unwrap();
+    let constants = driver_constants(
+        &rig.mirror,
+        0.25,
+        &call,
+        ViewportFlip::NONE,
+        DepthRange::ZeroToOne,
+    )
+    .unwrap();
     assert_eq!(
         (constants.render_area_width, constants.render_area_height),
         (32.0, 16.0)
