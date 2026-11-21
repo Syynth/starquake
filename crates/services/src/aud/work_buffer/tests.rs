@@ -217,7 +217,7 @@ fn the_fields_the_size_does_not_read_do_not_change_it() {
     assert_eq!(work_buffer_size(&other), Ok(size));
 }
 
-/// A parameter of zeroes except `fields`' changes, at `revision`.
+/// `parameter`'s fixed fields and zeroes elsewhere, at `revision`, with `change` applied.
 fn only(revision: u32, change: impl FnOnce(&mut RendererParameter)) -> RendererParameter {
     let mut params = parameter(0, 0, 0, 0, 0, 0, 0, 0, 0, revision);
     change(&mut params);

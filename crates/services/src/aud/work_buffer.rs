@@ -75,13 +75,22 @@
 //! - **A term that would wrap** is [`WorkBufferError::Overflow`] where Eden answers the wrapped
 //!   size. On every parameter where no term wraps, the size is Eden's exactly
 //!   (`work_buffer/tests.rs`: `the_size_is_edens_on_every_golden_parameter`, whose values were
-//!   taken from Eden-NX2's function compiled over its own headers). Each 32-bit term has an edge
-//!   test on both sides (`every_32_bit_term_is_refused_one_past_its_edge`). Some cannot be the
-//!   first to wrap: `sub_mixes + 1` wraps only at `sub_mixes` = `u32::MAX`, which already wraps
-//!   `sub_mixes * MAX_EFFECTS`; and with `sub_mixes + 1` at most 2^24 + 1, the node-state and
+//!   taken from Eden-NX2's function compiled over its own headers). These 32-bit terms each have
+//!   a test at their edge, answering Eden's size, and one past it, refused
+//!   (`every_32_bit_term_is_refused_one_past_its_edge`): `sub_mixes * MAX_EFFECTS`,
+//!   `(sinks + sub_mixes) * TARGET_SAMPLE_COUNT`, `mixes + MAX_CHANNELS`, the node states'
+//!   `count * (count * 4)`, `voices * MAX_WAVE_BUFFERS`, `effects + voices * MAX_WAVE_BUFFERS`,
+//!   the performance entry count, `perf_frames + 1` and the command buffer's node count.
+//!   `sinks + sub_mixes` on its own is refused one past its edge
+//!   (`a_sum_of_sinks_and_sub_mixes_past_32_bits_is_refused`); at its edge the product with
+//!   `TARGET_SAMPLE_COUNT` already refuses. Some terms cannot be the first to wrap:
+//!   `sub_mixes + 1` wraps only at `sub_mixes` = `u32::MAX`, which already wraps
+//!   `sub_mixes * MAX_EFFECTS`; and with `sub_mixes + 1` at most 2^24, the node-state and
 //!   edge-matrix terms other than `count * (count * 4)` cannot wrap before it does (`count * 4`,
 //!   both `AlignUp`s, and `count * count`, which wraps only past `count` = 65535, where
-//!   `count * (count * 4)` already has). They are checked all the same, so no path wraps.
+//!   `count * (count * 4)` already has). They are checked all the same, so no path wraps. The
+//!   64-bit terms are tested by parameters that wrap a product
+//!   (`a_parameter_whose_64_bit_size_would_wrap_is_refused`), not at each term's exact edge.
 //! - **A negative `splitter_destinations`** is [`WorkBufferError::NegativeSplitterDestinations`]
 //!   when a term reads it (revision 2 on: the splitter's size, and from revision 5 the command
 //!   buffer's). Eden converts the `s32` to an unsigned 64-bit value and wraps. Below revision 2
