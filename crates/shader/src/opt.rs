@@ -46,6 +46,7 @@
 
 mod constant;
 mod dce;
+pub mod global_memory;
 mod identity;
 mod ssa;
 #[cfg(test)]
