@@ -722,6 +722,29 @@ Landed: shader slices 15 (inputs, outputs and collect info, #374, PR #450), 16 (
 | proposed | **TLD4 `.F16`** is not added (no reference names it on SM 7.0+); TLD's `.F16` and `.CL` come from NAK comments only | #430 | area:shader (M4) |
 | proposed | **A negative viewport width** is still refused; a multi-viewport host without a native flip would need one flip per viewport | #438 | area:render |
 
+### From wave 47 (ledger: #22)
+
+Landed: the translation driver (slice 12i, #453, PR #478), SSA on structured functions (slice 8b, #467, PR #482), memory translation (slice 12e, #368, PR #471), decoder slice 6c (#353, PR #479), the backend choice, shared compile pool and `--window` (R12, #389, PR #481), masked clears in the render backend (#455, PR #483), the TextureKind usage and previous-stage keys (#432, PR #468), and the title bring-up's launch parameter (#459, PR #472) and guest RAM sizing (#460, PR #480). Decoder slice 6d (#354) was built and pushed but stopped before its checks; wave 48 resumes it. The production translation wiring the scope check found missing is filed as #484 (it follows the spec's flowchart and the 8b ruling).
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| proposed | **A guarded instruction that writes no IR gets no block:** the spec says "every guarded instruction becomes a conditional block, pure ones included"; the driver now splits only where Eden's `Visitor::Run` does (`classify().pure`), so a guarded NOP, DEPBAR, BREAK or immediate WARPSYNC adds no guard read and no empty block (pinned by `a_guarded_instruction_that_is_not_pure_reads_no_guard`). The outcome is the same. Recommendation: accept, and narrow the spec sentence to instructions that write IR | #453 | shader-pipeline |
+| proposed | **Stale spec text after the rulings:** shader-pipeline still says SSA "refuses a structured function"; execution-model keeps the 4 MiB pool sentence that guest RAM sizing replaced; gpu-protocol's first "Clears" paragraph predates masks in `ClearDesc`; render-backend names render capture v2 where it is now v3. Recommendation: editorial fixes to match the rulings and the merged code | #467, #460, #455 | shader-pipeline, execution-model, gpu-protocol, render-backend |
+| proposed | **`--backend` and the run summary:** R12 adds the backend choice, but observability.md does not list the flag, and a fallback to recording shows only in `log.txt`. Recommendation: document the flag and record the chosen backend in `summary.json` (a `SUMMARY_VERSION` bump), with a present-feedback counter | #389 | observability |
+| proposed | **Clear details:** the stencil mask is 8 bits in `ClearDesc` while the guest register is 32 bits, and the high bits of the stencil clear value are dropped; `MAX_CLEAR_PIPELINES` is a guess. Recommendation: keep 8 bits (what host APIs take) as a listed divergence, and keep the guess marked | #455 | render-backend |
+| proposed | **12e's open wording:** the bit-76 descriptor reading, the LDGSTS predicate and strong memory orders are still written as owner questions in `translate/memory.rs`, though the 2026-11-20 ruling ("12e follows PR #4588's lowering where they disagree") covers them. Recommendation: the ruling settles them; fix the wording | #368 | area:shader |
+| proposed | **6c and 6d decoder questions:** HFMA2.MMA, the nvdisasm (E2) checks, UP2UR (only `lower_to_maxwell.h` names it) and the uniform ALU twins. Details in PR #479's body and #354's scope comment. Recommendation: decide with 6d's PR in wave 48 | #353, #354 | shader-pipeline |
+| proposed | **The lowering-wins rule in general:** the 2026-11-20 ruling applies it to 12e; the merged decoder groups have not been rechecked against `lower_to_maxwell.h`. Recommendation: state it as the general rule, then recheck the groups | #368 | shader-pipeline |
+| proposed | **Structurizer time on long guarded runs:** 65,000 guarded IADD3s took 23.7 s in a debug build; impure guarded instructions structure into loops with about a dozen goto variables, and `MAX_TRANSLATED_INSTRUCTIONS` (262,144) is a guess. Recommendation: give flow analysis's guard-test blocks the same if-layout, and add a time-bound test at the capture cap | #453 | area:shader |
+| proposed | **IR verifier gaps:** the verifier run after every pass does not check structured phis' incoming blocks or that incoming values are in scope (8b added a test-side checker only). Recommendation: move the check into `ir/verify.rs` | #467 | area:shader |
+| proposed | **Local memory and LDCG:** slice 16 closed without the local-memory bound or local and shared array sizing, and LDCG (0x8b8) has no translating slice. Recommendation: one issue for the bound and sizing; fold LDCG into 12d (#367) | #375, #354 | area:shader |
+| proposed | **Verification still owed:** the lavapipe experiment (render-backend decision 9), so GPU tests and window wiring get CI coverage; a hand check of a windowed run on a Mac (resize, letterbox) and on a Linux desktop, Wayland included | #389 | area:render |
+| proposed | **render-wgpu follow-ups:** random masked clears in the differential generator; a resolve-based readback for MSAA and two-aspect clears; one parameter buffer per list instead of a submit per drawn clear; deliver dumped frames before storing `completed`; detect the main thread on Linux the way winit does | #455, #389 | area:render |
+| proposed | **Small chores:** an out-of-RAM end-to-end test seam with a small pool; a services-framework note and test pinning the result-only failure reply; the nextest leak in core's present-PNG test; "owner question" wording left in `variant.rs`, `exchange.rs` and `back/draw/shaders.rs` after the rulings | #460, #459, #389, #432 | area:core, area:services, area:shader |
+| proposed | **Accounts and launch (M2):** preselected-user storage and an accounts design, the ApplicationInitiated launch path, and a scoping-doc row for `IApplicationFunctions` 1 | #459 | services |
+| proposed | **Later (M4):** snapshot-reader bounds that now scale to GiBs; returning host pages on unmap; tessellation and geometry previous-stage masks; consuming `previous_stage_stores` and per-stage key projection | #460, #432 | area:core, area:shader |
+| proposed | **#449 review notes:** a zero-count macro loop with a JAL in the other slot, and a two-slot register write, diverge from Eden in ways no test pins | #449 | area:gpu |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
@@ -1041,3 +1064,11 @@ passed to build agents as a provisional rule for the next wave.
 - After a ruling lands, the PR's docs and body are re-read against it; settled questions lose their "open" wording.
 - A table of rows gets a test over every row with distinct values.
 - A cache never evicts its own just-resolved members, and a refusal names the cap that bound.
+
+### From wave 47 (ledger: #22)
+
+- Where references disagree, both paths are traced and every case only one accepts is a listed divergence with a named test.
+- Guard handling mirrors the reference's exact split rule and is tested with observable destinations over every predicate combination.
+- "Every variant" claims are backed by a deterministic enumeration of the full set, never a random sample.
+- A path that does not read a field refuses it with a named variant; error types use unit variants with exact Display text.
+- PR bodies and docs are re-checked after the last merge of main.
