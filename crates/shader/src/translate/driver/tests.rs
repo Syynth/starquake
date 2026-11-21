@@ -1034,22 +1034,28 @@ fn a_decoded_uniform_datapath_instruction_reaches_its_group() {
         let mut function = Function::new();
         let entry = function.entry();
         let mut driver = Driver::new(VERTEX, None);
-        match driver.dispatch(&mut function, entry, 5, instr) {
-            Ok(()) => {
-                translated.insert(instr.op.mnemonic());
-            }
-            Err(TranslateError::Uniform { index, error, .. }) => {
-                assert_eq!(index, 5);
-                if matches!(instr.op, Op::UBMsk(_)) {
-                    assert_eq!(
-                        error,
-                        UniformError::Unsupported(uniform::UniformUnsupported::Instruction(
-                            "ubmsk"
-                        ))
-                    );
-                }
-            }
-            Err(other) => panic!("{instr}: {other}"),
+        let result = driver.dispatch(&mut function, entry, 5, instr);
+        assert!(
+            matches!(
+                result,
+                Ok(()) | Err(TranslateError::Uniform { index: 5, .. })
+            ),
+            "{instr}: {result:?}"
+        );
+        if result.is_ok() {
+            translated.insert(instr.op.mnemonic());
+        }
+        if matches!(instr.op, Op::UBMsk(_)) {
+            assert_eq!(
+                result,
+                Err(TranslateError::Uniform {
+                    index: 5,
+                    instr,
+                    error: UniformError::Unsupported(uniform::UniformUnsupported::Instruction(
+                        "ubmsk"
+                    )),
+                })
+            );
         }
     }
     assert_eq!(seen.len(), 20, "{seen:?}");
@@ -1093,9 +1099,12 @@ fn a_refused_uniform_instruction_names_its_reason() {
             assemble(&instr).expect("encodable"),
             assemble(&exit()).expect("encodable"),
         ];
-        let error = translate_flow(VERTEX, None, &code, &BranchTables::new(0))
-            .expect_err("refused");
-        assert!(matches!(error, TranslateError::Uniform { index: 1, .. }), "{error}");
+        let error =
+            translate_flow(VERTEX, None, &code, &BranchTables::new(0)).expect_err("refused");
+        assert!(
+            matches!(error, TranslateError::Uniform { index: 1, .. }),
+            "{error}"
+        );
         assert_eq!(error.to_string(), text);
     }
 }

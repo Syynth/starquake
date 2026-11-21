@@ -3,8 +3,8 @@
 
 use super::*;
 use crate::decode::{
-    IMadMode, IntCmpOp, OpBRev, OpFlo, OpIAdd3X, OpIMad, OpIMad64, OpISetP, OpLea, OpLop3,
-    OpPopC, OpPrmt, OpSel, OpSgxt, OpShf, PredSetOp, PrmtMode, ShfType,
+    IMadMode, IntCmpOp, OpBRev, OpFlo, OpIAdd3X, OpIMad, OpIMad64, OpISetP, OpLea, OpLop3, OpPopC,
+    OpPrmt, OpSel, OpSgxt, OpShf, PredSetOp, PrmtMode, ShfType,
 };
 
 /// A `LEA` of `(a << shift) + b`, no carries.
@@ -52,15 +52,25 @@ fn umov_moves_immediates_and_registers() {
     assert_eq!(machine.uniform_regs[3], 0x1234_5678);
     assert_eq!(machine.uniform_regs[4], 0x1234_5678);
     assert_eq!(machine.uniform_regs[5], 0);
-    assert_eq!(machine.uniform_regs[usize::from(UniformReg::URZ.index())], 0);
-    assert_eq!(machine.regs[3], 0xbad0_0003, "the per-thread file is untouched");
+    assert_eq!(
+        machine.uniform_regs[usize::from(UniformReg::URZ.index())],
+        0
+    );
+    assert_eq!(
+        machine.regs[3], 0xbad0_0003,
+        "the per-thread file is untouched"
+    );
 }
 
 /// `UIADD3` sums its three uniform sources with each negation, in form 1 and with an immediate
 /// source 1 (form 4).
 #[test]
 fn uiadd3_sums_with_negations() {
-    for (a, b, c) in [(1, 2, 3), (0xffff_ffff, 1, 0x8000_0000), (0x1234_5678, 0x7fff_ffff, 0)] {
+    for (a, b, c) in [
+        (1, 2, 3),
+        (0xffff_ffff, 1, 0x8000_0000),
+        (0x1234_5678, 0x7fff_ffff, 0),
+    ] {
         let mut machine = machine_with(&[0, a, b, c]);
         run_op(
             Op::UIAdd3(twin(iadd3(4, [reg(1), neg(2), reg(3)]))),
@@ -124,7 +134,11 @@ fn a_uniform_carry_chain_adds_64_bits() {
 #[test]
 fn ulea_shifts_and_adds() {
     for shift in [0_u8, 1, 16, 31] {
-        for (a, b) in [(1, 2), (0xffff_ffff, 0x8000_0000), (0x1234_5678, 0xffff_fff0)] {
+        for (a, b) in [
+            (1, 2),
+            (0xffff_ffff, 0x8000_0000),
+            (0x1234_5678, 0xffff_fff0),
+        ] {
             let mut machine = machine_with(&[0, a, b, 0xdead_0002]);
             run_op(Op::ULea(twin(lea(4, reg(1), reg(2), shift))), &mut machine);
             assert_eq!(
@@ -242,7 +256,11 @@ fn uimad_multiplies_and_adds() {
             carry: NOT_PT,
         },
     };
-    for (a, b, c) in [(3, 5, 7), (0xffff_ffff, 0xffff_ffff, 1), (0x1234_5678, 0x10, 0)] {
+    for (a, b, c) in [
+        (3, 5, 7),
+        (0xffff_ffff, 0xffff_ffff, 1),
+        (0x1234_5678, 0x10, 0),
+    ] {
         let mut machine = machine_with(&[0, a, b, c]);
         run_op(Op::UIMad(twin(imad(4, reg(2)))), &mut machine);
         assert_eq!(machine.uniform_regs[4], a.wrapping_mul(b).wrapping_add(c));
@@ -334,7 +352,7 @@ fn usel_selects_by_a_uniform_predicate() {
             })),
             &mut machine,
         );
-        let expected = if cond != negated { 0x1111 } else { 0x2222 };
+        let expected = if cond == negated { 0x2222 } else { 0x1111 };
         assert_eq!(machine.uniform_regs[4], expected, "{cond} {negated}");
     }
 }
@@ -403,13 +421,13 @@ fn unary_twins() {
             ],
             &mut machine,
         );
-        let msb = if value == 0 {
-            u32::MAX
-        } else {
-            31 - value.leading_zeros()
-        };
+        let msb = if value == 0 { u32::MAX } else { value.ilog2() };
         assert_eq!(machine.uniform_regs[4], msb, "{value:#x}");
-        assert_eq!(machine.uniform_regs[5], 31_u32.wrapping_sub(msb), "{value:#x}");
+        assert_eq!(
+            machine.uniform_regs[5],
+            31_u32.wrapping_sub(msb),
+            "{value:#x}"
+        );
         assert_eq!(machine.uniform_regs[6], value.reverse_bits(), "{value:#x}");
         assert_eq!(machine.uniform_regs[7], value.count_ones(), "{value:#x}");
     }

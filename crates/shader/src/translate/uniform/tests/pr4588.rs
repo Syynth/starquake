@@ -35,7 +35,10 @@ fn uniform_bit_tests() {
                     machine.run(&function).expect("runs");
                     let mut expected = original.uniform_preds;
                     expected[usize::from(output)] = value & mask != 0;
-                    assert_eq!(machine.uniform_preds, expected, "{mask:#x} {output} {value:#x}");
+                    assert_eq!(
+                        machine.uniform_preds, expected,
+                        "{mask:#x} {output} {value:#x}"
+                    );
                     assert_eq!(machine.preds, original.preds);
                     assert_eq!(machine.uniform_regs[10], value);
                 }
@@ -147,11 +150,7 @@ fn uniform_bit_reverse() {
     inputs.extend((0..32).map(|bit| 1_u32 << bit));
     for dest in [4_u8, 17, 18, 30, 32, 46, 48, 62] {
         let brev = |src: AluSrc| {
-            build(&[Instr::new(Op::UBRev(twin(OpBRev {
-                dst: r(dest),
-                src,
-            })))])
-            .expect("translates")
+            build(&[Instr::new(Op::UBRev(twin(OpBRev { dst: r(dest), src })))]).expect("translates")
         };
         let function = brev(reg(4));
         for value in &inputs {

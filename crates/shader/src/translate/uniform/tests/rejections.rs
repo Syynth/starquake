@@ -153,9 +153,7 @@ fn every_form_2_is_refused() {
 /// `R2UR` into `URZ` is refused (`Require(destination < 63)`); into `UR62` it translates.
 #[test]
 fn r2ur_into_urz() {
-    let r2ur = |dst| {
-        Instr::new(Op::R2UR(OpR2UR { dst, src: r(1) }))
-    };
+    let r2ur = |dst| Instr::new(Op::R2UR(OpR2UR { dst, src: r(1) }));
     let error = refusal(r2ur(UniformReg::URZ));
     assert_eq!(
         error,
@@ -201,7 +199,8 @@ fn a_uldc_offset_is_a_multiple_of_four() {
     };
     for mem_type in [MemType::U8, MemType::I16, MemType::B32] {
         for offset in [0x247_u16, 0x249, 0x24a] {
-            let expected = UniformError::Unsupported(UniformUnsupported::ConstantLoadOffset(offset));
+            let expected =
+                UniformError::Unsupported(UniformUnsupported::ConstantLoadOffset(offset));
             assert_eq!(refusal(Instr::new(uldc(ur(4), offset, mem_type))), expected);
             assert_eq!(refusal(Instr::new(indexed(offset, mem_type))), expected);
         }
@@ -319,7 +318,10 @@ fn uimad_wide_pairs() {
 fn other_groups() {
     let error = refusal(Instr::new(Op::Nop(crate::decode::OpNop {})));
     assert_eq!(error, UniformError::OtherGroup("nop"));
-    assert_eq!(error.to_string(), "nop is not a uniform datapath instruction");
+    assert_eq!(
+        error.to_string(),
+        "nop is not a uniform datapath instruction"
+    );
 }
 
 /// The documented order, each neighbouring pair with both faults at once: a twin's form 2
@@ -357,10 +359,15 @@ fn the_checks_come_in_their_order() {
     let entry = function.entry();
     let mut builder = Builder::new(&mut function, entry);
     let exit = builder.add_block().expect("adds");
-    builder.terminate(Terminator::Jump(exit)).expect("terminates");
+    builder
+        .terminate(Terminator::Jump(exit))
+        .expect("terminates");
     builder.switch_to(exit).expect("switches");
     builder
-        .phi(crate::ir::Type::U32, vec![(entry, Operand::Imm(Imm::U32(1)))])
+        .phi(
+            crate::ir::Type::U32,
+            vec![(entry, Operand::Imm(Imm::U32(1)))],
+        )
         .expect("appends");
     builder.terminate(Terminator::Return).expect("terminates");
     let mut builder = Builder::new(&mut function, entry);
@@ -371,7 +378,10 @@ fn the_checks_come_in_their_order() {
             GuardMode::Honour
         ),
         Err(UniformError::Unsupported(
-            UniformUnsupported::ConstantLoadDestination { dst: ur(3), words: 2 }
+            UniformUnsupported::ConstantLoadDestination {
+                dst: ur(3),
+                words: 2
+            }
         ))
     );
 }

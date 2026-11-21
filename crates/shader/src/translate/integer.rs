@@ -83,11 +83,21 @@
 //! `UnpackUint2x32`) whose high word gives the carry, so the chain's result is exact at the
 //! 32-bit carry boundary (`tests::alu::a_two_instruction_carry_chain_adds_64_bits`).
 //!
+//! # The uniform datapath's twins
+//!
+//! The uniform datapath's translator (slice 12d, [`super::uniform`]) runs this module's code
+//! on a twin's vector operation (and on `UPLOP3` as a `PLOP3`) through `translate_in`, with
+//! the register files the operands name (`Files`): its [`Gpr`] operands then name the uniform
+//! registers of the same numbers and its predicates the file that module picks, as PR #4588
+//! runs the same visitor functions with `uniform_op` set. This group's own instructions use
+//! the per-thread files (`Files::VECTOR`), unchanged.
+//!
 //! # Register pairs
 //!
 //! `IMAD.WIDE` writes a register pair and reads one as its addend. The PR's checks are kept
 //! (`Visitor::IMAD_WIDE`: `dest % 2 == 0 && dest < limit` with `limit` 254 for the vector
-//! datapath, and the same for a register or uniform-register addend other than `RZ`), so a pair
+//! datapath, [`UNIFORM_WIDE_PAIR_LIMIT`] (62) for the uniform one, and the same for a register
+//! or uniform-register addend other than `RZ`), so a pair
 //! starts at an even register and ends at or below `R253`; a uniform-register addend must be an
 //! even register too, which refuses `URZ` (63 is odd), as the PR does. An immediate addend is
 //! refused (the PR's `default` case, "native wide multiply addend").

@@ -364,17 +364,14 @@ pub fn translate_uniform(
 /// (the module docs, "Guards"). `R2UR` reads its guard as data, a predicate.
 pub(crate) fn reads_uniform_guard(op: &Op) -> bool {
     match op {
-        Op::UMov(_) | Op::UPLop3(_) => true,
-        Op::ULdc(OpULdc {
-            src: ULdcSrc::Global { .. },
+        Op::UMov(_)
+        | Op::UPLop3(_)
+        | Op::ULdc(OpULdc {
+            src: ULdcSrc::CBuf(_) | ULdcSrc::Indexed { .. },
             ..
-        }) => false,
-        Op::ULdc(_) => true,
-        Op::UPrmt(_) | Op::UBMsk(_) | Op::R2UR(_) | Op::UP2UR(_) => false,
-        _ => match twin(op) {
-            Some((_, source_2)) => !matches!(source_2, Some(AluSrc::Imm(_))),
-            None => false,
-        },
+        }) => true,
+        Op::UPrmt(_) | Op::UBMsk(_) => false,
+        _ => twin(op).is_some_and(|(_, source_2)| !matches!(source_2, Some(AluSrc::Imm(_)))),
     }
 }
 
@@ -528,10 +525,7 @@ fn set_words(
         return set(builder, dst, value);
     }
     for k in 0..words {
-        let word = builder.op(
-            Opcode::CompositeExtractU32x2,
-            &[value, imm32(u32::from(k))],
-        )?;
+        let word = builder.op(Opcode::CompositeExtractU32x2, &[value, imm32(u32::from(k))])?;
         set(builder, next(dst, k), word.into())?;
     }
     Ok(())
@@ -611,8 +605,8 @@ fn check_uldc(op: OpULdc) -> Result<(), UniformUnsupported> {
 
 /// A 16-bit offset field read as signed, as the lowering's Maxwell `LDC` reads it (the module
 /// docs, "Divergences").
-const fn signed(offset: u16) -> u32 {
-    offset.cast_signed() as i32 as u32
+fn signed(offset: u16) -> u32 {
+    i32::from(offset.cast_signed()).cast_unsigned()
 }
 
 /// `ULDC` and `LDCG`, checked.
@@ -632,9 +626,7 @@ fn translate_uldc(builder: &mut Builder<'_>, op: OpULdc) -> Result<(), BuildErro
         ULdcSrc::Indexed { index, reg, offset } => {
             read_cbuf(builder, op, index, Some(reg), signed(offset))
         }
-        ULdcSrc::Global { addr, offset, pred } => {
-            translate_ldcg(builder, op, addr, offset, pred)
-        }
+        ULdcSrc::Global { addr, offset, pred } => translate_ldcg(builder, op, addr, offset, pred),
         // Refused by `check_uldc`.
         ULdcSrc::CBuf(_) => Ok(()),
     }

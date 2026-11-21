@@ -64,11 +64,11 @@ fn ldcg_loads_or_returns_zero() {
     machine.uniform_regs[5] = 0xdead;
     machine.uniform_preds[2] = true;
     machine.uniform_regs[8] = 0x5555;
-    run_op(
-        ldcg(8, ur(4), 0, ups(2, false), MemType::B32),
-        &mut machine,
+    run_op(ldcg(8, ur(4), 0, ups(2, false), MemType::B32), &mut machine);
+    assert_eq!(
+        machine.uniform_regs[8], 0,
+        "no load where the predicate holds"
     );
-    assert_eq!(machine.uniform_regs[8], 0, "no load where the predicate holds");
 }
 
 /// A negated predicate loads where the uniform predicate is false.
@@ -77,10 +77,7 @@ fn a_negated_predicate_inverts_it() {
     for value in [false, true] {
         let mut machine = machine();
         machine.uniform_preds[3] = value;
-        run_op(
-            ldcg(8, ur(4), 0, ups(3, true), MemType::B32),
-            &mut machine,
-        );
+        run_op(ldcg(8, ur(4), 0, ups(3, true), MemType::B32), &mut machine);
         let expected = if value { word_at(0x20) } else { 0 };
         assert_eq!(machine.uniform_regs[8], expected, "{value}");
     }
@@ -98,19 +95,13 @@ fn every_type_loads() {
     ];
     for (mem_type, expected) in cases {
         let mut machine = machine();
-        run_op(
-            ldcg(8, ur(4), 4, ups(1, false), mem_type),
-            &mut machine,
-        );
+        run_op(ldcg(8, ur(4), 4, ups(1, false), mem_type), &mut machine);
         // `UP1` is false: the load is made.
         assert_eq!(machine.uniform_regs[8], expected, "{mem_type:?}");
     }
     let mut machine = machine();
     machine.global.bytes[0x24] = 0x80;
-    run_op(
-        ldcg(8, ur(4), 4, ups(1, false), MemType::I8),
-        &mut machine,
-    );
+    run_op(ldcg(8, ur(4), 4, ups(1, false), MemType::I8), &mut machine);
     assert_eq!(machine.uniform_regs[8], 0xffff_ff80);
 }
 
@@ -156,10 +147,7 @@ fn constant_predicates_make_no_block() {
 #[test]
 fn the_address_is_read_before_the_destination_is_written() {
     let mut machine = machine();
-    run_op(
-        ldcg(4, ur(4), 0, ups(1, false), MemType::B64),
-        &mut machine,
-    );
+    run_op(ldcg(4, ur(4), 0, ups(1, false), MemType::B64), &mut machine);
     assert_eq!(machine.uniform_regs[4], word_at(0x20));
     assert_eq!(machine.uniform_regs[5], word_at(0x24));
 }

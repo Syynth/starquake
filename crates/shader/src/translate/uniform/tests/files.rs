@@ -63,7 +63,10 @@ fn ulea_carries_are_predicates() {
             &mut machine,
         );
         assert_eq!(machine.preds[3], carried, "{a:#x}");
-        assert_eq!(machine.uniform_preds[3], !carried, "UP3 is untouched: {a:#x}");
+        assert_eq!(
+            machine.uniform_preds[3], !carried,
+            "UP3 is untouched: {a:#x}"
+        );
     }
 }
 
@@ -165,10 +168,7 @@ fn the_other_twins_use_uniform_predicates() {
             })),
             &mut machine,
         );
-        assert_eq!(
-            machine.uniform_regs[4],
-            if cond { 0x1111 } else { 0x2222 }
-        );
+        assert_eq!(machine.uniform_regs[4], if cond { 0x1111 } else { 0x2222 });
     }
 }
 

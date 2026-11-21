@@ -148,13 +148,9 @@ fn r2ur_reads_its_guard_as_data() {
         stage: crate::translate::GuestStage::Compute,
         color_outputs: crate::translate::ColorOutputs::default(),
     };
-    let blocks = crate::translate::translate_flow(
-        stage,
-        None,
-        &code,
-        &crate::flow::BranchTables::new(0),
-    )
-    .expect("translates");
+    let blocks =
+        crate::translate::translate_flow(stage, None, &code, &crate::flow::BranchTables::new(0))
+            .expect("translates");
     assert_eq!(blocks.function.block_count(), 1);
     assert_eq!(count(&blocks.function, Opcode::SubgroupBallot), 1);
     assert_eq!(count(&blocks.function, Opcode::GetPred), 1);
@@ -244,7 +240,9 @@ fn phi_rig() -> (Function, BlockId, BlockId) {
     let entry = function.entry();
     let mut builder = Builder::new(&mut function, entry);
     let exit = builder.add_block().expect("adds");
-    builder.terminate(Terminator::Jump(exit)).expect("terminates");
+    builder
+        .terminate(Terminator::Jump(exit))
+        .expect("terminates");
     builder.switch_to(exit).expect("switches");
     builder
         .phi(Type::U32, vec![(entry, Operand::Imm(Imm::U32(1)))])
@@ -270,7 +268,10 @@ fn a_phi_on_a_successor_refuses_the_split() {
     let cases = [
         (under(ps(1, false), umov(4, 9)), true),
         (
-            under(ps(1, false), Op::UIAdd3(twin(iadd3(4, [reg(1), reg(2), RZ])))),
+            under(
+                ps(1, false),
+                Op::UIAdd3(twin(iadd3(4, [reg(1), reg(2), RZ]))),
+            ),
             true,
         ),
         (Instr::new(ldcg), true),

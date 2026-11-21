@@ -236,8 +236,9 @@
 //! `S32` (the PR's `Require(type <= 1)`, where Eden's Maxwell translator also takes 64-bit and
 //! float atomics); `MEMBAR.SM` (scope 1, the PR's `Require(scope == 0 || scope == 2 ||
 //! scope == 3 || scope == 5)`); and the bit-76 uniform `LDG` and `STG` words other than the
-//! lowering's descriptor word ("Decisions taken here"). `ULDC` and `ULDC.64` are slice 6d's
-//! and `LDCG` has no slice: neither decodes yet, so neither reaches this module.
+//! lowering's descriptor word ("Decisions taken here"). `ULDC`, `ULDC.64` and `LDCG` are the
+//! uniform datapath's (slice 12d, `super::uniform`), which shares this module's constant-buffer
+//! and global load opcodes (`cbuf_load`, `global_load`) and word counts (`words_of`).
 
 #[cfg(test)]
 mod tests;

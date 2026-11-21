@@ -46,11 +46,14 @@
 //! called on their own they give the IR the driver and flow analysis give together: the
 //! integer and memory groups ([`integer::GuardMode`]) and the float, half and double
 //! ([`half_double`]) and texture groups (`guard_tested`, through [`conditional_block`]) split
-//! with [`split_for_guard`], reading the guard as a predicate (of the decodable forms only
-//! `S2UR` and `VOTEU` are uniform datapath
-//! instructions, `classify.h`'s `uniform`, whose guard the driver reads as a uniform
-//! predicate, and neither is theirs: `driver::tests::the_guard_of_every_pure_form_is_read_by_its_kind`;
-//! a uniform form the decoder learns later needs its group's read changed too); the control
+//! with [`split_for_guard`], reading the guard as a predicate (of the decodable forms
+//! `classify.h` marks `uniform`, whose guard the driver reads as a uniform predicate, none is
+//! theirs: `S2UR` and `VOTEU` are the control group's and the rest slice 6d's:
+//! `driver::tests::the_guard_of_every_pure_form_is_read_by_its_kind`; a uniform form the decoder
+//! learns later in one of these groups needs its group's read changed too); the uniform datapath
+//! ([`uniform::translate_uniform`], [`integer::GuardMode`]) splits the same way, reading the
+//! guard as a uniform predicate for the forms `classify.h` marks `uniform` and as a predicate
+//! for the others, and reads `R2UR`'s guard as data with no split (its module docs); the control
 //! group ([`control::translate_control`]), which does not build blocks, refuses an untested
 //! guard on an instruction that writes IR ([`control::ControlUnsupported::UntestedGuard`]),
 //! `VOTEU` included: its select is retired, as the owner's ruling of 2026-11-19 (row 2) leaves

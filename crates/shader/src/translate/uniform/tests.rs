@@ -163,7 +163,10 @@ pub(super) fn count(function: &Function, opcode: Opcode) -> usize {
     function
         .to_string()
         .lines()
-        .filter(|line| line.split_whitespace().any(|word| word == format!("{opcode:?}")))
+        .filter(|line| {
+            line.split_whitespace()
+                .any(|word| word == format!("{opcode:?}"))
+        })
         .count()
 }
 
@@ -228,14 +231,15 @@ fn every_decoded_form_translates_or_is_refused() {
                 let entry = function.entry();
                 let mut builder = Builder::new(&mut function, entry);
                 let instr = Instr { guard, ..instr };
-                match translate_uniform(&mut builder, &instr, mode) {
-                    Ok(()) => {
-                        translated.insert(instr.op.mnemonic());
-                        builder.terminate(Terminator::Return).expect("terminates");
-                        assert_eq!(function.verify(), Ok(()), "{instr}");
-                    }
-                    Err(UniformError::Build(error)) => panic!("{instr}: {error}"),
-                    Err(_) => {}
+                let result = translate_uniform(&mut builder, &instr, mode);
+                assert!(
+                    !matches!(result, Err(UniformError::Build(_))),
+                    "{instr}: {result:?}"
+                );
+                if result.is_ok() {
+                    translated.insert(instr.op.mnemonic());
+                    builder.terminate(Terminator::Return).expect("terminates");
+                    assert_eq!(function.verify(), Ok(()), "{instr}");
                 }
             }
         }
@@ -372,4 +376,3 @@ proptest! {
         }
     }
 }
-

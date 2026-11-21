@@ -125,16 +125,34 @@ fn the_indexed_form_adds_its_register() {
 #[test]
 fn the_lowering_s_offsets_are_signed() {
     let cases = [
-        (bound(2, 5, 0x8000, MemType::B32), "GetCbufU32 u32 0x5, u32 0x8000"),
-        (bound(2, 5, 0x8000, MemType::U16), "GetCbufU16 u32 0x5, u32 0x8000"),
-        (bound(4, 5, 0x8000, MemType::B128), "GetCbufU32 u32 0x5, u32 0x8000"),
-        (bound(2, 5, 0x8000, MemType::B64), "GetCbufU32x2 u32 0x5, u32 0xffff8000"),
-        (bound(2, 5, 0x7ffc, MemType::B64), "GetCbufU32x2 u32 0x5, u32 0x7ffc"),
+        (
+            bound(2, 5, 0x8000, MemType::B32),
+            "GetCbufU32 u32 0x5, u32 0x8000",
+        ),
+        (
+            bound(2, 5, 0x8000, MemType::U16),
+            "GetCbufU16 u32 0x5, u32 0x8000",
+        ),
+        (
+            bound(4, 5, 0x8000, MemType::B128),
+            "GetCbufU32 u32 0x5, u32 0x8000",
+        ),
+        (
+            bound(2, 5, 0x8000, MemType::B64),
+            "GetCbufU32x2 u32 0x5, u32 0xffff8000",
+        ),
+        (
+            bound(2, 5, 0x7ffc, MemType::B64),
+            "GetCbufU32x2 u32 0x5, u32 0x7ffc",
+        ),
         (
             indexed(2, 5, ur(9), 0x8000, MemType::B32),
             "IAdd32 %0, u32 0xffff8000",
         ),
-        (indexed(2, 5, ur(9), 0x7ffc, MemType::B32), "IAdd32 %0, u32 0x7ffc"),
+        (
+            indexed(2, 5, ur(9), 0x7ffc, MemType::B32),
+            "IAdd32 %0, u32 0x7ffc",
+        ),
     ];
     for (op, expected) in cases {
         let text = text(&[Instr::new(op)]);
