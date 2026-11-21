@@ -189,7 +189,8 @@ fn caps() -> Caps {
 }
 
 /// What [`LateBackend`] refuses a list with.
-const REFUSED: RenderError = RenderError::Invalid("the late test backend refused this list");
+pub(crate) const REFUSED: RenderError =
+    RenderError::Invalid("the late test backend refused this list");
 
 #[derive(Default)]
 struct LateState {
@@ -242,7 +243,7 @@ impl LateBackend {
         self.state().script.extend(fences);
     }
 
-    fn refuse_next(&self) {
+    pub(crate) fn refuse_next(&self) {
         self.state().refuse_next = true;
     }
 

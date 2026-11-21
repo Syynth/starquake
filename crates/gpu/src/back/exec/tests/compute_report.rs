@@ -3,7 +3,9 @@
 //! address space, sharing the 3D class's path; an acquire or a trap writes nothing.
 
 use super::*;
-use crate::back::fence::tests::TIMESTAMP;
+use crate::back::fence::tests::{REFUSED, TIMESTAMP};
+use crate::back::fence::{FenceError, Waiter};
+use crate::sema::AcquireOp;
 use crate::sema::RELEASE_TIMESTAMP_OFFSET;
 
 /// The payload every test releases: non-zero in each byte, so a short write shows.
@@ -299,6 +301,37 @@ fn a_failed_deferred_draw_before_a_compute_report_still_releases_and_returns_the
     rig.submit();
     rig.exec.complete();
     assert_eq!(rig.word(CSEM), PAYLOAD);
+}
+
+#[test]
+fn a_compute_report_returns_the_submit_error_of_the_list_its_waiter_closes() {
+    // The compute report's own error, with no deferred draw to supply one: a dispatch is in
+    // the open list, another channel is parked on the semaphore, so attaching the release
+    // closes the list for the waiter (`back::fence`, the close trigger), and the backend
+    // refuses that submit. The query word returns the refusal; the refused list, with nothing
+    // in flight, still performs its release.
+    let mut rig = Rig::late();
+    rig.write_words(QMD, &compute_qmd());
+    rig.run(&compute_signal());
+    assert_eq!(rig.exec.counters().dispatches, 1);
+    rig.waiters.register(Waiter {
+        channel: OTHER,
+        space: SPACE,
+        address: CSEM,
+        op: AcquireOp::Equal,
+        payload: PAYLOAD,
+    });
+    let report = one_word(CSEM, PAYLOAD);
+    let (state, trigger) = split_trigger(&report);
+    rig.run(state);
+    rig.late.clone().unwrap().refuse_next();
+    let trigger = parse_text(trigger).unwrap();
+    assert_eq!(
+        rig.exec.apply(&trigger[0]),
+        Err(ExecError::Fence(FenceError::Submit(REFUSED)))
+    );
+    assert_eq!(rig.word(CSEM), PAYLOAD);
+    assert!(rig.waiters.is_latched(OTHER));
 }
 
 #[test]
