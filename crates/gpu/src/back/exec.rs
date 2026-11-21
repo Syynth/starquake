@@ -1214,6 +1214,9 @@ impl Executor {
             }
             clc7c0::CLASS => {
                 self.inline_word(channel, class, space, method)?;
+                if method == clc7c0::SET_REPORT_SEMAPHORE_D.method() {
+                    self.compute_report_semaphore(channel, space)?;
+                }
                 if method == LAST_INLINE_QMD_METHOD
                     || method == clc7c0::SEND_SIGNALING_PCAS2_B.method()
                 {
@@ -1243,7 +1246,32 @@ impl Executor {
     /// (module docs, "Report semaphores").
     fn report_semaphore(&mut self, channel: ChannelId, space: AsId) -> Result<(), ExecError> {
         let class = ClassId(clc797::CLASS);
-        match report::decide(&self.engine_mut(channel, class)?.mirror)? {
+        let action = report::decide(&self.engine_mut(channel, class)?.mirror)?;
+        self.report_action(channel, space, action)
+    }
+
+    /// A write of `SET_REPORT_SEMAPHORE_D` on `channel`'s compute engine, once the mirror stored
+    /// it: the 3D class's path, with the compute class's registers (module docs, "Report
+    /// semaphores").
+    fn compute_report_semaphore(
+        &mut self,
+        channel: ChannelId,
+        space: AsId,
+    ) -> Result<(), ExecError> {
+        let class = ClassId(clc7c0::CLASS);
+        let action = report::decide_compute(&self.engine_mut(channel, class)?.mirror)?;
+        self.report_action(channel, space, action)
+    }
+
+    /// What a report semaphore word of either class asked for, on `channel` (module docs,
+    /// "Report semaphores").
+    fn report_action(
+        &mut self,
+        channel: ChannelId,
+        space: AsId,
+        action: ReportAction,
+    ) -> Result<(), ExecError> {
+        match action {
             ReportAction::Release(release) => {
                 let failure = self.report_failure_log(channel, release.address);
                 let deferred = self.flush_deferred(Some(channel));

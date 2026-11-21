@@ -102,12 +102,94 @@
 //!   on them, and no title has been seen to write them.
 
 use crate::back::state::{Mirror, StateError};
-use crate::classes::clc797;
+use crate::classes::{Method, clc7c0, clc797};
+use crate::field::Field;
 use crate::ring::{Release, ReleaseOp};
 use crate::sema::{PayloadSize, ReleaseForm};
 
 /// Bit position of `SET_REPORT_SEMAPHORE_A`'s `OFFSET_UPPER` in the semaphore's GPU address.
 const ADDRESS_UPPER_SHIFT: u32 = 32;
+
+/// One class's report semaphore: its four registers and the fields and values [`decide_in`]
+/// reads (module docs).
+struct Registers {
+    /// `SET_REPORT_SEMAPHORE_A` and its `OFFSET_UPPER`.
+    upper: (&'static Method, Field),
+    /// `SET_REPORT_SEMAPHORE_B` and its `OFFSET_LOWER`.
+    lower: (&'static Method, Field),
+    /// `SET_REPORT_SEMAPHORE_C` and its `PAYLOAD`.
+    payload: (&'static Method, Field),
+    /// `SET_REPORT_SEMAPHORE_D`, the query word.
+    query: &'static Method,
+    /// The query word's `OPERATION`.
+    operation: Field,
+    /// The two `OPERATION` values that release: `RELEASE` and `REPORT_ONLY`.
+    releasing: [u32; 2],
+    /// The query word's `REPORT` and its `NONE` value, for a class that has one.
+    report: Option<(Field, u32)>,
+    /// The query word's `STRUCTURE_SIZE` and its `ONE_WORD` value.
+    structure_size: (Field, u32),
+}
+
+/// The 3D class's (`clc797.h`).
+const THREE_D: Registers = Registers {
+    upper: (
+        &clc797::SET_REPORT_SEMAPHORE_A,
+        clc797::SET_REPORT_SEMAPHORE_A_OFFSET_UPPER,
+    ),
+    lower: (
+        &clc797::SET_REPORT_SEMAPHORE_B,
+        clc797::SET_REPORT_SEMAPHORE_B_OFFSET_LOWER,
+    ),
+    payload: (
+        &clc797::SET_REPORT_SEMAPHORE_C,
+        clc797::SET_REPORT_SEMAPHORE_C_PAYLOAD,
+    ),
+    query: &clc797::SET_REPORT_SEMAPHORE_D,
+    operation: clc797::SET_REPORT_SEMAPHORE_D_OPERATION,
+    releasing: [
+        clc797::SET_REPORT_SEMAPHORE_D_OPERATION_RELEASE,
+        clc797::SET_REPORT_SEMAPHORE_D_OPERATION_REPORT_ONLY,
+    ],
+    report: Some((
+        clc797::SET_REPORT_SEMAPHORE_D_REPORT,
+        clc797::SET_REPORT_SEMAPHORE_D_REPORT_NONE,
+    )),
+    structure_size: (
+        clc797::SET_REPORT_SEMAPHORE_D_STRUCTURE_SIZE,
+        clc797::SET_REPORT_SEMAPHORE_D_STRUCTURE_SIZE_ONE_WORD,
+    ),
+};
+
+/// The compute class's (`clc7c0.h`; module docs, "The compute class"). Its query word has no
+/// `REPORT`, and the header names no `REPORT_ONLY` for it: the value is
+/// `REPORT_SEMAPHORE_EXECUTE`'s, which Eden-NX2 releases on (a **guess** that the two encodings
+/// agree).
+const COMPUTE: Registers = Registers {
+    upper: (
+        &clc7c0::SET_REPORT_SEMAPHORE_A,
+        clc7c0::SET_REPORT_SEMAPHORE_A_OFFSET_UPPER,
+    ),
+    lower: (
+        &clc7c0::SET_REPORT_SEMAPHORE_B,
+        clc7c0::SET_REPORT_SEMAPHORE_B_OFFSET_LOWER,
+    ),
+    payload: (
+        &clc7c0::SET_REPORT_SEMAPHORE_C,
+        clc7c0::SET_REPORT_SEMAPHORE_C_PAYLOAD,
+    ),
+    query: &clc7c0::SET_REPORT_SEMAPHORE_D,
+    operation: clc7c0::SET_REPORT_SEMAPHORE_D_OPERATION,
+    releasing: [
+        clc7c0::SET_REPORT_SEMAPHORE_D_OPERATION_RELEASE,
+        clc7c0::REPORT_SEMAPHORE_EXECUTE_OPERATION_REPORT_ONLY,
+    ],
+    report: None,
+    structure_size: (
+        clc7c0::SET_REPORT_SEMAPHORE_D_STRUCTURE_SIZE,
+        clc7c0::SET_REPORT_SEMAPHORE_D_STRUCTURE_SIZE_ONE_WORD,
+    ),
+};
 
 /// What a write to `SET_REPORT_SEMAPHORE_D` asks for (module docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,27 +213,42 @@ pub enum ReportAction {
 /// A [`StateError`] if `mirror`'s register file does not hold the four registers. Every class's
 /// file does, so none is reachable through the executor, which asks only for a 3D engine.
 pub fn decide(mirror: &Mirror) -> Result<ReportAction, StateError> {
-    let query = mirror.reg(&clc797::SET_REPORT_SEMAPHORE_D, &[])?;
-    match query.field(clc797::SET_REPORT_SEMAPHORE_D_OPERATION)? {
-        clc797::SET_REPORT_SEMAPHORE_D_OPERATION_RELEASE
-        | clc797::SET_REPORT_SEMAPHORE_D_OPERATION_REPORT_ONLY => {}
-        _ => return Ok(ReportAction::Nothing),
+    decide_in(mirror, &THREE_D)
+}
+
+/// What the report semaphore registers of `mirror`, a compute engine's, ask for now that
+/// `SET_REPORT_SEMAPHORE_D` was written (module docs, "The compute class"). Never a
+/// [`ReportAction::Counter`]: the compute class's query word has no `REPORT` field.
+///
+/// # Errors
+///
+/// A [`StateError`] if `mirror`'s register file does not hold the four registers. Every class's
+/// file does, so none is reachable through the executor, which asks only for a compute engine.
+pub fn decide_compute(mirror: &Mirror) -> Result<ReportAction, StateError> {
+    decide_in(mirror, &COMPUTE)
+}
+
+/// The decision of [`decide`] and [`decide_compute`], over one class's `registers`.
+fn decide_in(mirror: &Mirror, registers: &Registers) -> Result<ReportAction, StateError> {
+    let query = mirror.reg(registers.query, &[])?;
+    if !registers
+        .releasing
+        .contains(&query.field(registers.operation)?)
+    {
+        return Ok(ReportAction::Nothing);
     }
-    let report = query.field(clc797::SET_REPORT_SEMAPHORE_D_REPORT)?;
-    if report != clc797::SET_REPORT_SEMAPHORE_D_REPORT_NONE {
-        return Ok(ReportAction::Counter { report });
+    if let Some((field, none)) = registers.report {
+        let report = query.field(field)?;
+        if report != none {
+            return Ok(ReportAction::Counter { report });
+        }
     }
-    let one_word = query.field(clc797::SET_REPORT_SEMAPHORE_D_STRUCTURE_SIZE)?
-        == clc797::SET_REPORT_SEMAPHORE_D_STRUCTURE_SIZE_ONE_WORD;
-    let upper = mirror
-        .reg(&clc797::SET_REPORT_SEMAPHORE_A, &[])?
-        .field(clc797::SET_REPORT_SEMAPHORE_A_OFFSET_UPPER)?;
-    let lower = mirror
-        .reg(&clc797::SET_REPORT_SEMAPHORE_B, &[])?
-        .field(clc797::SET_REPORT_SEMAPHORE_B_OFFSET_LOWER)?;
-    let payload = mirror
-        .reg(&clc797::SET_REPORT_SEMAPHORE_C, &[])?
-        .field(clc797::SET_REPORT_SEMAPHORE_C_PAYLOAD)?;
+    let (size, one) = registers.structure_size;
+    let one_word = query.field(size)? == one;
+    let read = |(method, field): (&'static Method, Field)| mirror.reg(method, &[])?.field(field);
+    let upper = read(registers.upper)?;
+    let lower = read(registers.lower)?;
+    let payload = read(registers.payload)?;
     Ok(ReportAction::Release(Release {
         address: (u64::from(upper) << ADDRESS_UPPER_SHIFT) | u64::from(lower),
         payload: u64::from(payload),
@@ -166,7 +263,7 @@ pub fn decide(mirror: &Mirror) -> Result<ReportAction, StateError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::classes::clc797;
+    use crate::classes::{clc7c0, clc797};
     use crate::field::Field;
     use crate::interface::ChannelId;
     use crate::ring::ClassId;
@@ -316,6 +413,172 @@ mod tests {
         assert_eq!(
             Field::new(7, 0),
             clc797::SET_REPORT_SEMAPHORE_A_OFFSET_UPPER
+        );
+    }
+
+    /// The compute class's mirror with the same register values as [`mirror`]'s.
+    fn compute_mirror(query: u32) -> Mirror {
+        let mut mirror = Mirror::new(ChannelId(3), ClassId(clc7c0::CLASS));
+        for (method, value) in [
+            (&clc7c0::SET_REPORT_SEMAPHORE_A, UPPER),
+            (&clc7c0::SET_REPORT_SEMAPHORE_B, LOWER),
+            (&clc7c0::SET_REPORT_SEMAPHORE_C, PAYLOAD),
+            (&clc7c0::SET_REPORT_SEMAPHORE_D, query),
+        ] {
+            mirror.write(method.method(), value).unwrap();
+        }
+        mirror
+    }
+
+    /// A compute `SET_REPORT_SEMAPHORE_D` word with these `OPERATION` and `STRUCTURE_SIZE`.
+    fn compute_query(operation: u32, size: u32) -> u32 {
+        [
+            (clc7c0::SET_REPORT_SEMAPHORE_D_OPERATION, operation),
+            (clc7c0::SET_REPORT_SEMAPHORE_D_STRUCTURE_SIZE, size),
+        ]
+        .iter()
+        .fold(0, |word, &(field, value)| {
+            field.insert(word, value).unwrap()
+        })
+    }
+
+    #[test]
+    fn every_compute_operation_and_size_gives_the_tables_action() {
+        // The whole input space of the two fields read: 4 operations, 2 sizes, each with every
+        // other bit of the word clear and then set (the reduction fields and bits 27:23, where
+        // the 3D class has `REPORT`, among them).
+        let operations = [
+            (clc7c0::SET_REPORT_SEMAPHORE_D_OPERATION_RELEASE, true),
+            (clc7c0::REPORT_SEMAPHORE_EXECUTE_OPERATION_ACQUIRE, false),
+            (clc7c0::REPORT_SEMAPHORE_EXECUTE_OPERATION_REPORT_ONLY, true),
+            (clc7c0::SET_REPORT_SEMAPHORE_D_OPERATION_TRAP, false),
+        ];
+        let sizes = [
+            (
+                clc7c0::SET_REPORT_SEMAPHORE_D_STRUCTURE_SIZE_FOUR_WORDS,
+                true,
+            ),
+            (
+                clc7c0::SET_REPORT_SEMAPHORE_D_STRUCTURE_SIZE_ONE_WORD,
+                false,
+            ),
+        ];
+        let ignored = !compute_query(
+            clc7c0::SET_REPORT_SEMAPHORE_D_OPERATION.get(u32::MAX),
+            clc7c0::SET_REPORT_SEMAPHORE_D_STRUCTURE_SIZE.get(u32::MAX),
+        );
+        let mut seen = 0;
+        for (operation, releases) in operations {
+            for (size, timestamp) in sizes {
+                for other in [0, ignored] {
+                    let word = compute_query(operation, size) | other;
+                    let expected = if releases {
+                        release(timestamp)
+                    } else {
+                        ReportAction::Nothing
+                    };
+                    assert_eq!(
+                        decide_compute(&compute_mirror(word)),
+                        Ok(expected),
+                        "{word:#x}"
+                    );
+                    seen += 1;
+                }
+            }
+        }
+        assert_eq!(seen, 4 * 2 * 2);
+    }
+
+    #[test]
+    fn compute_words_built_by_hand_give_eden_nx2s_answer() {
+        // Hand-built, not through `compute_query`, each against Eden-NX2's
+        // `ProcessNativeReportSemaphore`: the operation in bits 1:0 (0 and 2 release), the
+        // one-word structure in bit 28.
+        let cases = [
+            (0x1000_0000, release(false)),
+            (0x0000_0000, release(true)),
+            (0x1000_0002, release(false)),
+            (0x0000_0002, release(true)),
+            (0x1000_0001, ReportAction::Nothing),
+            (0x1000_0003, ReportAction::Nothing),
+            // Bits 27:23 (the 3D class's `REPORT`) all set: the compute class has no counter.
+            (0x1f80_0000, release(false)),
+            // FLUSH_DISABLE (2), CONDITIONAL_TRAP (19) and AWAKEN_ENABLE (20) set.
+            (0x1018_0004, release(false)),
+            // REDUCTION_ENABLE (3) with RED_MIN (11:9) and SIGNED_32 (18:17): the payload is
+            // still written (module docs, "Divergences", the reduction).
+            (0x1002_0208, release(false)),
+        ];
+        for (word, expected) in cases {
+            assert_eq!(
+                decide_compute(&compute_mirror(word)),
+                Ok(expected),
+                "{word:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_compute_address_takes_eight_upper_bits_and_all_lower_ones() {
+        let word = 0x1000_0000;
+        let address_of = |upper: u32, lower: u32| {
+            let mut mirror = compute_mirror(word);
+            mirror
+                .write(clc7c0::SET_REPORT_SEMAPHORE_A.method(), upper)
+                .unwrap();
+            mirror
+                .write(clc7c0::SET_REPORT_SEMAPHORE_B.method(), lower)
+                .unwrap();
+            match decide_compute(&mirror) {
+                Ok(ReportAction::Release(release)) => Some(release.address),
+                _ => None,
+            }
+        };
+        assert_eq!(address_of(u32::MAX, 0), Some(0xff_0000_0000));
+        assert_eq!(address_of(0, u32::MAX), Some(0xffff_ffff));
+        // Bit 8 of `SET_REPORT_SEMAPHORE_A` is dropped; Eden-NX2's 25-bit mask would keep it
+        // as address bit 40 (module docs, "Divergences").
+        assert_eq!(address_of(0x100, 0), Some(0));
+        assert_eq!(address_of(0x1ff_ffff, 0), Some(0xff_0000_0000));
+    }
+
+    #[test]
+    fn the_compute_registers_are_the_headers() {
+        // Literals from `clc7c0.h` (mesa-nouveau @ 52238762), and the operation value 2 that
+        // Eden-NX2's `ProcessNativeReportSemaphore` releases on (`operation != 0 && operation
+        // != 2`), written out so a wrong generated constant fails here.
+        assert_eq!(
+            [
+                clc7c0::SET_REPORT_SEMAPHORE_A.byte_address,
+                clc7c0::SET_REPORT_SEMAPHORE_B.byte_address,
+                clc7c0::SET_REPORT_SEMAPHORE_C.byte_address,
+                clc7c0::SET_REPORT_SEMAPHORE_D.byte_address,
+            ],
+            [0x1b00, 0x1b04, 0x1b08, 0x1b0c]
+        );
+        assert_eq!(
+            clc7c0::SET_REPORT_SEMAPHORE_A_OFFSET_UPPER,
+            Field::new(7, 0)
+        );
+        assert_eq!(
+            clc7c0::SET_REPORT_SEMAPHORE_B_OFFSET_LOWER,
+            Field::new(31, 0)
+        );
+        assert_eq!(clc7c0::SET_REPORT_SEMAPHORE_C_PAYLOAD, Field::new(31, 0));
+        assert_eq!(clc7c0::SET_REPORT_SEMAPHORE_D_OPERATION, Field::new(1, 0));
+        assert_eq!(
+            clc7c0::SET_REPORT_SEMAPHORE_D_STRUCTURE_SIZE,
+            Field::new(28, 28)
+        );
+        assert_eq!(
+            [
+                clc7c0::SET_REPORT_SEMAPHORE_D_OPERATION_RELEASE,
+                clc7c0::REPORT_SEMAPHORE_EXECUTE_OPERATION_ACQUIRE,
+                clc7c0::REPORT_SEMAPHORE_EXECUTE_OPERATION_REPORT_ONLY,
+                clc7c0::SET_REPORT_SEMAPHORE_D_OPERATION_TRAP,
+                clc7c0::SET_REPORT_SEMAPHORE_D_STRUCTURE_SIZE_ONE_WORD,
+            ],
+            [0, 1, 2, 3, 1]
         );
     }
 }
