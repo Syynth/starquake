@@ -58,9 +58,13 @@ fn operand_of(builder: &mut Builder<'_>, ty: Type) -> Operand {
 /// The stage an opcode is tried in: the one that may use it.
 fn stage_for(opcode: Opcode) -> GuestStage {
     match opcode {
-        Opcode::DemoteToHelperInvocation | Opcode::SetFragColor | Opcode::LaneId => {
-            GuestStage::Pixel
-        }
+        Opcode::DemoteToHelperInvocation
+        | Opcode::SetFragColor
+        | Opcode::LaneId
+        | Opcode::DPdxFine
+        | Opcode::DPdyFine
+        | Opcode::DPdxCoarse
+        | Opcode::DPdyCoarse => GuestStage::Pixel,
         Opcode::GetAttribute | Opcode::SetAttribute => GuestStage::Vertex,
         _ => GuestStage::Compute,
     }
@@ -288,7 +292,34 @@ const LOWERED: &[Opcode] = &[
     Opcode::ConvertF32U16,
     Opcode::ConvertF32U32,
     Opcode::LaneId,
+    // Slice 16b: the warp operations and derivatives (`warp`), but `GetInBoundsFromOp`, which
+    // lowers only with a shuffle as its argument ([`IN_BOUNDS_OF_A_SHUFFLE`]).
+    Opcode::VoteAll,
+    Opcode::VoteAny,
+    Opcode::VoteEqual,
+    Opcode::SubgroupBallot,
+    Opcode::SubgroupEqMask,
+    Opcode::SubgroupLtMask,
+    Opcode::SubgroupLeMask,
+    Opcode::SubgroupGtMask,
+    Opcode::SubgroupGeMask,
+    Opcode::ShuffleIndex,
+    Opcode::ShuffleUp,
+    Opcode::ShuffleDown,
+    Opcode::ShuffleButterfly,
+    Opcode::QuadBroadcast,
+    Opcode::QuadSwap,
+    Opcode::FSwizzleAdd,
+    Opcode::DPdxFine,
+    Opcode::DPdyFine,
+    Opcode::DPdxCoarse,
+    Opcode::DPdyCoarse,
 ];
+
+/// The opcode that lowers only when its argument is a shuffle: alone (its argument the
+/// immediate 0) it is refused as an operand, not as an operation (`tests::warp` lowers it
+/// after each shuffle).
+const IN_BOUNDS_OF_A_SHUFFLE: Opcode = Opcode::GetInBoundsFromOp;
 
 /// Every opcode of the table, each alone in a function of the stage that may use it: the ones
 /// [`LOWERED`] lists lower (and validate with wgpu's flags too); every other one is refused,
@@ -324,6 +355,8 @@ fn every_opcode_is_lowered_or_refused() {
                 !shader.requirements.f64 && !shader.requirements.i64_atomics,
                 "{opcode}"
             );
+        } else if opcode == IN_BOUNDS_OF_A_SHUFFLE {
+            assert_eq!(result.err(), Some(LowerError::Operand { at, index: 0 }));
         } else {
             assert!(result.is_err(), "{opcode} is lowered but not listed");
             match result {

@@ -222,6 +222,8 @@ struct Rig {
     clock: Arc<Clock>,
     recording: Option<Arc<RecordingBackend>>,
     late: Option<Arc<LateBackend>>,
+    /// The acquire waiter table the executor's fences read, so a test can park a channel.
+    waiters: Arc<WaiterTable>,
     exec: Executor,
     mem: Arc<Memory>,
     watch: Arc<WriteWatch>,
@@ -263,7 +265,7 @@ impl Rig {
         let syncpoints = Arc::new(Syncpoints::new(Arc::<Pushed>::clone(&pushed)));
         let env = FenceEnv {
             syncpoints: Arc::clone(&syncpoints),
-            waiters,
+            waiters: Arc::clone(&waiters),
             completions: pushed,
             clock: Arc::<Clock>::clone(&clock),
             front: Arc::new(Front::default()),
@@ -293,6 +295,7 @@ impl Rig {
             clock,
             recording: None,
             late: None,
+            waiters,
             exec,
             mem,
             watch,
@@ -2425,3 +2428,5 @@ fn a_present_with_no_space_and_a_bad_format_is_no_present_space() {
 // Clears through the executor (slice G24).
 mod clear;
 mod report;
+// The compute class's report semaphore through the executor (#458).
+mod compute_report;

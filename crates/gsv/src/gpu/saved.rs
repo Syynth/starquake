@@ -16,7 +16,9 @@
 //! bumping [`SNAPSHOT_VERSION`].
 //!
 //! The translation tables are not in it: a restore builds each from the bookkeeping (every
-//! piece published again) and gives it to the front as a new address space, and sends the front
+//! piece published again, and every two-page registration listed for the semaphore mirror page,
+//! `super::memory`, "The semaphore mirror page") and gives it to the front as a new address
+//! space, and sends the front
 //! a barrier for each job still waiting, in ticket order, since a restored GPU knows none of
 //! them. The pages a waiting job holds are not published (`super::memory`, "Pages a waiting job
 //! holds"), so they stay holes in the new table until the last job holding them is done
@@ -743,10 +745,12 @@ impl GpuMemory {
         Ok(memory)
     }
 
-    /// Gives `front` each address space's table, publishes every piece into it, and sends a
-    /// barrier for each waiting job (module docs, "Format").
+    /// Lists each address space's two-page registrations in its table, gives `front` the table,
+    /// publishes every piece into it, and sends a barrier for each waiting job (module docs,
+    /// "Format").
     fn rebuild(&self, front: &dyn GpuVmFront) {
         for (&id, space) in &self.spaces {
+            self.list_semaphore_registrations(&space.vm);
             front.create_address_space(id, Arc::clone(&space.vm));
             self.publish_all(id);
         }

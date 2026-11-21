@@ -18,10 +18,13 @@
 //! * [`lm`]: the log manager, `lm` (a logger whose messages go to the run's guest log).
 //! * [`ectx`]: the error-context service as an application reaches it, `ectx:aw`.
 //! * [`aoc`]: the add-on content manager, `aoc:u` (no add-on content installed).
+//! * [`aud`]: the Switch 2 audio entry point, `aud:u` (an audio renderer manager's work-buffer
+//!   size, as far as a title's start-up asks).
 
 pub mod am;
 pub mod aoc;
 pub mod apm;
+pub mod aud;
 pub mod ectx;
 mod events;
 pub mod framework;

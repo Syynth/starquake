@@ -6,7 +6,7 @@
 //! Ported from PR #4588: `eden-pr4588/src/shader_recompiler/frontend/ampere/classify.h` @
 //! e5fb3b97 (GPL-3.0-or-later, Copyright 2026 Eden Emulator Project), `Classify`, `FormOf` and
 //! `BaseOf`. Every opcode the decoder already names is imported from its group (`decode::op`);
-//! the ones it does not name yet (instructions of slices 6c, 6d, 6e and 6i, which have no decode
+//! the ones it does not name yet (instructions of slices 6c, 6e and 6i, which have no decode
 //! form so far) are named here with the reference's comment.
 //! `tests::classify::classify_matches_the_reference` pins every row against the reference's
 //! literals.
@@ -25,7 +25,9 @@ use crate::decode::{
     IMAD_WIDE_OPCODE, IMNMX_OPCODE, IPA_OPCODE, ISETP_OPCODE, KILL_OPCODE, LEA_OPCODE, LOP3_OPCODE,
     MOV_OPCODE, MUFU_OPCODE, NOP_OPCODE, P2R_OPCODE, PLOP3_OPCODE, POPC_OPCODE, PRMT_OPCODE,
     R2P_OPCODE, RET_OPCODE, S2R_OPCODE, S2UR_OPCODE, SEL_OPCODE, SGXT_OPCODE, SHF_OPCODE,
-    VOTEU_OPCODE, WARPSYNC_OPCODE,
+    UBREV_OPCODE, UFLO_OPCODE, UIADD3_OPCODE, UIMAD_OPCODE, UIMAD_WIDE_OPCODE, UISETP_OPCODE,
+    ULEA_OPCODE, ULOP3_OPCODE, UPOPC_OPCODE, USEL_OPCODE, USGXT_OPCODE, USHF_OPCODE, VOTEU_OPCODE,
+    WARPSYNC_OPCODE,
 };
 
 /// The operand form of a register source (`classify.h`: "1 reg").
@@ -52,28 +54,40 @@ const fn base_of(opcode: u16) -> u16 {
     opcode & BASE_MASK
 }
 
+// Opcodes slice 6d's decoder names, each with `classify.h`'s comment.
+
+// `R2UR` ("R2UR: reads the guard as data, so it is not split into a block"), `UMOV` ("UMOV
+// imm", "UMOV UR"), `ULDC` ("ULDC", "ULDC.64") and `UPLOP3` ("UPLOP3"), named by slice 6d
+// (`decode::op::uniform`).
+pub(crate) use crate::decode::{
+    R2UR_OPCODE, ULDC_OPCODE, ULDC64_OPCODE, UMOV_IMM_OPCODE, UMOV_UR_OPCODE, UPLOP3_OPCODE,
+};
+/// The uniform ALU bases that are pure and uniform in forms 1 and 4 (`classify.h`: "Uniform
+/// ALU: UIADD3, ULEA, ULOP3, USHF, UIMAD, UISETP, USEL (register or immediate forms)"). The
+/// reference lists twelve bare bases under that comment, more than it names; slice 6d's decoder
+/// names each (`decode::op::uniform`): `UIADD3`, `ULEA`, `ULOP3`, `USHF`, `UIMAD`, `UIMAD.WIDE`,
+/// `UBREV`, `USGXT`, `UFLO`, `UPOPC`, `UISETP` and `USEL`, in the reference's order. `UPRMT`
+/// and `UBMSK` are not among them. `tests::classify::classify_matches_the_reference` keeps the
+/// reference's literals.
+pub(crate) const UNIFORM_ALU_BASES: [u16; 12] = [
+    UIADD3_OPCODE,
+    ULEA_OPCODE,
+    ULOP3_OPCODE,
+    USHF_OPCODE,
+    UIMAD_OPCODE,
+    UIMAD_WIDE_OPCODE,
+    UBREV_OPCODE,
+    USGXT_OPCODE,
+    UFLO_OPCODE,
+    UPOPC_OPCODE,
+    UISETP_OPCODE,
+    USEL_OPCODE,
+];
+
 // Opcodes the decoder does not name yet, each with `classify.h`'s comment.
 
 /// `LDC` (`classify.h`: "LDC", a pure attribute read; slice 6e decodes it).
 pub(crate) const LDC_OPCODE: u16 = 0xb82;
-/// `R2UR` (`classify.h`: "R2UR: reads the guard as data, so it is not split into a block").
-pub(crate) const R2UR_OPCODE: u16 = 0x3c2;
-/// `UMOV` with an immediate (`classify.h`: "UMOV imm").
-pub(crate) const UMOV_IMM_OPCODE: u16 = 0x882;
-/// `UMOV` from a uniform register (`classify.h`: "UMOV UR").
-pub(crate) const UMOV_UR_OPCODE: u16 = 0xc82;
-/// `ULDC` (`classify.h`: "ULDC").
-pub(crate) const ULDC_OPCODE: u16 = 0xab9;
-/// `ULDC.64` (`classify.h`: "ULDC.64").
-pub(crate) const ULDC64_OPCODE: u16 = 0xabb;
-/// `UPLOP3` (`classify.h`: "UPLOP3").
-pub(crate) const UPLOP3_OPCODE: u16 = 0x89c;
-/// The uniform ALU bases that are pure in forms 1 and 4 (`classify.h`: "Uniform ALU: UIADD3,
-/// ULEA, ULOP3, USHF, UIMAD, UISETP, USEL (register or immediate forms)"; the reference names
-/// the twelve bases without saying which is which).
-pub(crate) const UNIFORM_ALU_BASES: [u16; 12] = [
-    0x090, 0x091, 0x092, 0x099, 0x0a4, 0x0a5, 0x0be, 0x09a, 0x0bd, 0x0bf, 0x08c, 0x087,
-];
 /// `HMNMX2`'s base (`classify.h`: "HMNMX2").
 pub(crate) const HMNMX2_BASE: u16 = 0x040;
 /// `HADD2`'s base (`classify.h`: "HADD2").

@@ -10,7 +10,7 @@
 //! | `integer` | 6a | `IADD3`, `IADD3.X`, `IMAD`, `IMAD.WIDE`, `LOP3`, `SHF`, `LEA`, `LEA.X`, `ISETP`, `IMNMX`, `PRMT`, `POPC`, `FLO`, `BREV`, `SGXT`, `BMSK`, `IABS`, `IDP4`, `MOV`, `SEL`, `PLOP3`, `P2R`, `R2P` |
 //! | `float` | 6b | `FADD`, `FMUL`, `FFMA`, `FMNMX`, `FSET`, `FSETP`, `FSEL`, `MUFU`, `FSWZADD`, `FRND`, `F2F`, `F2I`, `I2F`, `I2FP`, `F2FP` |
 //! | `half_double` | 6c | `HADD2`, `HFMA2`, `HMUL2`, `HSET2`, `HSETP2`, `HMNMX2`, `DADD`, `DMUL`, `DFMA`, `DSETP` |
-//! | `uniform` | 6d | `R2UR`, `UP2UR` |
+//! | `uniform` | 6d | `R2UR`, `UP2UR`, `UMOV`, `ULDC` (with `LDCG`), `UPLOP3`, and the uniform ALU forms (`UIADD3` and the others: `uniform`'s module docs) |
 //! | `memory` | 6e | `LD`/`ST` (every space), `LDC`, `ATOM` (with `ATOMS`, `ATOMG`, `RED`), `CCTL`, `MEMBAR`, `LDGSTS`, `LDGDEPBAR`, `ERRBAR`, `ATOMS.POPC` |
 //! | `texture` | 6f | `TEX`, `TLD`, `TLD4`, `TMML`, `TXD`, `TXQ`, `SULD`, `SUST`, `SUATOM` (with `SURED`) |
 //! | `attribute` | 6g | `ALD`, `AST`, `IPA`, `AL2P`, `S2R`, `CS2R`, `PIXLD`, `OUT`, `OUT.FINAL`, `ISBERD`, `ISBEWR`, `LDTRAM` |
@@ -18,18 +18,18 @@
 //! | `tensor` | 6i | `HMMA`, `IMMA`, `LDSM`, `MOVM` |
 //!
 //! Where NAK models an instruction as a form of another (the memory spaces of `LD` and `ST`,
-//! `RED` as an `ATOM` without a destination, `SURED` as an `SUATOM` without one, the uniform
-//! forms of the ALU instructions such as `UMOV`, `ULDC` and `UPLOP3` as the vector op with
-//! uniform operands), the variant is NAK's and the slice adds the field that tells them apart.
-//! That split of the uniform forms is NAK's model, not a fact of the encoding; slice 6d may
-//! revisit it (NAK: `impl SM70Op for OpMov` encodes a uniform `MOV` as `0xc82`, `OpAtom` without
-//! a destination as `RED`, `OpSuAtom` without one as `SURED`; `nvdisasm_tests.rs`, `test_ldc`,
-//! prints a uniform `OpLdc` as `uldc`). The instructions NAK has no op for get variants of their
-//! own, named in NAK's style: `BRX`, `CALL`, `RET`, `DEPBAR`, `P2R`, `R2P`, `FSEL`, `I2FP`,
-//! `LDGSTS`, `LDGDEPBAR`, `ERRBAR` and `ATOMS.POPC`, which PR #4588's table has rows for
-//! (`ampere_isa_table.h`), and
-//! `JMX`, `UP2UR` and `BPT`, which only the spec's slice list names (their slices need a source
-//! for their encodings).
+//! `RED` as an `ATOM` without a destination, `SURED` as an `SUATOM` without one), the variant is
+//! NAK's and the slice adds the field that tells them apart (NAK: `OpAtom` without a destination
+//! is `RED`, `OpSuAtom` without one `SURED`). NAK models the uniform datapath the same way (a
+//! uniform `OpMov` is `UMOV` at `0xc82`; `nvdisasm_tests.rs`, `test_ldc`, prints a uniform
+//! `OpLdc` as `uldc`); slice 6d gives each uniform instruction a variant of its own instead, its
+//! ALU forms a [`Uniform`] of the vector struct, and says why in `uniform`'s module docs (`S2UR`
+//! and `VOTEU`, built before, stay forms of `S2R` and `VOTE`). The instructions NAK has no op for
+//! get variants of their own, named in NAK's style: `BRX`, `CALL`, `RET`, `DEPBAR`, `P2R`, `R2P`,
+//! `FSEL`, `I2FP`, `LDGSTS`, `LDGDEPBAR`, `ERRBAR` and `ATOMS.POPC`, which PR #4588's table has
+//! rows for (`ampere_isa_table.h`), and `JMX`, `UP2UR` and `BPT`, which only the spec's slice
+//! list names (their slices need a source for their encodings; `UP2UR`'s, in PR #4588's
+//! lowering alone, is in `uniform`'s module docs).
 //!
 //! An instruction its slice has not built yet is a **shell**: an empty struct that prints its
 //! mnemonic, which no decode form produces and the test assembler refuses
@@ -70,6 +70,7 @@ pub use texture::{
     ChannelMask, ImageAccess, ImageDim, TexCBufRef, TexChannel, TexDim, TexLodMode, TexOffsetMode,
     TexQuery, TexRef,
 };
+pub use uniform::{ULdcSrc, UMovSrc, Uniform};
 
 /// An operation's mnemonic, as `nvdisasm` writes it lower-cased (for a shell, a guess).
 pub(crate) trait Named {
@@ -129,7 +130,11 @@ macro_rules! op_list {
                 DSetP(OpDSetP),
             }
             uniform {
-                R2UR(OpR2UR), UP2UR(OpUP2UR),
+                R2UR(OpR2UR), UP2UR(OpUP2UR), UMov(OpUMov), ULdc(OpULdc), UPLop3(OpUPLop3),
+                UIAdd3(OpUIAdd3), UIAdd3X(OpUIAdd3X), ULea(OpULea), ULeaX(OpULeaX),
+                ULop3(OpULop3), UPrmt(OpUPrmt), UShf(OpUShf), UIMad(OpUIMad),
+                UIMad64(OpUIMad64), UISetP(OpUISetP), USel(OpUSel), USgxt(OpUSgxt),
+                UBMsk(OpUBMsk), UFlo(OpUFlo), UBRev(OpUBRev), UPopC(OpUPopC),
             }
             memory {
                 Ld(OpLd), St(OpSt), Ldc(OpLdc), Atom(OpAtom), CCtl(OpCCtl), MemBar(OpMemBar),

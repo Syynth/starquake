@@ -152,14 +152,18 @@ fn a_stalled_run_whose_gpu_answers_busy_arms_the_last_core_for_the_quiet_signal(
         |machine| {
             let cores = usize::from(machine.cores.count());
             let deadline = Instant::now() + PATIENCE;
-            while machine.cores.parked() != cores {
+            let armed = loop {
+                let (parked, armed) = machine.cores.parked_and_armed();
+                if parked == cores {
+                    break armed;
+                }
                 assert!(Instant::now() < deadline, "the cores never all parked");
                 std::thread::sleep(Duration::from_millis(1));
-            }
-            // Every core parked: the last one's question has been asked, and a stopped GPU
-            // tells no quiet signal that could disarm it.
+            };
+            // Every core parked, read in one moment with the arming: the last one's question
+            // has been asked, and a stopped GPU tells no quiet signal that could disarm it.
             assert!(
-                machine.cores.armed().is_some(),
+                armed.is_some(),
                 "no core was armed for the GPU's quiet signal"
             );
             assert!(

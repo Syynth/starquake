@@ -86,8 +86,8 @@ pub struct InterfaceSlot {
 
 /// Device features a shader needs beyond the baseline.
 ///
-/// The lowering ([`crate::lower`]) fills `subgroup`, `f16` and `i64` from what it lowers;
-/// slice 15's collect info
+/// The lowering ([`crate::lower`]) fills `subgroup`, `subgroup_size_32`, `f16` and `i64` from
+/// what it lowers; slice 15's collect info
 /// ([`crate::info::ShaderInfo::requirements`]) fills every field from the IR, before the host
 /// lowering passes of slice 18 remove what the host lacks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -97,9 +97,19 @@ pub struct InterfaceSlot {
 )]
 pub struct Requirements {
     /// Subgroup operations or built-ins (naga's `Capabilities::SUBGROUP`, wgpu's
-    /// `Features::SUBGROUP`). Guest warp code assumes 32 lanes, so this also means "needs a
-    /// subgroup size of 32" (spec, "Compute shaders"), which the render backend checks.
+    /// `Features::SUBGROUP`): every warp operation the lowering writes, quad operations and
+    /// `FSwizzleAdd` included ([`crate::info::opcode_requirements`]).
     pub subgroup: bool,
+    /// "Needs subgroup size 32", narrower than [`Self::subgroup`] (spec, "Compute shaders";
+    /// decided by the owner, 2026-11-20): set only for an operation whose result depends on the
+    /// warp having 32 lanes ([`crate::lower::needs_subgroup_size_32`]), so a shader whose only
+    /// subgroup operations are quad operations does not set it. It implies [`Self::subgroup`].
+    ///
+    /// Slice 16b added this field ahead of #473, which carries it on to the render crate's
+    /// `ShaderInterface`. Until then the GPU crate does not pass it on, and the render backend
+    /// keeps checking the size against [`Self::subgroup`], the wider flag, so it refuses no
+    /// shader it accepted before.
+    pub subgroup_size_32: bool,
     /// 16-bit float arithmetic (naga's `Capabilities::SHADER_FLOAT16`, wgpu's
     /// `Features::SHADER_F16`).
     pub f16: bool,
@@ -122,6 +132,8 @@ pub enum Feature {
     Int64,
     /// Subgroup operations ([`Requirements::subgroup`]).
     Subgroup,
+    /// A subgroup size of 32 ([`Requirements::subgroup_size_32`]).
+    SubgroupSize32,
 }
 
 impl Feature {
@@ -131,6 +143,7 @@ impl Feature {
             Self::Float16 => "16-bit floats",
             Self::Int64 => "64-bit integers",
             Self::Subgroup => "subgroup operations",
+            Self::SubgroupSize32 => "a subgroup size of 32",
         }
     }
 }
@@ -146,13 +159,20 @@ impl std::fmt::Display for Feature {
 /// lowering can need are here so far). The cache never hands out a module that needs a feature
 /// the target lacks: such a shader is rejected with that reason.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one flag per host feature a Requirements flag the lowering sets is checked against"
+)]
 pub struct HostCaps {
     /// 16-bit float arithmetic.
     pub f16: bool,
     /// 64-bit integer arithmetic.
     pub i64: bool,
-    /// Subgroup operations with a subgroup size of 32.
+    /// Subgroup operations, whatever their size.
     pub subgroup: bool,
+    /// Subgroups of 32 invocations (render-backend, "What a pipeline is made of", for which
+    /// devices meet it).
+    pub subgroup_size_32: bool,
 }
 
 impl HostCaps {
@@ -161,12 +181,14 @@ impl HostCaps {
         f16: true,
         i64: true,
         subgroup: true,
+        subgroup_size_32: true,
     };
     /// A target with none.
     pub const NONE: Self = Self {
         f16: false,
         i64: false,
         subgroup: false,
+        subgroup_size_32: false,
     };
 }
 
@@ -183,6 +205,8 @@ impl Requirements {
             Some(Feature::Int64)
         } else if self.subgroup && !caps.subgroup {
             Some(Feature::Subgroup)
+        } else if self.subgroup_size_32 && !caps.subgroup_size_32 {
+            Some(Feature::SubgroupSize32)
         } else {
             None
         }

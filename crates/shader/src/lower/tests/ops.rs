@@ -7,7 +7,7 @@ use crate::decode::{Pred, UniformPred, UniformReg};
 use crate::ir::{Builder, Flags, FpControl, FpRounding};
 
 /// One case of the GPU comparison: a name and the instructions that compute a `u32`.
-type Case = (&'static str, fn(&mut Builder<'_>) -> Value);
+pub(super) type Case = (&'static str, fn(&mut Builder<'_>) -> Value);
 
 pub(super) fn u(value: u32) -> Operand {
     Operand::Imm(Imm::U32(value))
@@ -28,24 +28,24 @@ pub(super) fn op(builder: &mut Builder<'_>, opcode: Opcode, args: &[Operand]) ->
 }
 
 /// `opcode` of `args`, whose result is a `u32`.
-fn int(builder: &mut Builder<'_>, opcode: Opcode, args: &[Operand]) -> Value {
+pub(super) fn int(builder: &mut Builder<'_>, opcode: Opcode, args: &[Operand]) -> Value {
     op(builder, opcode, args)
 }
 
 /// `opcode` of `args`, whose result is an `f32`, as its bits.
-fn float(builder: &mut Builder<'_>, opcode: Opcode, args: &[Operand]) -> Value {
+pub(super) fn float(builder: &mut Builder<'_>, opcode: Opcode, args: &[Operand]) -> Value {
     let value = op(builder, opcode, args);
     op(builder, Opcode::BitCastU32F32, &[value.into()])
 }
 
 /// `opcode` of `args`, whose result is a `u1`, as 1 or 0.
-fn boolean(builder: &mut Builder<'_>, opcode: Opcode, args: &[Operand]) -> Value {
+pub(super) fn boolean(builder: &mut Builder<'_>, opcode: Opcode, args: &[Operand]) -> Value {
     let value = op(builder, opcode, args);
     op(builder, Opcode::SelectU32, &[value.into(), u(1), u(0)])
 }
 
 /// A function that writes case `n`'s value to register `n`, and the registers.
-fn cases_function(cases: &[Case]) -> (Function, Vec<u8>) {
+pub(super) fn cases_function(cases: &[Case]) -> (Function, Vec<u8>) {
     let mut function = Function::new();
     let entry = function.entry();
     let mut builder = Builder::new(&mut function, entry);
@@ -67,7 +67,7 @@ fn cases_function(cases: &[Case]) -> (Function, Vec<u8>) {
 }
 
 /// The compute inputs of a workgroup of one.
-const ONE_INVOCATION: LowerInputs = LowerInputs {
+pub(super) const ONE_INVOCATION: LowerInputs = LowerInputs {
     workgroup_size: [1, 1, 1],
     ..LowerInputs::DEFAULT
 };
@@ -75,7 +75,7 @@ const ONE_INVOCATION: LowerInputs = LowerInputs {
 /// Lowers `cases` as a compute shader, checks both validations, and, where the host can run
 /// it, compares each register the GPU leaves with the interpreter's; returns the names of the
 /// cases that differ, with both values.
-fn gpu_mismatches(test: &str, cases: &[Case]) -> Vec<String> {
+pub(super) fn gpu_mismatches(test: &str, cases: &[Case]) -> Vec<String> {
     let (function, regs) = cases_function(cases);
     let function = opaque(&function);
     let shader = lowered(GuestStage::Compute, &function, &ONE_INVOCATION);

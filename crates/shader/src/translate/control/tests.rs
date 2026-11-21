@@ -509,44 +509,40 @@ fn pr_uniform_vote() {
     }
 }
 
-/// A guarded `VOTEU` keeps its guard, read as a uniform predicate, as a select of each
-/// result: the old values stay where the guard is false.
+/// A guarded `VOTEU` outside its conditional block is refused like the group's other
+/// instructions that write IR: the select PR #4588 keeps (`guard_select`) is retired, and the
+/// translation driver makes the conditional block (the owner's ruling of 2026-11-19, row 2;
+/// `crate::translate::driver::tests::guarded_votes_read_their_guard_once`). Handed to this
+/// group as tested, the guard is ignored: no select, and the vote runs whatever the guard.
 #[test]
-fn a_guarded_uniform_vote_selects_its_results() {
+fn a_guarded_uniform_vote_is_left_to_its_conditional_block() {
     let instr = guarded(not(2), voteu(VoteOp::Any, ur(9), up(3), src(4)));
-    let (ir, emitted) = translated(COMPUTE, instr, false).expect("translates");
+    assert_eq!(
+        translated(COMPUTE, instr, false),
+        refusal(instr, control(ControlUnsupported::UntestedGuard))
+    );
+    let (ir, emitted) = translated(COMPUTE, instr, true).expect("translates");
     assert!(emitted.needs_subgroup_size_32);
     assert_eq!(
         ir.to_string(),
         "block0:\n\
-         \x20   %0: u1 = GetUniformPred up2\n\
-         \x20   %1: u1 = LogicalNot %0\n\
-         \x20   %2: u1 = GetPred p4\n\
-         \x20   %3: u32 = SubgroupBallot %2\n\
-         \x20   %4: u32 = GetUniformRegister ur9\n\
-         \x20   %5: u32 = SelectU32 %1, %3, %4\n\
-         \x20   %6 = SetUniformRegister ur9, %5\n\
-         \x20   %7: u1 = VoteAny %2\n\
-         \x20   %8: u1 = GetUniformPred up3\n\
-         \x20   %9: u1 = SelectU1 %1, %7, %8\n\
-         \x20   %10 = SetUniformPred up3, %9\n\
+         \x20   %0: u1 = GetPred p4\n\
+         \x20   %1: u32 = SubgroupBallot %0\n\
+         \x20   %2 = SetUniformRegister ur9, %1\n\
+         \x20   %3: u1 = VoteAny %0\n\
+         \x20   %4 = SetUniformPred up3, %3\n\
          \x20   return\n"
     );
-    for runs in [false, true] {
+    for guard in [false, true] {
         let mut machine = lane(5);
-        // The guard is `!UP2`; the per-thread P2 is set the other way, so reading it fails.
-        machine.uniform_preds[2] = !runs;
-        machine.preds[2] = runs;
+        machine.uniform_preds[2] = guard;
         machine.preds[4] = true;
         machine.uniform_regs[9] = 0x1111;
         machine.uniform_preds[3] = false;
         run(&ir, &mut machine);
-        assert_eq!(machine.uniform_regs[9], if runs { 1 << 5 } else { 0x1111 });
-        assert_eq!(machine.uniform_preds[3], runs);
+        assert_eq!(machine.uniform_regs[9], 1 << 5, "{guard}");
+        assert!(machine.uniform_preds[3], "{guard}");
     }
-    // In a block whose guard flow analysis tested, the guard is ignored.
-    let (tested, _) = translated(COMPUTE, instr, true).expect("translates");
-    assert!(!tested.to_string().contains("Select"));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1465,7 +1461,10 @@ fn branch_forms_with_their_checks() {
 // ---------------------------------------------------------------------------------------------
 // Guards.
 
-/// `@!PT` never runs: nothing, whatever the instruction and its fields.
+/// `@!PT` never runs: nothing, whatever the group's instruction and its fields, whether or not
+/// the guard is tested (the translation driver's rule, `crate::translate::guard_step`). An
+/// instruction of another group is still refused as one: the group comes first, as in the
+/// other groups' translators.
 #[test]
 fn never_guarded_instructions_become_nothing() {
     let faulty = [
@@ -1477,12 +1476,8 @@ fn never_guarded_instructions_become_nothing() {
         depbar(0, false, 0),
         Op::Kill(OpKill { pred: src(1) }),
         vote(VoteOp::All, r(5), p(2), src(1)),
+        voteu(VoteOp::Any, ur(9), up(3), src(4)),
         redux(ReduxOp::Sum, UniformReg::URZ, r(3)),
-        Op::Exit(OpExit {
-            keep_ref_count: false,
-            no_at_exit: false,
-            pred: PredSrc::TRUE,
-        }),
         Op::Nanosleep(OpNanosleep {
             time: AluSrc::Imm(1),
             clear: false,
@@ -1498,6 +1493,20 @@ fn never_guarded_instructions_become_nothing() {
             assert_eq!(ir.to_string(), "block0:\n    return\n", "{op:?}");
             assert_eq!(emitted, Emitted::default());
         }
+    }
+    let exit = guarded(
+        NEVER,
+        Op::Exit(OpExit {
+            keep_ref_count: false,
+            no_at_exit: false,
+            pred: PredSrc::TRUE,
+        }),
+    );
+    for guard_tested in [false, true] {
+        assert_eq!(
+            translated(COMPUTE, exit, guard_tested),
+            refusal(exit, control(ControlUnsupported::OtherGroup("exit")))
+        );
     }
 }
 
@@ -1518,6 +1527,7 @@ fn untested_guards_are_refused() {
         ),
         redux(ReduxOp::Sum, ur(5), r(3)),
         match_all(false, r(4), p(2)),
+        voteu(VoteOp::Any, ur(9), up(3), src(4)),
     ];
     for op in writing {
         for guard in [src(0), not(6)] {
@@ -1926,15 +1936,34 @@ fn a_guarded_vote_runs_in_its_conditional_block() {
     }
 }
 
-/// A guarded `VOTEU` stays in its block, and its guard becomes a select.
+/// A guarded `VOTEU` (pure in `classify.h`) stays in its flow block, whose guard flow analysis
+/// does not test, so this group alone refuses it ([`ControlUnsupported::UntestedGuard`]): the
+/// translation driver makes it a conditional block before handing it over as tested, and it
+/// then runs exactly where its guard holds, with no select.
 #[test]
 fn a_guarded_uniform_vote_stays_in_its_block() {
     let program = [
         guarded(src(2), voteu(VoteOp::Any, ur(1), up(1), src(0))),
         exit_instr(),
     ];
-    let function = through_flow(&program, COMPUTE);
-    assert!(function.to_string().contains("SelectU32"));
+    let code: Vec<Instruction> = program
+        .iter()
+        .map(|instr| assemble(instr).expect("encodes"))
+        .collect();
+    let graph = flow_graph(&code, &BranchTables::new(0)).expect("flow");
+    assert!(graph.blocks().iter().all(|block| !block.guard_tested));
+    assert_eq!(
+        translated(COMPUTE, program[0], false),
+        refusal(program[0], control(ControlUnsupported::UntestedGuard))
+    );
+    let vertex = crate::translate::Stage {
+        stage: GuestStage::Vertex,
+        color_outputs: crate::translate::ColorOutputs::default(),
+    };
+    let function = crate::translate::translate_flow(vertex, None, &code, &BranchTables::new(0))
+        .expect("translates")
+        .function;
+    assert!(!function.to_string().contains("Select"), "{function}");
     for guard in [false, true] {
         let mut machine = lane(4);
         machine.uniform_preds[2] = guard;

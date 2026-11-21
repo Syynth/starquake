@@ -79,16 +79,20 @@
 //!
 //! # Guards
 //!
-//! An instruction under a guard predicate becomes a conditional block (spec, "Instruction
-//! translation"), through the same helper as the float group: the guard is read, the block
-//! branches to a block holding the instruction or past it, and translation continues in the
-//! block after. [`translate_instr`] skips this for `PT` and when its block already tests the
-//! guard (flow analysis's `guard_tested`). This is what the PR does too: none of this group's
+//! The guard follows the translation driver's rule, the one function the driver and every
+//! group's own entry point use (`super`'s `guard_step`, through its `conditional_block`, as
+//! the float group does; its module docs, "Guards"). After the group check, an instruction
+//! under `@!PT` never runs and appends nothing, unchecked, leaving the descriptor buffer as it
+//! was, as the PR's `Visitor::Run` returns at `guard.Never()`
+//! (`tests::guards::never_guarded_instructions_append_nothing`). An instruction under any
+//! other guard predicate but `PT` becomes a conditional block (spec, "Instruction
+//! translation"): once it is checked, the guard is read, the block branches to a block holding
+//! the instruction or past it, and translation continues in the block after.
+//! [`translate_instr`] skips the block for `PT` and when its block already tests the guard
+//! (flow analysis's `guard_tested`). This is what the PR does too: none of this group's
 //! opcodes is pure in its flow table (`classify.h`, `Classify`), so flow analysis gives each
 //! guarded one a conditional block (`flow.cpp`); pinned by
-//! `tests::guards::a_guard_makes_a_conditional_block`. `@!PT` is checked and put in a block that
-//! never runs, as the float group does (the PR skips it unchecked: `Visitor::Run`,
-//! `guard.Never()`).
+//! `tests::guards::a_guard_makes_a_conditional_block`.
 //!
 //! # Refusals
 //!
@@ -163,7 +167,6 @@
 //!
 //! | What | PR #4588 | Here | Pinned by |
 //! |---|---|---|---|
-//! | `@!PT` | skipped unchecked (`guard.Never()`) | checked, and put in a block that never runs | `tests::guards::never_guarded_instructions_are_checked` |
 //! | A fault (`.SPARSE`) predicate other than `PT` | refused ("native sparse texture residency", "native sparse surface residency") | translated; the predicate is written false, every texel reported resident (spec, gap table: "Report resident and list the divergence") | `tests::sample::sparse_results_report_resident`, `tests::fetch::a_uniform_handle_and_a_fault_predicate`, `tests::gather::a_fault_predicate_and_a_partial_mask`, `tests::query::gradients`, `tests::surface::formatted_loads`, `tests::surface::reductions_discard_the_old_value` |
 //! | `TEX.LC`, `TEX.LB.LC` with a constant-buffer or uniform handle | refused ("native texture clamp mode") | translated, the clamp carried (see "Level-of-detail clamp") | `tests::sample::lod_clamp_is_carried`, `tests::sample::lod_clamp_is_read_unsigned` |
 //! | `TLD4.PTP` | one gather with both offset registers | four gathers (see "Per-texel gather offsets") | `tests::gather::per_texel_offsets_take_four_gathers` |
@@ -175,10 +178,13 @@
 //! `program_info`, is not repeated: there is no environment here, and [`DescriptorBuffer`] is
 //! the program's record that the texture pass reads. The PR's bound on the buffer index,
 //! [`DESCRIPTOR_BUFFERS`] (18, Eden's `MaxConstBuffers`), is kept as the issue asks, though the
-//! spec gives the host 32 constant-buffer slots ("Passes needed for correctness", item 2):
-//! whether a texture handle may sit in buffers 18 to 31 is an owner question.
+//! spec gives the host 32 constant-buffer slots ("Passes needed for correctness", item 2): a
+//! handle in buffers 18 to 31 is refused by name. The owner ruled this as built (spec, "The
+//! texture translator's bounds, as built in slice 12f", decided by the owner, 2026-11-20); it
+//! stays a guess until a title whose handle sits in buffer 18 or above settles it.
 //!
-//! **Owner question** (`TEX.B`'s operand layout): the PR puts the level or depth reference at
+//! **Ruled as built, still a guess** (`TEX.B`'s operand layout; the same spec section and
+//! ruling, until an `nvdisasm` check of a `TEX.B` with a level): the PR puts the level or depth reference at
 //! `B` and the handle after it (`gpr_handle = source_b + (count > dim.coordinates ? 1 : 0)`),
 //! from the forms it saw, and requires the scalar layout; NAK's packing puts the handle first in
 //! `B` (`nak_nir_lower_tex.c`: `PUSH(src1, tex_h)` before the level) but never scalarises a
@@ -548,21 +554,32 @@ pub const fn in_group(op: &Op) -> bool {
 /// Translates `instr`, one of this group's instructions, at the end of `builder`'s block, and
 /// leaves `builder` in the block where translation continues: the same block, or for a guarded
 /// instruction the block after its conditional block (module docs, "Guards"). `guard_tested`
-/// says the block already runs only where the guard holds, so the guard is ignored. `buffer` is
-/// the program's texture descriptor buffer, checked and then updated by a constant-buffer
-/// handle. A refusal appends nothing and leaves `buffer` as it was.
+/// says the block already runs only where the guard holds, so a guard other than `!PT` is
+/// ignored. The checks run in this order: the group, then the guard (`!PT` appends nothing and
+/// leaves `buffer` as it was), then the PR's checks. `buffer` is the program's texture
+/// descriptor buffer, checked and then updated by a constant-buffer handle. A refusal appends
+/// nothing and leaves `buffer` as it was.
 pub fn translate_instr(
     builder: &mut Builder<'_>,
     instr: Instr,
     guard_tested: bool,
     buffer: &mut DescriptorBuffer,
 ) -> Result<(), TextureError> {
-    let (plan, bound) = plan(&instr.op, *buffer)?;
-    conditional_block(builder, instr.guard, guard_tested, |b| {
-        Ok::<_, TextureError>(Emit { b }.plan(&plan)?)
-    })?;
-    *buffer = bound;
-    Ok(())
+    if !in_group(&instr.op) {
+        return Err(TextureUnsupported::OtherGroup(instr.op.mnemonic()).into());
+    }
+    let current = *buffer;
+    conditional_block(
+        builder,
+        instr.guard,
+        guard_tested,
+        || Ok::<_, TextureError>(plan(&instr.op, current)?),
+        |b, (plan, bound)| {
+            Emit { b }.plan(&plan)?;
+            *buffer = bound;
+            Ok(())
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
