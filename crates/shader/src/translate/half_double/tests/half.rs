@@ -371,8 +371,8 @@ fn relu_clamps_as_the_lowering_does() {
 
 /// PR #4588's `HFMA2.RELU` cases (`native_shader.cpp`, the `ReLU` case "preserves fusion
 /// values above one and canonical NaNs"), from its words: `-R13.H1_H1 * R13.H1_H1 +
-/// R16.H0_H0`, then the fused residual with `R14`. One row differs from the PR's expectation,
-/// which is its lowering's: `-0.0` stays `-0.0`, not `+0.0` (module docs, owner question).
+/// R16.H0_H0`, then the fused residual with `R14`, every row with the PR's expected value,
+/// `-0.0` clamped to `+0.0` as the lowering clamps it (ruling 7; module docs, "Divergences").
 #[test]
 fn pr_relu_cases() {
     let instr = pr_word([0x0d12_7231, 0x3000_000d, 0x0384_8d10, 0]);

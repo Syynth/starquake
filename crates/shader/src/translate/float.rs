@@ -32,7 +32,8 @@
 //! - `FMNMX`: `FPMax32` and `FPMin32`, the predicate (read plain, the two swapped when it is
 //!   negated) selecting the minimum; with `.NAN` an unordered pair gives `0x7fffffff`.
 //! - `FSETP`, `FSET`: Eden's `FloatingPointCompare` (`.num` and `.nan` through `FPIsNan32`, `.f`
-//!   and `.t` as constants) combined with the accumulator by `PredicateCombine`; `FSETP` writes
+//!   and `.t` as constants; [`compare`], the one comparison the half and double group shares,
+//!   parameterised by width) combined with the accumulator by `PredicateCombine`; `FSETP` writes
 //!   the combination to its first predicate and the combination of the negated comparison to
 //!   its second (a `PT` destination writes nothing), `FSET` writes `1.0` or `0`.
 //! - `FSEL`: a select of the two modified sources' bits.
