@@ -71,6 +71,7 @@ fn golden_key() -> VariantKey {
     key.previous_stage_stores = golden_stores();
     key.workgroup_size = [0x4142_4344, 0x5152_5354, 0x6162_6364];
     key.shared_memory_size = 0x7172_7374;
+    key.local_memory_size = 0x8586_8788;
     key.emulation = EmulationKey {
         alpha_test: Some(CompareFunction::GreaterThanEqual),
         depth_range_rewrite: true,
@@ -84,8 +85,8 @@ fn golden_key() -> VariantKey {
 }
 
 #[rustfmt::skip]
-const GOLDEN_BYTES: [u8; 201] = [
-    0x03, // version
+const GOLDEN_BYTES: [u8; 205] = [
+    0x04, // version
     // vertex attribute types
     1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1,
     2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2,
@@ -115,6 +116,7 @@ const GOLDEN_BYTES: [u8; 201] = [
     // workgroup size x, y, z
     0x44, 0x43, 0x42, 0x41, 0x54, 0x53, 0x52, 0x51, 0x64, 0x63, 0x62, 0x61,
     0x74, 0x73, 0x72, 0x71, // shared-memory size
+    0x88, 0x87, 0x86, 0x85, // local-memory size
     0x07, // alpha test: greater or equal (6) plus one
     // depth range, primitive restart, attribute fetch, typed outputs, flipped viewport
     0x01, 0x01, 0x01, 0x01, 0x01,
@@ -125,7 +127,7 @@ const GOLDEN_BYTES: [u8; 201] = [
 
 #[test]
 fn layout_constants() {
-    assert_eq!(VARIANT_KEY_VERSION, 3);
+    assert_eq!(VARIANT_KEY_VERSION, 4);
     assert_eq!(VERTEX_ATTRIBUTES, 32);
     assert_eq!(MAX_TEXTURE_SWIZZLES, 192);
     assert_eq!(ATTRIBUTE_WORDS, 256);
@@ -133,8 +135,8 @@ fn layout_constants() {
     assert_eq!(FOLLOWING_STAGES, 4);
     assert_eq!(FollowingStage::ALL.len(), FOLLOWING_STAGES);
     assert_eq!(SWIZZLE_SIZE, 4);
-    assert_eq!(VARIANT_KEY_FIXED_SIZE, 193);
-    assert_eq!(VARIANT_KEY_MAX_SIZE, 193 + 192 * 4);
+    assert_eq!(VARIANT_KEY_FIXED_SIZE, 197);
+    assert_eq!(VARIANT_KEY_MAX_SIZE, 197 + 192 * 4);
 }
 
 #[test]
@@ -147,7 +149,7 @@ fn golden_bytes() {
 fn the_default_key_decodes_from_zeros() {
     // Hand-built: the version, then every field zero and no swizzles.
     let mut bytes = vec![0; VARIANT_KEY_FIXED_SIZE];
-    bytes[0] = 3;
+    bytes[0] = 4;
     assert_eq!(VariantKey::decode(&bytes), Ok(VariantKey::default()));
     assert_eq!(VariantKey::default().encode(), bytes);
 }
@@ -166,6 +168,7 @@ fn defaults() {
     }
     assert_eq!(fresh.workgroup_size, [0, 0, 0]);
     assert_eq!(fresh.shared_memory_size, 0);
+    assert_eq!(fresh.local_memory_size, 0);
     assert_eq!(
         fresh.emulation,
         EmulationKey {
@@ -217,12 +220,12 @@ fn any_key() -> impl Strategy<Value = VariantKey> {
         any::<bool>(),
         prop::array::uniform4(prop::array::uniform4(any::<u64>())),
         prop::array::uniform3(any::<u32>()),
-        any::<u32>(),
+        (any::<u32>(), any::<u32>()),
         emulation,
         prop::collection::vec(any_swizzle(), 0..=MAX_TEXTURE_SWIZZLES),
     )
         .prop_map(
-            |(attributes, colors, dual, lanes, workgroup, shared, emulation, swizzles)| {
+            |(attributes, colors, dual, lanes, workgroup, (shared, local), emulation, swizzles)| {
                 VariantKey {
                     vertex_attributes: attributes,
                     color_targets: colors,
@@ -235,6 +238,7 @@ fn any_key() -> impl Strategy<Value = VariantKey> {
                     ),
                     workgroup_size: workgroup,
                     shared_memory_size: shared,
+                    local_memory_size: local,
                     emulation,
                     texture_swizzles: TextureSwizzles::new(swizzles).expect("within the cap"),
                 }
@@ -279,8 +283,9 @@ fn the_version_is_checked_first() {
         })
     );
     // Another version with a truncated body: the version is reported (1 is the version
-    // before the flipped-viewport switch, 2 the one before the previous stages' stores).
-    for found in [0, 1, 2, 4, u8::MAX] {
+    // before the flipped-viewport switch, 2 the one before the previous stages' stores, 3 the
+    // one before the local-memory size).
+    for found in [0, 1, 2, 3, 5, u8::MAX] {
         assert_eq!(
             VariantKey::decode(&[found]),
             Err(KeyError::Version { found })
@@ -295,7 +300,7 @@ fn the_version_is_checked_first() {
     );
     assert_eq!(
         KeyError::Version { found: 1 }.to_string(),
-        "variant key version 1 is not supported; this build reads version 3"
+        "variant key version 1 is not supported; this build reads version 4"
     );
     // The right version with nothing after it.
     assert_eq!(
@@ -351,36 +356,38 @@ fn every_prefix_is_truncated_in_the_right_field() {
         (181, KeyField::WorkgroupSize(2)),
         (182, KeyField::SharedMemorySize),
         (185, KeyField::SharedMemorySize),
-        (186, KeyField::AlphaTest),
-        (187, KeyField::DepthRangeRewrite),
-        (188, KeyField::PrimitiveRestartRewrite),
-        (189, KeyField::AttributeFetch),
-        (190, KeyField::TypedOutputs),
-        (191, KeyField::FlippedViewport),
-        (192, KeyField::SwizzleCount),
+        (186, KeyField::LocalMemorySize),
+        (189, KeyField::LocalMemorySize),
+        (190, KeyField::AlphaTest),
+        (191, KeyField::DepthRangeRewrite),
+        (192, KeyField::PrimitiveRestartRewrite),
+        (193, KeyField::AttributeFetch),
+        (194, KeyField::TypedOutputs),
+        (195, KeyField::FlippedViewport),
+        (196, KeyField::SwizzleCount),
         (
-            193,
+            197,
             KeyField::Swizzle {
                 binding: 0,
                 component: 0,
             },
         ),
         (
-            196,
+            200,
             KeyField::Swizzle {
                 binding: 0,
                 component: 3,
             },
         ),
         (
-            197,
+            201,
             KeyField::Swizzle {
                 binding: 1,
                 component: 0,
             },
         ),
         (
-            200,
+            204,
             KeyField::Swizzle {
                 binding: 1,
                 component: 3,
@@ -428,14 +435,14 @@ fn each_coded_field_accepts_its_last_code_and_refuses_the_next() {
         (33, KeyField::ColorTarget(0), 2, 3),
         (40, KeyField::ColorTarget(7), 2, 3),
         (41, KeyField::DualSourceBlend, 1, 2),
-        (186, KeyField::AlphaTest, 8, 9),
-        (187, KeyField::DepthRangeRewrite, 1, 2),
-        (188, KeyField::PrimitiveRestartRewrite, 1, 2),
-        (189, KeyField::AttributeFetch, 1, 2),
-        (190, KeyField::TypedOutputs, 1, 2),
-        (191, KeyField::FlippedViewport, 1, 2),
+        (190, KeyField::AlphaTest, 8, 9),
+        (191, KeyField::DepthRangeRewrite, 1, 2),
+        (192, KeyField::PrimitiveRestartRewrite, 1, 2),
+        (193, KeyField::AttributeFetch, 1, 2),
+        (194, KeyField::TypedOutputs, 1, 2),
+        (195, KeyField::FlippedViewport, 1, 2),
         (
-            193,
+            197,
             KeyField::Swizzle {
                 binding: 0,
                 component: 0,
@@ -444,7 +451,7 @@ fn each_coded_field_accepts_its_last_code_and_refuses_the_next() {
             8,
         ),
         (
-            200,
+            204,
             KeyField::Swizzle {
                 binding: 1,
                 component: 3,
@@ -489,21 +496,21 @@ fn the_codes_inside_each_set() {
         Ok(ColorType::Float)
     );
     assert_eq!(zero(41).map(|key| key.dual_source_blend), Ok(false));
-    assert_eq!(zero(186).map(|key| key.emulation.alpha_test), Ok(None));
+    assert_eq!(zero(190).map(|key| key.emulation.alpha_test), Ok(None));
     assert_eq!(
-        VariantKey::decode(&patched(186, 1)).map(|key| key.emulation.alpha_test),
+        VariantKey::decode(&patched(190, 1)).map(|key| key.emulation.alpha_test),
         Ok(Some(CompareFunction::Never))
     );
     assert_eq!(
-        VariantKey::decode(&patched(186, 8)).map(|key| key.emulation.alpha_test),
+        VariantKey::decode(&patched(190, 8)).map(|key| key.emulation.alpha_test),
         Ok(Some(CompareFunction::Always))
     );
     let switches: [(usize, Read); 5] = [
-        (187, |key| key.emulation.depth_range_rewrite),
-        (188, |key| key.emulation.primitive_restart_rewrite),
-        (189, |key| key.emulation.attribute_fetch),
-        (190, |key| key.emulation.typed_outputs),
-        (191, |key| key.emulation.flipped_viewport),
+        (191, |key| key.emulation.depth_range_rewrite),
+        (192, |key| key.emulation.primitive_restart_rewrite),
+        (193, |key| key.emulation.attribute_fetch),
+        (194, |key| key.emulation.typed_outputs),
+        (195, |key| key.emulation.flipped_viewport),
     ];
     for (offset, read) in switches {
         assert_eq!(
@@ -517,7 +524,7 @@ fn the_codes_inside_each_set() {
         );
     }
     assert_eq!(
-        zero(193).map(|key| key.texture_swizzles.as_slice()[0].x),
+        zero(197).map(|key| key.texture_swizzles.as_slice()[0].x),
         Ok(SwizzleSource::Zero)
     );
     let field = KeyField::Swizzle {
@@ -525,7 +532,7 @@ fn the_codes_inside_each_set() {
         component: 0,
     };
     assert_eq!(
-        VariantKey::decode(&patched(193, 1)),
+        VariantKey::decode(&patched(197, 1)),
         Err(KeyError::InvalidValue { field, value: 1 })
     );
     assert_eq!(
@@ -537,8 +544,8 @@ fn the_codes_inside_each_set() {
 #[test]
 fn the_first_invalid_field_is_reported() {
     let mut bytes = patched(33, 3);
-    bytes[187] = 2;
-    bytes[200] = 1;
+    bytes[191] = 2;
+    bytes[204] = 1;
     assert_eq!(
         VariantKey::decode(&bytes),
         Err(KeyError::InvalidValue {
@@ -604,7 +611,7 @@ fn the_swizzle_cap_at_its_edge() {
 fn the_swizzle_count_is_checked_before_the_swizzles() {
     // A count past the cap and too few bytes for it: the count is reported.
     let count = u8::try_from(MAX_TEXTURE_SWIZZLES + 1).expect("fits");
-    let bytes = patched(192, count);
+    let bytes = patched(196, count);
     assert_eq!(
         VariantKey::decode(&bytes),
         Err(KeyError::TooManySwizzles {
@@ -613,7 +620,7 @@ fn the_swizzle_count_is_checked_before_the_swizzles() {
     );
     // A count within the cap and too few bytes: the swizzle it ends in.
     assert_eq!(
-        VariantKey::decode(&patched(192, 3)),
+        VariantKey::decode(&patched(196, 3)),
         Err(KeyError::Truncated {
             field: KeyField::Swizzle {
                 binding: 2,
@@ -624,7 +631,7 @@ fn the_swizzle_count_is_checked_before_the_swizzles() {
     );
     // A count below what follows: the rest is trailing.
     assert_eq!(
-        VariantKey::decode(&patched(192, 1)),
+        VariantKey::decode(&patched(196, 1)),
         Err(KeyError::TrailingBytes {
             end: GOLDEN_BYTES.len() - SWIZZLE_SIZE,
             len: GOLDEN_BYTES.len()
@@ -644,8 +651,8 @@ fn trailing_bytes_are_refused() {
         })
     );
     assert_eq!(
-        KeyError::TrailingBytes { end: 201, len: 202 }.to_string(),
-        "the variant key ends at byte 201, but 202 bytes were given"
+        KeyError::TrailingBytes { end: 205, len: 206 }.to_string(),
+        "the variant key ends at byte 205, but 206 bytes were given"
     );
 }
 
@@ -854,6 +861,7 @@ fn key_field_names_are_plain_words() {
             "the workgroup size along axis 2",
         ),
         (KeyField::SharedMemorySize, "the shared-memory size"),
+        (KeyField::LocalMemorySize, "the local-memory size"),
         (KeyField::AlphaTest, "the alpha test"),
         (
             KeyField::DepthRangeRewrite,
@@ -1018,4 +1026,23 @@ fn the_key_changes_with_the_stores_and_not_otherwise() {
     };
     assert_ne!(moved, base);
     assert_ne!(moved.encode(), base.encode());
+}
+
+/// The local-memory size is its own four bytes, little-endian, right after the shared-memory
+/// size (module docs, "Encoding"): a key that differs from the default only there differs in
+/// exactly those bytes, and decodes back; so two dispatches that differ only in it get
+/// different keys.
+#[test]
+fn the_local_memory_size_has_its_own_bytes() {
+    let empty = VariantKey::default().encode();
+    let key = VariantKey {
+        local_memory_size: 0x0102_0304,
+        ..VariantKey::default()
+    };
+    let bytes = key.encode();
+    let mut expected = empty;
+    expected[186..190].copy_from_slice(&[0x04, 0x03, 0x02, 0x01]);
+    assert_eq!(bytes, expected);
+    assert_eq!(VariantKey::decode(&bytes), Ok(key.clone()));
+    assert_ne!(key, VariantKey::default());
 }

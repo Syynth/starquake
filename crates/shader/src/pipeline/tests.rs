@@ -19,10 +19,11 @@ use crate::decode::{
 };
 use crate::exchange::{EngineState, TextureKind, exchange};
 use crate::flow::FlowError;
-use crate::host::HostStage;
+use crate::host::{HostCode, HostStage};
 use crate::info::InfoError;
 use crate::interp::Machine;
-use crate::ir::{ATTRIBUTE_WORD_BYTES, Attribute, Node};
+use crate::ir::{ATTRIBUTE_WORD_BYTES, Attribute, Function, Inst, Node, Opcode};
+use crate::translate::GuestStage;
 use crate::lookup::{ProgramMemory, ProgramRequest, Unmapped};
 use crate::lower::{LowerError, MAX_LOCAL_MEMORY_BYTES, MAX_SHARED_MEMORY_BYTES};
 use crate::sph::encode::encode_bytes;
@@ -657,82 +658,176 @@ fn the_program_entry_parses_the_header() {
     );
 }
 
-/// A compute program that writes local memory is refused by name; the same store in a vertex
-/// program, whose header gives the size, lowers; a compute program without local memory lowers.
-/// Each condition is the only one that varies between two of the cases.
+/// The length in words of `shader`'s local-memory array, `None` when it has none.
+fn local_words(shader: &HostShader) -> Option<u32> {
+    let HostCode::Naga { module, .. } = &shader.code;
+    module
+        .global_variables
+        .iter()
+        .find(|(_, global)| global.name.as_deref() == Some("local_memory"))
+        .map(|(_, global)| match module.types[global.ty].inner {
+            naga::TypeInner::Array {
+                size: naga::ArraySize::Constant(length),
+                ..
+            } => length.get(),
+            ref other => panic!("local memory is a sized array, not {other:?}"),
+        })
+}
+
+/// A vertex program's header with `low` bytes in the local-memory size's low field, `high` in
+/// its high field and `crs` bytes of CRS size.
+fn vertex_header_crs(low: u32, high: u32, crs: u32) -> ProgramHeader {
+    let mut header = vertex_header(low);
+    header.common.local_memory_high_size = high;
+    header.common.local_memory_crs_size = crs;
+    header
+}
+
+/// A compute program that writes local memory lowers over an array sized from the variant
+/// key's local-memory size (the QMD's, filled by the GPU crate): 0x13 bytes are five words.
+/// With a key size of zero it lowers with no array (the store is dropped, `crate::lower`'s
+/// "Local and shared memory"); a compute program without local memory has no array whatever
+/// the key says; and a vertex program with the same store takes its header's size, not the
+/// key's. Each condition is the only one that varies between two of the cases.
 #[test]
-fn a_compute_program_with_local_memory_is_refused() {
+fn a_compute_program_with_local_memory_takes_the_qmd_size() {
     let store = words(&[mov(0, 7), stl(0, 0), exit()]);
     let plain = words(&[mov(0, 7), exit()]);
-    let variant = compute_variant();
-    assert_eq!(
+    let compute = |code: &[Instruction], local: u32| {
         through_the_cache(
             GuestStage::Compute,
-            &bytes(None, &store),
+            &bytes(None, code),
             &State::default(),
-            &variant
+            &VariantKey {
+                local_memory_size: local,
+                ..compute_variant()
+            },
         )
-        .map(|_| ()),
-        Err(Arc::new(Rejection::Pipeline(
-            PipelineRefusal::ComputeLocalMemory
-        )))
-    );
-    assert_eq!(
-        Rejection::Pipeline(PipelineRefusal::ComputeLocalMemory).to_string(),
-        "a compute program that uses local memory, whose size no translation input carries yet"
-    );
-    assert!(
+        .map(|shader| local_words(&shader))
+    };
+    assert_eq!(compute(&store, 0x13), Ok(Some(5)));
+    assert_eq!(compute(&store, 0), Ok(None));
+    assert_eq!(compute(&plain, 0x13), Ok(None));
+    let vertex = through_the_cache(
+        GuestStage::Vertex,
+        &bytes(Some(&vertex_header(0x10)), &store),
+        &State::default(),
+        &VariantKey {
+            local_memory_size: 0x40,
+            ..VariantKey::default()
+        },
+    )
+    .map(|shader| local_words(&shader));
+    assert_eq!(vertex, Ok(Some(4)));
+}
+
+/// A compute program that only reads local memory (`LDL R0, [RZ]; STS [RZ], R0; EXIT`)
+/// lowers over the key's size too: the load alone, kept alive by the shared store, makes the
+/// array. Without the load the same program has no local array, so the load is the only thing
+/// that varies.
+#[test]
+fn a_compute_program_that_only_reads_local_memory_takes_the_qmd_size() {
+    let variant = VariantKey {
+        shared_memory_size: 16,
+        local_memory_size: 8,
+        ..compute_variant()
+    };
+    let lowered = |code: &[Instruction]| {
         through_the_cache(
             GuestStage::Compute,
-            &bytes(None, &plain),
+            &bytes(None, code),
             &State::default(),
-            &variant
+            &variant,
         )
-        .is_ok()
-    );
-    assert!(
+        .map(|shader| local_words(&shader))
+    };
+    assert_eq!(lowered(&words(&[ldl(0, 0), sts(0, 0), exit()])), Ok(Some(2)));
+    assert_eq!(lowered(&words(&[mov(0, 7), sts(0, 0), exit()])), Ok(None));
+}
+
+/// A graphics program's local memory is its header's size plus its CRS size, as every
+/// reference's `GraphicsEnvironment` adds `shader_local_memory_crs_size`: each field alone,
+/// both (0x10 + 0x9 = 0x19 bytes, seven words, where either alone gives four or three), none,
+/// and the high field, which adds 2^24.
+#[test]
+fn a_graphics_program_adds_its_crs_size() {
+    let store = words(&[mov(0, 7), stl(0, 0), exit()]);
+    let vertex = |header: &ProgramHeader| {
         through_the_cache(
             GuestStage::Vertex,
-            &bytes(Some(&vertex_header(0x10)), &store),
+            &bytes(Some(header), &store),
             &State::default(),
-            &variant
+            &VariantKey::default(),
         )
-        .is_ok()
+        .map(|shader| local_words(&shader))
+    };
+    assert_eq!(vertex(&vertex_header_crs(0x10, 0, 0)), Ok(Some(4)));
+    assert_eq!(vertex(&vertex_header_crs(0, 0, 0x9)), Ok(Some(3)));
+    assert_eq!(vertex(&vertex_header_crs(0x10, 0, 0x9)), Ok(Some(7)));
+    assert_eq!(vertex(&vertex_header_crs(0, 0, 0)), Ok(None));
+    // The high field is bits 24 up (Eden's formula, `Common::local_memory_size`): 2^24 bytes
+    // are past the lowering's cap, so it is refused with that exact size plus the CRS size.
+    assert_eq!(
+        vertex(&vertex_header_crs(0, 1, 0x9)),
+        Err(Arc::new(Rejection::Lower(LowerError::LocalMemory {
+            bytes: (1 << 24) + 0x9
+        })))
     );
 }
 
-/// A compute program that only reads local memory (`LDL R0, [RZ]; STS [RZ], R0; EXIT`) is
-/// refused by name too: the load alone, kept alive by the shared store, is a use of local
-/// memory, whose reads would otherwise give 0. Without the load the same program lowers, so
-/// the load is the only thing that varies.
+/// [`local_memory_bytes`] for every combination of its inputs: no header takes the key's size
+/// (zero, non-zero and the widest), a header takes its own size plus its CRS size and ignores
+/// the key's (zero and non-zero), and the header's three fields each count.
 #[test]
-fn a_compute_program_that_only_reads_local_memory_is_refused() {
-    let variant = VariantKey {
-        shared_memory_size: 16,
-        ..compute_variant()
+fn local_memory_bytes_for_each_input() {
+    let key = |local| VariantKey {
+        local_memory_size: local,
+        ..VariantKey::default()
     };
-    let load = words(&[ldl(0, 0), sts(0, 0), exit()]);
+    assert_eq!(local_memory_bytes(None, &key(0)), 0);
+    assert_eq!(local_memory_bytes(None, &key(0x123)), 0x123);
+    assert_eq!(local_memory_bytes(None, &key(u32::MAX)), u64::from(u32::MAX));
+    let header = vertex_header_crs(0x10, 0x2, 0x300);
+    let expected = 0x10 + (0x2 << 24) + 0x300;
+    assert_eq!(local_memory_bytes(Some(&header), &key(0)), expected);
+    assert_eq!(local_memory_bytes(Some(&header), &key(0x123)), expected);
     assert_eq!(
-        through_the_cache(
-            GuestStage::Compute,
-            &bytes(None, &load),
-            &State::default(),
-            &variant
-        )
-        .map(|_| ()),
-        Err(Arc::new(Rejection::Pipeline(
-            PipelineRefusal::ComputeLocalMemory
-        )))
+        local_memory_bytes(Some(&vertex_header_crs(0, 0, 0)), &key(0x123)),
+        0
     );
-    let no_load = words(&[mov(0, 7), sts(0, 0), exit()]);
-    assert!(
+    // The widest fields a caller can build (the type does not hold them to 24 bits) still sum
+    // without wrapping.
+    let widest = vertex_header_crs(u32::MAX, u32::MAX, u32::MAX);
+    assert_eq!(
+        local_memory_bytes(Some(&widest), &key(0)),
+        0x00ff_ffff_ffff_ffff + u64::from(u32::MAX)
+    );
+}
+
+/// Divergence (module docs, "The local-memory size"): a header size of 2^32 bytes (high field
+/// 0x100) is refused with that exact size, where Eden truncates it to 32 bits and sizes local
+/// memory as the CRS size alone; a header one byte below, plus a CRS size that takes the sum
+/// to 2^32, is refused with the same size, where Eden's 32-bit sum wraps to 0.
+#[test]
+fn a_header_size_of_2_to_the_32_is_refused_not_wrapped() {
+    let plain = words(&[mov(0, 7), exit()]);
+    let vertex = |header: &ProgramHeader| {
         through_the_cache(
-            GuestStage::Compute,
-            &bytes(None, &no_load),
+            GuestStage::Vertex,
+            &bytes(Some(header), &plain),
             &State::default(),
-            &variant
+            &VariantKey::default(),
         )
-        .is_ok()
+        .map(|_| ())
+    };
+    let refused = Err(Arc::new(Rejection::Lower(LowerError::LocalMemory {
+        bytes: 1 << 32,
+    })));
+    assert_eq!(vertex(&vertex_header_crs(0, 0x100, 0)), refused);
+    assert_eq!(
+        vertex(&vertex_header_crs(0xff_ffff, 0xff, 1)),
+        refused,
+        "0xff_ffff_ffff + 1"
     );
 }
 
@@ -782,9 +877,10 @@ fn compute_variant() -> VariantKey {
     }
 }
 
-/// The variant key's workgroup and shared-memory sizes and the header's local-memory size
-/// reach the lowering: the shader's workgroup size is the key's, and a size one past each
-/// lowering bound is refused with the lowering's error, at the bound accepted.
+/// The variant key's workgroup, shared-memory and local-memory sizes and the header's
+/// local-memory size (alone, and split with its CRS size) reach the lowering: the shader's
+/// workgroup size is the key's, and a size one past each lowering bound is refused with the
+/// lowering's error, at the bound accepted.
 #[test]
 fn the_variant_and_the_header_reach_the_lowering() {
     let plain = words(&[mov(0, 7), exit()]);
@@ -827,6 +923,7 @@ fn the_variant_and_the_header_reach_the_lowering() {
             }),
         ),
     ] {
+        let refused = refused.map(|error| Arc::new(Rejection::Lower(error)));
         let vertex = through_the_cache(
             GuestStage::Vertex,
             &bytes(Some(&vertex_header(local)), &plain),
@@ -835,8 +932,30 @@ fn the_variant_and_the_header_reach_the_lowering() {
         );
         assert_eq!(
             vertex.err(),
-            refused.map(|error| Arc::new(Rejection::Lower(error))),
+            refused.clone(),
             "{local}"
+        );
+        // The same size split between the header's size and its CRS size.
+        let split = through_the_cache(
+            GuestStage::Vertex,
+            &bytes(Some(&vertex_header_crs(local - 0x40, 0, 0x40)), &plain),
+            &State::default(),
+            &VariantKey::default(),
+        );
+        assert_eq!(
+            split.err(),
+            refused.clone(),
+            "{local} split"
+        );
+        // And a compute program's, from the variant key.
+        let from_key = compute(&VariantKey {
+            local_memory_size: local,
+            ..compute_variant()
+        });
+        assert_eq!(
+            from_key.err(),
+            refused.clone(),
+            "{local} from the key"
         );
     }
 }

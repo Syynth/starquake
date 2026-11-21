@@ -162,6 +162,9 @@
 //!   "unmapped QMD release" when a release address is unmapped, after the QMD completed; here a
 //!   release is handed to the sink, and its write is the fence path's (G15). Pinned by
 //!   `divergence_release_addresses_are_not_checked_here`.
+//! - **The local-memory fields keep all 24 bits.** Eden-NX2 assigns each into a 20-bit
+//!   `BitField`, dropping bits 20 to 23 ([`Dispatch::local_memory_size`]). Pinned by
+//!   `divergence_local_memory_keeps_bits_20_to_23`.
 //!
 //! # Refused as Eden-NX2 refuses them
 //!
@@ -408,6 +411,28 @@ pub struct Dispatch {
     pub local_memory_high: u32,
     /// The constant buffers (words 20 and 32–47).
     pub constant_buffers: [ConstantBuffer; CONSTANT_BUFFERS],
+}
+
+impl Dispatch {
+    /// The program's local-memory size in bytes, as the shader crate's variant key takes it
+    /// (`VariantKey::local_memory_size`; this is the one place the two QMD fields become one
+    /// size): [`Self::local_memory_low`] plus [`Self::local_memory_high`], as every reference's
+    /// `ComputeEnvironment` sets `local_memory_size = qmd.local_pos_alloc +
+    /// qmd.local_crs_alloc` (`eden-nx2/src/video_core/shader_environment.cpp` @ 50fa86bb,
+    /// `eden-pr4588/src/video_core/shader_environment.cpp` @ e5fb3b97).
+    ///
+    /// **Divergence:** Eden-NX2 and PR #4588 copy each 24-bit field
+    /// (`qmd[23] & 0xffffff`, `qmd[50] & 0xffffff`, `DispatchNativeCompute` in
+    /// `kepler_compute.cpp`) into a 20-bit `BitField` (`local_pos_alloc`, `local_crs_alloc` in
+    /// `kepler_compute.h`), whose `Assign` masks it, so bits 20 to 23 of each are dropped. Here
+    /// all 24 bits are kept, as `clc7c0qmd.h` defines them; a size of 1 MiB or more is past the
+    /// shader crate's local-memory cap and is refused there. Pinned by
+    /// `divergence_local_memory_keeps_bits_20_to_23`. The sum saturates, which only a
+    /// hand-built [`Dispatch`] with fields wider than 24 bits can reach.
+    #[must_use]
+    pub const fn local_memory_size(&self) -> u32 {
+        self.local_memory_low.saturating_add(self.local_memory_high)
+    }
 }
 
 /// One constant buffer binding of a [`Dispatch`].

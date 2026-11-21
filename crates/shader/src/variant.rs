@@ -13,6 +13,7 @@
 //! | [`VariantKey::dual_source_blend`] | whether dual-source blending is on | Eden `RuntimeInfo::dual_source_blend` |
 //! | [`VariantKey::previous_stage_stores`] | for each stage that follows another, the attribute words the stage before it stores | Eden `RuntimeInfo::previous_stage_stores`, filled by `MakeRuntimeInfo` (`eden/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp` @ cf654052); spec, "Pipeline-state specialisation"; see "The previous stage's stores" |
 //! | [`VariantKey::workgroup_size`], [`VariantKey::shared_memory_size`] | a compute program's workgroup and shared-memory size | spec, "Compute shaders"; Eden `Environment::WorkgroupSize`, `SharedMemorySize` (`environment.h`) |
+//! | [`VariantKey::local_memory_size`] | a compute program's local-memory size in bytes, which the GPU crate computes from the QMD (`Dispatch::local_memory_size`, the conversion's one owner) | spec, "Local and shared memory" (pass 6: "sized from ... the QMD (compute)"); Eden `Environment::LocalMemorySize`, which `ComputeEnvironment` sets to `qmd.local_pos_alloc + qmd.local_crs_alloc` (`eden-pr4588/src/video_core/shader_environment.cpp` @ e5fb3b97); see "The compute local-memory size" |
 //! | [`VariantKey::emulation`] | the render backend's `EmulationFlags`, field by field | spec, "Pipeline-state specialisation"; review guide, M13 |
 //! | [`VariantKey::texture_swizzles`] | each texture binding's swizzle, when the host has no view swizzle | spec, the exception to decision 16; review guide, M11 |
 //!
@@ -64,6 +65,17 @@
 //! - **No legacy stores mapping.** Eden also copies `previous_stage_legacy_stores_mapping`; the
 //!   key has no field for it.
 //!
+//! # The compute local-memory size
+//!
+//! [`VariantKey::local_memory_size`] is the size a compute program's local memory is sized
+//! from (`crate::pipeline::local_memory_bytes`); a graphics program's comes from its header,
+//! and the field is ignored for it, as [`VariantKey::shared_memory_size`] is. The spec's
+//! "Compute shaders" says "the variant key holds the workgroup size and shared-memory size";
+//! this field is a third compute field, added because the QMD is the only source of the size
+//! (the spec's pass 6) and a translated shader's array length depends on it, so two dispatches
+//! of one program with different sizes must not share a cached shader. **For the owner**: the
+//! spec sentence names two fields; whether it should name this one too.
+//!
 //! # The texture swizzles' binding order
 //!
 //! [`VariantKey::texture_swizzles`] is keyed by **binding order**:
@@ -92,6 +104,7 @@
 //! | 128 | previous stages' stores: one mask per [`FollowingStage`] in [`FollowingStage::ALL`] order, each four 64-bit lanes, lane 0 (attribute words 0 to 63) first |
 //! | 12 | workgroup size x, y, z, 32 bits each |
 //! | 4 | shared-memory size, 32 bits |
+//! | 4 | local-memory size, 32 bits |
 //! | 1 | alpha test: 0 for none, else 1 plus the [`CompareFunction`] code |
 //! | 5 | depth-range rewrite, primitive-restart rewrite, attribute fetch, typed outputs, flipped viewport: 0 or 1 each |
 //! | 1 | texture swizzle count, at most [`MAX_TEXTURE_SWIZZLES`] |
@@ -117,7 +130,8 @@ use crate::translate::{ATTRIBUTE_SPACE_END, COLOR_TARGETS, GuestStage};
 /// Version 2 added the flipped-viewport switch (owner's ruling 28 of 2026-11-19). Version 3
 /// replaced version 2's one mask of what the next stage reads with a mask per
 /// [`FollowingStage`] of what the previous stage stores (owner's ruling 8 of 2026-11-19).
-pub const VARIANT_KEY_VERSION: u8 = 3;
+/// Version 4 added the compute local-memory size (issue #489).
+pub const VARIANT_KEY_VERSION: u8 = 4;
 
 /// How many vertex attributes the guest has (`Maxwell::NumVertexAttributes` = 32,
 /// `eden/src/video_core/engines/maxwell_3d.h` @ cf654052; `RuntimeInfo::generic_input_types`
@@ -152,6 +166,7 @@ pub const VARIANT_KEY_FIXED_SIZE: usize = 1 // version
     + FOLLOWING_STAGES * ATTRIBUTE_MASK_LANES * 8
     + 3 * 4 // workgroup size
     + 4 // shared-memory size
+    + 4 // local-memory size
     + 1 // alpha test
     + 5 // the five emulation switches
     + 1; // swizzle count
@@ -530,6 +545,9 @@ pub struct VariantKey {
     pub workgroup_size: [u32; 3],
     /// A compute program's shared-memory size in bytes.
     pub shared_memory_size: u32,
+    /// A compute program's local-memory size in bytes (module docs, "The compute local-memory
+    /// size").
+    pub local_memory_size: u32,
     /// The render backend's emulation flags.
     pub emulation: EmulationKey,
     /// Each texture binding's swizzle, when the host has no view swizzle, in the binding order
@@ -554,6 +572,8 @@ pub enum KeyField {
     WorkgroupSize(u8),
     /// The shared-memory size.
     SharedMemorySize,
+    /// The local-memory size.
+    LocalMemorySize,
     /// The alpha test.
     AlphaTest,
     /// The depth-range rewrite switch.
@@ -592,6 +612,7 @@ impl Display for KeyField {
             }
             Self::WorkgroupSize(axis) => write!(f, "the workgroup size along axis {axis}"),
             Self::SharedMemorySize => f.write_str("the shared-memory size"),
+            Self::LocalMemorySize => f.write_str("the local-memory size"),
             Self::AlphaTest => f.write_str("the alpha test"),
             Self::DepthRangeRewrite => f.write_str("the depth-range rewrite switch"),
             Self::PrimitiveRestartRewrite => f.write_str("the primitive-restart rewrite switch"),
@@ -727,6 +748,7 @@ impl VariantKey {
             out.extend_from_slice(&size.to_le_bytes());
         }
         out.extend_from_slice(&self.shared_memory_size.to_le_bytes());
+        out.extend_from_slice(&self.local_memory_size.to_le_bytes());
         let emulation = &self.emulation;
         out.push(
             emulation
@@ -778,6 +800,7 @@ impl VariantKey {
             *size = reader.u32(KeyField::WorkgroupSize(index_u8(axis)))?;
         }
         key.shared_memory_size = reader.u32(KeyField::SharedMemorySize)?;
+        key.local_memory_size = reader.u32(KeyField::LocalMemorySize)?;
         key.emulation.alpha_test = reader.coded(KeyField::AlphaTest, |code| match code {
             0 => Some(None),
             code => CompareFunction::from_code(code - 1).map(Some),

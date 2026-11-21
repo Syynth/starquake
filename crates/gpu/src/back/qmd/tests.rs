@@ -2435,3 +2435,48 @@ fn errors_read_as_plain_words() {
     }
     assert_eq!(REGISTERS_NEEDED, 0x108);
 }
+
+/// The local-memory size is the low field plus the high field (every reference's
+/// `ComputeEnvironment`: `qmd.local_pos_alloc + qmd.local_crs_alloc`), decoded from a laid-out
+/// QMD with a distinct value in each, and with either field alone, so a size that took only
+/// one field, or either field twice, fails.
+#[test]
+fn the_local_memory_size_is_the_sum_of_both_fields() {
+    let mut w = encode(&Spec::new(0x1_0000));
+    for (low, high, size) in [
+        (0x0001_2000, 0x0000_0300, 0x0001_2300),
+        (0x0000_0040, 0, 0x0000_0040),
+        (0, 0x0000_0500, 0x0000_0500),
+        (0, 0, 0),
+    ] {
+        set(&mut w, q::QMDV03_00_SHADER_LOCAL_MEMORY_LOW_SIZE, low);
+        set(&mut w, q::QMDV03_00_SHADER_LOCAL_MEMORY_HIGH_SIZE, high);
+        let dispatch = Qmd::decode(qmd_at(1), &w).unwrap().dispatch;
+        assert_eq!(dispatch.local_memory_size(), size, "{low:#x} + {high:#x}");
+    }
+}
+
+/// Divergence: bits 20 to 23 of each local-memory field are kept, where Eden-NX2's 20-bit
+/// `BitField`s drop them (`launch_description.local_pos_alloc.Assign(qmd[23] & 0xffffff)`
+/// into `BitField<0, 20, u32>`): Eden-NX2 would size these as 0x1 and 0x20 bytes. Each field's
+/// widest value sums without wrapping, and a hand-built wider sum saturates.
+#[test]
+fn divergence_local_memory_keeps_bits_20_to_23() {
+    let mut w = encode(&Spec::new(0x1_0000));
+    set(&mut w, q::QMDV03_00_SHADER_LOCAL_MEMORY_LOW_SIZE, 0x10_0001);
+    set(&mut w, q::QMDV03_00_SHADER_LOCAL_MEMORY_HIGH_SIZE, 0x80_0020);
+    let dispatch = Qmd::decode(qmd_at(1), &w).unwrap().dispatch;
+    assert_eq!(dispatch.local_memory_size(), 0x90_0021);
+    let widest = Dispatch {
+        local_memory_low: 0xff_ffff,
+        local_memory_high: 0xff_ffff,
+        ..dispatch
+    };
+    assert_eq!(widest.local_memory_size(), 0x1ff_fffe);
+    let wider = Dispatch {
+        local_memory_low: u32::MAX,
+        local_memory_high: 1,
+        ..dispatch
+    };
+    assert_eq!(wider.local_memory_size(), u32::MAX);
+}

@@ -565,6 +565,7 @@ pub fn variant_key(
         previous_stage_stores,
         workgroup_size: [0; 3],
         shared_memory_size: 0,
+        local_memory_size: 0,
         emulation,
         texture_swizzles,
     }
