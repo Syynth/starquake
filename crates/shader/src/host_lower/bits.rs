@@ -97,6 +97,7 @@ pub(crate) const F64_CANONICAL_NAN_HIGH: u32 = 0x7fff_ffff;
 /// The interpreter's canonical binary64 NaN's low word.
 pub(crate) const F64_CANONICAL_NAN_LOW: u32 = 0xffff_ffff;
 /// The interpreter's canonical binary64 NaN.
+#[cfg(test)]
 pub(crate) const F64_CANONICAL_NAN: u64 =
     (F64_CANONICAL_NAN_HIGH as u64) << 32 | F64_CANONICAL_NAN_LOW as u64;
 /// A binary64 infinity's high word magnitude bits.
