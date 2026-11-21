@@ -35,24 +35,30 @@ fn every_narrowed_opcode_is_mapped_or_refused() {
                 Rewrite::Rename(Opcode::Identity) => {
                     assert!(names, "{opcode}");
                     let [arg] = opcode.args() else {
-                        panic!("{opcode} has one argument");
+                        unreachable!("{opcode} has one argument");
                     };
-                    assert_eq!(narrowed(pass, opcode.result()), narrowed(pass, *arg), "{opcode}");
+                    assert_eq!(
+                        narrowed(pass, opcode.result()),
+                        narrowed(pass, *arg),
+                        "{opcode}"
+                    );
                     assert_ne!(opcode.result(), *arg, "{opcode} converts");
                 }
                 Rewrite::Rename(renamed) => {
                     assert!(names, "{opcode}");
                     assert!(!pass.names_narrowed_type(renamed), "{opcode} -> {renamed}");
-                    assert_eq!(narrowed(pass, opcode.result()), renamed.result(), "{opcode}");
+                    assert_eq!(
+                        narrowed(pass, opcode.result()),
+                        renamed.result(),
+                        "{opcode}"
+                    );
                     let args: Vec<Type> =
                         opcode.args().iter().map(|&ty| narrowed(pass, ty)).collect();
                     assert_eq!(args, renamed.args(), "{opcode} -> {renamed}");
                 }
                 Rewrite::Expand(_) => {
-                    let half_packing = matches!(
-                        opcode,
-                        Opcode::PackHalf2x16 | Opcode::UnpackHalf2x16
-                    );
+                    let half_packing =
+                        matches!(opcode, Opcode::PackHalf2x16 | Opcode::UnpackHalf2x16);
                     assert!(
                         names || (pass == HostPass::Fp16ToFp32 && half_packing),
                         "{opcode}"
@@ -78,9 +84,18 @@ const F64_RENAMES: [(Opcode, Opcode); 53] = [
     (Opcode::FPSaturate64, Opcode::FPSaturate32),
     (Opcode::FPClamp64, Opcode::FPClamp32),
     (Opcode::FPTrunc64, Opcode::FPTrunc32),
-    (Opcode::CompositeConstructF64x2, Opcode::CompositeConstructF32x2),
-    (Opcode::CompositeConstructF64x3, Opcode::CompositeConstructF32x3),
-    (Opcode::CompositeConstructF64x4, Opcode::CompositeConstructF32x4),
+    (
+        Opcode::CompositeConstructF64x2,
+        Opcode::CompositeConstructF32x2,
+    ),
+    (
+        Opcode::CompositeConstructF64x3,
+        Opcode::CompositeConstructF32x3,
+    ),
+    (
+        Opcode::CompositeConstructF64x4,
+        Opcode::CompositeConstructF32x4,
+    ),
     (Opcode::CompositeExtractF64x2, Opcode::CompositeExtractF32x2),
     (Opcode::CompositeExtractF64x3, Opcode::CompositeExtractF32x3),
     (Opcode::CompositeExtractF64x4, Opcode::CompositeExtractF32x4),
@@ -96,9 +111,18 @@ const F64_RENAMES: [(Opcode, Opcode); 53] = [
     (Opcode::FPOrdGreaterThan64, Opcode::FPOrdGreaterThan32),
     (Opcode::FPUnordGreaterThan64, Opcode::FPUnordGreaterThan32),
     (Opcode::FPOrdLessThanEqual64, Opcode::FPOrdLessThanEqual32),
-    (Opcode::FPUnordLessThanEqual64, Opcode::FPUnordLessThanEqual32),
-    (Opcode::FPOrdGreaterThanEqual64, Opcode::FPOrdGreaterThanEqual32),
-    (Opcode::FPUnordGreaterThanEqual64, Opcode::FPUnordGreaterThanEqual32),
+    (
+        Opcode::FPUnordLessThanEqual64,
+        Opcode::FPUnordLessThanEqual32,
+    ),
+    (
+        Opcode::FPOrdGreaterThanEqual64,
+        Opcode::FPOrdGreaterThanEqual32,
+    ),
+    (
+        Opcode::FPUnordGreaterThanEqual64,
+        Opcode::FPUnordGreaterThanEqual32,
+    ),
     (Opcode::FPIsNan64, Opcode::FPIsNan32),
     (Opcode::ConvertS16F64, Opcode::ConvertS16F32),
     (Opcode::ConvertS32F64, Opcode::ConvertS32F32),
@@ -150,9 +174,18 @@ const F16_RENAMES: [(Opcode, Opcode); 55] = [
     (Opcode::FPSaturate16, Opcode::FPSaturate32),
     (Opcode::FPClamp16, Opcode::FPClamp32),
     (Opcode::FPTrunc16, Opcode::FPTrunc32),
-    (Opcode::CompositeConstructF16x2, Opcode::CompositeConstructF32x2),
-    (Opcode::CompositeConstructF16x3, Opcode::CompositeConstructF32x3),
-    (Opcode::CompositeConstructF16x4, Opcode::CompositeConstructF32x4),
+    (
+        Opcode::CompositeConstructF16x2,
+        Opcode::CompositeConstructF32x2,
+    ),
+    (
+        Opcode::CompositeConstructF16x3,
+        Opcode::CompositeConstructF32x3,
+    ),
+    (
+        Opcode::CompositeConstructF16x4,
+        Opcode::CompositeConstructF32x4,
+    ),
     (Opcode::CompositeExtractF16x2, Opcode::CompositeExtractF32x2),
     (Opcode::CompositeExtractF16x3, Opcode::CompositeExtractF32x3),
     (Opcode::CompositeExtractF16x4, Opcode::CompositeExtractF32x4),
@@ -168,9 +201,18 @@ const F16_RENAMES: [(Opcode, Opcode); 55] = [
     (Opcode::FPOrdGreaterThan16, Opcode::FPOrdGreaterThan32),
     (Opcode::FPUnordGreaterThan16, Opcode::FPUnordGreaterThan32),
     (Opcode::FPOrdLessThanEqual16, Opcode::FPOrdLessThanEqual32),
-    (Opcode::FPUnordLessThanEqual16, Opcode::FPUnordLessThanEqual32),
-    (Opcode::FPOrdGreaterThanEqual16, Opcode::FPOrdGreaterThanEqual32),
-    (Opcode::FPUnordGreaterThanEqual16, Opcode::FPUnordGreaterThanEqual32),
+    (
+        Opcode::FPUnordLessThanEqual16,
+        Opcode::FPUnordLessThanEqual32,
+    ),
+    (
+        Opcode::FPOrdGreaterThanEqual16,
+        Opcode::FPOrdGreaterThanEqual32,
+    ),
+    (
+        Opcode::FPUnordGreaterThanEqual16,
+        Opcode::FPUnordGreaterThanEqual32,
+    ),
     (Opcode::FPIsNan16, Opcode::FPIsNan32),
     (Opcode::ConvertS16F16, Opcode::ConvertS16F32),
     (Opcode::ConvertS32F16, Opcode::ConvertS32F32),
@@ -208,11 +250,18 @@ const F16_EXPANSIONS: [(Opcode, Expansion); 4] = [
     (Opcode::UnpackHalf2x16, Expansion::UnpackHalves),
 ];
 
+/// One pass's literal table: its renamings and its written-out operations.
+type Table = (
+    HostPass,
+    Vec<(Opcode, Opcode)>,
+    &'static [(Opcode, Expansion)],
+);
+
 /// Each pass's table is exactly the literal rows above, from Eden's source: every listed row
 /// maps as written, and no other opcode is renamed or written out.
 #[test]
 fn mappings_match_the_reference_literals() {
-    let cases: [(HostPass, Vec<(Opcode, Opcode)>, &[(Opcode, Expansion)]); 2] = [
+    let cases: [Table; 2] = [
         (
             HostPass::Fp64ToFp32,
             F64_RENAMES.iter().copied().chain([F64_SELECT]).collect(),
@@ -229,7 +278,11 @@ fn mappings_match_the_reference_literals() {
             assert_eq!(pass.rewrite(from), Rewrite::Rename(to), "{pass}: {from}");
         }
         for &(from, expansion) in expansions {
-            assert_eq!(pass.rewrite(from), Rewrite::Expand(expansion), "{pass}: {from}");
+            assert_eq!(
+                pass.rewrite(from),
+                Rewrite::Expand(expansion),
+                "{pass}: {from}"
+            );
         }
         let mapped = Opcode::ALL
             .iter()

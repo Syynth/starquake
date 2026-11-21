@@ -575,10 +575,8 @@ fn rewrite_block(
                 order.push(value);
                 continue;
             };
-            let result = expansion.emit(
-                &mut Emitter::new(Builder::new(function, block), work),
-                arg,
-            )?;
+            let result =
+                expansion.emit(&mut Emitter::new(Builder::new(function, block), work), arg)?;
             let written = function
                 .block_mut(block)
                 .map(|b| b.insts.split_off(base))

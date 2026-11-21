@@ -86,7 +86,8 @@ impl Writer<'_> {
         Operand::Value(
             self.b
                 .op(opcode, args)
-                .unwrap_or_else(|error| panic!("{opcode}: {error}")),
+                .map_err(|error| format!("{opcode}: {error}"))
+                .expect("builds"),
         )
     }
 
@@ -101,7 +102,10 @@ impl Writer<'_> {
     fn out(&mut self, words: u8) -> u8 {
         let at = self.next_out;
         self.next_out = self.next_out.checked_add(words).expect("output registers");
-        assert!(usize::from(self.next_out) < REG_SLOTS - 1, "too many outputs");
+        assert!(
+            usize::from(self.next_out) < REG_SLOTS - 1,
+            "too many outputs"
+        );
         at
     }
 
@@ -120,7 +124,10 @@ impl Writer<'_> {
             Type::F16 => {
                 let word = self.get(at(HALF_BANK));
                 let pair = self.op(Opcode::UnpackFloat2x16, &[word]);
-                self.op(Opcode::CompositeExtractF16x2, &[pair, u32_imm(u32::from(pick & 1))])
+                self.op(
+                    Opcode::CompositeExtractF16x2,
+                    &[pair, u32_imm(u32::from(pick & 1))],
+                )
             }
             Type::U32 => self.get(at(INT_BANK)),
             Type::U64 => {
@@ -139,7 +146,7 @@ impl Writer<'_> {
             Type::F32x2 | Type::F16x2 | Type::F64x2 => self.vector(ty, 2, pick),
             Type::F32x3 | Type::F16x3 | Type::F64x3 => self.vector(ty, 3, pick),
             Type::F32x4 | Type::F16x4 | Type::F64x4 => self.vector(ty, 4, pick),
-            other => panic!("no input of type {other}"),
+            other => unreachable!("no input of type {other}"),
         }
     }
 
@@ -217,7 +224,7 @@ impl Writer<'_> {
             Type::F32x2 | Type::F16x2 | Type::F64x2 => self.split(opcode, ty, 2, value),
             Type::F32x3 | Type::F16x3 | Type::F64x3 => self.split(opcode, ty, 3, value),
             Type::F32x4 | Type::F16x4 | Type::F64x4 => self.split(opcode, ty, 4, value),
-            other => panic!("no output of type {other}"),
+            other => unreachable!("no output of type {other}"),
         }
     }
 
@@ -268,7 +275,7 @@ fn vector_ops(ty: Type) -> (Type, Opcode) {
         Type::F64x2 => (Type::F64, Opcode::CompositeConstructF64x2),
         Type::F64x3 => (Type::F64, Opcode::CompositeConstructF64x3),
         Type::F64x4 => (Type::F64, Opcode::CompositeConstructF64x4),
-        other => panic!("{other} is not a float vector"),
+        other => unreachable!("{other} is not a float vector"),
     }
 }
 
@@ -283,7 +290,7 @@ fn extract_op(ty: Type) -> Opcode {
         Type::F64x2 => Opcode::CompositeExtractF64x2,
         Type::F64x3 => Opcode::CompositeExtractF64x3,
         Type::F64x4 => Opcode::CompositeExtractF64x4,
-        other => panic!("{other} is not a float vector"),
+        other => unreachable!("{other} is not a float vector"),
     }
 }
 
@@ -349,14 +356,17 @@ fn ran(function: &Function, machine: &Machine) -> Machine {
     let mut machine = machine.clone();
     machine
         .run(function)
-        .unwrap_or_else(|error| panic!("{error}\n{function}"));
+        .map_err(|error| format!("{error}\n{function}"))
+        .expect("runs");
     machine
 }
 
 /// `function` after `pass`, which must succeed.
 fn passed(function: &Function, pass: HostPass) -> Function {
     let mut function = function.clone();
-    run(&mut function, pass).unwrap_or_else(|error| panic!("{error}\n{function}"));
+    run(&mut function, pass)
+        .map_err(|error| format!("{error}\n{function}"))
+        .expect("the pass runs");
     function
 }
 
@@ -395,15 +405,48 @@ fn pair(machine: &Machine, lo: u8) -> u64 {
 
 /// Puts `bits` in the register pair at `lo`.
 fn set_pair(machine: &mut Machine, lo: u8, bits: u64) {
-    machine.regs[usize::from(lo)] = bits as u32;
-    machine.regs[usize::from(lo) + 1] = (bits >> 32) as u32;
+    let (low, high) = words(bits);
+    machine.regs[usize::from(lo)] = low;
+    machine.regs[usize::from(lo) + 1] = high;
+}
+
+/// The low and high words of `bits`.
+fn words(bits: u64) -> (u32, u32) {
+    let b = bits.to_le_bytes();
+    (
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+        u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+    )
+}
+
+/// The low and high halves of `word`.
+fn halves_of(word: u32) -> (u16, u16) {
+    let b = word.to_le_bytes();
+    (
+        u16::from_le_bytes([b[0], b[1]]),
+        u16::from_le_bytes([b[2], b[3]]),
+    )
+}
+
+/// Rust's own `f64` to `f32` conversion: IEEE 754 round to nearest even, the independent
+/// reference the narrowing is checked against.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the cast is the IEEE 754 narrowing the tests compare with, not an accident"
+)]
+fn ieee_f32(x: f64) -> f32 {
+    x as f32
 }
 
 /// The distance in binary16 ulps between two halves that are not NaNs.
 fn half_ulps(a: u16, b: u16) -> u32 {
     let order = |h: u16| -> i32 {
         let magnitude = i32::from(h & 0x7fff);
-        if h & 0x8000 == 0 { magnitude } else { -magnitude }
+        if h & 0x8000 == 0 {
+            magnitude
+        } else {
+            -magnitude
+        }
     };
     order(a).abs_diff(order(b))
 }

@@ -73,16 +73,22 @@ fn a_16_bit_bit_cast_is_refused() {
             )
         );
         assert_eq!(function, original);
-        assert!(run(&mut function, HostPass::Fp64ToFp32).is_ok(), "{opcode}: no f64 here");
+        assert!(
+            run(&mut function, HostPass::Fp64ToFp32).is_ok(),
+            "{opcode}: no f64 here"
+        );
     }
 }
+
+/// A function appending a narrowed value.
+type Maker = fn(&mut Builder<'_>) -> Operand;
 
 /// A narrowed value in an `Opaque` slot of an operation other than `Identity` is refused with
 /// the slot and the type, directly and through an `Identity`; in `Identity`'s own slot it is
 /// accepted.
 #[test]
 fn a_narrowed_value_in_an_opaque_slot_is_refused() {
-    let cases: [(HostPass, fn(&mut Builder<'_>) -> Operand, Type); 2] = [
+    let cases: [(HostPass, Maker, Type); 2] = [
         (HostPass::Fp64ToFp32, double, Type::F64),
         (HostPass::Fp16ToFp32, half, Type::F16),
     ];
@@ -175,7 +181,10 @@ fn the_first_fault_in_walk_order_is_reported() {
                     opcode: Opcode::BitCastU16F16,
                 }
             };
-            assert_eq!(error, wanted, "slot first {slot_first}, one block {one_block}");
+            assert_eq!(
+                error, wanted,
+                "slot first {slot_first}, one block {one_block}"
+            );
         }
     }
 }
@@ -228,7 +237,10 @@ fn a_refused_function_is_unchanged() {
         f16: true,
         ..HostCaps::NONE
     };
-    assert!(lower_for_host(&mut function, f16_target).is_ok(), "f64 alone lowers");
+    assert!(
+        lower_for_host(&mut function, f16_target).is_ok(),
+        "f64 alone lowers"
+    );
 }
 
 /// A malformed function is refused before anything is scanned, with the verifier's error.
@@ -238,14 +250,14 @@ fn a_malformed_function_is_refused() {
     let error = function.verify().expect_err("an unterminated block");
     assert_eq!(
         run(&mut function.clone(), HostPass::Fp64ToFp32),
-        Err(HostLowerError::Verify(error.clone()))
+        Err(HostLowerError::Verify(error))
     );
     assert_eq!(
         lower_for_host(&mut function, HostCaps::NONE),
-        Err(HostLowerError::Verify(error.clone()))
+        Err(HostLowerError::Verify(error))
     );
     assert_eq!(
-        HostLowerError::Verify(error.clone()).to_string(),
+        HostLowerError::Verify(error).to_string(),
         format!("the IR is malformed: {error}")
     );
 }

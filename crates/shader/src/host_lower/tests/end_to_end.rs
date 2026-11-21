@@ -9,8 +9,8 @@ use crate::asm::assemble;
 use crate::cache::{CodeForm, HostTarget, ShaderInput};
 use crate::capture::capture;
 use crate::decode::{
-    AluSrc, Gpr, HalfSrc, Instr, Instruction, MemAddr, MemSpace, MemType, Op, OpDAdd, OpExit,
-    OpHAdd2, OpLd, OpSt, OpVote, OffsetStride, Pred, PredSrc, RoundMode, UniformAddr, UniformReg,
+    AluSrc, Gpr, HalfSrc, Instr, Instruction, MemAddr, MemSpace, MemType, OffsetStride, Op, OpDAdd,
+    OpExit, OpHAdd2, OpLd, OpSt, OpVote, Pred, PredSrc, RoundMode, UniformAddr, UniformReg,
     VoteDst, VoteOp,
 };
 use crate::exchange::Answers;
@@ -164,10 +164,7 @@ fn target(caps: HostCaps) -> HostTarget {
 }
 
 /// The production translator's shader for the compute program `code` on a target with `caps`.
-fn translated(
-    code: &[Instruction],
-    caps: HostCaps,
-) -> Result<crate::host::HostShader, Rejection> {
+fn translated(code: &[Instruction], caps: HostCaps) -> Result<crate::host::HostShader, Rejection> {
     let bytes: Vec<u8> = code.iter().flat_map(|word| word.to_le_bytes()).collect();
     let captured = capture(bytes.as_slice(), GuestStage::Compute).expect("captures");
     let entry = PipelineProgram::new(&captured).expect("an entry");
@@ -208,12 +205,14 @@ fn the_production_translator_lowers_a_double_program() {
     lower_for_host(&mut after, caps).expect("lowers for the host");
     assert_eq!(count(&after, Opcode::FPAdd64), 0);
     assert_eq!(count(&after, Opcode::FPAdd32), 1);
-    let mut machine = Machine::default();
-    machine.shared = [1.5_f64, -0.375]
-        .iter()
-        .flat_map(|x| x.to_bits().to_le_bytes())
-        .chain([0; 8])
-        .collect();
+    let machine = Machine {
+        shared: [1.5_f64, -0.375]
+            .iter()
+            .flat_map(|x| x.to_bits().to_le_bytes())
+            .chain([0; 8])
+            .collect(),
+        ..Machine::default()
+    };
     let read = |m: &Machine| f64::from_le_bytes(m.shared[16..24].try_into().expect("8 bytes"));
     let mut ran_before = machine.clone();
     ran_before.run(&before).expect("runs");
@@ -281,7 +280,9 @@ fn a_warp_program_needs_a_subgroup_size_of_32() {
     );
     assert_eq!(
         translated(&vote_program(), subgroups).err(),
-        Some(Rejection::Lower(LowerError::Missing(Feature::SubgroupSize32)))
+        Some(Rejection::Lower(LowerError::Missing(
+            Feature::SubgroupSize32
+        )))
     );
     let shader = translated(&vote_program(), both).expect("translates");
     assert_eq!(

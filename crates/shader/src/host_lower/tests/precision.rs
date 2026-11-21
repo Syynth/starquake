@@ -3,7 +3,7 @@
 
 use super::super::bits::{F16_CANONICAL_NAN, F64_CANONICAL_NAN};
 use super::super::{F16_FMA_TOLERANCE_ULPS, F64_RELATIVE_TOLERANCE, HostPass};
-use super::{half_ulps, pair, passed, ran, reg, set_pair};
+use super::{half_ulps, halves_of, pair, passed, ran, reg, set_pair};
 use crate::interp::Machine;
 use crate::ir::{
     Builder, Flags, FmzMode, FpControl, FpRounding, Function, Imm, Opcode, Operand, Terminator,
@@ -76,14 +76,21 @@ fn build(body: impl FnOnce(&mut B<'_>)) -> Function {
 
 /// The machines `function` leaves before and after `pass`, from `machine`.
 fn before_after(function: &Function, pass: HostPass, machine: &Machine) -> (Machine, Machine) {
-    (ran(function, machine), ran(&passed(function, pass), machine))
+    (
+        ran(function, machine),
+        ran(&passed(function, pass), machine),
+    )
 }
 
 /// A machine with the 64-bit floats `values` in register pairs 0, 2, 4, and so on.
 fn doubles(values: &[f64]) -> Machine {
     let mut machine = Machine::default();
     for (i, value) in values.iter().enumerate() {
-        set_pair(&mut machine, 2 * u8::try_from(i).expect("small"), value.to_bits());
+        set_pair(
+            &mut machine,
+            2 * u8::try_from(i).expect("small"),
+            value.to_bits(),
+        );
     }
     machine
 }
@@ -102,7 +109,7 @@ fn double_at(machine: &Machine, lo: u8) -> f64 {
 }
 
 fn half_at(machine: &Machine, at: usize) -> u16 {
-    machine.regs[at] as u16
+    halves_of(machine.regs[at]).0
 }
 
 /// `FPNeg64` of `1 + 2^-30`, exact on its operand, gives `-1` after the pass: the operand was
@@ -282,18 +289,19 @@ fn f64_to_f32_conversion_modes_are_lost() {
 #[test]
 fn f16_intermediates_keep_binary32_precision_and_range() {
     let function = build(|b| {
-        let (a, c, big, h, k, n) = (b.half(0), b.half(1), b.half(2), b.half(3), b.half(4), b.half(5));
-        let square = b.op(Opcode::FPMul16, &[a, a]);
-        let neg_c = b.op(Opcode::FPNeg16, &[c]);
-        let difference = b.op(Opcode::FPAdd16, &[square, neg_c]);
+        let (near_one, sum, big, half) = (b.half(0), b.half(1), b.half(2), b.half(3));
+        let (just_under, factor) = (b.half(4), b.half(5));
+        let square = b.op(Opcode::FPMul16, &[near_one, near_one]);
+        let neg_sum = b.op(Opcode::FPNeg16, &[sum]);
+        let difference = b.op(Opcode::FPAdd16, &[square, neg_sum]);
         b.put_half(10, difference);
         let wide = b.op(Opcode::FPMul16, &[big, big]);
-        let halved = b.op(Opcode::FPMul16, &[wide, h]);
+        let halved = b.op(Opcode::FPMul16, &[wide, half]);
         b.put_half(11, halved);
-        let equal = b.op(Opcode::FPOrdEqual16, &[square, c]);
+        let equal = b.op(Opcode::FPOrdEqual16, &[square, sum]);
         let word = b.op(Opcode::SelectU32, &[equal, imm(1), imm(0)]);
         b.set(12, word);
-        let product = b.op(Opcode::FPMul16, &[k, n]);
+        let product = b.op(Opcode::FPMul16, &[just_under, factor]);
         let int = b.op(Opcode::ConvertS32F16, &[product]);
         b.set(13, int);
     });

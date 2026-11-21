@@ -157,11 +157,9 @@ pub(crate) const UNPACK_HALF_OPS: u64 = 25;
 /// model the pass uses for 64-bit float immediates.
 #[must_use]
 pub(crate) const fn narrow_f64(bits: u64) -> u32 {
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "the low and high words of a 64-bit value"
-    )]
-    let (lo, hi) = (bits as u32, (bits >> 32) as u32);
+    let b = bits.to_le_bytes();
+    let lo = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    let hi = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
     let exponent = (hi >> F64_EXPONENT_SHIFT) & F64_EXPONENT_MAX;
     let sign = hi & SIGN_BIT;
     let high_mantissa = hi & F64_HIGH_MANTISSA_MASK;
@@ -234,10 +232,7 @@ impl<'f, 'w> Emitter<'f, 'w> {
         let rebiased = self.bin(O::ISub32, exponent, imm(F64_TO_F32_BIAS))?;
         let placed = self.bin(O::ShiftLeftLogical32, rebiased, imm(F32_EXPONENT_SHIFT))?;
         let body = self.bin(O::BitwiseOr32, placed, mantissa)?;
-        let round = self.op(
-            O::BitFieldUExtract,
-            &[lo, imm(F64_LOW_ROUND_BIT), imm(1)],
-        )?;
+        let round = self.op(O::BitFieldUExtract, &[lo, imm(F64_LOW_ROUND_BIT), imm(1)])?;
         let sticky_bits = self.bin(O::BitwiseAnd32, lo, imm(F64_LOW_STICKY_MASK))?;
         let sticky = self.bin(O::INotEqual, sticky_bits, imm(0))?;
         let odd = self.bin(O::BitwiseAnd32, body, imm(1))?;
@@ -345,11 +340,7 @@ impl<'f, 'w> Emitter<'f, 'w> {
             exponent,
             imm(F16_OVERFLOW_F32_EXPONENT),
         )?;
-        let small = self.bin(
-            O::ULessThan,
-            exponent,
-            imm(F16_NORMAL_MIN_F32_EXPONENT),
-        )?;
+        let small = self.bin(O::ULessThan, exponent, imm(F16_NORMAL_MIN_F32_EXPONENT))?;
         let half = self.select(small, subnormal, normal)?;
         let half = self.select(big, imm(F16_INFINITY), half)?;
         let signed = self.bin(O::BitwiseOr32, sign, half)?;

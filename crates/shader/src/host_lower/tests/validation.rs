@@ -57,8 +57,13 @@ fn lowered_modules_validate_without_f16_or_f64() {
                 );
                 continue;
             }
-            let shader = result.unwrap_or_else(|error| panic!("{opcode}: {error}\n{function}"));
-            assert!(!shader.requirements.f16 && !shader.requirements.f64, "{opcode}");
+            let shader = result
+                .map_err(|error| format!("{opcode}: {error}\n{function}"))
+                .expect("lowers");
+            assert!(
+                !shader.requirements.f16 && !shader.requirements.f64,
+                "{opcode}"
+            );
             let caps = capabilities(shader.requirements);
             assert!(
                 !caps.intersects(
@@ -71,7 +76,8 @@ fn lowered_modules_validate_without_f16_or_f64() {
             let HostCode::Naga { module, .. } = &shader.code;
             Validator::new(validation_flags(), caps)
                 .validate(module)
-                .unwrap_or_else(|error| panic!("{opcode}: {error:?}"));
+                .map_err(|error| format!("{opcode}: {error:?}"))
+                .expect("validates");
         }
     }
 }

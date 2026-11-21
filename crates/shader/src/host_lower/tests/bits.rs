@@ -7,10 +7,9 @@ use proptest::collection::vec;
 use proptest::prelude::*;
 
 use super::super::bits::{
-    Emitter, F16_CANONICAL_NAN, F32_CANONICAL_NAN, F64_CANONICAL_NAN, F64_TO_F32_BIAS,
-    narrow_f64,
+    Emitter, F16_CANONICAL_NAN, F32_CANONICAL_NAN, F64_CANONICAL_NAN, F64_TO_F32_BIAS, narrow_f64,
 };
-use super::{pair, reg, set_pair, u32_imm};
+use super::{ieee_f32, pair, reg, set_pair, u32_imm, words};
 use crate::interp::Machine;
 use crate::ir::{Builder, Function, Opcode, Operand, Terminator};
 use crate::opt::Work;
@@ -41,7 +40,8 @@ enum Conversion {
 fn op(emitter: &mut Emitter<'_, '_>, opcode: Opcode, args: &[Operand]) -> Operand {
     emitter
         .op(opcode, args)
-        .unwrap_or_else(|error| panic!("{opcode}: {error}"))
+        .map_err(|error| format!("{opcode}: {error}"))
+        .expect("builds")
 }
 
 fn small(i: usize) -> u8 {
@@ -54,41 +54,41 @@ fn batch(conversion: Conversion) -> Function {
     let entry = function.entry();
     let mut work = Work::default();
     {
-        let mut e = Emitter::new(Builder::new(&mut function, entry), &mut work);
+        let mut em = Emitter::new(Builder::new(&mut function, entry), &mut work);
         for i in 0..BATCH {
             let i = small(i);
             match conversion {
                 Conversion::Narrow => {
-                    let lo = op(&mut e, Opcode::GetRegister, &[reg(2 * i)]);
-                    let hi = op(&mut e, Opcode::GetRegister, &[reg(2 * i + 1)]);
-                    let bits = e.narrow(lo, hi).expect("emits");
-                    op(&mut e, Opcode::SetRegister, &[reg(OUT + i), bits]);
+                    let lo = op(&mut em, Opcode::GetRegister, &[reg(2 * i)]);
+                    let hi = op(&mut em, Opcode::GetRegister, &[reg(2 * i + 1)]);
+                    let bits = em.narrow(lo, hi).expect("emits");
+                    op(&mut em, Opcode::SetRegister, &[reg(OUT + i), bits]);
                 }
                 Conversion::Widen => {
-                    let x = op(&mut e, Opcode::GetRegister, &[reg(i)]);
-                    let (lo, hi) = e.widen(x).expect("emits");
-                    op(&mut e, Opcode::SetRegister, &[reg(OUT + 2 * i), lo]);
-                    op(&mut e, Opcode::SetRegister, &[reg(OUT + 2 * i + 1), hi]);
+                    let x = op(&mut em, Opcode::GetRegister, &[reg(i)]);
+                    let (lo, hi) = em.widen(x).expect("emits");
+                    op(&mut em, Opcode::SetRegister, &[reg(OUT + 2 * i), lo]);
+                    op(&mut em, Opcode::SetRegister, &[reg(OUT + 2 * i + 1), hi]);
                 }
                 Conversion::PackHalf => {
-                    let x = op(&mut e, Opcode::GetRegister, &[reg(i)]);
-                    let half = e.pack_half(x).expect("emits");
-                    op(&mut e, Opcode::SetRegister, &[reg(OUT + i), half]);
-                    let f = op(&mut e, Opcode::BitCastF32U32, &[x]);
-                    let v = op(&mut e, Opcode::CompositeConstructF32x2, &[f, f]);
-                    let word = op(&mut e, Opcode::PackHalf2x16, &[v]);
-                    let low = op(&mut e, Opcode::BitwiseAnd32, &[word, u32_imm(0xffff)]);
-                    op(&mut e, Opcode::SetRegister, &[reg(OUT + THEIRS + i), low]);
+                    let x = op(&mut em, Opcode::GetRegister, &[reg(i)]);
+                    let half = em.pack_half(x).expect("emits");
+                    op(&mut em, Opcode::SetRegister, &[reg(OUT + i), half]);
+                    let single = op(&mut em, Opcode::BitCastF32U32, &[x]);
+                    let both = op(&mut em, Opcode::CompositeConstructF32x2, &[single, single]);
+                    let packed = op(&mut em, Opcode::PackHalf2x16, &[both]);
+                    let low = op(&mut em, Opcode::BitwiseAnd32, &[packed, u32_imm(0xffff)]);
+                    op(&mut em, Opcode::SetRegister, &[reg(OUT + THEIRS + i), low]);
                 }
                 Conversion::UnpackHalf => {
-                    let x = op(&mut e, Opcode::GetRegister, &[reg(i)]);
-                    let low = op(&mut e, Opcode::BitwiseAnd32, &[x, u32_imm(0xffff)]);
-                    let single = e.unpack_half(low).expect("emits");
-                    op(&mut e, Opcode::SetRegister, &[reg(OUT + i), single]);
-                    let v = op(&mut e, Opcode::UnpackHalf2x16, &[x]);
-                    let c = op(&mut e, Opcode::CompositeExtractF32x2, &[v, u32_imm(0)]);
-                    let bits = op(&mut e, Opcode::BitCastU32F32, &[c]);
-                    op(&mut e, Opcode::SetRegister, &[reg(OUT + THEIRS + i), bits]);
+                    let x = op(&mut em, Opcode::GetRegister, &[reg(i)]);
+                    let low = op(&mut em, Opcode::BitwiseAnd32, &[x, u32_imm(0xffff)]);
+                    let single = em.unpack_half(low).expect("emits");
+                    op(&mut em, Opcode::SetRegister, &[reg(OUT + i), single]);
+                    let both = op(&mut em, Opcode::UnpackHalf2x16, &[x]);
+                    let lane = op(&mut em, Opcode::CompositeExtractF32x2, &[both, u32_imm(0)]);
+                    let bits = op(&mut em, Opcode::BitCastU32F32, &[lane]);
+                    op(&mut em, Opcode::SetRegister, &[reg(OUT + THEIRS + i), bits]);
                 }
             }
         }
@@ -111,7 +111,7 @@ fn convert(conversion: Conversion, inputs: &[u64]) -> Vec<(u64, u64)> {
             let i = small(i);
             match conversion {
                 Conversion::Narrow => set_pair(&mut machine, 2 * i, input),
-                _ => machine.regs[usize::from(i)] = input as u32,
+                _ => machine.regs[usize::from(i)] = words(input).0,
             }
         }
         machine.run(&function).expect("runs");
@@ -134,7 +134,7 @@ fn convert(conversion: Conversion, inputs: &[u64]) -> Vec<(u64, u64)> {
 }
 
 fn narrowed(bits: u64) -> u32 {
-    convert(Conversion::Narrow, &[bits])[0].0 as u32
+    words(convert(Conversion::Narrow, &[bits])[0].0).0
 }
 
 fn widened(bits: u32) -> u64 {
@@ -145,11 +145,15 @@ fn widened(bits: u32) -> u64 {
 /// divergence: the exponent field plus `F64ToF32Exp = +1023 - 127`, and the top 23 mantissa
 /// bits kept.
 fn eden_narrow(bits: u64) -> u32 {
-    let (lo, hi) = (bits as u32, (bits >> 32) as u32);
+    let (lo, hi) = words(bits);
     let sign = hi >> 31;
     let exp = (hi >> 20) & 0x7ff;
     let mantissa = ((hi & 0xf_ffff) << 3) | (lo >> 29);
-    let exp_if_subnorm = if exp == 0 { 0 } else { exp.wrapping_add(1023 - 127) };
+    let exp_if_subnorm = if exp == 0 {
+        0
+    } else {
+        exp.wrapping_add(1023 - 127)
+    };
     let exp_if_infnan = if exp == 0x7ff { 0xff } else { exp_if_subnorm };
     (sign << 31) | (exp_if_infnan.wrapping_shl(23) | mantissa)
 }
@@ -178,7 +182,7 @@ fn narrow_edges() -> Vec<u64> {
         (1.0 + 3.0 * 2.0_f64.powi(-24)).to_bits(),
         (1.0 + 2.0_f64.powi(-24) + 2.0_f64.powi(-50)).to_bits(),
     ];
-    edges.extend([max_tie, -max_tie].map(|x| x.to_bits()));
+    edges.extend([max_tie, -max_tie].map(f64::to_bits));
     edges.extend([max_tie.next_down(), max_tie.next_up()].map(f64::to_bits));
     edges
 }
@@ -198,7 +202,11 @@ fn narrow_model_matches_the_emitted_operations_on_the_edges() {
     for (&input, (ours, _)) in edges.iter().zip(convert(Conversion::Narrow, &edges)) {
         assert_eq!(ours, u64::from(narrow_f64(input)), "{input:#x}");
         if ieee_range(input) {
-            assert_eq!(narrow_f64(input), (f64::from_bits(input) as f32).to_bits(), "{input:#x}");
+            assert_eq!(
+                narrow_f64(input),
+                ieee_f32(f64::from_bits(input)).to_bits(),
+                "{input:#x}"
+            );
         }
     }
 }
@@ -209,7 +217,7 @@ fn narrow_model_matches_the_emitted_operations_on_the_edges() {
 #[test]
 fn narrowing_rebiases_the_exponent_the_right_way() {
     for x in [1.0_f64, 2.0, 0.5, -3.0] {
-        assert_eq!(narrowed(x.to_bits()), (x as f32).to_bits(), "{x}");
+        assert_eq!(narrowed(x.to_bits()), ieee_f32(x).to_bits(), "{x}");
     }
     assert_eq!(eden_narrow(1.0_f64.to_bits()), (-1.0_f32).to_bits());
     assert_eq!(F64_TO_F32_BIAS, 896);
@@ -249,7 +257,10 @@ fn narrowing_saturates_and_flushes() {
     assert_eq!(narrowed(smallest.to_bits()), f32::MIN_POSITIVE.to_bits());
     assert_eq!(narrowed(smallest.next_down().to_bits()), 0);
     assert_eq!(narrowed((-smallest / 2.0).to_bits()), (-0.0_f32).to_bits());
-    assert_ne!((smallest / 2.0) as f32, 0.0, "IEEE 754 makes a subnormal");
+    assert!(
+        ieee_f32(smallest / 2.0).is_subnormal(),
+        "IEEE 754 makes a subnormal"
+    );
 }
 
 /// A binary32 subnormal widens to a zero of its sign (Eden's widening keeps its mantissa under
@@ -259,7 +270,10 @@ fn narrowing_saturates_and_flushes() {
 fn widening_flushes_subnormals() {
     assert_eq!(widened(1), 0);
     assert_eq!(widened(0x8040_0000), 1 << 63);
-    assert_eq!(widened(f32::MIN_POSITIVE.to_bits()), f64::from(f32::MIN_POSITIVE).to_bits());
+    assert_eq!(
+        widened(f32::MIN_POSITIVE.to_bits()),
+        f64::from(f32::MIN_POSITIVE).to_bits()
+    );
 }
 
 /// Every NaN becomes the canonical NaN: a binary64 NaN whose payload is only in the bits the
@@ -297,8 +311,9 @@ fn pack_input() -> BoxedStrategy<u32> {
             let step = 2.0_f32.powi(-11) * wide.abs().max(2.0_f32.powi(-14));
             (wide + step).to_bits().wrapping_add_signed(nudge)
         }),
-        (any::<bool>(), 90_u32..=115, 0_u32..(1 << 23))
-            .prop_map(|(sign, exponent, mantissa)| u32::from(sign) << 31 | exponent << 23 | mantissa),
+        (any::<bool>(), 90_u32..=115, 0_u32..(1 << 23)).prop_map(|(sign, exponent, mantissa)| {
+            u32::from(sign) << 31 | exponent << 23 | mantissa
+        }),
     ]
     .boxed()
 }
@@ -319,10 +334,22 @@ fn convert_half(half: u16) -> u32 {
 /// subnormal and the ties around it, infinities and NaNs.
 fn pack_edges() -> Vec<u64> {
     [
-        0.0_f32, -0.0, 65504.0, 65519.996, 65520.0, -65520.0, 2.0_f32.powi(-24),
-        2.0_f32.powi(-25), 2.0_f32.powi(-25) * 1.000_001, 3.0 * 2.0_f32.powi(-25),
-        2.0_f32.powi(-14), 2.0_f32.powi(-14) * (1.0 - 2.0_f32.powi(-12)), f32::INFINITY,
-        f32::NEG_INFINITY, f32::MIN_POSITIVE, 1.0,
+        0.0_f32,
+        -0.0,
+        65504.0,
+        65519.996,
+        65520.0,
+        -65520.0,
+        2.0_f32.powi(-24),
+        2.0_f32.powi(-25),
+        2.0_f32.powi(-25) * 1.000_001,
+        3.0 * 2.0_f32.powi(-25),
+        2.0_f32.powi(-14),
+        2.0_f32.powi(-14) * (1.0 - 2.0_f32.powi(-12)),
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::MIN_POSITIVE,
+        1.0,
     ]
     .iter()
     .map(|x| u64::from(x.to_bits()))
@@ -352,7 +379,7 @@ proptest! {
         for (&input, (ours, _)) in inputs.iter().zip(convert(Conversion::Narrow, &inputs)) {
             prop_assert_eq!(ours, u64::from(narrow_f64(input)));
             if ieee_range(input) {
-                prop_assert_eq!(narrow_f64(input), (f64::from_bits(input) as f32).to_bits());
+                prop_assert_eq!(narrow_f64(input), ieee_f32(f64::from_bits(input)).to_bits());
             }
         }
     }

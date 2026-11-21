@@ -25,11 +25,17 @@ fn mixed() -> Function {
     let x = op(Opcode::PackDouble2x32, &[words]);
     let sum = op(Opcode::FPAdd64, &[x, x]);
     let out = op(Opcode::UnpackDouble2x32, &[sum]);
-    let low = op(Opcode::CompositeExtractU32x2, &[out, Operand::Imm(Imm::U32(0))]);
+    let low = op(
+        Opcode::CompositeExtractU32x2,
+        &[out, Operand::Imm(Imm::U32(0))],
+    );
     op(Opcode::SetRegister, &[reg(10), low]);
     let packed = op(Opcode::GetRegister, &[reg(2)]);
     let halves = op(Opcode::UnpackFloat2x16, &[packed]);
-    let h = op(Opcode::CompositeExtractF16x2, &[halves, Operand::Imm(Imm::U32(0))]);
+    let h = op(
+        Opcode::CompositeExtractF16x2,
+        &[halves, Operand::Imm(Imm::U32(0))],
+    );
     let hsum = op(Opcode::FPAdd16, &[h, h]);
     let pair = op(Opcode::CompositeConstructF16x2, &[hsum, hsum]);
     let word = op(Opcode::PackFloat2x16, &[pair]);
@@ -64,8 +70,16 @@ fn each_pass_runs_exactly_when_the_target_lacks_its_feature() {
         assert_eq!(applied.ran(HostPass::Fp16ToFp32), !caps.f16, "{caps:?}");
         assert_eq!(HostPass::Fp64ToFp32.needed(caps), !caps.f64, "{caps:?}");
         assert_eq!(HostPass::Fp16ToFp32.needed(caps), !caps.f16, "{caps:?}");
-        assert_eq!(count(&function, Opcode::FPAdd64), usize::from(caps.f64), "{caps:?}");
-        assert_eq!(count(&function, Opcode::FPAdd16), usize::from(caps.f16), "{caps:?}");
+        assert_eq!(
+            count(&function, Opcode::FPAdd64),
+            usize::from(caps.f64),
+            "{caps:?}"
+        );
+        assert_eq!(
+            count(&function, Opcode::FPAdd16),
+            usize::from(caps.f16),
+            "{caps:?}"
+        );
         assert_eq!(
             count(&function, Opcode::FPAdd32),
             usize::from(!caps.f64) + usize::from(!caps.f16),
@@ -96,9 +110,18 @@ fn a_target_with_both_features_is_untouched() {
 /// errors print them.
 #[test]
 fn the_passes_run_in_eden_s_order() {
-    assert_eq!(HostPass::ORDER, [HostPass::Fp64ToFp32, HostPass::Fp16ToFp32]);
-    assert_eq!(HostPass::Fp64ToFp32.to_string(), "the 64-bit float lowering");
-    assert_eq!(HostPass::Fp16ToFp32.to_string(), "the 16-bit float lowering");
+    assert_eq!(
+        HostPass::ORDER,
+        [HostPass::Fp64ToFp32, HostPass::Fp16ToFp32]
+    );
+    assert_eq!(
+        HostPass::Fp64ToFp32.to_string(),
+        "the 64-bit float lowering"
+    );
+    assert_eq!(
+        HostPass::Fp16ToFp32.to_string(),
+        "the 16-bit float lowering"
+    );
     assert_eq!(HostPass::Fp64ToFp32.feature(), "64-bit floats");
     assert_eq!(HostPass::Fp16ToFp32.feature(), "16-bit floats");
 }
@@ -159,7 +182,11 @@ fn phis_take_the_narrowed_type() {
         },
         |b, phi| {
             let words = value(b, Opcode::UnpackDouble2x32, &[phi]);
-            let hi = value(b, Opcode::CompositeExtractU32x2, &[words, Operand::Imm(Imm::U32(1))]);
+            let hi = value(
+                b,
+                Opcode::CompositeExtractU32x2,
+                &[words, Operand::Imm(Imm::U32(1))],
+            );
             value(b, Opcode::SetRegister, &[reg(10), hi]);
         },
     );
@@ -168,7 +195,11 @@ fn phis_take_the_narrowed_type() {
         |b, base| {
             let word = value(b, Opcode::GetRegister, &[reg(base)]);
             let halves = value(b, Opcode::UnpackFloat2x16, &[word]);
-            value(b, Opcode::CompositeExtractF16x2, &[halves, Operand::Imm(Imm::U32(1))])
+            value(
+                b,
+                Opcode::CompositeExtractF16x2,
+                &[halves, Operand::Imm(Imm::U32(1))],
+            )
         },
         |b, phi| {
             let pair = value(b, Opcode::CompositeConstructF16x2, &[phi, phi]);
@@ -232,10 +263,22 @@ fn f64_immediates_are_narrowed() {
     let phi = value_phi(&mut b, entry, imm);
     for (i, v) in [sum, same, phi].into_iter().enumerate() {
         let w = value(&mut b, Opcode::UnpackDouble2x32, &[v]);
-        let hi = value(&mut b, Opcode::CompositeExtractU32x2, &[w, Operand::Imm(Imm::U32(1))]);
-        value(&mut b, Opcode::SetRegister, &[reg(10 + u8::try_from(i).expect("small")), hi]);
+        let hi = value(
+            &mut b,
+            Opcode::CompositeExtractU32x2,
+            &[w, Operand::Imm(Imm::U32(1))],
+        );
+        value(
+            &mut b,
+            Opcode::SetRegister,
+            &[reg(10 + u8::try_from(i).expect("small")), hi],
+        );
     }
-    let hi = value(&mut b, Opcode::CompositeExtractU32x2, &[unpacked, Operand::Imm(Imm::U32(1))]);
+    let hi = value(
+        &mut b,
+        Opcode::CompositeExtractU32x2,
+        &[unpacked, Operand::Imm(Imm::U32(1))],
+    );
     value(&mut b, Opcode::SetRegister, &[reg(13), hi]);
     value(&mut b, Opcode::SetRegister, &[reg(14), kept]);
     b.terminate(Terminator::Return).expect("returns");
@@ -283,19 +326,26 @@ fn flags_follow_the_renamed_opcode() {
     let lo = value(&mut b, Opcode::GetRegister, &[reg(0)]);
     let words = value(&mut b, Opcode::CompositeConstructU32x2, &[lo, lo]);
     let x = value(&mut b, Opcode::PackDouble2x32, &[words]);
-    let add = b.op_with(Opcode::FPAdd64, &[x, x], control).expect("builds");
+    let add = b
+        .op_with(Opcode::FPAdd64, &[x, x], control)
+        .expect("builds");
     let abs = b.op(Opcode::FPAbs64, &[x]).expect("builds");
-    let narrow = b.op_with(Opcode::ConvertF32F64, &[x], control).expect("builds");
+    let narrow = b
+        .op_with(Opcode::ConvertF32F64, &[x], control)
+        .expect("builds");
     let address = value(&mut b, Opcode::PackUint2x32, &[words]);
     let halves = value(&mut b, Opcode::UnpackFloat2x16, &[lo]);
     let atomic = b
         .op_with(Opcode::GlobalAtomicAddF16x2, &[address, halves], control)
         .expect("builds");
     b.terminate(Terminator::Return).expect("returns");
-    let after = passed(&passed(&function, HostPass::Fp64ToFp32), HostPass::Fp16ToFp32);
+    let after = passed(
+        &passed(&function, HostPass::Fp64ToFp32),
+        HostPass::Fp16ToFp32,
+    );
     let op = |v| match after.inst(v) {
         Some(Inst::Op(op)) => (op.opcode, op.flags),
-        other => panic!("{other:?}"),
+        other => unreachable!("{other:?}"),
     };
     assert_eq!(op(add), (Opcode::FPAdd32, control));
     assert_eq!(op(abs), (Opcode::FPAbs32, Flags::None));
@@ -307,14 +357,47 @@ fn flags_follow_the_renamed_opcode() {
 /// literals: one `PackDouble2x32` adds 30 instructions to its function, and so on.
 #[test]
 fn written_out_conversions_have_fixed_sizes() {
-    assert_eq!((NARROW_OPS, WIDEN_OPS, PACK_HALF_OPS, UNPACK_HALF_OPS), (27, 20, 41, 25));
+    assert_eq!(
+        (NARROW_OPS, WIDEN_OPS, PACK_HALF_OPS, UNPACK_HALF_OPS),
+        (27, 20, 41, 25)
+    );
     let cases = [
-        (Opcode::PackDouble2x32, Expansion::PackDouble, 30, HostPass::Fp64ToFp32),
-        (Opcode::UnpackDouble2x32, Expansion::UnpackDouble, 22, HostPass::Fp64ToFp32),
-        (Opcode::BitCastF64U64, Expansion::DoubleFromBits, 31, HostPass::Fp64ToFp32),
-        (Opcode::BitCastU64F64, Expansion::BitsFromDouble, 23, HostPass::Fp64ToFp32),
-        (Opcode::PackHalf2x16, Expansion::PackHalves, 88, HostPass::Fp16ToFp32),
-        (Opcode::UnpackHalf2x16, Expansion::UnpackHalves, 55, HostPass::Fp16ToFp32),
+        (
+            Opcode::PackDouble2x32,
+            Expansion::PackDouble,
+            30,
+            HostPass::Fp64ToFp32,
+        ),
+        (
+            Opcode::UnpackDouble2x32,
+            Expansion::UnpackDouble,
+            22,
+            HostPass::Fp64ToFp32,
+        ),
+        (
+            Opcode::BitCastF64U64,
+            Expansion::DoubleFromBits,
+            31,
+            HostPass::Fp64ToFp32,
+        ),
+        (
+            Opcode::BitCastU64F64,
+            Expansion::BitsFromDouble,
+            23,
+            HostPass::Fp64ToFp32,
+        ),
+        (
+            Opcode::PackHalf2x16,
+            Expansion::PackHalves,
+            88,
+            HostPass::Fp16ToFp32,
+        ),
+        (
+            Opcode::UnpackHalf2x16,
+            Expansion::UnpackHalves,
+            55,
+            HostPass::Fp16ToFp32,
+        ),
     ];
     for (opcode, expansion, size, pass) in cases {
         assert_eq!(expansion.ops(), size, "{opcode}");
@@ -350,7 +433,11 @@ fn unreachable_blocks_are_rewritten() {
     let x = value(&mut b, Opcode::PackDouble2x32, &[words]);
     let neg = value(&mut b, Opcode::FPNeg64, &[x]);
     let out = value(&mut b, Opcode::UnpackDouble2x32, &[neg]);
-    let w = value(&mut b, Opcode::CompositeExtractU32x2, &[out, Operand::Imm(Imm::U32(0))]);
+    let w = value(
+        &mut b,
+        Opcode::CompositeExtractU32x2,
+        &[out, Operand::Imm(Imm::U32(0))],
+    );
     value(&mut b, Opcode::SetRegister, &[reg(20), w]);
     b.terminate(Terminator::Return).expect("returns");
     let after = passed(&function, HostPass::Fp64ToFp32);
