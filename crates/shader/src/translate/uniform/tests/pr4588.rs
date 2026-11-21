@@ -1,5 +1,6 @@
-//! PR #4588's cases for this group (`eden-pr4588/src/tests/video_core/native_shader.cpp` @
-//! e5fb3b97), rebuilt with the test assembler: the PR's words may come from games, so each
+//! PR #4588's cases whose titles name the uniform datapath
+//! (`eden-pr4588/src/tests/video_core/native_shader.cpp` @ e5fb3b97), rebuilt with the test
+//! assembler: the PR's words may come from games, so each
 //! case is the same instruction built as an [`Instr`] and the same expectations, with the PR's
 //! packed register numbers (`216 - (n / 16) * 16 + n % 16` for `URn`, bit `6 - n` of register
 //! 239 for `UPn`) read as the uniform registers and predicates they stand for. The PR's

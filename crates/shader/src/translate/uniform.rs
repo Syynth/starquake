@@ -77,10 +77,11 @@
 //!
 //! - **`R2UR`** (`Visitor::R2UR`, the lowering's `case 0x3c2`): the source register of the
 //!   lowest lane whose guard holds (a ballot of the guard, its lowest set bit, a shuffle from
-//!   that lane) into the uniform register, in every lane. The guard is read as data, a
-//!   predicate, as both references read it (`classify.h`: "reads the guard as data, so it is
-//!   not split into a block"; the lowering's `case 0x3c2` ballots `native_predicate`), so a
-//!   guarded `R2UR` is **not** a conditional block (see "Divergences"). When no active lane's
+//!   that lane) into the uniform register, in every lane while the ballot is not zero. The
+//!   guard is read as data, a predicate, as both references read it (`classify.h`: "reads the
+//!   guard as data, so it is not split into a block"; the lowering's `case 0x3c2` ballots
+//!   `native_predicate`), so a guarded `R2UR` is **not** a conditional block (see
+//!   "Divergences"). When no active lane's
 //!   guard holds (the ballot is zero), the uniform register keeps its old value, as the
 //!   lowering keeps it: its `VOTE.ANY` (`0x50d8`) sets `P6` to whether any lane's guard holds,
 //!   and its closing `SEL` (`0x5ca0` on `P6`) writes `P6 ? shuffled : destination`. The native
