@@ -598,6 +598,16 @@ const ONE_LANE_CASES: &[Case] = &[
             &[u(VALUE), u(4), u(0), u(QUAD_SEGMENT)],
         )
     }),
+    // A clamp's bits inside the segment mask are dropped too (`ComputeMaxThreadId`'s
+    // `clamp & not_seg_mask`): a clamp of 4 under the quad mask bounds lane 0's segment at 0,
+    // so lane 1 is out of range.
+    ("index in bounds clamp inside the segment", |b| {
+        in_bounds(
+            b,
+            Opcode::ShuffleIndex,
+            &[u(VALUE), u(1), u(4), u(QUAD_SEGMENT)],
+        )
+    }),
     ("up 0", |b| {
         int(b, Opcode::ShuffleUp, &[u(VALUE), u(0), u(0), u(0)])
     }),
