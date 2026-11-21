@@ -120,7 +120,11 @@
 //! [`OutputInterpolation::from_pixel_io`] ([`pixel_interpolation`]). [`PixelModes`] remembers the
 //! last header and its modes, so a draw whose header bytes are unchanged parses nothing; the
 //! bytes are read and compared every draw, so a program rewritten in place is seen at the next
-//! draw (`tests::the_pixel_programs_interpolation_reaches_the_key`).
+//! draw (`tests::the_pixel_programs_interpolation_reaches_the_key`). Only the last header is
+//! remembered: a header that differs from it is parsed again, whether new or seen before, and
+//! a draw with no pixel request or an unmapped header leaves the memo as it was
+//! (`tests::pixel_modes_remember_only_the_last_header`). The memo saves parsing only, so no test
+//! sees it: dropping it (never storing, or a fresh [`PixelModes`] per draw) gives the same keys.
 //!
 //! The key holds [`OutputInterpolation::SMOOTH`] (every generic smooth, Eden's value-initialised
 //! `Info::interpolation`) when:
