@@ -47,7 +47,7 @@
 //! |---|---|---|---|
 //! | The alpha reference | Read from the driver constants each draw (decision 16) | Compiled in from `RuntimeInfo::alpha_test_reference` | `tests::emulation::the_alpha_test_reads_the_reference` |
 //! | The flipped viewport | Done in the vertex shader | Not done: Vulkan takes the viewport | `tests::emulation::the_flipped_viewport_reads_three_constants` |
-//! | Where the steps run | Before each `return` the lowering writes for a `return` node or at the end of the entry point | At each `Epilogue`, which Eden's structurizer puts before each return | `tests::emulation::each_return_does_the_steps`, `tests::emulation::a_program_of_one_block_does_the_steps` |
+//! | Where the steps run | Before each `return` the lowering writes for a `return` node or at the end of the entry point | At each `Epilogue`, which Eden's structurizer puts before each return | `tests::emulation::each_return_does_the_steps`, `tests::emulation::a_return_inside_a_loop_does_the_steps`, `tests::emulation::a_program_of_one_block_does_the_steps` |
 
 use naga::{BinaryOperator, Block, Expression, Handle, Literal, Statement};
 
