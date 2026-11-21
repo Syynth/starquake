@@ -127,8 +127,13 @@
 //! The zero past the bound is a **guess** at the hardware's answer: Eden selects zero the same
 //! way only where the host's robust buffer access is broken (`GetCbuf`,
 //! `profile.has_broken_robust`, comparing the element index with `0xFFFF`) and otherwise
-//! leaves the read to the host's robustness. The read itself is clamped as well, so no host
+//! leaves the read to the host's robustness; Eden's translation-time reads give zero past a
+//! bank's bound size too (`video_core/shader_environment.cpp`, `ReadCbufValue`: the word is read
+//! only `if (cbuf_offset < cbuf.size)`). The read itself is clamped as well, so no host
 //! bounds-check policy is needed to keep it inside the binding (spec, "Untrusted input").
+//! **Owner question**: the bound here is the host binding's size, not the size the guest bound
+//! the bank with, which only the draw knows; bounding by the guest's size would need a driver
+//! constant per bank.
 //!
 //! # Where the two references differ
 //!
@@ -144,7 +149,7 @@
 //! | `BitwiseOr32` of an array and a single word | the array is the primary word | refused (`count > 1 \|\| count > 1`) | Eden's (larger) | `tests::table::an_array_or_a_single_word` |
 //! | `BitwiseAnd32` with an immediate | the mask kept, applied after the shift | the shift set to the mask's trailing zero count, the mask dropped | **conflict**, Eden's: it computes the handle the IR computes, the PR's does not | `tests::trace::a_mask_is_applied_after_the_shift` |
 //! | A single word shifted left, with no second word | `(word << shift) & mask` | `(word << shift) \| word`: the PR ORs the primary word into itself when there is no secondary | **conflict**, Eden's: it computes the handle the IR computes | `tests::table::a_shifted_single_word` |
-//! | Handles loaded from global or storage memory | not tracked ("Failed to track bindless texture constant buffer") | refused by name | refused, the PR's reason ([`Untraced::GlobalMemory`]) | `tests::refusals::every_reason_reads_as_written` |
+//! | Handles loaded from global or storage memory | not matched: the search goes on into the load's address, binding a constant-buffer word found there or failing ("Failed to track bindless texture constant buffer") | refused by name | refused, the PR's reason ([`Untraced::GlobalMemory`]) | `tests::refusals::every_reason_reads_as_written` |
 //! | Buffer-backed textures (PR's `buffer_texture.h`, `BufferTexture::Tracker`) | none | traced through storage buffers, host-dependent | not ported: refused as untraceable (decision 8) | `tests::refusals::every_reason_reads_as_written` (the global-memory case) |
 //! | A handle from a vertex attribute (`IsAttributeSourcedHandle`) | accepted where the host sets `support_attribute_texture_handle` | none | refused, [`Untraced::Attribute`] | `tests::refusals::every_reason_reads_as_written` |
 //!
@@ -169,7 +174,7 @@
 //! | `ImageQueryDimensions`' type | the header's type (`ReadTextureType`) | the instruction's, or buffer when the answer is a buffer: the answer has no other type ([`crate::exchange`], "What the questions do not cover") | `tests::rewrite::a_buffer_query_and_fetch` |
 //! | A 2D sample of a rect texture (`PatchImageSampleImplicitLod`) | coordinates divided by the size | not patched: the answer does not say rect | same as the row above |
 //! | A SNORM texel-buffer fetch (`PatchTexelFetch`) | patched where the host cannot render SNORM buffers | not patched: the host is not known here, and a sampled answer has no format ([`crate::exchange`]) | none: no input reaches it |
-//! | An unanswered or missing word or header | Eden reads guest memory whatever it holds | refused: [`ResourceError::UnansweredWord`], [`ResourceError::NoCbufWord`], [`ResourceError::UnansweredKind`], [`ResourceError::NoTextureHeader`] (**owner question**: refuse, or read as an all-zero header) | `tests::answers::missing_answers_are_refused` |
+//! | An unanswered or missing word or header | a word past the bank's size reads 0 (`ReadCbufValue`), an unbound bank is an assertion, and a header is read from guest memory whatever it holds | refused: [`ResourceError::UnansweredWord`], [`ResourceError::NoCbufWord`], [`ResourceError::UnansweredKind`], [`ResourceError::NoTextureHeader`] (**owner question**: refuse, or read a missing word as 0 as Eden does) | `tests::answers::missing_answers_are_refused` |
 //! | The answer's `depth` and `multisampled` | none | not read: the descriptor takes both from the instruction, as Eden does ("TODO: Read this from TIC") | none |
 //!
 //! # Bindless handles in uniform registers (the review of #201)

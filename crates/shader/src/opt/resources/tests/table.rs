@@ -309,3 +309,74 @@ fn image_buffers_merge_by_format() {
     let index = |at| info_at(&function, at).descriptor_index;
     assert_eq!([2, 3, 4].map(index), [0, 0, 1]);
 }
+
+/// An array that holds one handle (it starts at the array limit) is spaced
+/// `DESCRIPTOR_SIZE_SHIFT` whatever its index's scale, as Eden's descriptor of one handle is,
+/// so it merges with a single word at the same place.
+#[test]
+fn an_array_of_one_handle_is_a_single_word() {
+    let text = format!(
+        "block0:
+    %0: u32 = GetRegister r0
+    %1: u32 = ShiftLeftLogical32 %0, u32 0x4
+    %2: u32 = IAdd32 %1, u32 {DYNAMIC_ARRAY_BYTES:#x}
+    %3: u32 = GetCbufU32 u32 0x3, %2
+    %4: f32x2 = CompositeConstructF32x2 f32 0x0, f32 0x0
+    %5: f32x4 = ImageSampleImplicitLod %3, %4, u32 0x0, u32 0x0 {{type=2d}}
+    %6: u32 = GetCbufU32 u32 0x3, u32 {DYNAMIC_ARRAY_BYTES:#x}
+    %7: f32x4 = ImageSampleImplicitLod %6, %4, u32 0x0, u32 0x0 {{type=2d}}
+    return
+"
+    );
+    let engine = Engine::new()
+        .word(3, DYNAMIC_ARRAY_BYTES, 0x5)
+        .kind(0x5, FLOAT);
+    let (function, table) = pass(&text, &engine);
+    let only = table.textures();
+    assert_eq!(only.len(), 1, "{table}");
+    assert_eq!(
+        only.first().map(|d| d.source.size_shift()),
+        Some(DESCRIPTOR_SIZE_SHIFT)
+    );
+    assert_eq!(op_at(&function, 5).args.first(), Some(&ABSENT));
+}
+
+/// A depth sample and a colour sample of the same handle and type are two descriptors (Eden
+/// compares `is_depth`).
+#[test]
+fn depth_keeps_descriptors_apart() {
+    let text = "block0:
+    %0: u32 = GetCbufU32 u32 0x3, u32 0x10
+    %1: f32x2 = CompositeConstructF32x2 f32 0x0, f32 0x0
+    %2: f32x4 = ImageSampleImplicitLod %0, %1, u32 0x0, u32 0x0 {type=2d}
+    %3: f32 = ImageSampleDrefImplicitLod %0, %1, f32 0x0, u32 0x0, u32 0x0 {type=2d, depth}
+    return
+";
+    let engine = Engine::new().word(3, 0x10, 0x11).kind(0x11, FLOAT);
+    let (function, table) = pass(text, &engine);
+    assert_eq!(
+        table.to_string(),
+        "texture 0: 2d, float, from cbuf 3 at 0x10\n\
+         texture 1: 2d, float, depth, from cbuf 3 at 0x10\n"
+    );
+    let index = |at| info_at(&function, at).descriptor_index;
+    assert_eq!([2, 3].map(index), [0, 1]);
+}
+
+/// A merged descriptor keeps a multisample flag an earlier use set (Eden ORs it in).
+#[test]
+fn a_later_use_keeps_the_multisample_flag() {
+    let text = "block0:
+    %0: u32 = GetCbufU32 u32 0x3, u32 0x30
+    %1: u32x2 = CompositeConstructU32x2 u32 0x0, u32 0x0
+    %2: f32x4 = ImageFetch %0, %1, u32 0x0, u32 0x0, u32 0x1 {type=2d}
+    %3: f32x4 = ImageFetch %0, %1, u32 0x0, u32 0x0, u32 0x0 {type=2d}
+    return
+";
+    let engine = Engine::new().word(3, 0x30, 0x33).kind(0x33, FLOAT);
+    let (_, table) = pass(text, &engine);
+    assert_eq!(
+        table.to_string(),
+        "texture 0: 2d, float, multisampled, from cbuf 3 at 0x30\n"
+    );
+}

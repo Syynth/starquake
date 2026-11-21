@@ -465,6 +465,12 @@ pub(super) fn dynamic_size_shift(function: &Function, dynamic: Operand) -> u32 {
 
 /// How many handles an array starting at `base` holds (Eden's `DynamicDescriptorCount` with
 /// the limit [`DESCRIPTOR_MAX_COUNT`]).
+///
+/// Eden's three early returns are kept as written although none changes the result: a shift
+/// of 31 already spaces handles past the 16 KiB an array may start in, and at
+/// `base == DYNAMIC_ARRAY_BYTES` or `available == DESCRIPTOR_SIZE` the formula gives 1 as well.
+/// Moving any of their edges by one is an equivalent mutation; `tests::table::array_lengths_at_the_edge`
+/// pins the results at each edge.
 pub(super) const fn dynamic_count(base: u32, size_shift: u32) -> u32 {
     if size_shift >= u32::BITS - 1 || base >= DYNAMIC_ARRAY_BYTES {
         return 1;
