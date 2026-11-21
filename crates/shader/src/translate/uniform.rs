@@ -51,13 +51,15 @@
 //! as a uniform predicate (`PredIn`, `PredOut`), but for `ULOP3`'s predicate output, which it
 //! writes to a per-thread predicate (`Visitor::LOP3`: `SetPred`). The lowering reads three
 //! fields differently, and its reading is followed (each a **guess** until an `nvdisasm` or
-//! hardware check):
+//! hardware check); for one form the references conflict and neither backs the reading made
+//! here:
 //!
-//! | Field | Here (the lowering) | Native translator | Pinned by |
-//! |---|---|---|---|
-//! | `ULOP3`'s predicate output (bits 81..84) | A uniform predicate (`0x892` is in `uniform_predicate_bank`, which maps bits 81..84 into the uniform bank) | A predicate (`SetPred`) | `tests::files::ulop3_writes_a_uniform_predicate` |
-//! | `ULEA`'s and `ULEA.X`'s carry input (87..91) and output (81..84) | Predicates (`0x291` and `0x891` are rewritten to `LEA`, `0x211`/`0x811`, outside `uniform_predicate_bank`, and `LEA`'s cases read both fields as predicates) | Uniform predicates | `tests::files::ulea_carries_are_predicates` |
-//! | `UIMAD.X`'s carry input (87..91) | A predicate (`0x2a4`/`0x8a4` are rewritten to `IMAD`, `0x224`/`0x824`, whose `.X` case reads it as one) | A uniform predicate | `tests::files::uimad_x_carry_is_a_predicate` |
+//! | Field | Here | The lowering | Native translator | Pinned by |
+//! |---|---|---|---|---|
+//! | `ULOP3` form 4 (`0x892`, an immediate source 1)'s predicate output (bits 81..84) | A uniform predicate, the lowering's | A uniform predicate (`0x892` is in `uniform_predicate_bank`, which maps bits 81..84 into the uniform bank) | A predicate (`SetPred`) | `tests::pr4588::uniform_bit_tests` |
+//! | `ULOP3` form 1 (`0x292`, a register source 1)'s predicate output | A uniform predicate, as form 4's: a **conflict**, read as form 4 is (a **guess**: neither reference backs it) | Refused unless it is `PT` (`opcode == 0x292 && ... insn.Bits(81, 3) != 7`: "native uniform logic mode") | A predicate (`SetPred`) | `tests::files::ulop3_writes_a_uniform_predicate` |
+//! | `ULEA`'s and `ULEA.X`'s carry input (87..91) and output (81..84) | Predicates, the lowering's | Predicates (`0x291` and `0x891` are rewritten to `LEA`, `0x211`/`0x811`, outside `uniform_predicate_bank`, and `LEA`'s cases read both fields as predicates) | Uniform predicates | `tests::files::ulea_carries_are_predicates` |
+//! | `UIMAD.X`'s carry input (87..91) | A predicate, the lowering's | A predicate (`0x2a4`/`0x8a4` are rewritten to `IMAD`, `0x224`/`0x824`, whose `.X` case reads it as one) | A uniform predicate | `tests::files::uimad_x_carry_is_a_predicate` |
 //!
 //! Every other predicate operand of a twin is a uniform predicate in both
 //! (`UIADD3`'s and `UIADD3.X`'s carries: `0x290`/`0x890` are in `uniform_predicate_bank`;
@@ -73,14 +75,22 @@
 //!
 //! # The other instructions
 //!
-//! - **`R2UR`** (`Visitor::R2UR`): the source register of the lowest lane whose guard holds
-//!   (a ballot of the guard, its lowest set bit, a shuffle from that lane) into the uniform
-//!   register, written in every lane. The guard is read as data, a predicate, as both
-//!   references read it (`classify.h`: "reads the guard as data, so it is not split into a
-//!   block"; the lowering's `case 0x3c2` ballots `native_predicate`), so a guarded `R2UR` is
-//!   **not** a conditional block (see "Divergences"). PR #4588's `Require(destination < 63)`
-//!   is kept ([`UniformUnsupported::R2urDestination`]); its predicate-output check cannot fail
-//!   here (the decoder fixes the field).
+//! - **`R2UR`** (`Visitor::R2UR`, the lowering's `case 0x3c2`): the source register of the
+//!   lowest lane whose guard holds (a ballot of the guard, its lowest set bit, a shuffle from
+//!   that lane) into the uniform register, in every lane. The guard is read as data, a
+//!   predicate, as both references read it (`classify.h`: "reads the guard as data, so it is
+//!   not split into a block"; the lowering's `case 0x3c2` ballots `native_predicate`), so a
+//!   guarded `R2UR` is **not** a conditional block (see "Divergences"). When no active lane's
+//!   guard holds (the ballot is zero), the uniform register keeps its old value, as the
+//!   lowering keeps it: its `VOTE.ANY` (`0x50d8`) sets `P6` to whether any lane's guard holds,
+//!   and its closing `SEL` (`0x5ca0` on `P6`) writes `P6 ? shuffled : destination`. The native
+//!   translator writes the shuffle unconditionally, from lane `FindUMsb32(0)`, which is out of
+//!   range (a value the warp does not define); decision 8 (the lowering wins) settles it, and
+//!   PR #4588's own test agrees ("Native warp uniform transfers use the first selected active
+//!   lane and preserve predicates" expects the old value for an empty ballot). Unguarded, the
+//!   running lane is in the ballot, so no select is made. PR #4588's `Require(destination <
+//!   63)` is kept ([`UniformUnsupported::R2urDestination`]); its predicate-output check cannot
+//!   fail here (the decoder fixes the field).
 //! - **`UMOV`** (`Visitor::UMOV`): an immediate or a uniform register into a uniform register.
 //! - **`ULDC`** (`Visitor::ULDC`): a constant-buffer read of the decoded type into one, two or
 //!   four uniform registers (`GetCbufU8` to `GetCbufU32x2`; `.128` is four `GetCbufU32` four
@@ -128,19 +138,26 @@
 //! |---|---|---|---|
 //! | A guarded pure instruction | A conditional block (spec, "Instruction translation") | A select of each written value (`guard_select`) | `tests::guards::a_guard_makes_a_conditional_block` |
 //! | A guarded `R2UR` | The guard read as data, no conditional block: an **owner question** (below) | The same (`classify.h`, `Visitor::R2UR`) | `tests::guards::r2ur_reads_its_guard_as_data` |
-//! | The predicate files above | The lowering's | The native translator's | `tests::files` |
-//! | `ULDC.64` (`0xabb`) offset, and `0xab9`'s with a 64-bit type | Signed 16 bits, as the lowering reads it: its `case 0xab9: case 0xabb` emits Maxwell's `LDC` (`0xef90`), whose offset Eden reads as signed (`frontend/maxwell/translate/impl/load_constant.h` @ cf654052, `BitField<20, 16, s64> offset`) | Unsigned (`Take(38, 16)` added as is) | `tests::constant::the_lowering_s_offsets_are_signed` |
-//! | `ULDC` `0xab9` 32-bit, 8- and 16-bit and 128-bit types | Unsigned, the native reading (the lowering reads `.32` through Maxwell's unsigned constant-buffer operand and has no case for the others) | The same | `tests::constant::the_lowering_s_offsets_are_signed` |
+//! | A guarded `R2UR` whose guard holds in no active lane | The uniform register keeps its value (the lowering's `VOTE.ANY` and `SEL`): a **conflict**, the lowering's reading chosen (decision 8) | The lowering keeps it; the native translator writes the shuffle from the out-of-range lane `FindUMsb32(0)` | `tests::guards::r2ur_with_no_lane_keeps_its_register` |
+//! | `@!UPT` on a twin the lowering takes (`0x891`, "Native predicated uniform address arithmetic") | Nothing appended (the driver's `!PT` rule; `@!UPT` is the same guard field as `@!PT`) | The native translator appends nothing (`Visitor::Run`: `if (guard.Never()) return;`); the lowering refuses it ("native inverted uniform true predicate"): a **conflict**, the native reading kept, as the driver keeps it for every group | `tests::pr4588::predicated_uniform_address_arithmetic` |
+//! | The predicate files above | The lowering's, but `ULOP3` form 1's predicate output, a conflict read as form 4's | The native translator's | `tests::files`, `tests::pr4588::uniform_bit_tests` |
+//! | `ULDC` `0xabb`'s offset with a 32- or 64-bit type, and `0xab9`'s with a 64-bit type | Signed 16 bits, as the lowering reads it: its `case 0xab9: case 0xabb` emits Maxwell's `LDC` (`0xef90`), whose offset Eden reads as signed (`frontend/maxwell/translate/impl/load_constant.h` @ cf654052, `BitField<20, 16, s64> offset`) | Unsigned (`Take(38, 16)` added as is) | `tests::constant::the_lowering_s_offsets_are_signed` |
+//! | `ULDC` `0xab9`'s offset with a 32-bit, 8- or 16-bit or 128-bit type, and `0xabb`'s with an 8- or 16-bit or 128-bit type | Unsigned, the native reading: the lowering reads `0xab9` `.32` through Maxwell's unsigned constant-buffer operand, and refuses the other types on both opcodes (`width != 4 && width != 5`: "native uniform constant load mode") | The same | `tests::constant::the_lowering_s_offsets_are_signed` |
 //! | `UPRMT` | Translated (an immediate selector) | No native case; the lowering's one selector | `tests::alu::uprmt_permutes_uniform_bytes` |
 //! | `LDCG` | Translated from NAK | No case in either | `tests::global::ldcg_loads_or_returns_zero` |
 //!
 //! **Owner question: a guarded `R2UR`.** The spec reads "Every guarded instruction that writes
 //! IR becomes a conditional block, pure ones included" ("Instruction translation", "Guards").
 //! A guarded `R2UR` writes IR, but both references read its guard as data (the ballot's
-//! input) and write the uniform register in every lane; a conditional block would leave the
-//! register unwritten in the lanes where the guard is false. Option 1, as built: read the guard
-//! as data, no block. Option 2, the spec's sentence: a conditional block, so lanes where the
-//! guard is false keep their old value, and the ballot sees only the lanes that entered it.
+//! input), and both write the uniform register in every lane when at least one active lane's
+//! guard holds. They differ when none holds: the lowering keeps the register (its `VOTE.ANY`
+//! and `SEL`), while the native translator writes the shuffle from an out-of-range lane, an
+//! undefined value. Option 1, as built: read the guard as data, no block, and keep the
+//! register when the ballot is zero; this follows the lowering in every case (decision 8) and
+//! the native translator only when some lane's guard holds. Option 2, the spec's sentence: a
+//! conditional block, so lanes where the guard is false keep their old value, and the ballot
+//! sees only the lanes that entered it; this follows neither reference where the guard differs
+//! between lanes.
 //!
 //! # Not translated
 //!
@@ -531,8 +548,11 @@ fn set_words(
     Ok(())
 }
 
-/// `R2UR` (`Visitor::R2UR`): `pending`, the guard of an untested guarded `R2UR`, is read as
-/// data (a predicate); with none, every lane takes part.
+/// `R2UR` (`Visitor::R2UR`, and the lowering's `case 0x3c2`): `pending`, the guard of an
+/// untested guarded `R2UR`, is read as data (a predicate); with none, every lane takes part.
+/// With a guard, the uniform register keeps its old value when the ballot is zero (no active
+/// lane's guard holds), as the lowering's `SEL` on its `VOTE.ANY` result keeps it (the module
+/// docs, "Divergences"); unguarded, the running lane is in the ballot, so no select is made.
 fn translate_r2ur(
     builder: &mut Builder<'_>,
     op: OpR2UR,
@@ -552,7 +572,16 @@ fn translate_r2ur(
         Opcode::ShuffleIndex,
         &[value, lane.into(), imm32(SHUFFLE_CLAMP), imm32(0)],
     )?;
-    Ok(set(builder, op.dst, shuffled.into())?)
+    let result = if pending.is_some() {
+        let any = builder.op(Opcode::INotEqual, &[ballot.into(), imm32(0)])?;
+        let old = source::uniform_reg(builder, op.dst)?;
+        builder
+            .op(Opcode::SelectU32, &[any.into(), shuffled.into(), old])?
+            .into()
+    } else {
+        shuffled.into()
+    };
+    Ok(set(builder, op.dst, result)?)
 }
 
 /// `UMOV` (`Visitor::UMOV`).
@@ -624,7 +653,14 @@ fn translate_uldc(builder: &mut Builder<'_>, op: OpULdc) -> Result<(), BuildErro
             read_cbuf(builder, op, bank, None, offset)
         }
         ULdcSrc::Indexed { index, reg, offset } => {
-            read_cbuf(builder, op, index, Some(reg), signed(offset))
+            // The lowering takes `0xabb` only with a 32- or 64-bit type (its Maxwell `LDC`,
+            // a signed offset); the native, unsigned, reading is kept for the others.
+            let offset = if matches!(op.mem_type, MemType::B32 | MemType::B64) {
+                signed(offset)
+            } else {
+                u32::from(offset)
+            };
+            read_cbuf(builder, op, index, Some(reg), offset)
         }
         ULdcSrc::Global { addr, offset, pred } => translate_ldcg(builder, op, addr, offset, pred),
         // Refused by `check_uldc`.

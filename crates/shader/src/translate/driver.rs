@@ -69,7 +69,11 @@
 //!   split into a block"): the driver hands it to the uniform group's translator with its guard
 //!   ([`GuardMode::Honour`]), which reads the guard as the ballot's input and makes no block (an
 //!   owner question against the spec's sentence, quoted in the uniform group's module docs,
-//!   "Divergences"; pinned by `uniform::tests::guards::r2ur_reads_its_guard_as_data`).
+//!   "Divergences"; pinned by `uniform::tests::guards::r2ur_reads_its_guard_as_data`). The
+//!   references do not both write the uniform register in every lane: when no active lane's
+//!   guard holds, the lowering keeps it (its `VOTE.ANY` and `SEL`) and the native translator
+//!   writes an undefined shuffle; the uniform translator keeps it, as the lowering does
+//!   (`uniform::tests::guards::r2ur_with_no_lane_keeps_its_register`).
 //! - Any other guarded instruction flow analysis leaves in its block is one of `classify.h`'s
 //!   `OpKind::Nop`: `NOP`, `DEPBAR`, `BREAK` and `WARPSYNC` with an immediate (flow analysis
 //!   refuses a guarded `BSSY` and a guarded `BRX`, [`FlowError::PredicatedBssy`] and its

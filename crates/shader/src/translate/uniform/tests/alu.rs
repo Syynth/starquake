@@ -434,33 +434,53 @@ fn unary_twins() {
 }
 
 /// `UPLOP3` with every truth table: each destination is bit `a << 2 | b << 1 | c` of its table,
-/// over every value of its three uniform predicates (row 88).
+/// over every value of its three uniform predicates (row 88), with each source negated alone
+/// and none negated, so a dropped negation of any one source changes a result.
 #[test]
 fn uplop3_takes_any_truth_table() {
-    let function = |lut: u8| {
+    let function = |lut: u8, negated: [bool; 3]| {
         build(&[Instr::new(Op::UPLop3(OpUPLop3 {
             dsts: [up(1), up(2)],
-            srcs: [ups(3, false), ups(4, false), ups(5, true)],
+            srcs: [ups(3, negated[0]), ups(4, negated[1]), ups(5, negated[2])],
             luts: [lut, !lut],
         }))])
         .expect("translates")
     };
-    for lut in 0..=u8::MAX {
-        let function = function(lut);
-        for row in 0..8_u8 {
-            let (a, b, c) = (row & 4 != 0, row & 2 != 0, row & 1 != 0);
-            let mut machine = Machine::new();
-            machine.uniform_preds[3] = a;
-            machine.uniform_preds[4] = b;
-            machine.uniform_preds[5] = !c;
-            // The per-thread predicates of the same numbers hold the opposite values.
-            machine.preds = [a, b, !c, !a, !b, c, a, false];
-            let preds = machine.preds;
-            machine.run(&function).expect("runs");
-            let expected = lut >> row & 1 != 0;
-            assert_eq!(machine.uniform_preds[1], expected, "{lut:#x} {row}");
-            assert_eq!(machine.uniform_preds[2], !expected, "{lut:#x} {row}");
-            assert_eq!(machine.preds, preds, "{lut:#x} {row}");
+    let negations = [
+        [false, false, false],
+        [true, false, false],
+        [false, true, false],
+        [false, false, true],
+    ];
+    for negated in negations {
+        for lut in 0..=u8::MAX {
+            let function = function(lut, negated);
+            for row in 0..8_u8 {
+                let (a, b, c) = (row & 4 != 0, row & 2 != 0, row & 1 != 0);
+                let mut machine = Machine::new();
+                // The stored predicates, so that the sources read after negation are a, b, c.
+                machine.uniform_preds[3] = a != negated[0];
+                machine.uniform_preds[4] = b != negated[1];
+                machine.uniform_preds[5] = c != negated[2];
+                // The per-thread predicates of the same numbers hold the opposite values.
+                machine.preds = [
+                    a,
+                    b,
+                    !c,
+                    !machine.uniform_preds[3],
+                    !machine.uniform_preds[4],
+                    !machine.uniform_preds[5],
+                    a,
+                    false,
+                ];
+                let preds = machine.preds;
+                machine.run(&function).expect("runs");
+                let expected = lut >> row & 1 != 0;
+                let at = format!("{lut:#x} {row} {negated:?}");
+                assert_eq!(machine.uniform_preds[1], expected, "{at}");
+                assert_eq!(machine.uniform_preds[2], !expected, "{at}");
+                assert_eq!(machine.preds, preds, "{at}");
+            }
         }
     }
 }

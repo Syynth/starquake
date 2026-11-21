@@ -1,11 +1,14 @@
 //! Tests of the uniform datapath translator: each instruction and modifier run through the IR
 //! interpreter (slice 7) with expected values from the instruction's documented behaviour, the
 //! predicate files the lowering reads, the guards, every refusal with its exact error, PR
-//! #4588's cases for this group rebuilt with the test assembler, the register classes through
-//! SSA, and a no-panic property test.
+//! #4588's cases whose titles name the uniform datapath rebuilt with the test assembler (the
+//! `pr4588` module's docs list which are ported and why the others are not), the register
+//! classes through SSA, and a no-panic property test.
 //!
 //! Every case is built as an [`Instr`], assembled by the test assembler and decoded again
-//! before it is translated (but `UP2UR`, a shell no word holds), so the words are synthetic.
+//! before it is translated (but `UP2UR`, a shell no word holds, and the two words
+//! `pr4588::uniform_moves` makes from an assembled one by setting a source field the assembler
+//! cannot encode), so the words are synthetic.
 
 mod alu;
 mod constant;

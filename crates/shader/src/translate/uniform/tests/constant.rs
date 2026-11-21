@@ -118,12 +118,39 @@ fn the_indexed_form_adds_its_register() {
     assert_eq!(machine.uniform_regs[1], WORDS[1]);
 }
 
-/// The lowering reads the offset of `0xabb`, and of `0xab9` with a 64-bit type, as signed (its
-/// Maxwell `LDC`); `0xab9`'s other types keep the native, unsigned, reading. Pinned on the IR's
-/// offsets for `0x8000`, and on the interpreter for an indexed read that wraps back into the
-/// buffer.
+/// The lowering reads the offset of `0xabb` with a 32- or 64-bit type, and of `0xab9` with a
+/// 64-bit type, as signed (its Maxwell `LDC`); the other types keep the native, unsigned,
+/// reading on both opcodes (the lowering refuses them on `0xabb` and reads `0xab9` `.32`
+/// unsigned). Pinned on the IR's offsets for `0x8000` and `0x7ffc` for every type of `0xabb`,
+/// and on the interpreter for an indexed 32-bit read that wraps back into the buffer and an
+/// indexed 16-bit read that does not.
 #[test]
 fn the_lowering_s_offsets_are_signed() {
+    let unsigned_indexed = [MemType::U8, MemType::I8, MemType::U16, MemType::I16];
+    for mem_type in unsigned_indexed {
+        let text = text(&[Instr::new(indexed(2, 5, ur(9), 0x8000, mem_type))]);
+        assert!(
+            text.contains("IAdd32 %0, u32 0x8000\n"),
+            "{mem_type:?}: {text}"
+        );
+    }
+    let quad = text(&[Instr::new(indexed(4, 5, ur(9), 0x8000, MemType::B128))]);
+    assert!(quad.contains("IAdd32 %0, u32 0x8000\n"), "{quad}");
+    assert!(quad.contains("IAdd32 %0, u32 0x800c\n"), "{quad}");
+    for (offset, expected) in [(0x8000, "0xffff8000"), (0x7ff8, "0x7ff8")] {
+        let pair = text(&[Instr::new(indexed(2, 5, ur(9), offset, MemType::B64))]);
+        assert!(
+            pair.contains(&format!("IAdd32 %0, u32 {expected}\n")),
+            "{pair}"
+        );
+    }
+    let mut machine = machine_with(&[]);
+    machine.uniform_regs[9] = 8;
+    let mut bytes = vec![0; usize::from(u16::MAX) + 1];
+    bytes[0x8008..0x800a].copy_from_slice(&0x9abc_u16.to_le_bytes());
+    machine.cbufs.insert(5, bytes);
+    run_op(indexed(2, 5, ur(9), 0x8000, MemType::U16), &mut machine);
+    assert_eq!(machine.uniform_regs[2], 0x9abc);
     let cases = [
         (
             bound(2, 5, 0x8000, MemType::B32),

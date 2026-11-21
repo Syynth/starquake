@@ -71,6 +71,30 @@ fn ldcg_loads_or_returns_zero() {
     );
 }
 
+/// Where a uniform predicate (not `UPT`) holds, a 64-bit `LDCG` clears both destination words,
+/// each of which held a distinct non-zero value; where it does not, both are loaded.
+#[test]
+fn a_held_predicate_clears_both_words() {
+    for holds in [false, true] {
+        let mut machine = machine();
+        machine.uniform_regs[8] = 0x5555;
+        machine.uniform_regs[9] = 0x6666;
+        machine.uniform_preds[1] = holds;
+        run_op(ldcg(8, ur(4), 0, ups(1, false), MemType::B64), &mut machine);
+        let expected = if holds {
+            (0, 0)
+        } else {
+            (word_at(0x20), word_at(0x24))
+        };
+        assert_eq!(
+            (machine.uniform_regs[8], machine.uniform_regs[9]),
+            expected,
+            "{holds}"
+        );
+        assert_eq!(machine.uniform_regs[10], 0, "{holds}: no third word");
+    }
+}
+
 /// A negated predicate loads where the uniform predicate is false.
 #[test]
 fn a_negated_predicate_inverts_it() {

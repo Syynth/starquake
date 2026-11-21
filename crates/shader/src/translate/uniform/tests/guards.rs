@@ -116,8 +116,9 @@ fn the_guard_file_is_classify_s() {
 
 /// A guarded `R2UR` reads its guard as data (a predicate, `classify.h`: "reads the guard as
 /// data, so it is not split into a block"): no conditional block, the guard the ballot's
-/// input, and the uniform register written in every lane. The translation driver hands it over
-/// unsplit too.
+/// input, and one write of the uniform register, a select that keeps its old value when the
+/// ballot is zero (`r2ur_with_no_lane_keeps_its_register`). The translation driver hands it
+/// over unsplit too.
 #[test]
 fn r2ur_reads_its_guard_as_data() {
     let r2ur = Op::R2UR(OpR2UR {
@@ -154,6 +155,57 @@ fn r2ur_reads_its_guard_as_data() {
     assert_eq!(blocks.function.block_count(), 1);
     assert_eq!(count(&blocks.function, Opcode::SubgroupBallot), 1);
     assert_eq!(count(&blocks.function, Opcode::GetPred), 1);
+}
+
+/// A guarded `R2UR` whose guard holds in no active lane keeps its uniform register, as the
+/// lowering's `VOTE.ANY` and `SEL` keep it (`case 0x3c2`; the module docs, "Divergences"),
+/// where the native translator would write the shuffle from the out-of-range lane
+/// `FindUMsb32(0)` (the interpreter's value for another lane). Where the guard holds, the
+/// running lane's own source register is written. Run on the interpreter's one-lane warp,
+/// with a lane other than 0, through the uniform translator and through the driver.
+#[test]
+fn r2ur_with_no_lane_keeps_its_register() {
+    let r2ur = Op::R2UR(OpR2UR {
+        dst: ur(3),
+        src: r(7),
+    });
+    let exit = Instr::new(Op::Exit(crate::decode::OpExit {
+        pred: PredSrc::TRUE,
+        keep_ref_count: false,
+        no_at_exit: false,
+    }));
+    let stage = crate::translate::Stage {
+        stage: crate::translate::GuestStage::Compute,
+        color_outputs: crate::translate::ColorOutputs::default(),
+    };
+    for negated in [false, true] {
+        let instr = under(ps(3, negated), r2ur);
+        let direct = build(&[instr]).expect("translates");
+        let code = [word(&instr), word(&exit)];
+        let driven = crate::translate::translate_flow(
+            stage,
+            None,
+            &code,
+            &crate::flow::BranchTables::new(0),
+        )
+        .expect("translates")
+        .function;
+        for function in [&direct, &driven] {
+            for p3 in [false, true] {
+                let mut machine = Machine::new();
+                machine.system.lane_id = 6;
+                machine.uniform_regs[3] = 0x1234;
+                machine.regs[7] = 0x5678;
+                machine.preds[3] = p3;
+                machine.uniform_preds[3] = !p3;
+                machine.run(function).expect("runs");
+                let holds = p3 != negated;
+                let expected = if holds { 0x5678 } else { 0x1234 };
+                assert_eq!(machine.uniform_regs[3], expected, "{negated} {p3}");
+                assert_eq!(machine.regs[7], 0x5678);
+            }
+        }
+    }
 }
 
 /// `!PT` appends nothing, without any check (a refused `R2UR`, `UBMSK`, `UP2UR`, a bindless
@@ -251,20 +303,26 @@ fn phi_rig() -> (Function, BlockId, BlockId) {
     (function, entry, exit)
 }
 
-/// A conditional block, a twin's or another form's, or an `LDCG`'s own split, in a block whose
-/// successor has a phi naming it is refused before anything is appended; unguarded, the same
-/// instructions translate there.
-#[test]
-fn a_phi_on_a_successor_refuses_the_split() {
-    let ldcg = Op::ULdc(OpULdc {
+/// An `LDCG` of 32 bits into `UR1` from `UR4:UR5`, zero where `reg` (negated or not) holds.
+fn ldcg_with(reg: UniformPred, negated: bool) -> Op {
+    Op::ULdc(OpULdc {
         dst: ur(1),
         src: ULdcSrc::Global {
             addr: ur(4),
             offset: 0,
-            pred: ups(1, false),
+            pred: UniformPredSrc { reg, negated },
         },
         mem_type: MemType::B32,
-    });
+    })
+}
+
+/// A conditional block, a twin's or another form's, or an `LDCG`'s own split, in a block whose
+/// successor has a phi naming it is refused before anything is appended; unguarded, the same
+/// instructions translate there, and so does an `LDCG` with `UPT` or `!UPT`, which makes no
+/// split.
+#[test]
+fn a_phi_on_a_successor_refuses_the_split() {
+    let ldcg = ldcg_with(up(1), false);
     let cases = [
         (under(ps(1, false), umov(4, 9)), true),
         (
@@ -276,6 +334,9 @@ fn a_phi_on_a_successor_refuses_the_split() {
         ),
         (Instr::new(ldcg), true),
         (Instr::new(umov(4, 9)), false),
+        // `UPT` and `!UPT` make no split of their own (`constant_predicates_make_no_block`).
+        (Instr::new(ldcg_with(UniformPred::UPT, false)), false),
+        (Instr::new(ldcg_with(UniformPred::UPT, true)), false),
     ];
     for (instr, refused) in cases {
         let (mut function, entry, exit) = phi_rig();
