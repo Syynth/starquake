@@ -10,9 +10,8 @@
 //! - [`float`]: the 32-bit float and conversion group (slice 12b);
 //! - [`half_double`]: the half- and double-precision group (slice 12c);
 //! - [`texture`]: the texture and surface group (slice 12f);
-//! - [`memory`]: the memory group (slice 12e), which translates one instruction on its own but
-//!   is not joined to the driver yet: the driver refuses its operations by name ([`driver`]'s
-//!   module docs, "Dispatch");
+//! - [`memory`]: the memory group (slice 12e), joined to the driver ([`driver`]'s module docs,
+//!   "Dispatch");
 //! - `attribute`: the attribute and system-value group (slice 12g: `ALD`, `AST`, `IPA`, `AL2P`,
 //!   `S2R`, `CS2R`, `PIXLD`, and the deferred `OUT`, `ISBERD` and `ISBEWR`), joined through
 //!   `GROUPS`;
@@ -66,7 +65,7 @@ use crate::ir::{BlockId, BuildError, Builder, Imm, Opcode, Operand, Terminator, 
 use crate::sph::PixelIo;
 
 pub use attribute::{AttributeRejection, Deferral};
-pub use driver::{MAX_TRANSLATED_INSTRUCTIONS, translate_flow};
+pub use driver::{MAX_TRANSLATED_INSTRUCTIONS, translate_flow, translates_stage};
 
 /// The guest's pipeline stage of a program (spec, "What the GPU front/back protocol and engine
 /// state (#12) gets": `GuestStage`; slot types from `SET_PIPELINE_SHADER`).
@@ -146,10 +145,6 @@ pub enum Unsupported {
     /// `LDTRAM`; in [`control::translate_control`], `BMOV`, `NANOSLEEP`, `JMX` and `BPT`.
     #[error("{0}")]
     Instruction(&'static str),
-    /// An instruction of the memory group, whose translator (slice 12e) is not joined to the
-    /// driver yet ([`driver`]'s module docs, "Dispatch").
-    #[error("{0}, of the memory group, which is not translated yet,")]
-    MemoryGroup(&'static str),
     /// A control or warp form [`control::translate_control`] does not handle.
     #[error("{0}")]
     Control(#[from] control::ControlUnsupported),
@@ -227,6 +222,20 @@ pub enum TranslateError {
         instr: Instr,
         /// Why.
         error: integer::IntegerError,
+    },
+    /// An instruction of the memory group is not translated ([`memory::MemoryError`]: a form or
+    /// field value slice 12e's translator does not handle; its decode, other-group and
+    /// successor-phi refusals cannot be reached from the driver, which hands it a decoded
+    /// instruction of the group with its guard already handled, and its build failures are
+    /// [`TranslateError::Build`]).
+    #[error("instruction {index} ({instr}): {error}")]
+    Memory {
+        /// The instruction's index in the program.
+        index: usize,
+        /// The instruction.
+        instr: Instr,
+        /// Why.
+        error: memory::MemoryError,
     },
     /// An instruction a flow block holds does not decode (flow analysis decodes only control
     /// instructions; the driver decodes the rest).

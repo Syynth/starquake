@@ -11,13 +11,13 @@ use crate::asm::assemble;
 use crate::capture::MAX_INSTRUCTIONS;
 use crate::decode::{
     AluSrc, BREAK_OPCODE, BraCond, BranchOffset, BrxSrc, DecodeError, GUARD, Gpr, IntCmpOp,
-    MemAddr, MemEvictionPriority, MemSpace, MemType, MovSrc, OPCODE, OpALd, OpASt, OpBra, OpBrx,
-    OpCall, OpDepBar, OpExit, OpFAdd, OpHmma, OpIAdd3, OpISetP, OpKill, OpLd, OpMov, OpNop, OpRet,
-    OpS2R, OpVote, OpWarpSync, Pred, PredSetOp, PredSrc, RoundMode, S2RDst, SpecialReg,
-    UniformAddr, UniformPred, UniformReg, VoteDst, VoteOp,
+    MemAddr, MemEvictionPriority, MemSpace, MemType, MovSrc, OPCODE, OffsetStride, OpALd, OpASt,
+    OpBra, OpBrx, OpCall, OpDepBar, OpExit, OpFAdd, OpHmma, OpIAdd3, OpISetP, OpKill, OpLd, OpMov,
+    OpNop, OpRet, OpS2R, OpVote, OpWarpSync, Pred, PredSetOp, PredSrc, RoundMode, S2RDst,
+    SpecialReg, UniformAddr, UniformPred, UniformReg, VoteDst, VoteOp,
 };
 use crate::interp::Machine;
-use crate::ir::{Attribute, Inst, Node, Opcode};
+use crate::ir::{Attribute, BuildError, Inst, Node, Opcode};
 use crate::structure::MAX_STRUCTURE_WORK;
 use crate::testing::{canonical_word, forms};
 use crate::translate::control::{DEPBAR_REQUIRED_SCOREBOARD, FULL_WARP_MASK};
@@ -811,21 +811,74 @@ fn the_lowest_undecodable_instruction_is_refused() {
             error: DecodeError::UnknownOpcode { opcode: 0 }
         })
     );
-    // With every word decodable, the memory instruction is refused by name.
+    // With every word decodable, the memory translator refuses the `LDL` with its uniform
+    // address on (`ops_memory.cpp`, `LDL`: `Require(!use_uniform)`).
     assert_eq!(
         refusal(&[ld_word, exit_word]),
-        Err(TranslateError::Unsupported {
+        Err(TranslateError::Memory {
             index: 0,
             instr: ld,
-            what: Unsupported::MemoryGroup(ld.op.mnemonic()),
+            error: MemoryError::Unsupported(LDL_UNIFORM),
         })
     );
 }
 
-/// The memory group, whose translator is not joined yet, is refused by name with the exact
-/// message.
+/// What slice 12e's translator refuses an `LDL` with its uniform address on as.
+const LDL_UNIFORM: crate::translate::memory::MemoryUnsupported =
+    crate::translate::memory::MemoryUnsupported::UniformAddress(
+        crate::translate::memory::Space::Local,
+    );
+
+/// A memory instruction reaches slice 12e's translator through the driver: an `LDS` of a word
+/// from a register plus an offset becomes the translator's `LoadSharedU32` at the address
+/// `Visitor::SharedOffset` makes (exact golden IR), in a compute program.
 #[test]
-fn memory_instructions_are_refused_by_name() {
+fn a_memory_instruction_reaches_the_memory_translator() {
+    let lds = Instr::new(Op::Ld(OpLd {
+        dst: r(2),
+        addr: MemAddr {
+            reg: r(1),
+            reg_64: false,
+            uniform: Some(UniformAddr {
+                reg: UniformReg::new(0).expect("a uniform register"),
+                wide: false,
+                enabled: false,
+            }),
+            offset: 0x10,
+        },
+        mem_type: MemType::B32,
+        space: MemSpace::Shared(OffsetStride::X1),
+        pred: PredSrc::TRUE,
+        pred_dst: Pred::PT,
+        zd: false,
+        bit76: false,
+    }));
+    let code = Program::default()
+        .op(mov(1, 0x20))
+        .op(lds)
+        .op(exit())
+        .build();
+    let compute = Stage {
+        stage: GuestStage::Compute,
+        ..VERTEX
+    };
+    let blocks = translated(compute, &code);
+    assert_eq!(
+        blocks.function.to_string(),
+        "block0:\n\
+         \x20   %0 = SetRegister r1, u32 0x20\n\
+         \x20   %1: u32 = GetRegister r1\n\
+         \x20   %2: u32 = IAdd32 %1, u32 0x10\n\
+         \x20   %3: u32 = LoadSharedU32 %2\n\
+         \x20   %4 = SetRegister r2, %3\n\
+         \x20   return\n"
+    );
+}
+
+/// A memory form slice 12e's translator refuses is refused through the driver with its error,
+/// the exact message naming the instruction.
+#[test]
+fn a_refused_memory_instruction_names_the_memory_translator_s_reason() {
     let mut program = vec![];
     let ld = OpLd {
         dst: r(0),
@@ -851,16 +904,51 @@ fn memory_instructions_are_refused_by_name() {
     let error = translate_instrs(VERTEX, None, &program).expect_err("refused");
     assert_eq!(
         error,
-        TranslateError::Unsupported {
+        TranslateError::Memory {
             index: 0,
             instr: program[0],
-            what: Unsupported::MemoryGroup("ld"),
+            error: MemoryError::Unsupported(LDL_UNIFORM),
         }
     );
     assert_eq!(
         error.to_string(),
-        "instruction 0 (ldl r0, [rz];): ld, of the memory group, which is not translated yet, is \
-         not supported"
+        "instruction 0 (ldl r0, [rz];): a uniform register in a local address is not supported"
+    );
+}
+
+/// A memory instruction dispatched into a block that does not exist is the builder's error,
+/// reported as [`TranslateError::Build`] as every group's is, not as
+/// [`TranslateError::Memory`] (the dispatch's `MemoryError::Build` arm).
+#[test]
+fn a_memory_instruction_into_a_missing_block_is_the_builder_s_error() {
+    let mut function = Function::new();
+    let missing = {
+        let mut other = Function::new();
+        other.add_block().expect("a block")
+    };
+    let lds = Instr::new(Op::Ld(OpLd {
+        dst: r(2),
+        addr: MemAddr {
+            reg: r(1),
+            reg_64: false,
+            uniform: Some(UniformAddr {
+                reg: UniformReg::new(0).expect("a uniform register"),
+                wide: false,
+                enabled: false,
+            }),
+            offset: 0x10,
+        },
+        mem_type: MemType::B32,
+        space: MemSpace::Shared(OffsetStride::X1),
+        pred: PredSrc::TRUE,
+        pred_dst: Pred::PT,
+        zd: false,
+        bit76: false,
+    }));
+    let mut driver = Driver::new(VERTEX, None);
+    assert_eq!(
+        driver.dispatch(&mut function, missing, 2, lds),
+        Err(TranslateError::Build(BuildError::NoBlock(missing)))
     );
 }
 
@@ -987,23 +1075,30 @@ fn an_inlined_program_past_the_budget_is_refused() {
     assert!(translate_flow(VERTEX, None, &program(4), &BranchTables::new(0)).is_ok());
 }
 
+/// The stages the lowering takes (vertex, pixel and compute) translate; every other stage is
+/// refused by name, each stage listed by hand.
 #[test]
-fn only_vertex_and_pixel_stages_translate() {
+fn only_the_stages_the_lowering_takes_translate() {
     let code = Program::default().op(exit()).build();
     for stage in [
         GuestStage::VertexCullBeforeFetch,
         GuestStage::TessellationInit,
         GuestStage::Tessellation,
         GuestStage::Geometry,
-        GuestStage::Compute,
     ] {
+        assert!(!translates_stage(stage), "{stage}");
         let stage = Stage { stage, ..VERTEX };
         assert_eq!(
             translate_flow(stage, None, &code, &BranchTables::new(0)).map(|_| ()),
             Err(TranslateError::Stage(Unsupported::Stage(stage.stage)))
         );
     }
-    for stage in [VERTEX, PIXEL] {
+    let compute = Stage {
+        stage: GuestStage::Compute,
+        ..VERTEX
+    };
+    for stage in [VERTEX, PIXEL, compute] {
+        assert!(translates_stage(stage.stage), "{}", stage.stage);
         assert!(translate_flow(stage, None, &code, &BranchTables::new(0)).is_ok());
     }
 }
@@ -1037,7 +1132,7 @@ fn groups_of(op: Op) -> Vec<&'static str> {
         ("half and double", half_double::in_group(&op)),
         ("texture", texture::in_group(&op)),
         ("control", control::in_group(&op)),
-        ("memory", in_memory_group(&op)),
+        ("memory", memory::is_memory(&op)),
         ("attribute", attribute::translate(&mut t, op).is_some()),
     ]
     .into_iter()
@@ -1293,12 +1388,12 @@ fn a_guarded_float_instruction_is_one_conditional_block() {
     );
 }
 
-/// The stage is checked before flow analysis: a compute program with no instructions is
+/// The stage is checked before flow analysis: a geometry program with no instructions is
 /// refused for its stage, though flow analysis would refuse its size.
 #[test]
 fn the_stage_is_checked_before_flow_analysis() {
-    let compute = Stage {
-        stage: GuestStage::Compute,
+    let geometry = Stage {
+        stage: GuestStage::Geometry,
         ..VERTEX
     };
     assert_eq!(
@@ -1306,9 +1401,9 @@ fn the_stage_is_checked_before_flow_analysis() {
         Err(TranslateError::Flow(FlowError::ProgramSize { len: 0 }))
     );
     assert_eq!(
-        translate_flow(compute, None, &[], &BranchTables::new(0)).map(|_| ()),
+        translate_flow(geometry, None, &[], &BranchTables::new(0)).map(|_| ()),
         Err(TranslateError::Stage(Unsupported::Stage(
-            GuestStage::Compute
+            GuestStage::Geometry
         )))
     );
 }
