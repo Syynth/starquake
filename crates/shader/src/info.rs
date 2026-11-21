@@ -93,15 +93,17 @@
 //! | `GetPatch`, `SetPatch` | Not collected, and not refused: the walk ignores both opcodes, whatever the patch word. The translator emits neither yet | `GetPatch` and `SetPatch` set `uses_patches`, and `SetPatch` of a tessellation level sets `stores_tess_level_outer` or `stores_tess_level_inner`; Eden throws on a `GetPatch` of a non-generic patch and on a `SetPatch` of any other patch | `tests::patch_operations_are_not_collected` |
 //! | Every other `Info` field `collect_shader_info_pass.cpp` writes: `uses_int8`, `uses_int16`; the float denormal flags (`uses_fp16_denorms_flush`, `uses_fp16_denorms_preserve`, `uses_fp32_denorms_flush`, `uses_fp32_denorms_preserve`, from `VisitFpModifiers`); the atomic-kind flags (`uses_atomic_s32_min`, `uses_atomic_s32_max`, `uses_atomic_f32_add`, `uses_atomic_f16x2_add`, `uses_atomic_f32x2_add`, `uses_atomic_f16x2_min`, `uses_atomic_f32x2_min`, `uses_atomic_f16x2_max`, `uses_atomic_f32x2_max`, `uses_shared_increment`, `uses_shared_decrement`, `uses_global_increment`, `uses_global_decrement`); the texture and image flags (`uses_sampled_1d`, `uses_sparse_residency`, `uses_shadow_lod`, `uses_typeless_image_reads`, `uses_typeless_image_writes`, `uses_image_buffers`, `uses_image_1d`, `uses_atomic_image_u32`); `uses_global_memory`, `stores_global_memory`, `used_storage_buffer_types`, `uses_local_memory`; `uses_demote_to_helper_invocation`; `uses_derivatives`; `uses_rescaling_uniform` (the spec deliberately does not port Eden's rescaling pass: resolution scaling is a later feature); `used_constant_buffer_types`, `used_indirect_cbuf_types`, `constant_buffer_descriptors` and `constant_buffer_mask` (the banks and sizes of [`ShaderInfo::constant_buffers`] stand in for the last two); `used_clip_distances` (`GatherInfoFromHeader`); the NVN storage buffers (`nvn_buffer_base`, `nvn_buffer_used`); and the `uses_is_helper_invocation` Eden also sets for `GetAttributeIndexed` (here only `IsHelperInvocation` records [`SystemValue::IsHelperInvocation`]) | Not collected. 8- and 16-bit integers are not host requirements here: a guess that the lowering (slices 16 and 17) reads them through 32-bit values, since naga has no 8-bit integer type. The rest serve Eden's own SPIR-V capabilities, or slices 13, 14, 16 to 18 | Collected | — |
 //!
-//! # Open, for the owner
+//! # The vertex outputs' interpolation
 //!
 //! wgpu refuses a pipeline whose vertex output and fragment input interpolation differ
 //! (`wgpu-core` 30.0.2, `validation.rs`: `InputError::InterpolationMismatch`), and only the
 //! pixel program's header gives the mode. A vertex program's outputs carry no interpolation
-//! here ([`InterfaceEntry::interpolation`] is `None` outside pixel inputs), so the lowering of
-//! slice 17 needs the pixel program's modes for the vertex outputs: from the next stage (which
-//! the 2026-11-19 ruling on interface matching does not specialise on) or by another route.
-//! Slice 1's guess of perspective interpolation for vertex outputs stays in `lower` until then.
+//! here ([`InterfaceEntry::interpolation`] is `None` outside pixel inputs): the vertex stage
+//! takes the paired pixel program's modes from the variant key instead
+//! ([`crate::variant::VariantKey::output_interpolation`], which the GPU crate fills from the
+//! pixel program's header with the reduction [`collect`] makes; decided by the owner,
+//! 2026-11-20, ruling 2). Slice 17 applies them; slice 1's guess of perspective interpolation
+//! for vertex outputs stays in `lower` until then.
 
 pub mod attribute;
 #[cfg(test)]
@@ -247,7 +249,7 @@ pub struct InterfaceEntry {
     /// words in order, a colour target's red to alpha; bit 0 for a slot with one component).
     pub components: u8,
     /// For a pixel program's generic input, how it is interpolated; `None` for every other
-    /// entry (see the module docs, "Open, for the owner").
+    /// entry (see the module docs, "The vertex outputs' interpolation").
     pub interpolation: Option<Interpolation>,
 }
 
@@ -839,8 +841,11 @@ const fn flags(mask: Components<bool>) -> [bool; 4] {
     [mask.x, mask.y, mask.z, mask.w]
 }
 
-/// Each generic's interpolation (`CollectInterpolationInfo`).
-fn interpolation(io: &PixelIo) -> Result<[Interpolation; GENERICS as usize], InfoError> {
+/// Each generic's interpolation (`CollectInterpolationInfo`), or the lowest generic whose used
+/// components the input map gives different modes. Shared with the variant key, whose vertex
+/// outputs take the paired pixel program's modes
+/// ([`crate::variant::OutputInterpolation::from_pixel_io`]).
+pub(crate) fn interpolation(io: &PixelIo) -> Result<[Interpolation; GENERICS as usize], u8> {
     let mut out = [Interpolation::Smooth; GENERICS as usize];
     for ((generic, map), slot) in (0_u8..).zip(&io.generic).zip(&mut out) {
         let mut mode = None;
@@ -849,7 +854,7 @@ fn interpolation(io: &PixelIo) -> Result<[Interpolation; GENERICS as usize], Inf
                 continue;
             }
             if mode.is_some_and(|mode| mode != imap) {
-                return Err(InfoError::MixedInterpolation { generic });
+                return Err(generic);
             }
             mode = Some(imap);
         }
@@ -1120,7 +1125,9 @@ pub fn collect(
 ) -> Result<ShaderInfo, InfoError> {
     check_header(stage, header)?;
     let modes = match header.map(|h| &h.io) {
-        Some(Io::Pixel(io)) => Some(interpolation(io)?),
+        Some(Io::Pixel(io)) => {
+            Some(interpolation(io).map_err(|generic| InfoError::MixedInterpolation { generic })?)
+        }
         _ => None,
     };
     let mut walk = Walk::new();
