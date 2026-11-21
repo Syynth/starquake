@@ -70,8 +70,9 @@
 //! ([`GlobalMemoryError::Pass`]: an `Identity` chain that loops, an id with no instruction) is
 //! reported when the walk meets it, before those checks; and once every access has passed
 //! them, an arena without room for the replacements ([`BuildError::Full`];
-//! `tests::arena_room_edges`). After that the replacement cannot fail: [`Function::push`]
-//! refuses only a full arena.
+//! `tests::arena_room_edges` pins the decision, the pure `arena_fits`; no test reaches its
+//! call, which needs an arena of about 2^32 instructions). After that the replacement cannot
+//! fail: [`Function::push`] refuses only a full arena.
 //!
 //! # Where this pass departs from Eden's
 //!
