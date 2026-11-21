@@ -796,7 +796,11 @@ change a decision.
 7. **The shared page's request rate** and how long requests stay unanswered without the 1 ms
    bound. Decides whether the bound matters.
 8. **The semaphore mirror page (row 35):** with a correct GPU, is NVN2's wait satisfied without
-   copying releases? (#12's question, gsv provides the two-page list)
+   copying releases? (#12's question, gsv provides the two-page list) **Answered for now, no**
+   (2026-11-20): the first retail title brought up registers 0x2000 bytes, the GPU's releases land
+   in the second page and the CPU waits on the same offsets in the first; copying releases into
+   the first page, as Eden-NX2 does, gets it past the stall. The copy is the tentative ruling
+   (gpu-protocol, "What gsv provides"); a hardware trace would confirm or replace it.
 9. **nvsrv framing:** CMIF or TIPC. NX2 serves it with Eden's CMIF nvdrv; nothing shows the wire.
 10. **Syncpoint count and reserved ids** on Switch 2 (192 and 26/27 are Eden's Switch 1 values).
 11. **Who binds constant bank 24** (row 65).
