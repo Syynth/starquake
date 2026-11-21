@@ -497,3 +497,31 @@ structure:
         );
     }
 }
+
+/// Each phi block's walk back starts from fresh marks: block1's walk marks block0, and block3,
+/// later in the tree, names block0, which only that earlier walk reached. The marks are
+/// stamped per block, so block3 sees block0 unmarked and refuses it; one stamp shared by every
+/// block would leave block0 marked and accept the plain sequence.
+#[test]
+fn a_later_phi_block_does_not_see_an_earlier_blocks_marks() {
+    assert_eq!(
+        verify(
+            "block0:
+block1:
+    %0: u32 = Phi [block0: u32 0]
+block2:
+block3:
+    %1: u32 = Phi [block0: u32 0]
+structure:
+    block0
+    block1
+    block2
+    block3
+"
+        ),
+        Err(VerifyError::PhiNotPredecessor {
+            at: v(1),
+            block: b(0)
+        })
+    );
+}

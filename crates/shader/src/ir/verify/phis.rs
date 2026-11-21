@@ -57,12 +57,14 @@
 //! loop's exit, which stores one per `break` of the loop plus the end of its body: memory
 //! linear in the tree. Then each block that holds a phi is walked back once, marking each point
 //! it passes once (marks are stamped with the block's number, so nothing is allocated per
-//! block); the points it passes are the joins, starts and exits between it and the blocks
-//! before it. A hand-built tree can make that quadratic: with a run of k `if`s and no block
-//! between them, a phi in the k-th body walks back through k - 1 joins. The trees phis come
-//! from in a translation are the SSA rewrite's, which puts a block after every `if` and loop
-//! that is followed by anything but a block, a `return` or an `unreachable`
-//! (`opt::ssa`'s module docs, "Blocks are added where paths meet").
+//! block, and one block's marks are not seen by the next:
+//! `tests::a_later_phi_block_does_not_see_an_earlier_blocks_marks`); the points it passes are
+//! the joins, starts and exits between it and the blocks before it. A hand-built tree can make
+//! that quadratic: with a run of k `if`s and no block between them, a phi in the k-th body
+//! walks back through k - 1 joins. The trees phis come from in a translation are the SSA
+//! rewrite's, which puts a block after every `if` and loop that is followed by anything but a
+//! block, a `return` or an `unreachable` (`opt::ssa`'s module docs, "Blocks are added where
+//! paths meet").
 //!
 //! The walk recurses once per nesting level, which step 3 has bounded by [`MAX_NESTING`].
 
