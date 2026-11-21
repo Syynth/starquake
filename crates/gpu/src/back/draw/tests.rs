@@ -5140,3 +5140,88 @@ fn pixel_interpolation_reads_the_shader_crates_header() {
         OutputInterpolation::SMOOTH
     );
 }
+
+/// Program memory holding one header at one address; every other read is unmapped.
+struct OneHeader {
+    address: u64,
+    bytes: [u8; SPH_BYTES],
+}
+
+impl ProgramMemory for OneHeader {
+    fn read(&self, address: u64, out: &mut [u8]) -> Result<(), Unmapped> {
+        if address != self.address || out.len() != SPH_BYTES {
+            return Err(Unmapped { address });
+        }
+        out.copy_from_slice(&self.bytes);
+        Ok(())
+    }
+}
+
+impl OneHeader {
+    fn new(address: u64, words: [u32; SPH_WORDS]) -> Self {
+        let mut bytes = [0; SPH_BYTES];
+        for (chunk, word) in bytes.chunks_exact_mut(4).zip(words) {
+            chunk.copy_from_slice(&word.to_le_bytes());
+        }
+        Self { address, bytes }
+    }
+}
+
+/// [`PixelModes`](shaders::PixelModes) remembers only the last header's bytes: a header that
+/// differs from the last one is parsed again, whether it is new or one seen two draws ago, and
+/// a draw with no pixel request or an unmapped header gives smooth without touching the memo.
+#[test]
+fn pixel_modes_remember_only_the_last_header() {
+    use Interpolation::{Flat, NoPerspective, Smooth};
+    const ADDRESS: u64 = 0x4_0000;
+    let flat_words = pixel_header([
+        imap(IMAP_CONSTANT, IMAP_CONSTANT, IMAP_CONSTANT, IMAP_CONSTANT),
+        0,
+        0,
+        0,
+    ]);
+    let linear_words = pixel_header([
+        0,
+        imap(IMAP_SCREEN_LINEAR, IMAP_UNUSED, IMAP_UNUSED, IMAP_UNUSED),
+        0,
+        0,
+    ]);
+    let flat = modes([Flat, Smooth, Smooth, Smooth]);
+    let linear = modes([Smooth, NoPerspective, Smooth, Smooth]);
+    // A vertex request first, at another address, so a read of the first request fails.
+    let requests = [
+        ProgramRequest {
+            stage: GuestStage::Vertex,
+            address: ADDRESS + 0x1000,
+        },
+        ProgramRequest {
+            stage: GuestStage::Pixel,
+            address: ADDRESS,
+        },
+    ];
+    let mut memo = shaders::PixelModes::default();
+    let a = OneHeader::new(ADDRESS, flat_words);
+    let b = OneHeader::new(ADDRESS, linear_words);
+    // A, A, B, A, B: each change is seen at the draw that makes it.
+    for (memory, expected) in [
+        (&a, flat),
+        (&a, flat),
+        (&b, linear),
+        (&a, flat),
+        (&b, linear),
+    ] {
+        assert_eq!(memo.read(&requests, memory), expected);
+    }
+    // No pixel request, then an unmapped header: smooth, and the memo still holds B, so the
+    // next read of A is parsed and B is read from the memo afterwards.
+    assert_eq!(memo.read(&requests[..1], &b), OutputInterpolation::SMOOTH);
+    let elsewhere = OneHeader::new(ADDRESS + 0x2000, flat_words);
+    assert_eq!(
+        memo.read(&requests, &elsewhere),
+        OutputInterpolation::SMOOTH
+    );
+    assert_eq!(memo.read(&requests, &a), flat);
+    assert_eq!(memo.read(&requests, &b), linear);
+    // A fresh memo with B as its first header: nothing remembered gives B's own modes.
+    assert_eq!(shaders::PixelModes::default().read(&requests, &b), linear);
+}
