@@ -798,7 +798,7 @@ const fn union(a: Requirements, b: Requirements) -> Requirements {
 
 /// The size of one constant-buffer read of `opcode`, or `None` for other opcodes (Eden's
 /// `GetElementSize`).
-const fn cbuf_element_size(opcode: Opcode) -> Option<u32> {
+pub(crate) const fn cbuf_element_size(opcode: Opcode) -> Option<u32> {
     Some(match opcode {
         Opcode::GetCbufU8 | Opcode::GetCbufS8 => 1,
         Opcode::GetCbufU16 | Opcode::GetCbufS16 => 2,

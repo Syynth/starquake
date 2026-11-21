@@ -508,6 +508,14 @@ impl DescriptorBuffer {
         Self(None)
     }
 
+    /// The record a translation leaves after a constant-buffer handle in buffer `index`, with
+    /// the same check [`translate_instr`] makes ([`TextureUnsupported::DescriptorBuffer`] at or
+    /// past [`DESCRIPTOR_BUFFERS`]); for a caller that kept the buffer's number, such as the
+    /// texture pass's tests.
+    pub const fn bound(index: u8) -> Result<Self, TextureUnsupported> {
+        Self::new().bind(index)
+    }
+
     /// The buffer, once a constant-buffer handle has been translated.
     pub const fn index(self) -> Option<u8> {
         self.0

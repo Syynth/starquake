@@ -50,6 +50,7 @@ mod constant;
 mod dce;
 pub mod global_memory;
 mod identity;
+pub mod resources;
 mod ssa;
 #[cfg(test)]
 pub(crate) mod tests;
