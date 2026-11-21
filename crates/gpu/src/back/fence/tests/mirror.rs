@@ -386,6 +386,29 @@ fn a_waiter_on_the_copy_closes_the_open_list() {
     }
 }
 
+/// Each word of a wide copy is looked at: a waiter on only the last word of an 8-byte copy, or
+/// of a 16-byte one, closes the open list when the release is attached.
+#[test]
+fn a_waiter_on_a_wide_copys_last_word_closes_the_open_list() {
+    let address = SECOND + 0x10;
+    for (release, len) in [(eight(address, 7), 8), (sixteen(address, 7), 16)] {
+        let mut r = rig();
+        let m = mirrored(&r);
+        let last = address - SEMAPHORE_MIRROR_OFFSET + len - 4;
+        r.waiters.register(Waiter {
+            space: SPACE,
+            channel: ChannelId(3),
+            address: last,
+            op: AcquireOp::Equal,
+            payload: 7,
+        });
+        r.fences.record(command(1)).unwrap();
+        let attached = r.fences.attach(m.action(release)).unwrap();
+        assert!(matches!(attached, Attached::InFlight(_)), "{len}");
+        assert_eq!(r.fences.counters().closed.waiter, 1, "{len}");
+    }
+}
+
 /// A pending release whose copy writes a byte of the range is settled; a range right after the
 /// copy (and away from the release) has nothing pending.
 #[test]

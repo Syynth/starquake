@@ -76,9 +76,10 @@
 //! **Tentative** (decision log, 2026-11-20, "The semaphore mirror page: copy releases, as
 //! Eden-NX2 does"; graphics-server, "The semaphore mirror page", verification item 8). gsv tells
 //! the GPU which registrations are two pages long: each address space's table lists every
-//! registration of exactly 0x2000 bytes (`starquake_gpu::vm::SemaphoreRegistration::new`, NX2's
-//! `last - start + 1 == 0x2000` in `SubRegisterMemory`,
-//! `eden-nx2/src/core/hle/service/nx2_gsv.h` @ 50fa86bb), and the GPU copies a fenced release
+//! registration of exactly 0x2000 bytes that does not start at address 0
+//! (`starquake_gpu::vm::SemaphoreRegistration::new`, NX2's `last - start + 1 == 0x2000` in
+//! `SubRegisterMemory`, `eden-nx2/src/core/hle/service/nx2_gsv.h` @ 50fa86bb; 0 is NX2's empty
+//! slot, which it never stores), and the GPU copies a fenced release
 //! that lands in the second page of one into its first page (`starquake_gpu::vm`, its `mirror`
 //! submodule). When each table learns of it:
 //!
@@ -364,7 +365,9 @@ impl Admission<'_> {
     }
 
     /// 101 after the kernel's checks: records the registration with its lock's token, maps it
-    /// at its own address in every address space, and returns its handle.
+    /// at its own address in every address space, lists it in every address space's table for
+    /// the semaphore mirror page when it is two pages long (module docs, "The semaphore mirror
+    /// page"), and returns its handle.
     pub fn register(self, token: DeviceShareToken) -> u32 {
         let Self {
             memory,

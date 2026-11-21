@@ -1,8 +1,10 @@
 //! The semaphore mirror page through the threads (tentative, decision log 2026-11-20): gsv
 //! lists a two-page registration in the table it gives the GPU, and a host `SEMAPHORED` release
 //! into its second page reaches its first page, where a GPU acquire on another channel sees it.
+//! A 3D class report semaphore release, not a `SEMAPHORED` one, is copied too.
 
 use super::*;
+use crate::field::Field;
 use crate::vm::{SEMAPHORE_MIRROR_OFFSET, SEMAPHORE_REGISTRATION_BYTES, SemaphoreRegistration};
 
 /// The two-page registration: inside the rig's mapping, clear of its command buffers, frame and
@@ -71,5 +73,64 @@ fn an_acquire_on_the_first_page_is_met_by_a_release_into_the_second() {
         )]),
     );
     wait_until("the waiting channel releases", || r.word(SEM) == 0x99);
+    r.gpu.stop().unwrap();
+}
+
+/// A stream that binds the 3D class and makes a one-word payload report (`SET_REPORT_SEMAPHORE_A`
+/// to `D`, `REPORT_NONE`) of `payload` at `address`.
+fn reports(address: u64, payload: u32) -> Vec<u32> {
+    let query = [
+        (
+            clc797::SET_REPORT_SEMAPHORE_D_OPERATION,
+            clc797::SET_REPORT_SEMAPHORE_D_OPERATION_RELEASE,
+        ),
+        (
+            clc797::SET_REPORT_SEMAPHORE_D_REPORT,
+            clc797::SET_REPORT_SEMAPHORE_D_REPORT_NONE,
+        ),
+        (
+            clc797::SET_REPORT_SEMAPHORE_D_STRUCTURE_SIZE,
+            clc797::SET_REPORT_SEMAPHORE_D_STRUCTURE_SIZE_ONE_WORD,
+        ),
+    ]
+    .iter()
+    .fold(0, |word, &(field, value): &(Field, u32)| {
+        field.insert(word, value).unwrap()
+    });
+    let mut pb = PushBuffer::new();
+    bind_3d(&mut pb);
+    pb.methods(
+        MethodMode::Incrementing,
+        0,
+        m(clc797::SET_REPORT_SEMAPHORE_A.method()),
+        &[
+            u32::try_from(address >> 32).unwrap(),
+            u32::try_from(address & 0xffff_ffff).unwrap(),
+            payload,
+            query,
+        ],
+    )
+    .unwrap();
+    pb.into_words()
+}
+
+/// The fence path copies every fenced release, not only NX2's `SEMAPHORED` one (`back::fence`,
+/// "The semaphore mirror page"): a 3D report semaphore release into the second page reaches the
+/// first.
+#[test]
+fn a_3d_report_release_into_the_second_page_reaches_the_first() {
+    let r = rig();
+    list(&r);
+    r.space();
+    let channel = r.channel();
+    let release = REGISTRATION + SEMAPHORE_MIRROR_OFFSET + 0x20;
+    r.gpu.submit(
+        channel,
+        plain(vec![r.entry(CMD, &reports(release, 0x5150_4344))]),
+    );
+    wait_until("the copy is written", || {
+        r.word(REGISTRATION + 0x20) == 0x5150_4344
+    });
+    assert_eq!(r.word(release), 0x5150_4344);
     r.gpu.stop().unwrap();
 }

@@ -55,7 +55,8 @@
 //!   covers two words and a 16-byte one four, and each is looked at
 //!   (`a_waiter_on_a_wide_releases_high_word_closes_the_open_list`), and so is each word of its
 //!   copy into a semaphore mirror page ("The semaphore mirror page" below;
-//!   `mirror::a_waiter_on_the_copy_closes_the_open_list`);
+//!   `mirror::a_waiter_on_the_copy_closes_the_open_list`,
+//!   `mirror::a_waiter_on_a_wide_copys_last_word_closes_the_open_list`);
 //! - [`CLOSE_AFTER`] (1 ms, a **guess**, so that a CPU spinning on a semaphore is not starved)
 //!   of recording ([`CloseReason::Elapsed`]): [`Fences::record`] measures from the open list's
 //!   first command, on [`FenceClock::elapsed`], and closes once a command is recorded at or past
@@ -156,14 +157,21 @@
 //! [`Report::failed`]; the release itself still counts in [`Report::released`], and the copy is
 //! not counted there (`mirror::a_copy_that_faults_is_reported_at_the_copys_address`).
 //!
-//! Divergences from Eden-NX2, each pinned by the test of `fence/tests/mirror.rs` named:
+//! Divergences from Eden-NX2, each pinned by the test named (of `fence/tests/mirror.rs` unless a
+//! path says otherwise):
 //!
 //! - **Every fenced release is copied.** NX2 copies only the host class's `SEMAPHORED` release
 //!   (`ProcessSemaphoreTriggerMethod`, `WriteLong`), not a `SEM_EXECUTE` release
 //!   (`ProcessSemaphoreExecute`), a 3D report semaphore or a QMD release. The ruling says "a
-//!   fenced release", and the copy is made where every kind is performed, so every form is
-//!   copied (`every_release_form_is_copied`; through the threads, a `SEMAPHORED` release:
-//!   `wiring::tests::mirror`).
+//!   fenced release", and the copy is made here, where every kind is performed: the three
+//!   attach sites of `back::exec` (the ring's host semaphore releases, 3D reports, and the
+//!   releases an engine's work hands its sink, QMD releases among them) each build the same
+//!   [`FencedAction::Release`]. `every_release_form_is_copied` pins the forms (4 and 8
+//!   bytes, 4 with a timestamp, 16), built at this layer; through the threads,
+//!   `wiring::tests::mirror` copies a `SEMAPHORED` release
+//!   (`a_release_into_the_second_page_reaches_the_first_through_the_threads`) and a 3D report
+//!   semaphore release (`a_3d_report_release_into_the_second_page_reaches_the_first`). No test
+//!   copies a `SEM_EXECUTE` or QMD release.
 //! - **A reduction's result is copied**, not reduced again at the copy; NX2's copied path has
 //!   no reduction (`a_reductions_result_is_copied`).
 //! - **The copy has the release's timestamp.** NX2 queries the mirror on its own, which reads

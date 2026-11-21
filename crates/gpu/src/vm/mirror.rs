@@ -33,7 +33,8 @@
 //! # What lives here
 //!
 //! gsv decides which registrations are two pages long ([`SemaphoreRegistration::new`], which
-//! only a range of exactly [`SEMAPHORE_REGISTRATION_BYTES`] passes) and tells each address
+//! only a range of exactly [`SEMAPHORE_REGISTRATION_BYTES`] that does not start at address 0
+//! passes) and tells each address
 //! table when one is made or destroyed ([`crate::vm::GpuVm::add_semaphore_registration`],
 //! [`crate::vm::GpuVm::remove_semaphore_registration`]). The table answers
 //! [`crate::vm::GpuVm::semaphore_mirror`], which the production memory
@@ -66,7 +67,18 @@
 //! - **One list per address table.** NX2's list is one per emulator; here each table holds the
 //!   registrations, which gsv maps into every address space of the process (row 30), so a
 //!   process's tables answer the same. A table gsv destroys is emptied
-//!   ([`crate::vm::GpuVm::clear_semaphore_registrations`]): gsv's address space destroy.
+//!   ([`crate::vm::GpuVm::clear_semaphore_registrations`]): gsv's address space destroy. This
+//!   one is pinned by gsv's tests, not by a test here: `gpu::tests::mirror::
+//!   a_two_page_registration_is_listed_in_every_space` and
+//!   `gpu::tests::mirror::a_destroyed_space_lists_nothing` (`crates/gsv`).
+//!
+//! # As in Eden-NX2
+//!
+//! - **A registration at address 0 is not listed.** In NX2, 0 is an empty slot:
+//!   `Nx2AddSemaphoreRegion(0)` finds an empty slot already "holding" 0 and stores nothing,
+//!   `Nx2SemaphoreMirror` skips a slot whose start is 0, and its answer 0 means "no mirror". So
+//!   [`SemaphoreRegistration::new`] refuses a range that starts at 0, and gsv lists nothing for
+//!   such a 101 (`a_registration_at_address_0_is_not_a_semaphore_registration`).
 //! - **Removing a start never added changes nothing**, as in NX2 (its `compare_exchange`
 //!   finds no slot) (`removing_a_start_never_added_changes_nothing`).
 
@@ -97,10 +109,12 @@ pub struct SemaphoreRegistration {
 
 impl SemaphoreRegistration {
     /// The registration of `range` when it is exactly [`SEMAPHORE_REGISTRATION_BYTES`] long (NX2
-    /// `SubRegisterMemory`: `last - start + 1 == 0x2000`), or `None`.
+    /// `SubRegisterMemory`: `last - start + 1 == 0x2000`) and does not start at address 0 (NX2's
+    /// empty slot, which `Nx2AddSemaphoreRegion` never stores and `Nx2SemaphoreMirror` skips;
+    /// module docs, "As in Eden-NX2"), or `None`.
     #[must_use]
     pub fn new(range: PageRange) -> Option<Self> {
-        (range.size() == SEMAPHORE_REGISTRATION_BYTES).then_some(Self {
+        (range.size() == SEMAPHORE_REGISTRATION_BYTES && range.start() != 0).then_some(Self {
             start: range.start(),
         })
     }

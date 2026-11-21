@@ -56,6 +56,18 @@ fn only_a_registration_of_exactly_two_pages_is_a_semaphore_registration() {
     );
 }
 
+/// NX2's empty slot: a two-page registration at address 0 is not one, and the lowest start that
+/// is, one page up, is (module docs, "As in Eden-NX2").
+#[test]
+fn a_registration_at_address_0_is_not_a_semaphore_registration() {
+    let bytes = SEMAPHORE_REGISTRATION_BYTES;
+    assert_eq!(SemaphoreRegistration::new(range(0, bytes)), None);
+    assert_eq!(
+        SemaphoreRegistration::new(range(PAGE_SIZE, bytes)).map(SemaphoreRegistration::start),
+        Some(PAGE_SIZE)
+    );
+}
+
 /// Each edge of the second page, on both sides, and a release in the first page.
 #[test]
 fn a_release_is_mirrored_from_exactly_the_second_page() {
@@ -157,12 +169,15 @@ fn more_than_32_registrations_all_mirror() {
     }
 }
 
-/// The lowest and highest registrations a `PageRange` allows: no lookup wraps.
+/// The lowest registration [`SemaphoreRegistration::new`] allows (one page up: address 0 is
+/// NX2's empty slot) and the highest a `PageRange` allows: no lookup wraps.
 #[test]
 fn lookups_at_the_ends_of_the_address_space_do_not_wrap() {
-    let low = listing(&[0]);
+    let low = listing(&[PAGE_SIZE]);
+    let second = PAGE_SIZE + SEMAPHORE_MIRROR_OFFSET;
     assert_eq!(low.mirror_of(SEMAPHORE_MIRROR_OFFSET - 1), None);
-    assert_eq!(low.mirror_of(SEMAPHORE_MIRROR_OFFSET), Some(0));
+    assert_eq!(low.mirror_of(second - 1), None);
+    assert_eq!(low.mirror_of(second), Some(PAGE_SIZE));
     assert_eq!(low.mirror_of(u64::MAX), None);
 
     // The highest start of a two-page `PageRange`: its end, the last page's start, is
