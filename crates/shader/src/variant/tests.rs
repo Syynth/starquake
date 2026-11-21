@@ -4,6 +4,7 @@
 use proptest::prelude::*;
 
 use super::*;
+use crate::sph::{Components, PixelImap, SystemValuesD};
 use crate::testing::config;
 
 const GOLDEN_SWIZZLES: [Swizzle; 2] = [
@@ -79,13 +80,18 @@ fn golden_key() -> VariantKey {
         typed_outputs: true,
         flipped_viewport: true,
     };
+    let mut modes = [Interpolation::Smooth; OUTPUT_GENERICS];
+    for (index, mode) in modes.iter_mut().enumerate() {
+        *mode = [Interpolation::Flat, Interpolation::NoPerspective][index % 2];
+    }
+    key.output_interpolation = OutputInterpolation::new(modes);
     key.texture_swizzles = TextureSwizzles::new(GOLDEN_SWIZZLES.to_vec()).expect("two");
     key
 }
 
 #[rustfmt::skip]
-const GOLDEN_BYTES: [u8; 201] = [
-    0x03, // version
+const GOLDEN_BYTES: [u8; 233] = [
+    0x04, // version
     // vertex attribute types
     1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1,
     2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2,
@@ -118,6 +124,9 @@ const GOLDEN_BYTES: [u8; 201] = [
     0x07, // alpha test: greater or equal (6) plus one
     // depth range, primitive restart, attribute fetch, typed outputs, flipped viewport
     0x01, 0x01, 0x01, 0x01, 0x01,
+    // output interpolation of generics 0 to 31: flat, no perspective, alternating
+    1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2,
+    1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2,
     0x02, // swizzle count
     4, 7, 2, 6, // swizzle 0: B, one (float), R, one (int)
     5, 3, 7, 4, // swizzle 1: A, G, one (float), B
@@ -125,16 +134,17 @@ const GOLDEN_BYTES: [u8; 201] = [
 
 #[test]
 fn layout_constants() {
-    assert_eq!(VARIANT_KEY_VERSION, 3);
+    assert_eq!(VARIANT_KEY_VERSION, 4);
     assert_eq!(VERTEX_ATTRIBUTES, 32);
+    assert_eq!(OUTPUT_GENERICS, 32);
     assert_eq!(MAX_TEXTURE_SWIZZLES, 192);
     assert_eq!(ATTRIBUTE_WORDS, 256);
     assert_eq!(ATTRIBUTE_MASK_LANES, 4);
     assert_eq!(FOLLOWING_STAGES, 4);
     assert_eq!(FollowingStage::ALL.len(), FOLLOWING_STAGES);
     assert_eq!(SWIZZLE_SIZE, 4);
-    assert_eq!(VARIANT_KEY_FIXED_SIZE, 193);
-    assert_eq!(VARIANT_KEY_MAX_SIZE, 193 + 192 * 4);
+    assert_eq!(VARIANT_KEY_FIXED_SIZE, 225);
+    assert_eq!(VARIANT_KEY_MAX_SIZE, 225 + 192 * 4);
 }
 
 #[test]
@@ -147,7 +157,7 @@ fn golden_bytes() {
 fn the_default_key_decodes_from_zeros() {
     // Hand-built: the version, then every field zero and no swizzles.
     let mut bytes = vec![0; VARIANT_KEY_FIXED_SIZE];
-    bytes[0] = 3;
+    bytes[0] = 4;
     assert_eq!(VariantKey::decode(&bytes), Ok(VariantKey::default()));
     assert_eq!(VariantKey::default().encode(), bytes);
 }
@@ -177,6 +187,14 @@ fn defaults() {
             flipped_viewport: false,
         }
     );
+    // Eden's value-initialised `Info::interpolation`: every generic `Smooth`, the first
+    // enumerator (shader_info.h).
+    assert_eq!(
+        fresh.output_interpolation.modes(),
+        [Interpolation::Smooth; 32]
+    );
+    assert_eq!(fresh.output_interpolation, OutputInterpolation::SMOOTH);
+    assert_eq!(OutputInterpolation::default(), OutputInterpolation::SMOOTH);
     assert_eq!(fresh.texture_swizzles.as_slice().len(), 0);
 }
 
@@ -219,10 +237,11 @@ fn any_key() -> impl Strategy<Value = VariantKey> {
         prop::array::uniform3(any::<u32>()),
         any::<u32>(),
         emulation,
+        prop::array::uniform32(any_coded(&INTERPOLATION_MODES)),
         prop::collection::vec(any_swizzle(), 0..=MAX_TEXTURE_SWIZZLES),
     )
         .prop_map(
-            |(attributes, colors, dual, lanes, workgroup, shared, emulation, swizzles)| {
+            |(attributes, colors, dual, lanes, workgroup, shared, emulation, modes, swizzles)| {
                 VariantKey {
                     vertex_attributes: attributes,
                     color_targets: colors,
@@ -236,6 +255,7 @@ fn any_key() -> impl Strategy<Value = VariantKey> {
                     workgroup_size: workgroup,
                     shared_memory_size: shared,
                     emulation,
+                    output_interpolation: OutputInterpolation::new(modes),
                     texture_swizzles: TextureSwizzles::new(swizzles).expect("within the cap"),
                 }
             },
@@ -279,8 +299,9 @@ fn the_version_is_checked_first() {
         })
     );
     // Another version with a truncated body: the version is reported (1 is the version
-    // before the flipped-viewport switch, 2 the one before the previous stages' stores).
-    for found in [0, 1, 2, 4, u8::MAX] {
+    // before the flipped-viewport switch, 2 the one before the previous stages' stores, 3 the
+    // one before the output interpolation).
+    for found in [0, 1, 2, 3, 5, u8::MAX] {
         assert_eq!(
             VariantKey::decode(&[found]),
             Err(KeyError::Version { found })
@@ -295,7 +316,7 @@ fn the_version_is_checked_first() {
     );
     assert_eq!(
         KeyError::Version { found: 1 }.to_string(),
-        "variant key version 1 is not supported; this build reads version 3"
+        "variant key version 1 is not supported; this build reads version 4"
     );
     // The right version with nothing after it.
     assert_eq!(
@@ -357,30 +378,33 @@ fn every_prefix_is_truncated_in_the_right_field() {
         (189, KeyField::AttributeFetch),
         (190, KeyField::TypedOutputs),
         (191, KeyField::FlippedViewport),
-        (192, KeyField::SwizzleCount),
+        (192, KeyField::OutputInterpolation(0)),
+        (193, KeyField::OutputInterpolation(1)),
+        (223, KeyField::OutputInterpolation(31)),
+        (224, KeyField::SwizzleCount),
         (
-            193,
+            225,
             KeyField::Swizzle {
                 binding: 0,
                 component: 0,
             },
         ),
         (
-            196,
+            228,
             KeyField::Swizzle {
                 binding: 0,
                 component: 3,
             },
         ),
         (
-            197,
+            229,
             KeyField::Swizzle {
                 binding: 1,
                 component: 0,
             },
         ),
         (
-            200,
+            232,
             KeyField::Swizzle {
                 binding: 1,
                 component: 3,
@@ -434,8 +458,11 @@ fn each_coded_field_accepts_its_last_code_and_refuses_the_next() {
         (189, KeyField::AttributeFetch, 1, 2),
         (190, KeyField::TypedOutputs, 1, 2),
         (191, KeyField::FlippedViewport, 1, 2),
+        (192, KeyField::OutputInterpolation(0), 2, 3),
+        (193, KeyField::OutputInterpolation(1), 2, 3),
+        (223, KeyField::OutputInterpolation(31), 2, 3),
         (
-            193,
+            225,
             KeyField::Swizzle {
                 binding: 0,
                 component: 0,
@@ -444,7 +471,7 @@ fn each_coded_field_accepts_its_last_code_and_refuses_the_next() {
             8,
         ),
         (
-            200,
+            232,
             KeyField::Swizzle {
                 binding: 1,
                 component: 3,
@@ -516,8 +543,20 @@ fn the_codes_inside_each_set() {
             Ok(true)
         );
     }
+    // Each interpolation code lands in its own generic, and no other.
+    for (code, mode) in [
+        (0, Interpolation::Smooth),
+        (1, Interpolation::Flat),
+        (2, Interpolation::NoPerspective),
+    ] {
+        let key = VariantKey::decode(&patched(193, code)).expect("valid");
+        assert_eq!(key.output_interpolation.get(1), Some(mode), "code {code}");
+        let mut expected = golden_key().output_interpolation.modes();
+        expected[1] = mode;
+        assert_eq!(key.output_interpolation.modes(), expected, "code {code}");
+    }
     assert_eq!(
-        zero(193).map(|key| key.texture_swizzles.as_slice()[0].x),
+        zero(225).map(|key| key.texture_swizzles.as_slice()[0].x),
         Ok(SwizzleSource::Zero)
     );
     let field = KeyField::Swizzle {
@@ -525,7 +564,7 @@ fn the_codes_inside_each_set() {
         component: 0,
     };
     assert_eq!(
-        VariantKey::decode(&patched(193, 1)),
+        VariantKey::decode(&patched(225, 1)),
         Err(KeyError::InvalidValue { field, value: 1 })
     );
     assert_eq!(
@@ -538,7 +577,8 @@ fn the_codes_inside_each_set() {
 fn the_first_invalid_field_is_reported() {
     let mut bytes = patched(33, 3);
     bytes[187] = 2;
-    bytes[200] = 1;
+    bytes[192] = 3;
+    bytes[232] = 1;
     assert_eq!(
         VariantKey::decode(&bytes),
         Err(KeyError::InvalidValue {
@@ -552,6 +592,36 @@ fn the_first_invalid_field_is_reported() {
         Err(KeyError::InvalidValue {
             field: KeyField::DualSourceBlend,
             value: 2
+        })
+    );
+    // An invalid flipped-viewport switch before an invalid interpolation, and an invalid
+    // interpolation before an invalid swizzle: the earlier field each time.
+    let mut bytes = patched(191, 2);
+    bytes[192] = 3;
+    assert_eq!(
+        VariantKey::decode(&bytes),
+        Err(KeyError::InvalidValue {
+            field: KeyField::FlippedViewport,
+            value: 2
+        })
+    );
+    let mut bytes = patched(223, 3);
+    bytes[225] = 1;
+    assert_eq!(
+        VariantKey::decode(&bytes),
+        Err(KeyError::InvalidValue {
+            field: KeyField::OutputInterpolation(31),
+            value: 3
+        })
+    );
+    // Two invalid interpolations: the lower generic.
+    let mut bytes = patched(194, 3);
+    bytes[193] = 4;
+    assert_eq!(
+        VariantKey::decode(&bytes),
+        Err(KeyError::InvalidValue {
+            field: KeyField::OutputInterpolation(1),
+            value: 4
         })
     );
 }
@@ -604,7 +674,7 @@ fn the_swizzle_cap_at_its_edge() {
 fn the_swizzle_count_is_checked_before_the_swizzles() {
     // A count past the cap and too few bytes for it: the count is reported.
     let count = u8::try_from(MAX_TEXTURE_SWIZZLES + 1).expect("fits");
-    let bytes = patched(192, count);
+    let bytes = patched(224, count);
     assert_eq!(
         VariantKey::decode(&bytes),
         Err(KeyError::TooManySwizzles {
@@ -613,7 +683,7 @@ fn the_swizzle_count_is_checked_before_the_swizzles() {
     );
     // A count within the cap and too few bytes: the swizzle it ends in.
     assert_eq!(
-        VariantKey::decode(&patched(192, 3)),
+        VariantKey::decode(&patched(224, 3)),
         Err(KeyError::Truncated {
             field: KeyField::Swizzle {
                 binding: 2,
@@ -624,7 +694,7 @@ fn the_swizzle_count_is_checked_before_the_swizzles() {
     );
     // A count below what follows: the rest is trailing.
     assert_eq!(
-        VariantKey::decode(&patched(192, 1)),
+        VariantKey::decode(&patched(224, 1)),
         Err(KeyError::TrailingBytes {
             end: GOLDEN_BYTES.len() - SWIZZLE_SIZE,
             len: GOLDEN_BYTES.len()
@@ -644,8 +714,8 @@ fn trailing_bytes_are_refused() {
         })
     );
     assert_eq!(
-        KeyError::TrailingBytes { end: 201, len: 202 }.to_string(),
-        "the variant key ends at byte 201, but 202 bytes were given"
+        KeyError::TrailingBytes { end: 233, len: 234 }.to_string(),
+        "the variant key ends at byte 233, but 234 bytes were given"
     );
 }
 
@@ -712,6 +782,17 @@ fn code_tables_match_the_references() {
             (CompareFunction::NotEqual, 5),
             (CompareFunction::GreaterThanEqual, 6),
             (CompareFunction::Always, 7),
+        ],
+    );
+    // Eden `Interpolation`, in declaration order (shader_info.h).
+    check_codes(
+        &INTERPOLATION_MODES,
+        interpolation_code,
+        interpolation_from_code,
+        &[
+            (Interpolation::Smooth, 0),
+            (Interpolation::Flat, 1),
+            (Interpolation::NoPerspective, 2),
         ],
     );
     // `NVC797_TEXHEAD_BL_X_SOURCE_IN_*` (clc797tex.h).
@@ -866,6 +947,14 @@ fn key_field_names_are_plain_words() {
         (KeyField::AttributeFetch, "the attribute fetch switch"),
         (KeyField::TypedOutputs, "the typed outputs switch"),
         (KeyField::FlippedViewport, "the flipped-viewport switch"),
+        (
+            KeyField::OutputInterpolation(0),
+            "the output interpolation of generic attribute 0",
+        ),
+        (
+            KeyField::OutputInterpolation(31),
+            "the output interpolation of generic attribute 31",
+        ),
         (KeyField::SwizzleCount, "the texture swizzle count"),
         (
             KeyField::Swizzle {
@@ -1018,4 +1107,172 @@ fn the_key_changes_with_the_stores_and_not_otherwise() {
     };
     assert_ne!(moved, base);
     assert_ne!(moved.encode(), base.encode());
+}
+
+/// A pixel header's input map with `generic`'s four components set to `modes`.
+fn pixel_io(generics: &[(usize, [PixelImap; 4])]) -> PixelIo {
+    let mut io = PixelIo::default();
+    for &(generic, [x, y, z, w]) in generics {
+        io.generic[generic] = Components { x, y, z, w };
+    }
+    io
+}
+
+#[test]
+fn output_interpolation_follows_the_pixel_input_map() {
+    use PixelImap::{Constant, Perspective, ScreenLinear, Unused};
+    // Each mode in all four components, each with some components unused, and generic 31
+    // (the last) flat; every other generic unused.
+    let io = pixel_io(&[
+        (0, [Perspective; 4]),
+        (1, [Constant; 4]),
+        (2, [ScreenLinear; 4]),
+        (3, [Unused, Constant, Unused, Constant]),
+        (4, [Unused, Unused, Unused, ScreenLinear]),
+        (5, [Perspective, Unused, Unused, Unused]),
+        (31, [Constant, Unused, Unused, Unused]),
+    ]);
+    let modes = OutputInterpolation::from_pixel_io(&io).expect("one mode per generic");
+    let mut expected = [Interpolation::Smooth; OUTPUT_GENERICS];
+    expected[1] = Interpolation::Flat;
+    expected[2] = Interpolation::NoPerspective;
+    expected[3] = Interpolation::Flat;
+    expected[4] = Interpolation::NoPerspective;
+    expected[31] = Interpolation::Flat;
+    assert_eq!(modes.modes(), expected);
+    // Golden: the key's bytes for the output interpolation (offsets 192 to 223).
+    let key = VariantKey {
+        output_interpolation: modes,
+        ..VariantKey::default()
+    };
+    let bytes = key.encode();
+    #[rustfmt::skip]
+    let golden: [u8; 32] = [
+        0, 1, 2, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+    ];
+    assert_eq!(bytes[192..224], golden);
+    assert_eq!(VariantKey::decode(&bytes), Ok(key));
+    // Nothing used: every generic smooth.
+    assert_eq!(
+        OutputInterpolation::from_pixel_io(&PixelIo::default()),
+        Ok(OutputInterpolation::SMOOTH)
+    );
+}
+
+#[test]
+fn output_interpolation_reads_only_the_generics() {
+    use PixelImap::Constant;
+    // The legacy colours and texture coordinates and the system values are not generics
+    // (module docs, "Not covered"): flat in all of them leaves every generic smooth.
+    let mut io = PixelIo::default();
+    let flat = Components {
+        x: Constant,
+        y: Constant,
+        z: Constant,
+        w: Constant,
+    };
+    io.color = io.color.map(|_| flat);
+    io.texture = io.texture.map(|_| flat);
+    io.system_values_d = SystemValuesD {
+        viewport_mask: Constant,
+        viewport_mask2: Constant,
+        barycentric: io.system_values_d.barycentric.map(|_| Constant),
+        barycentric_w: io.system_values_d.barycentric_w.map(|_| Constant),
+    };
+    assert_eq!(
+        OutputInterpolation::from_pixel_io(&io),
+        Ok(OutputInterpolation::SMOOTH)
+    );
+}
+
+#[test]
+fn mixed_interpolation_is_refused_lowest_generic_first() {
+    use PixelImap::{Constant, Perspective, ScreenLinear, Unused};
+    // One generic with two used modes: refused, with unused components around them.
+    for (generic, map) in [
+        (0, [Perspective, Constant, Perspective, Perspective]),
+        (7, [Unused, ScreenLinear, Unused, Perspective]),
+        (31, [Constant, Unused, Unused, ScreenLinear]),
+    ] {
+        let io = pixel_io(&[(generic, map)]);
+        assert_eq!(
+            OutputInterpolation::from_pixel_io(&io),
+            Err(KeyError::MixedInterpolation {
+                generic: u8::try_from(generic).expect("fits"),
+            }),
+            "generic {generic}"
+        );
+    }
+    // Two mixed generics, the higher one listed first: the lower is reported.
+    let io = pixel_io(&[
+        (9, [Constant, ScreenLinear, Unused, Unused]),
+        (4, [Perspective, Unused, Constant, Unused]),
+    ]);
+    assert_eq!(
+        OutputInterpolation::from_pixel_io(&io),
+        Err(KeyError::MixedInterpolation { generic: 4 })
+    );
+    assert_eq!(
+        KeyError::MixedInterpolation { generic: 4 }.to_string(),
+        "the pixel program interpolates generic attribute 4 differently per component"
+    );
+    assert_eq!(
+        KeyError::MixedInterpolation { generic: 0 }.to_string(),
+        "the pixel program interpolates generic attribute 0 differently per component"
+    );
+}
+
+#[test]
+fn output_interpolation_gets_each_generic_and_none_past_the_last() {
+    let mut modes = [Interpolation::Smooth; OUTPUT_GENERICS];
+    modes[0] = Interpolation::Flat;
+    modes[OUTPUT_GENERICS - 1] = Interpolation::NoPerspective;
+    let output = OutputInterpolation::new(modes);
+    assert_eq!(output.get(0), Some(Interpolation::Flat));
+    assert_eq!(output.get(1), Some(Interpolation::Smooth));
+    let last = u8::try_from(OUTPUT_GENERICS - 1).expect("fits");
+    assert_eq!(output.get(last), Some(Interpolation::NoPerspective));
+    assert_eq!(output.get(last + 1), None);
+    assert_eq!(output.get(u8::MAX), None);
+    assert_eq!(output.modes(), modes);
+}
+
+#[test]
+fn the_key_changes_with_the_output_interpolation_and_not_otherwise() {
+    use PixelImap::{Constant, Perspective, ScreenLinear, Unused};
+    let key = |io: &PixelIo| VariantKey {
+        output_interpolation: OutputInterpolation::from_pixel_io(io).expect("valid"),
+        ..golden_key()
+    };
+    let base = key(&pixel_io(&[(2, [Perspective; 4]), (6, [Constant; 4])]));
+    // The same modes with other components used or unused, and an unused generic made
+    // perspective (smooth either way): the same key and bytes.
+    let same = key(&pixel_io(&[
+        (2, [Perspective, Unused, Unused, Unused]),
+        (6, [Unused, Constant, Constant, Unused]),
+        (11, [Perspective; 4]),
+    ]));
+    assert_eq!(same, base);
+    assert_eq!(same.encode(), base.encode());
+    // A pixel header that differs outside the input map's generics: the same key.
+    let mut other = pixel_io(&[(2, [Perspective; 4]), (6, [Constant; 4])]);
+    other.writes_depth = true;
+    other.texture[0].x = ScreenLinear;
+    assert_eq!(key(&other), base);
+    // Each generic's mode changed alone: a different key.
+    for (generic, map) in [
+        (2, [Constant; 4]),
+        (2, [ScreenLinear; 4]),
+        (6, [Perspective; 4]),
+        (6, [ScreenLinear; 4]),
+        (0, [Constant; 4]),
+    ] {
+        let mut io = pixel_io(&[(2, [Perspective; 4]), (6, [Constant; 4])]);
+        let [x, y, z, w] = map;
+        io.generic[generic] = Components { x, y, z, w };
+        let changed = key(&io);
+        assert_ne!(changed, base, "generic {generic}");
+        assert_ne!(changed.encode(), base.encode(), "generic {generic}");
+    }
 }

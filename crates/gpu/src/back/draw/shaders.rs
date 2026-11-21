@@ -107,6 +107,38 @@
 //!   draw looks it up with the learned ones.
 //!   `tests::stores_are_not_learned_from_a_waited_set`.
 //!
+//! # The vertex outputs' interpolation
+//!
+//! The vertex stage's outputs take the paired pixel program's interpolation modes
+//! ([`VariantKey::output_interpolation`]; shader-pipeline, "Pipeline-state specialisation", the
+//! named exception; decided by the owner, 2026-11-20, ruling 2): wgpu refuses a pipeline whose
+//! vertex outputs and fragment inputs differ in interpolation, and only the pixel program's
+//! header gives the mode. Unlike the stores above, the mode is a fact of the pixel program's
+//! header, not of its translation, so the draw path reads it before the first lookup: each draw
+//! reads the 128-byte header ([`starquake_shader::sph::HEADER_BYTES`]) at the pixel request's address and parses it
+//! with the shader crate's parser, reduced per generic attribute by
+//! [`OutputInterpolation::from_pixel_io`] ([`pixel_interpolation`]). [`PixelModes`] remembers the
+//! last header and its modes, so a draw whose header bytes are unchanged parses nothing; the
+//! bytes are read and compared every draw, so a program rewritten in place is seen at the next
+//! draw (`tests::the_pixel_programs_interpolation_reaches_the_key`).
+//!
+//! The key holds [`OutputInterpolation::SMOOTH`] (every generic smooth, Eden's value-initialised
+//! `Info::interpolation`) when:
+//!
+//! - the requests have no pixel program (rasterisation off, step 3 of the draw path);
+//! - the header is not mapped;
+//! - the bytes are not a pixel header the shader crate reads (a `HeaderError`, or a type 1
+//!   header in the pixel slot);
+//! - the header gives a generic two modes ([`starquake_shader::variant::KeyError::MixedInterpolation`]).
+//!
+//! The draw still looks the set up rather than failing: the shader crate refuses the same pixel
+//! programs when it translates them (an unmapped or unparsable header in
+//! `program::translate_program`, which parses the header first; a type 1 header in the pixel
+//! slot or a generic with two modes in `info::collect`, `HeaderStage` and `MixedInterpolation`,
+//! once production translation runs collect info), and the draw path skips a rejected set once
+//! per set, as for any rejection. This keeps one place, the shader cache, that refuses
+//! programs. `tests::a_pixel_header_the_key_cannot_use_leaves_every_generic_smooth`.
+//!
 //! The flipped viewport ([`viewport_flip`], [`constants_flip`]): the backend's `emulation()`
 //! reads how the first viewport handed to it flips, and sets `FLIPPED_VIEWPORT` when the host
 //! cannot set that viewport; the driver constants then carry the same flip for the vertex
@@ -147,10 +179,11 @@ use starquake_shader::lookup::{
     VariantKey,
 };
 use starquake_shader::lower::GENERICS;
+use starquake_shader::sph::{HEADER_BYTES as SPH_BYTES, Io, ProgramHeader};
 use starquake_shader::translate::COLOR_TARGETS as SHADER_COLOR_TARGETS;
 use starquake_shader::variant::{
     AttributeMask, AttributeType, ColorType, CompareFunction as KeyCompare, EmulationKey,
-    FollowingStage, PreviousStores, Swizzle, SwizzleSource, TextureSwizzles,
+    FollowingStage, OutputInterpolation, PreviousStores, Swizzle, SwizzleSource, TextureSwizzles,
     VERTEX_ATTRIBUTES as KEY_ATTRIBUTES,
 };
 
@@ -545,6 +578,58 @@ pub fn previous_stage_stores(
     )
 }
 
+/// The vertex outputs' interpolation that a pixel program's header bytes give (module docs,
+/// "The vertex outputs' interpolation"): the header's modes, or
+/// [`OutputInterpolation::SMOOTH`] when the bytes are not a pixel header the shader crate reads
+/// or give one generic two modes.
+pub fn pixel_interpolation(header: &[u8; SPH_BYTES]) -> OutputInterpolation {
+    match ProgramHeader::from_program(header) {
+        Ok((
+            ProgramHeader {
+                io: Io::Pixel(io), ..
+            },
+            _,
+        )) => OutputInterpolation::from_pixel_io(&io).unwrap_or(OutputInterpolation::SMOOTH),
+        _ => OutputInterpolation::SMOOTH,
+    }
+}
+
+/// Reads the paired pixel program's header for each draw and remembers the last header's
+/// modes, so a draw whose pixel header is unchanged parses nothing (module docs, "The vertex
+/// outputs' interpolation").
+#[derive(Debug, Default)]
+pub struct PixelModes {
+    /// The last header parsed and the modes it gave.
+    last: Option<([u8; SPH_BYTES], OutputInterpolation)>,
+}
+
+impl PixelModes {
+    /// The vertex outputs' interpolation for `requests`: [`pixel_interpolation`] of the pixel
+    /// request's header as `programs` holds it now, or [`OutputInterpolation::SMOOTH`] when
+    /// there is no pixel request or its header is not mapped.
+    pub fn read<P: ProgramMemory + ?Sized>(
+        &mut self,
+        requests: &[ProgramRequest],
+        programs: &P,
+    ) -> OutputInterpolation {
+        let Some(pixel) = requests.iter().find(|r| r.stage == GuestStage::Pixel) else {
+            return OutputInterpolation::SMOOTH;
+        };
+        let mut header = [0; SPH_BYTES];
+        if programs.read(pixel.address, &mut header).is_err() {
+            return OutputInterpolation::SMOOTH;
+        }
+        if let Some((last, modes)) = &self.last
+            && *last == header
+        {
+            return *modes;
+        }
+        let modes = pixel_interpolation(&header);
+        self.last = Some((header, modes));
+        modes
+    }
+}
+
 /// The variant key of a draw (module docs, "The variant key").
 pub fn variant_key(
     attributes: &[AttributeType; KEY_ATTRIBUTES],
@@ -552,6 +637,7 @@ pub fn variant_key(
     dual_source_blend: bool,
     emulation: EmulationKey,
     previous_stage_stores: PreviousStores,
+    output_interpolation: OutputInterpolation,
     texture_swizzles: TextureSwizzles,
 ) -> VariantKey {
     let mut color_targets = [ColorType::Float; SHADER_COLOR_TARGETS];
@@ -566,6 +652,7 @@ pub fn variant_key(
         workgroup_size: [0; 3],
         shared_memory_size: 0,
         emulation,
+        output_interpolation,
         texture_swizzles,
     }
 }
