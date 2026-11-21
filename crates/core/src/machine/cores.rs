@@ -376,10 +376,13 @@ impl<I: Interrupter> Cores<I> {
         }
         state.woken = false;
         drop(state);
+        // The disarm and the count's decrement happen under the count's lock, as the question
+        // that armed the core did: nobody who reads the count under its lock sees every core
+        // parked with the last one's arming already cleared.
+        let mut idle = lock(&self.idle);
         // A signal told after this is told to no one; one told before it is forgotten here.
         self.parks.disarm(index);
         lock(&slot.state).quiet = false;
-        let mut idle = lock(&self.idle);
         *idle = idle.saturating_sub(1);
         if self.is_stopped() {
             Parked::Stopped
