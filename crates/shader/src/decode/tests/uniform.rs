@@ -858,7 +858,8 @@ fn twin_text_marks_exactly_the_register_operands() {
         starts("prmt.rc8 r1, rz, -r2, |r3|, ~r4, !pt, p0, 0x7, [r5]"),
         [9, 13, 18, 23, 29, 34, 38, 48]
     );
-    assert_eq!(starts("x r p q pz rr r1x p12 r255"), [18, 22]);
+    // `rt` and `pz` are neither a named register nor a named predicate (`rz`, `pt`).
+    assert_eq!(starts("x r p q pz rr rt r1x p12 r255"), [21, 25]);
     // A modifier that reads as a register (`.rz`, `.p1`) or a register inside a word is not one.
     assert_eq!(starts("f2f.rz.p1 r1, x_r2, 1r3"), [10]);
     let rc8 = word(
@@ -866,6 +867,70 @@ fn twin_text_marks_exactly_the_register_operands() {
         &[(16, 1), (24, 2), (32, 3), (64, 4), (72, 3), (91, 1)],
     );
     assert_eq!(text(rc8), "uprmt.rc8 ur1, ur2, ur3, ur4;");
+}
+
+/// A twin's operands are its vector op's ALU sources in slot order (source 0, 1, 2), each a
+/// distinct register: `PRMT`'s selector is source 1 and its second operand source 2.
+#[test]
+fn twin_operands_are_in_slot_order() {
+    use super::super::op::uniform::TwinOperands;
+    let prmt = OpPrmt {
+        dst: r(1),
+        srcs: [AluSrc::reg(r(2)), AluSrc::reg(r(4))],
+        sel: AluSrc::reg(r(3)),
+        mode: PrmtMode::Index,
+    };
+    assert_eq!(
+        prmt.operands(),
+        (
+            Some(r(1)),
+            [
+                Some(AluSrc::reg(r(2))),
+                Some(AluSrc::reg(r(3))),
+                Some(AluSrc::reg(r(4)))
+            ]
+        )
+    );
+}
+
+/// The assembler's refusals of a twin [`Uniform::new`] rules out (reached through the test-only
+/// `Uniform::unchecked`): a register past `UR62` other than `RZ`, one past the edge `UR62` the
+/// encoder accepts, and a source kind whose vector form the twin does not have (a constant
+/// buffer in source 2 is form 3).
+#[test]
+fn the_twin_encoder_refuses_what_new_rules_out() {
+    let op = |dst: Gpr, src2: AluSrc| {
+        Instr::new(Op::UIAdd3(Uniform::unchecked(OpIAdd3 {
+            dst,
+            overflow: [Pred::PT; 2],
+            srcs: [AluSrc::reg(r(1)), AluSrc::reg(r(2)), src2],
+            carry: [PredSrc::TRUE; 2],
+        })))
+    };
+    let edge = UniformReg::URZ.index();
+    assert!(assemble(&op(r(edge - 1), AluSrc::reg(r(3)))).is_ok());
+    assert_eq!(
+        assemble(&op(r(edge), AluSrc::reg(r(3)))),
+        Err(EncodeError::NoBits {
+            mnemonic: "uiadd3",
+            what: "a register past ur62",
+        })
+    );
+    let cbuf = AluSrc::CBuf {
+        cbuf: CBufRef {
+            buf: CBuf::Binding(1),
+            offset: 0x10,
+        },
+        abs: false,
+        neg: false,
+    };
+    assert_eq!(
+        assemble(&op(r(4), cbuf)),
+        Err(EncodeError::NoForm {
+            mnemonic: "uiadd3",
+            form: AluForm::CBufSrc2.bits(),
+        })
+    );
 }
 
 /// [`Uniform::new`] holds exactly the vector ops the uniform encoding can: registers up to

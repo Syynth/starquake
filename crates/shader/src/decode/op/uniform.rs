@@ -391,6 +391,13 @@ impl<T> Uniform<T> {
         let fits = op.has_twin() && dst.is_none_or(fits_uniform) && wide <= 1;
         fits.then_some(Self { op })
     }
+
+    /// `op` on the uniform datapath without [`Uniform::new`]'s checks: compiled only for tests,
+    /// to reach the assembler's refusals of values `new` rules out.
+    #[cfg(test)]
+    pub(crate) const fn unchecked(op: T) -> Self {
+        Self { op }
+    }
 }
 
 /// Whether the byte at `index` of `text` starts a register (`r1`, `rz`) or predicate (`p0`,

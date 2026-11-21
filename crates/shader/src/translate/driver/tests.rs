@@ -1238,8 +1238,9 @@ fn a_guarded_instruction_that_is_not_pure_reads_no_guard() {
 /// as the uniform predicate of the same number for a uniform one (of the decodable forms
 /// `S2UR`, `0x9c3`, `VOTEU`, `0x886`, and slice 6d's `UMOV`, `ULDC`, `UPLOP3` and the twins
 /// `classify.h` names pure: the list in the test), as the predicate for the others, which come
-/// from the integer, float, attribute and memory groups (or from no group yet: `R2UR`). The instruction itself may be refused after
-/// (a canonical word is not always a form the group translates); the guard's read comes first.
+/// from the integer, float, attribute and memory groups (or from no group yet: `R2UR`). The
+/// instruction itself may be refused after (a canonical word is not always a form the group
+/// translates); the guard's read comes first.
 #[test]
 fn the_guard_of_every_pure_form_is_read_by_its_kind() {
     let mut uniform = vec![];

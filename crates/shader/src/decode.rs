@@ -252,6 +252,9 @@ fn read(word: Instruction) -> Result<(u16, Instr, Reader), DecodeError> {
     let mut reader = Reader::new(word);
     let guard = reader.guard();
     let op = (form.decode)(&mut reader)?;
+    // No form reads a register or predicate field wider than its file, so no word reaches this
+    // return today; the reader's fault itself is pinned by
+    // `tests::uniform::the_reader_refuses_a_too_wide_field_with_the_exact_error`.
     if let Some(fault) = reader.fault() {
         return Err(fault);
     }
