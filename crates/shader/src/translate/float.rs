@@ -691,13 +691,17 @@ pub(crate) const fn rounding_of(mode: RoundMode) -> FpRounding {
     }
 }
 
-/// `FTZ` or no flushing, as the PR's controls say it.
-const fn flushing(ftz: bool) -> FmzMode {
+/// `FTZ` or no flushing, as the PR's controls say it (shared with [`super::half_double`]).
+pub(crate) const fn flushing(ftz: bool) -> FmzMode {
     if ftz { FmzMode::Ftz } else { FmzMode::None }
 }
 
-/// Floating-point controls.
-const fn control(no_contraction: bool, rounding: FpRounding, fmz_mode: FmzMode) -> FpControl {
+/// Floating-point controls (shared with [`super::half_double`]).
+pub(crate) const fn control(
+    no_contraction: bool,
+    rounding: FpRounding,
+    fmz_mode: FmzMode,
+) -> FpControl {
     FpControl {
         no_contraction,
         rounding,
@@ -744,8 +748,8 @@ const fn compare_op(cmp: FloatCmpOp) -> Option<Opcode> {
     })
 }
 
-/// Eden's `PredicateCombine`.
-const fn combine_op(set_op: PredSetOp) -> Opcode {
+/// Eden's `PredicateCombine` (shared with [`super::half_double`]).
+pub(crate) const fn combine_op(set_op: PredSetOp) -> Opcode {
     match set_op {
         PredSetOp::And => Opcode::LogicalAnd,
         PredSetOp::Or => Opcode::LogicalOr,

@@ -79,13 +79,14 @@
 //!
 //! By the decoded operation, in this order: `EXIT` (`super`'s `Translator::exit`); the integer
 //! ALU group ([`super::integer::is_integer`], `MOV` included); the float group
-//! ([`super::float::in_group`]); the texture group ([`super::texture::in_group`], with one
+//! ([`super::float::in_group`]); the half and double group ([`super::half_double::in_group`]);
+//! the texture group ([`super::texture::in_group`], with one
 //! [`DescriptorBuffer`] for the program); the control and warp group
 //! ([`super::control::in_group`]); the memory group, whose translator (slice 12e) is not joined
 //! yet, refused by name ([`Unsupported::MemoryGroup`]: `LD`, `ST`, `LDC`, `ATOM`, `CCTL`,
 //! `MEMBAR`, `LDGSTS`, `LDGDEPBAR`, `ERRBAR`, `ATOMS.POPC`); the attribute group (`super`'s
-//! `GROUPS`). An operation none of them takes (the half and double group, the uniform group,
-//! the tensor group) is refused by its mnemonic ([`Unsupported::Instruction`]). The groups are
+//! `GROUPS`). An operation none of them takes (the uniform group, the tensor group) is refused
+//! by its mnemonic ([`Unsupported::Instruction`]). The groups are
 //! disjoint, so the order decides nothing but speed: `tests::the_groups_are_disjoint` checks
 //! that every decoded operation (one instruction of each, from the deterministic
 //! `tests::decoded_samples`, which `tests::these_instructions_reach_every_decoded_operation`
@@ -114,6 +115,7 @@
 
 use super::control::{self, Emitted};
 use super::float::{self, FloatError};
+use super::half_double::{self, HalfDoubleError};
 use super::integer::{self, GuardMode, IntegerError};
 use super::texture::{self, DescriptorBuffer, TextureError};
 use super::{
@@ -327,6 +329,15 @@ impl Driver {
                 .map_err(|error| match error {
                     FloatError::Unsupported(what) => unsupported(Unsupported::Float(what)),
                     FloatError::Build(error) => TranslateError::Build(error),
+                });
+        }
+        if half_double::in_group(&op) {
+            return half_double::translate_instr(&mut Builder::new(function, block), instr, true)
+                .map_err(|error| match error {
+                    HalfDoubleError::Unsupported(what) => {
+                        unsupported(Unsupported::HalfDouble(what))
+                    }
+                    HalfDoubleError::Build(error) => TranslateError::Build(error),
                 });
         }
         if texture::in_group(&op) {

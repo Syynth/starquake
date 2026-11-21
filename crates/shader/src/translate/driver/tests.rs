@@ -882,20 +882,40 @@ fn an_instruction_no_group_takes_is_refused_by_its_mnemonic() {
     );
 }
 
-/// A decoded operation of the half and double group, whose translator is not joined yet, is
-/// refused by its mnemonic, one of each operation that [`decoded_samples`] reaches.
+/// A decoded operation of the half and double group reaches its translator (slice 12c): one of
+/// each operation that [`decoded_samples`] reaches is translated or refused with the group's
+/// own rejection, never by its mnemonic as an instruction no group takes.
 #[test]
-fn a_decoded_half_double_instruction_is_refused_by_its_mnemonic() {
+fn a_decoded_half_double_instruction_reaches_its_group() {
     let mut seen = std::collections::BTreeSet::new();
     for instr in decoded_samples() {
-        if !is_half_double(&instr.op) || !seen.insert(instr.op.mnemonic()) {
+        if !half_double::in_group(&instr.op) || !seen.insert(instr.op.mnemonic()) {
             continue;
         }
         let mut function = Function::new();
         let entry = function.entry();
         let mut driver = Driver::new(VERTEX, None);
+        let expected = {
+            let mut scratch = Function::new();
+            let at = scratch.entry();
+            half_double::translate_instr(&mut Builder::new(&mut scratch, at), instr, true).map_err(
+                |error| match error {
+                    HalfDoubleError::Unsupported(what) => TranslateError::Unsupported {
+                        index: 5,
+                        instr,
+                        what: Unsupported::HalfDouble(what),
+                    },
+                    HalfDoubleError::Build(error) => TranslateError::Build(error),
+                },
+            )
+        };
         assert_eq!(
             driver.dispatch(&mut function, entry, 5, instr),
+            expected,
+            "{instr}"
+        );
+        assert_ne!(
+            expected,
             Err(TranslateError::Unsupported {
                 index: 5,
                 instr,
@@ -1014,6 +1034,7 @@ fn groups_of(op: Op) -> Vec<&'static str> {
         ("exit", matches!(op, Op::Exit(_))),
         ("integer", integer::is_integer(&op)),
         ("float", float::in_group(&op)),
+        ("half and double", half_double::in_group(&op)),
         ("texture", texture::in_group(&op)),
         ("control", control::in_group(&op)),
         ("memory", in_memory_group(&op)),
@@ -1086,41 +1107,18 @@ fn these_instructions_reach_every_decoded_operation() {
     );
 }
 
-/// Whether `op` is of the half and double group, which words decode to (slice 6c) but whose
-/// translator is not joined yet, so no group takes it and the dispatch refuses it by its
-/// mnemonic.
-const fn is_half_double(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::HAdd2(_)
-            | Op::HFma2(_)
-            | Op::HMul2(_)
-            | Op::HSet2(_)
-            | Op::HSetP2(_)
-            | Op::HMnMx2(_)
-            | Op::DAdd(_)
-            | Op::DMul(_)
-            | Op::DFma(_)
-            | Op::DSetP(_)
-    )
-}
-
 /// The groups are disjoint, and every decoded operation (every one of [`decoded_samples`])
-/// belongs to exactly one of them, but for the half and double group's ([`is_half_double`]),
-/// which belong to none, so the dispatch order decides nothing; a shell belongs to none but the
-/// control group's `JMX` and `BPT`, which it refuses by name, so the fallback refusal is reached
-/// only by the half and double group and the other shells.
+/// belongs to exactly one of them, so the dispatch order decides nothing; a shell belongs to
+/// none but the control group's `JMX` and `BPT`, which it refuses by name, so the fallback
+/// refusal is reached only by the other shells.
 #[test]
 fn the_groups_are_disjoint() {
     let mut half_double = 0;
     for instr in decoded_samples() {
-        let wanted = if is_half_double(&instr.op) {
+        if half_double::in_group(&instr.op) {
             half_double += 1;
-            0
-        } else {
-            1
-        };
-        assert_eq!(groups_of(instr.op).len(), wanted, "{instr}");
+        }
+        assert_eq!(groups_of(instr.op).len(), 1, "{instr}");
     }
     assert!(half_double > 0);
     for op in shells() {
@@ -1177,7 +1175,7 @@ fn a_guarded_instruction_that_is_not_pure_reads_no_guard() {
 /// The guard of every decodable pure form (`classify.h`'s `pure`) is read before the split:
 /// as the uniform predicate of the same number for a uniform one (of the decodable forms only
 /// `S2UR`, `0x9c3`, and `VOTEU`, `0x886`), as the predicate for the others, which come from the
-/// integer, float, attribute and memory groups. The instruction itself may be refused after
+/// integer, float, half and double, attribute and memory groups. The instruction itself may be refused after
 /// (a canonical word is not always a form the group translates); the guard's read comes first.
 #[test]
 fn the_guard_of_every_pure_form_is_read_by_its_kind() {
@@ -1218,7 +1216,7 @@ fn the_guard_of_every_pure_form_is_read_by_its_kind() {
     assert_eq!(uniform, [0x9c3, 0x886]);
     assert_eq!(
         groups.into_iter().collect::<Vec<_>>(),
-        ["attribute", "float", "integer", "memory"]
+        ["attribute", "float", "half and double", "integer", "memory"]
     );
 }
 
