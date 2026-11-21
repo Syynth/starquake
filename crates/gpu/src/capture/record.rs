@@ -236,6 +236,12 @@ impl GpuMemory for RecordingMemory {
         value
     }
 
+    /// Passed on to the wrapped memory and **not recorded**: the format has no record of the
+    /// answer (the capture module's docs, "Not built, and departures").
+    fn semaphore_mirror(&self, va: u64) -> Option<u64> {
+        self.inner.semaphore_mirror(va)
+    }
+
     fn is_gpu_only(&self, va: u64, len: u64) -> bool {
         let answer = self.inner.is_gpu_only(va, len);
         self.recorder.access(
