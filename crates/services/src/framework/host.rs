@@ -105,6 +105,14 @@ impl Kernel for IpcContext<'_> {
         IpcContext::write_transfer_memory(self, object, offset, data)
     }
 
+    fn keep_transfer_memory(&mut self, object: ObjectId) -> SvcResult<TransferMemory> {
+        IpcContext::keep_transfer_memory(self, object)
+    }
+
+    fn release_kept_transfer_memory(&mut self, object: ObjectId) -> SvcResult<()> {
+        IpcContext::release_kept_transfer_memory(self, object)
+    }
+
     fn read_memory(&self, address: u64, out: &mut [u8]) -> SvcResult<()> {
         IpcContext::read_memory(self, address, out)
     }

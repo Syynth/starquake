@@ -84,7 +84,12 @@
 //! in gsv's shared state, not the root's: the drain and the page turn act on it. The root's
 //! family ([`RootFamily`]) holds the handle to that state beside [`RootState`]; the handle is the
 //! run's wiring, so a snapshot holds only the [`RootState`] and loading keeps the handle. Before
-//! the bootstrap is complete 204 is logged and accepted, as the stubs are (decision 7).
+//! the bootstrap is complete 204 is logged and accepted, as the stubs are (decision 7). 204
+//! keeps a reference of the root's own to each of the page's two transfer memories; when the
+//! server's last session closes, the family queues
+//! [`Completion::RootClosed`](crate::completion::Completion) and the timer thread's drain lets
+//! the page and both references go if no root session is open by then
+//! ([`crate::shared::page`], "When the root closes").
 //!
 //! # The gpu session (497)
 //!
@@ -248,6 +253,7 @@ use starquake_services::framework::{
 };
 use starquake_trace::ServiceId;
 
+use crate::completion::Completion;
 use crate::gpu::low_byte;
 use crate::native;
 use crate::native::pools;
@@ -1369,5 +1375,20 @@ impl Family for RootFamily {
         }
         self.state = saved;
         Ok(())
+    }
+
+    /// When the server's last session has closed (`open` is 0) in a run with the shared page,
+    /// queues [`Completion::RootClosed`] for the timer thread's drain, which lets the page and
+    /// its two transfer memories go if no root session is open by then (module docs, "The
+    /// shared syncpoint page (204)"). Called with the kernel's lock held when a process's end
+    /// closed the session: it only pushes, which takes only the queue's lock
+    /// ([`crate::completion`], "Never blocking"), never gsv's shared lock or the kernel's.
+    fn session_closed(&mut self, open: usize) {
+        if open != 0 {
+            return;
+        }
+        if let Some(shared) = &self.shared {
+            shared.queue().push(Completion::RootClosed);
+        }
     }
 }

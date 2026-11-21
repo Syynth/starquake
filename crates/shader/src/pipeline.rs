@@ -29,24 +29,27 @@
 //!   4. collect info ([`collect`], slice 15, [`Rejection::Info`]): the spec's pass 7 ("Dead
 //!      code elimination, then collect info"), run for its refusals ([`crate::info::InfoError`],
 //!      among them an unknown attribute, a colour output that does not exist and a
-//!      constant-buffer bank or offset out of range); its tables are not passed on yet, since
-//!      nothing the lowering takes reads them until slice 17;
+//!      constant-buffer bank or offset out of range) and for the constant-buffer sizes the
+//!      lowering declares ([`constant_buffer_sizes`]); its interface tables are not passed on
+//!      yet;
 //!   5. for a compute program, its local memory ([`PipelineRefusal::ComputeLocalMemory`]);
 //!   6. the host lowering passes the host target's features call for ([`lower_for_host`],
 //!      slice 18, [`Rejection::HostLower`]): 64-bit floats become 32-bit ones where the target
 //!      lacks them, and 16-bit floats likewise; the spec's pass 8;
 //!   7. the lowering ([`lower_with`], [`Rejection::Lower`]), with the variant key's workgroup
-//!      and shared-memory sizes, the header's local-memory size and the host target's
-//!      features.
+//!      and shared-memory sizes and emulation flags, the header's local-memory size, the
+//!      constant-buffer sizes of step 4 and the host target's features.
 //!
 //! # What it does not do yet
 //!
-//! - **Graphics interfaces and resources** are slice 17's (#376): the lowering refuses what 17
-//!   adds by name, so a program that needs it is rejected, not drawn wrongly: a pixel
-//!   program's generic inputs ([`crate::lower::LowerError::Input`]), and every constant-buffer,
-//!   texture, image and global-memory operation ([`crate::lower::LowerError::Operation`]).
-//!   Collect info (slice 15) runs (step 4), but the resource table and interface it builds are
-//!   dropped until 17 lowers them.
+//! - **The rest of the graphics interfaces and resources** are slice 17's (#376): constant
+//!   buffers and the emulation the key's flags ask for at the epilogue are lowered, but the
+//!   lowering still refuses by name, so a program that needs them is rejected, not drawn
+//!   wrongly: a pixel program's generic inputs ([`crate::lower::LowerError::Input`]), a
+//!   constant buffer whose bank is a register
+//!   ([`crate::lower::LowerError::ConstantBufferRegisterBank`]), and every texture, image and
+//!   global-memory operation ([`crate::lower::LowerError::Operation`]). Collect info's
+//!   interface tables (slice 15) are not passed on yet.
 //! - **A compute program's local memory** has no size: Eden takes it from the QMD
 //!   (`local_pos_alloc + local_crs_alloc`), which no question, key field or driver constant
 //!   carries yet (the exchange's module docs, "For the owner: what the questions do not
@@ -89,7 +92,7 @@ use crate::host::{HostCaps, HostShader, Requirements};
 use crate::host_lower::lower_for_host;
 use crate::info::{check_header, collect, translation_stage};
 use crate::ir::{Function, Inst, Opcode};
-use crate::lower::{LowerInputs, lower_with};
+use crate::lower::{LowerInputs, constant_buffer_sizes, lower_with};
 use crate::program::{Rejection, pipeline_ir};
 use crate::sph::{Io, ProgramHeader};
 use crate::translate::{ColorOutputs, GuestStage, Stage, TranslateError};
@@ -223,7 +226,7 @@ pub fn translate_shader(input: &ShaderInput<'_, PipelineProgram>) -> Result<Host
     });
     let code: Vec<Instruction> = program.capture.instructions().collect();
     let mut function = pipeline_ir(stage, pixel, &code, &tables)?;
-    collect(input.stage, header, &function)?;
+    let info = collect(input.stage, header, &function)?;
     if input.stage == GuestStage::Compute && uses_local_memory(&function) {
         return Err(PipelineRefusal::ComputeLocalMemory.into());
     }
@@ -234,6 +237,8 @@ pub fn translate_shader(input: &ShaderInput<'_, PipelineProgram>) -> Result<Host
         local_memory_bytes: header.map_or(0, |header| header.common.local_memory_size()),
         shared_memory_bytes: input.variant.shared_memory_size,
         caps,
+        constant_buffers: constant_buffer_sizes(&info),
+        emulation: input.variant.emulation,
     };
     Ok(lower_with(input.stage, &function, &inputs)?)
 }
