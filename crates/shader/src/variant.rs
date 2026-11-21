@@ -13,6 +13,7 @@
 //! | [`VariantKey::dual_source_blend`] | whether dual-source blending is on | Eden `RuntimeInfo::dual_source_blend` |
 //! | [`VariantKey::previous_stage_stores`] | for each stage that follows another, the attribute words the stage before it stores | Eden `RuntimeInfo::previous_stage_stores`, filled by `MakeRuntimeInfo` (`eden/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp` @ cf654052); spec, "Pipeline-state specialisation"; see "The previous stage's stores" |
 //! | [`VariantKey::workgroup_size`], [`VariantKey::shared_memory_size`] | a compute program's workgroup and shared-memory size | spec, "Compute shaders"; Eden `Environment::WorkgroupSize`, `SharedMemorySize` (`environment.h`) |
+//! | [`VariantKey::local_memory_size`] | a compute program's local-memory size in bytes, which the GPU crate computes from the QMD (`Dispatch::local_memory_size`, the conversion's one owner) | spec, "Local and shared memory" (pass 6: "sized from ... the QMD (compute)"); Eden `Environment::LocalMemorySize`, which `ComputeEnvironment` sets to `qmd.local_pos_alloc + qmd.local_crs_alloc` (`eden-pr4588/src/video_core/shader_environment.cpp` @ e5fb3b97); see "The compute local-memory size" |
 //! | [`VariantKey::emulation`] | the render backend's `EmulationFlags`, field by field | spec, "Pipeline-state specialisation"; review guide, M13 |
 //! | [`VariantKey::output_interpolation`] | how the paired pixel program interpolates each generic attribute, which the vertex stage's outputs take | spec, "Pipeline-state specialisation", the named exception (decided by the owner, 2026-11-20, ruling 2); Eden `Info::interpolation`, filled by `CollectInterpolationInfo` (`eden/src/shader_recompiler/frontend/maxwell/translate_program.cpp` @ cf654052); see "The vertex outputs' interpolation" |
 //! | [`VariantKey::texture_swizzles`] | each texture binding's swizzle, when the host has no view swizzle | spec, the exception to decision 16; review guide, M11 |
@@ -35,6 +36,14 @@
 //!   most [`MAX_TEXTURE_SWIZZLES`], that same number, and refuses more
 //!   ([`KeyError::TooManySwizzles`]) where Eden's fixed-capacity vector has no room. Pinned by
 //!   `tests::the_swizzle_cap_at_its_edge`.
+//! - Eden's compute pipeline cache key, `ComputePipelineCacheKey`
+//!   (`eden-pr4588/src/video_core/renderer_vulkan/vk_pipeline_cache.h` @ e5fb3b97, built in
+//!   `PipelineCache::CurrentComputePipeline`, `vk_pipeline_cache.cpp` line 593), holds only
+//!   `unique_hash`, `shared_memory_size` and `workgroup_size`, so Eden reuses one compute
+//!   pipeline, translated with the first dispatch's local-memory size, for every QMD local size
+//!   of the same program. Here [`VariantKey::local_memory_size`] is part of the key, so
+//!   dispatches with different local sizes get distinct keys and shaders (see "The compute
+//!   local-memory size"). Pinned by `tests::the_local_memory_size_has_its_own_bytes`.
 //!
 //! # The previous stage's stores
 //!
@@ -100,6 +109,30 @@
 //! carries the header's modes only, as Eden applies them; a flat rule for integer inputs in
 //! slice 17 would be a listed divergence from Eden.
 //!
+//! # The compute local-memory size
+//!
+//! [`VariantKey::local_memory_size`] is the size a compute program's local memory is sized
+//! from (`crate::pipeline::local_memory_bytes`); a graphics program's comes from its header,
+//! and the field is ignored for it, as [`VariantKey::shared_memory_size`] is. The spec's
+//! "Compute shaders" says "the variant key holds the workgroup size and shared-memory size";
+//! this field is a third compute field, added because the QMD is the only source of the size
+//! (the spec's pass 6) and a translated shader's array length depends on it, so two dispatches
+//! of one program with different sizes must not share a cached shader (Eden's compute cache
+//! key leaves it out: "Where this differs from Eden").
+//!
+//! **For the owner**: the field departs from three approved sentences, and whether they should
+//! name it, or the size go elsewhere, is the owner's call:
+//!
+//! - "Compute shaders": "the variant key holds the workgroup size and shared-memory size".
+//! - "Pipeline-state specialisation": "Compute: workgroup size (naga needs it as a constant in
+//!   the entry point) and shared-memory size."
+//! - Decision 16: "driver constants for numbers, the variant key for types and structure", as
+//!   this module's header puts it, "the key holds types and structure only; numbers go in the
+//!   driver constants". The local-memory size is a number in the key. It sets the length of a
+//!   naga array type (a private array takes a constant length, not one read at run time), which
+//!   is why it is here, as the workgroup size is for naga's entry point; the alternative is a
+//!   fixed-size array (the cap) bounded by a driver constant.
+//!
 //! # The texture swizzles' binding order
 //!
 //! [`VariantKey::texture_swizzles`] is keyed by **binding order**:
@@ -128,6 +161,7 @@
 //! | 128 | previous stages' stores: one mask per [`FollowingStage`] in [`FollowingStage::ALL`] order, each four 64-bit lanes, lane 0 (attribute words 0 to 63) first |
 //! | 12 | workgroup size x, y, z, 32 bits each |
 //! | 4 | shared-memory size, 32 bits |
+//! | 4 | local-memory size, 32 bits |
 //! | 1 | alpha test: 0 for none, else 1 plus the [`CompareFunction`] code |
 //! | 5 | depth-range rewrite, primitive-restart rewrite, attribute fetch, typed outputs, flipped viewport: 0 or 1 each |
 //! | 32 | the output interpolation: one [`interpolation_code`] per generic attribute, generic 0 first |
@@ -157,7 +191,8 @@ use crate::translate::{ATTRIBUTE_SPACE_END, COLOR_TARGETS, GuestStage};
 /// replaced version 2's one mask of what the next stage reads with a mask per
 /// [`FollowingStage`] of what the previous stage stores (owner's ruling 8 of 2026-11-19).
 /// Version 4 added the output interpolation (owner's ruling 2 of 2026-11-20).
-pub const VARIANT_KEY_VERSION: u8 = 4;
+/// Version 5 added the compute local-memory size (issue #489).
+pub const VARIANT_KEY_VERSION: u8 = 5;
 
 /// How many generic attributes the output interpolation has a mode for: every generic of the
 /// guest's attribute space ([`GENERICS`]; Eden's `Info::interpolation` has 32 entries,
@@ -197,6 +232,7 @@ pub const VARIANT_KEY_FIXED_SIZE: usize = 1 // version
     + FOLLOWING_STAGES * ATTRIBUTE_MASK_LANES * 8
     + 3 * 4 // workgroup size
     + 4 // shared-memory size
+    + 4 // local-memory size
     + 1 // alpha test
     + 5 // the five emulation switches
     + OUTPUT_GENERICS // the output interpolation
@@ -639,6 +675,9 @@ pub struct VariantKey {
     pub workgroup_size: [u32; 3],
     /// A compute program's shared-memory size in bytes.
     pub shared_memory_size: u32,
+    /// A compute program's local-memory size in bytes (module docs, "The compute local-memory
+    /// size").
+    pub local_memory_size: u32,
     /// The render backend's emulation flags.
     pub emulation: EmulationKey,
     /// How the paired pixel program interpolates each generic attribute, which the vertex
@@ -666,6 +705,8 @@ pub enum KeyField {
     WorkgroupSize(u8),
     /// The shared-memory size.
     SharedMemorySize,
+    /// The local-memory size.
+    LocalMemorySize,
     /// The alpha test.
     AlphaTest,
     /// The depth-range rewrite switch.
@@ -706,6 +747,7 @@ impl Display for KeyField {
             }
             Self::WorkgroupSize(axis) => write!(f, "the workgroup size along axis {axis}"),
             Self::SharedMemorySize => f.write_str("the shared-memory size"),
+            Self::LocalMemorySize => f.write_str("the local-memory size"),
             Self::AlphaTest => f.write_str("the alpha test"),
             Self::DepthRangeRewrite => f.write_str("the depth-range rewrite switch"),
             Self::PrimitiveRestartRewrite => f.write_str("the primitive-restart rewrite switch"),
@@ -852,6 +894,7 @@ impl VariantKey {
             out.extend_from_slice(&size.to_le_bytes());
         }
         out.extend_from_slice(&self.shared_memory_size.to_le_bytes());
+        out.extend_from_slice(&self.local_memory_size.to_le_bytes());
         let emulation = &self.emulation;
         out.push(
             emulation
@@ -904,6 +947,7 @@ impl VariantKey {
             *size = reader.u32(KeyField::WorkgroupSize(index_u8(axis)))?;
         }
         key.shared_memory_size = reader.u32(KeyField::SharedMemorySize)?;
+        key.local_memory_size = reader.u32(KeyField::LocalMemorySize)?;
         key.emulation.alpha_test = reader.coded(KeyField::AlphaTest, |code| match code {
             0 => Some(None),
             code => CompareFunction::from_code(code - 1).map(Some),

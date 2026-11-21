@@ -208,6 +208,7 @@ impl ComputeSink<'_> {
         let variant = VariantKey {
             workgroup_size: dispatch.block,
             shared_memory_size: dispatch.shared_memory,
+            local_memory_size: dispatch.local_memory_size(),
             ..VariantKey::default()
         };
         let answers = ComputeAnswers {

@@ -72,6 +72,7 @@ fn golden_key() -> VariantKey {
     key.previous_stage_stores = golden_stores();
     key.workgroup_size = [0x4142_4344, 0x5152_5354, 0x6162_6364];
     key.shared_memory_size = 0x7172_7374;
+    key.local_memory_size = 0x8586_8788;
     key.emulation = EmulationKey {
         alpha_test: Some(CompareFunction::GreaterThanEqual),
         depth_range_rewrite: true,
@@ -90,8 +91,8 @@ fn golden_key() -> VariantKey {
 }
 
 #[rustfmt::skip]
-const GOLDEN_BYTES: [u8; 233] = [
-    0x04, // version
+const GOLDEN_BYTES: [u8; 237] = [
+    0x05, // version
     // vertex attribute types
     1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1,
     2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2,
@@ -121,6 +122,7 @@ const GOLDEN_BYTES: [u8; 233] = [
     // workgroup size x, y, z
     0x44, 0x43, 0x42, 0x41, 0x54, 0x53, 0x52, 0x51, 0x64, 0x63, 0x62, 0x61,
     0x74, 0x73, 0x72, 0x71, // shared-memory size
+    0x88, 0x87, 0x86, 0x85, // local-memory size
     0x07, // alpha test: greater or equal (6) plus one
     // depth range, primitive restart, attribute fetch, typed outputs, flipped viewport
     0x01, 0x01, 0x01, 0x01, 0x01,
@@ -134,7 +136,7 @@ const GOLDEN_BYTES: [u8; 233] = [
 
 #[test]
 fn layout_constants() {
-    assert_eq!(VARIANT_KEY_VERSION, 4);
+    assert_eq!(VARIANT_KEY_VERSION, 5);
     assert_eq!(VERTEX_ATTRIBUTES, 32);
     assert_eq!(OUTPUT_GENERICS, 32);
     assert_eq!(MAX_TEXTURE_SWIZZLES, 192);
@@ -143,8 +145,8 @@ fn layout_constants() {
     assert_eq!(FOLLOWING_STAGES, 4);
     assert_eq!(FollowingStage::ALL.len(), FOLLOWING_STAGES);
     assert_eq!(SWIZZLE_SIZE, 4);
-    assert_eq!(VARIANT_KEY_FIXED_SIZE, 225);
-    assert_eq!(VARIANT_KEY_MAX_SIZE, 225 + 192 * 4);
+    assert_eq!(VARIANT_KEY_FIXED_SIZE, 229);
+    assert_eq!(VARIANT_KEY_MAX_SIZE, 229 + 192 * 4);
 }
 
 #[test]
@@ -157,7 +159,7 @@ fn golden_bytes() {
 fn the_default_key_decodes_from_zeros() {
     // Hand-built: the version, then every field zero and no swizzles.
     let mut bytes = vec![0; VARIANT_KEY_FIXED_SIZE];
-    bytes[0] = 4;
+    bytes[0] = VARIANT_KEY_VERSION;
     assert_eq!(VariantKey::decode(&bytes), Ok(VariantKey::default()));
     assert_eq!(VariantKey::default().encode(), bytes);
 }
@@ -176,6 +178,7 @@ fn defaults() {
     }
     assert_eq!(fresh.workgroup_size, [0, 0, 0]);
     assert_eq!(fresh.shared_memory_size, 0);
+    assert_eq!(fresh.local_memory_size, 0);
     assert_eq!(
         fresh.emulation,
         EmulationKey {
@@ -235,13 +238,23 @@ fn any_key() -> impl Strategy<Value = VariantKey> {
         any::<bool>(),
         prop::array::uniform4(prop::array::uniform4(any::<u64>())),
         prop::array::uniform3(any::<u32>()),
-        any::<u32>(),
+        (any::<u32>(), any::<u32>()),
         emulation,
         prop::array::uniform32(any_coded(&INTERPOLATION_MODES)),
         prop::collection::vec(any_swizzle(), 0..=MAX_TEXTURE_SWIZZLES),
     )
         .prop_map(
-            |(attributes, colors, dual, lanes, workgroup, shared, emulation, modes, swizzles)| {
+            |(
+                attributes,
+                colors,
+                dual,
+                lanes,
+                workgroup,
+                (shared, local),
+                emulation,
+                modes,
+                swizzles,
+            )| {
                 VariantKey {
                     vertex_attributes: attributes,
                     color_targets: colors,
@@ -254,6 +267,7 @@ fn any_key() -> impl Strategy<Value = VariantKey> {
                     ),
                     workgroup_size: workgroup,
                     shared_memory_size: shared,
+                    local_memory_size: local,
                     emulation,
                     output_interpolation: OutputInterpolation::new(modes),
                     texture_swizzles: TextureSwizzles::new(swizzles).expect("within the cap"),
@@ -300,8 +314,8 @@ fn the_version_is_checked_first() {
     );
     // Another version with a truncated body: the version is reported (1 is the version
     // before the flipped-viewport switch, 2 the one before the previous stages' stores, 3 the
-    // one before the output interpolation).
-    for found in [0, 1, 2, 3, 5, u8::MAX] {
+    // one before the output interpolation, 4 the one before the local-memory size).
+    for found in [0, 1, 2, 3, 4, 6, u8::MAX] {
         assert_eq!(
             VariantKey::decode(&[found]),
             Err(KeyError::Version { found })
@@ -316,7 +330,7 @@ fn the_version_is_checked_first() {
     );
     assert_eq!(
         KeyError::Version { found: 1 }.to_string(),
-        "variant key version 1 is not supported; this build reads version 4"
+        "variant key version 1 is not supported; this build reads version 5"
     );
     // The right version with nothing after it.
     assert_eq!(
@@ -372,39 +386,41 @@ fn every_prefix_is_truncated_in_the_right_field() {
         (181, KeyField::WorkgroupSize(2)),
         (182, KeyField::SharedMemorySize),
         (185, KeyField::SharedMemorySize),
-        (186, KeyField::AlphaTest),
-        (187, KeyField::DepthRangeRewrite),
-        (188, KeyField::PrimitiveRestartRewrite),
-        (189, KeyField::AttributeFetch),
-        (190, KeyField::TypedOutputs),
-        (191, KeyField::FlippedViewport),
-        (192, KeyField::OutputInterpolation(0)),
-        (193, KeyField::OutputInterpolation(1)),
-        (223, KeyField::OutputInterpolation(31)),
-        (224, KeyField::SwizzleCount),
+        (186, KeyField::LocalMemorySize),
+        (189, KeyField::LocalMemorySize),
+        (190, KeyField::AlphaTest),
+        (191, KeyField::DepthRangeRewrite),
+        (192, KeyField::PrimitiveRestartRewrite),
+        (193, KeyField::AttributeFetch),
+        (194, KeyField::TypedOutputs),
+        (195, KeyField::FlippedViewport),
+        (196, KeyField::OutputInterpolation(0)),
+        (197, KeyField::OutputInterpolation(1)),
+        (227, KeyField::OutputInterpolation(31)),
+        (228, KeyField::SwizzleCount),
         (
-            225,
+            229,
             KeyField::Swizzle {
                 binding: 0,
                 component: 0,
             },
         ),
         (
-            228,
+            232,
             KeyField::Swizzle {
                 binding: 0,
                 component: 3,
             },
         ),
         (
-            229,
+            233,
             KeyField::Swizzle {
                 binding: 1,
                 component: 0,
             },
         ),
         (
-            232,
+            236,
             KeyField::Swizzle {
                 binding: 1,
                 component: 3,
@@ -432,6 +448,14 @@ fn truncation_errors_name_the_field() {
     );
     assert_eq!(
         KeyError::Truncated {
+            field: KeyField::LocalMemorySize,
+            len: 187
+        }
+        .to_string(),
+        "the variant key ends after 187 bytes, inside the local-memory size"
+    );
+    assert_eq!(
+        KeyError::Truncated {
             field: KeyField::Version,
             len: 0
         }
@@ -456,17 +480,17 @@ fn each_coded_field_accepts_its_last_code_and_refuses_the_next() {
         (33, KeyField::ColorTarget(0), 2, 3),
         (40, KeyField::ColorTarget(7), 2, 3),
         (41, KeyField::DualSourceBlend, 1, 2),
-        (186, KeyField::AlphaTest, 8, 9),
-        (187, KeyField::DepthRangeRewrite, 1, 2),
-        (188, KeyField::PrimitiveRestartRewrite, 1, 2),
-        (189, KeyField::AttributeFetch, 1, 2),
-        (190, KeyField::TypedOutputs, 1, 2),
-        (191, KeyField::FlippedViewport, 1, 2),
-        (192, KeyField::OutputInterpolation(0), 2, 3),
-        (193, KeyField::OutputInterpolation(1), 2, 3),
-        (223, KeyField::OutputInterpolation(31), 2, 3),
+        (190, KeyField::AlphaTest, 8, 9),
+        (191, KeyField::DepthRangeRewrite, 1, 2),
+        (192, KeyField::PrimitiveRestartRewrite, 1, 2),
+        (193, KeyField::AttributeFetch, 1, 2),
+        (194, KeyField::TypedOutputs, 1, 2),
+        (195, KeyField::FlippedViewport, 1, 2),
+        (196, KeyField::OutputInterpolation(0), 2, 3),
+        (197, KeyField::OutputInterpolation(1), 2, 3),
+        (227, KeyField::OutputInterpolation(31), 2, 3),
         (
-            225,
+            229,
             KeyField::Swizzle {
                 binding: 0,
                 component: 0,
@@ -475,7 +499,7 @@ fn each_coded_field_accepts_its_last_code_and_refuses_the_next() {
             8,
         ),
         (
-            232,
+            236,
             KeyField::Swizzle {
                 binding: 1,
                 component: 3,
@@ -520,21 +544,21 @@ fn the_codes_inside_each_set() {
         Ok(ColorType::Float)
     );
     assert_eq!(zero(41).map(|key| key.dual_source_blend), Ok(false));
-    assert_eq!(zero(186).map(|key| key.emulation.alpha_test), Ok(None));
+    assert_eq!(zero(190).map(|key| key.emulation.alpha_test), Ok(None));
     assert_eq!(
-        VariantKey::decode(&patched(186, 1)).map(|key| key.emulation.alpha_test),
+        VariantKey::decode(&patched(190, 1)).map(|key| key.emulation.alpha_test),
         Ok(Some(CompareFunction::Never))
     );
     assert_eq!(
-        VariantKey::decode(&patched(186, 8)).map(|key| key.emulation.alpha_test),
+        VariantKey::decode(&patched(190, 8)).map(|key| key.emulation.alpha_test),
         Ok(Some(CompareFunction::Always))
     );
     let switches: [(usize, Read); 5] = [
-        (187, |key| key.emulation.depth_range_rewrite),
-        (188, |key| key.emulation.primitive_restart_rewrite),
-        (189, |key| key.emulation.attribute_fetch),
-        (190, |key| key.emulation.typed_outputs),
-        (191, |key| key.emulation.flipped_viewport),
+        (191, |key| key.emulation.depth_range_rewrite),
+        (192, |key| key.emulation.primitive_restart_rewrite),
+        (193, |key| key.emulation.attribute_fetch),
+        (194, |key| key.emulation.typed_outputs),
+        (195, |key| key.emulation.flipped_viewport),
     ];
     for (offset, read) in switches {
         assert_eq!(
@@ -553,14 +577,14 @@ fn the_codes_inside_each_set() {
         (1, Interpolation::Flat),
         (2, Interpolation::NoPerspective),
     ] {
-        let key = VariantKey::decode(&patched(193, code)).expect("valid");
+        let key = VariantKey::decode(&patched(197, code)).expect("valid");
         assert_eq!(key.output_interpolation.get(1), Some(mode), "code {code}");
         let mut expected = golden_key().output_interpolation.modes();
         expected[1] = mode;
         assert_eq!(key.output_interpolation.modes(), expected, "code {code}");
     }
     assert_eq!(
-        zero(225).map(|key| key.texture_swizzles.as_slice()[0].x),
+        zero(229).map(|key| key.texture_swizzles.as_slice()[0].x),
         Ok(SwizzleSource::Zero)
     );
     let field = KeyField::Swizzle {
@@ -568,7 +592,7 @@ fn the_codes_inside_each_set() {
         component: 0,
     };
     assert_eq!(
-        VariantKey::decode(&patched(225, 1)),
+        VariantKey::decode(&patched(229, 1)),
         Err(KeyError::InvalidValue { field, value: 1 })
     );
     assert_eq!(
@@ -580,9 +604,9 @@ fn the_codes_inside_each_set() {
 #[test]
 fn the_first_invalid_field_is_reported() {
     let mut bytes = patched(33, 3);
-    bytes[187] = 2;
-    bytes[192] = 3;
-    bytes[232] = 1;
+    bytes[191] = 2;
+    bytes[196] = 3;
+    bytes[236] = 1;
     assert_eq!(
         VariantKey::decode(&bytes),
         Err(KeyError::InvalidValue {
@@ -600,8 +624,8 @@ fn the_first_invalid_field_is_reported() {
     );
     // An invalid flipped-viewport switch before an invalid interpolation, and an invalid
     // interpolation before an invalid swizzle: the earlier field each time.
-    let mut bytes = patched(191, 2);
-    bytes[192] = 3;
+    let mut bytes = patched(195, 2);
+    bytes[196] = 3;
     assert_eq!(
         VariantKey::decode(&bytes),
         Err(KeyError::InvalidValue {
@@ -609,8 +633,8 @@ fn the_first_invalid_field_is_reported() {
             value: 2
         })
     );
-    let mut bytes = patched(223, 3);
-    bytes[225] = 1;
+    let mut bytes = patched(227, 3);
+    bytes[229] = 1;
     assert_eq!(
         VariantKey::decode(&bytes),
         Err(KeyError::InvalidValue {
@@ -619,8 +643,8 @@ fn the_first_invalid_field_is_reported() {
         })
     );
     // Two invalid interpolations: the lower generic.
-    let mut bytes = patched(194, 3);
-    bytes[193] = 4;
+    let mut bytes = patched(198, 3);
+    bytes[197] = 4;
     assert_eq!(
         VariantKey::decode(&bytes),
         Err(KeyError::InvalidValue {
@@ -678,7 +702,7 @@ fn the_swizzle_cap_at_its_edge() {
 fn the_swizzle_count_is_checked_before_the_swizzles() {
     // A count past the cap and too few bytes for it: the count is reported.
     let count = u8::try_from(MAX_TEXTURE_SWIZZLES + 1).expect("fits");
-    let bytes = patched(224, count);
+    let bytes = patched(228, count);
     assert_eq!(
         VariantKey::decode(&bytes),
         Err(KeyError::TooManySwizzles {
@@ -687,7 +711,7 @@ fn the_swizzle_count_is_checked_before_the_swizzles() {
     );
     // A count within the cap and too few bytes: the swizzle it ends in.
     assert_eq!(
-        VariantKey::decode(&patched(224, 3)),
+        VariantKey::decode(&patched(228, 3)),
         Err(KeyError::Truncated {
             field: KeyField::Swizzle {
                 binding: 2,
@@ -698,7 +722,7 @@ fn the_swizzle_count_is_checked_before_the_swizzles() {
     );
     // A count below what follows: the rest is trailing.
     assert_eq!(
-        VariantKey::decode(&patched(224, 1)),
+        VariantKey::decode(&patched(228, 1)),
         Err(KeyError::TrailingBytes {
             end: GOLDEN_BYTES.len() - SWIZZLE_SIZE,
             len: GOLDEN_BYTES.len()
@@ -718,8 +742,8 @@ fn trailing_bytes_are_refused() {
         })
     );
     assert_eq!(
-        KeyError::TrailingBytes { end: 233, len: 234 }.to_string(),
-        "the variant key ends at byte 233, but 234 bytes were given"
+        KeyError::TrailingBytes { end: 237, len: 238 }.to_string(),
+        "the variant key ends at byte 237, but 238 bytes were given"
     );
 }
 
@@ -939,6 +963,7 @@ fn key_field_names_are_plain_words() {
             "the workgroup size along axis 2",
         ),
         (KeyField::SharedMemorySize, "the shared-memory size"),
+        (KeyField::LocalMemorySize, "the local-memory size"),
         (KeyField::AlphaTest, "the alpha test"),
         (
             KeyField::DepthRangeRewrite,
@@ -1144,7 +1169,7 @@ fn output_interpolation_follows_the_pixel_input_map() {
     expected[4] = Interpolation::NoPerspective;
     expected[31] = Interpolation::Flat;
     assert_eq!(modes.modes(), expected);
-    // Golden: the key's bytes for the output interpolation (offsets 192 to 223).
+    // Golden: the key's bytes for the output interpolation (offsets 196 to 227).
     let key = VariantKey {
         output_interpolation: modes,
         ..VariantKey::default()
@@ -1155,7 +1180,7 @@ fn output_interpolation_follows_the_pixel_input_map() {
         0, 1, 2, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
     ];
-    assert_eq!(bytes[192..224], golden);
+    assert_eq!(bytes[196..228], golden);
     assert_eq!(VariantKey::decode(&bytes), Ok(key));
     // Nothing used: every generic smooth.
     assert_eq!(

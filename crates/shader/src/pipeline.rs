@@ -32,13 +32,46 @@
 //!      constant-buffer bank or offset out of range) and for the constant-buffer sizes the
 //!      lowering declares ([`constant_buffer_sizes`]); its interface tables are not passed on
 //!      yet;
-//!   5. for a compute program, its local memory ([`PipelineRefusal::ComputeLocalMemory`]);
-//!   6. the host lowering passes the host target's features call for ([`lower_for_host`],
+//!   5. the host lowering passes the host target's features call for ([`lower_for_host`],
 //!      slice 18, [`Rejection::HostLower`]): 64-bit floats become 32-bit ones where the target
 //!      lacks them, and 16-bit floats likewise; the spec's pass 8;
-//!   7. the lowering ([`lower_with`], [`Rejection::Lower`]), with the variant key's workgroup
-//!      and shared-memory sizes and emulation flags, the header's local-memory size, the
-//!      constant-buffer sizes of step 4 and the host target's features.
+//!   6. the lowering ([`lower_with`], [`Rejection::Lower`]), with the variant key's workgroup
+//!      and shared-memory sizes and emulation flags, the local-memory size (module docs, "The
+//!      local-memory size"), the constant-buffer sizes of step 4 and the host target's
+//!      features.
+//!
+//! # The local-memory size
+//!
+//! [`local_memory_bytes`] gives the size the lowering sizes and bounds the local array by
+//! (`crate::lower`, "Local and shared memory"), as each reference's environment gives
+//! `LocalMemorySize()`:
+//!
+//! - **Graphics:** the header's size ([`crate::sph::Common::local_memory_size`]) plus its CRS
+//!   size ([`crate::sph::Common::local_memory_crs_size`]), as `GraphicsEnvironment` sets
+//!   `local_memory_size = static_cast<u32>(local_size) +
+//!   sph.common3.shader_local_memory_crs_size` (`eden/src/video_core/shader_environment.cpp`
+//!   @ cf654052, `eden-nx2` @ 50fa86bb and `eden-pr4588` @ e5fb3b97 alike). The CRS field is
+//!   named only in version 3 of the header layout (`SHADER_LOCAL_MEMORY_CRS_SIZE`, bits 96 to
+//!   119); version 4 leaves those bits unnamed, so reading them as the CRS size on Switch 2
+//!   follows PR #4588, which runs titles on it (graphics-server decision 8), and is a
+//!   **guess** until a large-local-memory shader (verification E3) settles it.
+//! - **Compute:** [`VariantKey::local_memory_size`], which the GPU crate fills from the QMD
+//!   (`local_pos_alloc + local_crs_alloc`, `ComputeEnvironment` in the same files).
+//!
+//! A program with no local-memory operation left after the passes is lowered with a size of
+//! 0 whatever its header or key says, since the size only sizes an array it never touches. So
+//! the lowering's cap ([`crate::lower::MAX_LOCAL_MEMORY_BYTES`], which no reference applies)
+//! refuses only a program that reads or writes local memory: a plain compute program whose QMD
+//! sets bits 20 to 23 of a local-memory field (which both Switch 2 references mask away) is
+//! accepted, as in the references. Pinned by
+//! `tests::a_program_without_local_access_is_not_held_to_the_cap`.
+//!
+//! **Divergence:** Eden asserts the header's size fits 32 bits (a soft `ASSERT`) and then
+//! truncates it to `u32` and adds the CRS size in 32 bits, so a size of 2^32 or more wraps.
+//! Here the sum is taken in 64 bits (it cannot wrap: the header's size is below 2^56 and the
+//! CRS size below 2^32), and the lowering refuses a program that uses local memory with any
+//! size past [`crate::lower::MAX_LOCAL_MEMORY_BYTES`]. Pinned by
+//! `tests::a_header_size_of_2_to_the_32_is_refused_not_wrapped`.
 //!
 //! # What it does not do yet
 //!
@@ -50,14 +83,6 @@
 //!   ([`crate::lower::LowerError::ConstantBufferRegisterBank`]), and every texture, image and
 //!   global-memory operation ([`crate::lower::LowerError::Operation`]). Collect info's
 //!   interface tables (slice 15) are not passed on yet.
-//! - **A compute program's local memory** has no size: Eden takes it from the QMD
-//!   (`local_pos_alloc + local_crs_alloc`), which no question, key field or driver constant
-//!   carries yet (the exchange's module docs, "For the owner: what the questions do not
-//!   cover"). A compute program that still reads or writes local memory after the passes is
-//!   refused ([`PipelineRefusal::ComputeLocalMemory`]) rather than lowered over an array of no
-//!   words, whose reads would give 0. Pinned for a store by
-//!   `tests::a_compute_program_with_local_memory_is_refused` and for a load alone by
-//!   `tests::a_compute_program_that_only_reads_local_memory_is_refused`.
 //! - **Jump tables do not extend the capture** (the cache's module docs, "Where this differs
 //!   from the spec"): the tables are resolved against the capture's own bytes, since
 //!   [`Translator::shader`] has no guest-memory reader, so a target at or past the capture's
@@ -95,18 +120,13 @@ use crate::ir::{Function, Inst, Opcode};
 use crate::lower::{LowerInputs, constant_buffer_sizes, lower_with};
 use crate::program::{Rejection, pipeline_ir};
 use crate::sph::{Io, ProgramHeader};
-use crate::translate::{ColorOutputs, GuestStage, Stage, TranslateError};
+use crate::translate::{ColorOutputs, Stage, TranslateError};
+use crate::variant::VariantKey;
 
 /// What the production translator refuses itself, beside the refusals of the steps it runs
 /// (module docs, "What it does not do yet").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum PipelineRefusal {
-    /// A compute program reads or writes local memory, whose size comes from the QMD, which no
-    /// translation input carries yet.
-    #[error(
-        "a compute program that uses local memory, whose size no translation input carries yet"
-    )]
-    ComputeLocalMemory,
     /// A jump table names an instruction at or past the capture's end, which the translator
     /// cannot extend the capture to (module docs, "Divergences from the reference").
     #[error(
@@ -227,14 +247,15 @@ pub fn translate_shader(input: &ShaderInput<'_, PipelineProgram>) -> Result<Host
     let code: Vec<Instruction> = program.capture.instructions().collect();
     let mut function = pipeline_ir(stage, pixel, &code, &tables)?;
     let info = collect(input.stage, header, &function)?;
-    if input.stage == GuestStage::Compute && uses_local_memory(&function) {
-        return Err(PipelineRefusal::ComputeLocalMemory.into());
-    }
     let caps = host_caps(input.target.caps);
     lower_for_host(&mut function, caps)?;
     let inputs = LowerInputs {
         workgroup_size: input.variant.workgroup_size,
-        local_memory_bytes: header.map_or(0, |header| header.common.local_memory_size()),
+        local_memory_bytes: if uses_local_memory(&function) {
+            local_memory_bytes(header, input.variant)
+        } else {
+            0
+        },
         shared_memory_bytes: input.variant.shared_memory_size,
         caps,
         constant_buffers: constant_buffer_sizes(&info),
@@ -243,7 +264,24 @@ pub fn translate_shader(input: &ShaderInput<'_, PipelineProgram>) -> Result<Host
     Ok(lower_with(input.stage, &function, &inputs)?)
 }
 
-/// Whether `function` lists a local-memory operation.
+/// The local-memory size in bytes of a program with `header` (module docs, "The local-memory
+/// size"): a graphics program's header size plus its CRS size, or, for a compute program
+/// (which has no header; [`check_header`] refuses a graphics program without one and a
+/// compute program with one before this is asked), the variant key's
+/// [`VariantKey::local_memory_size`]. The key's field is not read for a graphics program.
+#[must_use]
+pub fn local_memory_bytes(header: Option<&ProgramHeader>, variant: &VariantKey) -> u64 {
+    header.map_or(u64::from(variant.local_memory_size), |header| {
+        // Below 2^56 plus below 2^32: the sum cannot wrap, and saturating keeps that a proof.
+        header
+            .common
+            .local_memory_size()
+            .saturating_add(u64::from(header.common.local_memory_crs_size))
+    })
+}
+
+/// Whether `function` lists a local-memory operation (module docs, "The local-memory size":
+/// a program without one is lowered with a size of 0, so its size is never checked).
 fn uses_local_memory(function: &Function) -> bool {
     function.listed().any(|(_, inst)| {
         matches!(inst, Inst::Op(op) if matches!(op.opcode, Opcode::LoadLocal | Opcode::WriteLocal))

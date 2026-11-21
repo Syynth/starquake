@@ -155,8 +155,9 @@
 //! # Local and shared memory
 //!
 //! The `memory` submodule: local memory is a private array of `u32` words, sized from the
-//! SPH (graphics) or the QMD (compute), shared memory a workgroup array sized from the QMD
-//! (through the variant key), each `ceil(bytes / 4)` words as Eden sizes them
+//! SPH (graphics: its size plus its CRS size) or the QMD (compute, through the variant key;
+//! [`crate::pipeline::local_memory_bytes`] gives both), shared memory a workgroup array sized
+//! from the QMD (through the variant key), each `ceil(bytes / 4)` words as Eden sizes them
 //! (`backend/spirv/spirv_emit_context.cpp` @ cf654052, `DefineLocalMemory` and the
 //! non-explicit-layout arm of `DefineSharedMemory`). Every word an access touches is
 //! bounds-checked: a read past the end gives 0 and a write past the end is dropped (the
@@ -526,8 +527,9 @@ pub struct LowerInputs {
     /// A compute program's workgroup size, x, y and z (the variant key's); ignored for other
     /// stages.
     pub workgroup_size: [u32; 3],
-    /// The local-memory size in bytes: the SPH's for a graphics program, the QMD's for a
-    /// compute program.
+    /// The local-memory size in bytes: the SPH's (its size plus its CRS size) for a graphics
+    /// program, the QMD's (through the variant key) for a compute program; the production
+    /// translator takes it from [`crate::pipeline::local_memory_bytes`].
     pub local_memory_bytes: u64,
     /// A compute program's shared-memory size in bytes (the variant key's, from the QMD);
     /// ignored for other stages.

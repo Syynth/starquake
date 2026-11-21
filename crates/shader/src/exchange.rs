@@ -56,7 +56,7 @@
 //! | `IsTexturePixelFormatInteger` | [`TextureKind::sampled`] (which also tells signed from unsigned) | yes |
 //! | `ReadViewportTransformState` | nothing | **no** |
 //! | `TextureBoundBuffer` | nothing | **no** |
-//! | `LocalMemorySize` | graphics: the program header, part of the program's bytes; compute: nothing | **graphics only** |
+//! | `LocalMemorySize` | graphics: the program header, part of the program's bytes (its size plus its CRS size); compute: [`crate::variant::VariantKey::local_memory_size`], from the QMD ([`crate::pipeline::local_memory_bytes`]) | yes |
 //! | `SharedMemorySize` | [`crate::variant::VariantKey::shared_memory_size`] | yes |
 //! | `WorkgroupSize` | [`crate::variant::VariantKey::workgroup_size`] | yes |
 //! | `HasHLEMacroState`, `GetReplaceConstBuffer` | nothing | **no** |
@@ -135,9 +135,6 @@
 //! - **`ReadViewportTransformState`**: whether the viewport scale and offset are enabled
 //!   (`viewport_scale_offset_enabled`). It gates Eden-NX2's `PositionPass`
 //!   (`eden-nx2/src/shader_recompiler/ir_opt/position_pass.cpp` @ 50fa86bb), the row-65 path.
-//! - **Compute `LocalMemorySize`**: Eden takes it from the QMD (`local_pos_alloc +
-//!   local_crs_alloc`, `ComputeEnvironment`'s constructor in `shader_environment.cpp`), which is
-//!   not in a compute program's bytes. A graphics program's comes from its header.
 //! - **`HasHLEMacroState` and `GetReplaceConstBuffer`**: constant-buffer words that Eden's
 //!   high-level macro emulation replaces, folded by its constant propagation pass
 //!   (`eden/src/shader_recompiler/ir_opt/constant_propagation_pass.cpp`).
