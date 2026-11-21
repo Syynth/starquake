@@ -281,3 +281,30 @@ fn the_longest_trace_takes_the_documented_steps() {
     let deeper = format!("{lines}    %41: u32 = BitwiseAnd32 %40, u32 0xff\n");
     assert_eq!(untraced(&sample_of(&deeper, "%41")), Untraced::TooDeep);
 }
+
+/// An index word shifted by 32 or more is not kept (Eden's `shift >= 32` check): the array is
+/// indexed at run time; 31 is kept.
+#[test]
+fn an_index_shift_at_the_edge() {
+    let indexed = |shift: u32| {
+        sample_of(
+            &format!(
+                "    %0: u32 = GetCbufU32 u32 0x5, u32 0x8\n    \
+                 %1: u32 = ShiftLeftLogical32 %0, u32 {shift:#x}\n    \
+                 %2: u32 = GetCbufU32 u32 0x3, %1\n"
+            ),
+            "%2",
+        )
+    };
+    let last = u32::BITS - 1;
+    assert_eq!(
+        sources(&indexed(last)),
+        format!(
+            "%60: cbuf 3 at 0x0, 1024 handles 8 bytes apart, index from cbuf 5 at 0x8 << {last}\n"
+        )
+    );
+    assert_eq!(
+        sources(&indexed(u32::BITS)),
+        "%60: cbuf 3 at 0x0, 1024 handles 8 bytes apart\n"
+    );
+}

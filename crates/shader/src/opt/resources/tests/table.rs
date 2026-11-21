@@ -285,3 +285,27 @@ fn descriptors_merge_as_edens_do() {
         [0, 1, 0, 0, 0, 1, 2, 2]
     );
 }
+
+/// Texel buffers read as images merge by format and source, as Eden's image buffers do.
+#[test]
+fn image_buffers_merge_by_format() {
+    let text = "block0:
+    %0: u32 = GetCbufU32 u32 0x3, u32 0x10
+    %1: u32 = GetRegister r0
+    %2: u32x4 = ImageRead %0, %1 {type=buffer, format=r32_uint}
+    %3 = ImageWrite %0, %1, %2 {type=buffer, format=r32_uint}
+    %4: u32x4 = ImageRead %0, %1 {type=buffer, format=r16_uint}
+    return
+";
+    let engine = Engine::new()
+        .word(3, 0x10, 0x11)
+        .kind(0x11, kind_of(SampledType::UnsignedInt, true, 0x7));
+    let (function, table) = pass(text, &engine);
+    assert_eq!(
+        table.to_string(),
+        "image buffer 0: r32_uint, unsigned, header format 0x7, read and written, from cbuf 3 at 0x10\n\
+         image buffer 1: r16_uint, unsigned, header format 0x7, read, from cbuf 3 at 0x10\n"
+    );
+    let index = |at| info_at(&function, at).descriptor_index;
+    assert_eq!([2, 3, 4].map(index), [0, 0, 1]);
+}

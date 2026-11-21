@@ -277,3 +277,9 @@ fn every_row_matches_edens_table() {
         assert_eq!(is_storage_image(opcode), storage, "{opcode}");
     }
 }
+
+/// A bound offset is aligned down to a word, as the word read is.
+#[test]
+fn a_bound_offset_is_aligned_down_to_a_word() {
+    assert_eq!(sources(&sample_of("", "u32 0x43")), "%60: cbuf 2 at 0x40\n");
+}
