@@ -446,6 +446,51 @@ fn unreachable_blocks_are_rewritten() {
     assert!(after.block(dead).is_some_and(|block| block.insts.len() > 7));
 }
 
+/// The conversions that make a narrowed value are written out before those that read one,
+/// whatever the arena order of their blocks: here the block that makes the 64-bit and 16-bit
+/// values (block 2) comes after the block that reads them (block 1), which the entry reaches
+/// through it, and both passes still run and give the same results.
+#[test]
+fn conversions_in_blocks_out_of_arena_order() {
+    let mut function = Function::new();
+    let entry = function.entry();
+    let mut b = Builder::new(&mut function, entry);
+    let reader = b.add_block().expect("a block");
+    let maker = b.add_block().expect("a block");
+    b.terminate(Terminator::Jump(maker)).expect("jumps");
+    b.switch_to(maker).expect("a block");
+    let lo = value(&mut b, Opcode::GetRegister, &[reg(0)]);
+    let hi = value(&mut b, Opcode::GetRegister, &[reg(1)]);
+    let words = value(&mut b, Opcode::CompositeConstructU32x2, &[lo, hi]);
+    let double = value(&mut b, Opcode::PackDouble2x32, &[words]);
+    let packed = value(&mut b, Opcode::GetRegister, &[reg(2)]);
+    let halves = value(&mut b, Opcode::UnpackFloat2x16, &[packed]);
+    b.terminate(Terminator::Jump(reader)).expect("jumps");
+    b.switch_to(reader).expect("a block");
+    let out = value(&mut b, Opcode::UnpackDouble2x32, &[double]);
+    let high = value(
+        &mut b,
+        Opcode::CompositeExtractU32x2,
+        &[out, Operand::Imm(Imm::U32(1))],
+    );
+    value(&mut b, Opcode::SetRegister, &[reg(10), high]);
+    let word = value(&mut b, Opcode::PackFloat2x16, &[halves]);
+    value(&mut b, Opcode::SetRegister, &[reg(11), word]);
+    b.terminate(Terminator::Return).expect("returns");
+
+    let mut after = function.clone();
+    lower_for_host(&mut after, HostCaps::NONE).expect("lowers");
+    assert_eq!(narrowed_left(&after, HostPass::Fp64ToFp32), 0);
+    assert_eq!(narrowed_left(&after, HostPass::Fp16ToFp32), 0);
+    let mut machine = Machine::default();
+    set_pair(&mut machine, 0, (-2.5_f64).to_bits());
+    machine.regs[2] = 0x3c00_c200;
+    let (before, after) = (ran(&function, &machine), ran(&after, &machine));
+    assert_eq!(before.regs[10..12], after.regs[10..12]);
+    assert_eq!(after.regs[10], ((-2.5_f64).to_bits() >> 32) as u32);
+    assert_eq!(after.regs[11], 0x3c00_c200);
+}
+
 /// The room check accepts a function that fills the arena exactly and refuses one more
 /// instruction, with the total it would need; an overflowing sum is refused too.
 #[test]
