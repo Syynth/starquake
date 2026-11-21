@@ -195,6 +195,7 @@ pub const fn host_caps(caps: Requirements) -> HostCaps {
         f16: caps.f16,
         i64: caps.i64,
         subgroup: caps.subgroup,
+        subgroup_size_32: caps.subgroup_size_32,
     }
 }
 
