@@ -1839,6 +1839,146 @@ fn replies_said_to_be_ready_while_another_core_runs_the_handler_are_delivered() 
     assert!(lock(&world.first.ready).is_empty());
 }
 
+/// A's request on one session of the first server is deferred; then a delivery of its reply
+/// takes the handler out of its slot and stops in `take_reply`, and B, a scheduler thread on
+/// another core, sends on a second session meanwhile. B's request starts (the deferred one holds
+/// no worker) and finds the handler out, so it is parked (module docs). The test checks, while
+/// the delivery is stopped, that B waits for its reply on that session with the handle still in
+/// its saved `x0`, and only then lets the delivery go on: it puts the handler back and runs B's
+/// request with `parked_script`. Returns A's and B's scheduler threads, B's handle and session.
+fn park_a_request_behind_a_delivery(
+    world: &World,
+    parked_script: Script,
+) -> (KernelThreadId, KernelThreadId, Handle, ObjectId) {
+    let (deferred, parked) = (world.session(), world.session());
+    let (deferred_object, parked_object) = (world.object(deferred), world.object(parked));
+    let (a, b) = (run_thread_for(world, A), run_thread_for(world, B));
+    world
+        .first
+        .script(Box::new(|_, _, _| Ok(Handled::Deferred)));
+    assert_eq!(
+        world.send(A, deferred, &request()).0.outcome,
+        Outcome::Waiting
+    );
+    world.first.script(parked_script);
+    let (gate, keeper) = gate();
+    let gate = Mutex::new(Some(gate));
+    lock(&world.first.hooks).take_reply = Some(Box::new(move |_| {
+        if let Some(gate) = lock(&gate).take() {
+            gate.pass();
+        }
+    }));
+    lock(&world.first.ready).push_back((deferred_object, Ok(0xA0)));
+    // What B's call left while the delivery was stopped, taken before the gate opens and
+    // checked after it, so a failed check cannot leave the delivery waiting at the gate.
+    let (record, regs, waits, saved, handled) = std::thread::scope(|scope| {
+        let delivering = scope.spawn(|| world.deliver(&world.first));
+        keeper.wait();
+        let (record, regs) = world.send(B, parked, &request());
+        let seen = (
+            record,
+            regs,
+            reply_state(world, b, parked_object),
+            saved_x0(world, b),
+            world.first.log().handled.len(),
+        );
+        keeper.open();
+        assert_eq!(delivering.join().unwrap(), Vec::<Ended>::new());
+        seen
+    });
+    assert_eq!(record.outcome, Outcome::Waiting);
+    // The registers the call returns with are not the result: the core reloads B's saved
+    // context, so B must be in its reply wait, and that context must still be the call's.
+    assert_eq!(regs.x[0], u64::from(parked.raw()));
+    assert_eq!(
+        waits,
+        (ThreadState::Waiting, true),
+        "a parked request's sender waits for its reply"
+    );
+    assert_eq!(saved, u64::from(parked.raw()));
+    // Parked, not run: the handler had seen only A's request.
+    assert_eq!(handled, 1);
+    // The delivery put the handler back and ran B's request.
+    assert_eq!(world.first.log().handled.len(), 2);
+    assert_eq!(world.first.log().handled[1].0, parked_object);
+    (a, b, parked, parked_object)
+}
+
+#[test]
+fn a_request_parked_while_a_delivery_has_the_handler_leaves_its_sender_waiting_for_the_reply() {
+    let world = World::new();
+    let (a, b, _, parked) = park_a_request_behind_a_delivery(&world, reply_with(0xBC));
+    // The core that put the handler back answered B: B is runnable with the result in the
+    // context its core loads, and its reply in its message buffer.
+    assert_eq!(
+        reply_state(&world, b, parked),
+        (ThreadState::Runnable, false)
+    );
+    assert_eq!(saved_x0(&world, b), u64::from(ResultCode::SUCCESS.raw()));
+    assert_eq!(world.tls(B), [0xBC; BUFFER_SIZE]);
+    assert_eq!(world.tls(A), [0xA0; BUFFER_SIZE]);
+    assert_eq!(
+        world.with_tables(|_, scheduler| scheduler.thread(a).unwrap().state()),
+        ThreadState::Runnable
+    );
+    assert_eq!(
+        world.dispatcher.take_woken(),
+        [
+            Woken {
+                thread: A,
+                core: core_of(A),
+                result: ResultCode::SUCCESS
+            },
+            Woken {
+                thread: B,
+                core: core_of(B),
+                result: ResultCode::SUCCESS
+            },
+        ]
+    );
+}
+
+#[test]
+fn a_parked_request_its_handler_then_defers_keeps_its_sender_waiting_until_the_reply() {
+    let world = World::new();
+    let (_, b, _, parked) =
+        park_a_request_behind_a_delivery(&world, Box::new(|_, _, _| Ok(Handled::Deferred)));
+    // Run and deferred: B still waits, in the one wait it began when parked.
+    assert_eq!(
+        reply_state(&world, b, parked),
+        (ThreadState::Waiting, true)
+    );
+    // The delivery woke A alone.
+    assert_eq!(
+        world.dispatcher.take_woken(),
+        [Woken {
+            thread: A,
+            core: core_of(A),
+            result: ResultCode::SUCCESS
+        }]
+    );
+    // The deferred reply fails, which closes the session: B gets that result, not success and
+    // not its handle.
+    lock(&world.first.ready).push_back((parked, Err(HandlerError("lost".to_owned()))));
+    assert_eq!(world.deliver(&world.first), Vec::<Ended>::new());
+    assert_eq!(
+        reply_state(&world, b, parked),
+        (ThreadState::Runnable, false)
+    );
+    assert_eq!(
+        saved_x0(&world, b),
+        u64::from(KernelError::SessionClosed.code().raw())
+    );
+    assert_eq!(
+        world.dispatcher.take_woken(),
+        [Woken {
+            thread: B,
+            core: core_of(B),
+            result: KernelError::SessionClosed.code()
+        }]
+    );
+}
+
 // ----- Whether a run is stalled (`Dispatcher::is_stalled`) ------------------------------------
 
 #[test]

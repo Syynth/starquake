@@ -1129,8 +1129,13 @@ impl Dispatcher {
             return (finish(ipc, session, failed, Vec::new()), Vec::new());
         };
         let Some(mut handler) = slot.take() else {
-            // Out of its slot without a worker: whoever puts it back runs this request.
+            // Out of its slot without a worker: whoever puts it back runs this request. The
+            // sender waits for its reply now, as on the queued and deferred paths, before the
+            // lock goes: the thread that puts the handler back may run and answer the request
+            // at once, and its answer must find the sender waiting. Eden: every synchronous
+            // request begins its sender's wait (`KServerSession::OnRequest`, module docs).
             state.parked.entry(server).or_default().push(session);
+            await_reply(&mut state.tables.scheduler, request.sender, session);
             return (Vec::new(), Vec::new());
         };
         give_notices(&mut state.tables, server, &mut *handler);
