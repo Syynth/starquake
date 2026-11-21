@@ -553,10 +553,11 @@ a `Write` or `Run` of its 3D class, and every channel's before a `Syncpoint`, `M
 `Present`, so the work after them in the stream comes after the draw. A listed divergence, as
 built in G19 (decided by the owner, 2026-11-19).
 
-**Clears.** `CLEAR_SURFACE` becomes a `Command::Clear` of the bound targets, or a draw when the
-clear is masked or scissored in a way a render-pass clear cannot express, as Eden's
-`DrawManager::Clear` decides (`eden-nx2/src/video_core/engines/draw_manager.cpp`). Slice G24
-owns it (decided by the owner, 2026-11-19).
+**Clears.** `CLEAR_SURFACE` becomes a `Command::Clear` of the bound targets, with the write masks
+and rectangle the guest asks for. Slice G24 owns it (decided by the owner, 2026-11-19). G24 first
+drew masked and scissored clears itself, as Eden's `DrawManager::Clear` decides
+(`eden-nx2/src/video_core/engines/draw_manager.cpp`); #455 (PR #483) moved those draws into the
+render backend, as the next paragraph says.
 
 Masked clears are the render backend's (decided by the owner, 2026-11-19). `ClearDesc` carries the
 colour channels and stencil bits a clear writes (render-backend, "Commands"), so a masked clear is
@@ -1062,7 +1063,13 @@ What this spec assumes of gsv:
   frame whose fence is reached, and frees the buffer that frame replaces on the same tick; this
   crate is not asked to wait on a fence or to report the buffer free.
 - gsv tells this crate which registrations are two pages long (the semaphore mirror question,
-  row 35).
+  row 35). A fenced release that lands in the second page of such a registration is also written
+  at the same offset in its first page, as Eden-NX2's `Nx2SemaphoreMirror` does
+  (`eden-nx2/src/video_core/nx2.h`, `engines/puller.cpp`; the two-page list from `nx2_gsv.h`,
+  `SubRegisterMemory`). A release anywhere else, a one-page neighbour included, is not copied.
+  Tentative (decided by the owner, 2026-11-20, graphics-server verification item 8): the title
+  brought up waits on the first page while the GPU writes the second; a hardware trace may show
+  a different cause.
 
 Thread rules: every `GpuFront` method only enqueues and never blocks. `Completions::push` is
 called from the front thread (`GpuQueueRoom`), the back thread (`SyncpointChanged`,

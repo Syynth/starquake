@@ -127,6 +127,7 @@ starquake run <program>
     --record ring | full | off
     --snapshot-every 30s
     --artifacts <dir>
+    --backend recording|wgpu    choose the render backend (default below)
     --window                    show frames in a plain window while running
     --capture render            write a render capture (below)
     --capture-limit <size>      stop capturing past this size (below)
@@ -143,6 +144,12 @@ of every call the render backend received from its construction, which `render-r
 a fresh backend; `--capture-limit` (default 4 GiB, a guess) closes it early. The flag takes a list
 so the GPU capture (`SQGC`) can join it if gpu-protocol chooses; neither capture has a switch in
 this contract today.
+
+`--backend` names the render backend a run draws with. Without it, a run uses wgpu where the
+build has it and falls back to the recording backend on a host with no GPU adapter (R12, PR #481).
+`summary.json` records the backend the run drew with and whether it fell back, with a
+`SUMMARY_VERSION` bump, and counts the presents the backend reported back as shown (its present
+feedback) (decided by the owner, 2026-11-20).
 
 `--window` is for watching bring-up live; it changes nothing the guest sees, and a run without it
 needs no display (`render-backend.md`, decision 11). The three replay commands are offline and
