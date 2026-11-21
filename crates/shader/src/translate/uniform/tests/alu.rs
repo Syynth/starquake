@@ -453,7 +453,8 @@ fn uplop3_takes_any_truth_table() {
             machine.uniform_preds[3] = a;
             machine.uniform_preds[4] = b;
             machine.uniform_preds[5] = !c;
-            machine.preds = [!a, !b, c, a, b, c, a, false];
+            // The per-thread predicates of the same numbers hold the opposite values.
+            machine.preds = [a, b, !c, !a, !b, c, a, false];
             let preds = machine.preds;
             machine.run(&function).expect("runs");
             let expected = lut >> row & 1 != 0;

@@ -376,3 +376,15 @@ proptest! {
         }
     }
 }
+
+/// The shipping limits against the reference's literals, written out: `Visitor::ULDC`'s
+/// `dest < 62` and `dest < 60`, `Visitor::IMAD_WIDE`'s `uniform_op ? 62 : 254`, and
+/// `Visitor::R2UR`'s shuffle clamp `31`.
+#[test]
+fn the_reference_constants() {
+    assert_eq!(ULDC_PAIR_LIMIT, 62);
+    assert_eq!(ULDC_QUAD_LIMIT, 60);
+    assert_eq!(integer::UNIFORM_WIDE_PAIR_LIMIT, 62);
+    assert_eq!(integer::WIDE_PAIR_LIMIT, 254);
+    assert_eq!(SHUFFLE_CLAMP, 31);
+}
