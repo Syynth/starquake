@@ -312,7 +312,7 @@ structure:
         let before = function.clone();
         let buffers = to_storage_buffers(&mut function, align(ALIGN)).expect("runs");
         assert_eq!(function, before);
-        assert!(buffers.descriptors().is_empty());
+        assert_eq!(buffers.descriptors(), []);
     }
 }
 
@@ -863,9 +863,8 @@ mod search {
              \x20   %12: u32 = LoadGlobal32 %11\n    return\n"
         );
         let (_, buffers) = convert(&text);
-        let [only] = buffers.descriptors() else {
-            panic!("one buffer: {:?}", buffers.descriptors());
-        };
+        assert_eq!(buffers.descriptors().len(), 1, "one buffer");
+        let only = buffers.descriptors().first().expect("one buffer");
         (only.bank(), only.offset())
     }
 
@@ -1056,15 +1055,17 @@ block2:
         let mut text = String::from("block0:\n    %0: u1 = UndefU1\n    %1: u32 = UndefU32\n");
         let mut id = 2_usize;
         let write = |text: &mut String, id: &mut usize, item: &Gen| {
-            let back = |d: usize| (*id).saturating_sub(d).max(1);
+            let earlier = |d: usize| (*id).saturating_sub(d).max(1);
             let line = match *item {
                 Gen::Cbuf(bank, offset) => {
                     format!("u32 = GetCbufU32 u32 {bank:#x}, u32 {offset:#x}")
                 }
-                Gen::Add(a, b) => format!("u32 = IAdd32 %{}, %{}", back(a), back(b)),
-                Gen::AddImm(a) => format!("u32 = IAdd32 %{}, u32 0x4", back(a)),
-                Gen::Identity(a) => format!("opaque = Identity %{}", back(a)),
-                Gen::Select(a, b) => format!("u32 = SelectU32 %0, %{}, %{}", back(a), back(b)),
+                Gen::Add(a, b) => format!("u32 = IAdd32 %{}, %{}", earlier(a), earlier(b)),
+                Gen::AddImm(a) => format!("u32 = IAdd32 %{}, u32 0x4", earlier(a)),
+                Gen::Identity(a) => format!("opaque = Identity %{}", earlier(a)),
+                Gen::Select(a, b) => {
+                    format!("u32 = SelectU32 %0, %{}, %{}", earlier(a), earlier(b))
+                }
                 Gen::Undef => "u32 = UndefU32".to_string(),
             };
             let _ = writeln!(text, "    %{id}: {line}");

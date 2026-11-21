@@ -458,10 +458,46 @@ pub fn to_storage_buffers(
     alignment: StorageAlignment,
 ) -> Result<StorageBuffers, GlobalMemoryError> {
     let mut work = Work::default();
-    let mut order = block_order(function, &mut work);
-    order.reverse();
+    let accesses = find_accesses(function, &mut work)?;
+    if accesses.is_empty() {
+        return Ok(StorageBuffers {
+            descriptors: Vec::new(),
+            work,
+        });
+    }
+    let collected = collect(function, &accesses, &mut work)?;
+    let descriptors = table(&accesses, &collected);
+    // Replace, block by block in collection order (a block's accesses are consecutive there).
+    let mut start = 0;
+    while let Some(first) = accesses.get(start) {
+        let block = first.block;
+        let end = accesses
+            .iter()
+            .skip(start)
+            .position(|found| found.block != block)
+            .map_or(accesses.len(), |len| start + len);
+        replace_block(
+            function,
+            block,
+            accesses.get(start..end).unwrap_or_default(),
+            collected.get(start..end).unwrap_or_default(),
+            &descriptors,
+            alignment,
+            &mut work,
+        )?;
+        start = end;
+    }
+    if VERIFY {
+        function.verify().map_err(GlobalMemoryError::Verify)?;
+    }
+    Ok(StorageBuffers { descriptors, work })
+}
 
-    // The accesses, in collection order.
+/// The global memory accesses, in collection order: blocks in post order, each block's
+/// instructions in order.
+fn find_accesses(function: &Function, work: &mut Work) -> Result<Vec<Found>, PassError> {
+    let mut order = block_order(function, work);
+    order.reverse();
     let mut accesses = Vec::new();
     for &block in &order {
         let Some(listed) = function.block(block) else {
@@ -470,7 +506,7 @@ pub fn to_storage_buffers(
         for &value in &listed.insts {
             work.step();
             let Some(inst) = function.inst(value) else {
-                return Err(PassError::Missing(value).into());
+                return Err(PassError::Missing(value));
             };
             if let Inst::Op(op) = inst
                 && let Some((storage, access)) = storage_opcode(op.opcode)
@@ -485,94 +521,104 @@ pub fn to_storage_buffers(
             }
         }
     }
-    if accesses.is_empty() {
-        return Ok(StorageBuffers {
-            descriptors: Vec::new(),
-            work,
-        });
-    }
+    Ok(accesses)
+}
 
-    // Collect: the low addresses, the search over all of them at once, then the checks in
-    // collection order.
+/// Collects every access (module docs, "What the pass does", step 1): the low addresses, the
+/// search over all of them at once, then each access's checks in collection order, then the
+/// arena's room. Changes nothing.
+fn collect(
+    function: &Function,
+    accesses: &[Found],
+    work: &mut Work,
+) -> Result<Vec<Collected>, GlobalMemoryError> {
     let mut resolver = Resolver::new(function);
     let mut lows = Vec::with_capacity(accesses.len());
-    for found in &accesses {
+    for found in accesses {
         work.step();
-        lows.push(low_address(
-            function,
-            &mut resolver,
-            found.value,
-            &mut work,
-        )?);
+        lows.push(low_address(function, &mut resolver, found.value, work)?);
     }
     let starts: Vec<Value> = lows
         .iter()
-        .filter_map(|low| match low {
-            Ok(low) => Some(low.start),
-            Err(_) => None,
-        })
+        .filter_map(|low| low.as_ref().ok().map(|low| low.start))
         .collect();
-    let mut tracker = Tracker::new(function, &mut resolver, &starts, &mut work)?;
+    let mut tracker = Tracker::new(function, &mut resolver, &starts, work)?;
     let mut collected = Vec::with_capacity(accesses.len());
     for (found, low) in accesses.iter().zip(lows) {
         work.step();
-        let untraced = |reason| GlobalMemoryError::Untraced {
-            at: found.value,
-            opcode: found.opcode,
-            reason,
-        };
-        let low = low.map_err(untraced)?;
-        let pointer = tracker
-            .find(low.start, Search::Biased, &mut work)
-            .or_else(|| tracker.find(low.start, Search::Unbiased, &mut work))
-            .ok_or_else(|| untraced(UntracedReason::NoPointer))?;
-        let (bank, offset) = tracker.place(pointer);
-        let bank = u8::try_from(bank)
-            .ok()
-            .filter(|&bank| bank < CBUF_BANKS)
-            .ok_or(GlobalMemoryError::Bank {
-                at: found.value,
-                opcode: found.opcode,
-                bank,
-            })?;
-        if offset
-            .checked_add(POINTER_BYTES)
-            .is_none_or(|end| end > INDEXED_CBUF_SIZE)
-        {
-            return Err(GlobalMemoryError::Offset {
-                at: found.value,
-                opcode: found.opcode,
-                bank,
-                offset,
-            });
-        }
-        let data = match found.access {
-            Access::Load => None,
-            Access::Write | Access::Atomic => {
-                Some(operation(function, found.value)?.1.get(1).copied().ok_or(
-                    GlobalMemoryError::MissingData {
-                        at: found.value,
-                        opcode: found.opcode,
-                    },
-                )?)
-            }
-        };
-        collected.push(Collected {
-            low: low.word,
-            imm_offset: low.imm_offset,
-            bank,
-            offset,
-            data,
-        });
+        collected.push(check(function, &mut tracker, found, low, work)?);
     }
     if !arena_fits(arena_len(function), accesses.len()) {
         return Err(PassError::Build(BuildError::Full).into());
     }
+    Ok(collected)
+}
 
-    // The table: each buffer once, by bank then offset, written when any access writes.
+/// One access's checks after its low address, in the module docs' order: the pointer, its
+/// bank, its offset, then a store's or an atomic's data argument.
+fn check(
+    function: &Function,
+    tracker: &mut Tracker,
+    found: &Found,
+    low: Result<LowAddress, UntracedReason>,
+    work: &mut Work,
+) -> Result<Collected, GlobalMemoryError> {
+    let untraced = |reason| GlobalMemoryError::Untraced {
+        at: found.value,
+        opcode: found.opcode,
+        reason,
+    };
+    let low = low.map_err(untraced)?;
+    let pointer = tracker
+        .find(low.start, Search::Biased, work)
+        .or_else(|| tracker.find(low.start, Search::Unbiased, work))
+        .ok_or_else(|| untraced(UntracedReason::NoPointer))?;
+    let (bank, offset) = tracker.place(pointer);
+    let bank = u8::try_from(bank)
+        .ok()
+        .filter(|&bank| bank < CBUF_BANKS)
+        .ok_or(GlobalMemoryError::Bank {
+            at: found.value,
+            opcode: found.opcode,
+            bank,
+        })?;
+    if offset
+        .checked_add(POINTER_BYTES)
+        .is_none_or(|end| end > INDEXED_CBUF_SIZE)
+    {
+        return Err(GlobalMemoryError::Offset {
+            at: found.value,
+            opcode: found.opcode,
+            bank,
+            offset,
+        });
+    }
+    let data = match found.access {
+        Access::Load => None,
+        Access::Write | Access::Atomic => {
+            Some(operation(function, found.value)?.1.get(1).copied().ok_or(
+                GlobalMemoryError::MissingData {
+                    at: found.value,
+                    opcode: found.opcode,
+                },
+            )?)
+        }
+    };
+    Ok(Collected {
+        low: low.low_word,
+        imm_offset: low.imm_offset,
+        bank,
+        offset,
+        data,
+    })
+}
+
+/// The table (module docs, step 2): each buffer once, by bank then offset, written when any
+/// access to it writes.
+fn table(accesses: &[Found], collected: &[Collected]) -> Vec<StorageBufferDescriptor> {
     let mut descriptors: Vec<StorageBufferDescriptor> = accesses
         .iter()
-        .zip(&collected)
+        .zip(collected)
         .map(|(found, c)| StorageBufferDescriptor {
             bank: c.bank,
             offset: c.offset,
@@ -585,33 +631,7 @@ pub fn to_storage_buffers(
         // when any is.
         later.bank == kept.bank && later.offset == kept.offset
     });
-
-    // Replace, block by block in collection order (a block's accesses are consecutive there).
-    let mut start = 0;
-    while let Some(first) = accesses.get(start) {
-        let block = first.block;
-        let end = accesses
-            .iter()
-            .skip(start)
-            .position(|found| found.block != block)
-            .map_or(accesses.len(), |len| start + len);
-        let run = accesses.get(start..end).unwrap_or_default();
-        let made = collected.get(start..end).unwrap_or_default();
-        replace_block(
-            function,
-            block,
-            run,
-            made,
-            &descriptors,
-            alignment,
-            &mut work,
-        )?;
-        start = end;
-    }
-    if VERIFY {
-        function.verify().map_err(GlobalMemoryError::Verify)?;
-    }
-    Ok(StorageBuffers { descriptors, work })
+    descriptors
 }
 
 /// A global memory access found in the walk.
@@ -662,7 +682,7 @@ fn arena_fits(len: usize, accesses: usize) -> bool {
 #[derive(Clone, Copy, Debug)]
 struct LowAddress {
     /// The pair's argument 0, as written.
-    word: Operand,
+    low_word: Operand,
     /// The same, resolved: where the search starts.
     start: Value,
     /// The immediate offset's low 32 bits (Eden's `s32`, kept as its bits).
@@ -707,14 +727,14 @@ fn low_address(
         current = vector;
     }
     let (opcode, args) = operation(function, current)?;
-    let (Some(Opcode::CompositeConstructU32x2), Some(&word)) = (opcode, args.first()) else {
+    let (Some(Opcode::CompositeConstructU32x2), Some(&low_word)) = (opcode, args.first()) else {
         return Ok(Err(UntracedReason::NotAPair));
     };
-    let Operand::Value(start) = resolver.resolve(function, word, work)? else {
+    let Operand::Value(start) = resolver.resolve(function, low_word, work)? else {
         return Ok(Err(UntracedReason::ImmediateLowWord));
     };
     Ok(Ok(LowAddress {
-        word,
+        low_word,
         start,
         imm_offset,
     }))
@@ -761,6 +781,14 @@ impl Search {
     }
 }
 
+/// The users of each reached instruction ([`Tracker::users`]).
+struct Users {
+    /// Where each instruction's users start in `users`, by arena index, and one past the last.
+    start: Vec<u32>,
+    /// The users, as arena indices.
+    users: Vec<u32>,
+}
+
 /// No distance, or no match remembered.
 const NONE: u32 = u32::MAX;
 
@@ -801,16 +829,37 @@ impl Tracker {
             dist: [Vec::new(), Vec::new()],
             found: [vec![NONE; len], vec![NONE; len]],
         };
-        // The walk along arguments.
+        let reached = tracker.walk(function, resolver, starts, work)?;
+        let users = tracker.users(&reached, work);
+        for search in [Search::Biased, Search::Unbiased] {
+            let dist = tracker.distances(&reached, &users, search, work);
+            if let Some(cell) = tracker.dist.get_mut(search.slot()) {
+                *cell = dist;
+            }
+        }
+        Ok(tracker)
+    }
+
+    /// Walks every instruction `starts` reach along resolved arguments, once each, recording
+    /// each one's argument edges and, for a constant-buffer read with immediate `u32` bank and
+    /// offset, its place. Returns the reached instructions.
+    fn walk(
+        &mut self,
+        function: &Function,
+        resolver: &mut Resolver,
+        starts: &[Value],
+        work: &mut Work,
+    ) -> Result<Vec<Value>, PassError> {
         let mut reached = Vec::new();
         let mut stack: Vec<Value> = Vec::new();
         for &start in starts {
-            tracker.reach(function, start, &mut reached, &mut stack)?;
+            self.reach(function, start, &mut reached, &mut stack)?;
         }
         while let Some(value) = stack.pop() {
             work.step();
             let index = slot(value);
-            let first = u32::try_from(tracker.args.len()).map_err(|_| PassError::Missing(value))?;
+            let first =
+                u32::try_from(self.args.len()).map_err(|_| PassError::Build(BuildError::Full))?;
             let Some(inst) = function.inst(value) else {
                 return Err(PassError::Missing(value));
             };
@@ -826,15 +875,15 @@ impl Tracker {
             for &arg in operands.iter().chain(incoming.iter().map(|(_, arg)| arg)) {
                 work.step();
                 if let Operand::Value(target) = resolver.resolve(function, arg, work)? {
-                    tracker.reach(function, target, &mut reached, &mut stack)?;
-                    tracker.args.push(target.index());
+                    self.reach(function, target, &mut reached, &mut stack)?;
+                    self.args.push(target.index());
                     edges = edges.saturating_add(1);
                 }
             }
-            if let Some(slot) = tracker.first.get_mut(index) {
+            if let Some(slot) = self.first.get_mut(index) {
                 *slot = first;
             }
-            if let Some(slot) = tracker.count.get_mut(index) {
+            if let Some(slot) = self.count.get_mut(index) {
                 *slot = edges;
             }
             if let Inst::Op(op) = inst
@@ -842,14 +891,19 @@ impl Tracker {
                 && let (Some(&bank), Some(&offset)) = (op.args.first(), op.args.get(1))
                 && let Operand::Imm(Imm::U32(bank)) = resolver.resolve(function, bank, work)?
                 && let Operand::Imm(Imm::U32(offset)) = resolver.resolve(function, offset, work)?
-                && let Some(place) = tracker.places.get_mut(index)
+                && let Some(place) = self.places.get_mut(index)
             {
                 *place = Some((bank, offset));
             }
         }
-        // The users of each reached instruction, as a reverse adjacency in one array.
-        let mut user_start = vec![0_u32; len.saturating_add(1)];
-        for &target in &tracker.args {
+        Ok(reached)
+    }
+
+    /// The users of each reached instruction, as a reverse adjacency in one array: user ids
+    /// of instruction `i` are `users[start[i]..start[i + 1]]`.
+    fn users(&self, reached: &[Value], work: &mut Work) -> Users {
+        let mut user_start = vec![0_u32; self.first.len().saturating_add(1)];
+        for &target in &self.args {
             work.step();
             if let Some(count) = user_start.get_mut(slot_index(target).saturating_add(1)) {
                 *count = count.saturating_add(1);
@@ -862,10 +916,10 @@ impl Tracker {
             }
         }
         let mut fill = user_start.clone();
-        let mut users = vec![0_u32; tracker.args.len()];
-        for &value in &reached {
+        let mut users = vec![0_u32; self.args.len()];
+        for &value in reached {
             let index = slot(value);
-            for target in tracker.edges(index) {
+            for target in self.edges(index) {
                 work.step();
                 if let Some(next) = fill.get_mut(slot_index(target))
                     && let Some(cell) = users.get_mut(slot_index(*next))
@@ -875,53 +929,64 @@ impl Tracker {
                 }
             }
         }
-        // Each search's distances: a breadth-first walk from every match along users.
-        for search in [Search::Biased, Search::Unbiased] {
-            let mut dist = vec![NONE; len];
-            let mut queue: Vec<u32> = Vec::new();
-            for &value in &reached {
-                work.step();
-                let index = slot(value);
-                if let Some(Some((bank, offset))) = tracker.places.get(index)
-                    && search.accepts(*bank, *offset)
-                    && let Some(d) = dist.get_mut(index)
-                {
-                    *d = 0;
-                    queue.push(value.index());
-                }
-            }
-            let mut head = 0;
-            while let Some(&node) = queue.get(head) {
-                head += 1;
-                work.step();
-                let next = dist
-                    .get(slot_index(node))
-                    .copied()
-                    .unwrap_or(NONE)
-                    .saturating_add(1);
-                let from = user_start.get(slot_index(node)).copied().unwrap_or(0);
-                let to = user_start
-                    .get(slot_index(node).saturating_add(1))
-                    .copied()
-                    .unwrap_or(from);
-                for &user in users
-                    .get(slot_index(from)..slot_index(to))
-                    .unwrap_or_default()
-                {
-                    work.step();
-                    if let Some(d) = dist.get_mut(slot_index(user))
-                        && *d == NONE
-                    {
-                        *d = next;
-                        queue.push(user);
-                    }
-                }
-            }
-            if let Some(cell) = tracker.dist.get_mut(search.slot()) {
-                *cell = dist;
+        Users {
+            start: user_start,
+            users,
+        }
+    }
+
+    /// `search`'s distance from each reached instruction to its nearest match: a
+    /// breadth-first walk from every match along users ([`NONE`] for none).
+    fn distances(
+        &self,
+        reached: &[Value],
+        users: &Users,
+        search: Search,
+        work: &mut Work,
+    ) -> Vec<u32> {
+        let mut dist = vec![NONE; self.first.len()];
+        let mut queue: Vec<u32> = Vec::new();
+        for &value in reached {
+            work.step();
+            let index = slot(value);
+            if let Some(Some((bank, offset))) = self.places.get(index)
+                && search.accepts(*bank, *offset)
+                && let Some(d) = dist.get_mut(index)
+            {
+                *d = 0;
+                queue.push(value.index());
             }
         }
-        Ok(tracker)
+        let mut head = 0;
+        while let Some(&node) = queue.get(head) {
+            head += 1;
+            work.step();
+            let next = dist
+                .get(slot_index(node))
+                .copied()
+                .unwrap_or(NONE)
+                .saturating_add(1);
+            let from = users.start.get(slot_index(node)).copied().unwrap_or(0);
+            let to = users
+                .start
+                .get(slot_index(node).saturating_add(1))
+                .copied()
+                .unwrap_or(from);
+            for &user in users
+                .users
+                .get(slot_index(from)..slot_index(to))
+                .unwrap_or_default()
+            {
+                work.step();
+                if let Some(d) = dist.get_mut(slot_index(user))
+                    && *d == NONE
+                {
+                    *d = next;
+                    queue.push(user);
+                }
+            }
+        }
+        dist
     }
 
     /// Marks `value` reached and queues it, once.
@@ -1030,7 +1095,7 @@ fn replace_block(
     function: &mut Function,
     block: BlockId,
     run: &[Found],
-    made: &[Collected],
+    collected_run: &[Collected],
     descriptors: &[StorageBufferDescriptor],
     alignment: StorageAlignment,
     work: &mut Work,
@@ -1038,8 +1103,13 @@ fn replace_block(
     let list = function
         .block_mut(block)
         .map_or_default(|b| std::mem::take(&mut b.insts));
-    let mut out = Vec::with_capacity(list.len().saturating_add(run.len().saturating_mul(5)));
-    let mut next = run.iter().zip(made).peekable();
+    let mut out = Vec::with_capacity(
+        list.len().saturating_add(
+            run.len()
+                .saturating_mul(usize::try_from(MADE_PER_ACCESS).unwrap_or(usize::MAX)),
+        ),
+    );
+    let mut next = run.iter().zip(collected_run).peekable();
     for value in list {
         work.step();
         if let Some(&(found, collected)) = next.peek()
@@ -1049,36 +1119,37 @@ fn replace_block(
             let binding = descriptors
                 .binary_search_by_key(&(collected.bank, collected.offset), |d| (d.bank, d.offset))
                 .unwrap_or(0);
-            let binding = u32::try_from(binding).map_err(|_| PassError::Missing(value))?;
+            // A binding is below the number of accesses, which are instructions with 32-bit ids.
+            let binding = u32::try_from(binding).unwrap_or(u32::MAX);
             let data = collected.data;
-            let mut make = |opcode: Opcode, args: Vec<Operand>| -> Result<Operand, PassError> {
+            let mut emit = |opcode: Opcode, args: Vec<Operand>| -> Result<Operand, PassError> {
                 work.step();
-                let made = function.push(block, Inst::Op(Operation::new(opcode, args)))?;
-                out.push(made);
-                Ok(Operand::Value(made))
+                let new_value = function.push(block, Inst::Op(Operation::new(opcode, args)))?;
+                out.push(new_value);
+                Ok(Operand::Value(new_value))
             };
             let mut offset = collected.low;
             if collected.imm_offset != 0 {
-                offset = make(
+                offset = emit(
                     Opcode::IAdd32,
                     vec![offset, Operand::Imm(Imm::U32(collected.imm_offset))],
                 )?;
             }
-            let word = make(
+            let cbuf_word = emit(
                 Opcode::GetCbufU32,
                 vec![
                     Operand::Imm(Imm::U32(u32::from(collected.bank))),
                     Operand::Imm(Imm::U32(collected.offset)),
                 ],
             )?;
-            let base = make(
+            let base = emit(
                 Opcode::BitwiseAnd32,
-                vec![word, Operand::Imm(Imm::U32(alignment.mask()))],
+                vec![cbuf_word, Operand::Imm(Imm::U32(alignment.mask()))],
             )?;
-            let offset = make(Opcode::ISub32, vec![offset, base])?;
+            let offset = emit(Opcode::ISub32, vec![offset, base])?;
             let mut args = vec![Operand::Imm(Imm::U32(binding)), offset];
             args.extend(data);
-            let storage = make(found.storage, args)?;
+            let storage = emit(found.storage, args)?;
             if let Some(inst) = function.inst_mut(value) {
                 *inst = match (found.access, storage) {
                     (Access::Write, _) => invalidated(),
