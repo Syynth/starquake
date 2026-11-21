@@ -71,14 +71,14 @@
 //! as its context when the request is queued or started (step 1), and it waits for its reply
 //! ([`crate::sync::Wait::Reply`]) when the request waits behind another (step 1), is deferred
 //! (step 2), or is parked because its handler is out of its slot (step 2). The wait begins
-//! under the lock that queues, defers or parks the request, before it goes, so that a reply delivered
-//! at once finds the sender waiting. This follows Eden, where every synchronous request begins
-//! its sender's wait (`KServerSession::OnRequest`, `eden/src/core/hle/kernel/k_server_session.cpp`
-//! @ cf654052, `BeginWait` after the request is listed), and its reply ends it. Settling a
-//! request writes the reply into the sender's message buffer and then, under the same lock,
-//! writes the result into its saved `x0` and makes it runnable
-//! ([`Scheduler::end_reply_wait`]); the core that schedules it next loads that context. A
-//! sender is still reported woken too ([`Dispatcher::take_woken`]).
+//! under the lock that queues, defers or parks the request, before it goes, so that a reply
+//! delivered at once finds the sender waiting. This follows Eden, where every synchronous
+//! request begins its sender's wait (`KServerSession::OnRequest`,
+//! `eden/src/core/hle/kernel/k_server_session.cpp` @ cf654052, `BeginWait` after the request
+//! is listed), and its reply ends it. Settling a request writes the reply into the sender's
+//! message buffer and then, under the same lock, writes the result into its saved `x0` and makes
+//! it runnable ([`Scheduler::end_reply_wait`]); the core that schedules it next loads that
+//! context. A sender is still reported woken too ([`Dispatcher::take_woken`]).
 //!
 //! A dispatch that ends in [`Outcome::Waiting`] writes no register: the core reloads the
 //! context saved in step 1, so a sender that is not in its reply wait would read its own
