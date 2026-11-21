@@ -328,7 +328,8 @@ fn a_sum_of_sinks_and_sub_mixes_past_32_bits_is_refused() {
 
 #[test]
 fn a_parameter_whose_64_bit_size_would_wrap_is_refused() {
-    // Not at each term's exact edge: one parameter per 64-bit product that wraps in Eden.
+    // Not at each term's exact edge: one parameter for each of the three 64-bit products that
+    // can wrap in Eden (module docs, "Where this differs from Eden").
     // `(samples) * (mixes + 6)`: (4 * u32::MAX) * u32::MAX passes 2^64.
     let mix_buffers = only(1, |p| {
         p.sample_count = u32::MAX;
@@ -347,6 +348,59 @@ fn a_parameter_whose_64_bit_size_would_wrap_is_refused() {
         work_buffer_size(&performance),
         Err(WorkBufferError::Overflow)
     );
+    // The command buffer's `voices * (splitter_infos * sizeof(DepopPrepareCommand) +
+    // voice_size)`: (2^30 - 1) * (96 * u32::MAX + 816) is about 2^68.6, while `voices * 4` still
+    // fits 32 bits. Eden-NX2's function answers the wrapped size, 2_164_663_549_952.
+    let command_buffer = only(Feature::VariadicCommandBufferSize.since(), |p| {
+        p.voices = 0x3FFF_FFFF;
+        p.splitter_infos = u32::MAX;
+    });
+    assert_eq!(
+        work_buffer_size(&command_buffer),
+        Err(WorkBufferError::Overflow)
+    );
+}
+
+#[test]
+fn a_running_sum_past_64_bits_is_refused() {
+    // No product wraps here: the mix buffers' `(sample_count * 4) * (mixes + MAX_CHANNELS)` is
+    // (2^33 - 4) * 2^31 = 2^64 - 2^33, but the mix-id term before it, `AlignUp(mixes * 4,
+    // 0x40)`, is 2^33, so the running sum passes 2^64. Eden answers the wrapped size, 102_400.
+    let params = only(1, |p| {
+        p.mixes = (1 << 31) - MAX_CHANNELS;
+        p.sample_count = (1 << 31) - 1;
+    });
+    assert_eq!(work_buffer_size(&params), Err(WorkBufferError::Overflow));
+}
+
+#[test]
+fn the_graph_terms_are_edens() {
+    // `NodeStates::GetWorkBufferSize(count)`: `(AlignUp(count, 0x40) / 8) * 2 + count * 32 +
+    // count * (count * 4)`. 3: 16 + 96 + 36. 65: 32 + 2080 + 16900.
+    assert_eq!(node_states_size(3), Ok(148));
+    assert_eq!(node_states_size(65), Ok(19_012));
+    // `EdgeMatrix::GetWorkBufferSize(count)`: `AlignUp(count * count, 0x40) / 8`. 3: 64 / 8.
+    // 65: 4288 / 8.
+    assert_eq!(edge_matrix_size(3), Ok(8));
+    assert_eq!(edge_matrix_size(65), Ok(536));
+}
+
+#[test]
+fn the_size_before_its_page_alignment_is_edens() {
+    // The last `AlignUp(size, 0x1000)` hides inner alignments, so this checks the sum before
+    // it. Revision 2, two sub-mixes (`count` 3) and one voice, hand-worked from
+    // `System::GetWorkBufferSize`: 0 + 2048 + 7104 + 1056 + 32 + 16 + 11520, the graph
+    // `AlignUp(148 + 8, 0x10)` = 160, 0 for the splitter, 128 for the memory pools and 0x50:
+    // 22144, already a multiple of 0x40. Then 1232 (upsamplers), `AlignUp(296, 0x40)` = 320 and
+    // 0x18000 + 126: 122126. The first part's other terms sum to 32 modulo 0x40, so the graph
+    // aligned to 0x40 instead (192) would carry through its `AlignUp(size, 0x40)` as 64 more.
+    let revision = Feature::Splitter.since();
+    let params = only(revision, |p| {
+        p.sub_mixes = 2;
+        p.voices = 1;
+    });
+    assert_eq!(size_before_page_alignment(&params, revision), Ok(122_126));
+    assert_eq!(work_buffer_size(&params), Ok(122_880));
 }
 
 #[test]
@@ -648,7 +702,7 @@ fn a_hand_built_parameter_is_read_at_edens_offsets() {
     for (at, word) in words {
         bytes[at..at + 4].copy_from_slice(&word.to_le_bytes());
     }
-    bytes[0x20..0x24].copy_from_slice(&[0x01, 0x21, 0x02, 0x01]);
+    bytes[0x20..0x24].copy_from_slice(&[0x01, 0x21, 0x02, 0x03]);
     let read = RendererParameter::read(&mut Reader::new(&bytes)).unwrap();
     assert_eq!(
         read,
@@ -664,7 +718,7 @@ fn a_hand_built_parameter_is_read_at_edens_offsets() {
             voice_drop_enabled: 0x01,
             unknown_21: 0x21,
             rendering_device: 0x02,
-            execution_mode: 0x01,
+            execution_mode: 0x03,
             splitter_infos: 0x0809_0011,
             splitter_destinations: -19,
             external_context_size: 0x0A0B_0017,

@@ -88,9 +88,17 @@
 //!   `sub_mixes * MAX_EFFECTS`; and with `sub_mixes + 1` at most 2^24, the node-state and
 //!   edge-matrix terms other than `count * (count * 4)` cannot wrap before it does (`count * 4`,
 //!   both `AlignUp`s, and `count * count`, which wraps only past `count` = 65535, where
-//!   `count * (count * 4)` already has). They are checked all the same, so no path wraps. The
-//!   64-bit terms are tested by parameters that wrap a product
-//!   (`a_parameter_whose_64_bit_size_would_wrap_is_refused`), not at each term's exact edge.
+//!   `count * (count * 4)` already has). They are checked all the same, so no path wraps.
+//!
+//!   Three 64-bit products can wrap, and only these three: the mix buffers' `(samples) *
+//!   (mixes + MAX_CHANNELS)`, the performance term's `frame * (perf_frames + 1)` and the
+//!   command buffer's `voices * (splitter_infos * sizeof(DepopPrepareCommand) + voice_size)`.
+//!   Every other 64-bit product multiplies a value below 2^33 by sizes whose product is below
+//!   2^16, far below 2^64. Each of the three has one parameter that wraps it
+//!   (`a_parameter_whose_64_bit_size_would_wrap_is_refused`), not a case at its exact edge. A
+//!   64-bit sum can wrap only with one of these products near 2^64; one such sum, the mix
+//!   buffers' product added to the mix-id term before it, is tested
+//!   (`a_running_sum_past_64_bits_is_refused`), not each sum.
 //! - **A negative `splitter_destinations`** is [`WorkBufferError::NegativeSplitterDestinations`]
 //!   when a term reads it (revision 2 on: the splitter's size, and from revision 5 the command
 //!   buffer's). Eden converts the `s32` to an unsigned 64-bit value and wraps. Below revision 2
@@ -308,7 +316,10 @@ impl RendererParameter {
 pub enum WorkBufferError {
     /// The revision is past [`CURRENT_REVISION`] (Eden's `CheckValidRevision`), checked before
     /// any size.
-    #[error("revision word {word:#x} reads as revision {number}, past the newest, 15")]
+    #[error(
+        "revision word {word:#x} reads as revision {number}, past the newest, {newest}",
+        newest = CURRENT_REVISION
+    )]
     InvalidRevision {
         /// The parameter's revision word.
         word: u32,
@@ -573,6 +584,19 @@ pub fn work_buffer_size(params: &RendererParameter) -> Result<u64, WorkBufferErr
             number: revision,
         });
     }
+    align_up(
+        size_before_page_alignment(params, revision)?,
+        fixed::WORK_BUFFER_ALIGNMENT,
+    )
+}
+
+/// `System::GetWorkBufferSize` for revision number `revision` up to its last step, the
+/// `AlignUp(size, 0x1000)` that [`work_buffer_size`] applies: kept apart so that tests can see
+/// the inner alignments the last one hides.
+fn size_before_page_alignment(
+    params: &RendererParameter,
+    revision: u32,
+) -> Result<u64, WorkBufferError> {
     let mixes = u64::from(params.mixes);
     let sub_mixes = u64::from(params.sub_mixes);
     let voices = u64::from(params.voices);
@@ -647,6 +671,5 @@ pub fn work_buffer_size(params: &RendererParameter) -> Result<u64, WorkBufferErr
     } else {
         fixed::FIXED_COMMAND_BUFFER
     };
-    size = add(size, add(commands, fixed::COMMAND_BUFFER_SLACK)?)?;
-    align_up(size, fixed::WORK_BUFFER_ALIGNMENT)
+    add(size, add(commands, fixed::COMMAND_BUFFER_SLACK)?)
 }

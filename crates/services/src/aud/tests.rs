@@ -17,8 +17,9 @@ use crate::framework::fake::FakeKernel;
 use crate::framework::result::{INVALID_CMIF_REQUEST, UNKNOWN_COMMAND_ID};
 use crate::framework::{Handled, Kernel, Protocol, Session, StubbedCommand};
 
-/// `aud:u`'s commands left to the unknown-command policy (module docs, "Left out"), so they
-/// have no shipping constants: PR #4588's `GetAudioInManager` (0) and `GetAudioOutManager` (1)
+/// `aud:u`'s commands left to the unknown-command policy (module docs, "Left out"; deferred
+/// against decision 8's rule, "The two references"), so they have no shipping constants: PR
+/// #4588's `GetAudioInManager` (0) and `GetAudioOutManager` (1)
 /// (`eden-pr4588/src/core/hle/service/audio/audio.cpp` @ e5fb3b97).
 const USER_CLIENT_LEFT_OUT: [u32; 2] = [0, 1];
 /// `IAudioRendererManager`'s commands left out likewise

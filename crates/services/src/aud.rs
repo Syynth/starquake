@@ -55,9 +55,16 @@
 //!   `impl`, `AudioCore::Renderer::Manager`, two sessions at most); whether it is one count per
 //!   server (PR #4588's shared manager) or per manager (Eden-NX2's) is to be settled then. Per
 //!   server, it would be the server's family state, which this design leaves room for.
-//! - **Commands 0 and 1 are left out**: PR #4588's audio in and out managers, which no row
-//!   records a title asking for and Eden-NX2 does not serve. They go to the server's
-//!   unknown-command policy.
+//! - **Commands 0 and 1 are deferred, against the rule: an open owner question.** PR #4588's
+//!   table (0 `GetAudioInManager`, 1 `GetAudioOutManager`, 2) contains Eden-NX2's (2 alone),
+//!   so decision 8's clause "where one answer contains the other, the larger" picks PR #4588's
+//!   and would serve 0 and 1. They are not served here because issue #498 scopes command 2,
+//!   the one row 38 records a title asking for, and serving 0 and 1 needs `IAudioInManager` and
+//!   `IAudioOutManager`, which are not ported. Until they are, both go to the server's
+//!   unknown-command policy, which under auto-stub answers success with no object
+//!   (`commands_that_are_left_out_go_to_the_unknown_command_policy`): the failure #498 was
+//!   filed for, a title then reading an object that is not there. Whether to port them now, or
+//!   to refuse them rather than auto-stub them until then, is for the owner.
 //! - **A TIPC request** goes to the unknown-command policy (no interface here has a TIPC
 //!   table): auto-stubbed in a run, where PR #4588 answers `ResultNotImplemented`
 //!   (`a_tipc_request_goes_to_the_unknown_command_policy`).
@@ -67,7 +74,7 @@
 //! Every other command goes to the server's unknown-command policy, which under auto-stub logs
 //! it once, answers success with nothing, and lists it among the run's stubbed commands:
 //!
-//! - `aud:u`: 0 and 1 (PR #4588's, above).
+//! - `aud:u`: 0 and 1 (PR #4588's, which decision 8's rule would serve; deferred, above).
 //! - [`IAudioRendererManager`]: `OpenAudioRenderer` (0), `GetAudioDeviceService` (2),
 //!   `OpenAudioRendererForManualExecution` (3, which Eden lists without a handler) and
 //!   `GetAudioDeviceServiceWithRevisionInfo` (4). Commands 0, 2 and 4 return an object in
