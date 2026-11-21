@@ -44,6 +44,9 @@ struct main_Input {
     uint r27_ = {};
     uint r28_ = {};
     uint r29_ = {};
+    uint r30_ = {};
+    uint r31_ = {};
+    uint r32_ = {};
     uint _e4 = (lane_id * 257u) + 7u;
     bool _e8 = (lane_id & 1u) != 0u;
     metal::uint4 unnamed = metal::uint4((uint64_t)metal::simd_ballot(true), 0, 0, 0);
@@ -90,6 +93,13 @@ struct main_Input {
     float _e237 = static_cast<float>(lane_id);
     uint _e246 = (228u >> ((lane_id & 3u) << 1u)) & 3u;
     uint _e271 = (27u >> ((lane_id & 3u) << 1u)) & 3u;
+    uint _e289 = lane_id & 3u;
+    uint _e301 = lane_id - ((_e289 ^ 3u) & 31u);
+    uint unnamed_23 = metal::simd_shuffle(_e4, _e301);
+    uint _e316 = lane_id + (_e289 & 31u);
+    uint unnamed_24 = metal::simd_shuffle(_e4, _e316);
+    uint _e331 = lane_id ^ (_e289 & 31u);
+    uint unnamed_25 = metal::simd_shuffle(_e4, _e331);
     r0_ = lane_id;
     r1_ = unnamed.x;
     r2_ = unnamed_1.x;
@@ -120,5 +130,8 @@ struct main_Input {
     r27_ = unnamed_22;
     r28_ = as_type<uint>((_e237 * metal::float4(-1.0, 1.0, -1.0, 0.0)[_e246]) + (0.5 * metal::float4(-1.0, -1.0, 1.0, -1.0)[_e246]));
     r29_ = as_type<uint>((_e237 * metal::float4(-1.0, 1.0, -1.0, 0.0)[_e271]) + (0.5 * metal::float4(-1.0, -1.0, 1.0, -1.0)[_e271]));
+    r30_ = (as_type<int>(_e301) >= as_type<int>((lane_id & 0u) | (0u & ~(0u)))) ? unnamed_23 : _e4;
+    r31_ = (as_type<int>(_e316) <= as_type<int>((lane_id & 0u) | (31u & ~(0u)))) ? unnamed_24 : _e4;
+    r32_ = (as_type<int>(_e331) <= as_type<int>((lane_id & 0u) | (31u & ~(0u)))) ? unnamed_25 : _e4;
     return;
 }

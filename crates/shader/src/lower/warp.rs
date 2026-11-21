@@ -25,9 +25,16 @@
 //!   comparisons `OpSLessThanEqual` and `OpSGreaterThanEqual`), and select the gathered value
 //!   only in range (`OpSelect`). The gather is naga's `Shuffle` of the source lane for
 //!   `ShuffleIndex` (`ShuffleAbsolute`), or its `Broadcast` of `lane & 31` when the lane and
-//!   the segment mask are immediates and the mask is 0 (Eden's `BroadcastLane` case);
-//!   `ShuffleUp` and `ShuffleDown` of the delta (`ShuffleRelative` where the host supports
-//!   relative shuffles); `ShuffleXor` of the delta for `ShuffleButterfly`.
+//!   the segment mask are immediates and the mask is 0 (Eden's `BroadcastLane` case). For
+//!   `ShuffleUp` and `ShuffleDown` whose index is an immediate it is naga's `ShuffleUp` and
+//!   `ShuffleDown` of the delta (`ShuffleRelative` where the host supports relative
+//!   shuffles), and for such a `ShuffleButterfly` its `ShuffleXor` of the delta. With an index
+//!   computed at run time all three gather with `Shuffle` of the source lane (`lane - delta`,
+//!   `lane + delta`, `lane ^ delta`): Eden's path for a host without relative shuffles
+//!   (`ShuffleRelative`'s `ShuffleAbsolute(ctx, value, HostThreadId(ctx, src_thread_id))`),
+//!   since naga's MSL writer writes the relative gathers as `simd_shuffle_up`,
+//!   `simd_shuffle_down` and `simd_shuffle_xor`, whose delta or mask Metal needs to be the
+//!   same in every lane (see the divergences).
 //!   `GetInBoundsFromOp` of a shuffle is that shuffle's in-range flag (`SetInBoundsFlag`).
 //! - `QuadBroadcast` with an immediate index is naga's `QuadBroadcast` of `index & 3`
 //!   (`EmitQuadBroadcast` with quad shuffles); with an index computed at run time it is
@@ -68,6 +75,7 @@
 //! | The lane masks | Computed from the lane id | SPIR-V's mask built-ins (the words agree for every lane below 32) | `tests::warp::warp_operations_match_the_interpreter_on_the_gpu`, `tests::warp::warp_operations_match_a_32_lane_model_on_the_gpu` |
 //! | `QuadSwap` whose direction is not the immediate 0, 1 or 2 | Refused ([`LowerError::Operand`], argument 1): naga's `QuadSwap` takes only the three directions | Eden passes the direction on (SPIR-V needs a constant); its fallback without quad shuffles, and the interpreter, read lane `lane ^ (direction + 1)` for any value | `tests::warp::quad_swap_takes_an_immediate_direction` |
 //! | A coarse or fine derivative on Metal | The module keeps the control, but naga's MSL writer writes `dfdx` and `dfdy` for every control (Metal has no other), so the host's own derivative runs, coarse or fine | `OpDPdxCoarse`, `OpDPdxFine` and their `y` forms | `tests::warp::warp_snapshot` (`warp_derivatives`) |
+//! | `ShuffleUp`, `ShuffleDown` or `ShuffleButterfly` whose index is not an immediate | `Shuffle` of the absolute source lane, which needs no uniform delta: Metal's `simd_shuffle_up`, `simd_shuffle_down` and `simd_shuffle_xor`, which naga writes for the relative gathers, need their delta or mask to be the same in every lane, and a computed index may differ from lane to lane | Eden uses the relative shuffle whatever the index: `OpGroupNonUniformShuffleXor` rewritten to `ShuffleUp` or `ShuffleDown` whenever `support_shuffle_relative` is set (`ShuffleRelative`), and `OpGroupNonUniformShuffleXor` always for `EmitShuffleButterfly` | `tests::warp::each_shuffle_gathers_as_edens_does`, `tests::warp::warp_operations_match_a_32_lane_model_on_the_gpu` |
 //! | `QuadBroadcast` with an immediate index of 4 or more | `index & 3`, as the interpreter and Eden's fallback | Eden passes the index on unmasked to `OpGroupNonUniformQuadBroadcast` | `tests::warp::quad_broadcast_masks_an_immediate_index_and_shuffles_a_computed_one` |
 
 use naga::{
@@ -410,6 +418,16 @@ impl Lowering {
         // `GuestLane`.
         let lane_mask = self.lit(body, Literal::U32(LANE_MASK));
         let delta = self.binary(body, BinaryOperator::And, index, lane_mask);
+        // A relative gather only for an immediate delta: Metal needs a relative shuffle's delta
+        // to be the same in every lane (see the module docs' divergences).
+        let uniform_delta = matches!(Self::raw_arg(at, op, 1)?, Operand::Imm(Imm::U32(_)));
+        let relative = |relative: GatherMode, source| {
+            if uniform_delta {
+                relative
+            } else {
+                GatherMode::Shuffle(source)
+            }
+        };
         let (source, cmp, mode) = match shuffle {
             Shuffle::Index => {
                 let low = self.binary(body, BinaryOperator::And, delta, not_segment);
@@ -425,27 +443,18 @@ impl Lowering {
             }
             Shuffle::Up => {
                 let source = self.binary(body, BinaryOperator::Subtract, lane, delta);
-                (
-                    source,
-                    BinaryOperator::GreaterEqual,
-                    GatherMode::ShuffleUp(delta),
-                )
+                let mode = relative(GatherMode::ShuffleUp(delta), source);
+                (source, BinaryOperator::GreaterEqual, mode)
             }
             Shuffle::Down => {
                 let source = self.binary(body, BinaryOperator::Add, lane, delta);
-                (
-                    source,
-                    BinaryOperator::LessEqual,
-                    GatherMode::ShuffleDown(delta),
-                )
+                let mode = relative(GatherMode::ShuffleDown(delta), source);
+                (source, BinaryOperator::LessEqual, mode)
             }
             Shuffle::Butterfly => {
                 let source = self.binary(body, BinaryOperator::ExclusiveOr, lane, delta);
-                (
-                    source,
-                    BinaryOperator::LessEqual,
-                    GatherMode::ShuffleXor(delta),
-                )
+                let mode = relative(GatherMode::ShuffleXor(delta), source);
+                (source, BinaryOperator::LessEqual, mode)
             }
         };
         let in_range = self.signed_compare(body, cmp, source, max_lane);

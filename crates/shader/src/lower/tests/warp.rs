@@ -393,10 +393,13 @@ fn quad_broadcast_masks_an_immediate_index_and_shuffles_a_computed_one() {
 
 /// `ShuffleIndex` broadcasts `lane & 31` when the lane and the segment mask are immediates and
 /// the mask is 0, and shuffles otherwise (a segment of 1, a computed lane, a computed segment
-/// of 0); the relative shuffles gather up, down and by exclusive or.
+/// of 0); the relative shuffles gather up, down and by exclusive or when their delta is an
+/// immediate, and shuffle from the absolute source lane when it is computed (the `warp`
+/// module's divergence table: Metal needs a relative shuffle's delta to be the same in every
+/// lane).
 #[test]
 fn each_shuffle_gathers_as_edens_does() {
-    let cases: [(Opcode, Args, Gather); 8] = [
+    let cases: [(Opcode, Args, Gather); 11] = [
         (
             Opcode::ShuffleIndex,
             |_| vec![u(VALUE), u(5), u(31), u(0)],
@@ -436,6 +439,21 @@ fn each_shuffle_gathers_as_edens_does() {
             Opcode::ShuffleButterfly,
             |_| vec![u(VALUE), u(1), u(31), u(0)],
             Gather::Xor,
+        ),
+        (
+            Opcode::ShuffleUp,
+            |b| vec![u(VALUE), computed(b, 1), u(0), u(0)],
+            Gather::Shuffle,
+        ),
+        (
+            Opcode::ShuffleDown,
+            |b| vec![u(VALUE), computed(b, 1), u(31), u(0)],
+            Gather::Shuffle,
+        ),
+        (
+            Opcode::ShuffleButterfly,
+            |b| vec![u(VALUE), computed(b, 1), u(31), u(0)],
+            Gather::Shuffle,
         ),
     ];
     for (opcode, args, gather) in cases {
@@ -500,6 +518,23 @@ fn in_bounds_is_its_shuffles_flag() {
             "{opcode}"
         );
     }
+}
+
+/// `GetInBoundsFromOp` of an operation that is not a shuffle, in a vertex program, is refused
+/// as argument 0, as in any other stage: the in-bounds read itself is allowed in every stage
+/// (`allowed_in`), so the refusal is its operand's, not [`LowerError::NotInStage`].
+#[test]
+fn in_bounds_of_a_non_shuffle_in_a_vertex_program_is_an_operand_error() {
+    let mut function = Function::new();
+    let entry = function.entry();
+    let mut b = Builder::new(&mut function, entry);
+    let of = op(&mut b, Opcode::IAdd32, &[u(1), u(2)]);
+    let at = op(&mut b, Opcode::GetInBoundsFromOp, &[of.into()]);
+    b.terminate(Terminator::Return).expect("the block returns");
+    assert_eq!(
+        lower_with(GuestStage::Vertex, &function, &LowerInputs::DEFAULT).err(),
+        Some(LowerError::Operand { at, index: 0 })
+    );
 }
 
 /// `opcode` of `args` (a shuffle), and its `GetInBoundsFromOp` as 1 or 0.
@@ -696,7 +731,7 @@ fn warp_operations_match_the_interpreter_on_the_gpu() {
 
 /// The registers of [`full_warp_function`]: the lane id, the active-lane ballot, then each
 /// case [`full_warp_model`] computes, in order.
-const FULL_WARP_REGS: u8 = 30;
+const FULL_WARP_REGS: u8 = 33;
 
 /// `v(lane)`, the value each lane moves in the full-warp cases.
 const fn lane_value(lane: u32) -> u32 {
@@ -792,6 +827,9 @@ fn full_warp_function() -> Function {
             &[as_float, f(0.5), u(swizzle)],
         ));
     }
+    for shuffle in computed_delta_shuffles(&mut b, lane, value) {
+        push(shuffle);
+    }
     assert_eq!(results.len(), usize::from(FULL_WARP_REGS));
     for (reg, result) in (0..FULL_WARP_REGS).zip(results) {
         op(
@@ -802,6 +840,23 @@ fn full_warp_function() -> Function {
     }
     b.terminate(Terminator::Return).expect("the block returns");
     function
+}
+
+/// The relative shuffles of `value` with a delta that differs from lane to lane, as
+/// [`full_warp_function`] writes them last: `(lane & 3) ^ 3` up (out of range in lanes 0 and
+/// 1), `lane & 3` down and by exclusive or.
+fn computed_delta_shuffles(b: &mut Builder<'_>, lane: Operand, value: Operand) -> [Value; 3] {
+    let quad_place: Operand = op(b, Opcode::BitwiseAnd32, &[lane, u(QUAD_LANE_MASK)]).into();
+    let up_delta: Operand = op(b, Opcode::BitwiseXor32, &[quad_place, u(QUAD_LANE_MASK)]).into();
+    [
+        int(b, Opcode::ShuffleUp, &[value, up_delta, u(0), u(0)]),
+        int(b, Opcode::ShuffleDown, &[value, quad_place, u(31), u(0)]),
+        int(
+            b,
+            Opcode::ShuffleButterfly,
+            &[value, quad_place, u(31), u(0)],
+        ),
+    ]
 }
 
 /// What [`full_warp_function`] leaves in `lane` on a warp of 32 active lanes, from Eden's
@@ -817,6 +872,8 @@ fn full_warp_model(lane: u32) -> Vec<u32> {
     let down_in_range = lane + 2 < WARP_SIZE;
     let quad_base = lane & !QUAD_LANE_MASK;
     let lane_float = f32::from(u16::try_from(lane).expect("a lane of the warp"));
+    let quad_place = lane & QUAD_LANE_MASK;
+    let up_delta = quad_place ^ QUAD_LANE_MASK;
     vec![
         lane,
         all_lanes,
@@ -848,6 +905,17 @@ fn full_warp_model(lane: u32) -> Vec<u32> {
         v(lane ^ 3),
         swizzle_add_model(lane_float, 0.5, 0xe4, lane),
         swizzle_add_model(lane_float, 0.5, 0x1b, lane),
+        if lane >= up_delta {
+            v(lane - up_delta)
+        } else {
+            v(lane)
+        },
+        if lane + quad_place < WARP_SIZE {
+            v(lane + quad_place)
+        } else {
+            v(lane)
+        },
+        v(lane ^ quad_place),
     ]
 }
 
