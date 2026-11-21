@@ -157,11 +157,13 @@ pub(crate) use op::integer::{
     IMAD_WIDE_OPCODE, IMNMX_OPCODE, ISETP_OPCODE, LEA_OPCODE, LOP3_OPCODE, MOV_OPCODE, P2R_OPCODE,
     PLOP3_OPCODE, POPC_OPCODE, PRMT_OPCODE, R2P_OPCODE, SEL_OPCODE, SGXT_OPCODE, SHF_OPCODE,
 };
-// The uniform datapath's opcodes flow analysis classifies, named once in slice 6d's group.
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use op::texture;
+// The uniform datapath's opcodes flow analysis classifies, named once in slice 6d's group.
 pub(crate) use op::uniform::{
-    R2UR_OPCODE, ULDC_OPCODE, ULDC64_OPCODE, UMOV_IMM_OPCODE, UMOV_UR_OPCODE, UPLOP3_OPCODE,
+    R2UR_OPCODE, UBREV_OPCODE, UFLO_OPCODE, UIADD3_OPCODE, UIMAD_OPCODE, UIMAD_WIDE_OPCODE,
+    UISETP_OPCODE, ULDC_OPCODE, ULDC64_OPCODE, ULEA_OPCODE, ULOP3_OPCODE, UMOV_IMM_OPCODE,
+    UMOV_UR_OPCODE, UPLOP3_OPCODE, UPOPC_OPCODE, USEL_OPCODE, USGXT_OPCODE, USHF_OPCODE,
 };
 pub use op::*;
 #[cfg(any(test, feature = "test-support"))]

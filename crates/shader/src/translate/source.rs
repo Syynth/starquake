@@ -118,8 +118,13 @@ pub(crate) fn pred(e: &mut impl Emit, src: PredSrc) -> Result<Operand, BuildErro
 }
 
 /// The guard of a uniform datapath instruction (`classify.h`'s `uniform`: `UMOV`, `ULDC`,
-/// `ULDC.64`, `S2UR`, `UPLOP3`, `VOTEU` and the uniform ALU forms, each of which has a decode
-/// form), read as the uniform predicate of the same number (`Visitor::Run`: `UPred(guard.index,
+/// `ULDC.64`, `S2UR`, `UPLOP3`, `VOTEU`, and the twelve uniform ALU bases `UIADD3`, `ULEA`,
+/// `ULOP3`, `USHF`, `UIMAD`, `UIMAD.WIDE`, `UBREV`, `USGXT`, `UFLO`, `UPOPC`, `UISETP` and
+/// `USEL` in forms 1 and 4 only, each of which has a decode form; `UPRMT`, `UBMSK` and every
+/// twin's form 2 are not classified, so are neither pure nor uniform, and the driver, which
+/// passes `info.uniform`, does not read their guard here; the literal list is in
+/// `driver::tests::the_guard_of_every_pure_form_is_read_by_its_kind`), read
+/// as the uniform predicate of the same number (`Visitor::Run`: `UPred(guard.index,
 /// guard.negated)`); `PT` names `UPT`, which reads as the immediate.
 pub(crate) fn uniform_guard(e: &mut impl Emit, guard: PredSrc) -> Result<Operand, BuildError> {
     let reg = UniformPred::new(guard.reg.index()).unwrap_or(UniformPred::UPT);

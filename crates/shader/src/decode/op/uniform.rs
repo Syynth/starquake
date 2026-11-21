@@ -133,8 +133,17 @@
 //! # Guards
 //!
 //! PR #4588 reads the guard of a uniform datapath instruction as a uniform predicate
-//! (`Visitor::Run`: `info.uniform ? UPred(..) : Pred(..)`; `classify.h` marks `UMOV`, `ULDC`,
-//! `UPLOP3` and the twins' forms 1 and 4 uniform, and not `R2UR`). The decoder reads every guard
+//! (`Visitor::Run`: `info.uniform ? UPred(..) : Pred(..)`). Of this slice's forms, `classify.h`
+//! marks uniform (and pure) exactly `UMOV` (`0x882`, `0xc82`), `ULDC` (`0xab9`, `0xabb`),
+//! `UPLOP3` (`0x89c`) and twelve twin bases in forms 1 and 4 only: `UIADD3` (`0x090`), `ULEA`
+//! (`0x091`), `ULOP3` (`0x092`), `USHF` (`0x099`), `UIMAD` (`0x0a4`), `UIMAD.WIDE` (`0x0a5`),
+//! `UBREV` (`0x0be`), `USGXT` (`0x09a`), `UFLO` (`0x0bd`), `UPOPC` (`0x0bf`), `UISETP`
+//! (`0x08c`) and `USEL` (`0x087`). It marks `R2UR` pure but not uniform. It does not classify
+//! `UPRMT` (`0x096`), `UBMSK` (`0x09b`) or any twin's form 2 (`UIADD3`, `ULEA`, `ULOP3`,
+//! `UPRMT`, `USHF`, `UIMAD` and `UIMAD.WIDE` in form 2), so these are neither pure nor uniform,
+//! and `Visitor::Run` sets neither `guard_select` nor `uniform_op` for them. The literal list
+//! is in `translate::driver::tests::the_guard_of_every_pure_form_is_read_by_its_kind`, which
+//! checks it against the opcodes [`crate::flow`] classifies uniform. The decoder reads every guard
 //! as [`super::Instr::guard`], a [`PredSrc`], and prints it `@p0`; that a twin's or `UMOV`'s
 //! guard names `UP0` is for the translator, and its text a guess.
 
