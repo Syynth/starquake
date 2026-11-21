@@ -148,20 +148,23 @@ fn only_a_release_starting_in_the_second_page_is_copied() {
             .attach(m.action(four(address, 0x5a5a_0001)))
             .unwrap();
         assert_eq!(m.word(address), 0x5a5a_0001, "{address:#x}");
-        match copied {
-            Some(at) => assert_eq!(m.word(at), 0x5a5a_0001, "{address:#x}"),
-            None => {
-                // Nothing else in the four pages changed.
-                let all = m.bytes(BEFORE, usize::try_from(MAPPED * PAGE_SIZE).unwrap());
-                let changed: Vec<usize> = all
-                    .iter()
-                    .enumerate()
-                    .filter(|&(_, &byte)| byte != FILL)
-                    .map(|(index, _)| index)
-                    .collect();
-                let at = usize::try_from(address - BEFORE).unwrap();
-                assert_eq!(changed, (at..at + 4).collect::<Vec<_>>(), "{address:#x}");
-            }
+        // The release's 4 bytes and, when copied, the copy's 4 bytes changed; nothing else in
+        // the four pages did.
+        let all = m.bytes(BEFORE, usize::try_from(MAPPED * PAGE_SIZE).unwrap());
+        let changed: Vec<u64> = (0u64..)
+            .zip(&all)
+            .filter(|&(_, &byte)| byte != FILL)
+            .map(|(index, _)| BEFORE + index)
+            .collect();
+        let mut expected: Vec<u64> = copied
+            .into_iter()
+            .chain([address])
+            .flat_map(|at| at..at + 4)
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(changed, expected, "{address:#x}");
+        if let Some(at) = copied {
+            assert_eq!(m.word(at), 0x5a5a_0001, "{address:#x}");
         }
     }
 }
