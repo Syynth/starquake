@@ -281,15 +281,51 @@ pub(crate) fn lookup(opcode: u16) -> Option<&'static Form> {
 }
 
 /// Reads fields of one word and records which bits were read.
+///
+/// A register, uniform register or predicate field read through [`Reader::uniform_reg`],
+/// [`Reader::pred_src`] or [`Reader::uniform_pred_src`] whose value names no register (only a
+/// field wider than the register file's, which no form passes) is not turned into `URZ` or
+/// `UPT`: the reader keeps the first such value as a [`DecodeError::UnknownValue`]
+/// ([`Reader::fault`]), which `decode` reports after the form's function has run (slice 6d,
+/// from the review of slice 4: "check the width").
 pub(crate) struct Reader {
     word: Instruction,
     read: u128,
+    /// Whether per-thread register fields name uniform registers ([`Reader::uniform_datapath`]).
+    uniform: bool,
+    /// The first register field whose value names no register.
+    fault: Option<DecodeError>,
 }
 
 impl Reader {
     /// A reader of `word` that counts [`COMMON`] as read.
     pub(crate) const fn new(word: Instruction) -> Self {
-        Self { word, read: COMMON }
+        Self {
+            word,
+            read: COMMON,
+            uniform: false,
+            fault: None,
+        }
+    }
+
+    /// Reads every later [`Reader::gpr`] field as the uniform datapath encodes it: the low
+    /// [`UniformReg::BITS`] bits of the field, a uniform register's number, with `URZ` (63)
+    /// read as [`Gpr::RZ`] (`op::uniform`, whose twins reuse the vector decoders).
+    pub(crate) const fn uniform_datapath(&mut self) {
+        self.uniform = true;
+    }
+
+    /// The first register field whose value named no register, as the error `decode` reports.
+    pub(crate) const fn fault(&self) -> Option<DecodeError> {
+        self.fault
+    }
+
+    /// Keeps `field` holding `value`, which names no register, as the fault unless one is kept
+    /// already.
+    fn refuse(&mut self, field: Field, value: u64) {
+        if self.fault.is_none() {
+            self.fault = Some(self.unknown_value(field, value));
+        }
     }
 
     /// The 12-bit opcode (always read).
@@ -336,31 +372,61 @@ impl Reader {
         self.word.signed(field)
     }
 
-    /// Reads a register field ([`Gpr::BITS`] wide).
+    /// Reads a register field ([`Gpr::BITS`] wide). After [`Reader::uniform_datapath`], reads
+    /// the field's low [`UniformReg::BITS`] bits instead, `URZ` as [`Gpr::RZ`].
     pub(crate) fn gpr(&mut self, field: Field) -> Gpr {
+        if self.uniform {
+            let reg = self.uniform_reg(Field::new(field.start, UniformReg::BITS));
+            return if reg.is_zero() {
+                Gpr::RZ
+            } else {
+                Gpr::new(reg.index())
+            };
+        }
         Gpr::new(self.byte(field))
     }
 
     /// Reads a uniform register field ([`UniformReg::BITS`] wide, so every value names a
-    /// register).
+    /// register; a wider field's value past `URZ` is the reader's fault).
     pub(crate) fn uniform_reg(&mut self, field: Field) -> UniformReg {
-        UniformReg::new(self.byte(field)).unwrap_or(UniformReg::URZ)
+        let value = self.field(field);
+        let reg = u8::try_from(value).ok().and_then(UniformReg::new);
+        reg.unwrap_or_else(|| {
+            self.refuse(field, value);
+            UniformReg::URZ
+        })
     }
 
-    /// Reads a predicate field ([`Pred::BITS`] wide) and its negation bit.
+    /// Reads a predicate field ([`Pred::BITS`] wide; a wider field's value past `PT` is the
+    /// reader's fault) and its negation bit.
     pub(crate) fn pred_src(&mut self, reg: Field, not: Field) -> PredSrc {
+        let value = self.field(reg);
+        let pred = u8::try_from(value).ok().and_then(Pred::new);
         PredSrc {
-            // Cannot fail for a three-bit field.
-            reg: Pred::new(self.byte(reg)).unwrap_or(Pred::PT),
+            reg: pred.unwrap_or_else(|| {
+                self.refuse(reg, value);
+                Pred::PT
+            }),
             negated: self.flag(not),
         }
     }
 
-    /// Reads a uniform predicate field ([`UniformPred::BITS`] wide) and its negation bit.
+    /// Reads a uniform predicate field ([`UniformPred::BITS`] wide; a wider field's value past
+    /// `UPT` is the reader's fault).
+    pub(crate) fn uniform_pred(&mut self, field: Field) -> UniformPred {
+        let value = self.field(field);
+        let pred = u8::try_from(value).ok().and_then(UniformPred::new);
+        pred.unwrap_or_else(|| {
+            self.refuse(field, value);
+            UniformPred::UPT
+        })
+    }
+
+    /// Reads a uniform predicate field ([`UniformPred::BITS`] wide; a wider field's value past
+    /// `UPT` is the reader's fault) and its negation bit.
     pub(crate) fn uniform_pred_src(&mut self, reg: Field, not: Field) -> UniformPredSrc {
         UniformPredSrc {
-            // Cannot fail for a field of `UniformPred::BITS`.
-            reg: UniformPred::new(self.byte(reg)).unwrap_or(UniformPred::UPT),
+            reg: self.uniform_pred(reg),
             negated: self.flag(not),
         }
     }
