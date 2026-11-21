@@ -4853,13 +4853,22 @@ const fn imap(x: u32, y: u32, z: u32, w: u32) -> u32 {
 
 /// A header built by hand from `clc797sph.h`: `SPH_TYPE` (`MW(4:0)`) `sph_type`, `VERSION`
 /// (`MW(9:5)`) 4, `SHADER_TYPE` (`MW(13:10)`) `shader_type`, and word 6 (bits 192 to 223) set
-/// to `word6`, which in a type 2 header holds generics 0 to 3 of the input map
+/// to `input_map`, which in a type 2 header holds generics 0 to 3 of the input map
 /// (`GENERIC_IMAP_X(i)` = `MW((193+i*8):(192+i*8))`, then y, z and w).
-fn header_words(sph_type: u32, shader_type: u32, word6: u32) -> [u32; SPH_WORDS] {
+fn header_words(sph_type: u32, shader_type: u32, input_map: u32) -> [u32; SPH_WORDS] {
     let mut words = [0; SPH_WORDS];
     words[0] = sph_type | 4 << 5 | shader_type << 10;
-    words[6] = word6;
+    words[6] = input_map;
     words
+}
+
+/// A header's words as the bytes guest memory holds, little-endian.
+fn sph_bytes(words: [u32; SPH_WORDS]) -> [u8; SPH_BYTES] {
+    let mut out = [0; SPH_BYTES];
+    for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(words) {
+        *chunk = word.to_le_bytes();
+    }
+    out
 }
 
 /// A pixel header (`SPH_TYPE_TYPE_02_PS` = 2, `SHADER_TYPE_PIXEL` = 5) with generics 0 to 3 of
@@ -5101,13 +5110,7 @@ fn a_pixel_header_the_key_cannot_use_leaves_every_generic_smooth() {
 #[test]
 fn pixel_interpolation_reads_the_shader_crates_header() {
     use Interpolation::{Flat, NoPerspective, Smooth};
-    let bytes = |words: [u32; SPH_WORDS]| -> [u8; SPH_BYTES] {
-        let mut out = [0; SPH_BYTES];
-        for (chunk, word) in out.chunks_exact_mut(4).zip(words) {
-            chunk.copy_from_slice(&word.to_le_bytes());
-        }
-        out
-    };
+    let bytes = sph_bytes;
     let header = pixel_header([
         imap(IMAP_SCREEN_LINEAR, IMAP_UNUSED, IMAP_UNUSED, IMAP_UNUSED),
         imap(IMAP_UNUSED, IMAP_UNUSED, IMAP_UNUSED, IMAP_CONSTANT),
@@ -5159,11 +5162,10 @@ impl ProgramMemory for OneHeader {
 
 impl OneHeader {
     fn new(address: u64, words: [u32; SPH_WORDS]) -> Self {
-        let mut bytes = [0; SPH_BYTES];
-        for (chunk, word) in bytes.chunks_exact_mut(4).zip(words) {
-            chunk.copy_from_slice(&word.to_le_bytes());
+        Self {
+            address,
+            bytes: sph_bytes(words),
         }
-        Self { address, bytes }
     }
 }
 

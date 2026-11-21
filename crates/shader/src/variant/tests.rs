@@ -418,6 +418,10 @@ fn every_prefix_is_truncated_in_the_right_field() {
             "prefix of {len} bytes"
         );
     }
+}
+
+#[test]
+fn truncation_errors_name_the_field() {
     assert_eq!(
         KeyError::Truncated {
             field: KeyField::WorkgroupSize(1),
