@@ -6,14 +6,20 @@
 //! structurizer makes (slice 11), compute entry points, arithmetic, conversions, comparisons and
 //! predicates, and the local and shared memory pass ("Passes needed for correctness", item 6);
 //! slice 16b adds the warp operations and derivatives (the `warp` submodule) and the narrower
-//! "needs subgroup size 32" requirement.
+//! "needs subgroup size 32" requirement. Slice 17 (#376) adds, so far, the resource table and
+//! its binding convention, the constant-buffer reads and the driver constants (the `resources`
+//! submodule), and the emulation the variant key's flags ask for before each return (the
+//! `emulation` submodule); textures, samplers, swizzles, storage buffers, pixel inputs and the
+//! interface types and interpolation from the key are the rest of slice 17.
 //!
 //! # The entry points
 //!
-//! [`lower_with`] takes the stage, the function and [`LowerInputs`]: the workgroup size and
-//! shared-memory size (from the variant key, [`crate::variant::VariantKey`]), the local-memory
-//! size (from the SPH or the QMD) and the host target's features ([`HostCaps`]). [`lower`] is
-//! [`lower_with`] with [`LowerInputs::DEFAULT`], what slice 1's [`crate::program`] chain uses.
+//! [`lower_with`] takes the stage, the function and [`LowerInputs`]: the workgroup size,
+//! shared-memory size and emulation flags (from the variant key,
+//! [`crate::variant::VariantKey`]), the local-memory size (from the SPH or the QMD), each
+//! constant-buffer bank's size (from collect info, [`constant_buffer_sizes`]) and the host
+//! target's features ([`HostCaps`]). [`lower`] is [`lower_with`] with [`LowerInputs::DEFAULT`],
+//! what slice 1's [`crate::program`] chain uses.
 //!
 //! # What it takes
 //!
@@ -85,6 +91,9 @@
 //!   with an 8- or 16-bit type (`ConvertU16U32` to `ConvertS32S16`) are refused: the lowering
 //!   has no 8- or 16-bit integer type.
 //! - Local and shared memory (below).
+//! - Constant-buffer reads (`GetCbufU8`, `GetCbufS8`, `GetCbufU16`, `GetCbufS16`, `GetCbufU32`,
+//!   `GetCbufF32`, `GetCbufU32x2`) at an immediate bank and an immediate or register offset
+//!   (the `resources` submodule).
 //! - The warp operations and derivatives (slice 16b, the `warp` submodule): the votes, the
 //!   ballot, the lane masks, the four shuffles and `GetInBoundsFromOp` of one, `QuadBroadcast`,
 //!   `QuadSwap`, `FSwizzleAdd`, and the four derivatives, which only pixel programs may use;
@@ -113,10 +122,11 @@
 //!   `vec4<f32>` at location `n`. Its outputs are one struct: the position built-in, then
 //!   generic `n` at location `n`, with perspective interpolation at the pixel centre. That is
 //!   still slice 1's guess: slice 15 now collects the pixel header's modes
-//!   ([`crate::info::ShaderInfo::interpolation`]), but nothing here reads them yet. Slice 17
-//!   lowers them, subject to the open owner question on where a vertex program's outputs get
-//!   the pixel program's modes ([`crate::info`], "Open, for the owner"). Pixel generic inputs
-//!   are refused here ([`LowerError::Input`]) until then. Components the program does not
+//!   ([`crate::info::ShaderInfo::interpolation`]), but nothing here reads them yet. The rest
+//!   of slice 17 lowers them: the vertex stage's variant key carries the paired pixel
+//!   program's modes and its outputs take them (spec, "Pipeline-state specialisation"; decided
+//!   by the owner, 2026-11-20; the key's field is #476's). Pixel generic inputs are refused
+//!   here ([`LowerError::Input`]) until then. Components the program does not
 //!   write are zero. Generics from [`HOST_LOCATIONS`] up (generic 31) are refused, read or
 //!   written, because wgpu on Metal binds no location past 30.
 //! - A pixel function's colour target `n` is a `vec4<f32>` output at location `n`; unwritten
@@ -151,6 +161,16 @@
 //! bounds-checked: a read past the end gives 0 and a write past the end is dropped (the
 //! submodule lists where this differs from Eden).
 //!
+//! # Resources and emulation
+//!
+//! The `resources` submodule: each host stage's resources are in its own bind group
+//! ([`resource_group`]), the driver constants at binding [`DRIVER_CONSTANTS_BINDING`] and
+//! constant-buffer bank `b` at [`constant_buffer_binding`]`(b)`; [`HostShader::resources`]
+//! lists each declared one in binding order. The `emulation` submodule: before each return,
+//! the depth-range rewrite and the flipped viewport in vertex programs and the alpha test in
+//! pixel programs, as the key's [`crate::variant::EmulationKey`] asks; the driver constants
+//! are declared exactly when one of those steps reads them.
+//!
 //! # Requirements and the host target
 //!
 //! A function needs [`Requirements::f16`] when an operation it lowers has a 16-bit float in its
@@ -170,10 +190,13 @@
 //! 2. The stage is lowered ([`LowerError::Stage`]: vertex, pixel and compute).
 //! 3. The inputs: a compute program's workgroup size ([`LowerError::WorkgroupSize`]), the
 //!    local-memory size ([`LowerError::LocalMemory`]), a compute program's shared-memory size
-//!    ([`LowerError::SharedMemory`]).
+//!    ([`LowerError::SharedMemory`]), each constant-buffer bank's size, the lowest bank first
+//!    ([`LowerError::ConstantBufferSize`]).
 //! 4. The control-flow form ([`LowerError::ControlFlow`]).
 //! 5. Each listed instruction, blocks in arena order, for what the interface and the variables
-//!    need: phi types, name and attribute operands, stages, colour outputs.
+//!    need: phi types, name and attribute operands, stages, constant-buffer banks (a register
+//!    bank, a bank past the last, a bank with no size: the `resources` submodule's "Checks"),
+//!    colour outputs.
 //! 6. The body, in tree order: unlowered operations and operand forms.
 //! 7. The requirements against the target ([`LowerError::Missing`]).
 //! 8. naga's validation ([`LowerError::Validation`], a bug in this module if it happens).
@@ -200,6 +223,8 @@
 //! | Shared-memory word index | `offset >> 2`, logical | `OpShiftRightArithmetic` (`emit_spirv_shared_memory.cpp`), which differs only for offsets of 2^31 and up, all out of bounds here | `tests::memory::shared_offsets_at_and_past_the_end` |
 //! | `PackHalf2x16` and `UnpackHalf2x16` | Need [`Requirements::f16`] (see [`capabilities`]) | Eden needs no feature (`OpExtInst PackHalf2x16`) | `tests::opcodes::f16_packing_needs_f16` |
 //! | Out-of-bounds local and shared accesses | Read 0, write dropped, word by word | Eden does not check; the interpreter refuses | `tests::memory` |
+//! | Constant-buffer reads | The `resources` submodule's own table: a register bank, a read past the declared size, the declared type | Eden's `GetCbuf` and `DefineConstantBuffers` | `tests::resources` |
+//! | The epilogue's emulation | The `emulation` submodule's own table: the alpha reference and the flip from the driver constants, the steps before each return | Eden's `EmitEpilogue` | `tests::emulation` |
 //! | The warp operations and derivatives | The `warp` submodule's own table: vertex programs, derivatives outside pixel programs, subgroups wider than 32 lanes, the lane masks, `QuadSwap`'s direction, `QuadBroadcast`'s index, Metal's derivative controls | Eden's `emit_spirv_warp.cpp` | `tests::warp` |
 
 pub(crate) mod builder;

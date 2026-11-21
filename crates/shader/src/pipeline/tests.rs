@@ -19,7 +19,7 @@ use crate::decode::{
 };
 use crate::exchange::{EngineState, TextureKind, exchange};
 use crate::flow::FlowError;
-use crate::host::{Feature, HostStage, ResourceKind, ResourceSlot, ResourceSource};
+use crate::host::{Feature, HostCode, HostStage, ResourceKind, ResourceSlot, ResourceSource};
 use crate::info::InfoError;
 use crate::interp::Machine;
 use crate::ir::{ATTRIBUTE_WORD_BYTES, Attribute, Node};
@@ -1051,4 +1051,91 @@ fn a_pixel_program_s_header_reaches_the_driver() {
         refused.to_string(),
         "a pixel program cannot read attribute a0x80"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Speed.
+
+/// How many instructions the speed test's program has: tens of thousands (spec, "Compilation,
+/// threads and stutter": "a test translates a large synthetic program (tens of thousands of
+/// instructions) within a fixed time on CI").
+const SPEED_INSTRUCTIONS: usize = 20_000;
+
+/// The fixed bound the speed test's translation must finish within (spec, "The offline test
+/// harness", "Speed"; slice 17). A **guess**, set well above the time measured on the
+/// development Mac in the test profile (see the PR) so a slower CI runner passes, and below the
+/// cache wait's own watchdog ([`WATCHDOG`]).
+const SPEED_BOUND: Duration = Duration::from_secs(20);
+
+/// The speed test's program: segments of eight instructions (an add, a comparison, a guarded
+/// move into R7, a constant-buffer load indexed by R7, and adds back into R7), so each
+/// segment's values feed the next and the passes cannot drop them, and the translation driver,
+/// the structurizer (a conditional block per segment), the SSA rewrite (a phi per segment), the
+/// passes, collect info and the lowering all see work in proportion to the size; then two
+/// stores and `EXIT`.
+fn speed_program() -> Vec<Instruction> {
+    const SEGMENT: usize = 8;
+    let segments = (SPEED_INSTRUCTIONS - 3) / SEGMENT;
+    let mut code = Vec::with_capacity(SPEED_INSTRUCTIONS);
+    for segment in 0..segments {
+        let k = u32::try_from(segment).expect("small");
+        code.extend(words(&[
+            add_imm(0, 0, 1),
+            less_than(1, 0, k),
+            Instr {
+                guard: p(1),
+                ..mov(7, k)
+            },
+        ]));
+        code.push(ldc(4, 7, 1, (k * 4) % 0x100));
+        code.extend(words(&[
+            add_imm(5, 4, 1),
+            add_imm(6, 5, 2),
+            add_imm(7, 6, 3),
+            add_imm(3, 0, 1),
+        ]));
+    }
+    code.extend(words(&[ast(0, GENERIC_0_X), ast(7, GENERIC_0_Y), exit()]));
+    code
+}
+
+/// The speed test (spec, "The offline test harness", "Speed"; owned by slice 17): a program of
+/// about [`SPEED_INSTRUCTIONS`] instructions goes through the cache's production translator,
+/// from bytes to a validated module, within [`SPEED_BOUND`].
+#[test]
+fn a_large_program_translates_within_the_bound() {
+    let code = speed_program();
+    assert!(code.len() > SPEED_INSTRUCTIONS - 8 && code.len() <= SPEED_INSTRUCTIONS);
+    let program = bytes(Some(&vertex_header(0)), &code);
+    let start = std::time::Instant::now();
+    let shader = through_the_cache(
+        GuestStage::Vertex,
+        &program,
+        &State::default(),
+        &VariantKey::default(),
+    )
+    .expect("ready");
+    let took = start.elapsed();
+    eprintln!("translated {} instructions in {took:?}", code.len());
+    assert!(took < SPEED_BOUND, "took {took:?}");
+    assert_eq!(
+        shader.resources,
+        [ResourceSlot {
+            group: 0,
+            binding: 2,
+            kind: ResourceKind::UniformBuffer {
+                size: crate::info::INDEXED_CBUF_SIZE,
+            },
+            source: ResourceSource::ConstantBuffer { bank: 1 },
+        }]
+    );
+    // Every segment's load reached the module.
+    let HostCode::Naga { module, .. } = &shader.code;
+    let loads = module.entry_points[0]
+        .function
+        .expressions
+        .iter()
+        .filter(|(_, expression)| matches!(expression, naga::Expression::Load { .. }))
+        .count();
+    assert!(loads >= (SPEED_INSTRUCTIONS - 3) / 8, "{loads} loads");
 }
