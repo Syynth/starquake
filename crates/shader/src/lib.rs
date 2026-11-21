@@ -72,6 +72,11 @@
 //! [`program::graphics_program_ir`] runs a graphics program's bytes through the header, the
 //! translator, the slice 8 passes and collect info.
 //!
+//! [`pipeline::PipelineTranslator`] is the shader cache's production translator (issue #484):
+//! it runs [`program::pipeline_ir`] (the driver, the structurizer, the SSA rewrite and the
+//! passes, in the spec's order) and the lowering, with each `BRX`'s targets from slice 9's
+//! answers.
+//!
 //! Slice 19 is the shader cache ([`cache`]): the address map, program entries and shader
 //! entries, invalidation by guest range, the negative cache, and translations queued on the
 //! shared compile pool behind tickets, driven through a translator seam until slice 17.
@@ -95,6 +100,7 @@ pub mod ir;
 pub mod lookup;
 pub mod lower;
 pub mod opt;
+pub mod pipeline;
 pub mod program;
 pub mod sph;
 pub mod structure;
