@@ -79,7 +79,9 @@
 //! last each source's swizzle as `HalfLanes` reads it, in operand order. Every check runs
 //! before the first instruction is appended, so a refusal leaves the function as it was
 //! (`tests::refusals_append_nothing`). The order is pinned with two faults at once by
-//! `tests::refusals_report_in_the_prs_order`.
+//! `tests::add_and_multiply_refusals_report_in_the_prs_order`,
+//! `tests::fma_refusals_report_in_the_prs_order` and
+//! `tests::compare_refusals_report_in_the_prs_order`.
 //!
 //! A uniform-register source (forms 6 and 7, which slice 6c decodes from NAK) is refused by the
 //! check of the PR's that refuses its form: `HADD2`'s `Form() <= 3` ("native half add source
@@ -92,8 +94,9 @@
 //! Some of the PR's checks cannot fail on a decoded instruction and are not repeated:
 //! `HADD2`'s `Require(Take(76, 1) == 0 && Take(79, 1) == 0, ..)` and `HMUL2`'s bit 78 in its
 //! `Take(78, 2)` (the decoder rejects those bits), `HMNMX2`'s `Require(Take(91, 1) == 0, ..)`
-//! (bit 91 is the bindless bit of the one form that has it, refused first, and unknown in the
-//! others), `HSETP2`'s `Require(Take(65, 1) == 0, ..)` (the decoder rejects bit 65) and
+//! (bit 91 is the bindless bit of form 5, refused first as a bindless constant buffer; it is
+//! fixed in form 6, which the form check refuses first; forms 1 and 4 do not know it, so the
+//! decoder rejects it there), `HSETP2`'s `Require(Take(65, 1) == 0, ..)` (the decoder rejects bit 65) and
 //! `Require(set_op <= 2, ..)` ([`PredSetOp`] has three variants), and `HFMA2`'s
 //! `Take(87, 4) == 0` without `.RELU` (the decoder refuses another value). The bank check runs
 //! on every constant-buffer source, though a decoded bank has five bits, so only a hand-made
@@ -115,10 +118,10 @@
 //! | What | Reference | Here | Pinned by |
 //! |---|---|---|---|
 //! | A guard on these instructions | PR #4588: a select of the result (`guard_select`) | a conditional block (spec, "Instruction translation") | `tests::guarded_instructions_become_conditional_blocks` |
-//! | `HADD2.F32` whose `a` is not `-RZ` with neither absolute value nor swizzle | the native translator ignores `a` (its comment: "-RZ + b.Hn widened to F32") | refused ([`HalfDoubleUnsupported::HalfAddFloatOperand`]), the lowering's check (`lower_to_maxwell.h` case `0x230`: `a.reg != 255 \|\| !a.negate \|\| a.absolute \|\| a.swizzle != 0`), so `a` is never silently dropped | `tests::hadd2_f32_needs_negated_rz` |
-//! | `HSET2` with swizzle 1 on a source | the lowering passes it to Eden's `HSET2`, which widens the other source to single precision (`Extract`'s `F32`) | refused ([`HalfDoubleUnsupported::HalfAsFloat`]), as `HalfLanes` refuses it in the PR's other half translators | `tests::swizzle_1_is_refused_everywhere` |
-//! | `RZ` and `URZ` in a double source or destination | Eden refuses them, being odd | a zero double, or nothing written (NAK's `Src::ZERO`) | `tests::double_pairs_at_each_edge` |
-//! | A uniform-register pair in a double source | none: Eden has no uniform registers | read as a pair, refused when odd, as a register pair | `tests::double_pairs_at_each_edge` |
+//! | `HADD2.F32` whose `a` is not `-RZ` with neither absolute value nor swizzle | the native translator ignores `a` (its comment: "-RZ + b.Hn widened to F32") | refused ([`HalfDoubleUnsupported::HalfAddFloatOperand`]), the lowering's check (`lower_to_maxwell.h` case `0x230`: `a.reg != 255 \|\| !a.negate \|\| a.absolute \|\| a.swizzle != 0`), so `a` is never silently dropped | `tests::half::hadd2_f32_needs_negated_rz` |
+//! | `HSET2` with swizzle 1 on a source | the lowering passes it to Eden's `HSET2`, which widens the other source to single precision (`Extract`'s `F32`) | refused ([`HalfDoubleUnsupported::HalfAsFloat`]), as `HalfLanes` refuses it in the PR's other half translators | `tests::half::swizzle_1_is_refused_everywhere` |
+//! | `RZ` and `URZ` in a double source or destination | Eden refuses them, being odd | a zero double, or nothing written (NAK's `Src::ZERO`) | `tests::double::double_pairs_at_each_edge` |
+//! | A uniform-register pair in a double source | none: Eden has no uniform registers | read as a pair, refused when odd, as a register pair | `tests::double::double_pairs_at_each_edge` |
 //!
 //! **Owner question**: where PR #4588's lowering and its native translator read these
 //! instructions differently, this module follows the native translator, as the spec's
@@ -126,15 +129,22 @@
 //! translators then built; slice 6c's decoder and slice 12e follow the lowering under
 //! graphics-server decision 8 (owner's ruling, 2026-11-20). Each point is pinned by a test:
 //! swizzle 1 in `HADD2`, `HMUL2` and `HFMA2` (the lowering widens to single precision, as in
-//! `HSET2` above; `tests::swizzle_1_is_refused_everywhere`); `HMUL2.FMZ` and `HFMA2.FMZ` (the
+//! `HSET2` above; `tests::half::swizzle_1_is_refused_everywhere`); `HMUL2.FMZ` and `HFMA2.FMZ` (the
 //! lowering forwards Maxwell's `FMZ` precision, whose Eden translator then compares a half lane
 //! with a single-precision zero, `IREmitter::FPEqual`'s "Mismatching types", unless `.SAT` or a
-//! widened source; `tests::fmz_is_refused`); `HFMA2.RELU` with a predicate other than `PT` (the
-//! lowering keeps the clamped result only where it holds; `tests::relu_with_a_predicate_is_refused`);
+//! widened source; `tests::half::fmz_is_refused`); `HFMA2.RELU` with a predicate other than `PT` (the
+//! lowering keeps the clamped result only where it holds;
+//! `tests::half::relu_with_a_predicate_is_refused`);
 //! and `HFMA2.RELU`'s clamp of `-0.0` (the lowering, and PR #4588's own test of it in
 //! `native_shader.cpp`, the `ReLU` case "preserves fusion values above one and canonical
 //! NaNs", give `+0.0` where the native translator keeps `-0.0`;
-//! `tests::relu_mirrors_the_native_clamp`, `tests::pr_relu_cases`).
+//! `tests::half::relu_mirrors_the_native_clamp`, `tests::half::pr_relu_cases`).
+//!
+//! **Equivalent in the interpreter.** `HFMA2.RELU`'s replacement of a NaN lane by
+//! [`RELU_NAN`] changes no value the interpreter gives: it makes every NaN result of the
+//! narrowing conversion its canonical half NaN whatever the payload. The replacement is kept,
+//! as the PR writes it, for a backend whose conversion keeps payloads, and pinned by the IR it
+//! builds (`tests::half::golden_relu_clamp`).
 
 #[cfg(test)]
 mod tests;
@@ -712,12 +722,9 @@ impl Emit<'_, '_> {
 
     /// `HADD2.F32` (`ops_half.cpp`, `HADD2`, `to_float`): `b`'s selected half widened.
     fn hadd2_f32(&mut self, dst: Gpr, b: HalfSrc) -> Result<(), HalfDoubleError> {
-        let lanes = self.lanes(b)?;
-        let selected = if b.swizzle == HalfSwizzle::H1H1 {
-            lanes.high
-        } else {
-            lanes.low
-        };
+        // [`check`] takes only `H0_H0` and `H1_H1` here, which put the one half they select in
+        // both lanes, so the low lane is it (the PR's `b.swizzle == 3 ? rhs : lhs`).
+        let selected = self.lanes(b)?.low;
         let widen = control(false, FpRounding::Rn, FmzMode::None);
         let wide = self.emit_fp(Opcode::ConvertF32F16, &[selected], widen)?;
         let bits = self.emit(Opcode::BitCastU32F32, &[wide])?;

@@ -819,3 +819,23 @@ fn golden_hadd2() {
          \x20   return\n"
     );
 }
+
+/// The IR of `HFMA2.RELU`'s clamp of one lane, as the PR's translator builds it: widened, a
+/// negative value replaced by zero, a NaN by `RELU_NAN`, narrowed back. The NaN replacement
+/// changes no value the interpreter gives (module docs), so this pins it.
+#[test]
+fn golden_relu_clamp() {
+    let op = Op::HFma2(OpHFma2 {
+        relu: Some(PredSrc::TRUE),
+        ..hfma2(r(0), h(1), h(2), h(3))
+    });
+    let text = translated(&[Instr::new(op)]).to_string();
+    let clamp = "\
+         \x20   %14: f32 = ConvertF32F16 %12\n\
+         \x20   %15: u1 = FPOrdLessThan32 %14, f32 0x0\n\
+         \x20   %16: f32 = SelectF32 %15, f32 0x0, %14\n\
+         \x20   %17: u1 = FPIsNan32 %14\n\
+         \x20   %18: f32 = SelectF32 %17, f32 0x7fc00000, %16\n\
+         \x20   %19: f16 = ConvertF16F32 %18\n";
+    assert!(text.contains(clamp), "{text}");
+}
