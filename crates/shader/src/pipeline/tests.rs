@@ -24,7 +24,9 @@ use crate::info::InfoError;
 use crate::interp::Machine;
 use crate::ir::{ATTRIBUTE_WORD_BYTES, Attribute, Function, Inst, Node, Opcode};
 use crate::lookup::{ProgramMemory, ProgramRequest, Unmapped};
-use crate::lower::{LowerError, MAX_LOCAL_MEMORY_BYTES, MAX_SHARED_MEMORY_BYTES};
+use crate::lower::{
+    LowerError, MAX_LOCAL_MEMORY_BYTES, MAX_SHARED_MEMORY_BYTES, MEMORY_WORD_BYTES,
+};
 use crate::sph::encode::encode_bytes;
 use crate::sph::{Common, HEADER_BYTES, HeaderError, VtgIo, VtgMap, VtgStage};
 use crate::testing::{imnmx, ldc, shf};
@@ -888,11 +890,13 @@ fn local_memory_bytes_for_each_input() {
 /// to 2^32, is refused with the same size, where Eden's 32-bit sum wraps to 0.
 #[test]
 fn a_header_size_of_2_to_the_32_is_refused_not_wrapped() {
-    let plain = words(&[mov(0, 7), exit()]);
+    // A program that stores to local memory: one without a local access is lowered with a size
+    // of 0 (`a_program_without_local_access_is_not_held_to_the_cap`).
+    let store = words(&[mov(0, 7), stl(0, 0), exit()]);
     let vertex = |header: &ProgramHeader| {
         through_the_cache(
             GuestStage::Vertex,
-            &bytes(Some(header), &plain),
+            &bytes(Some(header), &store),
             &State::default(),
             &VariantKey::default(),
         )
@@ -907,6 +911,109 @@ fn a_header_size_of_2_to_the_32_is_refused_not_wrapped() {
         refused,
         "0xff_ffff_ffff + 1"
     );
+}
+
+/// A program with no local-memory access is lowered with a local-memory size of 0 (module
+/// docs, "The local-memory size"), so its key or header size is never held to
+/// [`MAX_LOCAL_MEMORY_BYTES`], which no reference applies: a plain compute program with a key
+/// size one past the cap, or `u32::MAX`, lowers with no local array, and so does a plain vertex
+/// program whose header's high field makes 2^32 bytes. The same programs with a local store are
+/// refused with the lowering's exact error, so the local access is the only thing that varies
+/// between each pair.
+#[test]
+fn a_program_without_local_access_is_not_held_to_the_cap() {
+    let plain = words(&[mov(0, 7), exit()]);
+    let store = words(&[mov(0, 7), stl(0, 0), exit()]);
+    let past = u32::try_from(MAX_LOCAL_MEMORY_BYTES + 1).expect("fits");
+    for local in [past, u32::MAX] {
+        let compute = |code: &[Instruction]| {
+            through_the_cache(
+                GuestStage::Compute,
+                &bytes(None, code),
+                &State::default(),
+                &VariantKey {
+                    local_memory_size: local,
+                    ..compute_variant()
+                },
+            )
+            .map(|shader| local_words(&shader))
+        };
+        assert_eq!(compute(&plain), Ok(None), "{local:#x}");
+        assert_eq!(
+            compute(&store),
+            Err(Arc::new(Rejection::Lower(LowerError::LocalMemory {
+                bytes: u64::from(local)
+            }))),
+            "{local:#x}"
+        );
+    }
+    let header = vertex_header_crs(0, 0x100, 0);
+    let vertex = |code: &[Instruction]| {
+        through_the_cache(
+            GuestStage::Vertex,
+            &bytes(Some(&header), code),
+            &State::default(),
+            &VariantKey::default(),
+        )
+        .map(|shader| local_words(&shader))
+    };
+    assert_eq!(vertex(&plain), Ok(None));
+    assert_eq!(
+        vertex(&store),
+        Err(Arc::new(Rejection::Lower(LowerError::LocalMemory {
+            bytes: 1 << 32
+        })))
+    );
+}
+
+/// A local store at a constant offset at or past the end of the array, through the production
+/// pipeline (the cache and [`PipelineTranslator`], no opaque operands): the store is dropped,
+/// not the shader, since a store's index is clamped as a load's is (`crate::lower`'s "Local
+/// and shared memory"), so naga's validation never sees a constant index past the end. With 16
+/// bytes (four words): `STL [RZ + 16]`, the first word past the end, `STL [RZ - 4]` (word
+/// `0x3fff_ffff`) and, as the accepted neighbour, `STL [RZ + 12]`, the last word, each lower
+/// with a four-word array, for a compute program (the key's size) and a vertex program (its
+/// header's); and `STL [RZ + MAX_LOCAL_MEMORY_BYTES]` lowers at the cap.
+#[test]
+fn a_local_store_at_a_constant_offset_past_the_end_lowers() {
+    let size: u32 = 16;
+    let length = Some(size / MEMORY_WORD_BYTES);
+    let end = i32::try_from(size).expect("small");
+    for offset in [end, -4, end - 4] {
+        let code = words(&[mov(0, 7), stl(0, offset), exit()]);
+        let compute = through_the_cache(
+            GuestStage::Compute,
+            &bytes(None, &code),
+            &State::default(),
+            &VariantKey {
+                local_memory_size: size,
+                ..compute_variant()
+            },
+        )
+        .map(|shader| local_words(&shader));
+        assert_eq!(compute, Ok(length), "compute, offset {offset}");
+        let vertex = through_the_cache(
+            GuestStage::Vertex,
+            &bytes(Some(&vertex_header(size)), &code),
+            &State::default(),
+            &VariantKey::default(),
+        )
+        .map(|shader| local_words(&shader));
+        assert_eq!(vertex, Ok(length), "vertex, offset {offset}");
+    }
+    let max = u32::try_from(MAX_LOCAL_MEMORY_BYTES).expect("fits");
+    let at_cap = words(&[mov(0, 7), stl(0, i32::try_from(max).expect("fits")), exit()]);
+    let lowered = through_the_cache(
+        GuestStage::Compute,
+        &bytes(None, &at_cap),
+        &State::default(),
+        &VariantKey {
+            local_memory_size: max,
+            ..compute_variant()
+        },
+    )
+    .map(|shader| local_words(&shader));
+    assert_eq!(lowered, Ok(Some(max / MEMORY_WORD_BYTES)));
 }
 
 /// Collect info runs between the passes and the lowering (module docs, step 4): a vertex
@@ -958,18 +1065,22 @@ fn compute_variant() -> VariantKey {
 /// The variant key's workgroup, shared-memory and local-memory sizes and the header's
 /// local-memory size (alone, and split with its CRS size) reach the lowering: the shader's
 /// workgroup size is the key's, and a size one past each lowering bound is refused with the
-/// lowering's error, at the bound accepted.
+/// lowering's error, at the bound accepted. The local-memory cases store to local memory, since
+/// a program without a local access is lowered with a size of 0
+/// (`a_program_without_local_access_is_not_held_to_the_cap`).
 #[test]
 fn the_variant_and_the_header_reach_the_lowering() {
     let plain = words(&[mov(0, 7), exit()]);
-    let compute = |variant: &VariantKey| {
+    let store = words(&[mov(0, 7), stl(0, 0), exit()]);
+    let compute_code = |code: &[Instruction], variant: &VariantKey| {
         through_the_cache(
             GuestStage::Compute,
-            &bytes(None, &plain),
+            &bytes(None, code),
             &State::default(),
             variant,
         )
     };
+    let compute = |variant: &VariantKey| compute_code(&plain, variant);
     let shader = compute(&compute_variant()).expect("lowers");
     assert_eq!(shader.workgroup_size, Some([8, 4, 2]));
     for (shared, refused) in [
@@ -1004,7 +1115,7 @@ fn the_variant_and_the_header_reach_the_lowering() {
         let refused = refused.map(|error| Arc::new(Rejection::Lower(error)));
         let vertex = through_the_cache(
             GuestStage::Vertex,
-            &bytes(Some(&vertex_header(local)), &plain),
+            &bytes(Some(&vertex_header(local)), &store),
             &State::default(),
             &VariantKey::default(),
         );
@@ -1012,16 +1123,19 @@ fn the_variant_and_the_header_reach_the_lowering() {
         // The same size split between the header's size and its CRS size.
         let split = through_the_cache(
             GuestStage::Vertex,
-            &bytes(Some(&vertex_header_crs(local - 0x40, 0, 0x40)), &plain),
+            &bytes(Some(&vertex_header_crs(local - 0x40, 0, 0x40)), &store),
             &State::default(),
             &VariantKey::default(),
         );
         assert_eq!(split.err(), refused.clone(), "{local} split");
         // And a compute program's, from the variant key.
-        let from_key = compute(&VariantKey {
-            local_memory_size: local,
-            ..compute_variant()
-        });
+        let from_key = compute_code(
+            &store,
+            &VariantKey {
+                local_memory_size: local,
+                ..compute_variant()
+            },
+        );
         assert_eq!(from_key.err(), refused.clone(), "{local} from the key");
     }
 }

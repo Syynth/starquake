@@ -58,11 +58,19 @@
 //! - **Compute:** [`VariantKey::local_memory_size`], which the GPU crate fills from the QMD
 //!   (`local_pos_alloc + local_crs_alloc`, `ComputeEnvironment` in the same files).
 //!
+//! A program with no local-memory operation left after the passes is lowered with a size of
+//! 0 whatever its header or key says, since the size only sizes an array it never touches. So
+//! the lowering's cap ([`crate::lower::MAX_LOCAL_MEMORY_BYTES`], which no reference applies)
+//! refuses only a program that reads or writes local memory: a plain compute program whose QMD
+//! sets bits 20 to 23 of a local-memory field (which both Switch 2 references mask away) is
+//! accepted, as in the references. Pinned by
+//! `tests::a_program_without_local_access_is_not_held_to_the_cap`.
+//!
 //! **Divergence:** Eden asserts the header's size fits 32 bits (a soft `ASSERT`) and then
 //! truncates it to `u32` and adds the CRS size in 32 bits, so a size of 2^32 or more wraps.
 //! Here the sum is taken in 64 bits (it cannot wrap: the header's size is below 2^56 and the
-//! CRS size below 2^32), and the lowering refuses any size past
-//! [`crate::lower::MAX_LOCAL_MEMORY_BYTES`]. Pinned by
+//! CRS size below 2^32), and the lowering refuses a program that uses local memory with any
+//! size past [`crate::lower::MAX_LOCAL_MEMORY_BYTES`]. Pinned by
 //! `tests::a_header_size_of_2_to_the_32_is_refused_not_wrapped`.
 //!
 //! # What it does not do yet
@@ -108,6 +116,7 @@ use crate::flow::{BranchTables, JumpTableQuestions, resolve_jump_tables};
 use crate::host::{HostCaps, HostShader, Requirements};
 use crate::host_lower::lower_for_host;
 use crate::info::{check_header, collect, translation_stage};
+use crate::ir::{Function, Inst, Opcode};
 use crate::lower::{LowerInputs, constant_buffer_sizes, lower_with};
 use crate::program::{Rejection, pipeline_ir};
 use crate::sph::{Io, ProgramHeader};
@@ -242,7 +251,11 @@ pub fn translate_shader(input: &ShaderInput<'_, PipelineProgram>) -> Result<Host
     lower_for_host(&mut function, caps)?;
     let inputs = LowerInputs {
         workgroup_size: input.variant.workgroup_size,
-        local_memory_bytes: local_memory_bytes(header, input.variant),
+        local_memory_bytes: if uses_local_memory(&function) {
+            local_memory_bytes(header, input.variant)
+        } else {
+            0
+        },
         shared_memory_bytes: input.variant.shared_memory_size,
         caps,
         constant_buffers: constant_buffer_sizes(&info),
@@ -264,5 +277,13 @@ pub fn local_memory_bytes(header: Option<&ProgramHeader>, variant: &VariantKey) 
             .common
             .local_memory_size()
             .saturating_add(u64::from(header.common.local_memory_crs_size))
+    })
+}
+
+/// Whether `function` lists a local-memory operation (module docs, "The local-memory size":
+/// a program without one is lowered with a size of 0, so its size is never checked).
+fn uses_local_memory(function: &Function) -> bool {
+    function.listed().any(|(_, inst)| {
+        matches!(inst, Inst::Op(op) if matches!(op.opcode, Opcode::LoadLocal | Opcode::WriteLocal))
     })
 }

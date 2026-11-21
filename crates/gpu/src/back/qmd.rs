@@ -164,7 +164,12 @@
 //!   `divergence_release_addresses_are_not_checked_here`.
 //! - **The local-memory fields keep all 24 bits.** Eden-NX2 assigns each into a 20-bit
 //!   `BitField`, dropping bits 20 to 23 ([`Dispatch::local_memory_size`]). Pinned by
-//!   `divergence_local_memory_keeps_bits_20_to_23`.
+//!   `divergence_local_memory_keeps_bits_20_to_23`. A size with any of those bits set is 1 MiB
+//!   or more, past the shader crate's local-memory cap (512 KiB, which no reference applies): a
+//!   compute program that reads or writes local memory is then refused there, where both
+//!   Switch 2 references mask the bits away and accept it; one that does not is lowered with a
+//!   size of 0 and accepted, as in the references (the shader crate's
+//!   `pipeline::tests::a_program_without_local_access_is_not_held_to_the_cap`).
 //!
 //! # Refused as Eden-NX2 refuses them
 //!
@@ -426,7 +431,8 @@ impl Dispatch {
     /// `kepler_compute.cpp`) into a 20-bit `BitField` (`local_pos_alloc`, `local_crs_alloc` in
     /// `kepler_compute.h`), whose `Assign` masks it, so bits 20 to 23 of each are dropped. Here
     /// all 24 bits are kept, as `clc7c0qmd.h` defines them; a size of 1 MiB or more is past the
-    /// shader crate's local-memory cap and is refused there. Pinned by
+    /// shader crate's local-memory cap and refused there when the program uses local memory
+    /// (module docs, "Divergences from Eden-NX2"). Pinned by
     /// `divergence_local_memory_keeps_bits_20_to_23`. The sum saturates, which only a
     /// hand-built [`Dispatch`] with fields wider than 24 bits can reach.
     #[must_use]
