@@ -84,7 +84,12 @@
 //! in gsv's shared state, not the root's: the drain and the page turn act on it. The root's
 //! family ([`RootFamily`]) holds the handle to that state beside [`RootState`]; the handle is the
 //! run's wiring, so a snapshot holds only the [`RootState`] and loading keeps the handle. Before
-//! the bootstrap is complete 204 is logged and accepted, as the stubs are (decision 7).
+//! the bootstrap is complete 204 is logged and accepted, as the stubs are (decision 7). 204
+//! keeps a reference of the root's own to each of the page's two transfer memories; when the
+//! server's last session closes, the family queues
+//! [`Completion::RootClosed`](crate::completion::Completion) and the timer thread's drain lets
+//! the page and both references go if no root session is open by then
+//! ([`crate::shared::page`], "When the root closes").
 //!
 //! # The gpu session (497)
 //!

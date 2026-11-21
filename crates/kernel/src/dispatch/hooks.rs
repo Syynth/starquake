@@ -179,7 +179,10 @@ impl Dispatcher {
         .map_err(|error| match error {
             SvcError::Kernel(error) => error,
             SvcError::Internal(what) => {
-                tracing::error!(what, "kernel bookkeeping failed releasing a kept transfer memory");
+                tracing::error!(
+                    what,
+                    "kernel bookkeeping failed releasing a kept transfer memory"
+                );
                 KernelError::InvalidState
             }
         })

@@ -954,7 +954,8 @@ impl TimerHost for KernelHost<'_> {
     }
 
     fn release_kept_transfer_memory(&mut self, memory: ObjectId) -> SvcResult<()> {
-        self.dispatcher.release_kept_transfer_memory(GSV_ROOT, memory)
+        self.dispatcher
+            .release_kept_transfer_memory(GSV_ROOT, memory)
     }
 
     fn root_sessions(&mut self) -> SvcResult<usize> {

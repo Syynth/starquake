@@ -73,7 +73,11 @@ fn a_refused_keep_gives_back_what_the_bind_kept_and_the_next_bind_succeeds() {
         assert_eq!(page.binding(), None, "{which}");
         assert!(page.request_event().is_some(), "{which}");
         assert_eq!(rig.kernel.memory(WRITABLE, 1), Some(&[DIRT][..]), "{which}");
-        assert_eq!(rig.kernel.memory(READ_ONLY, 1), Some(&[DIRT][..]), "{which}");
+        assert_eq!(
+            rig.kernel.memory(READ_ONLY, 1),
+            Some(&[DIRT][..]),
+            "{which}"
+        );
         rig.kernel.refuse_objects(None);
         let reply = rig.bind();
         assert_eq!(

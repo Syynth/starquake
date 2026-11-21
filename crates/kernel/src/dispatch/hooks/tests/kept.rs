@@ -180,10 +180,7 @@ fn only_a_live_transfer_memory_is_kept() {
     let (_, writable, _) = world.hooked_event(Arc::new(Counting::default()));
     let never_made = ObjectId::from_parts(0x7FFF, 9);
     for object in [writable, never_made] {
-        assert_eq!(
-            keep(&world, object, 1),
-            [Err(KernelError::InvalidHandle)]
-        );
+        assert_eq!(keep(&world, object, 1), [Err(KernelError::InvalidHandle)]);
         assert_eq!(world.dispatcher.kept_transfer_memory(SERVICE, object), 0);
     }
     // The event's references are as they were: the server's two (its creator's, kept for as

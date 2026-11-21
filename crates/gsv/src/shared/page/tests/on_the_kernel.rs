@@ -201,7 +201,8 @@ impl KernelRig {
     fn kept(&self, binding: Binding) -> [u32; 2] {
         [
             self.dispatcher.kept_transfer_memory(ROOT, binding.writable),
-            self.dispatcher.kept_transfer_memory(ROOT, binding.read_only),
+            self.dispatcher
+                .kept_transfer_memory(ROOT, binding.read_only),
         ]
     }
 
@@ -472,6 +473,23 @@ fn corrupt_pages(rig: &KernelRig) -> Vec<(Page, PageSnapshotError)> {
                 size: u64::from(WRITABLE_SIZE),
             },
         ),
+    ];
+    let mut cases: Vec<_> = cases.into();
+    cases.extend(unkept_pages(rig, &page));
+    cases
+}
+
+/// The bound rig's `page` naming live memories of the right sizes that the root does not keep,
+/// with the error: each check of the root's references, and their order against each other and
+/// against the size check.
+fn unkept_pages(rig: &KernelRig, page: &Page) -> [(Page, PageSnapshotError); 4] {
+    let binding = page.binding().unwrap();
+    let corrupt = |change: &dyn Fn(&mut Page)| {
+        let mut page = page.clone();
+        change(&mut page);
+        page
+    };
+    [
         // Live memories of the right sizes that the root does not keep.
         (
             corrupt(&|page| {
@@ -513,8 +531,7 @@ fn corrupt_pages(rig: &KernelRig) -> Vec<(Page, PageSnapshotError)> {
                 size: u64::from(READ_ONLY_SIZE),
             },
         ),
-    ];
-    cases.into()
+    ]
 }
 
 #[test]

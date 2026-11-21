@@ -768,7 +768,11 @@ impl Rig {
 /// The page bound by 204 through a run's root, with its two transfer memories; the request
 /// event's writable end and the answer event, as the guest holds them, and the memories.
 fn bound(rig: &Rig) -> (Handle, Handle, Handle, Handle) {
-    let root = rig.graphics_root();
+    bound_on(rig, rig.graphics_root())
+}
+
+/// [`bound`] through the root session `root`.
+fn bound_on(rig: &Rig, root: Handle) -> (Handle, Handle, Handle, Handle) {
     let writable = rig.lend(WRITABLE_AT, WRITABLE_SIZE, SvcPermission::None);
     let read_only = rig.lend(READ_ONLY_AT, READ_ONLY_SIZE, SvcPermission::Read);
     // 204 as PR checks it (`0xdc, 0x80000006, 4`, two copied handles, then `1, 0x1ff, 0x1000,
@@ -874,6 +878,54 @@ fn the_shared_page_is_bound_and_answered_through_the_kernel() {
     assert_eq!(poll(&rig, answer), ResultCode::SUCCESS);
     assert!(graphics.is_idle());
     assert_eq!(graphics.deadline(), None);
+}
+
+/// Issue 499 through a run's wiring: the root keeps its own references to the page's two
+/// transfer memories, so the page is answered through the kernel host after the title closes
+/// its handles; closing the title's root session, the root's only one, lets the turn drop both
+/// references through the kernel host, and the memories go.
+#[test]
+fn the_page_outlives_the_title_s_handles_until_its_root_session_closes() {
+    let graphics = Graphics::new(FrontMode::Live, None);
+    let rig = rig_with(&graphics);
+    let root = rig.graphics_root();
+    let (request, answer, writable, read_only) = bound_on(&rig, root);
+    let memories = [rig.object(writable), rig.object(read_only)];
+    let kept = || memories.map(|memory| rig.dispatcher.kept_transfer_memory(GSV_ROOT, memory));
+    assert_eq!(kept(), [1, 1]);
+    for handle in [writable, read_only] {
+        let regs = rig.call(SvcId::CloseHandle, u64::from(handle.raw()), 0);
+        assert_eq!(result(&regs), ResultCode::SUCCESS);
+    }
+    assert_eq!(kept(), [1, 1]);
+
+    // The title asks and signals; the turn answers into the memories it no longer holds.
+    let asked = SyncpointId::new(ASKED).unwrap();
+    graphics.shared().syncpoints().increment_by(asked, 3);
+    let request_at = WRITABLE_AT + u64::from(page::GROUP_REQUEST_OFFSET);
+    rig.memory.write(request_at, &1_u64.to_le_bytes()).unwrap();
+    let slot_at = WRITABLE_AT + u64::from(page::SLOT_REQUEST_OFFSET);
+    rig.memory
+        .write(slot_at, &(1_u64 << ASKED).to_le_bytes())
+        .unwrap();
+    let regs = rig.call(SvcId::SignalEvent, u64::from(request.raw()), 0);
+    assert_eq!(result(&regs), ResultCode::SUCCESS);
+    rig.turn_at(&graphics, HostNanos(0));
+    assert_eq!(rig.read_u64(READ_ONLY_AT + page::value_offset(asked)), 3);
+    assert_eq!(poll(&rig, answer), ResultCode::SUCCESS);
+
+    // The title closes its root session: the turn lets the page go.
+    let regs = rig.call(SvcId::CloseHandle, u64::from(root.raw()), 0);
+    assert_eq!(result(&regs), ResultCode::SUCCESS);
+    rig.turn_at(&graphics, HostNanos(0));
+    assert_eq!(kept(), [0, 0]);
+    for memory in memories {
+        assert_eq!(
+            rig.dispatcher.transfer_memory(memory),
+            Err(KernelError::InvalidHandle)
+        );
+    }
+    assert_eq!(graphics.shared().lock().page().binding(), None);
 }
 
 /// The kernel host reads and writes a transfer memory up to its exact end and not a byte past
