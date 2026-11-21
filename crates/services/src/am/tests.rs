@@ -22,8 +22,8 @@ use crate::framework::{Handled, Kernel, Protocol, Session, SnapshotError};
 use super::command::application_functions::{
     GET_DESIRED_LANGUAGE, GET_GPU_ERROR_DETECTED_SYSTEM_EVENT,
     GET_SCREEN_SHOT_AND_CONTINUOUS_RECORDING_INITIALLY_ENABLED, GET_UNKNOWN_EVENT_210,
-    IS_GAME_PLAY_RECORDING_SUPPORTED, NOTIFY_RUNNING, SET_GAME_PLAY_RECORDING_STATE, UNKNOWN_321,
-    UNKNOWN_330,
+    IS_GAME_PLAY_RECORDING_SUPPORTED, NOTIFY_RUNNING, POP_LAUNCH_PARAMETER,
+    SET_GAME_PLAY_RECORDING_STATE, UNKNOWN_321, UNKNOWN_330,
 };
 use super::command::common_state_getter::{
     GET_CURRENT_FOCUS_STATE, GET_EVENT_HANDLE, GET_OPERATION_MODE, GET_PERFORMANCE_MODE,
@@ -947,6 +947,7 @@ fn the_tables_name_the_commands_as_eden_does() {
     assert_eq!(
         names(&IApplicationFunctions),
         [
+            (POP_LAUNCH_PARAMETER, "pop_launch_parameter"),
             (GET_DESIRED_LANGUAGE, "get_desired_language"),
             (NOTIFY_RUNNING, "notify_running"),
             (
@@ -3698,5 +3699,137 @@ fn an_appletoe_server_is_restored_only_beside_the_kernel() {
         assert_eq!(restored.restore(&bytes), Err(SnapshotError::NeedsKernel));
         assert_eq!(restored.family::<Applet>(), Some(&fresh));
         assert_eq!(restored.restore_beside(&bytes, &rig.kernel), Ok(()));
+    }
+}
+
+// ----- The launch parameter: `IApplicationFunctions` 1 ---------------------------------------
+
+/// [`NO_DATA_IN_CHANNEL`] is Eden's `ResultNoDataInChannel`, written out:
+/// `eden/src/core/hle/service/am/am_results.h` @ cf654052, `constexpr Result
+/// ResultNoDataInChannel{ErrorModule::AM, 2}` (the same line in Eden-NX2 @ 50fa86bb and PR #4588
+/// @ e5fb3b97): module 128, description 2, so the word `128 | 2 << 9`.
+#[test]
+fn no_data_in_channel_is_edens_result() {
+    assert_eq!(ResultCode::new(128, 2), Some(NO_DATA_IN_CHANNEL));
+    assert_eq!(NO_DATA_IN_CHANNEL.raw(), 0x480);
+    assert_eq!(NO_DATA_IN_CHANNEL.module(), AM_MODULE);
+    assert_eq!(NO_DATA_IN_CHANNEL.description(), 2);
+    assert_ne!(NO_DATA_IN_CHANNEL, NO_MESSAGES);
+}
+
+/// The id and the kinds are the reference's, written out, since every other test sends the
+/// shipping constants and so passes whatever their values: Eden @ cf654052,
+/// `src/core/hle/service/am/service/application_functions.cpp` (`{1,
+/// D<&IApplicationFunctions::PopLaunchParameter>, "PopLaunchParameter"}`), and `am_types.h`
+/// (`enum class LaunchParameterKind : u32 { UserChannel = 1, AccountPreselectedUser = 2 }`);
+/// libnx's `AppletLaunchParameterKind` gives the two the same values.
+#[test]
+fn the_launch_parameter_command_and_kinds_are_the_reference_s() {
+    assert_eq!(POP_LAUNCH_PARAMETER, 1);
+    assert_eq!(LaunchParameterKind::UserChannel.raw(), 1);
+    assert_eq!(LaunchParameterKind::AccountPreselectedUser.raw(), 2);
+    assert_eq!(
+        LaunchParameterKind::ALL,
+        [
+            LaunchParameterKind::UserChannel,
+            LaunchParameterKind::AccountPreselectedUser
+        ]
+    );
+}
+
+/// Eden's channel for each word: `launch_parameter_kind == LaunchParameterKind::UserChannel ?
+/// user_channel_launch_parameter : preselected_user_launch_parameter`, so the user channel for
+/// exactly the word 1, and the preselected user's for every other word: 0, 2, libnx's `Unknown`
+/// 3, words whose low byte is 1 but whose upper bytes are not zero, and the largest word.
+#[test]
+fn eden_pops_the_user_channel_for_kind_1_and_the_preselected_user_s_for_any_other_word() {
+    assert_eq!(
+        LaunchParameterKind::channel_for(1),
+        LaunchParameterKind::UserChannel
+    );
+    for raw in [0, 2, 3, 0x101, 0x0100_0001, u32::MAX] {
+        assert_eq!(
+            LaunchParameterKind::channel_for(raw),
+            LaunchParameterKind::AccountPreselectedUser,
+            "{raw:#x}"
+        );
+    }
+    for kind in LaunchParameterKind::ALL {
+        assert_eq!(LaunchParameterKind::channel_for(kind.raw()), kind);
+    }
+}
+
+/// The issue's acceptance: both kinds answer Eden's empty-channel result, with no object and no
+/// data, as libnx sends the command (`appletPopLaunchParameter`: the kind as one `u32`, one out
+/// object). A second call answers the same, and nothing in the applet changes.
+#[test]
+fn pop_launch_parameter_answers_no_data_in_channel_for_both_kinds() {
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let functions = rig.open(proxy, GET_APPLICATION_FUNCTIONS);
+    let before = rig.applet();
+    for kind in LaunchParameterKind::ALL {
+        for _ in 0..2 {
+            assert_eq!(
+                rig.object_raw(functions, POP_LAUNCH_PARAMETER, &kind.raw().to_le_bytes()),
+                domain_reply(NO_DATA_IN_CHANNEL, &[], &[]),
+                "{kind:?}"
+            );
+            assert_eq!(rig.applet(), before, "{kind:?}");
+        }
+    }
+}
+
+/// A word that is not a kind answers as the preselected user's kind does, since Eden pops the
+/// preselected user's channel for it: here, too, no data.
+#[test]
+fn pop_launch_parameter_answers_an_unknown_kind_as_the_preselected_user_s() {
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let functions = rig.open(proxy, GET_APPLICATION_FUNCTIONS);
+    let preselected = rig.object_raw(
+        functions,
+        POP_LAUNCH_PARAMETER,
+        &LaunchParameterKind::AccountPreselectedUser
+            .raw()
+            .to_le_bytes(),
+    );
+    assert_eq!(preselected, domain_reply(NO_DATA_IN_CHANNEL, &[], &[]));
+    for raw in [0_u32, 3, 0x101, u32::MAX] {
+        assert_eq!(
+            LaunchParameterKind::channel_for(raw),
+            LaunchParameterKind::AccountPreselectedUser,
+            "{raw:#x}"
+        );
+        assert_eq!(
+            rig.object_raw(functions, POP_LAUNCH_PARAMETER, &raw.to_le_bytes()),
+            preselected,
+            "{raw:#x}"
+        );
+    }
+}
+
+/// A payload of fewer than the kind's four bytes (libnx's layout, whose domain `size` counts the
+/// exact argument bytes) is refused with [`INVALID_CMIF_REQUEST`] and changes nothing; the whole
+/// word reaches the channel and answers no data.
+#[test]
+fn pop_launch_parameter_refuses_a_payload_too_short() {
+    let mut rig = Rig::new();
+    let proxy = rig.proxy();
+    let functions = rig.open(proxy, GET_APPLICATION_FUNCTIONS);
+    let word = LaunchParameterKind::UserChannel.raw().to_le_bytes();
+    let before = rig.applet();
+    for len in 0..=word.len() {
+        let request = RequestBuilder::domain(CommandType::Request, functions, POP_LAUNCH_PARAMETER)
+            .layout(RequestLayout::Libnx)
+            .data(&word[..len]);
+        let reply = rig.send_raw(rig.session, &request);
+        let expected = if len == word.len() {
+            NO_DATA_IN_CHANNEL
+        } else {
+            INVALID_CMIF_REQUEST
+        };
+        assert_eq!(reply, domain_reply(expected, &[], &[]), "{len}");
+        assert_eq!(rig.applet(), before, "{len}");
     }
 }

@@ -500,6 +500,7 @@ fn session_over<'a>(memory: &'a FlatMemory, options: &'a RunOptions) -> Session<
         clock: RunClock::new(timebase()),
         recorder: Arc::new(Recorder::new()),
         gpu_memory: None,
+        render: crate::renderer::RenderSetup::recording(),
     }
 }
 

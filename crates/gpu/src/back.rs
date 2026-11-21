@@ -23,8 +23,8 @@
 //!
 //! - [`draw`]: draws (slice G18): 3D state to a `Command::Draw`, with shader lookups, the
 //!   variant key, bindings through the caches, driver constants and conditional render; and
-//!   clears (slice G24, [`draw::clear`]): `CLEAR_SURFACE` to a `Command::Clear`, or a draw for a
-//!   masked clear.
+//!   clears (slice G24, [`draw::clear`]): `CLEAR_SURFACE` to a `Command::Clear` with its write
+//!   masks.
 //!
 //! - [`exec`]: the executor (slice G19): ring entries to the engines above, compute dispatches
 //!   to `Command::Dispatch`, presents to `Command::Present`, and the commands to the fence path.

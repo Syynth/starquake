@@ -65,7 +65,10 @@ fn a_rejected_program_names_it_with_its_hash_and_its_first_bad_instruction() {
 fn a_rejected_shader_is_rejected_after_its_translation() {
     let mut rig = Rig::new();
     let hash = rig.place(A, GuestStage::Vertex, &program(GuestStage::Vertex, &[1]));
-    rig.fake.script().shader_rejections.insert(hash, no_exit());
+    rig.fake
+        .script()
+        .shader_rejections
+        .insert(hash, too_large());
     let ticket = pending(rig.lookup(&[vertex(A)]));
     rig.executor.run_all();
     let rejection = rejected(rig.cache.wait_timeout(ticket, WATCHDOG));
@@ -74,7 +77,7 @@ fn a_rejected_shader_is_rejected_after_its_translation() {
         ProgramRejection {
             request: vertex(A),
             hash: Some(hash),
-            reason: Arc::new(no_exit()),
+            reason: Arc::new(too_large()),
         }
     );
     // Remembered: a later lookup is rejected without new work.

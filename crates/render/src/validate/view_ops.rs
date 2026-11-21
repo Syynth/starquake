@@ -7,7 +7,9 @@
 //! What each command touches (this crate's choice, which every backend follows):
 //!
 //! - a clear writes the view's base mip level, every layer of the view (every slice of a 3D
-//!   texture's level), within its rectangle or the whole level;
+//!   texture's level), within its rectangle or the whole level, through its write masks
+//!   (`ClearDesc::color_mask` and `ClearDesc::stencil_mask`, which every value of their types
+//!   passes: a mask has no check here);
 //! - a blit reads the source view's base mip level at its base layer and writes the destination
 //!   view's base mip level at its base layer (slice 0 of a 3D texture);
 //! - a present reads the view's base mip level at its base layer.

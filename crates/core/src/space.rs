@@ -154,10 +154,11 @@
 //!   reuses (the first run, in address order, it fits in; what is left of the run stays
 //!   free); given-back runs are not merged with their neighbours, nor with the RAM never
 //!   handed out. The backing pools of the execution model replace it, sized as the kernel's
-//!   pool accounting says. Until then guest RAM is sized
-//!   from the program a run loads, plus a working allowance (`crate::system`'s `ram` module),
-//!   which is usually far smaller than what the kernel lets a process reserve, and a guest that
-//!   touches more ends its run as an emulator error.
+//!   pool accounting says. Until then guest RAM is one region as large as the program's
+//!   application pool less its system resource's charge, backed lazily by the host
+//!   (`crate::system`'s `ram` module), and since RAM given to a page is never reused, a guest
+//!   that unmaps and maps again can run out of it before the kernel's accounting says the pool
+//!   is used up; a guest that touches more than it holds ends its run as an emulator error.
 //! - **A shared memory can be mapped only in the address space that handed it out** (or that
 //!   a snapshot restored it into, which records the run the same way): its run is recorded in
 //!   that [`AddressSpace`]'s shadow, and its pages are taken from that address space's RAM.

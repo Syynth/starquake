@@ -5,6 +5,7 @@ mod attribute;
 mod control;
 mod float32;
 mod framework;
+mod half_double;
 mod integer;
 mod memory;
 mod texture;

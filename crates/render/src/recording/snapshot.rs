@@ -5,13 +5,14 @@
 //! zero. Flag sets print their flag names. Uploaded bytes print as their length and FNV-1a hash
 //! (64-bit; offset basis and prime from the FNV reference, `draft-eastlake-fnv`), so a snapshot
 //! stays short and still changes when the bytes do. Nested state (samplers, pipelines, draw
-//! state) prints as Rust's derived `Debug` form: complete, and stable for a given build.
+//! state) prints as Rust's derived `Debug` form: complete, and stable for a given build. A
+//! clear's masks print only when one leaves something out ([`clear_masks`]).
 
 use super::{DestroyOutcome, Event};
 use crate::backend::PresentTarget;
 use crate::command::{
-    Binding, BindingResource, BufferSlice, ClearValue, Command, CopyRegion, DispatchParams,
-    DrawParams, Rect,
+    ALL_STENCIL_BITS, Binding, BindingResource, BufferSlice, ClearDesc, ClearValue, Command,
+    CopyRegion, DispatchParams, DrawParams, Rect,
 };
 use crate::id::{
     BufferId, PipelineId, ReadbackId, ResourceId, SamplerId, ShaderId, TextureId, ViewId,
@@ -282,6 +283,33 @@ fn clear_value(v: &ClearValue) -> String {
     }
 }
 
+/// A clear's masks, written only where one leaves something out, so an unmasked clear reads
+/// as it did before clears had masks: the colour channels written by their initials, the
+/// stencil bits in hex.
+fn clear_masks(d: &ClearDesc) -> String {
+    let color = if d.color_mask == ColorWrites::ALL {
+        String::new()
+    } else {
+        let channels: String = [
+            (ColorWrites::RED, 'r'),
+            (ColorWrites::GREEN, 'g'),
+            (ColorWrites::BLUE, 'b'),
+            (ColorWrites::ALPHA, 'a'),
+        ]
+        .into_iter()
+        .filter(|(bit, _)| d.color_mask.contains(*bit))
+        .map(|(_, c)| c)
+        .collect();
+        format!(" writing colour [{channels}]")
+    };
+    let stencil = if d.stencil_mask == ALL_STENCIL_BITS {
+        String::new()
+    } else {
+        format!(" writing stencil {:#04x}", d.stencil_mask)
+    };
+    color + &stencil
+}
+
 /// One command.
 pub(super) fn command(c: &Command) -> String {
     match c {
@@ -301,12 +329,13 @@ pub(super) fn command(c: &Command) -> String {
             b.filter
         ),
         Command::Clear(d) => format!(
-            "clear {} to {} in {}",
+            "clear {} to {} in {}{}",
             view_id(d.target),
             clear_value(&d.value),
             d.rect
                 .as_ref()
-                .map_or_else(|| "the whole view".to_owned(), rect)
+                .map_or_else(|| "the whole view".to_owned(), rect),
+            clear_masks(d)
         ),
         Command::SetRenderTargets(t) => {
             let colors: Vec<String> = t

@@ -132,6 +132,7 @@ fn the_log_the_summary_and_the_crash_report_name_an_unknown_service_and_its_comm
         artifacts.clone().into(),
     ];
     line.extend(common::pinned_date());
+    line.extend(common::recording_backend());
     let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
     let code = starquake::execute(&line, &mut stdout, &mut stderr);
     let stdout = String::from_utf8(stdout).unwrap();

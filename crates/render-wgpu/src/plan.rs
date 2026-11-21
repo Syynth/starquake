@@ -31,6 +31,7 @@
 //! compressed level's edge is rounded up to the block, which wgpu calls the physical size),
 //! and the tightly packed row layout of every buffer side (`starquake_render::validate::packed_size`).
 
+use crate::clear::ClearHow;
 use crate::draw::check::ListDraws;
 use crate::draw::{DispatchStep, DrawLimits, DrawStep, RewriteScratch, Targets};
 use crate::format::texture_format;
@@ -200,8 +201,12 @@ pub struct ClearStep {
     pub layers: Layers,
     /// The rectangle, or `None` for the whole level.
     pub rect: Option<Rect>,
-    /// The value.
+    /// The level's width and height.
+    pub size: (u32, u32),
+    /// What a render pass's load operation writes ([`crate::clear::pass_ops`]).
     pub ops: ClearOps,
+    /// How the render thread does it ([`crate::clear::clear_how`]).
+    pub how: ClearHow,
 }
 
 /// Where a readback reads.
@@ -461,7 +466,8 @@ fn upload_step(
 }
 
 /// The step for a clear. A rectangle that covers the whole level becomes `None`, so the render
-/// thread clears it as a whole level.
+/// thread clears it as a whole level; how it clears is [`crate::clear::clear_how`]'s answer
+/// (a partial clear of a depth, stencil or multisampled view, or a masked one, is drawn).
 fn clear_step(tables: &Tables, clear: &ClearDesc) -> Result<Step, RenderError> {
     let (view, tex) = tables.view(clear.target)?;
     let target = ResolvedView {
@@ -471,13 +477,6 @@ fn clear_step(tables: &Tables, clear: &ClearDesc) -> Result<Step, RenderError> {
     validate::validate_clear(target, clear)?;
     let extent = target.base_extent()?;
     let (width, height) = (extent.width, extent.height);
-    rules::check_clear_area(
-        &tex.desc,
-        view.desc.format,
-        clear.rect.as_ref(),
-        width,
-        height,
-    )?;
     let layers = if tex.desc.dimension == TextureDimension::D3 {
         Layers::Slices {
             count: extent.depth_or_layers,
@@ -489,13 +488,24 @@ fn clear_step(tables: &Tables, clear: &ClearDesc) -> Result<Step, RenderError> {
         }
     };
     let whole = |r: &Rect| r.x == 0 && r.y == 0 && r.width == width && r.height == height;
+    let rect = clear.rect.filter(|r| !whole(r));
+    let format = host_format(view.desc.format)?;
+    let how = crate::clear::clear_how(
+        view.desc.format,
+        format,
+        tex.desc.sample_count,
+        rect.is_none(),
+        clear,
+    );
     Ok(Step::Clear(ClearStep {
         texture: view.texture,
-        format: host_format(view.desc.format)?,
+        format,
         mip: view.desc.base_mip,
         layers,
-        rect: clear.rect.filter(|r| !whole(r)),
-        ops: clear_ops(clear.value),
+        rect,
+        size: (width, height),
+        ops: crate::clear::pass_ops(clear),
+        how,
     }))
 }
 

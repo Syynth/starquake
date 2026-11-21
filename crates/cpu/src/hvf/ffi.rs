@@ -2,8 +2,11 @@
 //!
 //! Ported from `tools/hvprobe/src/hv.rs`; signatures, register ids and error codes are from the
 //! macOS SDK headers `Hypervisor.framework/Headers/{hv_vcpu.h,hv_vm.h,hv_vcpu_types.h,hv_error.h}`.
+//! Also the few libSystem calls the backend's memory needs (`sys_icache_invalidate`, and the
+//! `mmap` family that backs guest memory lazily), from the SDK's `<libkern/OSCacheControl.h>`,
+//! `<sys/mman.h>` and `<unistd.h>`.
 
-use std::ffi::c_void;
+use std::ffi::{c_char, c_int, c_void};
 
 use crate::Error;
 
@@ -126,7 +129,39 @@ unsafe extern "C" {
     /// point of unification, invalidates the instruction cache by address (both broadcast to all
     /// cores) and issues the barriers.
     pub(super) fn sys_icache_invalidate(start: *mut c_void, len: usize);
+    /// `mmap` (`<sys/mman.h>`): with [`MAP_ANON`] and [`MAP_PRIVATE`], reserves `len` bytes of
+    /// zeroed memory that the host commits a page at a time, the first time each is touched.
+    /// Returns [`MAP_FAILED`] on failure.
+    pub(super) fn mmap(
+        addr: *mut c_void,
+        len: usize,
+        prot: c_int,
+        flags: c_int,
+        fd: c_int,
+        offset: i64,
+    ) -> *mut c_void;
+    /// `munmap` (`<sys/mman.h>`): gives back a range `mmap` returned. 0 on success.
+    pub(super) fn munmap(addr: *mut c_void, len: usize) -> c_int;
+    /// `mincore` (`<sys/mman.h>`): one byte per host page of `addr..addr + len` into `vec`,
+    /// with [`MINCORE_INCORE`] set where the page is in memory. 0 on success.
+    pub(super) fn mincore(addr: *const c_void, len: usize, vec: *mut c_char) -> c_int;
+    /// `getpagesize` (`<unistd.h>`): the host's page size in bytes, the unit of `mincore`.
+    pub(super) fn getpagesize() -> c_int;
 }
+
+// From the macOS SDK's `<sys/mman.h>`.
+/// `PROT_READ`.
+pub(super) const PROT_READ: c_int = 0x01;
+/// `PROT_WRITE`.
+pub(super) const PROT_WRITE: c_int = 0x02;
+/// `MAP_PRIVATE`.
+pub(super) const MAP_PRIVATE: c_int = 0x0002;
+/// `MAP_ANON`: memory backed by no file, zero-filled.
+pub(super) const MAP_ANON: c_int = 0x1000;
+/// `MAP_FAILED`, `((void *)-1)`: what `mmap` returns when it fails.
+pub(super) const MAP_FAILED: *mut c_void = std::ptr::without_provenance_mut(usize::MAX);
+/// `MINCORE_INCORE`: the bit of a `mincore` byte that says the page is in memory.
+pub(super) const MINCORE_INCORE: c_char = 0x1;
 
 /// `hv_vcpu_set_simd_fp_reg(vcpu, reg, value)`, with the vector passed as the C compiler
 /// passes it.

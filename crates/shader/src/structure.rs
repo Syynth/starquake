@@ -99,6 +99,15 @@
 //! flow analysis makes after all the source blocks) right after the block whose jump, or whose
 //! branch's `otherwise`, leads to it, following such chains: that is where Eden's statement
 //! list has the test, the comparisons and the demote, among the flow block's own statements.
+//! A conditional block, a branch whose `then` is such a block and jumps straight to the
+//! branch's `otherwise`, leads the chain to its `then` first: the translation driver's
+//! conditional blocks have that shape (slice 12i, `crate::translate::split_for_guard`), so a
+//! guarded instruction lies between its test and the code after it, as its statement does in
+//! Eden's list, and its goto is eliminated as an `if`, not a loop
+//! (`translate::driver::tests::a_guarded_instruction_structures_as_an_if`). Any other branch's
+//! `then` starts no chain (`flow::tests::structure::blocks_no_chain_reaches_follow_in_arena_order`).
+//! Flow analysis's own branches lead only to source blocks or, for an indirect branch's
+//! comparisons, to their `otherwise`, so their layout is unchanged.
 //! Only the entry and the source blocks start chains. A block no source names that no chain
 //! reaches is placed after the rest, in arena order
 //! (`flow::tests::structure::blocks_no_chain_reaches_follow_in_arena_order`). The sources are
@@ -321,12 +330,14 @@ fn source_layout(function: &Function, sources: &[BlockSource]) -> Vec<BlockId> {
         // Follow the chain of attached blocks; each step places a new block, so the chain
         // ends within the function's blocks.
         let mut current = block;
-        while let Some(next) = fall_through(function, current) {
-            let attached = slot(next).is_some_and(|slot| {
+        let attached = |next: BlockId, placed: &[bool]| {
+            slot(next).is_some_and(|slot| {
                 !is_source.get(slot).copied().unwrap_or(true)
                     && !placed.get(slot).copied().unwrap_or(true)
-            });
-            if !attached {
+            })
+        };
+        while let Some(next) = fall_through(function, current, |then| attached(then, &placed)) {
+            if !attached(next, &placed) {
                 break;
             }
             place(next, &mut placed, &mut order);
@@ -339,10 +350,24 @@ fn source_layout(function: &Function, sources: &[BlockSource]) -> Vec<BlockId> {
     order
 }
 
-/// The block a jump, or a branch's `otherwise`, leads to.
-fn fall_through(function: &Function, block: BlockId) -> Option<BlockId> {
+/// The block a jump, or a branch's `otherwise`, leads to; for a conditional block, a branch
+/// whose `then` is `attachable` (a block no source names and not placed yet) and jumps straight
+/// to the branch's `otherwise`, its `then` instead (see the module docs, "Layout").
+fn fall_through(
+    function: &Function,
+    block: BlockId,
+    attachable: impl Fn(BlockId) -> bool,
+) -> Option<BlockId> {
     match function.block(block)?.terminator {
         Terminator::Jump(target) => Some(target),
+        Terminator::Branch {
+            then, otherwise, ..
+        } if attachable(then)
+            && function.block(then).map(|block| block.terminator)
+                == Some(Terminator::Jump(otherwise)) =>
+        {
+            Some(then)
+        }
         Terminator::Branch { otherwise, .. } => Some(otherwise),
         Terminator::None | Terminator::Return | Terminator::Unreachable => None,
     }

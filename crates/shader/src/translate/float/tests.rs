@@ -16,22 +16,11 @@ use proptest::prelude::*;
 
 use super::*;
 use crate::asm::assemble;
-use crate::decode::{
-    CBufRef, GROUP_HOOKS, GROUPS, MovSrc, OPCODE, OpExit, OpMov, UniformReg, decode,
-};
+use crate::decode::{CBufRef, GROUP_HOOKS, GROUPS, MovSrc, OPCODE, OpMov, UniformReg, decode};
 use crate::interp::Machine;
 use crate::ir::{Terminator, Value};
 use crate::testing::{any_pred_src, config};
-use crate::translate::{
-    COLOR_TARGETS, ColorOutputs, GuestStage, Stage, TranslateError, Unsupported, translate,
-};
-
-pub(super) const VERTEX: Stage = Stage {
-    stage: GuestStage::Vertex,
-    color_outputs: ColorOutputs {
-        targets: [0; COLOR_TARGETS],
-    },
-};
+use crate::translate::{TranslateError, Unsupported};
 
 pub(super) fn r(index: u8) -> Gpr {
     Gpr::new(index)
@@ -89,14 +78,6 @@ pub(super) fn int(size: u8, signed: bool) -> IntType {
     IntType::new(size, signed).expect("an integer type")
 }
 
-pub(super) fn exit() -> Instr {
-    Instr::new(Op::Exit(OpExit {
-        keep_ref_count: false,
-        no_at_exit: false,
-        pred: PredSrc::TRUE,
-    }))
-}
-
 /// `instr`, after checking that the test assembler encodes it and the decoder reads the word
 /// back as the same instruction.
 pub(super) fn encodable(instr: Instr) -> Instr {
@@ -105,11 +86,27 @@ pub(super) fn encodable(instr: Instr) -> Instr {
     instr
 }
 
-/// `program` followed by `EXIT`, translated as a vertex program, without the encoding check.
+/// `program`, this group's instructions, translated one after another by [`translate_instr`]
+/// into a function's entry block, which then returns (a vertex program's `EXIT` writes
+/// nothing), without the encoding check. A refusal is reported as the translation driver
+/// reports it ([`TranslateError::Unsupported`] with [`Unsupported::Float`]); the driver's own
+/// path for whole programs is `crate::translate::driver`'s tests.
 pub(super) fn translate_raw(program: &[Instr]) -> Result<Function, TranslateError> {
-    let mut program = program.to_vec();
-    program.push(exit());
-    translate(VERTEX, &program)
+    let mut function = Function::new();
+    let entry = function.entry();
+    let mut builder = Builder::new(&mut function, entry);
+    for (index, instr) in program.iter().enumerate() {
+        translate_instr(&mut builder, *instr, false).map_err(|error| match error {
+            FloatError::Unsupported(what) => TranslateError::Unsupported {
+                index,
+                instr: *instr,
+                what: Unsupported::Float(what),
+            },
+            FloatError::Build(error) => TranslateError::Build(error),
+        })?;
+    }
+    builder.terminate(Terminator::Return)?;
+    Ok(function)
 }
 
 /// `program`, each instruction checked by [`encodable`], translated; the result verifies.

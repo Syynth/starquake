@@ -209,6 +209,7 @@ fn stepped(
         clock: RunClock::new(fixed_timebase()),
         recorder: Arc::new(Recorder::new()),
         gpu_memory: None,
+        render: crate::renderer::RenderSetup::recording(),
     };
     let sink = Arc::new(VecSink::new());
     session.recorder.add_sink(Arc::clone(&sink));
@@ -1017,6 +1018,7 @@ fn a_timed_out_run_says_where_each_thread_is_and_which_core_held_it() {
         clock: RunClock::new(fixed_timebase()),
         recorder: Arc::new(Recorder::new()),
         gpu_memory: None,
+        render: crate::renderer::RenderSetup::recording(),
     };
     let env = session.environment();
     let (dispatcher, _) = boot(guest.address_space(), &guest.placed, &guest.memory, &*env).unwrap();
@@ -1099,6 +1101,7 @@ fn a_run_that_did_not_time_out_reads_no_threads() {
         clock: RunClock::new(fixed_timebase()),
         recorder: Arc::new(Recorder::new()),
         gpu_memory: None,
+        render: crate::renderer::RenderSetup::recording(),
     };
     let env = session.environment();
     let (dispatcher, _) = boot(guest.address_space(), &guest.placed, &guest.memory, &*env).unwrap();

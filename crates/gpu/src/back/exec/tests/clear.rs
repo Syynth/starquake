@@ -1,5 +1,6 @@
 //! Clears through the executor (slice G24): a `CLEAR_SURFACE` word reaches the draw path's
-//! clear, after the CPU-write drain, and a clear that draws sets render targets of its own.
+//! clear, after the CPU-write drain, and a clear, masked or not, is a clear command that sets no
+//! render targets.
 
 use super::*;
 use crate::back::draw::clear::ClearSurface;
@@ -92,35 +93,52 @@ fn a_clear_drains_cpu_writes_first() {
     assert_eq!(rig.log().invalidated, vec![page(UNIFORMS)]);
 }
 
-#[test]
-fn a_draw_after_a_masked_clear_sets_its_targets_again() {
-    let mut rig = Rig::new();
-    rig.run(&(draw_state() + &depth_state() + &draw()));
-    // A masked stencil clear sets the depth target alone.
-    rig.run(&clear(surface(ColorWrites::EMPTY, true)));
-    let counters = rig.exec.draws(CHANNEL).unwrap().clear_counters();
-    assert_eq!(counters.drawn, 1);
-    rig.run(&draw());
-    rig.submit();
-    let commands = rig.commands();
-    assert_eq!(draws(&commands), 3);
-    assert_eq!(targets_set(&commands), 3, "{commands:?}");
+/// The clear commands appended, in order.
+fn clear_descs(commands: &[Command]) -> Vec<starquake_render::command::ClearDesc> {
+    commands
+        .iter()
+        .filter_map(|c| match c {
+            Command::Clear(d) => Some(*d),
+            _ => None,
+        })
+        .collect()
 }
 
 #[test]
-fn a_masked_clear_on_another_channel_makes_the_next_draw_set_its_targets() {
+fn a_draw_after_a_masked_clear_keeps_its_targets() {
+    let mut rig = Rig::new();
+    rig.run(&(draw_state() + &depth_state() + &draw()));
+    // A masked stencil clear is a clear command through the mask, not a draw.
+    rig.run(&clear(surface(ColorWrites::EMPTY, true)));
+    let counters = rig.exec.draws(CHANNEL).unwrap().clear_counters();
+    assert_eq!(counters.cleared, 1);
+    rig.run(&draw());
+    rig.submit();
+    let commands = rig.commands();
+    assert_eq!(draws(&commands), 2);
+    assert_eq!(targets_set(&commands), 1, "{commands:?}");
+    let cleared = clear_descs(&commands);
+    assert_eq!(cleared.len(), 1);
+    assert_eq!(cleared[0].stencil_mask, 0x0f);
+}
+
+#[test]
+fn a_masked_clear_on_another_channel_leaves_the_next_draws_targets() {
     let mut rig = Rig::new();
     let other_state = clear_state().replace("channel=3 ", "channel=9 ");
     rig.run(&(draw_state() + &other_state + &draw()));
     let masked = clear(surface(ColorWrites::RED, false)).replace("channel=3 ", "channel=9 ");
     rig.run(&masked);
     let other = rig.exec.draws(OTHER).unwrap().clear_counters();
-    assert_eq!(other.drawn, 1);
+    assert_eq!(other.cleared, 1);
     rig.run(&draw());
     rig.submit();
     let commands = rig.commands();
-    assert_eq!(draws(&commands), 3);
-    assert_eq!(targets_set(&commands), 3, "{commands:?}");
+    assert_eq!(draws(&commands), 2);
+    assert_eq!(targets_set(&commands), 1, "{commands:?}");
+    let cleared = clear_descs(&commands);
+    assert_eq!(cleared.len(), 1);
+    assert_eq!(cleared[0].color_mask, ColorWrites::RED);
 }
 
 #[test]

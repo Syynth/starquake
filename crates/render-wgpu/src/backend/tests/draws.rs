@@ -273,11 +273,11 @@ impl Scene {
     }
 
     fn clear(&self) -> Command {
-        Command::Clear(ClearDesc {
-            target: self.view,
-            value: ClearValue::Float([0.0, 0.0, 0.0, 1.0]),
-            rect: None,
-        })
+        Command::Clear(ClearDesc::unmasked(
+            self.view,
+            ClearValue::Float([0.0, 0.0, 0.0, 1.0]),
+            None,
+        ))
     }
 
     fn readback(&mut self) -> (Command, ReadbackId) {
@@ -736,11 +736,11 @@ fn an_integer_target_needs_a_typed_output() {
         let id = ReadbackId::new(99, 0);
         s.run(vec![
             up,
-            Command::Clear(ClearDesc {
-                target: view,
-                value: ClearValue::Uint([7, 0, 0, 0]),
-                rect: None,
-            }),
+            Command::Clear(ClearDesc::unmasked(
+                view,
+                ClearValue::Uint([7, 0, 0, 0]),
+                None,
+            )),
             Command::SetRenderTargets(targets),
             Command::Draw(DrawDesc {
                 pipeline,

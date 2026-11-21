@@ -212,7 +212,11 @@ fn fixed_bits_are_required() {
 ///   1)` for every form it accepts, `0x361` (`register_handle`) included;
 /// - bits 77 (`.CL`) of `TLD` (`0xb66`, `0x367`) and 79 (`.F16`) of `TLD.B` (`0x367`), NAK's
 ///   comments in `impl SM70Op for OpTld` ("bit 77: .CL" below SM 12.0, "bits 79..81: .F16"),
-///   which cover every handle.
+///   which cover every handle;
+/// - bit 90 of every `HFMA2` form (`0x231`, `0x431`, `0x631`, `0x831`, `0xa31`, `0xc31`,
+///   `0xe31`), PR #4588's translator: `Visitor::HFMA2` takes `Take(87, 4)`, and the lowering
+///   (`lower_to_maxwell.h`) passes `insn.Bits(87, 4)` as `.RELU`'s predicate, bit 90 its
+///   negation.
 #[test]
 fn added_bits_are_the_listed_cases() {
     let mut expected: Vec<(u16, u32, Namer)> = [
@@ -228,6 +232,11 @@ fn added_bits_are_the_listed_cases() {
         (0x367, 77, Namer::NakComment),
         (0x367, 79, Namer::NakComment),
     ]);
+    expected.extend(
+        [0x231, 0x431, 0x631, 0x831, 0xa31, 0xc31, 0xe31]
+            .into_iter()
+            .map(|opcode| (opcode, 90, Namer::Pr4588Translator)),
+    );
     let mut actual = Vec::new();
     for hooks in &GROUP_HOOKS {
         for row in hooks.reference_rows {
@@ -307,7 +316,7 @@ fn added_bits_decode_print_and_round_trip() {
             }
         }
     }
-    assert_eq!(checked, 23);
+    assert_eq!(checked, 30);
 }
 
 /// Every form decodes its canonical word, whose fields are the form's own (not its opcode,

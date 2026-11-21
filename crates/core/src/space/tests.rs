@@ -634,16 +634,31 @@ fn an_access_that_leaves_what_is_mapped_faults_there_and_does_nothing() {
 
 #[test]
 fn a_pool_the_memory_does_not_hold_is_refused() {
-    let physical = FlatMemory::new(POOL_BASE, usize::try_from(PAGE_SIZE).unwrap());
+    // The memory does not hold the root: refused when the address space is made.
+    let physical = FlatMemory::new(POOL_BASE + PAGE_SIZE, usize::try_from(PAGE_SIZE).unwrap());
     let pool = BackingRange::new(POOL_BASE, 2 * PAGE_SIZE).unwrap();
     let ram = BackingRange::new(RAM_BASE, PAGE_SIZE).unwrap();
     let error = AddressSpace::new(physical, ram, pool).unwrap_err();
     assert_eq!(
         error,
-        SpaceError::Map(MapError::Memory(Fault {
-            address: POOL_BASE + PAGE_SIZE
-        }))
+        SpaceError::Map(MapError::Memory(Fault { address: POOL_BASE }))
     );
+    // It holds the root and the next page, not the third: the tables zero a pool page only
+    // when a table first needs it, so the address space is made, and the first page backed
+    // (which needs a level-2 and a level-3 table, pool pages 1 and 2) is refused at the third
+    // page, with nothing mapped or handed out; the next page of RAM is still the first.
+    let physical = FlatMemory::new(POOL_BASE, usize::try_from(2 * PAGE_SIZE).unwrap());
+    let pool = BackingRange::new(POOL_BASE, 3 * PAGE_SIZE).unwrap();
+    let space = AddressSpace::new(physical, ram, pool).unwrap();
+    space.map(LOW, PAGE_SIZE, Perms::ReadWrite).unwrap();
+    let refused = SpaceError::Map(MapError::Memory(Fault {
+        address: POOL_BASE + 2 * PAGE_SIZE,
+    }));
+    assert_eq!(space.touch(LOW, Access::Write), Touch::Failed(refused));
+    assert!(unmapped_at(&space, LOW));
+    assert_eq!(space.shadow().next, RAM_BASE);
+    assert!(space.shadow().backed.is_empty());
+    assert_eq!(space.tables.table_pages_in_use(), 1);
 }
 
 #[test]

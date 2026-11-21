@@ -11,8 +11,10 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-# naga's WGSL front end parses the present blit's WGSL (R4's `present.wgsl`) into the module the
-# blit's shader is made from (slice R8): the workspace's wgpu has no WGSL front end of its own.
+# naga's WGSL front end parses the render crate's host shaders into the modules their shaders
+# are made from: the present blit's `present.wgsl` (R4, slice R8) and the drawn clear's
+# `clear.wgsl` (`crate::clear::Drawer::new`). The workspace's wgpu has no WGSL front end of its
+# own.
 naga = { workspace = true, features = ["wgsl-in"] }
 starquake-render.workspace = true
 thiserror.workspace = true

@@ -979,8 +979,8 @@ fn decode_rejection(index: usize) -> Rejection {
 }
 
 /// A translator's rejection with no instruction.
-fn no_exit() -> Rejection {
-    Rejection::Translate(TranslateError::NoExit)
+fn too_large() -> Rejection {
+    Rejection::Translate(TranslateError::TooManyInstructions)
 }
 
 #[test]

@@ -1,8 +1,12 @@
 //! The walking skeleton end to end: program bytes to a validated naga module and its tables.
 //!
-//! Bytes are split into instructions, each instruction is decoded, the program is translated
-//! to IR and the IR is lowered and validated. The first failure is the rejection; there is no
-//! partial translation (spec, "Instruction translation").
+//! Bytes are split into instructions; the translation driver ([`translate_flow`], slice 12i)
+//! rebuilds their control flow, decodes the instructions its blocks hold and translates them to
+//! IR; the structurizer (slice 11) structures the IR, and the IR is lowered and validated. The
+//! first failure is the rejection; there is no partial translation (spec, "Instruction
+//! translation"). The bytes carry no jump tables, so a `BRX` has no target and is refused
+//! ([`crate::flow::FlowError::NoTarget`]); jump tables come with the questions and answers
+//! (slice 9) when the shader cache drives the chain.
 
 use thiserror::Error;
 
@@ -10,13 +14,15 @@ use crate::cache::CacheRefusal;
 use crate::capture::CaptureError;
 use crate::decode::{DecodeError, Instr, Instruction, LengthError, decode};
 use crate::exchange::ExchangeError;
+use crate::flow::{BranchTables, IrBlocks};
 use crate::host::HostShader;
 use crate::info::{InfoError, ShaderInfo, check_header, collect, translation_stage};
 use crate::ir::Function;
 use crate::lower::{LowerError, lower};
 use crate::opt::{PassError, optimize};
-use crate::sph::{HeaderError, Io, ProgramHeader};
-use crate::translate::{GuestStage, Stage, TranslateError, translate, translate_with_header};
+use crate::sph::{HeaderError, Io, PixelIo, ProgramHeader};
+use crate::structure::{MAX_STRUCTURE_WORK, StructureError};
+use crate::translate::{GuestStage, Stage, TranslateError, translate_flow};
 
 /// Why a program was rejected.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -24,7 +30,8 @@ pub enum Rejection {
     /// The bytes are not whole instructions.
     #[error(transparent)]
     Length(#[from] LengthError),
-    /// An instruction does not decode.
+    /// An instruction does not decode: from [`decode_program`], or one a flow block holds,
+    /// which the translation driver decodes ([`TranslateError::Decode`] is reported as this).
     #[error("instruction {index}: {error}")]
     Decode {
         /// The instruction's index.
@@ -32,9 +39,13 @@ pub enum Rejection {
         /// Why.
         error: DecodeError,
     },
-    /// The program does not translate.
+    /// The program does not translate (every [`TranslateError`] but `Decode`, which is
+    /// [`Rejection::Decode`]).
     #[error(transparent)]
-    Translate(#[from] TranslateError),
+    Translate(TranslateError),
+    /// The translated program cannot be structured (slice 11).
+    #[error(transparent)]
+    Structure(#[from] StructureError),
     /// The IR does not lower.
     #[error(transparent)]
     Lower(#[from] LowerError),
@@ -61,6 +72,17 @@ pub enum Rejection {
     Info(#[from] InfoError),
 }
 
+impl From<TranslateError> for Rejection {
+    /// A driver's decode failure is [`Rejection::Decode`], as [`decode_program`] reports one;
+    /// every other translation failure is [`Rejection::Translate`].
+    fn from(error: TranslateError) -> Self {
+        match error {
+            TranslateError::Decode { index, error } => Self::Decode { index, error },
+            other => Self::Translate(other),
+        }
+    }
+}
+
 /// Splits `code` into instructions and decodes each one.
 pub fn decode_program(code: &[u8]) -> Result<Vec<Instr>, Rejection> {
     Instruction::from_program(code)?
@@ -70,15 +92,38 @@ pub fn decode_program(code: &[u8]) -> Result<Vec<Instr>, Rejection> {
         .collect()
 }
 
-/// Decodes and translates `code` to IR.
-pub fn program_ir(stage: Stage, code: &[u8]) -> Result<Function, Rejection> {
-    Ok(translate(stage, &decode_program(code)?)?)
+/// Splits `code` into instructions and runs the translation driver on them, with `header` for a
+/// pixel program and no jump tables.
+fn translated(stage: Stage, header: Option<&PixelIo>, code: &[u8]) -> Result<IrBlocks, Rejection> {
+    let words = Instruction::from_program(code)?;
+    Ok(translate_flow(
+        stage,
+        header,
+        &words,
+        &BranchTables::new(0),
+    )?)
 }
 
-/// Translates a straight-line program to a host shader (the lowering handles slice 1's
-/// instructions; the translator, more).
+/// Translates `code` to IR with the translation driver: the filled control-flow graph, before
+/// structuring.
+pub fn program_ir(stage: Stage, code: &[u8]) -> Result<Function, Rejection> {
+    Ok(translated(stage, None, code)?.function)
+}
+
+/// Translates a program to a host shader: the translation driver, the structurizer with
+/// [`MAX_STRUCTURE_WORK`], and the lowering (no SSA pass runs between them until slice 8b, as
+/// the lowering's module docs say). A program the driver leaves as one block (no control flow
+/// and no guard) is lowered as it is, as the lowering takes a one-block graph (its "What it
+/// takes"), so the structurizer's goto-variable resets do not reach a straight-line program's
+/// module (pinned by `lower`'s `tests::skeleton_modules_are_unchanged`).
 pub fn translate_program(stage: Stage, code: &[u8]) -> Result<HostShader, Rejection> {
-    Ok(lower(stage.stage, &program_ir(stage, code)?)?)
+    let blocks = translated(stage, None, code)?;
+    let function = if blocks.function.block_count() == 1 {
+        blocks.function
+    } else {
+        blocks.structure(MAX_STRUCTURE_WORK)?.blocks.function
+    };
+    Ok(lower(stage.stage, &function)?)
 }
 
 /// A graphics program translated to IR, with its header and what collect info found in it.
@@ -96,19 +141,22 @@ pub struct GraphicsIr {
 /// byte onwards) to IR and its info, stopping at the first failure, in this order: the header
 /// ([`ProgramHeader::from_program`], [`Rejection::Header`]); the header against the slot
 /// ([`check_header`], [`Rejection::Info`]; compute has no header, so a compute slot is refused
-/// here as [`InfoError::ComputeHeader`]); decoding the instructions after the header; the
-/// translator, given the header's colour outputs ([`translation_stage`]) and, for a pixel
-/// program, its input map ([`translate_with_header`]); the slice 8 passes ([`optimize`],
-/// [`Rejection::Pass`]); and collect info ([`collect`], [`Rejection::Info`]).
+/// here as [`InfoError::ComputeHeader`]); the translation driver on the instructions after the
+/// header ([`translate_flow`]: flow analysis, decoding, translation), given the header's colour
+/// outputs ([`translation_stage`]) and, for a pixel program, its input map; the slice 8 passes
+/// ([`optimize`], [`Rejection::Pass`]); and collect info ([`collect`], [`Rejection::Info`]).
+/// The passes run on the control-flow graph, not structured: slice 8's SSA rewrite refuses a
+/// structured function until slice 8b reworks it (the owner's ruling of 2026-11-19, row 3, puts
+/// the structurizer first once it does).
 pub fn graphics_program_ir(slot: GuestStage, program: &[u8]) -> Result<GraphicsIr, Rejection> {
     let (header, code) = ProgramHeader::from_program(program)?;
     check_header(slot, Some(&header))?;
     let stage = translation_stage(slot, &header);
-    let instrs = decode_program(code)?;
-    let mut function = match &header.io {
-        Io::Pixel(io) => translate_with_header(stage, io, &instrs)?,
-        Io::Vtg(_) => translate(stage, &instrs)?,
+    let pixel = match &header.io {
+        Io::Pixel(io) => Some(&**io),
+        Io::Vtg(_) => None,
     };
+    let mut function = translated(stage, pixel, code)?.function;
     optimize(&mut function)?;
     let info = collect(slot, Some(&header), &function)?;
     Ok(GraphicsIr {
@@ -152,12 +200,15 @@ mod tests {
                 size: Instruction::SIZE
             }))
         );
-        let mut unknown = exit_bytes();
+        // An unknown word in front of the exit: the driver decodes it and reports it as the
+        // chain always has, at its index. The same word after the exit is never reached.
+        let mut unknown = vec![0; Instruction::SIZE];
+        unknown.extend_from_slice(&exit_bytes());
         unknown.extend_from_slice(&[0; Instruction::SIZE]);
         assert_eq!(
             translate_program(VERTEX, &unknown).err(),
             Some(Rejection::Decode {
-                index: 1,
+                index: 0,
                 error: DecodeError::UnknownOpcode { opcode: 0 }
             })
         );
@@ -165,11 +216,16 @@ mod tests {
             translate_program(VERTEX, &unknown)
                 .err()
                 .map(|error| error.to_string()),
-            Some("instruction 1: unknown opcode 0x000".into())
+            Some("instruction 0: unknown opcode 0x000".into())
         );
+        let mut unreached = exit_bytes();
+        unreached.extend_from_slice(&[0; Instruction::SIZE]);
+        assert!(translate_program(VERTEX, &unreached).is_ok());
         assert_eq!(
             translate_program(VERTEX, &[]).err(),
-            Some(Rejection::Translate(TranslateError::NoExit))
+            Some(Rejection::Translate(TranslateError::Flow(
+                crate::flow::FlowError::ProgramSize { len: 0 }
+            )))
         );
         let ir = program_ir(VERTEX, &exit_bytes()).expect("translates");
         assert_eq!(ir.to_string(), "block0:\n    return\n");

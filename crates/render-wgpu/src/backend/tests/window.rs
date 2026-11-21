@@ -196,11 +196,11 @@ fn the_window_shows_the_presented_frame_after_the_image_is_written() {
                 let (writes, after) = match write {
                     Write::Upload => (vec![r.fill(second.clone())], second.clone()),
                     Write::Clear => (
-                        vec![Command::Clear(ClearDesc {
-                            target: r.view,
-                            value: ClearValue::Float([1.0, 0.0, 1.0, 1.0]),
-                            rect: None,
-                        })],
+                        vec![Command::Clear(ClearDesc::unmasked(
+                            r.view,
+                            ClearValue::Float([1.0, 0.0, 1.0, 1.0]),
+                            None,
+                        ))],
                         [255, 0, 255, 255].repeat(16),
                     ),
                     Write::Copy => (

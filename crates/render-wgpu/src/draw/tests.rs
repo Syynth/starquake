@@ -1333,11 +1333,11 @@ fn draws_start_a_pass_only_when_they_must() {
     let w = world();
     let draw = || Command::Draw(w.draw());
     let marker = Command::Marker(Marker { submit: 1, draw: 2 });
-    let clear = Command::Clear(starquake_render::command::ClearDesc {
-        target: w.small,
-        value: starquake_render::command::ClearValue::Float([0.0; 4]),
-        rect: None,
-    });
+    let clear = Command::Clear(starquake_render::command::ClearDesc::unmasked(
+        w.small,
+        starquake_render::command::ClearValue::Float([0.0; 4]),
+        None,
+    ));
     let fresh = |commands| -> Vec<bool> {
         w.draw_steps(commands)
             .iter()

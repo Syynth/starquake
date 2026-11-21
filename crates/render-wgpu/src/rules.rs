@@ -77,15 +77,12 @@
 //!   that buffer must fit `Caps::limits.max_buffer_size`; a bigger one is refused. A frame dump
 //!   whose read would not fit is not refused: its pixels are reported unknown
 //!   ([`crate::plan`]).
-//! - [`check_clear_area`]: a clear of part of a multisampled or depth or stencil view is
-//!   refused; the backend clears part of a view by clearing a scratch texture and copying it in,
-//!   which those copies forbid.
 //! - [`check_sampler`]: a border colour other than transparent black, opaque black or opaque
 //!   white is refused when an address mode clamps to the border (wgpu's `SamplerBorderColor`).
 
 use crate::caps::{COPY_BUFFER_ALIGNMENT, FormatSupport};
 use crate::format::texture_format;
-use starquake_render::command::{Rect, TextureRegion};
+use starquake_render::command::TextureRegion;
 use starquake_render::format::{Compression, FormatAspect};
 use starquake_render::resource::{
     AddressMode, BorderColor, Extent3d, TextureDimension, ViewDimension,
@@ -148,9 +145,6 @@ pub const SAME_LEVEL: &str =
     "a wgpu copy within one texture is between different mip levels or layers";
 /// A copy of part of the width or height of a depth, stencil or multisampled texture's level.
 pub const WHOLE_COPY: &str = "a wgpu copy of a depth, stencil or multisampled texture covers the whole width and height of its mip level";
-/// A partial clear of a depth, stencil or multisampled view.
-pub const WHOLE_CLEAR: &str =
-    "the wgpu backend clears depth, stencil and multisampled views only whole";
 /// A border colour wgpu cannot express.
 pub const BORDER_COLOR: &str =
     "wgpu's border colours are transparent black, opaque black and opaque white only";
@@ -450,23 +444,6 @@ pub fn check_texture_copy(
     let restricted = src.format.aspect() != FormatAspect::Color || src.sample_count > 1;
     if restricted && partial {
         return Err(unsupported(WHOLE_COPY));
-    }
-    Ok(())
-}
-
-/// Checks a clear of `rect` (`None`: the whole level) in a view of `texture` whose format is
-/// `format` and whose base level is `width` by `height`.
-pub fn check_clear_area(
-    texture: &TextureDesc,
-    format: PixelFormat,
-    rect: Option<&Rect>,
-    width: u32,
-    height: u32,
-) -> Result<(), RenderError> {
-    let whole = rect.is_none_or(|r| r.x == 0 && r.y == 0 && r.width == width && r.height == height);
-    let restricted = format.aspect() != FormatAspect::Color || texture.sample_count > 1;
-    if restricted && !whole {
-        return Err(unsupported(WHOLE_CLEAR));
     }
     Ok(())
 }

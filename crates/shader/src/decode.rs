@@ -24,9 +24,11 @@
 //! (`op::integer`), every instruction of it in the vector datapath's forms; slice 6e's memory
 //! group (`op::memory`), every instruction of it in the vector datapath's forms; slice 6f's
 //! texture and surface group (`op::texture`), every instruction of it, with PR #4588's `.UR`
-//! texture forms; and slice 6d's uniform datapath (`op::uniform`), every instruction of it but
-//! `UP2UR`, with the integer group's uniform forms (its module docs list the rows it leaves
-//! undecoded). Every other opcode is [`DecodeError::UnknownOpcode`].
+//! texture forms; slice 6c's half and double group (`op::half_double`), every instruction of it
+//! in the vector datapath's forms, with its packed-half sources' swizzles (`alu`); and slice 6d's
+//! uniform datapath (`op::uniform`), every instruction of it but `UP2UR`, with the integer
+//! group's uniform forms (its module docs list the rows it leaves undecoded). Every other opcode
+//! is [`DecodeError::UnknownOpcode`].
 //!
 //! **Strict decoding** (owner's decision 4, 2026-11-12): a word with a bit set that its form
 //! does not explain is rejected, never decoded with the bit ignored. The decoder checks, in this
@@ -53,10 +55,11 @@
 //!    ones the references name: `op::memory`; the exact set the texture group refuses, which
 //!    includes memory orders in the holes between NAK's values as well as past them, `TLD4`'s
 //!    offset mode 3 and `TXQ`'s query 3, is listed in `op::texture`'s module docs under "Values
-//!    the decoder refuses"; the uniform datapath's twins refuse their vector ops' values, and
-//!    `ULDC` a memory type of 7, `op::uniform`), or a register or predicate field whose value
-//!    names no register (only a field wider than its file's, which no form has: `form`'s
-//!    `Reader`);
+//!    the decoder refuses"; the combine operation 3 of `HSET2`, `HSETP2` and `DSETP`, and
+//!    `HFMA2`'s bits 87 to 90 set without `.RELU`: `op::half_double`; the uniform datapath's
+//!    twins refuse their vector ops' values, and `ULDC` a memory type of 7, `op::uniform`), or a
+//!    register or predicate field whose value names no register (only a field wider than its
+//!    file's, which no form has: `form`'s `Reader`);
 //! 5. every set bit was read, else [`DecodeError::UnknownBit`] naming the lowest unread one. A
 //!    form explains some bits only in some of its layouts or operations: in the constant-buffer
 //!    ALU forms a bound buffer reads its index (bits 54..59) and a bindless one its uniform
@@ -94,8 +97,10 @@
 //! translator requires clear or set in `LDGSTS` and `ATOMS.POPC`) in `op::memory`'s, pinned in
 //! `tests::memory`; the texture group's (bit 89 of `TLD4.UR`, the surface forms with a
 //! constant-buffer handle left unknown, and the `.F16` and `.CL` bits its `TEX` and `TLD` forms
-//! add) in `op::texture`'s, pinned in `tests::texture`; the uniform datapath's (the integer
-//! group's, carried to the twins, and `UMOV`'s bits 38..64) in `op::uniform`'s, pinned in
+//! add) in `op::texture`'s, pinned in `tests::texture`; the half and double group's (the unused
+//! register slot's bits, NAK's SM 7.x and SM 9.0 bits, and the forms PR #4588's translator
+//! refuses) in `op::half_double`'s, pinned in `tests::half_double`; the uniform datapath's (the
+//! integer group's, carried to the twins, and `UMOV`'s bits 38..64) in `op::uniform`'s, pinned in
 //! `tests::uniform`.
 //!
 //! **Known bits and canonical words** (slice 4b; owner's ruling 33, 2026-11-19). A form may know
@@ -119,10 +124,11 @@ mod tests;
 
 use thiserror::Error;
 
-// `AluForm` is used by the translator; `Slot` and `Source` only by tests and the assembler.
-pub(crate) use alu::AluForm;
+// `AluForm`, `Slot` and `Source` are used only by tests and the assembler.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) use alu::{Slot, Source};
+pub(crate) use alu::{AluForm, Slot, Source};
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use alu::{HALF_SRC0, half_fields, with_modifiers};
 pub(crate) use fields::*;
 #[cfg(test)]
 pub(crate) use form::{Form, GROUP_HOOKS, GROUPS, ReferenceRow};
@@ -144,6 +150,8 @@ pub(crate) use op::float::{
     FRND_OPCODE, FSEL_OPCODE, FSET_OPCODE, FSETP_OPCODE, FSWZADD_OPCODE, I2F_OPCODE, I2FP_OPCODE,
     MUFU_OPCODE,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use op::half_double;
 pub(crate) use op::integer::{
     BREV_OPCODE, FLO_OPCODE, IABS_OPCODE, IADD3_OPCODE, IMAD_HI_OPCODE, IMAD_OPCODE,
     IMAD_WIDE_OPCODE, IMNMX_OPCODE, ISETP_OPCODE, LEA_OPCODE, LOP3_OPCODE, MOV_OPCODE, P2R_OPCODE,
@@ -161,6 +169,7 @@ pub(crate) use op::{Named, attribute, control, float, integer, memory, op_list, 
 pub use operand::{
     AluSrc, CBuf, CBufRef, Gpr, Pred, PredSrc, RoundMode, UniformPred, UniformPredSrc, UniformReg,
 };
+pub use operand::{HalfSrc, HalfSwizzle};
 
 use form::{Reader, lookup};
 

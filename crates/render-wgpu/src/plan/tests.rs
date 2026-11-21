@@ -447,13 +447,7 @@ fn blits_wait_for_their_slice_and_dispatches_need_a_pipeline() {
 #[test]
 fn clears_name_their_layers_area_and_value() {
     let w = world();
-    let clear = |target, rect, value| {
-        Command::Clear(ClearDesc {
-            target,
-            value,
-            rect,
-        })
-    };
+    let clear = |target, rect, value| Command::Clear(ClearDesc::unmasked(target, value, rect));
     let red = ClearValue::Float([1.0, 0.0, 0.0, 1.0]);
     let full = Rect {
         x: 0,
@@ -489,19 +483,34 @@ fn clears_name_their_layers_area_and_value() {
     assert_eq!(deep.layers, Layers::Slices { count: 3 });
     let array = as_clear(&s[3]);
     assert_eq!(array.layers, Layers::Array { first: 1, count: 3 });
+    // How each is done (`crate::clear::clear_how`): a pass, the scratch, passes again.
+    let hows: Vec<_> = s.iter().map(|step| as_clear(step).how).collect();
     assert_eq!(
-        run(
+        hows,
+        [
+            ClearHow::Pass,
+            ClearHow::Scratch,
+            ClearHow::Pass,
+            ClearHow::Pass
+        ]
+    );
+    assert_eq!(partial.size, (8, 4));
+    // A partial clear of a depth view is accepted and drawn (owner's ruling of 2026-11-19).
+    let depth_part = Rect { width: 7, ..full };
+    let drawn = as_clear(
+        &steps(
             &w,
             vec![clear(
                 w.depth_view,
-                Some(Rect { width: 7, ..full }),
-                ClearValue::Depth(0.5)
-            )]
-        )
-        .err(),
-        Some(RenderError::Unsupported(rules::WHOLE_CLEAR))
+                Some(depth_part),
+                ClearValue::Depth(0.5),
+            )],
+        )[0],
     );
+    assert_eq!(drawn.rect, Some(depth_part));
+    assert!(matches!(drawn.how, ClearHow::Draw(_)), "{:?}", drawn.how);
     let depth = as_clear(&steps(&w, vec![clear(w.depth_view, None, ClearValue::Depth(0.5))])[0]);
+    assert_eq!(depth.how, ClearHow::Pass);
     assert_eq!(
         depth.ops,
         ClearOps::DepthStencil {
@@ -854,21 +863,21 @@ fn a_view_whose_texture_is_gone_is_stale() {
         .textures
         .remove(rgba.index(), rgba.generation())
         .expect("live");
-    let clear = Command::Clear(ClearDesc {
-        target: w.rgba_view,
-        value: ClearValue::Float([0.0; 4]),
-        rect: None,
-    });
+    let clear = Command::Clear(ClearDesc::unmasked(
+        w.rgba_view,
+        ClearValue::Float([0.0; 4]),
+        None,
+    ));
     assert_eq!(
         run(&w, vec![clear]).err(),
         Some(RenderError::Invalid(NO_TEXTURE))
     );
     let stale = ViewId::new(w.rgba_view.index(), w.rgba_view.generation() + 1);
-    let clear = Command::Clear(ClearDesc {
-        target: stale,
-        value: ClearValue::Float([0.0; 4]),
-        rect: None,
-    });
+    let clear = Command::Clear(ClearDesc::unmasked(
+        stale,
+        ClearValue::Float([0.0; 4]),
+        None,
+    ));
     assert_eq!(
         run(&w, vec![clear]).err(),
         Some(RenderError::Invalid(NO_VIEW))

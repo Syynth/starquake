@@ -4,9 +4,10 @@
 //! interface, which the GPU crate carries to the render backend; wgpu takes the module directly
 //! (`docs/specs/shader-pipeline.md`). Instruction encodings come from Mesa NAK (MIT).
 //!
-//! Slice 1 of the spec's port slices built the walking skeleton: [`translate`] turns
-//! straight-line programs of six instructions (`MOV`, `FFMA`, `ALD`, `AST`, `EXIT`, `S2R`) into
-//! the [`ir`], and [`lower`] builds and validates the naga module and its [`host`] tables.
+//! Slice 1 of the spec's port slices built the walking skeleton: a translator of straight-line
+//! programs of six instructions (`MOV`, `FFMA`, `ALD`, `AST`, `EXIT`, `S2R`) into the [`ir`],
+//! retired by slice 12i, and [`lower`], which builds and validates the naga module and its
+//! [`host`] tables.
 //! [`program::translate_program`] runs the whole chain on program bytes. [`decode`] is slice 4's
 //! decoder framework: the form table with known-bit masks, the operand types, the full `Op`
 //! enum (instructions not decoded yet are shells), the printer, and the test assembler (`asm`,
@@ -55,9 +56,14 @@
 //!
 //! Slice 12g translates the attribute and system-value group ([`translate`]'s `attribute`
 //! module): attribute loads and stores, interpolation (with the pixel header,
-//! [`translate::translate_with_header`]), the special registers of `S2R`, `S2UR`, `CS2R` and
+//! [`translate::translate_flow`]'s `header`), the special registers of `S2R`, `S2UR`, `CS2R` and
 //! `PIXLD`, and `AL2P`; it rejects the geometry and mesh instructions by name. A guarded
 //! instruction becomes a conditional block.
+//!
+//! Slice 12i is the translation driver ([`translate::translate_flow`]): it runs the group
+//! translators over a whole program, block by block of the flow graph, with one guard helper and
+//! one source reader they share; [`program::translate_program`] runs it, then the structurizer
+//! ([`structure`]) and the lowering.
 //!
 //! Slice 15 maps attribute loads and stores, system values and pixel outputs to the
 //! shader's interface and collects what the lowering and the host need to know ([`info`]):

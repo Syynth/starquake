@@ -293,3 +293,72 @@ fn a_page_guest_code_stored_to_is_restored_onto_a_new_vm() {
     assert_eq!(read_u64(&space, heap + 16), 0x77);
     drop(vcpu);
 }
+
+#[test]
+fn pages_saved_from_ram_of_a_whole_pool_restore_onto_another_at_the_cost_of_those_pages() {
+    if std::env::var_os("CI").is_some() {
+        return;
+    }
+    let _one_vm = ONE_VM.lock().unwrap_or_else(PoisonError::into_inner);
+    // Guest RAM as a run makes it for a Switch 1 program: the whole application pool, backed
+    // lazily (`crate::system`'s `ram` module).
+    let pool = starquake_kernel::memory::MemoryArrangement::FourGb.application_pool_size();
+    let ram = RamConfig::at_least(pool).unwrap();
+    // The host's page (16 KiB on Apple Silicon), the smallest RAM a `RamConfig` holds.
+    let host_page = RamConfig::at_least(1).unwrap().size();
+    let value = 0x7370_6172_7365_2121_u64;
+    // The original: the code page and the second heap page written by the host, two pages of
+    // RAM in one host page; the first heap page and the stack never touched.
+    let (pages, blocks, heap) = {
+        let backend = HvfBackend::new(ram).expect("create the VM");
+        let space = AddressSpace::<PhysicalMemory>::new(
+            backend.physical(),
+            backend.ram(),
+            backend.table_pool(),
+        )
+        .unwrap();
+        let mut original = World::over(space);
+        let kernel = &mut original.kernel;
+        kernel
+            .set_process_memory_permission(CODE, PAGE_SIZE, SvcPermission::ReadExecute)
+            .unwrap();
+        kernel.create_main_thread_stack(PAGE_SIZE).unwrap();
+        let heap = kernel.set_heap_size(2 * PAGE_SIZE).unwrap();
+        original.space.write(CODE, &program()).unwrap();
+        original
+            .space
+            .write(heap + PAGE_SIZE, &value.to_le_bytes())
+            .unwrap();
+        assert_eq!(backend.physical().ram_resident_bytes(), Ok(host_page));
+        (
+            original.space.save_pages().unwrap(),
+            original.kernel.save().unwrap(),
+            heap,
+        )
+    };
+
+    // The restore, onto a new VM with the same RAM: it costs nothing until the pages are
+    // restored, then only theirs.
+    let backend = HvfBackend::new(ram).expect("create the VM");
+    let physical = backend.physical();
+    assert_eq!(physical.ram_resident_bytes(), Ok(0));
+    let space = Arc::new(
+        AddressSpace::<PhysicalMemory>::new(physical.clone(), backend.ram(), backend.table_pool())
+            .unwrap(),
+    );
+    let kernel = restore(&space, &pages, &blocks, |_| None).unwrap();
+    assert_eq!(kernel.heap_size(), 2 * PAGE_SIZE);
+    assert_eq!(physical.ram_resident_bytes(), Ok(host_page));
+    // Guest code from the restored code page reads what the host wrote, and stores beside it.
+    let mut vcpu = backend.create_vcpu().unwrap();
+    vcpu.set_address_space(space.root(), FIRST_ASID).unwrap();
+    vcpu.set_pac_keys(&PacKeys::default()).unwrap();
+    vcpu.flush_pending(space.tables(), FIRST_ASID).unwrap();
+    assert_eq!(run(&mut vcpu, heap + PAGE_SIZE, 0x5a), Exit::Svc(0));
+    assert_eq!(vcpu.regs().unwrap().x[0], value);
+    assert_eq!(read_u64(&space, heap + PAGE_SIZE + 8), 0x5a);
+    // The first heap page was never touched, so it was not saved, and reads as zero.
+    assert_eq!(read_u64(&space, heap), 0);
+    assert_eq!(physical.ram_resident_bytes(), Ok(host_page));
+    drop(vcpu);
+}
