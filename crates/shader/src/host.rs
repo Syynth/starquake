@@ -89,7 +89,8 @@ pub struct InterfaceSlot {
 /// The lowering ([`crate::lower`]) fills `subgroup`, `subgroup_size_32`, `f16` and `i64` from
 /// what it lowers; slice 15's collect info
 /// ([`crate::info::ShaderInfo::requirements`]) fills every field from the IR, before the host
-/// lowering passes of slice 18 remove what the host lacks.
+/// lowering passes of slice 18 ([`crate::host_lower`]) remove the 64- and 16-bit floats the
+/// host lacks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[expect(
     clippy::struct_excessive_bools,
@@ -166,6 +167,10 @@ impl std::fmt::Display for Feature {
 pub struct HostCaps {
     /// 16-bit float arithmetic.
     pub f16: bool,
+    /// 64-bit floats. Without them the f64 host lowering pass runs
+    /// ([`crate::host_lower`]); with them the lowering refuses every 64-bit float operation,
+    /// which no slice lowers to naga yet.
+    pub f64: bool,
     /// 64-bit integer arithmetic.
     pub i64: bool,
     /// Subgroup operations, whatever their size.
@@ -179,6 +184,7 @@ impl HostCaps {
     /// A target with every feature.
     pub const ALL: Self = Self {
         f16: true,
+        f64: true,
         i64: true,
         subgroup: true,
         subgroup_size_32: true,
@@ -186,6 +192,7 @@ impl HostCaps {
     /// A target with none.
     pub const NONE: Self = Self {
         f16: false,
+        f64: false,
         i64: false,
         subgroup: false,
         subgroup_size_32: false,
@@ -195,9 +202,11 @@ impl HostCaps {
 impl Requirements {
     /// The first feature, in [`Feature`] order, that this needs and `caps` lacks.
     ///
-    /// [`Self::f64`] and [`Self::i64_atomics`] are not checked: [`HostCaps`] has no field for
-    /// them, and the lowering refuses every 64-bit float and 64-bit atomic operation, so a
-    /// shader it lowers never needs them.
+    /// [`Self::f64`] and [`Self::i64_atomics`] are not checked: the lowering refuses every
+    /// 64-bit float and 64-bit atomic operation, so a shader it lowers never needs them. Where
+    /// the target lacks 64-bit floats ([`HostCaps::f64`]), the f64 host lowering pass
+    /// ([`crate::host_lower`]) turns them into 32-bit ones before the lowering; [`HostCaps`]
+    /// has no field for 64-bit atomics.
     pub const fn missing(self, caps: HostCaps) -> Option<Feature> {
         if self.f16 && !caps.f16 {
             Some(Feature::Float16)

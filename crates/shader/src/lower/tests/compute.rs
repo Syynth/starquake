@@ -205,6 +205,7 @@ fn a_feature_the_target_lacks_is_refused() {
             for offered in 0_u8..16 {
                 let caps = HostCaps {
                     f16: bit(offered, 0),
+                    f64: false,
                     i64: bit(offered, 1),
                     subgroup: bit(offered, 2),
                     subgroup_size_32: bit(offered, 3),

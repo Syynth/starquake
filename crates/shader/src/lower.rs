@@ -74,7 +74,8 @@
 //!   immediate component).
 //! - The 32-bit and 16-bit float operations of the table from `FPAbs16` to `FPIsNan64`
 //!   (`FPRecip32`, `FPRecipSqrt32`, `FPSqrt` and the transcendentals have only a 32-bit form);
-//!   every 64-bit float operation is refused until slice 18 lowers f64.
+//!   every 64-bit float operation is refused: where the target lacks 64-bit floats, slice
+//!   18's host lowering ([`crate::host_lower`]) turns them into 32-bit ones first.
 //! - 32-bit integer arithmetic, bit operations and comparisons (`IAdd32` to
 //!   `UGreaterThanEqual`), the 64-bit `IAdd64`, `ISub64`, `INeg64`, `IAbs64` and shifts, and
 //!   the logical operations.
