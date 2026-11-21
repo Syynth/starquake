@@ -218,6 +218,9 @@ pub enum Command {
   multisampled views), the backend draws with its own clear helper shader, with the same pixels
   as a clear. So the gpu side never draws a clear itself and never parses the backend's helper
   shaders. The recording backend models a masked clear on the CPU, since its pixels are exact.
+  The stencil write mask is 8 bits, what host APIs take: the high bits of the guest's 32-bit mask
+  and of the stencil clear value are dropped, a listed divergence. `MAX_CLEAR_PIPELINES` is a
+  guess (decided by the owner, 2026-11-20).
 - **Barriers and image layouts are the backend's business.** Every command says which resources
   it reads and writes, so the backend can insert what its API needs. wgpu inserts them itself
   from each resource's declared usage; a direct Metal backend would need few; a direct Vulkan
@@ -655,6 +658,10 @@ bit-identical readbacks wherever the recording backend has an answer.
 Status: **approved by the owner, 2026-11-18** (design PR #395; decision log, 2026-11-18, "Render
 capture v2: the design in PR #395, as recommended"), with decisions 15 to 19 as recommended. R11b
 built the render crate's part; R11c follows (errata decided by the owner, 2026-11-19).
+
+The format's version number is now 3: masked clears (PR #483) added the write masks to
+`ClearDesc` and bumped it. "v2" names this design, not the number in a file's header (decided by
+the owner, 2026-11-20).
 
 ### Why version 1 is not enough
 
