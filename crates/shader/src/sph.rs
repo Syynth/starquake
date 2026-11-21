@@ -301,8 +301,9 @@ impl Common {
     /// [`ProgramHeader::from_words`] returned, both fields are at most 24 bits, so the size is
     /// at most 48 bits; the type does not enforce the widths, and a caller-built `Common` with
     /// wider fields gives up to 56 bits (which the test encoder refuses to write). NAK's writer
-    /// places the high field at bit 32 instead (module docs, "Conflict"). PR #4588 adds
-    /// [`Self::local_memory_crs_size`] to it; that choice is the local memory pass's.
+    /// places the high field at bit 32 instead (module docs, "Conflict"). Every reference's
+    /// environment adds [`Self::local_memory_crs_size`] to it, and so does the production
+    /// translator ([`crate::pipeline::local_memory_bytes`]).
     pub fn local_memory_size(&self) -> u64 {
         // Each field is a `u32`, so the result is below 2^56 whatever they hold.
         u64::from(self.local_memory_low_size) | u64::from(self.local_memory_high_size) << 24

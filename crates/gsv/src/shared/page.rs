@@ -114,10 +114,14 @@
 //! (`a_refused_access_drops_the_hold_and_the_next_signal_tries_again`) and treats it as any
 //! other: a value the stopped answer wrote counts as shown, so unless a counter asked about has
 //! moved since, the request is held, and answered at the latest at the bound
-//! (`a_stopped_answer_s_values_count_as_shown_and_the_next_signal_holds_to_the_bound`). The
-//! kernel refuses once
-//! the title has closed a transfer memory (`a_closed_transfer_memory_is_refused_by_the_kernel`):
-//! PR keeps a reference to both (`Open(kernel)`), so it never meets this case. A host that does
+//! (`a_stopped_answer_s_values_count_as_shown_and_the_next_signal_holds_to_the_bound`). While
+//! the page is bound the root keeps a reference of its own to each memory (below, "Binding
+//! (204)"), as PR does (`Open(kernel)`), so the title closing its handles to them changes
+//! nothing (`the_page_answers_after_the_title_closes_its_handles_to_the_memories`, and on the
+//! kernel's own dispatcher
+//! `the_page_answers_after_the_title_closes_its_handles_and_the_root_s_close_lets_it_go`); the
+//! kernel refuses only a memory it no longer has, which 204 never leaves bound
+//! (`a_transfer_memory_the_kernel_no_longer_has_is_refused`). A host that does
 //! not offer the two calls (their default) refuses every read, so a page bound in a run whose
 //! timer host lacks them answers nothing (`a_host_without_transfer_memory_answers_nothing`).
 //!
@@ -138,15 +142,75 @@
 //! [`READ_ONLY_SIZE`] (`InvalidSize`, PR). The data words are read and, where they differ from
 //! PR's, logged, not refused (they say nothing the transfer memories do not). Then it makes the
 //! two events (the request event with the completion queue as its hook), or takes those an
-//! earlier 204 made; only then clears both memories and writes the header and [`UNALLOCATED`] for
+//! earlier 204 made; then keeps a reference of the root's own to each memory, the writable one
+//! first ([`Context::keep_transfer_memory`]; PR `m_syncpoint_rw->Open(kernel)`,
+//! `m_syncpoint_ro->Open(kernel)`, once its event is made; issue 499), so the page outlives the
+//! title's handles; only then clears both memories and writes the header and [`UNALLOCATED`] for
 //! every value (PR: its event first, then zeros, `Header`, `Unallocated`), so a refused event
 //! leaves the memories as they were (`a_refused_event_binds_nothing_and_the_next_bind_succeeds`);
 //! then binds the page and replies. An event made before a later failure is kept and handed out
-//! by the next 204, so a failing 204 leaks nothing.
+//! by the next 204. A refused keep of the read-only memory gives back the writable memory's
+//! keep, and a refused write gives back both keeps and leaves the bytes it had written
+//! (`a_refused_keep_gives_back_what_the_bind_kept_and_the_next_bind_succeeds`,
+//! `a_refused_write_gives_back_both_references_and_binds_nothing`), so a failing 204 leaks
+//! neither an event nor a reference; a refusal before the keeps keeps nothing
+//! (`a_refused_bind_keeps_nothing`). PR's keeps cannot fail and its writes are
+//! `Memory::WriteBlock`s that report nothing, so it has neither failure path.
+//!
+//! # When the root closes
+//!
+//! PR drops its two references when the session that bound the page is destroyed
+//! (`~IGraphicsSupervisor`: `m_syncpoint_rw->Close(kernel)`, `m_syncpoint_ro->Close(kernel)`),
+//! and `am` hands every later 2000 that same session (module docs of [`crate::root`]), so the
+//! page lives as long as the title's root session. Here every root session shares the page, so
+//! it lives as long as any root session is open:
+//!
+//! - When the root server's last session closes, the root's family queues
+//!   [`Completion::RootClosed`](crate::completion::Completion) ([`crate::root::RootFamily`]'s
+//!   `session_closed`); it may be told with the kernel's lock held, so it only pushes.
+//! - The drain then asks the kernel how many root sessions are open
+//!   ([`TimerHost::root_sessions`]). The kernel leaves out a session whose request in flight is
+//!   a close message (`Ipc::open_sessions` in `starquake-kernel`): the root's server closes such
+//!   a session inside its handler, with the kernel's lock let go, and pushes the close there,
+//!   before the kernel marks the session's end closed, so a drain run in between must not count
+//!   it (`a_drain_between_the_root_s_close_and_the_kernel_s_end_of_it_lets_the_page_go`,
+//!   `closing_the_root_with_a_close_message_lets_the_page_and_its_memories_go`; libnx sends a
+//!   close message before `CloseHandle`). With none, it gives back the hold's watches, unbinds the page
+//!   (what it shows goes back to [`UNALLOCATED`] and a waiting signal is dropped), and drops the
+//!   root's reference to each memory, the writable one first
+//!   ([`TimerHost::release_kept_transfer_memory`]); a memory the title no longer holds then goes,
+//!   and its pages are unlocked (`closing_the_root_s_last_session_lets_the_page_and_its_memories_go`,
+//!   `a_signal_waiting_when_the_root_closes_is_dropped`, and on the kernel
+//!   `the_root_s_close_leaves_the_title_s_own_hold_on_its_memories`). The events stay, as they
+//!   do after a failing 204, and a later root session's 204 binds again with them
+//!   (`after_the_root_closes_a_new_session_binds_again_with_the_same_events`).
+//! - If a root session has opened by then, the page stays bound for it, and its own close
+//!   queues the next [`Completion::RootClosed`](crate::completion::Completion)
+//!   (`the_page_stays_bound_while_the_kernel_says_a_root_session_is_open`,
+//!   `closing_a_root_session_while_another_is_open_queues_nothing`). Asking at the drain, not
+//!   at the close, is what keeps a 204 made on a session opened in between from being undone.
+//! - A host that cannot count the root's sessions (the default) leaves the page bound
+//!   (`a_host_that_cannot_count_root_sessions_leaves_the_page_bound`), and an unbound page is
+//!   left as it is without asking (`an_unbound_page_ignores_the_root_s_close`). A release the
+//!   kernel refuses (the root keeps no reference to that memory: gsv's own bookkeeping gone
+//!   wrong) is logged as an error, and the page is unbound either way
+//!   (`a_refused_release_is_logged_and_the_page_is_unbound_either_way`; log-only: no test
+//!   captures the line).
+//!
+//! Nothing is recorded: the guest's `CloseHandle`, close message or process end that closed the
+//! session is recorded as its system call. **Replay gap:** whether the drain lets the page go or
+//! keeps it depends on when the timer thread drains, compared with the guest's system calls:
+//! a root session the guest opens (its `ConnectToNamedPort`, or `am`'s 2000) before the drain
+//! keeps the page bound, one it opens after finds it unbound. That timing is host timing, and
+//! nothing records the drain's answer, so a replay can take the other branch, and with it a
+//! later 204's outcome (bound again, or `InvalidState` while the old page is still bound) and
+//! whether later requests on the page are answered. Recording the answer as a note fed back in
+//! replay would close the gap; it is not done here.
 //!
 //! # Where this differs from the references
 //!
-//! Each row is pinned by the test named, in `shared/page/tests.rs`:
+//! Each row is pinned by the test named, in `shared/page/tests.rs` or one of its modules
+//! (`tests/kept.rs`, `tests/on_the_kernel.rs`):
 //!
 //! | Case | PR | NX2 | Here |
 //! |---|---|---|---|
@@ -161,7 +225,9 @@
 //! | Read-only memory larger than [`READ_ONLY_SIZE`] | `InvalidSize` | accepted | `InvalidSize`, as PR (`each_size_is_checked_at_its_edge`) |
 //! | Handle kind of the two events | moved | copied | **conflict:** copied, as [`crate::protocol::HANDLE_KIND`] |
 //! | The request event after an answer | cleared | left as it is | left as it is: the title holds only its writable end, so whether it is signalled is not visible to it |
-//! | The transfer memories | referenced while bound | not referenced | not referenced: see "When a request is answered" |
+//! | The transfer memories | referenced while bound (`Open(kernel)`) | not referenced: it keeps the owner's addresses and writes there | referenced while bound, as PR (`the_page_answers_after_the_title_closes_its_handles_to_the_memories`) |
+//! | When the references go | the binding session's destruction | never taken | when the root's last session has closed and none is open at the next drain (above, "When the root closes"; `closing_the_root_s_last_session_lets_the_page_and_its_memories_go`) |
+//! | A 204 after the binding session has gone | a new session, fresh state: bound again | rebinds | bound again once the drain has let the old page go, with the same events (`after_the_root_closes_a_new_session_binds_again_with_the_same_events`); before that drain, `InvalidState` as for any second 204 |
 //!
 //! # What is recorded
 //!
@@ -197,8 +263,16 @@
 //! ([`RestoreKernel`]): that the answer event is a live end of an event the root's server made
 //! ([`PageSnapshotError::AnswerEvent`]); that the writable memory is a live transfer memory
 //! ([`PageSnapshotError::WritableMemory`]) of exactly [`WRITABLE_SIZE`] bytes
-//! ([`PageSnapshotError::WritableSize`]); the same for the read-only memory and
-//! [`READ_ONLY_SIZE`] ([`PageSnapshotError::ReadOnlyMemory`], [`PageSnapshotError::ReadOnlySize`]);
+//! ([`PageSnapshotError::WritableSize`]) of which the root's server keeps exactly one
+//! reference, as 204 leaves it ([`PageSnapshotError::WritableNotKept`]); the same for the
+//! read-only memory and [`READ_ONLY_SIZE`] ([`PageSnapshotError::ReadOnlyMemory`],
+//! [`PageSnapshotError::ReadOnlySize`], [`PageSnapshotError::ReadOnlyNotKept`];
+//! `a_restored_page_must_name_memories_the_root_keeps_exactly_once`); then that the root's
+//! server keeps no reference the page does not account for: [`KEPT_PER_BINDING`] in all for a
+//! bound page, none for an unbound one ([`PageSnapshotError::UnaccountedKept`];
+//! `a_restored_page_must_account_for_every_reference_the_root_keeps`,
+//! `the_unaccounted_check_comes_after_the_memories_and_before_the_hook`), since nothing would
+//! ever drop such a reference and the owner's pages would stay locked for the rest of the run;
 //! and last that the kernel takes the request event's hook back, which it does only for the
 //! live writable end of an event the root's server made ([`PageSnapshotError::Rehook`]; owner's
 //! ruling of 2026-11-17: hooks are re-attached by their owner in its restore step, checked
@@ -223,7 +297,7 @@ use starquake_kernel::dispatch::Dispatcher;
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::ipc::EventHook;
 use starquake_kernel::result::{KernelError, SvcResult};
-use starquake_services::framework::{Context, Outcome, Reply, Request};
+use starquake_services::framework::{Context, Fault, Outcome, Reply, Request};
 use starquake_trace::{HostNanos, ServiceId};
 use thiserror::Error;
 
@@ -631,6 +705,10 @@ pub enum PageSnapshotError {
         /// Its size.
         size: u64,
     },
+    /// The root's server does not keep exactly one reference to the writable memory, as 204
+    /// leaves it.
+    #[error("the root does not keep exactly one reference to the syncpoint page's writable memory")]
+    WritableNotKept,
     /// The read-only memory is not a live transfer memory.
     #[error("the syncpoint page's read-only memory is not a live transfer memory: {0}")]
     ReadOnlyMemory(KernelError),
@@ -639,6 +717,25 @@ pub enum PageSnapshotError {
     ReadOnlySize {
         /// Its size.
         size: u64,
+    },
+    /// The root's server does not keep exactly one reference to the read-only memory, as 204
+    /// leaves it.
+    #[error(
+        "the root does not keep exactly one reference to the syncpoint page's read-only memory"
+    )]
+    ReadOnlyNotKept,
+    /// The root's server keeps references to transfer memories that the page does not account
+    /// for: in all `kept`, where the page accounts for `accounted` ([`KEPT_PER_BINDING`] for a
+    /// bound page, none for an unbound one).
+    #[error(
+        "the root keeps transfer-memory references the syncpoint page does not account for \
+         (kept in all: {kept}, accounted for: {accounted})"
+    )]
+    UnaccountedKept {
+        /// How many references the root's server keeps in all.
+        kept: u32,
+        /// How many of them the page accounts for.
+        accounted: u32,
     },
     /// The kernel refused to re-attach the request event's hook.
     #[error("the kernel refused to re-attach the syncpoint page's request hook: {0}")]
@@ -665,6 +762,14 @@ pub trait RestoreKernel {
     /// The size of the live transfer memory `memory` names, or why there is none
     /// ([`Dispatcher::transfer_memory`]: `InvalidHandle`).
     fn transfer_memory_size(&self, memory: ObjectId) -> SvcResult<u64>;
+
+    /// How many references the server of `service` keeps to `memory`
+    /// ([`Dispatcher::kept_transfer_memory`]).
+    fn kept_transfer_memory(&self, service: ServiceId, memory: ObjectId) -> u32;
+
+    /// How many references the server of `service` keeps in all, over every transfer memory
+    /// ([`Dispatcher::kept_transfer_memories`]).
+    fn kept_transfer_memories(&self, service: ServiceId) -> u32;
 }
 
 impl RestoreKernel for Dispatcher {
@@ -687,6 +792,16 @@ impl RestoreKernel for Dispatcher {
     fn transfer_memory_size(&self, memory: ObjectId) -> SvcResult<u64> {
         Ok(self.transfer_memory(memory)?.size())
     }
+
+    /// [`Dispatcher::kept_transfer_memory`].
+    fn kept_transfer_memory(&self, service: ServiceId, memory: ObjectId) -> u32 {
+        Dispatcher::kept_transfer_memory(self, service, memory)
+    }
+
+    /// [`Dispatcher::kept_transfer_memories`].
+    fn kept_transfer_memories(&self, service: ServiceId) -> u32 {
+        Dispatcher::kept_transfer_memories(self, service)
+    }
 }
 
 /// The checks of the objects `page` names against what `kernel` holds, for the root's server,
@@ -708,15 +823,36 @@ fn check_kernel_objects(
         if size != u64::from(WRITABLE_SIZE) {
             return Err(PageSnapshotError::WritableSize { size });
         }
+        if kernel.kept_transfer_memory(root, binding.writable) != 1 {
+            return Err(PageSnapshotError::WritableNotKept);
+        }
         let size = kernel
             .transfer_memory_size(binding.read_only)
             .map_err(PageSnapshotError::ReadOnlyMemory)?;
         if size != u64::from(READ_ONLY_SIZE) {
             return Err(PageSnapshotError::ReadOnlySize { size });
         }
+        if kernel.kept_transfer_memory(root, binding.read_only) != 1 {
+            return Err(PageSnapshotError::ReadOnlyNotKept);
+        }
+    }
+    let accounted = if page.binding.is_some() {
+        KEPT_PER_BINDING
+    } else {
+        0
+    };
+    let kept = kernel.kept_transfer_memories(root);
+    if kept != accounted {
+        return Err(PageSnapshotError::UnaccountedKept { kept, accounted });
     }
     Ok(())
 }
+
+/// How many references the root keeps while the page is bound: one to each of its two
+/// transfer memories, as 204 leaves them (module docs, "Binding (204)"). The two cannot be one
+/// memory, as their sizes differ ([`WRITABLE_SIZE`], [`READ_ONLY_SIZE`]).
+pub const KEPT_PER_BINDING: u32 = 2;
+const _: () = assert!(WRITABLE_SIZE != READ_ONLY_SIZE);
 
 /// The snapshot header.
 #[derive(Serialize, Deserialize)]
@@ -911,6 +1047,43 @@ impl Locked<'_> {
         Ok(())
     }
 
+    /// The drain's answer to [`Completion::RootClosed`](crate::completion::Completion) (module
+    /// docs, "When the root closes"): if the page is bound and the kernel says no root session
+    /// is open, gives back the hold's watches, unbinds the page, and drops the root's reference
+    /// to each memory, the writable one first. A host that cannot say how many root sessions
+    /// are open leaves the page bound; a refused release is logged, and the page is unbound
+    /// either way.
+    pub(super) fn root_closed(&mut self, host: &mut dyn TimerHost) {
+        let Some(binding) = self.state.page.binding else {
+            return;
+        };
+        match host.root_sessions() {
+            Ok(0) => {}
+            Ok(open) => {
+                tracing::debug!(
+                    open,
+                    "gsv: a root session is open again; the page stays bound"
+                );
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "gsv: the kernel did not say whether the root is open");
+                return;
+            }
+        }
+        self.release_hold();
+        let page = &mut self.state.page;
+        page.binding = None;
+        page.shown = CounterExtension::default();
+        page.signalled = false;
+        for memory in [binding.writable, binding.read_only] {
+            if let Err(error) = host.release_kept_transfer_memory(memory) {
+                tracing::error!(%error, "gsv: the kernel refused to let a page memory go");
+            }
+        }
+        tracing::debug!("gsv: the root closed; the shared syncpoint page is unbound");
+    }
+
     /// The checks a page snapshot passes against this state, in the documented order (module
     /// docs, "What is saved"): the page's own relations, then each syncpoint's waiter count.
     fn check_page(&self, page: &Page) -> Result<(), PageSnapshotError> {
@@ -1038,6 +1211,30 @@ impl Shared {
     }
 }
 
+/// Clears both memories and writes the header and [`UNALLOCATED`] for every value into the
+/// read-only one (module docs, "Binding (204)"). A refused write stops it where it is.
+fn clear_and_write_header(
+    cx: &mut Context<'_>,
+    writable: ObjectId,
+    read_only: ObjectId,
+) -> Result<(), Fault> {
+    cx.write_transfer_memory(writable, 0, &[0; WRITABLE_SIZE as usize])?;
+    cx.write_transfer_memory(read_only, 0, &[0; READ_ONLY_SIZE as usize])?;
+    cx.write_transfer_memory(read_only, 0, &header())?;
+    let unallocated: Vec<u8> = (0..COUNT).flat_map(|_| UNALLOCATED.to_le_bytes()).collect();
+    cx.write_transfer_memory(read_only, u64::from(VALUES_OFFSET), &unallocated)
+}
+
+/// Gives back the references a failing 204 kept to `memories`. The root keeps one of each, so
+/// a refusal means gsv's own bookkeeping is wrong, and is logged.
+fn give_back(cx: &mut Context<'_>, memories: &[ObjectId]) {
+    for memory in memories {
+        if let Err(error) = cx.release_kept_transfer_memory(*memory) {
+            tracing::error!(%error, "gsv: a failing 204 could not give back a transfer memory");
+        }
+    }
+}
+
 /// gsv 204 in a run with gsv's `shared` state (module docs, "Binding (204)").
 pub(crate) fn bind(
     shared: &Shared,
@@ -1108,13 +1305,21 @@ pub(crate) fn bind(
         state.state.page.answer = Some(answer);
         answer
     };
+    // The root keeps a reference of its own to each memory, as PR opens both
+    // (`m_syncpoint_rw->Open(kernel)`, `m_syncpoint_ro->Open(kernel)`) once its event is made,
+    // so the page outlives the title's handles (module docs, "Binding (204)"). A refused keep
+    // gives back what this 204 kept.
+    cx.keep_transfer_memory(writable)?;
+    if let Err(error) = cx.keep_transfer_memory(read_only) {
+        give_back(cx, &[writable]);
+        return Err(error);
+    }
     // The memories are written only once both events are there, as PR makes its event before
     // it writes: a refused event leaves them as they were.
-    cx.write_transfer_memory(writable, 0, &[0; WRITABLE_SIZE as usize])?;
-    cx.write_transfer_memory(read_only, 0, &[0; READ_ONLY_SIZE as usize])?;
-    cx.write_transfer_memory(read_only, 0, &header())?;
-    let unallocated: Vec<u8> = (0..COUNT).flat_map(|_| UNALLOCATED.to_le_bytes()).collect();
-    cx.write_transfer_memory(read_only, u64::from(VALUES_OFFSET), &unallocated)?;
+    if let Err(error) = clear_and_write_header(cx, writable, read_only) {
+        give_back(cx, &[writable, read_only]);
+        return Err(error);
+    }
     state.state.page.binding = Some(Binding {
         writable,
         read_only,

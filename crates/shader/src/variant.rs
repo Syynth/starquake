@@ -13,7 +13,9 @@
 //! | [`VariantKey::dual_source_blend`] | whether dual-source blending is on | Eden `RuntimeInfo::dual_source_blend` |
 //! | [`VariantKey::previous_stage_stores`] | for each stage that follows another, the attribute words the stage before it stores | Eden `RuntimeInfo::previous_stage_stores`, filled by `MakeRuntimeInfo` (`eden/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp` @ cf654052); spec, "Pipeline-state specialisation"; see "The previous stage's stores" |
 //! | [`VariantKey::workgroup_size`], [`VariantKey::shared_memory_size`] | a compute program's workgroup and shared-memory size | spec, "Compute shaders"; Eden `Environment::WorkgroupSize`, `SharedMemorySize` (`environment.h`) |
+//! | [`VariantKey::local_memory_size`] | a compute program's local-memory size in bytes, which the GPU crate computes from the QMD (`Dispatch::local_memory_size`, the conversion's one owner) | spec, "Local and shared memory" (pass 6: "sized from ... the QMD (compute)"); Eden `Environment::LocalMemorySize`, which `ComputeEnvironment` sets to `qmd.local_pos_alloc + qmd.local_crs_alloc` (`eden-pr4588/src/video_core/shader_environment.cpp` @ e5fb3b97); see "The compute local-memory size" |
 //! | [`VariantKey::emulation`] | the render backend's `EmulationFlags`, field by field | spec, "Pipeline-state specialisation"; review guide, M13 |
+//! | [`VariantKey::output_interpolation`] | how the paired pixel program interpolates each generic attribute, which the vertex stage's outputs take | spec, "Pipeline-state specialisation", the named exception (decided by the owner, 2026-11-20, ruling 2); Eden `Info::interpolation`, filled by `CollectInterpolationInfo` (`eden/src/shader_recompiler/frontend/maxwell/translate_program.cpp` @ cf654052); see "The vertex outputs' interpolation" |
 //! | [`VariantKey::texture_swizzles`] | each texture binding's swizzle, when the host has no view swizzle | spec, the exception to decision 16; review guide, M11 |
 //!
 //! # Where this differs from Eden
@@ -34,6 +36,14 @@
 //!   most [`MAX_TEXTURE_SWIZZLES`], that same number, and refuses more
 //!   ([`KeyError::TooManySwizzles`]) where Eden's fixed-capacity vector has no room. Pinned by
 //!   `tests::the_swizzle_cap_at_its_edge`.
+//! - Eden's compute pipeline cache key, `ComputePipelineCacheKey`
+//!   (`eden-pr4588/src/video_core/renderer_vulkan/vk_pipeline_cache.h` @ e5fb3b97, built in
+//!   `PipelineCache::CurrentComputePipeline`, `vk_pipeline_cache.cpp` line 593), holds only
+//!   `unique_hash`, `shared_memory_size` and `workgroup_size`, so Eden reuses one compute
+//!   pipeline, translated with the first dispatch's local-memory size, for every QMD local size
+//!   of the same program. Here [`VariantKey::local_memory_size`] is part of the key, so
+//!   dispatches with different local sizes get distinct keys and shaders (see "The compute
+//!   local-memory size"). Pinned by `tests::the_local_memory_size_has_its_own_bytes`.
 //!
 //! # The previous stage's stores
 //!
@@ -64,6 +74,65 @@
 //! - **No legacy stores mapping.** Eden also copies `previous_stage_legacy_stores_mapping`; the
 //!   key has no field for it.
 //!
+//! # The vertex outputs' interpolation
+//!
+//! The one place a stage is specialised on the stage after it (spec, "Pipeline-state
+//! specialisation": "A named exception, vertex-output interpolation"; decided by the owner,
+//! 2026-11-20, ruling 2). wgpu refuses a pipeline whose vertex outputs and fragment inputs
+//! differ in interpolation (`wgpu-core` 30.0.2, `validation.rs`:
+//! `InputError::InterpolationMismatch`), and only the pixel program's header (SPH) gives the
+//! mode, so [`VariantKey::output_interpolation`] carries the pixel program's modes for the
+//! vertex stage's outputs. The GPU crate reads the paired pixel program's header when it builds
+//! the draw and fills the field through [`OutputInterpolation::from_pixel_io`]; slice 17's
+//! lowering applies it to the vertex outputs. Until slice 17 lands, nothing in this crate reads
+//! the field: it reaches the lowering only as part of the key.
+//!
+//! [`OutputInterpolation::from_pixel_io`] makes the reduction Eden's `CollectInterpolationInfo`
+//! makes for the pixel program's own inputs, with the same helper [`crate::info::collect`]
+//! uses: per generic attribute, the mode of the components the input map does not mark unused
+//! ([`crate::info::Interpolation::of`]: perspective is smooth, constant is flat, screen-linear
+//! is no-perspective), smooth when every component is unused, and a refusal when the used
+//! components disagree ([`KeyError::MixedInterpolation`]; Eden throws "Per component
+//! interpolation"). So both stages of a pair see the same mode for every generic. A key with
+//! no pixel program, as for a draw with rasterisation off, holds [`OutputInterpolation::SMOOTH`],
+//! Eden's value-initialised `Info::interpolation`.
+//!
+//! Not covered, as in Eden: the legacy colours and fixed-function texture coordinates of the
+//! input map (Eden's `CollectInterpolationInfo` reads the 32 generics only, and
+//! [`crate::info`] does not fill the legacy varyings). Eden's SPIR-V backend has a branch that
+//! decorates a fragment input flat whatever its mode when its `generic_input_types` entry is an
+//! integer type (`eden/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp` @ cf654052),
+//! but no fragment input reaches it: `MakeRuntimeInfo`
+//! (`eden/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp` @ cf654052) fills
+//! `generic_input_types` only under `case Shader::Stage::VertexB`, so a fragment program's
+//! entries keep the value-initialised `AttributeType::Float` and take the header's mode. The key
+//! carries the header's modes only, as Eden applies them; a flat rule for integer inputs in
+//! slice 17 would be a listed divergence from Eden.
+//!
+//! # The compute local-memory size
+//!
+//! [`VariantKey::local_memory_size`] is the size a compute program's local memory is sized
+//! from (`crate::pipeline::local_memory_bytes`); a graphics program's comes from its header,
+//! and the field is ignored for it, as [`VariantKey::shared_memory_size`] is. The spec's
+//! "Compute shaders" says "the variant key holds the workgroup size and shared-memory size";
+//! this field is a third compute field, added because the QMD is the only source of the size
+//! (the spec's pass 6) and a translated shader's array length depends on it, so two dispatches
+//! of one program with different sizes must not share a cached shader (Eden's compute cache
+//! key leaves it out: "Where this differs from Eden").
+//!
+//! **For the owner**: the field departs from three approved sentences, and whether they should
+//! name it, or the size go elsewhere, is the owner's call:
+//!
+//! - "Compute shaders": "the variant key holds the workgroup size and shared-memory size".
+//! - "Pipeline-state specialisation": "Compute: workgroup size (naga needs it as a constant in
+//!   the entry point) and shared-memory size."
+//! - Decision 16: "driver constants for numbers, the variant key for types and structure", as
+//!   this module's header puts it, "the key holds types and structure only; numbers go in the
+//!   driver constants". The local-memory size is a number in the key. It sets the length of a
+//!   naga array type (a private array takes a constant length, not one read at run time), which
+//!   is why it is here, as the workgroup size is for naga's entry point; the alternative is a
+//!   fixed-size array (the cap) bounded by a driver constant.
+//!
 //! # The texture swizzles' binding order
 //!
 //! [`VariantKey::texture_swizzles`] is keyed by **binding order**:
@@ -92,8 +161,10 @@
 //! | 128 | previous stages' stores: one mask per [`FollowingStage`] in [`FollowingStage::ALL`] order, each four 64-bit lanes, lane 0 (attribute words 0 to 63) first |
 //! | 12 | workgroup size x, y, z, 32 bits each |
 //! | 4 | shared-memory size, 32 bits |
+//! | 4 | local-memory size, 32 bits |
 //! | 1 | alpha test: 0 for none, else 1 plus the [`CompareFunction`] code |
 //! | 5 | depth-range rewrite, primitive-restart rewrite, attribute fetch, typed outputs, flipped viewport: 0 or 1 each |
+//! | 32 | the output interpolation: one [`interpolation_code`] per generic attribute, generic 0 first |
 //! | 1 | texture swizzle count, at most [`MAX_TEXTURE_SWIZZLES`] |
 //! | 4 per swizzle | the [`SwizzleSource`] codes of x, y, z, w |
 //!
@@ -110,6 +181,8 @@ use std::fmt::{self, Display, Formatter};
 
 use thiserror::Error;
 
+use crate::info::{self, Interpolation, attribute::GENERICS};
+use crate::sph::PixelIo;
 use crate::translate::{ATTRIBUTE_SPACE_END, COLOR_TARGETS, GuestStage};
 
 /// The version of the byte encoding [`VariantKey::encode`] writes.
@@ -117,7 +190,14 @@ use crate::translate::{ATTRIBUTE_SPACE_END, COLOR_TARGETS, GuestStage};
 /// Version 2 added the flipped-viewport switch (owner's ruling 28 of 2026-11-19). Version 3
 /// replaced version 2's one mask of what the next stage reads with a mask per
 /// [`FollowingStage`] of what the previous stage stores (owner's ruling 8 of 2026-11-19).
-pub const VARIANT_KEY_VERSION: u8 = 3;
+/// Version 4 added the output interpolation (owner's ruling 2 of 2026-11-20).
+/// Version 5 added the compute local-memory size (issue #489).
+pub const VARIANT_KEY_VERSION: u8 = 5;
+
+/// How many generic attributes the output interpolation has a mode for: every generic of the
+/// guest's attribute space ([`GENERICS`]; Eden's `Info::interpolation` has 32 entries,
+/// `eden/src/shader_recompiler/shader_info.h` @ cf654052).
+pub const OUTPUT_GENERICS: usize = GENERICS as usize;
 
 /// How many vertex attributes the guest has (`Maxwell::NumVertexAttributes` = 32,
 /// `eden/src/video_core/engines/maxwell_3d.h` @ cf654052; `RuntimeInfo::generic_input_types`
@@ -152,8 +232,10 @@ pub const VARIANT_KEY_FIXED_SIZE: usize = 1 // version
     + FOLLOWING_STAGES * ATTRIBUTE_MASK_LANES * 8
     + 3 * 4 // workgroup size
     + 4 // shared-memory size
+    + 4 // local-memory size
     + 1 // alpha test
     + 5 // the five emulation switches
+    + OUTPUT_GENERICS // the output interpolation
     + 1; // swizzle count
 
 /// The size of the longest encoded key.
@@ -511,6 +593,69 @@ impl EmulationKey {
     ];
 }
 
+/// Every interpolation mode, in code order: Eden's `Interpolation` in declaration order
+/// (`Smooth`, `Flat`, `NoPerspective`; `eden/src/shader_recompiler/shader_info.h` @
+/// cf654052), which gives the codes.
+pub const INTERPOLATION_MODES: [Interpolation; 3] = [
+    Interpolation::Smooth,
+    Interpolation::Flat,
+    Interpolation::NoPerspective,
+];
+
+/// The code of `mode` in the key's encoding (its index in [`INTERPOLATION_MODES`]).
+pub const fn interpolation_code(mode: Interpolation) -> u8 {
+    match mode {
+        Interpolation::Smooth => 0,
+        Interpolation::Flat => 1,
+        Interpolation::NoPerspective => 2,
+    }
+}
+
+/// The mode with `code`, if there is one.
+pub const fn interpolation_from_code(code: u8) -> Option<Interpolation> {
+    match code {
+        0 => Some(Interpolation::Smooth),
+        1 => Some(Interpolation::Flat),
+        2 => Some(Interpolation::NoPerspective),
+        _ => None,
+    }
+}
+
+/// How the paired pixel program interpolates each generic attribute: the modes the vertex
+/// stage's outputs take (module docs, "The vertex outputs' interpolation").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct OutputInterpolation([Interpolation; OUTPUT_GENERICS]);
+
+impl OutputInterpolation {
+    /// Every generic smooth (perspective-correct): Eden's value-initialised
+    /// `Info::interpolation`, and the key's value with no pixel program.
+    pub const SMOOTH: Self = Self([Interpolation::Smooth; OUTPUT_GENERICS]);
+
+    /// These modes, generic 0 first.
+    pub const fn new(modes: [Interpolation; OUTPUT_GENERICS]) -> Self {
+        Self(modes)
+    }
+
+    /// The modes a pixel program's header gives (module docs, "The vertex outputs'
+    /// interpolation"), or [`KeyError::MixedInterpolation`] naming the lowest generic whose
+    /// used components the input map gives different modes.
+    pub fn from_pixel_io(io: &PixelIo) -> Result<Self, KeyError> {
+        info::interpolation(io)
+            .map(Self)
+            .map_err(|generic| KeyError::MixedInterpolation { generic })
+    }
+
+    /// The modes, generic 0 first.
+    pub const fn modes(self) -> [Interpolation; OUTPUT_GENERICS] {
+        self.0
+    }
+
+    /// The mode of generic `generic`, or `None` past the last generic.
+    pub fn get(self, generic: u8) -> Option<Interpolation> {
+        self.0.get(usize::from(generic)).copied()
+    }
+}
+
 /// The part of 3D engine state a translated shader is specialised on (see the module docs).
 ///
 /// `Default` gives Eden's value-initialised `RuntimeInfo` for the fields it has (every type
@@ -530,8 +675,14 @@ pub struct VariantKey {
     pub workgroup_size: [u32; 3],
     /// A compute program's shared-memory size in bytes.
     pub shared_memory_size: u32,
+    /// A compute program's local-memory size in bytes (module docs, "The compute local-memory
+    /// size").
+    pub local_memory_size: u32,
     /// The render backend's emulation flags.
     pub emulation: EmulationKey,
+    /// How the paired pixel program interpolates each generic attribute, which the vertex
+    /// stage's outputs take (module docs, "The vertex outputs' interpolation").
+    pub output_interpolation: OutputInterpolation,
     /// Each texture binding's swizzle, when the host has no view swizzle, in the binding order
     /// slice 17's lowering assigns (an owner question; see the module docs).
     pub texture_swizzles: TextureSwizzles,
@@ -554,6 +705,8 @@ pub enum KeyField {
     WorkgroupSize(u8),
     /// The shared-memory size.
     SharedMemorySize,
+    /// The local-memory size.
+    LocalMemorySize,
     /// The alpha test.
     AlphaTest,
     /// The depth-range rewrite switch.
@@ -566,6 +719,8 @@ pub enum KeyField {
     TypedOutputs,
     /// The flipped-viewport switch.
     FlippedViewport,
+    /// The interpolation of a generic attribute's vertex output.
+    OutputInterpolation(u8),
     /// The texture swizzle count.
     SwizzleCount,
     /// A component of a texture swizzle (0 is x).
@@ -592,12 +747,16 @@ impl Display for KeyField {
             }
             Self::WorkgroupSize(axis) => write!(f, "the workgroup size along axis {axis}"),
             Self::SharedMemorySize => f.write_str("the shared-memory size"),
+            Self::LocalMemorySize => f.write_str("the local-memory size"),
             Self::AlphaTest => f.write_str("the alpha test"),
             Self::DepthRangeRewrite => f.write_str("the depth-range rewrite switch"),
             Self::PrimitiveRestartRewrite => f.write_str("the primitive-restart rewrite switch"),
             Self::AttributeFetch => f.write_str("the attribute fetch switch"),
             Self::TypedOutputs => f.write_str("the typed outputs switch"),
             Self::FlippedViewport => f.write_str("the flipped-viewport switch"),
+            Self::OutputInterpolation(generic) => {
+                write!(f, "the output interpolation of generic attribute {generic}")
+            }
             Self::SwizzleCount => f.write_str("the texture swizzle count"),
             Self::Swizzle { binding, component } => {
                 write!(f, "component {component} of texture swizzle {binding}")
@@ -642,6 +801,14 @@ pub enum KeyError {
     TooManySwizzles {
         /// How many there are.
         count: usize,
+    },
+    /// A pixel program's input map gives the used components of one generic attribute
+    /// different modes, so the vertex output has no single mode (Eden: "Per component
+    /// interpolation").
+    #[error("the pixel program interpolates generic attribute {generic} differently per component")]
+    MixedInterpolation {
+        /// The lowest such generic attribute.
+        generic: u8,
     },
     /// Bytes follow the end of the key.
     #[error("the variant key ends at byte {end}, but {len} bytes were given")]
@@ -704,7 +871,7 @@ impl Reader<'_> {
 
 /// The index `index` of an array of at most 256 entries, as errors name it.
 fn index_u8(index: usize) -> u8 {
-    // Every array indexed here (attributes, targets, axes, swizzles, components) has at most
+    // Every array indexed here (attributes, targets, axes, generics, swizzles, components) has at most
     // 256 entries, so this never saturates.
     u8::try_from(index).unwrap_or(u8::MAX)
 }
@@ -727,6 +894,7 @@ impl VariantKey {
             out.extend_from_slice(&size.to_le_bytes());
         }
         out.extend_from_slice(&self.shared_memory_size.to_le_bytes());
+        out.extend_from_slice(&self.local_memory_size.to_le_bytes());
         let emulation = &self.emulation;
         out.push(
             emulation
@@ -738,6 +906,7 @@ impl VariantKey {
         out.push(u8::from(emulation.attribute_fetch));
         out.push(u8::from(emulation.typed_outputs));
         out.push(u8::from(emulation.flipped_viewport));
+        out.extend(self.output_interpolation.modes().map(interpolation_code));
         // `TextureSwizzles` holds at most `MAX_TEXTURE_SWIZZLES`, which fits a byte (asserted
         // above), so this never saturates.
         out.push(u8::try_from(swizzles.len()).unwrap_or(u8::MAX));
@@ -778,6 +947,7 @@ impl VariantKey {
             *size = reader.u32(KeyField::WorkgroupSize(index_u8(axis)))?;
         }
         key.shared_memory_size = reader.u32(KeyField::SharedMemorySize)?;
+        key.local_memory_size = reader.u32(KeyField::LocalMemorySize)?;
         key.emulation.alpha_test = reader.coded(KeyField::AlphaTest, |code| match code {
             0 => Some(None),
             code => CompareFunction::from_code(code - 1).map(Some),
@@ -788,6 +958,14 @@ impl VariantKey {
         key.emulation.attribute_fetch = reader.switch(KeyField::AttributeFetch)?;
         key.emulation.typed_outputs = reader.switch(KeyField::TypedOutputs)?;
         key.emulation.flipped_viewport = reader.switch(KeyField::FlippedViewport)?;
+        let mut modes = [Interpolation::Smooth; OUTPUT_GENERICS];
+        for (generic, mode) in modes.iter_mut().enumerate() {
+            *mode = reader.coded(
+                KeyField::OutputInterpolation(index_u8(generic)),
+                interpolation_from_code,
+            )?;
+        }
+        key.output_interpolation = OutputInterpolation::new(modes);
         let count = usize::from(reader.byte(KeyField::SwizzleCount)?);
         if count > MAX_TEXTURE_SWIZZLES {
             return Err(KeyError::TooManySwizzles { count });

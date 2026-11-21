@@ -209,19 +209,34 @@ fn get_audio_renderer_manager_in_a_domain_returns_an_object() {
 }
 
 #[test]
-fn get_work_buffer_size_refuses_a_revision_past_15_with_invalid_revision() {
+fn get_work_buffer_size_refuses_a_revision_past_its_bound_with_invalid_revision() {
     let mut rig = Rig::new(UnknownPolicy::Strict);
     let manager = rig.manager();
-    for revision in [CURRENT_REVISION + 1, u32::from_le_bytes(*b"REv@")] {
+    // Past 15 as a number or `REV` tag, past 16 as a native `REv` tag, and a native tag that
+    // names no revision.
+    for revision in [
+        CURRENT_REVISION + 1,
+        u32::from_le_bytes(*b"REV@"),
+        u32::from_le_bytes(*b"REvA"),
+        u32::from_le_bytes(*b"REv/"),
+    ] {
         let (result, data, _) = rig.send(manager, &work_buffer_size_request(&parameter(revision)));
         assert_eq!((result, data), (INVALID_REVISION, vec![]), "{revision:#x}");
     }
-    // At 15 itself, a size (above): one past it is the refusal.
-    let (result, _, _) = rig.send(
-        manager,
-        &work_buffer_size_request(&parameter(CURRENT_REVISION)),
-    );
-    assert_eq!(result, ResultCode::SUCCESS);
+    // At each bound itself, a size: 15 as a number or `REV?`, 16 as `REv@`, the word a native
+    // title sends, which has revision 15's features and so its size.
+    for revision in [
+        CURRENT_REVISION,
+        u32::from_le_bytes(*b"REV?"),
+        u32::from_le_bytes(*b"REv@"),
+    ] {
+        let (result, data, _) = rig.send(manager, &work_buffer_size_request(&parameter(revision)));
+        assert_eq!(
+            (result, data),
+            (ResultCode::SUCCESS, SIZE_AT_15.to_le_bytes().to_vec()),
+            "{revision:#x}"
+        );
+    }
 }
 
 #[test]
@@ -252,6 +267,10 @@ fn the_results_are_mapped_by_error() {
             word: 16,
             number: 16
         }),
+        INVALID_REVISION
+    );
+    assert_eq!(
+        result_of(WorkBufferError::NoRevision { word: 0x2f76_4552 }),
         INVALID_REVISION
     );
     assert_eq!(result_of(WorkBufferError::Overflow), INVALID_ARGUMENT);

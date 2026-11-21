@@ -30,8 +30,10 @@
 //! | [`IAudioRendererManager`] | 1 | `GetWorkBufferSize` | a [`RendererParameter`] (0x34 bytes) | `u64` size; [`INVALID_REVISION`], or [`INVALID_ARGUMENT`] (a guess) |
 //!
 //! `GetWorkBufferSize` answers [`work_buffer_size`] of the parameter: [`INVALID_REVISION`] for
-//! a revision past 15 (Eden's `Manager::GetWorkBufferSize`: `if
-//! (!CheckValidRevision(params.revision)) return Service::Audio::ResultInvalidRevision`), and
+//! a revision past 15, or past 16 for a native-tagged `REv` word, or for a native word that
+//! names no revision (Eden's `Manager::GetWorkBufferSize`: `if
+//! (!CheckValidRevision(params.revision)) return Service::Audio::ResultInvalidRevision`, with
+//! the bound [`work_buffer`]'s "The revision word" gives), and
 //! [`INVALID_ARGUMENT`] for a parameter whose size would wrap Eden's arithmetic or that has a
 //! negative splitter destination count where a term reads it ([`work_buffer`], "Where this
 //! differs from Eden"). The revision is checked first.
@@ -112,7 +114,8 @@ pub const U_NAME: &str = "aud:u";
 pub const AUDIO_MODULE: u32 = 153;
 
 /// `ResultInvalidRevision` (`errors.h`: `constexpr Result ResultInvalidRevision{ErrorModule::Audio,
-/// 1537}`), which `GetWorkBufferSize` answers for a revision past 15.
+/// 1537}`), which `GetWorkBufferSize` answers for a revision past the bound its tag allows (15,
+/// or 16 for a native `REv` word) or a native word that names no revision.
 pub const INVALID_REVISION: ResultCode = code(AUDIO_MODULE, 1537);
 
 /// `ResultInvalidArgument` (`errors.h`: `constexpr Result ResultInvalidArgument{ErrorModule::Audio,
@@ -204,7 +207,9 @@ impl IAudioRendererManager {
 /// The result `GetWorkBufferSize` answers for `error` (module docs, "Commands").
 const fn result_of(error: WorkBufferError) -> ResultCode {
     match error {
-        WorkBufferError::InvalidRevision { .. } => INVALID_REVISION,
+        WorkBufferError::InvalidRevision { .. } | WorkBufferError::NoRevision { .. } => {
+            INVALID_REVISION
+        }
         WorkBufferError::Overflow | WorkBufferError::NegativeSplitterDestinations(_) => {
             INVALID_ARGUMENT
         }

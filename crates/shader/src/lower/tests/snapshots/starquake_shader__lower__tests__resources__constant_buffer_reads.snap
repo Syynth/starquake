@@ -1,0 +1,50 @@
+---
+source: crates/shader/src/lower/tests/resources.rs
+expression: msl(&shader)
+---
+// language: metal2.4
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using metal::uint;
+
+struct type_3 {
+    metal::uint4 inner[3];
+};
+
+[[max_total_threads_per_threadgroup(1)]] kernel void main_(
+  constant type_3& cbuf5_ [[user(fake0)]]
+) {
+    uint r0_ = {};
+    bool _e4 = 36u < 48u;
+    uint _e6 = _e4 ? (36u & 4294967292u) : 0u;
+    uint _e16 = cbuf5_.inner[_e6 >> 4u][(_e6 >> 2u) & 3u];
+    uint _e17 = _e4 ? _e16 : 0u;
+    bool _e21 = _e17 < 48u;
+    uint _e23 = _e21 ? (_e17 & 4294967295u) : 0u;
+    uint _e33 = cbuf5_.inner[_e23 >> 4u][(_e23 >> 2u) & 3u];
+    uint _e37 = (_e23 & 3u) << 3u;
+    bool _e46 = _e17 < 48u;
+    uint _e48 = _e46 ? (_e17 & 4294967294u) : 0u;
+    uint _e58 = cbuf5_.inner[_e48 >> 4u][(_e48 >> 2u) & 3u];
+    uint _e62 = (_e48 & 3u) << 3u;
+    bool _e70 = 44u < 48u;
+    uint _e72 = _e70 ? (44u & 4294967292u) : 0u;
+    uint _e82 = cbuf5_.inner[_e72 >> 4u][(_e72 >> 2u) & 3u];
+    bool _e89 = _e17 < 48u;
+    uint _e91 = _e89 ? (_e17 & 4294967288u) : 0u;
+    uint _e97 = (_e91 >> 2u) & 3u;
+    uint _e101 = cbuf5_.inner[_e91 >> 4u][_e97];
+    uint _e105 = cbuf5_.inner[_e91 >> 4u][_e97 + 1u];
+    bool _e117 = _e17 < 48u;
+    uint _e119 = _e117 ? (_e17 & 4294967294u) : 0u;
+    uint _e129 = cbuf5_.inner[_e119 >> 4u][(_e119 >> 2u) & 3u];
+    uint _e133 = (_e119 & 3u) << 3u;
+    bool _e143 = 20u < 48u;
+    uint _e145 = _e143 ? (20u & 4294967288u) : 0u;
+    uint _e151 = (_e145 >> 2u) & 3u;
+    uint _e155 = cbuf5_.inner[_e145 >> 4u][_e151];
+    uint _e159 = cbuf5_.inner[_e145 >> 4u][_e151 + 1u];
+    r0_ = ((((_e21 ? as_type<uint>(metal::extract_bits(as_type<int>(_e33), metal::min(_e37, 32u), metal::min(8u, 32u - metal::min(_e37, 32u)))) : 0u) + (_e46 ? metal::extract_bits(_e58, metal::min(_e62, 32u), metal::min(16u, 32u - metal::min(_e62, 32u))) : 0u)) + ((_e89 ? metal::uint2(_e101, _e105) : metal::uint2 {}).y + as_type<uint>(_e70 ? as_type<float>(_e82) : 0.0))) + (_e117 ? as_type<uint>(metal::extract_bits(as_type<int>(_e129), metal::min(_e133, 32u), metal::min(16u, 32u - metal::min(_e133, 32u)))) : 0u)) + (_e143 ? metal::uint2(_e155, _e159) : metal::uint2 {}).x;
+    return;
+}

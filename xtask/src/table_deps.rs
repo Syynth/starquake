@@ -33,7 +33,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::unused_deps::{
-    DEPENDENCY_TABLES, Error, Unused, member_manifests, parse_manifest, tables_package,
+    DEPENDENCY_TABLES, Error, Unused, member_manifests, package_name, parse_manifest,
+    tables_package,
 };
 use crate::walk;
 
@@ -120,11 +121,7 @@ pub fn unused_in_package(
     sources: &Sources,
 ) -> Result<Vec<TableUnused>, Error> {
     let manifest = parse_manifest(path, manifest)?;
-    let Some(package) = manifest
-        .get("package")
-        .and_then(|package| package.get("name"))
-        .and_then(toml::Value::as_str)
-    else {
+    let Some(package) = package_name(&manifest) else {
         return Ok(Vec::new());
     };
     let mut unused: Vec<TableUnused> = declared(&manifest)

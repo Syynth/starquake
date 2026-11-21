@@ -60,7 +60,8 @@
 //!   gone the way above, goes whole to the constant-buffer upload
 //!   ([`ConstantBufferLoad::method`], slice G25): written to guest memory, its ranges added to
 //!   the pending inline writes, so they reach the caches before the next draw, dispatch or
-//!   copy. A refused load is [`ExecError::ConstantBuffer`], with the words still in the mirror.
+//!   copy. A load with a refused word is [`ExecError::ConstantBuffer`] once the words before
+//!   that word are written, with every word still in the mirror.
 //! - **Compute (`C7C0`)**: the inline upload ([`INLINE_C7C0`]) and [`QmdTable::compute_method`];
 //!   each dispatch it decides on becomes a `Command::Dispatch` (`compute`).
 //! - **DMA (`C7B5`)**: [`dma_method`]. **2D (`902D`)**: [`blit_method`]. **Inline (`A140`)**:

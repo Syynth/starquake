@@ -274,6 +274,23 @@ fn a_guest_signal_is_kept_once_per_event() {
 }
 
 #[test]
+fn the_root_s_close_is_kept_once() {
+    let queue = CompletionQueue::new();
+    queue.push(Completion::RootClosed);
+    queue.push(signalled(1));
+    // Folded across an ordered entry too: the drain asks the kernel when it acts on it.
+    queue.push(ordered(3));
+    queue.push(Completion::RootClosed);
+    assert_eq!(
+        queue.take_all(),
+        [Completion::RootClosed, signalled(1), ordered(3)]
+    );
+    // Once drained, the next close is queued again.
+    queue.push(Completion::RootClosed);
+    assert_eq!(queue.take_all(), [Completion::RootClosed]);
+}
+
+#[test]
 fn ordered_reports_are_each_kept() {
     let queue = CompletionQueue::new();
     queue.push(ordered(7));
@@ -405,6 +422,7 @@ fn completion() -> impl Strategy<Value = Completion> {
         (0u32..3).prop_map(room),
         (0u32..3).prop_map(signalled),
         (0..LOCKS).prop_map(released),
+        Just(Completion::RootClosed),
     ]
 }
 
@@ -416,8 +434,8 @@ fn step() -> impl Strategy<Value = Step> {
 }
 
 /// The queue as a list: what the module docs say it keeps. A syncpoint change folds into the
-/// id's last entry if no ordered entry follows it; a room or a signal folds into any entry
-/// naming the same thing.
+/// id's last entry if no ordered entry follows it; a room, a signal or the root's close folds into
+/// any entry naming the same thing.
 fn model_push(model: &mut Vec<Completion>, completion: Completion) {
     match completion {
         Completion::Gpu(GpuCompletion::SyncpointChanged { id, value }) => {
@@ -446,7 +464,9 @@ fn model_push(model: &mut Vec<Completion>, completion: Completion) {
         }
         Completion::Gpu(GpuCompletion::GpuOrdered { .. })
         | Completion::DeviceShareReleased { .. } => model.push(completion),
-        Completion::Gpu(GpuCompletion::GpuQueueRoom { .. }) | Completion::GuestSignalled { .. } => {
+        Completion::Gpu(GpuCompletion::GpuQueueRoom { .. })
+        | Completion::GuestSignalled { .. }
+        | Completion::RootClosed => {
             if !model.contains(&completion) {
                 model.push(completion);
             }
@@ -541,19 +561,21 @@ fn the_snapshot_layout_is_pinned() {
     };
     let lock = kernel.reclaim(kernel.process, 0x0B, 0x0C, 0).unwrap();
     queue.push(Completion::DeviceShareReleased { token: lock });
+    queue.push(Completion::RootClosed);
     let bytes = queue.save().unwrap();
     assert_eq!(
         bytes,
         [
             b'S', b'Q', b'C', b'Q', // magic
-            0x02, // version 2
-            0x05, // five entries
+            0x03, // version 3
+            0x06, // six entries
             0x00, 0x05, 0x82, 0x02, // SyncpointChanged: id 5, value 0x102
             0x01, 0x84, 0x06, // GpuOrdered: ticket 0x304
             0x02, 0x06, // GpuQueueRoom: channel 6
             0x03, 0x07, 0x08, // GuestSignalled: event index 7, generation 8
             0x04, 0x09, 0x0A, 0x0B,
             0x0C, // DeviceShareReleased: process (9, 10), 0xC bytes at 0xB
+            0x05, // RootClosed
         ]
     );
     // It restores to the same queue, with the kernel's token.
@@ -704,10 +726,11 @@ fn an_entry_naming_no_syncpoint_is_refused_at_the_count() {
 fn a_repeated_coalesced_entry_is_refused() {
     // Each coalesced kind twice, at index 2 after an unrelated entry (not an ordered one for the
     // syncpoint, which would make the second change a new entry).
-    let repeats: [&[u8]; 3] = [
+    let repeats: [&[u8]; 4] = [
         &[0x03, 0x00, 0x05, 0x01, 0x02, 0x09, 0x00, 0x05, 0x02], // syncpoint 5 twice
         &[0x03, 0x02, 0x04, 0x01, 0x09, 0x02, 0x04],             // channel 4 twice
         &[0x03, 0x03, 0x04, 0x05, 0x01, 0x09, 0x03, 0x04, 0x05], // event (4, 5) twice
+        &[0x03, 0x05, 0x01, 0x09, 0x05],                         // the root's close twice
     ];
     for body in repeats {
         let error = CompletionQueue::restore(&snapshot(body), &locks())

@@ -20,6 +20,7 @@
 //! | The thread that learns the host GPU is past the work that could use a device-share lock | [`CompletionQueue::push`] | [`Completion::DeviceShareReleased`] |
 //! | nvsrv's family, when the server's last session closes and frees the process's nvmap handles ([`crate::nvsrv::nvmap`], "When the process's last session closes"), with the kernel's lock held | [`CompletionQueue::push`] | [`Completion::DeviceShareReleased`], one per handle that held a lock, in ascending handle order |
 //! | gsv's syncpt session, arming a wait the counter already satisfies, so the drain fires and records it ([`crate::syncpt`], "Commands": 201) | [`CompletionQueue::push`] | [`Completion::Gpu`] with [`GpuCompletion::SyncpointChanged`] |
+//! | The root's family, when the root server's last session closes ([`crate::root`], "The shared syncpoint page (204)"), possibly with the kernel's lock held | [`CompletionQueue::push`] | [`Completion::RootClosed`] |
 //!
 //! **A device-share release** (owner's ruling of 2026-11-17, graphics-server "The model"):
 //! taking a device-share lock returns a token naming the process and the exact range
@@ -48,7 +49,9 @@
 //! A hostile title can make a host thread push without limit: one submission's increment value
 //! (`SubmitGPFIFO` flag bit 8) is a `u32`, and each increment of a watched id is a push, and each
 //! guest `SignalEvent` on a hooked event is one. So three kinds, each a report of state that a
-//! later report of the same thing replaces, are kept once per thing while queued.
+//! later report of the same thing replaces, are kept once per thing while queued, and so is a
+//! fourth, [`Completion::RootClosed`], which each session the guest opens and closes again can
+//! push.
 //!
 //! Two kinds are **ordered entries**, never coalesced and never folded across by a syncpoint
 //! change: [`GpuCompletion::GpuOrdered`] and [`Completion::DeviceShareReleased`]. Below, "an
@@ -74,6 +77,9 @@
 //!   all the later one would.
 //! - [`Completion::GuestSignalled`]: one entry per event (`a_guest_signal_is_kept_once_per_event`),
 //!   folded across ordered entries likewise.
+//! - [`Completion::RootClosed`]: one entry in all (`the_root_s_close_is_kept_once`), folded
+//!   across ordered entries likewise: the drain asks the kernel, when it acts on it, whether a
+//!   root session is open, so a later close says nothing an earlier entry does not.
 //!
 //! [`GpuCompletion::GpuOrdered`] is never coalesced: each ticket is one ordered update or
 //! barrier gsv asked for, so their number is bounded by gsv's own requests, and every one is
@@ -97,7 +103,7 @@
 //! no two of which fold together drain exactly in push order
 //! (`scripted_completions_drain_in_push_order`); a folded repeat drains at its entry's place,
 //! which is earlier than its push, never across an ordered entry for a syncpoint change, and
-//! possibly across one for a room report or a guest signal.
+//! possibly across one for a room report, a guest signal or the root's close.
 //!
 //! # Never blocking
 //!
@@ -130,7 +136,8 @@
 //! releases of the same range), and that the entry is not one the
 //! queue would have folded into an earlier entry (a syncpoint change whose id has an entry with
 //! no ordered entry after it, or a room report or guest signal naming what an earlier entry
-//! names). Saving runs the same entry checks on what it is about to write, all but the
+//! names, or a second root's close). Saving runs the same entry checks on what it is about to
+//! write, all but the
 //! kernel's: a queued token is one the kernel made.
 //!
 //! **A token held across a snapshot.** A release can be queued when a snapshot is taken, so
@@ -177,8 +184,8 @@ mod tests;
 pub const SNAPSHOT_MAGIC: [u8; 4] = *b"SQCQ";
 
 /// Layout version written into every completion-queue snapshot and required when reading one.
-/// Version 2 added [`Saved::DeviceShareReleased`].
-pub const SNAPSHOT_VERSION: u32 = 2;
+/// Version 2 added [`Saved::DeviceShareReleased`], version 3 [`Saved::RootClosed`].
+pub const SNAPSHOT_VERSION: u32 = 3;
 
 /// What a host thread reports to the graphics server (graphics-server, "Who signals what: the
 /// completion queue"). See the module docs for the variants the spec's enum holds that this one
@@ -198,6 +205,10 @@ pub enum Completion {
         /// The token the lock returned.
         token: DeviceShareToken,
     },
+    /// The root server's last open session has closed: the drain lets the shared syncpoint
+    /// page go if no root session is open when it acts ([`crate::shared::page`], "When the root
+    /// closes"). Kept once while queued (module docs, "Coalescing").
+    RootClosed,
 }
 
 /// How a restore takes a saved device-share release back (module docs, "A token held across a
@@ -261,6 +272,8 @@ enum Slot {
     Signalled(ObjectId),
     /// A device-share lock may be released.
     Released(DeviceShareToken),
+    /// The root's last session closed.
+    RootClosed,
 }
 
 /// What the queue holds.
@@ -279,6 +292,8 @@ struct Pending {
     rooms: BTreeSet<ChannelId>,
     /// The events with a queued guest signal.
     signalled: BTreeSet<ObjectId>,
+    /// Whether the root's close is queued.
+    root_closed: bool,
 }
 
 impl Pending {
@@ -316,6 +331,12 @@ impl Pending {
                 self.last_ordered = Some(self.order.len());
                 Slot::Released(token)
             }
+            Completion::RootClosed => {
+                if core::mem::replace(&mut self.root_closed, true) {
+                    return false;
+                }
+                Slot::RootClosed
+            }
         };
         self.order.push_back(slot);
         true
@@ -344,6 +365,7 @@ impl Pending {
             Slot::Room(channel) => Completion::Gpu(GpuCompletion::GpuQueueRoom { channel }),
             Slot::Signalled(event) => Completion::GuestSignalled { event },
             Slot::Released(token) => Completion::DeviceShareReleased { token },
+            Slot::RootClosed => Completion::RootClosed,
         })
     }
 }
@@ -587,6 +609,8 @@ enum Saved {
         /// How many bytes are locked.
         size: u64,
     },
+    /// [`Completion::RootClosed`].
+    RootClosed,
 }
 
 impl From<Completion> for Saved {
@@ -610,6 +634,7 @@ impl From<Completion> for Saved {
                 address: token.address(),
                 size: token.size(),
             },
+            Completion::RootClosed => Self::RootClosed,
         }
     }
 }
@@ -656,6 +681,7 @@ impl Saved {
                 *earlier = earlier.saturating_add(1);
                 Completion::DeviceShareReleased { token }
             }
+            Self::RootClosed => Completion::RootClosed,
         })
     }
 }
