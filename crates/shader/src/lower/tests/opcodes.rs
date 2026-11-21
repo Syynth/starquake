@@ -97,6 +97,13 @@ const LOWERED: &[Opcode] = &[
     Opcode::GetAttribute,
     Opcode::SetAttribute,
     Opcode::SetFragColor,
+    Opcode::GetCbufU8,
+    Opcode::GetCbufS8,
+    Opcode::GetCbufU16,
+    Opcode::GetCbufS16,
+    Opcode::GetCbufU32,
+    Opcode::GetCbufF32,
+    Opcode::GetCbufU32x2,
     Opcode::GetZFlag,
     Opcode::GetSFlag,
     Opcode::GetCFlag,
@@ -326,9 +333,13 @@ const IN_BOUNDS_OF_A_SHUFFLE: Opcode = Opcode::GetInBoundsFromOp;
 /// with [`LowerError::Operation`] naming it when its own instruction is the first fault.
 #[test]
 fn every_opcode_is_lowered_or_refused() {
+    // Bank 0, which the constant-buffer reads below name, is declared (`resources`).
+    let mut constant_buffers = [0; CONSTANT_BUFFER_SLOTS];
+    constant_buffers[0] = crate::info::CBUF_ALIGNMENT;
     let inputs = LowerInputs {
         local_memory_bytes: 16,
         shared_memory_bytes: 16,
+        constant_buffers,
         ..LowerInputs::DEFAULT
     };
     let mut refused_alone = 0;

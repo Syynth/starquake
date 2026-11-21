@@ -19,7 +19,7 @@ use crate::decode::{
 };
 use crate::exchange::{EngineState, TextureKind, exchange};
 use crate::flow::FlowError;
-use crate::host::HostStage;
+use crate::host::{Feature, HostStage, ResourceKind, ResourceSlot, ResourceSource};
 use crate::info::InfoError;
 use crate::interp::Machine;
 use crate::ir::{ATTRIBUTE_WORD_BYTES, Attribute, Node};
@@ -370,7 +370,18 @@ fn through_the_cache(
     engine: &State,
     variant: &VariantKey,
 ) -> Result<Arc<HostShader>, Arc<Rejection>> {
-    let mut cache = ShaderCache::new(Arc::new(PipelineTranslator), Arc::new(Threads), TARGET);
+    through_the_cache_to(TARGET, stage, program, engine, variant)
+}
+
+/// [`through_the_cache`] with the host target `target`.
+fn through_the_cache_to(
+    target: HostTarget,
+    stage: GuestStage,
+    program: &[u8],
+    engine: &State,
+    variant: &VariantKey,
+) -> Result<Arc<HostShader>, Arc<Rejection>> {
+    let mut cache = ShaderCache::new(Arc::new(PipelineTranslator), Arc::new(Threads), target);
     let memory = Memory(program.to_vec());
     let request = [ProgramRequest {
         stage,
@@ -493,8 +504,8 @@ fn table_value(index: u32) -> u32 {
 /// A `BRX` whose table the answers give is translated with its targets: the program entry asks
 /// for the table's two words, the exchange answers them, flow analysis takes the targets, and
 /// the interpreter goes where the selector says. Through the cache the same program gets past
-/// flow analysis and is refused only by the lowering, at the table's constant-buffer load,
-/// which slice 13 and 17 lower.
+/// flow analysis and the table's constant-buffer load (slice 17 lowers it), and is refused only
+/// for what the test target lacks: the funnel shift's 64-bit integers.
 #[test]
 fn a_brx_the_answers_resolve_translates() {
     let header = vertex_header(0);
@@ -543,18 +554,56 @@ fn a_brx_the_answers_resolve_translates() {
         );
     }
     let refused = through_the_cache(GuestStage::Vertex, &program, &state, &VariantKey::default())
-        .expect_err("the constant-buffer load is not lowered yet");
-    assert!(
-        matches!(
-            &*refused,
-            Rejection::Lower(LowerError::Operation {
-                at,
-                opcode: Opcode::GetCbufU32,
-            }) if at.index() == 22
-        ),
+        .expect_err("the target has no 64-bit integers");
+    assert_eq!(
+        *refused,
+        Rejection::Lower(LowerError::Missing(Feature::Int64)),
         "{refused:?}"
     );
-    assert_eq!(refused.to_string(), "%22: GetCbufU32 is not lowered yet");
+    assert_eq!(
+        refused.to_string(),
+        "the shader needs 64-bit integers, which the host target lacks"
+    );
+}
+
+/// Through the cache's production translator, with a target that has the 64-bit integers the
+/// funnel shift needs, the `BRX` program of `a_brx_the_answers_resolve_translates` is ready, and
+/// its resource table is the one bank its table load reads, sized by collect info to the end of
+/// the indexed read (the whole bank, `INDEXED_CBUF_SIZE`), in the vertex stage's group at the
+/// bank's binding: slice 17's table from program bytes to module.
+#[test]
+fn a_constant_buffer_load_reaches_the_resource_table() {
+    let header = vertex_header(0);
+    let program = bytes(Some(&header), &selector_program(0));
+    let state = State {
+        table: vec![table_value(FIRST), table_value(SECOND)],
+    };
+    let target = HostTarget {
+        caps: Requirements {
+            i64: true,
+            ..TARGET.caps
+        },
+        ..TARGET
+    };
+    let shader = through_the_cache_to(
+        target,
+        GuestStage::Vertex,
+        &program,
+        &state,
+        &VariantKey::default(),
+    )
+    .expect("ready");
+    assert_eq!(
+        shader.resources,
+        [ResourceSlot {
+            group: 0,
+            binding: 1 + u32::from(TABLE_BANK),
+            kind: ResourceKind::UniformBuffer {
+                size: crate::info::INDEXED_CBUF_SIZE,
+            },
+            source: ResourceSource::ConstantBuffer { bank: TABLE_BANK },
+        }]
+    );
 }
 
 /// A `BRX` whose table words the engine does not have reads them as 0, which names no

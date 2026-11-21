@@ -5,9 +5,14 @@
 //! code, entry point, inputs, outputs and requirements. Slice 16 adds compute shaders (the
 //! [`HostStage::Compute`] stage and [`HostShader::workgroup_size`]), the 16-bit float and
 //! 64-bit integer requirements, and the host target's features the lowering honours
-//! ([`HostCaps`]). The resource table joins with slice 13; the driver-constants layout, which
-//! slice 9 defines ([`crate::driver_constants::DriverConstantsLayout`]), joins with slice 17,
-//! which lowers reads of it; and the SPIR-V and MSL forms of `HostCode` with slice 22.
+//! ([`HostCaps`]). Slice 17 adds the resource table ([`HostShader::resources`], with the
+//! binding convention of [`crate::lower`]'s "Resources") and the driver-constants layout
+//! ([`HostShader::driver_constants`]), which slice 9 defines
+//! ([`crate::driver_constants::DriverConstantsLayout`]); so far the table holds the driver
+//! constants and the constant-buffer banks, and the textures, samplers and storage buffers
+//! join with the rest of slice 17. The SPIR-V and MSL forms of `HostCode` come with slice 22.
+
+use crate::driver_constants::DriverConstantsLayout;
 
 /// The host pipeline stage of a shader.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -213,6 +218,47 @@ impl Requirements {
     }
 }
 
+/// What the module declares at a resource binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ResourceKind {
+    /// A uniform buffer of `size` bytes: the module reads bytes `0..size` of the buffer bound
+    /// there (a multiple of 16, the uniform address space's array stride).
+    UniformBuffer {
+        /// The bytes the module declares.
+        size: u32,
+    },
+}
+
+/// What fills a resource binding: where the GPU crate takes the bound resource from (spec,
+/// "What the GPU front/back protocol and engine state (#12) gets": "It binds constant buffers
+/// ... as the shader's resource table says").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ResourceSource {
+    /// The per-draw driver constants ([`crate::driver_constants`]), in the layout
+    /// [`HostShader::driver_constants`] names.
+    DriverConstants,
+    /// Guest constant-buffer bank `bank` (0 to 31) of the shader's stage, from its start.
+    ConstantBuffer {
+        /// The bank.
+        bank: u8,
+    },
+}
+
+/// One resource a shader binds, at the group and binding the lowering assigned and wrote into
+/// the module (spec, "What the render backend (#14) gets": "the render backend does not guess
+/// it"; the convention is [`crate::lower`]'s "Resources").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ResourceSlot {
+    /// The bind group.
+    pub group: u32,
+    /// The binding in the group.
+    pub binding: u32,
+    /// What the module declares there.
+    pub kind: ResourceKind,
+    /// What fills it.
+    pub source: ResourceSource,
+}
+
 /// One translated shader.
 #[derive(Clone, Debug)]
 pub struct HostShader {
@@ -226,6 +272,11 @@ pub struct HostShader {
     pub inputs: Vec<InterfaceSlot>,
     /// The outputs, in binding order (built-ins, then locations ascending).
     pub outputs: Vec<InterfaceSlot>,
+    /// The resources, in binding order (group, then binding, ascending).
+    pub resources: Vec<ResourceSlot>,
+    /// The driver-constants layout the module reads, when [`Self::resources`] has a
+    /// [`ResourceSource::DriverConstants`] row; [`DriverConstantsLayout::CURRENT`] always.
+    pub driver_constants: DriverConstantsLayout,
     /// What the device must support.
     pub requirements: Requirements,
     /// A compute shader's workgroup size, x, y and z (from the variant key); `None` for the
