@@ -65,6 +65,7 @@
 //! | `GpuCompletion::GpuQueueRoom` | records `QueueRoom`; then gives the channel's waiting submissions to the front again, oldest first, completing the reply of each one it queues, until the front answers `Full` ([`crate::nvsrv::gpu::submits::Submits::room`]) |
 //! | [`Completion::GuestSignalled`] | records nothing (the guest's `SignalEvent` is recorded as its system call); if the event is the bound shared page's request event, marks the page signalled, and the next page turn ([`Shared::tick_page`]) reads the request and records what it answers ([`page`]) |
 //! | [`Completion::DeviceShareReleased`] | unlocks through the kernel with the token ([`TimerHost::unlock_device_share`]), which checks it; records nothing (the spec's "What is recorded" has no note for it) |
+//! | [`Completion::RootClosed`] | if the shared page is bound and the kernel says no root session is open ([`TimerHost::root_sessions`]), unbinds it and drops the root's references to its two transfer memories ([`TimerHost::release_kept_transfer_memory`]; [`page`], "When the root closes"); records nothing (the guest's `CloseHandle` or process end that closed the session is recorded as its system call) |
 //!
 //! The kernel's refusal of a release is logged, and the drain goes on: a token whose process
 //! has ended is refused as a matter of course (the process ended while the GPU still had work
@@ -221,6 +222,28 @@ pub trait TimerHost {
         _offset: u64,
         _data: &[u8],
     ) -> SvcResult<()> {
+        Err(KernelError::NotImplemented)
+    }
+
+    /// Drops the reference the root's server keeps to the transfer memory `memory` names,
+    /// through the kernel (`Dispatcher::release_kept_transfer_memory` for the root's service):
+    /// how the drain lets the shared page's memories go once the root has closed ([`page`],
+    /// "When the root closes"). The kernel's errors are its own: `InvalidHandle` when the root's
+    /// server keeps no reference to `memory`.
+    ///
+    /// The default answers `NotImplemented`: a host for a run with no shared page need not offer
+    /// it.
+    fn release_kept_transfer_memory(&mut self, _memory: ObjectId) -> SvcResult<()> {
+        Err(KernelError::NotImplemented)
+    }
+
+    /// How many sessions on the root's server are open, through the kernel
+    /// (`Dispatcher::open_sessions` for the root's service): what the drain asks before it lets
+    /// the shared page go ([`page`], "When the root closes").
+    ///
+    /// The default answers `NotImplemented`, the same as for
+    /// [`TimerHost::release_kept_transfer_memory`].
+    fn root_sessions(&mut self) -> SvcResult<usize> {
         Err(KernelError::NotImplemented)
     }
 }
@@ -517,6 +540,7 @@ impl Shared {
                     tracing::trace!(?completion, "gsv drained a guest signal");
                     state.state.page.guest_signalled(event);
                 }
+                Completion::RootClosed => state.root_closed(host),
                 Completion::Gpu(gpu) => {
                     host.record(note(gpu).event(self.service));
                     if let GpuCompletion::GpuOrdered { ticket } = gpu

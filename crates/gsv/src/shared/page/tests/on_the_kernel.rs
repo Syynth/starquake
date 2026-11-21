@@ -3,9 +3,15 @@
 //! by its own `CreateTransferMemory`, 204 sent through the kernel, and the restore's checks run
 //! against what the kernel then holds (owner's ruling of 2026-11-17: hooks are re-attached by
 //! their owner in its restore step, checked against the restored events). Each refusal is also
-//! run on [`Holding`] holding the same objects, which must answer alike.
+//! run on [`Holding`] holding the same objects, which must answer alike. The root's own
+//! references to the page's memories are followed here end to end too: the title closes its
+//! handles and the page still answers through the kernel, and the root's last session closing
+//! lets them go (issue 499).
+
+use std::sync::{OnceLock, Weak};
 
 use starquake_cpu::GuestRegs;
+use starquake_ipc::CommandType;
 use starquake_kernel::dispatch::{Caller, Outcome};
 use starquake_kernel::handle::HandleTable;
 use starquake_kernel::ipc::PortName;
@@ -17,16 +23,19 @@ use starquake_memory::{FlatMemory, GuestMemory, PAGE_SIZE};
 use starquake_trace::{FixedClock, GuestTicks, LiveEnv, Recorder, ThreadId};
 
 use super::*;
+use crate::completion::Wake;
 
 /// The process's memory: the message buffer, the port name, the title's writable memory, its
-/// read-only memory, and one more page it lends at the writable memory's size.
+/// read-only memory, one more page it lends at the writable memory's size, and one more range
+/// it lends at the read-only memory's size.
 const BASE: u64 = 0x8000_0000;
 const TLS: u64 = BASE;
 const NAME: u64 = BASE + PAGE_SIZE;
 const AT_WRITABLE: u64 = BASE + 2 * PAGE_SIZE;
 const AT_READ_ONLY: u64 = AT_WRITABLE + WRITABLE_SIZE as u64;
 const AT_EXTRA: u64 = AT_READ_ONLY + READ_ONLY_SIZE as u64;
-const END: u64 = AT_EXTRA + WRITABLE_SIZE as u64;
+const AT_EXTRA_READ_ONLY: u64 = AT_EXTRA + WRITABLE_SIZE as u64;
+const END: u64 = AT_EXTRA_READ_ONLY + READ_ONLY_SIZE as u64;
 
 struct NoDebug;
 
@@ -37,19 +46,30 @@ impl DebugSink for NoDebug {
 /// A Switch 2 process whose memory is all read-write, the root server with the page on the port
 /// `gsvt:` as [`ROOT`], and the title's page bound through it.
 struct KernelRig {
-    dispatcher: Dispatcher,
+    dispatcher: Arc<Dispatcher>,
     memory: FlatMemory,
     env: LiveEnv,
     recorder: Recorder,
     shared: Arc<Shared>,
-    /// The guest's handles to the request event's writable end and to the answer event.
+    /// The guest's handle to the request event's writable end.
     request: Handle,
     /// A third transfer memory the guest lent, of [`WRITABLE_SIZE`] bytes.
     extra: ObjectId,
+    /// A fourth, of [`READ_ONLY_SIZE`] bytes.
+    extra_read_only: ObjectId,
+    /// The guest's root session.
+    session: Handle,
+    /// The guest's handles to its writable and read-only memories.
+    memories: [Handle; 2],
 }
 
 impl KernelRig {
     fn bound() -> Self {
+        Self::bound_with(fresh_shared())
+    }
+
+    /// [`KernelRig::bound`] with `shared` as gsv's shared state.
+    fn bound_with(shared: Arc<Shared>) -> Self {
         let (mapper, _log) = RecordingMapper::new();
         let layout = ProcessMemory {
             code_address: BASE,
@@ -63,8 +83,9 @@ impl KernelRig {
             .set_process_memory_permission(BASE, END - BASE, SvcPermission::ReadWrite)
             .unwrap();
         let description = ProcessDescription::homebrew(Console::Switch2);
-        let dispatcher = Dispatcher::new(process::create(&description, space).unwrap());
-        let shared = fresh_shared();
+        let dispatcher = Arc::new(Dispatcher::new(
+            process::create(&description, space).unwrap(),
+        ));
         let server =
             root_server_with_page(RootState::new(), UnknownPolicy::Strict, Arc::clone(&shared))
                 .with_service_id(ROOT);
@@ -84,14 +105,21 @@ impl KernelRig {
             shared,
             request: Handle::from_raw(0),
             extra: ObjectId::from_parts(0, 0),
+            extra_read_only: ObjectId::from_parts(0, 0),
+            session: Handle::from_raw(0),
+            memories: [Handle::from_raw(0); 2],
         };
         let writable = rig.lend(AT_WRITABLE, WRITABLE_SIZE, SvcPermission::None);
         let read_only = rig.lend(AT_READ_ONLY, READ_ONLY_SIZE, SvcPermission::Read);
+        rig.memories = [writable, read_only];
         let extra = rig.lend(AT_EXTRA, WRITABLE_SIZE, SvcPermission::None);
         rig.extra = rig.object(extra);
+        let extra_read_only = rig.lend(AT_EXTRA_READ_ONLY, READ_ONLY_SIZE, SvcPermission::Read);
+        rig.extra_read_only = rig.object(extra_read_only);
         // 204 through the kernel, as the title sends it.
         rig.memory.write(NAME, b"gsvt:\0").unwrap();
         let session = Handle::from_register(rig.call(SvcId::ConnectToNamedPort, [0, NAME]).x[1]);
+        rig.session = session;
         let mut buffer = vec![0; starquake_ipc::BUFFER_SIZE];
         let words = bind_words(writable.raw(), read_only.raw());
         let bytes = le(&words);
@@ -172,6 +200,184 @@ impl KernelRig {
     fn page(&self) -> Page {
         self.shared.lock().page().clone()
     }
+
+    /// The guest's `CloseHandle` of `handle`.
+    fn close(&self, handle: Handle) {
+        let regs = self.call(SvcId::CloseHandle, [u64::from(handle.raw()), 0]);
+        assert_eq!(regs.x[0], 0);
+    }
+
+    /// The references the root keeps to the bound page's writable and read-only memories.
+    fn kept(&self, binding: Binding) -> [u32; 2] {
+        [
+            self.dispatcher.kept_transfer_memory(ROOT, binding.writable),
+            self.dispatcher
+                .kept_transfer_memory(ROOT, binding.read_only),
+        ]
+    }
+
+    /// Plays the timer thread's turn at `now` over the kernel's dispatcher: the drain, then the
+    /// page turn.
+    fn turn(&self, now: HostNanos) {
+        let mut host = OnTheKernel {
+            dispatcher: &self.dispatcher,
+            memory: &self.memory,
+        };
+        self.shared.drain(&mut host);
+        self.shared.tick_page(&mut host, now);
+    }
+
+    /// The `u64` at `offset` of the title's memory starting at `base`.
+    fn word(&self, base: u64, offset: u64) -> u64 {
+        let mut bytes = [0; 8];
+        self.memory.read(base + offset, &mut bytes).unwrap();
+        u64::from_le_bytes(bytes)
+    }
+
+    /// The result word of the guest's `CreateTransferMemory` of its writable memory's range
+    /// again: refused while a lend still locks it, taken once none does.
+    fn lend_writable_again(&self) -> u64 {
+        let bits = u64::from(SvcPermission::None.bits());
+        self.call4(
+            SvcId::CreateTransferMemory,
+            [0, AT_WRITABLE, u64::from(WRITABLE_SIZE), bits],
+        )
+        .x[0]
+    }
+}
+
+/// The timer thread's host over the kernel's dispatcher, as the wiring's is
+/// (`starquake-core`'s `hle::graphics`): the page's memories are read and written through the
+/// dispatcher, and the root's references dropped and its sessions counted for [`ROOT`].
+struct OnTheKernel<'a> {
+    dispatcher: &'a Dispatcher,
+    memory: &'a FlatMemory,
+}
+
+impl TimerHost for OnTheKernel<'_> {
+    fn record(&mut self, _: EventKind) {}
+
+    fn unlock_device_share(&mut self, token: DeviceShareToken) -> Result<(), DeviceShareError> {
+        self.dispatcher.unlock_device_share(token)
+    }
+
+    fn signal_event(&mut self, event: ObjectId) -> SvcResult<()> {
+        let env = LiveEnv::new(FixedClock::new(0, 1), 0);
+        self.dispatcher
+            .signal_event(event, &env, &Recorder::new())
+            .map_err(|_| KernelError::InvalidState)
+    }
+
+    fn read_transfer_memory(
+        &mut self,
+        memory: ObjectId,
+        offset: u64,
+        out: &mut [u8],
+    ) -> SvcResult<()> {
+        self.dispatcher
+            .read_transfer_memory(self.memory, memory, offset, out)
+    }
+
+    fn write_transfer_memory(
+        &mut self,
+        memory: ObjectId,
+        offset: u64,
+        data: &[u8],
+    ) -> SvcResult<()> {
+        self.dispatcher
+            .write_transfer_memory(self.memory, memory, offset, data)
+    }
+
+    fn release_kept_transfer_memory(&mut self, memory: ObjectId) -> SvcResult<()> {
+        self.dispatcher.release_kept_transfer_memory(ROOT, memory)
+    }
+
+    fn root_sessions(&mut self) -> SvcResult<usize> {
+        Ok(self.dispatcher.open_sessions(ROOT))
+    }
+}
+
+#[test]
+fn the_page_answers_after_the_title_closes_its_handles_and_the_root_s_close_lets_it_go() {
+    let rig = KernelRig::bound();
+    let binding = rig.page().binding().unwrap();
+    assert_eq!(rig.kept(binding), [1, 1]);
+    // The title closes both its handles: the root's references keep the memories, still
+    // locked.
+    rig.close(rig.memories[0]);
+    rig.close(rig.memories[1]);
+    assert_eq!(rig.kept(binding), [1, 1]);
+    assert!(rig.dispatcher.transfer_memory(binding.writable).is_ok());
+    assert!(rig.dispatcher.transfer_memory(binding.read_only).is_ok());
+    assert_eq!(
+        rig.lend_writable_again(),
+        u64::from(KernelError::InvalidCurrentMemory.code().raw())
+    );
+    // It asks about a syncpoint whose counter moved, and signals: the answer is written into
+    // its memories through the kernel.
+    let value = rig.shared.syncpoints().increment(id(SP));
+    let group = usize::from(SP) / GROUP_BITS;
+    let bit = 1u64 << (usize::from(SP) % GROUP_BITS);
+    rig.memory
+        .write(
+            AT_WRITABLE + group_offset(SLOT_REQUEST_OFFSET, group),
+            &bit.to_le_bytes(),
+        )
+        .unwrap();
+    rig.memory
+        .write(
+            AT_WRITABLE + u64::from(GROUP_REQUEST_OFFSET),
+            &(1u64 << group).to_le_bytes(),
+        )
+        .unwrap();
+    rig.signal();
+    rig.turn(T0);
+    assert_eq!(
+        rig.word(AT_READ_ONLY, value_offset(id(SP))),
+        u64::from(value)
+    );
+    assert_eq!(
+        rig.word(AT_READ_ONLY, group_offset(SLOT_ACK_OFFSET, group)),
+        bit
+    );
+    assert_eq!(
+        rig.word(AT_READ_ONLY, u64::from(GROUP_ACK_OFFSET)),
+        1 << group
+    );
+    // The title closes its root session, the only one: the drain drops the root's references,
+    // the memories go, and the title's pages are its own again.
+    rig.close(rig.session);
+    assert_eq!(rig.dispatcher.open_sessions(ROOT), 0);
+    rig.turn(T0);
+    assert_eq!(rig.kept(binding), [0, 0]);
+    assert_eq!(
+        rig.dispatcher.transfer_memory(binding.writable),
+        Err(KernelError::InvalidHandle)
+    );
+    assert_eq!(
+        rig.dispatcher.transfer_memory(binding.read_only),
+        Err(KernelError::InvalidHandle)
+    );
+    assert_eq!(rig.page().binding(), None);
+    assert_eq!(rig.lend_writable_again(), 0);
+}
+
+#[test]
+fn the_root_s_close_leaves_the_title_s_own_hold_on_its_memories() {
+    let rig = KernelRig::bound();
+    let binding = rig.page().binding().unwrap();
+    rig.close(rig.session);
+    rig.turn(T0);
+    assert_eq!(rig.kept(binding), [0, 0]);
+    assert_eq!(rig.page().binding(), None);
+    // The title still holds its handles: the memories stay, locked, until it closes them.
+    assert!(rig.dispatcher.transfer_memory(binding.writable).is_ok());
+    assert_eq!(
+        rig.lend_writable_again(),
+        u64::from(KernelError::InvalidCurrentMemory.code().raw())
+    );
+    rig.close(rig.memories[0]);
+    assert_eq!(rig.lend_writable_again(), 0);
 }
 
 #[test]
@@ -187,7 +393,7 @@ fn a_page_restored_on_the_kernel_hears_the_guest_s_signal() {
     // The restore re-attaches the hook, to the restored state's queue.
     let restored = fresh_shared();
     restored
-        .restore_page(&saved, &rig.dispatcher, ROOT)
+        .restore_page(&saved, &*rig.dispatcher, ROOT)
         .unwrap();
     assert_eq!(restored.lock().page(), &rig.page());
     rig.signal();
@@ -278,7 +484,73 @@ fn corrupt_pages(rig: &KernelRig) -> Vec<(Page, PageSnapshotError)> {
             },
         ),
     ];
-    cases.into()
+    let mut cases: Vec<_> = cases.into();
+    cases.extend(unkept_pages(rig, &page));
+    // Unbound, while the root keeps the bound page's two references: nothing would ever drop
+    // them.
+    cases.push((
+        corrupt(&|page| page.binding = None),
+        PageSnapshotError::UnaccountedKept {
+            kept: KEPT_PER_BINDING,
+            accounted: 0,
+        },
+    ));
+    cases
+}
+
+/// The bound rig's `page` naming live memories of the right sizes that the root does not keep,
+/// with the error: each check of the root's references, and their order against each other and
+/// against the size check.
+fn unkept_pages(rig: &KernelRig, page: &Page) -> [(Page, PageSnapshotError); 4] {
+    let binding = page.binding().unwrap();
+    let corrupt = |change: &dyn Fn(&mut Page)| {
+        let mut page = page.clone();
+        change(&mut page);
+        page
+    };
+    [
+        // Live memories of the right sizes that the root does not keep.
+        (
+            corrupt(&|page| {
+                page.binding = Some(Binding {
+                    writable: rig.extra,
+                    ..binding
+                });
+            }),
+            PageSnapshotError::WritableNotKept,
+        ),
+        (
+            corrupt(&|page| {
+                page.binding = Some(Binding {
+                    read_only: rig.extra_read_only,
+                    ..binding
+                });
+            }),
+            PageSnapshotError::ReadOnlyNotKept,
+        ),
+        // Both unkept: the writable memory's is reported.
+        (
+            corrupt(&|page| {
+                page.binding = Some(Binding {
+                    writable: rig.extra,
+                    read_only: rig.extra_read_only,
+                });
+            }),
+            PageSnapshotError::WritableNotKept,
+        ),
+        // Unkept and the wrong size: the size is reported.
+        (
+            corrupt(&|page| {
+                page.binding = Some(Binding {
+                    writable: rig.extra_read_only,
+                    ..binding
+                });
+            }),
+            PageSnapshotError::WritableSize {
+                size: u64::from(READ_ONLY_SIZE),
+            },
+        ),
+    ]
 }
 
 #[test]
@@ -289,12 +561,14 @@ fn each_kernel_check_refuses_on_the_kernel_as_on_the_fake() {
     // The double holds what the kernel holds: the page's objects, and the extra memory.
     let mut fake = Holding::of(&page);
     fake.memories.insert(rig.extra, u64::from(WRITABLE_SIZE));
+    fake.memories
+        .insert(rig.extra_read_only, u64::from(READ_ONLY_SIZE));
     rig.dispatcher.forget_event_hooks();
     for (corrupted, error) in cases {
         let bytes = snapshot_of(&corrupted);
         let real = fresh_shared();
         assert_eq!(
-            real.restore_page(&bytes, &rig.dispatcher, ROOT),
+            real.restore_page(&bytes, &*rig.dispatcher, ROOT),
             Err(error.clone()),
             "{error}"
         );
@@ -312,7 +586,7 @@ fn each_kernel_check_refuses_on_the_kernel_as_on_the_fake() {
     // The page as saved is taken by both.
     let bytes = snapshot_of(&page);
     fresh_shared()
-        .restore_page(&bytes, &rig.dispatcher, ROOT)
+        .restore_page(&bytes, &*rig.dispatcher, ROOT)
         .unwrap();
     fresh_shared().restore_page(&bytes, &fake, ROOT).unwrap();
 }
@@ -353,4 +627,125 @@ fn the_fake_kernel_refuses_a_rehook_as_the_real_one() {
         real,
         Err(PageSnapshotError::Rehook(KernelError::InvalidHandle))
     );
+}
+
+impl KernelRig {
+    /// The guest's close message of `command_type` on its root session, as libnx's
+    /// `cmifRequestClose` lays one out (the header's type and nothing else), hand-built: the
+    /// result word of its `SendSyncRequest`.
+    fn send_close(&self, command_type: CommandType) -> u64 {
+        let word0 = u32::from(command_type.to_raw().unwrap());
+        let mut buffer = vec![0; starquake_ipc::BUFFER_SIZE];
+        buffer[..size_of::<u32>()].copy_from_slice(&word0.to_le_bytes());
+        self.memory.write(TLS, &buffer).unwrap();
+        self.call(SvcId::SendSyncRequest, [u64::from(self.session.raw()), 0])
+            .x[0]
+    }
+}
+
+#[test]
+fn closing_the_root_with_a_close_message_lets_the_page_and_its_memories_go() {
+    for command_type in [CommandType::Close, CommandType::TipcClose] {
+        let rig = KernelRig::bound();
+        let binding = rig.page().binding().unwrap();
+        rig.close(rig.memories[0]);
+        rig.close(rig.memories[1]);
+        // The title ends its root session with a close message, as libnx does before
+        // `CloseHandle`: the server closes its end instead of replying.
+        assert_eq!(
+            rig.send_close(command_type),
+            u64::from(KernelError::SessionClosed.code().raw()),
+            "{command_type:?}"
+        );
+        assert_eq!(rig.dispatcher.open_sessions(ROOT), 0, "{command_type:?}");
+        rig.turn(T0);
+        assert_eq!(rig.kept(binding), [0, 0], "{command_type:?}");
+        assert_eq!(
+            rig.dispatcher.transfer_memory(binding.writable),
+            Err(KernelError::InvalidHandle),
+            "{command_type:?}"
+        );
+        assert_eq!(rig.page().binding(), None, "{command_type:?}");
+        assert_eq!(rig.lend_writable_again(), 0, "{command_type:?}");
+    }
+}
+
+/// A [`Wake`] that runs the timer thread's drain at once, on the thread that pushed: so when a
+/// close message closes the root, the drain runs inside the root server's handler, after
+/// `Server::close` and before the kernel marks the session's end closed. Given the rig's
+/// dispatcher and state once the rig is built; it notes the root sessions the kernel counted
+/// at each drain it ran.
+#[derive(Default)]
+struct DrainAtOnce {
+    rig: OnceLock<(Arc<Dispatcher>, Weak<Shared>)>,
+    counted: Mutex<Vec<usize>>,
+}
+
+impl Wake for DrainAtOnce {
+    fn completion_queued(&self) {
+        let Some((dispatcher, shared)) = self.rig.get() else {
+            return;
+        };
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        self.counted
+            .lock()
+            .unwrap()
+            .push(dispatcher.open_sessions(ROOT));
+        // The drain of a root's close reads and writes no guest memory.
+        let memory = FlatMemory::new(BASE, usize::try_from(PAGE_SIZE).unwrap());
+        let mut host = OnTheKernel {
+            dispatcher,
+            memory: &memory,
+        };
+        shared.drain(&mut host);
+    }
+}
+
+#[test]
+fn a_drain_between_the_root_s_close_and_the_kernel_s_end_of_it_lets_the_page_go() {
+    let wake = Arc::new(DrainAtOnce::default());
+    let queue = Arc::new(CompletionQueue::new().with_wake(Arc::<DrainAtOnce>::clone(&wake)));
+    let completions: Arc<dyn Completions> = Arc::<CompletionQueue>::clone(&queue);
+    let syncpoints = Arc::new(Syncpoints::new(completions));
+    let shared = Arc::new(Shared::new(syncpoints, queue, GSV));
+    let rig = KernelRig::bound_with(Arc::clone(&shared));
+    let binding = rig.page().binding().unwrap();
+    wake.rig
+        .set((Arc::clone(&rig.dispatcher), Arc::downgrade(&shared)))
+        .unwrap_or_else(|_| unreachable!("set once"));
+    rig.close(rig.memories[0]);
+    rig.close(rig.memories[1]);
+    assert_eq!(
+        rig.send_close(CommandType::Close),
+        u64::from(KernelError::SessionClosed.code().raw())
+    );
+    // The drain ran inside the close, and the kernel already left the closing session out.
+    assert_eq!(*wake.counted.lock().unwrap(), [0]);
+    assert_eq!(rig.kept(binding), [0, 0]);
+    assert_eq!(rig.page().binding(), None);
+    assert_eq!(rig.lend_writable_again(), 0);
+    // Nothing is left for the timer thread's next turn.
+    assert!(shared.queue().is_empty());
+}
+
+#[test]
+fn the_page_the_root_s_close_leaves_is_restored_on_the_kernel() {
+    // The real state after the root's last session closed and the drain let the page go: its
+    // events stay, the root keeps nothing, and that is taken.
+    let rig = KernelRig::bound();
+    rig.close(rig.session);
+    rig.turn(T0);
+    let page = rig.page();
+    assert_eq!(page.binding(), None);
+    assert!(page.request_event().is_some());
+    assert_eq!(rig.dispatcher.kept_transfer_memories(ROOT), 0);
+    let saved = rig.shared.save_page().unwrap();
+    rig.dispatcher.forget_event_hooks();
+    let restored = fresh_shared();
+    restored
+        .restore_page(&saved, &*rig.dispatcher, ROOT)
+        .unwrap();
+    assert_eq!(restored.lock().page(), &page);
 }

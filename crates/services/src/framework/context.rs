@@ -154,6 +154,18 @@ impl Context<'_> {
         Ok(self.kernel.write_transfer_memory(object, offset, data)?)
     }
 
+    /// Keeps a reference of the server's own to the transfer memory `object` names, so that it
+    /// stays after the caller closes its handles. See [`Kernel::keep_transfer_memory`].
+    pub fn keep_transfer_memory(&mut self, object: ObjectId) -> Result<TransferMemory, Fault> {
+        Ok(self.kernel.keep_transfer_memory(object)?)
+    }
+
+    /// Drops one reference [`Context::keep_transfer_memory`] kept. See
+    /// [`Kernel::release_kept_transfer_memory`].
+    pub fn release_kept_transfer_memory(&mut self, object: ObjectId) -> Result<(), Fault> {
+        Ok(self.kernel.release_kept_transfer_memory(object)?)
+    }
+
     /// Copies `out.len()` bytes of the caller's memory at `address` into `out`.
     pub fn read_memory(&self, address: u64, out: &mut [u8]) -> Result<(), Fault> {
         Ok(self.kernel.read_memory(address, out)?)
