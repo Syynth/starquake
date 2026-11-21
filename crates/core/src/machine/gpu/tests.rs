@@ -696,3 +696,159 @@ fn a_run_renders_with_the_setup_it_is_given() {
     assert_eq!(recorded.exit, ExitReason::ProcessExited);
     assert_ne!(recorded.guest_log.len(), 0);
 }
+
+/// No program memory and no engine state: for lookups of no programs.
+struct Nothing;
+
+impl ProgramMemory for Nothing {
+    fn read(
+        &self,
+        address: u64,
+        _out: &mut [u8],
+    ) -> Result<(), starquake_shader::lookup::Unmapped> {
+        Err(starquake_shader::lookup::Unmapped { address })
+    }
+}
+
+impl EngineState for Nothing {
+    fn cbuf_word(
+        &self,
+        _stage: starquake_shader::lookup::GuestStage,
+        _bank: u8,
+        _offset: u32,
+    ) -> Option<u32> {
+        None
+    }
+
+    fn texture_kind(
+        &self,
+        _stage: starquake_shader::lookup::GuestStage,
+        _handle: u32,
+    ) -> Option<starquake_shader::exchange::TextureKind> {
+        None
+    }
+}
+
+/// With a pool, the run's shader cache is the shader crate's cache: a lookup of no programs is
+/// a ready set of none. Without one it is [`NoShaders`], whose every lookup is pending.
+#[test]
+fn the_run_s_shader_cache_is_the_real_one_on_a_pool() {
+    let pool = Arc::new(CompileWorkers::new(std::num::NonZeroUsize::MIN).unwrap());
+    let mut real = run_shaders(Some(pool));
+    assert!(matches!(
+        real.lookup(&[], &VariantKey::default(), &Nothing, &Nothing),
+        SetLookup::Ready(set) if set.stages.is_empty()
+    ));
+    let mut none = run_shaders(None);
+    assert!(matches!(
+        none.lookup(&[], &VariantKey::default(), &Nothing, &Nothing),
+        SetLookup::Pending(ticket) if ticket == NO_TICKET
+    ));
+    assert_eq!(SHADER_TARGET.form, CodeForm::NagaModule);
+    assert_eq!(SHADER_TARGET.caps, Requirements::default());
+}
+
+/// A compile pool that could not be started is the wgpu backend's failure
+/// ([`wgpu_opening`]): the backend is not opened, a run that chose to fall back renders with
+/// the recording backend and has no shader cache ([`NoShaders`]), and a run that chose to end
+/// ends with the pool's words. A pool that started reaches the opener, whose backend failure
+/// then follows the same choice.
+#[test]
+fn a_compile_pool_that_cannot_start_is_the_backend_s_failure() {
+    use crate::renderer::IfUnavailable;
+
+    let pool = started_pool(Err(std::io::Error::other("no threads left")));
+    assert_eq!(
+        pool.as_ref().err().map(String::as_str),
+        Some("the compile pool could not be started: no threads left")
+    );
+    // Were the backend opened without a pool, the outcome would be `Opened`, which the
+    // assertions below refuse.
+    let never = |_: Arc<CompileWorkers>| -> Result<(), Unopened> { Ok(()) };
+    assert_eq!(
+        wgpu_opening(&pool, never, IfUnavailable::UseRecording),
+        Ok(Opening::FallBack(
+            "the compile pool could not be started: no threads left".to_owned()
+        ))
+    );
+    let mut shaders = run_shaders(pool.clone().ok());
+    assert!(matches!(
+        shaders.lookup(&[], &VariantKey::default(), &Nothing, &Nothing),
+        SetLookup::Pending(ticket) if ticket == NO_TICKET
+    ));
+    assert_eq!(
+        wgpu_opening(&pool, never, IfUnavailable::EndRun),
+        Err(
+            "the wgpu backend could not be opened: the compile pool could not be started: no \
+             threads left"
+                .to_owned()
+        )
+    );
+
+    let started = started_pool(CompileWorkers::new(std::num::NonZeroUsize::MIN));
+    assert!(started.is_ok());
+    let opens = |_: Arc<CompileWorkers>| -> Result<u8, Unopened> { Ok(7) };
+    let refuses = |_: Arc<CompileWorkers>| -> Result<u8, Unopened> {
+        Err(Unopened::Backend("no GPU adapter".to_owned()))
+    };
+    for if_unavailable in [IfUnavailable::UseRecording, IfUnavailable::EndRun] {
+        assert_eq!(
+            wgpu_opening(&started, opens, if_unavailable),
+            Ok(Opening::Opened(7))
+        );
+    }
+    assert_eq!(
+        wgpu_opening(&started, refuses, IfUnavailable::UseRecording),
+        Ok(Opening::FallBack("no GPU adapter".to_owned()))
+    );
+    assert_eq!(
+        wgpu_opening(&started, refuses, IfUnavailable::EndRun),
+        Err("the wgpu backend could not be opened: no GPU adapter".to_owned())
+    );
+}
+
+/// A run that chose the wgpu backend hands the compile pool it gave the backend to its shader
+/// cache, which keeps it when the backend cannot be opened and the run falls back to the
+/// recording backend; the pool ends with the run (module docs, "The shader cache shares the
+/// pool").
+#[cfg(feature = "wgpu")]
+#[test]
+fn the_shader_cache_holds_the_pool_the_backend_was_given() {
+    use std::sync::Weak;
+
+    use starquake_render::CompilePool;
+
+    use crate::renderer::{Choice, IfUnavailable};
+
+    let given: Arc<Mutex<Option<Weak<dyn CompilePool>>>> = Arc::new(Mutex::new(None));
+    let record = Arc::clone(&given);
+    let opener = WgpuOpener::with(Box::new(move |_, _, pool, _| {
+        *record.lock().unwrap() = Some(Arc::downgrade(&pool));
+        Err(starquake_render_wgpu::NewError::NoAdapter(
+            "none on the test's host".to_owned(),
+        ))
+    }));
+    let memory = choice_memory();
+    let render = RenderSetup::headless(Choice::Wgpu(IfUnavailable::UseRecording));
+    let (graphics, built) = graphics_opening(
+        &EnvSource::Live,
+        Some(&memory),
+        (None, Arc::new(NoWake), SystemClock::new()),
+        &render,
+        &opener,
+    )
+    .unwrap();
+    let pool = given
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the opener was given a pool");
+    assert!(
+        pool.upgrade().is_some(),
+        "the shader cache keeps the backend's pool after the fallback"
+    );
+    graphics.gpu().expect("the run has its GPU").stop().unwrap();
+    drop(graphics);
+    drop(built);
+    assert!(pool.upgrade().is_none(), "the pool ends with the run");
+}

@@ -22,8 +22,15 @@
 //!   thread until the set is settled.
 //! - **An invalidation** of a page range becomes the cache's byte range.
 //!
-//! Nothing builds it in a run yet: `core` keeps its `NoShaders` until slice 17's translator
-//! implements [`SeamShader`] for its output and `core` hands the cache its compile pool.
+//! **The production translator's shaders.** [`SeamShader`] is implemented for the shader
+//! crate's [`HostShader`], what its production translator
+//! (`starquake_shader::pipeline::PipelineTranslator`, issue #484) gives, so `core` can build
+//! the cache with it on the run's compile pool. Such a shader binds no resources
+//! ([`SeamShader::resources`] is empty): until slices 13, 14 and 17, the lowering refuses every
+//! constant-buffer, texture, image and global-memory operation by name
+//! (`starquake_shader::lower::LowerError::Operation`), so a shader that would bind one is
+//! rejected, not drawn without it. Slice 17 adds the resource table to the host shader, and
+//! this impl reads it then. Pinned by `tests::a_host_shader_binds_nothing_yet`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -44,6 +51,18 @@ pub trait SeamShader: Translated {
     fn host(&self) -> &HostShader;
     /// The resources it binds, in the seam's terms.
     fn resources(&self) -> Vec<ResourceUse>;
+}
+
+/// The production translator's shader (module docs, "The production translator's shaders").
+impl SeamShader for HostShader {
+    fn host(&self) -> &HostShader {
+        self
+    }
+
+    /// None: the lowering refuses every resource operation until slice 17 (module docs).
+    fn resources(&self) -> Vec<ResourceUse> {
+        Vec::new()
+    }
 }
 
 /// The most converted sets [`CachedShaders`] keeps (a **guess**: a frame rarely draws with more
