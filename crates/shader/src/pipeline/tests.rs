@@ -351,6 +351,7 @@ const TARGET: HostTarget = HostTarget {
     form: CodeForm::NagaModule,
     caps: Requirements {
         subgroup: false,
+        subgroup_size_32: false,
         f16: false,
         f64: false,
         i64: false,
@@ -909,6 +910,16 @@ fn host_caps_take_each_feature() {
             },
             HostCaps {
                 subgroup: true,
+                ..HostCaps::NONE
+            },
+        ),
+        (
+            Requirements {
+                subgroup_size_32: true,
+                ..all_off
+            },
+            HostCaps {
+                subgroup_size_32: true,
                 ..HostCaps::NONE
             },
         ),

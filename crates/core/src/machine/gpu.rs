@@ -337,6 +337,7 @@ pub(crate) const SHADER_TARGET: HostTarget = HostTarget {
     form: CodeForm::NagaModule,
     caps: Requirements {
         subgroup: false,
+        subgroup_size_32: false,
         f16: false,
         f64: false,
         i64: false,

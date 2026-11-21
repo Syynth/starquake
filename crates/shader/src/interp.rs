@@ -185,6 +185,7 @@ use crate::ir::{
 pub use value::Val;
 
 pub(crate) use exec::eval_immediates;
+pub(crate) use exec::{QUAD_LANE_MASK, SWIZZLE_ADD_FACTORS};
 
 /// The default [`Machine::step_limit`]: about a million steps, far more than a test of one
 /// instruction or a short sequence takes.
