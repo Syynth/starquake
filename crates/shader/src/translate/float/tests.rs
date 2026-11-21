@@ -587,7 +587,11 @@ fn never_guarded_instructions_append_nothing() {
                 "{instr} {guard_tested}"
             );
             assert_eq!(builder.block(), entry);
-            assert_eq!(builder.function(), &Function::new(), "{instr} {guard_tested}");
+            assert_eq!(
+                builder.function(),
+                &Function::new(),
+                "{instr} {guard_tested}"
+            );
         }
         let other = Instr {
             guard: NOT_PT,

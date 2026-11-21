@@ -784,19 +784,22 @@ fn conditional_block_splits_only_for_an_untested_guard() {
         let mut function = Function::new();
         let entry = function.entry();
         let mut b = Builder::new(&mut function, entry);
-        let mut ran = false;
+        let (mut checked, mut written) = (false, false);
         conditional_block::<(), BuildError>(
             &mut b,
             never,
             tested,
             || {
-                ran = true;
+                checked = true;
                 Ok(())
             },
-            |_, ()| panic!("the body of a never-run instruction ran"),
+            |_, ()| {
+                written = true;
+                Ok(())
+            },
         )
         .expect("skips");
-        assert!(!ran, "{tested}");
+        assert_eq!((checked, written), (false, false), "{tested}");
         assert_eq!(b.block(), entry);
         assert_eq!(b.function(), &Function::new());
     }
@@ -852,16 +855,21 @@ fn conditional_block_splits_only_for_an_untested_guard() {
         let entry = function.entry();
         let mut b = Builder::new(&mut function, entry);
         let refused = BuildError::NoBlock(entry);
+        let mut written = false;
         assert_eq!(
             conditional_block::<(), BuildError>(
                 &mut b,
                 guard,
                 tested,
                 || Err(refused),
-                |_, ()| panic!("the body of a refused instruction ran"),
+                |_, ()| {
+                    written = true;
+                    Ok(())
+                },
             ),
             Err(refused)
         );
+        assert!(!written, "{guard} {tested}");
         assert_eq!(b.block(), entry);
         assert_eq!(b.function(), &Function::new(), "{guard} {tested}");
     }

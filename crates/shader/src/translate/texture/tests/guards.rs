@@ -91,7 +91,11 @@ fn never_guarded_instructions_append_nothing() {
                 "{instr} {guard_tested}"
             );
             assert_eq!(builder.block(), entry);
-            assert_eq!(builder.function(), &Function::new(), "{instr} {guard_tested}");
+            assert_eq!(
+                builder.function(),
+                &Function::new(),
+                "{instr} {guard_tested}"
+            );
             assert_eq!(buffer, DescriptorBuffer::new());
         }
         let other = Instr {
