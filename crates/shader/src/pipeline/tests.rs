@@ -23,12 +23,12 @@ use crate::host::{HostCode, HostStage};
 use crate::info::InfoError;
 use crate::interp::Machine;
 use crate::ir::{ATTRIBUTE_WORD_BYTES, Attribute, Function, Inst, Node, Opcode};
-use crate::translate::GuestStage;
 use crate::lookup::{ProgramMemory, ProgramRequest, Unmapped};
 use crate::lower::{LowerError, MAX_LOCAL_MEMORY_BYTES, MAX_SHARED_MEMORY_BYTES};
 use crate::sph::encode::encode_bytes;
 use crate::sph::{Common, HEADER_BYTES, HeaderError, VtgIo, VtgMap, VtgStage};
 use crate::testing::{imnmx, ldc, shf};
+use crate::translate::GuestStage;
 use crate::variant::VariantKey;
 
 // ---------------------------------------------------------------------------------------------
@@ -741,7 +741,10 @@ fn a_compute_program_that_only_reads_local_memory_takes_the_qmd_size() {
         )
         .map(|shader| local_words(&shader))
     };
-    assert_eq!(lowered(&words(&[ldl(0, 0), sts(0, 0), exit()])), Ok(Some(2)));
+    assert_eq!(
+        lowered(&words(&[ldl(0, 0), sts(0, 0), exit()])),
+        Ok(Some(2))
+    );
     assert_eq!(lowered(&words(&[mov(0, 7), sts(0, 0), exit()])), Ok(None));
 }
 
@@ -786,7 +789,10 @@ fn local_memory_bytes_for_each_input() {
     };
     assert_eq!(local_memory_bytes(None, &key(0)), 0);
     assert_eq!(local_memory_bytes(None, &key(0x123)), 0x123);
-    assert_eq!(local_memory_bytes(None, &key(u32::MAX)), u64::from(u32::MAX));
+    assert_eq!(
+        local_memory_bytes(None, &key(u32::MAX)),
+        u64::from(u32::MAX)
+    );
     let header = vertex_header_crs(0x10, 0x2, 0x300);
     let expected = 0x10 + (0x2 << 24) + 0x300;
     assert_eq!(local_memory_bytes(Some(&header), &key(0)), expected);
@@ -930,11 +936,7 @@ fn the_variant_and_the_header_reach_the_lowering() {
             &State::default(),
             &VariantKey::default(),
         );
-        assert_eq!(
-            vertex.err(),
-            refused.clone(),
-            "{local}"
-        );
+        assert_eq!(vertex.err(), refused.clone(), "{local}");
         // The same size split between the header's size and its CRS size.
         let split = through_the_cache(
             GuestStage::Vertex,
@@ -942,21 +944,13 @@ fn the_variant_and_the_header_reach_the_lowering() {
             &State::default(),
             &VariantKey::default(),
         );
-        assert_eq!(
-            split.err(),
-            refused.clone(),
-            "{local} split"
-        );
+        assert_eq!(split.err(), refused.clone(), "{local} split");
         // And a compute program's, from the variant key.
         let from_key = compute(&VariantKey {
             local_memory_size: local,
             ..compute_variant()
         });
-        assert_eq!(
-            from_key.err(),
-            refused.clone(),
-            "{local} from the key"
-        );
+        assert_eq!(from_key.err(), refused.clone(), "{local} from the key");
     }
 }
 

@@ -2464,7 +2464,11 @@ fn the_local_memory_size_is_the_sum_of_both_fields() {
 fn divergence_local_memory_keeps_bits_20_to_23() {
     let mut w = encode(&Spec::new(0x1_0000));
     set(&mut w, q::QMDV03_00_SHADER_LOCAL_MEMORY_LOW_SIZE, 0x10_0001);
-    set(&mut w, q::QMDV03_00_SHADER_LOCAL_MEMORY_HIGH_SIZE, 0x80_0020);
+    set(
+        &mut w,
+        q::QMDV03_00_SHADER_LOCAL_MEMORY_HIGH_SIZE,
+        0x80_0020,
+    );
     let dispatch = Qmd::decode(qmd_at(1), &w).unwrap().dispatch;
     assert_eq!(dispatch.local_memory_size(), 0x90_0021);
     let widest = Dispatch {

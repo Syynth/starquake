@@ -23,11 +23,33 @@
 //! words reads 0 and writes nothing. The word index is at most `u32::MAX >> 2` and the last word
 //! of an access three more, so the index arithmetic cannot wrap.
 //!
+//! The local array's size is the one each reference's environment gives `LocalMemorySize()`
+//! ([`crate::pipeline::local_memory_bytes`]: a graphics program's header size plus its CRS
+//! size, a compute program's QMD size through the variant key).
+//!
 //! Where this differs, each pinned by a test in `tests::memory`:
 //!
-//! - Eden checks nothing (SPIR-V leaves an out-of-bounds access undefined), and the
-//!   interpreter refuses one ([`crate::interp::InterpError::OutOfBounds`]): here it reads 0 or
-//!   writes nothing (`local_accesses_at_and_past_the_end`, `shared_offsets_at_and_past_the_end`).
+//! - Eden's backend checks nothing (SPIR-V leaves an out-of-bounds access undefined;
+//!   `EmitLoadLocal` and `EmitWriteLocal` in `emit_spirv_context_get_set.cpp` index the array
+//!   directly), and the interpreter refuses one ([`crate::interp::InterpError::OutOfBounds`]):
+//!   here it reads 0 or writes nothing (`local_accesses_at_and_past_the_end`,
+//!   `shared_offsets_at_and_past_the_end`, and, translated and run on the interpreter too,
+//!   `translated_local_accesses_match_the_interpreter_at_the_edge`).
+//! - Eden bounds local memory in its translator instead
+//!   (`eden/src/shader_recompiler/frontend/maxwell/translate/impl/load_store_local_shared.cpp`
+//!   @ cf654052): `LoadLocal` selects 0 unless the **byte** offset is below
+//!   `env.LocalMemorySize()` (`ILessThan(offset, local_memory_size, false)`, each word of a
+//!   64- or 128-bit `LDL` checked at its own offset), and `STL` drops a store whose offset is
+//!   an immediate not below the size, while a store at a register offset is not bounded (its
+//!   `TODO`). Here the bound is per **word** against `ceil(size / 4)` words, for loads and
+//!   stores alike. They give the same result for every load, and every store at an immediate
+//!   offset, except, when the size is not a multiple of 4, an access whose byte offset lies in
+//!   the last word at or past the size: Eden's load reads 0 and its immediate-offset store is
+//!   dropped, while here both reach the word
+//!   (`divergence_a_narrow_load_past_the_byte_size_in_the_last_word_reads_it`). A store at a
+//!   register offset past the end writes out of bounds in Eden and is dropped here
+//!   (`translated_local_accesses_match_the_interpreter_at_the_edge`, which also pins the word
+//!   edge for loads and immediate-offset stores).
 //! - Eden's word index is `OpShiftRightArithmetic(offset, 2)`; here it is logical. They differ
 //!   only for offsets of 2^31 and up, which are out of bounds either way, except that Eden's
 //!   next word after index `0xffff_ffff` wraps to word 0
