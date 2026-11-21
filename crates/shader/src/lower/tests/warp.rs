@@ -589,6 +589,15 @@ const ONE_LANE_CASES: &[Case] = &[
             &[u(VALUE), u(3), u(1), u(QUAD_SEGMENT)],
         )
     }),
+    // Lane 4's bits inside the segment mask are dropped (`& not_seg_mask`): the source is lane
+    // 0, in range of a clamp of 0.
+    ("index in bounds quad lane 4 clamp 0", |b| {
+        in_bounds(
+            b,
+            Opcode::ShuffleIndex,
+            &[u(VALUE), u(4), u(0), u(QUAD_SEGMENT)],
+        )
+    }),
     ("up 0", |b| {
         int(b, Opcode::ShuffleUp, &[u(VALUE), u(0), u(0), u(0)])
     }),
