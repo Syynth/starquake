@@ -250,11 +250,18 @@ fn the_selector_and_offset_are_the_headers_registers_and_fields() {
 // ---------------------------------------------------------------------------------------------
 // The size bound.
 
+/// What [`check`] answers: the first `accepted` words pass, and `refused` is the next word's
+/// error.
+fn checked(accepted: usize, refused: Option<ConstantBufferError>) -> Checked {
+    Checked { accepted, refused }
+}
+
 #[test]
 fn the_size_edge_accepts_a_word_ending_at_it_and_refuses_one_past() {
-    // The last word that fits, then one byte further: refused before anything is written. The
-    // bits above `SIZE` (16:0) are set and ignored, so a size read as the whole register word
-    // would accept the refused cases.
+    // The last word that fits, then one byte further, a word starting at the size and one past
+    // it: each a one-word run refused before anything is written. The bits above `SIZE` (16:0)
+    // are set and ignored, so a size read as the whole register word would accept the refused
+    // cases.
     let size_word = 0xfffe_0000 | SIZE;
     assert_eq!(
         clc797::SET_CONSTANT_BUFFER_SELECTOR_A_SIZE.get(size_word),
@@ -275,7 +282,7 @@ fn the_size_edge_accepts_a_word_ending_at_it_and_refuses_one_past() {
     assert_eq!(memory.word(BUFFER + u64::from(last)), 0x7777_7777);
     let memory = Memory::new();
     let mut pending = PendingWrites::new();
-    for offset in [last + 1, SIZE] {
+    for offset in [last + 1, SIZE, SIZE + 4] {
         assert_eq!(
             run(
                 &mirror(BUFFER, size_word, offset),
@@ -291,69 +298,226 @@ fn the_size_edge_accepts_a_word_ending_at_it_and_refuses_one_past() {
 }
 
 #[test]
-fn a_run_whose_last_word_passes_the_size_writes_none_of_its_words() {
-    let memory = Memory::new();
-    let mut pending = PendingWrites::new();
-    let start = SIZE - 8;
-    let m = mirror(BUFFER, SIZE, start);
-    assert_eq!(
-        run(&m, &[1, 2, 3], &memory, &mut pending),
-        Err(ConstantBufferError::PastEnd {
-            offset: SIZE,
-            size: SIZE
-        })
-    );
-    assert_eq!(memory.writes(), []);
-    assert!(pending.is_empty());
-    assert_eq!(memory.word(BUFFER + u64::from(start)), FILLED);
-    // The next load, ending exactly at the size, is written whole.
-    assert_eq!(run(&m, &[1, 2], &memory, &mut pending), Ok(()));
+fn a_run_ending_at_the_size_is_written_whole_and_one_word_further_writes_the_words_that_fit() {
+    // The same three words from the same offset; only the size moves across the third word's
+    // end. At or above it the run is written whole; one byte or one word below it, the first
+    // two words are written as one piece, the third is the refused word, and nothing of it
+    // lands or is pending.
+    let start = SIZE - 12;
     let at = BUFFER + u64::from(start);
-    assert_eq!(memory.writes(), [(at, 8)]);
-    assert_eq!(pending.ranges(), only(at..at + 8));
+    let words = [0x1111_0001, 0x1111_0002, 0x1111_0003];
+    for size in [SIZE, SIZE + 1] {
+        let memory = Memory::new();
+        let mut pending = PendingWrites::new();
+        assert_eq!(
+            run(&mirror(BUFFER, size, start), &words, &memory, &mut pending),
+            Ok(()),
+            "{size:#x}"
+        );
+        assert_eq!(memory.writes(), [(at, 12)], "{size:#x}");
+        assert_eq!(pending.ranges(), only(at..at + 12), "{size:#x}");
+        assert_eq!(memory.word(at + 8), words[2], "{size:#x}");
+    }
+    for size in [SIZE - 1, SIZE - 4] {
+        let memory = Memory::new();
+        let mut pending = PendingWrites::new();
+        assert_eq!(
+            run(&mirror(BUFFER, size, start), &words, &memory, &mut pending),
+            Err(ConstantBufferError::PastEnd {
+                offset: SIZE - 4,
+                size
+            }),
+            "{size:#x}"
+        );
+        assert_eq!(memory.writes(), [(at, 8)], "{size:#x}");
+        assert_eq!(pending.ranges(), only(at..at + 8), "{size:#x}");
+        assert_eq!(
+            [memory.word(at), memory.word(at + 4), memory.word(at + 8)],
+            [words[0], words[1], FILLED],
+            "{size:#x}"
+        );
+    }
 }
 
 #[test]
-fn a_run_with_two_words_past_the_size_reports_the_first() {
-    // Both words of the run pass the size, at offsets `SIZE` and `SIZE + 4`: the first in word
-    // order is reported, through the upload as well as through `check`.
+fn a_run_straddling_the_size_writes_its_words_that_fit_and_a_load_from_the_size_writes_none() {
+    // Offsets `SIZE - 8`, `SIZE - 4` and `SIZE`: the first two land, the third is reported.
     let memory = Memory::new();
     let mut pending = PendingWrites::new();
+    let start = SIZE - 8;
+    let at = BUFFER + u64::from(start);
+    let m = mirror(BUFFER, SIZE, start);
     assert_eq!(
-        run(&mirror(BUFFER, SIZE, SIZE), &[1, 2], &memory, &mut pending),
+        run(&m, &[0xc1, 0xc2, 0xc3], &memory, &mut pending),
         Err(ConstantBufferError::PastEnd {
             offset: SIZE,
             size: SIZE
         })
     );
-    assert_eq!(memory.writes(), []);
-    assert!(pending.is_empty());
+    assert_eq!(memory.writes(), [(at, 8)]);
+    assert_eq!(pending.ranges(), only(at..at + 8));
+    assert_eq!([memory.word(at), memory.word(at + 4)], [0xc1, 0xc2]);
+    assert_eq!(memory.word(BUFFER + u64::from(SIZE)), FILLED);
+    // A load starting exactly at the size, which Eden-NX2's `offset <= size` accepts: its first
+    // word is refused, so nothing more is written or pending.
+    assert_eq!(
+        run(&mirror(BUFFER, SIZE, SIZE), &[0xd1], &memory, &mut pending),
+        Err(ConstantBufferError::PastEnd {
+            offset: SIZE,
+            size: SIZE
+        })
+    );
+    assert_eq!(memory.writes(), [(at, 8)]);
+    assert_eq!(pending.ranges(), only(at..at + 8));
+    assert_eq!(memory.word(BUFFER + u64::from(SIZE)), FILLED);
+}
+
+#[test]
+fn a_run_with_two_words_past_the_size_reports_the_first_and_writes_the_word_before() {
+    // Offsets `SIZE - 4`, `SIZE` and `SIZE + 4`: the first lands, and of the two past the size
+    // the first in word order is reported.
+    let memory = Memory::new();
+    let mut pending = PendingWrites::new();
+    let at = BUFFER + u64::from(SIZE - 4);
+    assert_eq!(
+        run(
+            &mirror(BUFFER, SIZE, SIZE - 4),
+            &[0xe1, 0xe2, 0xe3],
+            &memory,
+            &mut pending
+        ),
+        Err(ConstantBufferError::PastEnd {
+            offset: SIZE,
+            size: SIZE
+        })
+    );
+    assert_eq!(memory.writes(), [(at, 4)]);
+    assert_eq!(pending.ranges(), only(at..at + 4));
+    assert_eq!(memory.word(at), 0xe1);
+    assert_eq!(memory.word(at + 4), FILLED);
+    assert_eq!(memory.word(at + 8), FILLED);
+}
+
+#[test]
+fn a_refused_word_ends_the_entry_even_where_a_later_word_fits_after_the_offset_wraps() {
+    // The size is one word short of the 16-bit field's range. Offsets 0xfff8 (fits), 0xfffc
+    // (ends at 0x10000, past the size: refused) and, after the front wraps the field, 0 (would
+    // fit, but comes after the refused word, so it is not written). The memory faults from its
+    // second write, so writing the word at offset 0 would also turn the error into a fault.
+    let size = clc797::LOAD_CONSTANT_BUFFER_OFFSET_V.max() + 1 - 4;
+    let start = size - 4;
+    let high = BUFFER + u64::from(start);
+    let memory = Memory::failing(Some(1));
+    let mut pending = PendingWrites::new();
+    assert_eq!(
+        run(
+            &mirror(BUFFER, size, start),
+            &[0xf1, 0xf2, 0xf3],
+            &memory,
+            &mut pending
+        ),
+        Err(ConstantBufferError::PastEnd { offset: size, size })
+    );
+    assert_eq!(memory.writes(), [(high, 4)]);
+    assert_eq!(pending.ranges(), only(high..high + 4));
+    assert_eq!(memory.word(high), 0xf1);
+    assert_eq!(memory.word(high + 4), FILLED);
+    assert_eq!(memory.word(BUFFER), FILLED);
+}
+
+#[test]
+fn a_fault_writing_the_words_that_fit_is_reported_before_the_refused_word() {
+    // Both faults in one entry: the piece before the size faults after writing, and the third
+    // word passes the size. The fault comes first in word order and is the error; without it,
+    // the same entry is the size refusal.
+    let start = SIZE - 8;
+    let at = BUFFER + u64::from(start);
+    let words = [0x0a, 0x0b, 0x0c];
+    let memory = Memory::failing(Some(0));
+    let mut pending = PendingWrites::new();
+    assert_eq!(
+        run(&mirror(BUFFER, SIZE, start), &words, &memory, &mut pending),
+        Err(ConstantBufferError::Fault(GpuFault::Unmapped {
+            va: FAULT_VA
+        }))
+    );
+    assert_eq!(memory.writes(), [(at, 8)]);
+    assert_eq!(pending.ranges(), only(at..at + 8));
+    let memory = Memory::new();
+    let mut pending = PendingWrites::new();
+    assert_eq!(
+        run(&mirror(BUFFER, SIZE, start), &words, &memory, &mut pending),
+        Err(ConstantBufferError::PastEnd {
+            offset: SIZE,
+            size: SIZE
+        })
+    );
+    assert_eq!(memory.writes(), [(at, 8)]);
 }
 
 #[test]
 fn check_compares_each_words_end_with_the_size() {
     // Ends one below, at and one above the size.
     let check_one = |offset: u32| check(BUFFER, SIZE, [offset].into_iter());
-    assert_eq!(check_one(SIZE - 5), Ok(()));
-    assert_eq!(check_one(SIZE - 4), Ok(()));
+    assert_eq!(check_one(SIZE - 5), checked(1, None));
+    assert_eq!(check_one(SIZE - 4), checked(1, None));
     assert_eq!(
         check_one(SIZE - 3),
-        Err(ConstantBufferError::PastEnd {
-            offset: SIZE - 3,
-            size: SIZE
-        })
+        checked(
+            0,
+            Some(ConstantBufferError::PastEnd {
+                offset: SIZE - 3,
+                size: SIZE
+            })
+        )
     );
     // A size of zero takes no word; the largest offset is refused whatever the size.
     assert_eq!(
         check(BUFFER, 0, [0].into_iter()),
-        Err(ConstantBufferError::PastEnd { offset: 0, size: 0 })
+        checked(0, Some(ConstantBufferError::PastEnd { offset: 0, size: 0 }))
     );
     assert_eq!(
         check(BUFFER, u32::MAX, [u32::MAX].into_iter()),
-        Err(ConstantBufferError::PastEnd {
-            offset: u32::MAX,
-            size: u32::MAX
-        })
+        checked(
+            0,
+            Some(ConstantBufferError::PastEnd {
+                offset: u32::MAX,
+                size: u32::MAX
+            })
+        )
+    );
+    // No words: nothing accepted, nothing refused.
+    assert_eq!(check(BUFFER, SIZE, [].into_iter()), checked(0, None));
+}
+
+#[test]
+fn check_counts_the_words_before_the_first_failure_and_stops_there() {
+    // Every word fits: all three are accepted.
+    assert_eq!(
+        check(BUFFER, SIZE, [0, 8, SIZE - 4].into_iter()),
+        checked(3, None)
+    );
+    // Two fit, then one past: two accepted, the third reported.
+    assert_eq!(
+        check(BUFFER, SIZE, [4, SIZE - 4, SIZE, SIZE + 4].into_iter()),
+        checked(
+            2,
+            Some(ConstantBufferError::PastEnd {
+                offset: SIZE,
+                size: SIZE
+            })
+        )
+    );
+    // A word that fits after the refused one is not counted.
+    assert_eq!(
+        check(BUFFER, SIZE, [SIZE - 4, SIZE, 0, 4].into_iter()),
+        checked(
+            1,
+            Some(ConstantBufferError::PastEnd {
+                offset: SIZE,
+                size: SIZE
+            })
+        )
     );
 }
 
@@ -362,15 +526,29 @@ fn check_refuses_a_word_ending_past_the_address_space() {
     let offset = 8;
     // The word ends at u64::MAX exactly: representable, accepted.
     let at_end = u64::MAX - u64::from(offset) - 4;
-    assert_eq!(check(at_end, SIZE, [offset].into_iter()), Ok(()));
+    assert_eq!(check(at_end, SIZE, [offset].into_iter()), checked(1, None));
     // One byte further.
     let past = at_end + 1;
     assert_eq!(
         check(past, SIZE, [offset].into_iter()),
-        Err(ConstantBufferError::AddressOverflow {
-            address: past,
-            offset
-        })
+        checked(
+            0,
+            Some(ConstantBufferError::AddressOverflow {
+                address: past,
+                offset
+            })
+        )
+    );
+    // The words before an overflowing one are accepted.
+    assert_eq!(
+        check(past, SIZE, [0, 4, offset].into_iter()),
+        checked(
+            2,
+            Some(ConstantBufferError::AddressOverflow {
+                address: past,
+                offset
+            })
+        )
     );
 }
 
@@ -380,23 +558,32 @@ fn check_reports_the_first_failing_word_and_the_size_before_the_address() {
     // One word failing both: the size is checked first.
     assert_eq!(
         check(address, SIZE, [SIZE].into_iter()),
-        Err(ConstantBufferError::PastEnd {
-            offset: SIZE,
-            size: SIZE
-        })
+        checked(
+            0,
+            Some(ConstantBufferError::PastEnd {
+                offset: SIZE,
+                size: SIZE
+            })
+        )
     );
     // An overflowing word before a word past the size: the first is reported.
     assert_eq!(
         check(address, SIZE, [0, SIZE].into_iter()),
-        Err(ConstantBufferError::AddressOverflow { address, offset: 0 })
+        checked(
+            0,
+            Some(ConstantBufferError::AddressOverflow { address, offset: 0 })
+        )
     );
     // Two words past the size: the first is reported.
     assert_eq!(
         check(BUFFER, SIZE, [4, SIZE + 4, SIZE].into_iter()),
-        Err(ConstantBufferError::PastEnd {
-            offset: SIZE + 4,
-            size: SIZE
-        })
+        checked(
+            1,
+            Some(ConstantBufferError::PastEnd {
+                offset: SIZE + 4,
+                size: SIZE
+            })
+        )
     );
 }
 
