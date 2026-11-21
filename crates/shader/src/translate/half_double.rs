@@ -89,9 +89,11 @@
 //!
 //! # Guards
 //!
-//! An instruction under a guard predicate becomes a conditional block (spec, "Instruction
-//! translation"), through the shared helper ([`super::conditional_block`]): skipped when the
-//! block already tests the guard (flow analysis's `guard_tested`), and for `PT`.
+//! The translation driver's guard rule (`super::guard_step`), through the shared helper
+//! ([`super::conditional_block`]): an instruction under `!PT` appends nothing and is not
+//! checked (the group check still runs first); under `PT`, or in a block that already tests the
+//! guard (flow analysis's `guard_tested`), it is translated as if unguarded; under any other
+//! guard it becomes a conditional block (spec, "Instruction translation").
 //!
 //! # Refusals
 //!
@@ -390,18 +392,25 @@ pub const fn in_group(op: &Op) -> bool {
 
 /// Translates `instr`, one of this group's instructions, at the end of `builder`'s block, and
 /// leaves `builder` in the block where translation continues: the same block, or for a guarded
-/// instruction the block after its conditional block (module docs). `guard_tested` says the
-/// block already runs only where the guard holds (flow analysis's `guard_tested`), so the guard
-/// is ignored. A refusal appends nothing.
+/// instruction the block after its conditional block (module docs, "Guards"). `guard_tested`
+/// says the block already runs only where the guard holds (flow analysis's `guard_tested`), so
+/// a guard other than `!PT` is ignored. The checks run in this order: the group, then the guard
+/// (`!PT` appends nothing), then the PR's checks. A refusal appends nothing.
 pub fn translate_instr(
     builder: &mut Builder<'_>,
     instr: Instr,
     guard_tested: bool,
 ) -> Result<(), HalfDoubleError> {
-    check(&instr.op)?;
-    super::conditional_block(builder, instr.guard, guard_tested, |b| {
-        Emit { b }.op(&instr.op)
-    })
+    if !in_group(&instr.op) {
+        return Err(HalfDoubleUnsupported::OtherGroup.into());
+    }
+    super::conditional_block(
+        builder,
+        instr.guard,
+        guard_tested,
+        || Ok::<_, HalfDoubleError>(check(&instr.op)?),
+        |b, ()| Emit { b }.op(&instr.op),
+    )
 }
 
 // ---------------------------------------------------------------------------------------------

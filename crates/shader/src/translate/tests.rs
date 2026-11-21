@@ -731,15 +731,74 @@ fn the_guard_helper_moves_the_terminator_to_the_block_after() {
     }
 }
 
-/// `conditional_block`: no split when the block's guard is tested or the guard is `PT`; else
-/// the guard's read, the split, the body in the instruction's block and the builder left in the
-/// block after.
+/// The one guard rule (`guard_step`), for every kind of guard (`PT`, `!PT`, a predicate, a
+/// negated predicate, the last predicate `P6` included) with the guard settled and not: `!PT`
+/// is skipped even when settled, `PT` and a settled guard are ignored, any other guard is a
+/// conditional block.
+#[test]
+fn guard_step_for_every_guard() {
+    let pred = |index, negated| PredSrc {
+        reg: Pred::new(index).expect("a predicate"),
+        negated,
+    };
+    let never = PredSrc {
+        reg: Pred::PT,
+        negated: true,
+    };
+    let cases = [
+        (PredSrc::TRUE, false, GuardStep::Unguarded),
+        (PredSrc::TRUE, true, GuardStep::Unguarded),
+        (never, false, GuardStep::Skip),
+        (never, true, GuardStep::Skip),
+        (pred(0, false), false, GuardStep::Conditional),
+        (pred(0, false), true, GuardStep::Unguarded),
+        (pred(3, true), false, GuardStep::Conditional),
+        (pred(3, true), true, GuardStep::Unguarded),
+        (pred(6, false), false, GuardStep::Conditional),
+        (pred(6, true), true, GuardStep::Unguarded),
+    ];
+    for (guard, settled, step) in cases {
+        assert_eq!(guard_step(guard, settled), step, "{guard} {settled}");
+    }
+}
+
+/// `conditional_block`: `!PT` runs neither `check` nor `body`, whether or not the guard is
+/// tested; no split when the block's guard is tested or the guard is `PT`; else `check`, then
+/// the guard's read, the split, the body (given what `check` returned) in the instruction's
+/// block and the builder left in the block after.
 #[test]
 fn conditional_block_splits_only_for_an_untested_guard() {
     let p1 = PredSrc {
         reg: Pred::new(1).expect("p1"),
         negated: false,
     };
+    let never = PredSrc {
+        reg: Pred::PT,
+        negated: true,
+    };
+    for tested in [false, true] {
+        let mut function = Function::new();
+        let entry = function.entry();
+        let mut b = Builder::new(&mut function, entry);
+        let (mut checked, mut written) = (false, false);
+        conditional_block::<(), BuildError>(
+            &mut b,
+            never,
+            tested,
+            || {
+                checked = true;
+                Ok(())
+            },
+            |_, ()| {
+                written = true;
+                Ok(())
+            },
+        )
+        .expect("skips");
+        assert_eq!((checked, written), (false, false), "{tested}");
+        assert_eq!(b.block(), entry);
+        assert_eq!(b.function(), &Function::new());
+    }
     for (guard, tested, splits) in [
         (p1, false, true),
         (p1, true, false),
@@ -750,11 +809,18 @@ fn conditional_block_splits_only_for_an_untested_guard() {
         let mut b = Builder::new(&mut function, entry);
         b.terminate(Terminator::Return).expect("terminates");
         let mut body_block = None;
-        conditional_block::<BuildError>(&mut b, guard, tested, |b| {
-            body_block = Some(b.block());
-            b.op(Opcode::Barrier, &[])?;
-            Ok(())
-        })
+        conditional_block::<u32, BuildError>(
+            &mut b,
+            guard,
+            tested,
+            || Ok(0x5a),
+            |b, checked| {
+                assert_eq!(checked, 0x5a);
+                body_block = Some(b.block());
+                b.op(Opcode::Barrier, &[])?;
+                Ok(())
+            },
+        )
         .expect("builds");
         let after = b.block();
         if splits {
@@ -778,6 +844,30 @@ fn conditional_block_splits_only_for_an_untested_guard() {
                 "block0:\n    %0 = Barrier\n    return\n"
             );
         }
+    }
+    // A refusal by `check` comes before the guard's read and the split: nothing is appended.
+    for (guard, tested) in [(p1, false), (p1, true), (PredSrc::TRUE, false)] {
+        let mut function = Function::new();
+        let entry = function.entry();
+        let mut b = Builder::new(&mut function, entry);
+        let refused = BuildError::NoBlock(entry);
+        let mut written = false;
+        assert_eq!(
+            conditional_block::<(), BuildError>(
+                &mut b,
+                guard,
+                tested,
+                || Err(refused),
+                |_, ()| {
+                    written = true;
+                    Ok(())
+                },
+            ),
+            Err(refused)
+        );
+        assert!(!written, "{guard} {tested}");
+        assert_eq!(b.block(), entry);
+        assert_eq!(b.function(), &Function::new(), "{guard} {tested}");
     }
 }
 

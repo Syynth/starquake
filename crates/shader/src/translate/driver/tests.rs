@@ -1330,6 +1330,35 @@ fn a_guarded_instruction_that_is_not_pure_reads_no_guard() {
     }
 }
 
+/// The driver's rule (`super::super::guard_step`) settles a guard on either of its two inputs:
+/// a pure instruction (`MOV`) handed over in a block whose guard is tested is translated as if
+/// unguarded, with no read and no split, as is one that is not pure (`AST`) in a block whose
+/// guard is not tested; only a pure one in an untested block splits. Flow analysis gives a
+/// tested block only to an instruction that is not pure, so a whole program cannot reach the
+/// first case: this drives [`Driver::instruction`] directly.
+#[test]
+fn either_a_tested_block_or_an_impure_instruction_settles_the_guard() {
+    let cases = [
+        (under(p(2), mov(0, 7)), true, false),
+        (under(p(2), ast(0, 0x80)), false, false),
+        (under(p(2), mov(0, 7)), false, true),
+    ];
+    for (instr, guard_tested, splits) in cases {
+        let info = classify(opcode_of(assemble(&instr).expect("encodable")));
+        let mut function = Function::new();
+        let entry = function.entry();
+        let after = Driver::new(VERTEX, None)
+            .instruction(&mut function, entry, 0, instr, info, guard_tested)
+            .expect("translates");
+        assert_eq!(after != entry, splits, "{instr} {guard_tested}");
+        assert_eq!(
+            count(&function, Opcode::GetPred),
+            usize::from(splits),
+            "{instr} {guard_tested}"
+        );
+    }
+}
+
 /// The guard of every decodable pure form (`classify.h`'s `pure`) is read before the split:
 /// as the uniform predicate of the same number for a uniform one (of the decodable forms
 /// `S2UR`, `0x9c3`, `VOTEU`, `0x886`, and slice 6d's `UMOV`, `ULDC`, `UPLOP3` and the twins

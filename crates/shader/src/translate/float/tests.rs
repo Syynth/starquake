@@ -559,37 +559,52 @@ fn guarded_predicate_writes() {
     }
 }
 
-/// `@!PT` never runs: the instruction is still checked (the PR skips it unchecked, a listed
-/// divergence), and a valid one goes in a block behind a constant `false`.
+/// `@!PT` never runs and appends nothing, unchecked, whether or not the guard is tested: the
+/// translation driver's rule (`crate::translate::guard_step`), as the PR's `Visitor::Run`
+/// returns at `guard.Never()`. A form the group refuses is not refused there, but an
+/// instruction of another group still is (the group comes first).
 #[test]
-fn never_guarded_instructions_are_checked() {
-    let refused = Op::FMul(OpFMul {
-        dnz: true,
-        ..fmul(r(0), reg(1), reg(2))
-    });
-    let instr = encodable(Instr {
+fn never_guarded_instructions_append_nothing() {
+    let refused = encodable(Instr {
         guard: NOT_PT,
-        op: refused,
+        op: Op::FMul(OpFMul {
+            dnz: true,
+            ..fmul(r(0), reg(1), reg(2))
+        }),
     });
-    assert_eq!(
-        translate_raw(&[instr]),
-        refusal(instr, FloatUnsupported::FmulMultiplyZero)
-    );
-    let instr = Instr {
+    let valid = encodable(Instr {
         guard: NOT_PT,
         op: Op::FAdd(fadd(r(0), reg(1), reg(2))),
-    };
-    let function = translated(&[instr]);
-    assert!(
-        function
-            .to_string()
-            .starts_with("block0:\n    branch u1 false, block1, block2\n"),
-        "{function}"
-    );
-    let mut machine = Machine::new();
-    machine.regs[0] = 7;
-    machine.run(&function).expect("runs");
-    assert_eq!(machine.regs[0], 7);
+    });
+    for guard_tested in [false, true] {
+        for instr in [refused, valid] {
+            let mut function = Function::new();
+            let entry = function.entry();
+            let mut builder = Builder::new(&mut function, entry);
+            assert_eq!(
+                translate_instr(&mut builder, instr, guard_tested),
+                Ok(()),
+                "{instr} {guard_tested}"
+            );
+            assert_eq!(builder.block(), entry);
+            assert_eq!(
+                builder.function(),
+                &Function::new(),
+                "{instr} {guard_tested}"
+            );
+        }
+        let other = Instr {
+            guard: NOT_PT,
+            op: Op::Nop(crate::decode::OpNop {}),
+        };
+        let mut function = Function::new();
+        let entry = function.entry();
+        let mut builder = Builder::new(&mut function, entry);
+        assert_eq!(
+            translate_instr(&mut builder, other, guard_tested),
+            Err(FloatError::Unsupported(FloatUnsupported::OtherGroup("nop")))
+        );
+    }
 }
 
 /// A block flow analysis already made conditional on the guard (`guard_tested`) holds the
@@ -886,7 +901,9 @@ fn golden_emulated_conversions() {
 }
 
 /// Every refusal is decided before anything is appended: the function is unchanged, and the
-/// builder stays in its block. One case per refusal reachable from a decoded operation.
+/// builder stays in its block. One case per refusal reachable from a decoded operation. Under
+/// `!PT` the same instructions are not checked and append nothing either (only another
+/// group's instruction is still refused there).
 #[test]
 fn refusals_append_nothing() {
     for (op, what) in refusal_cases() {
@@ -899,7 +916,12 @@ fn refusals_append_nothing() {
                 .expect("appends");
             let before = builder.function().clone();
             let result = translate_instr(&mut builder, Instr { guard, op }, false);
-            assert_eq!(result, Err(FloatError::Unsupported(what)), "{op}");
+            let expected = if guard == NOT_PT && !matches!(what, FloatUnsupported::OtherGroup(_)) {
+                Ok(())
+            } else {
+                Err(FloatError::Unsupported(what))
+            };
+            assert_eq!(result, expected, "{op} {guard}");
             assert_eq!(builder.block(), entry);
             assert_eq!(builder.function(), &before, "{op}");
         }

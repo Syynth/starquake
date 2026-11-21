@@ -539,7 +539,10 @@ fn guarded_instructions_become_conditional_blocks() {
 
 /// A block flow analysis already made conditional on the guard (`guard_tested`) holds the
 /// instruction unconditionally, and so does one under `PT`: no blocks are added and no guard
-/// is read. Under `@!PT` the instruction goes in a block behind a constant `false`.
+/// is read. Under `@!PT` the instruction appends nothing, unchecked, whether or not the guard
+/// is tested (the translation driver's rule, `crate::translate::guard_step`, as PR #4588's
+/// `Visitor::Run` returns at `guard.Never()`), but an instruction of another group is still
+/// refused (the group comes first).
 #[test]
 fn tested_and_constant_guards() {
     let op = Op::HMul2(hmul2(r(0), h(1), h(2)));
@@ -553,17 +556,41 @@ fn tested_and_constant_guards() {
         assert_eq!(function.blocks().count(), 1);
         assert!(!opcodes(&function).contains(&Opcode::GetPred));
     }
-    let function = translated(&[Instr { guard: NOT_PT, op }]);
-    assert!(
-        function
-            .to_string()
-            .starts_with("block0:\n    branch u1 false, block1, block2\n"),
-        "{function}"
-    );
-    let mut machine = Machine::new();
-    machine.regs[0] = 7;
-    machine.run(&function).expect("runs");
-    assert_eq!(machine.regs[0], 7);
+    let refused = Op::HMul2(OpHMul2 {
+        relu: true,
+        ..hmul2(r(0), h(1), h(2))
+    });
+    for guard_tested in [false, true] {
+        for op in [op, refused] {
+            let mut function = Function::new();
+            let entry = function.entry();
+            let mut builder = Builder::new(&mut function, entry);
+            assert_eq!(
+                translate_instr(&mut builder, Instr { guard: NOT_PT, op }, guard_tested),
+                Ok(()),
+                "{op} {guard_tested}"
+            );
+            assert_eq!(builder.block(), entry);
+            assert_eq!(builder.function(), &Function::new(), "{op} {guard_tested}");
+        }
+        let other = Op::Nop(crate::decode::OpNop {});
+        let mut function = Function::new();
+        let entry = function.entry();
+        let mut builder = Builder::new(&mut function, entry);
+        assert_eq!(
+            translate_instr(
+                &mut builder,
+                Instr {
+                    guard: NOT_PT,
+                    op: other
+                },
+                guard_tested
+            ),
+            Err(HalfDoubleError::Unsupported(
+                HalfDoubleUnsupported::OtherGroup
+            ))
+        );
+    }
 }
 
 /// The translation driver takes the group (slice 12i): a program of half and double
@@ -977,7 +1004,8 @@ fn pair_refusal_cases() -> Vec<(Op, HalfDoubleUnsupported)> {
 }
 
 /// Every refusal a decoded operation can reach, with its exact error; a refusal leaves the
-/// function as it was and the builder in its block, whatever the guard.
+/// function as it was and the builder in its block, whatever the guard. Under `!PT` the same
+/// instructions are not checked and append nothing either (the translation driver's rule).
 #[test]
 fn refusals_append_nothing() {
     for (op, what) in refusal_cases() {
@@ -991,7 +1019,12 @@ fn refusals_append_nothing() {
                 .expect("appends");
             let before = builder.function().clone();
             let result = translate_instr(&mut builder, Instr { guard, op }, false);
-            assert_eq!(result, Err(HalfDoubleError::Unsupported(what)), "{op}");
+            let expected = if guard == NOT_PT {
+                Ok(())
+            } else {
+                Err(HalfDoubleError::Unsupported(what))
+            };
+            assert_eq!(result, expected, "{op} {guard}");
             assert_eq!(builder.block(), entry);
             assert_eq!(builder.function(), &before, "{op}");
         }
