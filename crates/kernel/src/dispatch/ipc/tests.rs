@@ -1945,6 +1945,21 @@ fn a_parked_request_its_handler_then_defers_keeps_its_sender_waiting_until_the_r
         park_a_request_behind_a_delivery(&world, Box::new(|_, _, _| Ok(Handled::Deferred)));
     // Run and deferred: B still waits, in the one wait it began when parked.
     assert_eq!(reply_state(&world, b, parked), (ThreadState::Waiting, true));
+    // The deferred path called `await_reply` a second time for B; it must find B already in
+    // its wait on this session and keep it (true), not try to begin a second one, which
+    // `wait_for_reply` refuses (false, logged as an error) while B still reads as waiting.
+    let kept = world
+        .dispatcher
+        .with::<(&mut Scheduler,), _>(|(scheduler,)| {
+            let sender = scheduler.ipc().in_flight(parked).unwrap().unwrap().sender;
+            assert_eq!(sender.waiter, Some(b));
+            await_reply(scheduler, sender, parked)
+        });
+    assert!(
+        kept,
+        "a sender already waiting on its session stays in that wait"
+    );
+    assert_eq!(reply_state(&world, b, parked), (ThreadState::Waiting, true));
     // The delivery woke A alone.
     assert_eq!(
         world.dispatcher.take_woken(),
