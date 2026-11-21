@@ -36,6 +36,14 @@
 //!   most [`MAX_TEXTURE_SWIZZLES`], that same number, and refuses more
 //!   ([`KeyError::TooManySwizzles`]) where Eden's fixed-capacity vector has no room. Pinned by
 //!   `tests::the_swizzle_cap_at_its_edge`.
+//! - Eden's compute pipeline cache key, `ComputePipelineCacheKey`
+//!   (`eden-pr4588/src/video_core/renderer_vulkan/vk_pipeline_cache.h` @ e5fb3b97, built in
+//!   `PipelineCache::CurrentComputePipeline`, `vk_pipeline_cache.cpp` line 593), holds only
+//!   `unique_hash`, `shared_memory_size` and `workgroup_size`, so Eden reuses one compute
+//!   pipeline, translated with the first dispatch's local-memory size, for every QMD local size
+//!   of the same program. Here [`VariantKey::local_memory_size`] is part of the key, so
+//!   dispatches with different local sizes get distinct keys and shaders (see "The compute
+//!   local-memory size"). Pinned by `tests::the_local_memory_size_has_its_own_bytes`.
 //!
 //! # The previous stage's stores
 //!
@@ -109,8 +117,21 @@
 //! "Compute shaders" says "the variant key holds the workgroup size and shared-memory size";
 //! this field is a third compute field, added because the QMD is the only source of the size
 //! (the spec's pass 6) and a translated shader's array length depends on it, so two dispatches
-//! of one program with different sizes must not share a cached shader. **For the owner**: the
-//! spec sentence names two fields; whether it should name this one too.
+//! of one program with different sizes must not share a cached shader (Eden's compute cache
+//! key leaves it out: "Where this differs from Eden").
+//!
+//! **For the owner**: the field departs from three approved sentences, and whether they should
+//! name it, or the size go elsewhere, is the owner's call:
+//!
+//! - "Compute shaders": "the variant key holds the workgroup size and shared-memory size".
+//! - "Pipeline-state specialisation": "Compute: workgroup size (naga needs it as a constant in
+//!   the entry point) and shared-memory size."
+//! - Decision 16: "driver constants for numbers, the variant key for types and structure", as
+//!   this module's header puts it, "the key holds types and structure only; numbers go in the
+//!   driver constants". The local-memory size is a number in the key. It sets the length of a
+//!   naga array type (a private array takes a constant length, not one read at run time), which
+//!   is why it is here, as the workgroup size is for naga's entry point; the alternative is a
+//!   fixed-size array (the cap) bounded by a driver constant.
 //!
 //! # The texture swizzles' binding order
 //!
