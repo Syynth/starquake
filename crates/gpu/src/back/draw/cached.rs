@@ -25,23 +25,37 @@
 //! **The production translator's shaders.** [`SeamShader`] is implemented for the shader
 //! crate's [`HostShader`], what its production translator
 //! (`starquake_shader::pipeline::PipelineTranslator`, issue #484) gives, so `core` can build
-//! the cache with it on the run's compile pool. Such a shader binds no resources
-//! ([`SeamShader::resources`] is empty): until slices 13, 14 and 17, the lowering refuses every
-//! constant-buffer, texture, image and global-memory operation by name
-//! (`starquake_shader::lower::LowerError::Operation`), so a shader that would bind one is
-//! rejected, not drawn without it. Slice 17 adds the resource table to the host shader, and
-//! this impl reads it then. Pinned by `tests::a_host_shader_binds_nothing_yet`.
+//! the cache with it on the run's compile pool. Its resources are the host shader's resource
+//! table ([`HostShader::resources`], slice 17): one seam row per table row, in the table's
+//! order, at the group and binding the lowering wrote into the module:
+//!
+//! | Host table row | Seam row ([`ResourceUse`]) |
+//! |---|---|
+//! | `ResourceSource::ConstantBuffer { bank }`, `ResourceKind::UniformBuffer { size }` | [`ResourceSource::ConstantBuffer`]` { bank, size }`, the render crate's `ResourceKind::UniformBuffer`, `count: None` |
+//! | `ResourceSource::DriverConstants`, `ResourceKind::UniformBuffer { size }` | [`ResourceSource::DriverConstants`], `ResourceKind::UniformBuffer`, `count: None` (the draw binds the driver constants' own size) |
+//!
+//! The table holds only those two kinds so far; the textures, samplers and storage buffers join
+//! it with the rest of slice 17, and the match in [`resource_use`] is exhaustive, so a new kind
+//! does not compile until it is converted here. Pinned by
+//! `tests::a_host_shader_s_resource_table_reaches_the_seam` (through the production translator:
+//! a constant-buffer load's bank row, and the driver constants' row a flipped viewport adds)
+//! and `tests::each_row_field_reaches_the_seam` (each field, with distinct values).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use starquake_memory::PageRange;
+use starquake_render::shader::ResourceKind as RenderKind;
 use starquake_shader::cache::{CacheLookup, ReadyShader, ShaderCache, Translated, Translator};
-use starquake_shader::host::HostShader;
+use starquake_shader::host::{
+    HostShader, ResourceKind as HostKind, ResourceSlot, ResourceSource as HostSource,
+};
 use starquake_shader::lookup::{EngineState, ProgramMemory, ProgramRequest, ShaderSet, Ticket};
 use starquake_shader::variant::VariantKey;
 
-use super::shaders::{ReadySet, ResourceUse, SetLookup, ShaderLookup, StageInfo};
+use super::shaders::{
+    ReadySet, ResourceSource, ResourceUse, SetLookup, ShaderLookup, Slot, StageInfo,
+};
 use crate::back::buffer::InvalidationSink;
 use crate::back::pipeline::ShaderStamp;
 
@@ -59,9 +73,27 @@ impl SeamShader for HostShader {
         self
     }
 
-    /// None: the lowering refuses every resource operation until slice 17 (module docs).
+    /// The resource table, one seam row per table row (module docs).
     fn resources(&self) -> Vec<ResourceUse> {
-        Vec::new()
+        self.resources.iter().map(resource_use).collect()
+    }
+}
+
+/// The seam's row for one row of a host shader's resource table (module docs, "The production
+/// translator's shaders").
+fn resource_use(row: &ResourceSlot) -> ResourceUse {
+    let HostKind::UniformBuffer { size } = row.kind;
+    ResourceUse {
+        slot: Slot {
+            group: row.group,
+            binding: row.binding,
+        },
+        kind: RenderKind::UniformBuffer,
+        count: None,
+        source: match row.source {
+            HostSource::DriverConstants => ResourceSource::DriverConstants,
+            HostSource::ConstantBuffer { bank } => ResourceSource::ConstantBuffer { bank, size },
+        },
     }
 }
 

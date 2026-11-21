@@ -1,0 +1,47 @@
+---
+source: crates/shader/src/lower/tests/emulation.rs
+expression: "msl(&with(CompareFunction::Greater))"
+---
+// language: metal2.4
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using metal::uint;
+
+struct Output {
+    metal::float4 color0_;
+};
+struct DriverConstants {
+    float alpha_reference;
+    float viewport_flip;
+    float render_area_width;
+    float render_area_height;
+    uint base_vertex;
+    uint base_instance;
+    float position_y_scale;
+    float position_z_scale;
+    float position_z_offset;
+    char _pad9[12];
+};
+
+struct main_Output {
+    metal::float4 color0_ [[color(0)]];
+};
+fragment main_Output main_(
+  constant DriverConstants& driver_constants [[user(fake0)]]
+) {
+    Output out = {};
+    out.color0_.x = 2.0;
+    out.color0_.y = 3.0;
+    out.color0_.z = 4.0;
+    out.color0_.w = 5.0;
+    float _e19 = out.color0_.w;
+    float _e22 = driver_constants.alpha_reference;
+    if (!((metal::isnan(_e19) || metal::isnan(_e22))) && (_e19 > _e22)) {
+    } else {
+        metal::discard_fragment();
+    }
+    Output _e30 = out;
+    const auto _tmp = _e30;
+    return main_Output { _tmp.color0_ };
+}

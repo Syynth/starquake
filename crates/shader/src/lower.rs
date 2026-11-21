@@ -6,14 +6,20 @@
 //! structurizer makes (slice 11), compute entry points, arithmetic, conversions, comparisons and
 //! predicates, and the local and shared memory pass ("Passes needed for correctness", item 6);
 //! slice 16b adds the warp operations and derivatives (the `warp` submodule) and the narrower
-//! "needs subgroup size 32" requirement.
+//! "needs subgroup size 32" requirement. Slice 17 (#376) adds, so far, the resource table and
+//! its binding convention, the constant-buffer reads and the driver constants (the `resources`
+//! submodule), and the emulation the variant key's flags ask for before each return (the
+//! `emulation` submodule); textures, samplers, swizzles, storage buffers, pixel inputs and the
+//! interface types and interpolation from the key are the rest of slice 17.
 //!
 //! # The entry points
 //!
-//! [`lower_with`] takes the stage, the function and [`LowerInputs`]: the workgroup size and
-//! shared-memory size (from the variant key, [`crate::variant::VariantKey`]), the local-memory
-//! size (from the SPH or the QMD) and the host target's features ([`HostCaps`]). [`lower`] is
-//! [`lower_with`] with [`LowerInputs::DEFAULT`], what slice 1's [`crate::program`] chain uses.
+//! [`lower_with`] takes the stage, the function and [`LowerInputs`]: the workgroup size,
+//! shared-memory size and emulation flags (from the variant key,
+//! [`crate::variant::VariantKey`]), the local-memory size (from the SPH or the QMD), each
+//! constant-buffer bank's size (from collect info, [`constant_buffer_sizes`]) and the host
+//! target's features ([`HostCaps`]). [`lower`] is [`lower_with`] with [`LowerInputs::DEFAULT`],
+//! what slice 1's [`crate::program`] chain uses.
 //!
 //! # What it takes
 //!
@@ -85,6 +91,9 @@
 //!   with an 8- or 16-bit type (`ConvertU16U32` to `ConvertS32S16`) are refused: the lowering
 //!   has no 8- or 16-bit integer type.
 //! - Local and shared memory (below).
+//! - Constant-buffer reads (`GetCbufU8`, `GetCbufS8`, `GetCbufU16`, `GetCbufS16`, `GetCbufU32`,
+//!   `GetCbufF32`, `GetCbufU32x2`) at an immediate bank and an immediate or register offset
+//!   (the `resources` submodule).
 //! - The warp operations and derivatives (slice 16b, the `warp` submodule): the votes, the
 //!   ballot, the lane masks, the four shuffles and `GetInBoundsFromOp` of one, `QuadBroadcast`,
 //!   `QuadSwap`, `FSwizzleAdd`, and the four derivatives, which only pixel programs may use;
@@ -152,6 +161,16 @@
 //! bounds-checked: a read past the end gives 0 and a write past the end is dropped (the
 //! submodule lists where this differs from Eden).
 //!
+//! # Resources and emulation
+//!
+//! The `resources` submodule: each host stage's resources are in its own bind group
+//! ([`resource_group`]), the driver constants at binding [`DRIVER_CONSTANTS_BINDING`] and
+//! constant-buffer bank `b` at [`constant_buffer_binding`]`(b)`; [`HostShader::resources`]
+//! lists each declared one in binding order. The `emulation` submodule: before each return,
+//! the depth-range rewrite and the flipped viewport in vertex programs and the alpha test in
+//! pixel programs, as the key's [`crate::variant::EmulationKey`] asks; the driver constants
+//! are declared exactly when one of those steps reads them.
+//!
 //! # Requirements and the host target
 //!
 //! A function needs [`Requirements::f16`] when an operation it lowers has a 16-bit float in its
@@ -171,10 +190,13 @@
 //! 2. The stage is lowered ([`LowerError::Stage`]: vertex, pixel and compute).
 //! 3. The inputs: a compute program's workgroup size ([`LowerError::WorkgroupSize`]), the
 //!    local-memory size ([`LowerError::LocalMemory`]), a compute program's shared-memory size
-//!    ([`LowerError::SharedMemory`]).
+//!    ([`LowerError::SharedMemory`]), each constant-buffer bank's size, the lowest bank first
+//!    ([`LowerError::ConstantBufferSize`]).
 //! 4. The control-flow form ([`LowerError::ControlFlow`]).
 //! 5. Each listed instruction, blocks in arena order, for what the interface and the variables
-//!    need: phi types, name and attribute operands, stages, colour outputs.
+//!    need: phi types, name and attribute operands, stages, constant-buffer banks (a register
+//!    bank, a bank past the last, a bank with no size: the `resources` submodule's "Checks"),
+//!    colour outputs.
 //! 6. The body, in tree order: unlowered operations and operand forms.
 //! 7. The requirements against the target ([`LowerError::Missing`]).
 //! 8. naga's validation ([`LowerError::Validation`], a bug in this module if it happens).
@@ -201,18 +223,26 @@
 //! | Shared-memory word index | `offset >> 2`, logical | `OpShiftRightArithmetic` (`emit_spirv_shared_memory.cpp`), which differs only for offsets of 2^31 and up, all out of bounds here | `tests::memory::shared_offsets_at_and_past_the_end` |
 //! | `PackHalf2x16` and `UnpackHalf2x16` | Need [`Requirements::f16`] (see [`capabilities`]) | Eden needs no feature (`OpExtInst PackHalf2x16`) | `tests::opcodes::f16_packing_needs_f16` |
 //! | Out-of-bounds local and shared accesses | Read 0, write dropped, word by word | Eden does not check; the interpreter refuses | `tests::memory` |
+//! | Constant-buffer reads | The `resources` submodule's own table: a register bank, a read past the declared size, the declared type | Eden's `GetCbuf` and `DefineConstantBuffers` | `tests::resources` |
+//! | The epilogue's emulation | The `emulation` submodule's own table: the alpha reference and the flip from the driver constants, the steps before each return | Eden's `EmitEpilogue` | `tests::emulation` |
 //! | The warp operations and derivatives | The `warp` submodule's own table: vertex programs, derivatives outside pixel programs, subgroups wider than 32 lanes, the lane masks, `QuadSwap`'s direction, `QuadBroadcast`'s index, Metal's derivative controls | Eden's `emit_spirv_warp.cpp` | `tests::warp` |
 
 pub(crate) mod builder;
 mod control;
 #[cfg(test)]
 mod e1;
+mod emulation;
 mod memory;
 mod ops;
+mod resources;
 #[cfg(test)]
 mod tests;
 mod warp;
 
+pub use resources::{
+    CBUF_BANKS, CONSTANT_BUFFER_BINDING_BASE, CONSTANT_BUFFER_SLOTS, DRIVER_CONSTANTS_BINDING,
+    constant_buffer_binding, constant_buffer_sizes, resource_group,
+};
 pub use warp::needs_subgroup_size_32;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -225,6 +255,7 @@ use naga::{
 };
 use thiserror::Error;
 
+use crate::driver_constants::DriverConstantsLayout;
 pub use crate::host::HostCaps;
 use crate::host::{
     Feature, GuestSlot, HostBuiltIn, HostCode, HostShader, HostStage, InterfaceSlot, Requirements,
@@ -237,6 +268,7 @@ use crate::ir::{
 };
 pub use crate::ir::{GENERIC_0_X, POSITION_X};
 use crate::translate::{COLOR_TARGETS, GuestStage};
+use crate::variant::EmulationKey;
 use builder::{FunctionBuilder, named_ty, push, ty};
 
 /// The entry point's name in every module.
@@ -411,6 +443,41 @@ pub enum LowerError {
         /// The size asked for.
         bytes: u32,
     },
+    /// A constant-buffer bank's size in [`LowerInputs::constant_buffers`] is not a multiple
+    /// of [`crate::info::CBUF_ALIGNMENT`] or is past [`crate::info::INDEXED_CBUF_SIZE`].
+    #[error(
+        "constant buffer bank {bank} is given {size} bytes; a bank's size is a multiple of \
+         {align}, at most {max}",
+        align = crate::info::CBUF_ALIGNMENT, max = crate::info::INDEXED_CBUF_SIZE
+    )]
+    ConstantBufferSize {
+        /// The bank.
+        bank: u8,
+        /// The size given.
+        size: u32,
+    },
+    /// A constant-buffer read whose bank is a value (a register), which is not lowered yet.
+    #[error("{at}: the constant buffer bank is a register, which is not lowered yet")]
+    ConstantBufferRegisterBank {
+        /// The read.
+        at: Value,
+    },
+    /// A constant-buffer read of a bank at or past [`CBUF_BANKS`].
+    #[error("{at}: constant buffer bank {bank} does not exist; banks stop at {last}", last = CBUF_BANKS - 1)]
+    ConstantBufferBank {
+        /// The read.
+        at: Value,
+        /// The bank.
+        bank: u32,
+    },
+    /// A constant-buffer read of a bank [`LowerInputs::constant_buffers`] gives no bytes.
+    #[error("{at}: constant buffer bank {bank} is read but given no size")]
+    ConstantBufferUnsized {
+        /// The read.
+        at: Value,
+        /// The bank.
+        bank: u8,
+    },
     /// The shader needs a feature the host target lacks.
     #[error("the shader needs {0}, which the host target lacks")]
     Missing(Feature),
@@ -466,16 +533,32 @@ pub struct LowerInputs {
     pub shared_memory_bytes: u32,
     /// The features of the host target.
     pub caps: HostCaps,
+    /// Each constant-buffer bank's size in bytes, by bank, 0 for a bank not declared
+    /// ([`constant_buffer_sizes`] gives them from collect info; the `resources` submodule's
+    /// docs, "Constant-buffer reads").
+    pub constant_buffers: [u32; CONSTANT_BUFFER_SLOTS],
+    /// The render backend's emulation flags, from the variant key (the `emulation`
+    /// submodule).
+    pub emulation: EmulationKey,
 }
 
 impl LowerInputs {
-    /// A workgroup of one invocation, no local or shared memory, and a target with every
-    /// feature: what [`lower`] uses.
+    /// A workgroup of one invocation, no local or shared memory, a target with every feature,
+    /// no constant buffers and no emulation: what [`lower`] uses.
     pub const DEFAULT: Self = Self {
         workgroup_size: [1, 1, 1],
         local_memory_bytes: 0,
         shared_memory_bytes: 0,
         caps: HostCaps::ALL,
+        constant_buffers: [0; CONSTANT_BUFFER_SLOTS],
+        emulation: EmulationKey {
+            alpha_test: None,
+            depth_range_rewrite: false,
+            primitive_restart_rewrite: false,
+            attribute_fetch: false,
+            typed_outputs: false,
+            flipped_viewport: false,
+        },
     };
 }
 
@@ -569,6 +652,10 @@ struct Interface {
     system: SystemValues,
     memory: MemoryUse,
     requirements: Requirements,
+    /// The constant-buffer banks read.
+    constant_buffers: BTreeSet<u8>,
+    /// Whether the module reads the driver constants, decided from the epilogue's plan.
+    driver_constants: bool,
 }
 
 /// The system values a function reads that become built-in arguments.
@@ -607,7 +694,11 @@ const fn is_f16(ty: Type) -> bool {
 }
 
 impl Interface {
-    fn collect(stage: GuestStage, function: &Function) -> Result<Self, LowerError> {
+    fn collect(
+        stage: GuestStage,
+        function: &Function,
+        inputs: &LowerInputs,
+    ) -> Result<Self, LowerError> {
         let vertex = stage == GuestStage::Vertex;
         let mut found = Self::default();
         for (at, inst) in function.listed() {
@@ -649,6 +740,11 @@ impl Interface {
             found.requirements.subgroup |= subgroups.subgroup;
             found.requirements.subgroup_size_32 |= subgroups.subgroup_size_32;
             found.system.lane_id |= warp::reads_lane_id(op);
+            if resources::is_cbuf_read(op.opcode) {
+                found
+                    .constant_buffers
+                    .insert(resources::read_bank(at, op, inputs)?);
+            }
             match op.opcode {
                 Opcode::GetAttribute => match classify(attribute_arg(at, op, 1)?) {
                     Some(AttributeKind::Generic { index, .. }) if vertex => {
@@ -753,7 +849,7 @@ fn check_inputs(stage: GuestStage, inputs: &LowerInputs) -> Result<(), LowerErro
             bytes: inputs.shared_memory_bytes,
         });
     }
-    Ok(())
+    resources::check_sizes(&inputs.constant_buffers)
 }
 
 /// The tree a function runs: its own, or, for a control-flow graph of one block that ends in
@@ -786,7 +882,20 @@ pub fn lower_with(
     };
     check_inputs(stage, inputs)?;
     let nodes = tree(function)?;
-    let interface = Interface::collect(stage, function)?;
+    let mut interface = Interface::collect(stage, function, inputs)?;
+    // The steps run before each return (the `emulation` submodule), so a function with none
+    // (it ends in `unreachable` everywhere) plans none and declares no driver constants.
+    let epilogue = if emulation::returns(&nodes) {
+        emulation::Epilogue::plan(
+            stage == GuestStage::Vertex,
+            stage == GuestStage::Pixel,
+            interface.targets.contains(&0),
+            inputs.emulation,
+        )
+    } else {
+        emulation::Epilogue::default()
+    };
+    interface.driver_constants = epilogue.reads_driver_constants();
     let requirements = interface.requirements;
 
     let mut module = Module::default();
@@ -803,6 +912,8 @@ pub fn lower_with(
     let mut lowering = Lowering::new(FunctionBuilder::new(ENTRY_POINT), module, types);
     let interface_inputs = lowering.declare_inputs(&interface);
     let outputs = lowering.declare_outputs(stage, &interface);
+    let resources = lowering.declare_resources(host_stage, &interface, inputs)?;
+    lowering.epilogue = epilogue;
     for &var in &interface.vars {
         let (name, boolean) = var.name();
         let var_ty = if boolean {
@@ -820,6 +931,7 @@ pub fn lower_with(
     let mut body = Block::new();
     lowering.nodes(function, &nodes, &mut body)?;
     if !matches!(nodes.last(), Some(Node::Return | Node::Unreachable)) {
+        lowering.epilogue(&mut body)?;
         lowering.ret(&mut body);
     }
     if let Some(feature) = requirements.missing(inputs.caps) {
@@ -852,6 +964,8 @@ pub fn lower_with(
         entry: ENTRY_POINT.into(),
         inputs: interface_inputs,
         outputs,
+        resources,
+        driver_constants: DriverConstantsLayout::CURRENT,
         requirements,
         workgroup_size,
     })
@@ -916,6 +1030,10 @@ struct Lowering {
     memory: memory::Memory,
     /// Each shuffle's in-range flag, for a `GetInBoundsFromOp` of it (`warp`).
     in_bounds: BTreeMap<Value, Handle<Expression>>,
+    /// The declared constant buffers and driver constants (`resources`).
+    resources: resources::Resources,
+    /// What each `Epilogue` does (`emulation`).
+    epilogue: emulation::Epilogue,
 }
 
 impl Lowering {
@@ -940,6 +1058,8 @@ impl Lowering {
             target_members: BTreeMap::new(),
             memory: memory::Memory::default(),
             in_bounds: BTreeMap::new(),
+            resources: resources::Resources::default(),
+            epilogue: emulation::Epilogue::default(),
         }
     }
 

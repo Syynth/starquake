@@ -141,6 +141,31 @@ impl TestDevice {
         })
     }
 
+    /// Creates a pipeline layout with one bind group per entry of `groups`, group `n` from
+    /// `groups[n]` (an empty group for an empty list).
+    pub(crate) fn layout_groups(
+        &self,
+        groups: &[&[wgpu::BindGroupLayoutEntry]],
+    ) -> Result<wgpu::PipelineLayout, String> {
+        self.scoped(|device| {
+            let made: Vec<wgpu::BindGroupLayout> = groups
+                .iter()
+                .map(|entries| {
+                    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                        label: None,
+                        entries,
+                    })
+                })
+                .collect();
+            let refs: Vec<Option<&wgpu::BindGroupLayout>> = made.iter().map(Some).collect();
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &refs,
+                immediate_size: 0,
+            })
+        })
+    }
+
     /// Creates a render pipeline with `layout` (or one derived from the shaders), `buffers` as
     /// its vertex input and `targets` as its colour targets.
     pub(crate) fn render_pipeline(

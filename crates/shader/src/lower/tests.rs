@@ -2,9 +2,11 @@
 //! this crate's flags and wgpu's, acceptance on a wgpu device), and each lowering error.
 
 mod compute;
+mod emulation;
 mod memory;
 mod opcodes;
 mod ops;
+mod resources;
 mod run;
 mod structured;
 mod warp;
