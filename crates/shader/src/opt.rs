@@ -47,6 +47,7 @@
 mod constant;
 mod dce;
 mod identity;
+pub mod resources;
 mod ssa;
 #[cfg(test)]
 pub(crate) mod tests;
