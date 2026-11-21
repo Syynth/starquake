@@ -779,49 +779,7 @@ fn ci(offline: bool) -> ExitCode {
     let total = Instant::now();
     for Step { name, action } in steps(plan) {
         let start = Instant::now();
-        let ok = match action {
-            Action::Cargo(args) => {
-                eprintln!("==> {name}: cargo {}", args.join(" "));
-                cargo()
-                    .args(&args)
-                    .status()
-                    .is_ok_and(|status| status.success())
-            }
-            Action::WorkspaceDependencies => {
-                eprintln!("==> {name}: [workspace.dependencies] against the members");
-                workspace_dependencies()
-            }
-            Action::TableDependencies => {
-                eprintln!("==> {name}: dev, build and target dependencies against the sources");
-                table_dependencies()
-            }
-            Action::HostAccess => {
-                eprintln!(
-                    "==> {name}: no host clock, randomness, file or network access in {}",
-                    host_access::CRATES.join(", ")
-                );
-                host_access()
-            }
-            Action::Machete => {
-                eprintln!("==> {name}: cargo machete against xtask/unused-deps.toml");
-                run_machete()
-            }
-            Action::Classes => {
-                eprintln!(
-                    "==> {name}: {} against a fresh generation from the class headers",
-                    gen_classes::OUTPUT_FOLDER
-                );
-                classes()
-            }
-            Action::Packages => {
-                eprintln!(
-                    "==> {name}: each workspace package on its own (cargo clippy -p <package> \
-                     --locked -- -D warnings)"
-                );
-                each_package()
-            }
-        };
-        if !ok {
+        if !run_step(name, action) {
             eprintln!("==> {name} FAILED");
             return ExitCode::FAILURE;
         }
@@ -829,6 +787,52 @@ fn ci(offline: bool) -> ExitCode {
     }
     eprintln!("==> gate passed in {:.1}s", total.elapsed().as_secs_f64());
     ExitCode::SUCCESS
+}
+
+/// Announces one gate step and runs it. Returns whether it passes.
+fn run_step(name: &str, action: Action) -> bool {
+    match action {
+        Action::Cargo(args) => {
+            eprintln!("==> {name}: cargo {}", args.join(" "));
+            cargo()
+                .args(&args)
+                .status()
+                .is_ok_and(|status| status.success())
+        }
+        Action::WorkspaceDependencies => {
+            eprintln!("==> {name}: [workspace.dependencies] against the members");
+            workspace_dependencies()
+        }
+        Action::TableDependencies => {
+            eprintln!("==> {name}: dev, build and target dependencies against the sources");
+            table_dependencies()
+        }
+        Action::HostAccess => {
+            eprintln!(
+                "==> {name}: no host clock, randomness, file or network access in {}",
+                host_access::CRATES.join(", ")
+            );
+            host_access()
+        }
+        Action::Machete => {
+            eprintln!("==> {name}: cargo machete against xtask/unused-deps.toml");
+            run_machete()
+        }
+        Action::Classes => {
+            eprintln!(
+                "==> {name}: {} against a fresh generation from the class headers",
+                gen_classes::OUTPUT_FOLDER
+            );
+            classes()
+        }
+        Action::Packages => {
+            eprintln!(
+                "==> {name}: each workspace package on its own (cargo clippy -p <package> \
+                     --locked -- -D warnings)"
+            );
+            each_package()
+        }
+    }
 }
 
 #[cfg(test)]
