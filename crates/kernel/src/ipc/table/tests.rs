@@ -1,7 +1,7 @@
 //! The IPC table driven directly, without a dispatcher: sessions, the queue between their ends,
 //! and what closing either end does.
 
-use starquake_ipc::BUFFER_SIZE;
+use starquake_ipc::{BUFFER_SIZE, CommandType};
 use starquake_trace::{ServiceId, ThreadId};
 
 use super::*;
@@ -476,4 +476,75 @@ fn kept_notes_count_up_and_down_per_server_and_object() {
     );
     assert!(!world.ipc.take_kept(unknown, object));
     assert_eq!(world.ipc.kept(unknown, object), 0);
+}
+
+/// A request whose message is all `fill` but for its first header word, `word0`: the command
+/// type in bits 0..16 (`starquake_ipc::CommandHeader`).
+fn request_typed(thread: u64, fill: u8, word0: u32) -> Request {
+    let mut request = request(thread, fill);
+    request.message[..size_of::<u32>()].copy_from_slice(&word0.to_le_bytes());
+    request
+}
+
+#[test]
+fn a_session_whose_request_in_flight_is_a_close_message_is_not_counted_open() {
+    // The server's handler closes such a session before the kernel ends the request, so a
+    // question asked in between (gsv's drain) must not count it: the services server has
+    // already forgotten it. Each type, raw as the header carries it, with the descriptor counts
+    // above bit 16 set, which the close test ignores (`CommandHeader::decode`).
+    let closes = [
+        (CommandType::Close.to_raw().unwrap(), true),
+        (CommandType::TipcClose.to_raw().unwrap(), true),
+        (CommandType::Request.to_raw().unwrap(), false),
+        (CommandType::Control.to_raw().unwrap(), false),
+        (CommandType::LegacyRequest.to_raw().unwrap(), false),
+        (CommandType::Invalid.to_raw().unwrap(), false),
+        (CommandType::Tipc(1).to_raw().unwrap(), false),
+        // An undefined type, which the server's parse refuses: not a close.
+        (8, false),
+        (14, false),
+    ];
+    for (raw, close) in closes {
+        let mut world = World::new();
+        let (session, _) = world.connect();
+        let (_, _neighbour) = world.connect();
+        let word0 = 0x00F0_0000 | u32::from(raw);
+        assert_eq!(
+            world.send(session, request_typed(1, 1, word0)),
+            Ok(Admission::Start)
+        );
+        let open = if close { 1 } else { 2 };
+        assert_eq!(world.ipc.open_sessions(world.server), open, "type {raw}");
+        // Once the request ends with the server's end closed, it is not counted either way.
+        let done = world.ipc.finish(session, Finish::ServerClosed).unwrap();
+        world.release(session, &done);
+        assert_eq!(world.ipc.open_sessions(world.server), 1, "type {raw}");
+    }
+}
+
+#[test]
+fn a_close_message_waiting_behind_another_request_is_not_left_out() {
+    // Only the request in flight is the one the handler is running: a close waiting behind it
+    // has not closed anything yet.
+    let mut world = World::new();
+    let (session, _) = world.connect();
+    let close = u32::from(CommandType::Close.to_raw().unwrap());
+    let other = u32::from(CommandType::Request.to_raw().unwrap());
+    assert_eq!(
+        world.send(session, request_typed(1, 1, other)),
+        Ok(Admission::Start)
+    );
+    assert_eq!(
+        world.send(session, request_typed(2, 2, close)),
+        Ok(Admission::Queued)
+    );
+    assert_eq!(world.ipc.open_sessions(world.server), 1);
+    // The close starts once the first request is over: now it is left out.
+    let done = world
+        .ipc
+        .finish(session, Finish::Replied(Box::new([0; BUFFER_SIZE])))
+        .unwrap();
+    world.release(session, &done);
+    assert_eq!(world.ipc.start_next(world.server), Ok(Some(session)));
+    assert_eq!(world.ipc.open_sessions(world.server), 0);
 }

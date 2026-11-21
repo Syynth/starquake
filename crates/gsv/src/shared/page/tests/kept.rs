@@ -200,18 +200,26 @@ fn closing_a_root_session_while_another_is_open_queues_nothing() {
 
 #[test]
 fn the_page_stays_bound_while_the_kernel_says_a_root_session_is_open() {
-    // The root closed, and a new root session opened before the drain: the page is that
-    // session's to use.
+    // The root closed, and a new root session opened before the drain: the kernel counts it
+    // (a session whose own close message is in flight it does not count; on the kernel,
+    // `a_drain_between_the_root_s_close_and_the_kernel_s_end_of_it_lets_the_page_go`), so the
+    // page is that session's to use.
     let mut rig = Rig::bound();
     rig.server.close(rig.session).unwrap();
+    let second = rig.kernel.new_object();
+    rig.server.accept(second).unwrap();
     rig.root_sessions = 1;
     assert_eq!(rig.turn(T0), [Act::RootSessions]);
     assert!(rig.page().binding().is_some());
     assert_eq!(kept(&rig), [1, 1]);
-    // The close was acted on: a later turn asks nothing.
+    // The new session's own close queues the next close, and with none open the page goes.
+    assert!(rig.shared.queue().is_empty());
+    rig.server.close(second).unwrap();
+    assert!(!rig.shared.queue().is_empty());
     rig.root_sessions = 0;
-    assert_eq!(rig.turn(T0), []);
-    assert!(rig.page().binding().is_some());
+    assert_eq!(rig.turn(T0), let_go(&rig));
+    assert_eq!(rig.page().binding(), None);
+    assert_eq!(kept(&rig), [0, 0]);
 }
 
 #[test]
@@ -347,5 +355,109 @@ fn the_not_kept_refusals_read_as_plain_words() {
     assert_eq!(
         PageSnapshotError::ReadOnlyNotKept.to_string(),
         "the root does not keep exactly one reference to the syncpoint page's read-only memory"
+    );
+}
+
+#[test]
+fn a_restored_page_must_account_for_every_reference_the_root_keeps() {
+    let rig = Rig::bound();
+    let page = rig.page();
+    let stray = object(0x55, 5);
+    let bound = snapshot_of(&page);
+    // Bound: exactly the page's two, and not one more.
+    fresh_shared()
+        .restore_page(&bound, &Holding::of(&page), ROOT)
+        .unwrap();
+    let mut kernel = Holding::of(&page);
+    kernel.kept.insert((ROOT, stray), 1);
+    let restored = fresh_shared();
+    assert_eq!(
+        restored.restore_page(&bound, &kernel, ROOT),
+        Err(PageSnapshotError::UnaccountedKept {
+            kept: KEPT_PER_BINDING + 1,
+            accounted: KEPT_PER_BINDING,
+        })
+    );
+    assert_eq!(restored.lock().page(), &Page::default());
+    assert!(kernel.attached_nothing());
+    // Unbound, as the root's close leaves it (its events stay): none, and not one.
+    let unbound = Page {
+        binding: None,
+        ..page.clone()
+    };
+    let bytes = snapshot_of(&unbound);
+    fresh_shared()
+        .restore_page(&bytes, &Holding::of(&unbound), ROOT)
+        .unwrap();
+    let mut kernel = Holding::of(&unbound);
+    kernel.kept.insert((ROOT, stray), 1);
+    assert_eq!(
+        fresh_shared().restore_page(&bytes, &kernel, ROOT),
+        Err(PageSnapshotError::UnaccountedKept {
+            kept: 1,
+            accounted: 0,
+        })
+    );
+    assert!(kernel.attached_nothing());
+    // The unbound page restored while the root still keeps the bound page's two.
+    let kernel = Holding::of(&page);
+    assert_eq!(
+        fresh_shared().restore_page(&bytes, &kernel, ROOT),
+        Err(PageSnapshotError::UnaccountedKept {
+            kept: KEPT_PER_BINDING,
+            accounted: 0,
+        })
+    );
+    // Another service's references are not the root's.
+    let mut kernel = Holding::of(&unbound);
+    kernel.kept.insert((GSV, stray), 3);
+    fresh_shared().restore_page(&bytes, &kernel, ROOT).unwrap();
+}
+
+#[test]
+fn the_unaccounted_check_comes_after_the_memories_and_before_the_hook() {
+    let rig = Rig::bound();
+    let page = rig.page();
+    let binding = page.binding().unwrap();
+    let bytes = snapshot_of(&page);
+    // The writable memory kept twice is also one reference too many: its own check first.
+    let mut kernel = Holding::of(&page);
+    kernel.kept.insert((ROOT, binding.writable), 2);
+    assert_eq!(
+        fresh_shared().restore_page(&bytes, &kernel, ROOT),
+        Err(PageSnapshotError::WritableNotKept)
+    );
+    // The read-only memory's likewise.
+    let mut kernel = Holding::of(&page);
+    kernel.kept.insert((ROOT, binding.read_only), 2);
+    assert_eq!(
+        fresh_shared().restore_page(&bytes, &kernel, ROOT),
+        Err(PageSnapshotError::ReadOnlyNotKept)
+    );
+    // A stray reference and a hook the kernel will not take back: the stray first, and
+    // nothing attached.
+    let mut kernel = Holding::of(&page);
+    kernel.kept.insert((ROOT, object(0x55, 5)), 1);
+    kernel.hooked.clear();
+    assert_eq!(
+        fresh_shared().restore_page(&bytes, &kernel, ROOT),
+        Err(PageSnapshotError::UnaccountedKept {
+            kept: KEPT_PER_BINDING + 1,
+            accounted: KEPT_PER_BINDING,
+        })
+    );
+    assert!(kernel.attached_nothing());
+}
+
+#[test]
+fn the_unaccounted_refusal_reads_as_plain_words() {
+    assert_eq!(
+        PageSnapshotError::UnaccountedKept {
+            kept: 1,
+            accounted: 0
+        }
+        .to_string(),
+        "the root keeps transfer-memory references the syncpoint page does not account for \
+         (kept in all: 1, accounted for: 0)"
     );
 }

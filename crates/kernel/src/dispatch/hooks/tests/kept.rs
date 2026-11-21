@@ -240,3 +240,53 @@ fn open_sessions_counts_the_server_s_sessions_whose_client_has_not_gone() {
     assert_eq!(world.call_with_handle(SvcId::CloseHandle, second), 0);
     assert_eq!(world.dispatcher.open_sessions(SERVICE), 0);
 }
+
+#[test]
+fn a_keep_for_a_server_the_table_does_not_know_drops_the_reference_it_opened() {
+    // Through `IpcContext` the server is always one the table knows; driven directly, the note
+    // fails after the reference was opened, and the reference is dropped again.
+    let world = World::new();
+    let (_handle, lent) = lend(&world);
+    let unknown = ServerId::from_parts(0x7F, 3);
+    let kept = world
+        .dispatcher
+        .with::<(&mut Scheduler,), _>(|(scheduler,)| {
+            keep_transfer_memory_in(scheduler, unknown, lent).map(|_| ())
+        });
+    assert_eq!(
+        kept,
+        Err(SvcError::internal(&crate::ipc::IpcError::UnknownServer(
+            unknown
+        )))
+    );
+    // The guest's handle is the only reference, and the pages are still locked by it alone.
+    assert_eq!(refs(&world, lent), 1);
+    assert_eq!(world.dispatcher.kept_transfer_memory(SERVICE, lent), 0);
+    assert_eq!(world.dispatcher.kept_transfer_memories(SERVICE), 0);
+}
+
+#[test]
+fn kept_transfer_memories_counts_every_reference_the_server_keeps() {
+    let world = World::new();
+    let (_, lent) = lend(&world);
+    assert_eq!(world.dispatcher.kept_transfer_memories(SERVICE), 0);
+    keep(&world, lent, 1);
+    assert_eq!(world.dispatcher.kept_transfer_memories(SERVICE), 1);
+    // A second object, of a different count, and the same one again: every reference counts.
+    let mut regs = GuestRegs::default();
+    regs.x[1] = DATA + PAGE_SIZE;
+    regs.x[2] = PAGE_SIZE;
+    regs.x[3] = u64::from(crate::memory::SvcPermission::Read.bits());
+    world.call(SvcId::CreateTransferMemory, &mut regs);
+    assert_eq!(regs.x[0], 0);
+    let second = object_of(&world, Handle::from_register(regs.x[1]));
+    keep(&world, second, 2);
+    keep(&world, lent, 1);
+    assert_eq!(world.dispatcher.kept_transfer_memories(SERVICE), 4);
+    assert_eq!(world.dispatcher.kept_transfer_memories(NO_SERVER), 0);
+    world
+        .dispatcher
+        .release_kept_transfer_memory(SERVICE, second)
+        .unwrap();
+    assert_eq!(world.dispatcher.kept_transfer_memories(SERVICE), 3);
+}

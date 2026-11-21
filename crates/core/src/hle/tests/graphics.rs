@@ -81,6 +81,14 @@ struct Tipc {
 impl Rig {
     /// The graphics server's root, as a title gets it: `appletOE`'s `ISelfController` 2000.
     fn graphics_root(&self) -> Handle {
+        let (oe, controller) = self.self_controller();
+        self.graphics_supervisor(oe, controller)
+    }
+
+    /// `appletOE`'s `ISelfController`, as a title opens it: the `appletOE` session (a domain)
+    /// and the controller's object id in it. Getting it writes the service name into the
+    /// `NAME` page, so a test that lends that page gets it first.
+    fn self_controller(&self) -> (Handle, u32) {
         let oe = self.service(am::OE_NAME);
         let root = self.convert(oe);
         let (_, buffer) = self.send(oe, &open_proxy(root, Handle::CURRENT_PROCESS));
@@ -91,11 +99,12 @@ impl Rig {
             &domain(objects[0], &proxy_interface, "get_self_controller"),
         );
         let (_, _, controller) = domain_reply(&buffer, 0);
-        let ask = domain(
-            controller[0],
-            &am::ISelfController,
-            "get_graphics_supervisor",
-        );
+        (oe, controller[0])
+    }
+
+    /// A new session on the graphics server's root: the controller's 2000 on `oe`.
+    fn graphics_supervisor(&self, oe: Handle, controller: u32) -> Handle {
+        let ask = domain(controller, &am::ISelfController, "get_graphics_supervisor");
         let (code, buffer) = self.send(oe, &ask);
         assert_eq!(code, ResultCode::SUCCESS);
         let message = Message::parse_reply_sized(&buffer, SessionKind::Domain, 0).unwrap();
@@ -925,6 +934,36 @@ fn the_page_outlives_the_title_s_handles_until_its_root_session_closes() {
             Err(KernelError::InvalidHandle)
         );
     }
+    assert_eq!(graphics.shared().lock().page().binding(), None);
+}
+
+/// The production host asks the kernel how many root sessions are open
+/// (`KernelHost::root_sessions`): the title closes its only root session and opens a new one
+/// through `GetGraphicsSupervisor` before the turn, so the turn keeps the page bound for it,
+/// with the root's two references; the new session's close then lets it go.
+#[test]
+fn the_page_stays_bound_for_a_root_session_opened_before_the_turn() {
+    let graphics = Graphics::new(FrontMode::Live, None);
+    let rig = rig_with(&graphics);
+    // The controller first: getting it writes into the page the writable memory is lent from.
+    let (oe, controller) = rig.self_controller();
+    let root = rig.graphics_supervisor(oe, controller);
+    let (_, _, writable, read_only) = bound_on(&rig, root);
+    let memories = [rig.object(writable), rig.object(read_only)];
+    let kept = || memories.map(|memory| rig.dispatcher.kept_transfer_memory(GSV_ROOT, memory));
+    assert_eq!(kept(), [1, 1]);
+    let regs = rig.call(SvcId::CloseHandle, u64::from(root.raw()), 0);
+    assert_eq!(result(&regs), ResultCode::SUCCESS);
+    let second = rig.graphics_supervisor(oe, controller);
+    rig.turn_at(&graphics, HostNanos(0));
+    assert_eq!(kept(), [1, 1]);
+    let binding = graphics.shared().lock().page().binding().unwrap();
+    assert_eq!([binding.writable, binding.read_only], memories);
+    // The new session's close is the root's last: the turn lets the page go.
+    let regs = rig.call(SvcId::CloseHandle, u64::from(second.raw()), 0);
+    assert_eq!(result(&regs), ResultCode::SUCCESS);
+    rig.turn_at(&graphics, HostNanos(0));
+    assert_eq!(kept(), [0, 0]);
     assert_eq!(graphics.shared().lock().page().binding(), None);
 }
 

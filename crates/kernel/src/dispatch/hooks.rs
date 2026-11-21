@@ -201,8 +201,23 @@ impl Dispatcher {
         })
     }
 
+    /// How many references the server of `service` keeps in all, over every transfer memory
+    /// (module docs, "A server's own reference"; [`crate::ipc::Ipc::kept_total`]): how a
+    /// service's restore step checks that its snapshot accounts for every reference the
+    /// server keeps. Zero for a service with no server.
+    #[must_use]
+    pub fn kept_transfer_memories(&self, service: ServiceId) -> u32 {
+        self.with::<(&Scheduler,), _>(|(scheduler,)| {
+            let ipc = scheduler.ipc();
+            ipc.service(service)
+                .map_or(0, |server| ipc.kept_total(server))
+        })
+    }
+
     /// How many sessions on the server of `service` have their server end open
-    /// ([`crate::ipc::Ipc::open_sessions`]): zero for a service with no server. Run outside any
+    /// ([`crate::ipc::Ipc::open_sessions`], which leaves out a session whose request in flight
+    /// is a close message, as the server has already forgotten it): zero for a service with no
+    /// server. Run outside any
     /// request; gsv asks it on its timer thread, before it lets the shared syncpoint page go,
     /// whether a root session has opened since the last one closed.
     #[must_use]

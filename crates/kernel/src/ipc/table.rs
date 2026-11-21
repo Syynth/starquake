@@ -30,6 +30,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use starquake_ipc::CommandHeader;
 use starquake_trace::{ServiceId, ThreadId};
 
 use super::message::{MessageBuffer, Translated};
@@ -325,15 +326,43 @@ impl Ipc {
             .unwrap_or(0)
     }
 
+    /// How many references `server` keeps in all, over every object ([`Ipc::add_kept`]): zero
+    /// for a server this table does not know. It walks the server's notes, which hold one
+    /// entry per object it keeps.
+    #[must_use]
+    pub fn kept_total(&self, server: ServerId) -> u32 {
+        self.server(server).map_or(0, |row| {
+            row.kept
+                .values()
+                .fold(0, |total: u32, count| total.saturating_add(*count))
+        })
+    }
+
     /// How many sessions on `server` have their server end open: those whose client end has not
-    /// gone and whose server end has not been closed. Zero for a server this table does not
-    /// know. It walks every session, so it is for rare questions (gsv asks it when the root's
-    /// last session has closed), not for a request's path.
+    /// gone, whose server end has not been closed, and whose request in flight is not a close
+    /// message ([`is_close_message`]). Zero for a server this table does not know. It walks
+    /// every session, so it is for rare questions (gsv asks it when the root's last session has
+    /// closed), not for a request's path.
+    ///
+    /// A session with a close message in flight is left out because the server's handler
+    /// closes its own end of it while the kernel's lock is let go (`Server::run` in
+    /// `starquake-services`), and the kernel marks the end closed ([`Finish::ServerClosed`])
+    /// only once the handler has returned: a question asked in between must agree with the
+    /// server, which has already forgotten the session. Every close message ends that way: the
+    /// handler answers it with `Handled::Closed`, or fails and has its end closed
+    /// (`close_failed` in `dispatch/ipc.rs`). A close message still waiting behind another
+    /// request is counted: nothing has closed the session yet
+    /// (`a_close_message_waiting_behind_another_request_is_not_left_out`).
     #[must_use]
     pub fn open_sessions(&self, server: ServerId) -> usize {
         self.sessions
             .values()
             .filter(|row| row.server == server && row.server_open)
+            .filter(|row| {
+                !row.in_flight
+                    .as_ref()
+                    .is_some_and(|request| is_close_message(&request.message))
+            })
             .count()
     }
 
@@ -671,6 +700,19 @@ impl Ipc {
         }
         Ok(())
     }
+}
+
+/// Whether `message` is a close message: its first two words decode as a command header
+/// (`starquake_ipc::CommandHeader::decode`, the decode the server's own parse runs first) whose
+/// type closes the session (`CommandType::is_close`: `Close` or `TipcClose`;
+/// `eden/src/core/hle/ipc.h`, `CommandHeader::IsCloseCommand`). An undefined type, which that
+/// decode refuses, is not one.
+fn is_close_message(message: &MessageBuffer) -> bool {
+    let mut words = [0; CommandHeader::WORDS];
+    for (word, bytes) in words.iter_mut().zip(message.as_chunks::<4>().0) {
+        *word = u32::from_le_bytes(*bytes);
+    }
+    CommandHeader::decode(words).is_ok_and(|header| header.command_type.is_close())
 }
 
 #[cfg(test)]

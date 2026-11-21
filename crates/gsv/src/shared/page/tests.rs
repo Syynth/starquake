@@ -1496,6 +1496,14 @@ impl RestoreKernel for Holding {
     fn kept_transfer_memory(&self, service: ServiceId, memory: ObjectId) -> u32 {
         self.kept.get(&(service, memory)).copied().unwrap_or(0)
     }
+
+    fn kept_transfer_memories(&self, service: ServiceId) -> u32 {
+        self.kept
+            .iter()
+            .filter(|((keeper, _), _)| *keeper == service)
+            .map(|(_, count)| *count)
+            .sum()
+    }
 }
 
 /// A snapshot holding `page`, as `save_page` lays one out.
