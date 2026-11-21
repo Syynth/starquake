@@ -87,6 +87,9 @@ pub enum Rejection {
     /// ([`crate::pipeline`]'s module docs, "What it does not do yet").
     #[error(transparent)]
     Pipeline(#[from] crate::pipeline::PipelineRefusal),
+    /// A host lowering pass refused the program (slice 18, [`crate::host_lower`]).
+    #[error(transparent)]
+    HostLower(#[from] crate::host_lower::HostLowerError),
 }
 
 impl From<TranslateError> for Rejection {

@@ -19,7 +19,7 @@ use crate::decode::{
 };
 use crate::exchange::{EngineState, TextureKind, exchange};
 use crate::flow::FlowError;
-use crate::host::{HostCode, HostStage};
+use crate::host::{Feature, HostCode, HostStage, ResourceKind, ResourceSlot, ResourceSource};
 use crate::info::InfoError;
 use crate::interp::Machine;
 use crate::ir::{ATTRIBUTE_WORD_BYTES, Attribute, Function, Inst, Node, Opcode};
@@ -371,7 +371,18 @@ fn through_the_cache(
     engine: &State,
     variant: &VariantKey,
 ) -> Result<Arc<HostShader>, Arc<Rejection>> {
-    let mut cache = ShaderCache::new(Arc::new(PipelineTranslator), Arc::new(Threads), TARGET);
+    through_the_cache_to(TARGET, stage, program, engine, variant)
+}
+
+/// [`through_the_cache`] with the host target `target`.
+fn through_the_cache_to(
+    target: HostTarget,
+    stage: GuestStage,
+    program: &[u8],
+    engine: &State,
+    variant: &VariantKey,
+) -> Result<Arc<HostShader>, Arc<Rejection>> {
+    let mut cache = ShaderCache::new(Arc::new(PipelineTranslator), Arc::new(Threads), target);
     let memory = Memory(program.to_vec());
     let request = [ProgramRequest {
         stage,
@@ -494,8 +505,8 @@ fn table_value(index: u32) -> u32 {
 /// A `BRX` whose table the answers give is translated with its targets: the program entry asks
 /// for the table's two words, the exchange answers them, flow analysis takes the targets, and
 /// the interpreter goes where the selector says. Through the cache the same program gets past
-/// flow analysis and is refused only by the lowering, at the table's constant-buffer load,
-/// which slice 13 and 17 lower.
+/// flow analysis and the table's constant-buffer load (slice 17 lowers it), and is refused only
+/// for what the test target lacks: the funnel shift's 64-bit integers.
 #[test]
 fn a_brx_the_answers_resolve_translates() {
     let header = vertex_header(0);
@@ -544,18 +555,76 @@ fn a_brx_the_answers_resolve_translates() {
         );
     }
     let refused = through_the_cache(GuestStage::Vertex, &program, &state, &VariantKey::default())
-        .expect_err("the constant-buffer load is not lowered yet");
-    assert!(
-        matches!(
-            &*refused,
-            Rejection::Lower(LowerError::Operation {
-                at,
-                opcode: Opcode::GetCbufU32,
-            }) if at.index() == 22
-        ),
+        .expect_err("the target has no 64-bit integers");
+    assert_eq!(
+        *refused,
+        Rejection::Lower(LowerError::Missing(Feature::Int64)),
         "{refused:?}"
     );
-    assert_eq!(refused.to_string(), "%22: GetCbufU32 is not lowered yet");
+    assert_eq!(
+        refused.to_string(),
+        "the shader needs 64-bit integers, which the host target lacks"
+    );
+}
+
+/// Through the cache's production translator, with a target that has the 64-bit integers the
+/// funnel shift needs, the `BRX` program of `a_brx_the_answers_resolve_translates` is ready, and
+/// its resource table is the one bank its table load reads, sized by collect info to the end of
+/// the indexed read (the whole bank, `INDEXED_CBUF_SIZE`), in the vertex stage's group at the
+/// bank's binding: slice 17's table from program bytes to module.
+#[test]
+fn a_constant_buffer_load_reaches_the_resource_table() {
+    let header = vertex_header(0);
+    let program = bytes(Some(&header), &selector_program(0));
+    let state = State {
+        table: vec![table_value(FIRST), table_value(SECOND)],
+    };
+    let target = HostTarget {
+        caps: Requirements {
+            i64: true,
+            ..TARGET.caps
+        },
+        ..TARGET
+    };
+    let shader = through_the_cache_to(
+        target,
+        GuestStage::Vertex,
+        &program,
+        &state,
+        &VariantKey::default(),
+    )
+    .expect("ready");
+    assert_eq!(
+        shader.resources,
+        [ResourceSlot {
+            group: 0,
+            binding: 1 + u32::from(TABLE_BANK),
+            kind: ResourceKind::UniformBuffer {
+                size: crate::info::INDEXED_CBUF_SIZE,
+            },
+            source: ResourceSource::ConstantBuffer { bank: TABLE_BANK },
+        }]
+    );
+    // A load at an immediate offset: the bank is sized by collect info to the end of the read,
+    // rounded up to 16 bytes (0x24 + 4 is 0x30), not to the whole bank.
+    let mut code = vec![ldc(0, Gpr::RZ.index(), 3, 0x24)];
+    code.extend(words(&[ast(0, GENERIC_0_X), exit()]));
+    let immediate = through_the_cache(
+        GuestStage::Vertex,
+        &bytes(Some(&header), &code),
+        &State::default(),
+        &VariantKey::default(),
+    )
+    .expect("ready");
+    assert_eq!(
+        immediate.resources,
+        [ResourceSlot {
+            group: 0,
+            binding: 4,
+            kind: ResourceKind::UniformBuffer { size: 0x30 },
+            source: ResourceSource::ConstantBuffer { bank: 3 },
+        }]
+    );
 }
 
 /// A `BRX` whose table words the engine does not have reads them as 0, which names no
@@ -1042,6 +1111,15 @@ fn host_caps_take_each_feature() {
         (
             Requirements {
                 f64: true,
+                ..all_off
+            },
+            HostCaps {
+                f64: true,
+                ..HostCaps::NONE
+            },
+        ),
+        (
+            Requirements {
                 i64_atomics: true,
                 ..all_off
             },
@@ -1117,5 +1195,133 @@ fn a_pixel_program_s_header_reaches_the_driver() {
     assert_eq!(
         refused.to_string(),
         "a pixel program cannot read attribute a0x80"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Speed.
+
+/// How many instructions the speed test's program has: tens of thousands (spec, "Compilation,
+/// threads and stutter": "a test translates a large synthetic program (tens of thousands of
+/// instructions) within a fixed time on CI").
+const SPEED_INSTRUCTIONS: usize = 20_000;
+
+/// The fixed bound the speed test's translation must finish within (spec, "The offline test
+/// harness", "Speed"; slice 17). A **guess**, set well above the time measured on the
+/// development Mac in the test profile (see the PR) so a slower CI runner passes, and below the
+/// cache wait's own watchdog ([`WATCHDOG`]).
+const SPEED_BOUND: Duration = Duration::from_secs(20);
+
+/// The speed test's program: segments of eight instructions (an add, a comparison, a guarded
+/// move into R7, a constant-buffer load indexed by R7, and adds back into R7), so each
+/// segment's values feed the next and the passes cannot drop them, and the translation driver,
+/// the structurizer (a conditional block per segment), the SSA rewrite (a phi per segment), the
+/// passes, collect info and the lowering all see work in proportion to the size; then two
+/// stores and `EXIT`.
+fn speed_program() -> Vec<Instruction> {
+    const SEGMENT: usize = 8;
+    let segments = (SPEED_INSTRUCTIONS - 3) / SEGMENT;
+    let mut code = Vec::with_capacity(SPEED_INSTRUCTIONS);
+    for segment in 0..segments {
+        let k = u32::try_from(segment).expect("small");
+        code.extend(words(&[
+            add_imm(0, 0, 1),
+            less_than(1, 0, k),
+            Instr {
+                guard: p(1),
+                ..mov(7, k)
+            },
+        ]));
+        code.push(ldc(4, 7, 1, (k * 4) % 0x100));
+        code.extend(words(&[
+            add_imm(5, 4, 1),
+            add_imm(6, 5, 2),
+            add_imm(7, 6, 3),
+            add_imm(3, 0, 1),
+        ]));
+    }
+    code.extend(words(&[ast(0, GENERIC_0_X), ast(7, GENERIC_0_Y), exit()]));
+    code
+}
+
+/// The speed test (spec, "The offline test harness", "Speed"; owned by slice 17): a program of
+/// about [`SPEED_INSTRUCTIONS`] instructions goes through the cache's production translator,
+/// from bytes to a validated module, within [`SPEED_BOUND`].
+#[test]
+fn a_large_program_translates_within_the_bound() {
+    let code = speed_program();
+    assert!(code.len() > SPEED_INSTRUCTIONS - 8 && code.len() <= SPEED_INSTRUCTIONS);
+    let program = bytes(Some(&vertex_header(0)), &code);
+    let start = std::time::Instant::now();
+    let shader = through_the_cache(
+        GuestStage::Vertex,
+        &program,
+        &State::default(),
+        &VariantKey::default(),
+    )
+    .expect("ready");
+    let took = start.elapsed();
+    eprintln!("translated {} instructions in {took:?}", code.len());
+    assert!(took < SPEED_BOUND, "took {took:?}");
+    assert_eq!(
+        shader.resources,
+        [ResourceSlot {
+            group: 0,
+            binding: 2,
+            kind: ResourceKind::UniformBuffer {
+                size: crate::info::INDEXED_CBUF_SIZE,
+            },
+            source: ResourceSource::ConstantBuffer { bank: 1 },
+        }]
+    );
+    // Every segment's load reached the module.
+    let HostCode::Naga { module, .. } = &shader.code;
+    let loads = module.entry_points[0]
+        .function
+        .expressions
+        .iter()
+        .filter(|(_, expression)| matches!(expression, naga::Expression::Load { .. }))
+        .count();
+    assert!(loads >= (SPEED_INSTRUCTIONS - 3) / 8, "{loads} loads");
+}
+
+/// The variant key's emulation flags reach the lowering through the cache's production
+/// translator: the same vertex program, looked up with the flipped viewport and the depth-range
+/// rewrite set, lists the driver constants in its resource table and reads the position words;
+/// looked up with no flag, it binds nothing.
+#[test]
+fn the_key_s_emulation_reaches_the_lowering() {
+    let header = vertex_header(0);
+    let program = bytes(
+        Some(&header),
+        &words(&[mov(0, 0), ast(0, GENERIC_0_X), exit()]),
+    );
+    let plain = through_the_cache(
+        GuestStage::Vertex,
+        &program,
+        &State::default(),
+        &VariantKey::default(),
+    )
+    .expect("ready");
+    assert_eq!(plain.resources, []);
+    let flipped = VariantKey {
+        emulation: crate::variant::EmulationKey {
+            flipped_viewport: true,
+            ..crate::variant::EmulationKey::default()
+        },
+        ..VariantKey::default()
+    };
+    let shader = through_the_cache(GuestStage::Vertex, &program, &State::default(), &flipped)
+        .expect("ready");
+    assert_eq!(
+        shader.resources,
+        [ResourceSlot {
+            group: 0,
+            binding: 0,
+            kind: ResourceKind::UniformBuffer {
+                size: u32::try_from(crate::driver_constants::DRIVER_CONSTANTS_SIZE).expect("small"),
+            },
+            source: ResourceSource::DriverConstants,
+        }]
     );
 }

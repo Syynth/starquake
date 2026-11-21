@@ -54,7 +54,11 @@ pub(super) fn opaque(function: &Function) -> Function {
                 (op.opcode, slot),
                 (Opcode::QuadBroadcast | Opcode::QuadSwap, 1) | (Opcode::ShuffleIndex, 1 | 3)
             );
+            // A constant-buffer read's bank names its binding and must stay an immediate
+            // (`resources`); its offset is made opaque like any other operand.
+            let cbuf_bank = slot == 0 && super::super::resources::is_cbuf_read(op.opcode);
             let kept = warp_kept
+                || cbuf_bank
                 || matches!(
                     (op.opcode, slot),
                     (Opcode::GetGotoVariable | Opcode::SetGotoVariable, 0)
@@ -284,7 +288,18 @@ fn patched(shader: &HostShader, regs: &[u8], lanes: u32) -> naga::Module {
 /// Runs `shader` (a compute shader with a workgroup of one) once on the GPU and returns
 /// registers `regs`; `None` when the host cannot run it (a notice says why).
 pub(super) fn gpu_registers(test: &str, shader: &HostShader, regs: &[u8]) -> Option<Vec<u32>> {
-    gpu_run(test, shader, regs, 1)
+    gpu_run(test, shader, regs, 1, &[])
+}
+
+/// [`gpu_registers`], with each `(binding, bytes)` of `uniforms` bound as a uniform buffer at
+/// that binding of group 0 (a compute shader's constant buffers, `resources`).
+pub(super) fn gpu_registers_with(
+    test: &str,
+    shader: &HostShader,
+    regs: &[u8],
+    uniforms: &[(u32, &[u8])],
+) -> Option<Vec<u32>> {
+    gpu_run(test, shader, regs, 1, uniforms)
 }
 
 /// Runs one workgroup of `shader` (a compute shader whose workgroup has `lanes` invocations
@@ -297,12 +312,18 @@ pub(super) fn gpu_lanes(
     lanes: u32,
 ) -> Option<Vec<Vec<u32>>> {
     assert_eq!(shader.workgroup_size, Some([lanes, 1, 1]));
-    let words = gpu_run(test, shader, regs, lanes)?;
+    let words = gpu_run(test, shader, regs, lanes, &[])?;
     Some(words.chunks(regs.len()).map(<[u32]>::to_vec).collect())
 }
 
 /// [`gpu_lanes`], as one list of words.
-fn gpu_run(test: &str, shader: &HostShader, regs: &[u8], lanes: u32) -> Option<Vec<u32>> {
+fn gpu_run(
+    test: &str,
+    shader: &HostShader,
+    regs: &[u8],
+    lanes: u32,
+    uniforms: &[(u32, &[u8])],
+) -> Option<Vec<u32>> {
     let wanted = features(shader.requirements);
     let gpu = TestDevice::open(test, wanted)?;
     if !gpu.has(wanted) {
@@ -340,13 +361,23 @@ fn gpu_run(test: &str, shader: &HostShader, regs: &[u8], lanes: u32) -> Option<V
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let buffers = uniform_buffers(device, &gpu.queue, uniforms);
+        let mut entries = vec![wgpu::BindGroupEntry {
+            binding: 0,
+            resource: storage.as_entire_binding(),
+        }];
+        entries.extend(
+            buffers
+                .iter()
+                .map(|(binding, buffer)| wgpu::BindGroupEntry {
+                    binding: *binding,
+                    resource: buffer.as_entire_binding(),
+                }),
+        );
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &pipeline.get_bind_group_layout(0),
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: storage.as_entire_binding(),
-            }],
+            entries: &entries,
         });
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
@@ -389,6 +420,27 @@ fn gpu_run(test: &str, shader: &HostShader, regs: &[u8], lanes: u32) -> Option<V
             .map(|word| u32::from_le_bytes(*word))
             .collect(),
     )
+}
+
+/// One uniform buffer per `(binding, bytes)` of `uniforms`, holding the bytes, with its binding.
+fn uniform_buffers(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    uniforms: &[(u32, &[u8])],
+) -> Vec<(u32, wgpu::Buffer)> {
+    uniforms
+        .iter()
+        .map(|&(binding, bytes)| {
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("uniform"),
+                size: u64::try_from(bytes.len()).expect("small"),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            queue.write_buffer(&buffer, 0, bytes);
+            (binding, buffer)
+        })
+        .collect()
 }
 
 /// Registers `regs` after the interpreter runs `function` once.

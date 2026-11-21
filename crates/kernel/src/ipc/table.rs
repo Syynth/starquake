@@ -30,6 +30,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use starquake_ipc::CommandHeader;
 use starquake_trace::{ServiceId, ThreadId};
 
 use super::message::{MessageBuffer, Translated};
@@ -169,6 +170,9 @@ struct ServerRow {
     /// The events the server made for itself while it handled requests (either end), which
     /// it alone may clear ([`Ipc::is_server_event`]).
     events: BTreeSet<ObjectId>,
+    /// The references the server keeps to objects a request lent it, by object, with how many
+    /// ([`Ipc::add_kept`]): each is one of the object's references, opened when it was noted.
+    kept: BTreeMap<ObjectId, u32>,
 }
 
 /// One session.
@@ -213,6 +217,7 @@ impl Ipc {
             queue: RequestQueue::new(),
             notices: VecDeque::new(),
             events: BTreeSet::new(),
+            kept: BTreeMap::new(),
         };
         let server = self.servers.insert(row).map_err(|_| IpcError::Full)?;
         self.services.insert(service, server);
@@ -281,6 +286,84 @@ impl Ipc {
     pub fn is_server_event(&self, server: ServerId, event: ObjectId) -> bool {
         self.server(server)
             .is_ok_and(|row| row.events.contains(&event))
+    }
+
+    /// Notes that `server` keeps one more reference to `object`, which the caller has just
+    /// opened for it: the note is how [`Ipc::take_kept`] knows the reference is the server's to
+    /// drop, and no other holder's.
+    pub fn add_kept(&mut self, server: ServerId, object: ObjectId) -> Result<(), IpcError> {
+        let count = self.server_mut(server)?.kept.entry(object).or_insert(0);
+        // Each note is one of the object's references, which the object table counts in a
+        // `u32` and refuses to open past it, so a count that was opened cannot saturate here.
+        *count = count.saturating_add(1);
+        Ok(())
+    }
+
+    /// Takes one of the references `server` keeps to `object` off its notes ([`Ipc::add_kept`]),
+    /// for the caller to drop. False, and nothing changes, when the server keeps none (and for
+    /// a server this table does not know).
+    pub fn take_kept(&mut self, server: ServerId, object: ObjectId) -> bool {
+        let Ok(row) = self.server_mut(server) else {
+            return false;
+        };
+        match row.kept.get_mut(&object) {
+            Some(count) if *count > 1 => *count -= 1,
+            Some(_) => {
+                row.kept.remove(&object);
+            }
+            None => return false,
+        }
+        true
+    }
+
+    /// How many references `server` keeps to `object` ([`Ipc::add_kept`]): zero for an object it
+    /// keeps none of, and for a server this table does not know.
+    #[must_use]
+    pub fn kept(&self, server: ServerId, object: ObjectId) -> u32 {
+        self.server(server)
+            .ok()
+            .and_then(|row| row.kept.get(&object).copied())
+            .unwrap_or(0)
+    }
+
+    /// How many references `server` keeps in all, over every object ([`Ipc::add_kept`]): zero
+    /// for a server this table does not know. It walks the server's notes, which hold one
+    /// entry per object it keeps.
+    #[must_use]
+    pub fn kept_total(&self, server: ServerId) -> u32 {
+        self.server(server).map_or(0, |row| {
+            row.kept
+                .values()
+                .fold(0, |total: u32, count| total.saturating_add(*count))
+        })
+    }
+
+    /// How many sessions on `server` have their server end open: those whose client end has not
+    /// gone, whose server end has not been closed, and whose request in flight is not a close
+    /// message ([`is_close_message`]). Zero for a server this table does not know. It walks
+    /// every session, so it is for rare questions (gsv asks it when the root's last session has
+    /// closed), not for a request's path.
+    ///
+    /// A session with a close message in flight is left out because the server's handler
+    /// closes its own end of it while the kernel's lock is let go (`Server::run` in
+    /// `starquake-services`), and the kernel marks the end closed ([`Finish::ServerClosed`])
+    /// only once the handler has returned: a question asked in between must agree with the
+    /// server, which has already forgotten the session. Every close message ends that way: the
+    /// handler answers it with `Handled::Closed`, or fails and has its end closed
+    /// (`close_failed` in `dispatch/ipc.rs`). A close message still waiting behind another
+    /// request is counted: nothing has closed the session yet
+    /// (`a_close_message_waiting_behind_another_request_is_not_left_out`).
+    #[must_use]
+    pub fn open_sessions(&self, server: ServerId) -> usize {
+        self.sessions
+            .values()
+            .filter(|row| row.server == server && row.server_open)
+            .filter(|row| {
+                !row.in_flight
+                    .as_ref()
+                    .is_some_and(|request| is_close_message(&request.message))
+            })
+            .count()
     }
 
     fn server_mut(&mut self, server: ServerId) -> Result<&mut ServerRow, IpcError> {
@@ -617,6 +700,19 @@ impl Ipc {
         }
         Ok(())
     }
+}
+
+/// Whether `message` is a close message: its first two words decode as a command header
+/// (`starquake_ipc::CommandHeader::decode`, the decode the server's own parse runs first) whose
+/// type closes the session (`CommandType::is_close`: `Close` or `TipcClose`;
+/// `eden/src/core/hle/ipc.h`, `CommandHeader::IsCloseCommand`). An undefined type, which that
+/// decode refuses, is not one.
+fn is_close_message(message: &MessageBuffer) -> bool {
+    let mut words = [0; CommandHeader::WORDS];
+    for (word, bytes) in words.iter_mut().zip(message.as_chunks::<4>().0) {
+        *word = u32::from_le_bytes(*bytes);
+    }
+    CommandHeader::decode(words).is_ok_and(|header| header.command_type.is_close())
 }
 
 #[cfg(test)]

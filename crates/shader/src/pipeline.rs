@@ -29,12 +29,16 @@
 //!   4. collect info ([`collect`], slice 15, [`Rejection::Info`]): the spec's pass 7 ("Dead
 //!      code elimination, then collect info"), run for its refusals ([`crate::info::InfoError`],
 //!      among them an unknown attribute, a colour output that does not exist and a
-//!      constant-buffer bank or offset out of range); its tables are not passed on yet, since
-//!      nothing the lowering takes reads them until slice 17;
-//!   5. the lowering ([`lower_with`], [`Rejection::Lower`]), with the variant key's workgroup
-//!      and shared-memory sizes, the local-memory size ([`local_memory_bytes`]: the header's
-//!      for a graphics program, the variant key's, from the QMD, for a compute program) and
-//!      the host target's features.
+//!      constant-buffer bank or offset out of range) and for the constant-buffer sizes the
+//!      lowering declares ([`constant_buffer_sizes`]); its interface tables are not passed on
+//!      yet;
+//!   5. the host lowering passes the host target's features call for ([`lower_for_host`],
+//!      slice 18, [`Rejection::HostLower`]): 64-bit floats become 32-bit ones where the target
+//!      lacks them, and 16-bit floats likewise; the spec's pass 8;
+//!   6. the lowering ([`lower_with`], [`Rejection::Lower`]), with the variant key's workgroup
+//!      and shared-memory sizes and emulation flags, the local-memory size (module docs, "The
+//!      local-memory size"), the constant-buffer sizes of step 4 and the host target's
+//!      features.
 //!
 //! # The local-memory size
 //!
@@ -63,12 +67,14 @@
 //!
 //! # What it does not do yet
 //!
-//! - **Graphics interfaces and resources** are slice 17's (#376): the lowering refuses what 17
-//!   adds by name, so a program that needs it is rejected, not drawn wrongly: a pixel
-//!   program's generic inputs ([`crate::lower::LowerError::Input`]), and every constant-buffer,
-//!   texture, image and global-memory operation ([`crate::lower::LowerError::Operation`]).
-//!   Collect info (slice 15) runs (step 4), but the resource table and interface it builds are
-//!   dropped until 17 lowers them.
+//! - **The rest of the graphics interfaces and resources** are slice 17's (#376): constant
+//!   buffers and the emulation the key's flags ask for at the epilogue are lowered, but the
+//!   lowering still refuses by name, so a program that needs them is rejected, not drawn
+//!   wrongly: a pixel program's generic inputs ([`crate::lower::LowerError::Input`]), a
+//!   constant buffer whose bank is a register
+//!   ([`crate::lower::LowerError::ConstantBufferRegisterBank`]), and every texture, image and
+//!   global-memory operation ([`crate::lower::LowerError::Operation`]). Collect info's
+//!   interface tables (slice 15) are not passed on yet.
 //! - **Jump tables do not extend the capture** (the cache's module docs, "Where this differs
 //!   from the spec"): the tables are resolved against the capture's own bytes, since
 //!   [`Translator::shader`] has no guest-memory reader, so a target at or past the capture's
@@ -100,8 +106,9 @@ use crate::decode::Instruction;
 use crate::exchange::{Answers, Question, Questioner};
 use crate::flow::{BranchTables, JumpTableQuestions, resolve_jump_tables};
 use crate::host::{HostCaps, HostShader, Requirements};
+use crate::host_lower::lower_for_host;
 use crate::info::{check_header, collect, translation_stage};
-use crate::lower::{LowerInputs, lower_with};
+use crate::lower::{LowerInputs, constant_buffer_sizes, lower_with};
 use crate::program::{Rejection, pipeline_ir};
 use crate::sph::{Io, ProgramHeader};
 use crate::translate::{ColorOutputs, Stage, TranslateError};
@@ -197,13 +204,14 @@ impl Translator for PipelineTranslator {
     }
 }
 
-/// The host target's features as the lowering takes them: the features of [`Requirements`] the
-/// lowering can need ([`HostCaps`]); 64-bit floats and 64-bit atomics are refused by the
+/// The host target's features as the lowering and the host lowering passes take them: the
+/// features of [`Requirements`] they can need ([`HostCaps`]); 64-bit atomics are refused by the
 /// lowering whatever the target has.
 #[must_use]
 pub const fn host_caps(caps: Requirements) -> HostCaps {
     HostCaps {
         f16: caps.f16,
+        f64: caps.f64,
         i64: caps.i64,
         subgroup: caps.subgroup,
         subgroup_size_32: caps.subgroup_size_32,
@@ -228,13 +236,17 @@ pub fn translate_shader(input: &ShaderInput<'_, PipelineProgram>) -> Result<Host
         Io::Vtg(_) => None,
     });
     let code: Vec<Instruction> = program.capture.instructions().collect();
-    let function = pipeline_ir(stage, pixel, &code, &tables)?;
-    collect(input.stage, header, &function)?;
+    let mut function = pipeline_ir(stage, pixel, &code, &tables)?;
+    let info = collect(input.stage, header, &function)?;
+    let caps = host_caps(input.target.caps);
+    lower_for_host(&mut function, caps)?;
     let inputs = LowerInputs {
         workgroup_size: input.variant.workgroup_size,
         local_memory_bytes: local_memory_bytes(header, input.variant),
         shared_memory_bytes: input.variant.shared_memory_size,
-        caps: host_caps(input.target.caps),
+        caps,
+        constant_buffers: constant_buffer_sizes(&info),
+        emulation: input.variant.emulation,
     };
     Ok(lower_with(input.stage, &function, &inputs)?)
 }

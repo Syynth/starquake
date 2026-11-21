@@ -541,6 +541,10 @@ impl Lowering {
             let expr = self.warp(body, at, op, kind)?;
             return self.done(at, expr);
         }
+        if super::resources::is_cbuf_read(opcode) {
+            let expr = self.cbuf_read(body, at, op)?;
+            return self.done(at, Some(expr));
+        }
         let expr = match opcode {
             Opcode::Void | Opcode::Prologue | Opcode::Epilogue => None,
             Opcode::Identity | Opcode::ConditionRef => Some(self.arg(body, at, op, 0)?),
@@ -845,7 +849,7 @@ impl Lowering {
     /// operand is a NaN, tested with `isnan` rather than left to the comparison, because the
     /// host compiler's fast math treats a NaN as an ordinary value in a comparison (see the
     /// module docs).
-    fn float_compare(
+    pub(super) fn float_compare(
         &mut self,
         body: &mut Block,
         cmp: BinaryOperator,
