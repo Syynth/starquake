@@ -8,10 +8,10 @@
 //!
 //! - [`integer`]: the integer ALU group (slice 12a), `MOV` included;
 //! - [`float`]: the 32-bit float and conversion group (slice 12b);
+//! - [`half_double`]: the half- and double-precision group (slice 12c);
 //! - [`texture`]: the texture and surface group (slice 12f);
-//! - [`memory`]: the memory group (slice 12e), which translates one instruction on its own but
-//!   is not joined to the driver yet: the driver refuses its operations by name ([`driver`]'s
-//!   module docs, "Dispatch");
+//! - [`memory`]: the memory group (slice 12e), joined to the driver ([`driver`]'s module docs,
+//!   "Dispatch");
 //! - `attribute`: the attribute and system-value group (slice 12g: `ALD`, `AST`, `IPA`, `AL2P`,
 //!   `S2R`, `CS2R`, `PIXLD`, and the deferred `OUT`, `ISBERD` and `ISBEWR`), joined through
 //!   `GROUPS`;
@@ -32,17 +32,19 @@
 //! ([`crate::flow::FlowBlock::guard_tested`]); the driver builds the conditional block of a
 //! guarded pure instruction with [`split_for_guard`], the shared guard helper, and translates
 //! the guarded instructions that write no IR (`NOP`, `DEPBAR`, `BREAK`, `WARPSYNC` with an
-//! immediate) as they are, with no block ([`driver`]'s "Guards", which lists this as an open
-//! owner question: the spec's "Every guarded instruction becomes a conditional block" read
-//! literally would give each an empty block).
+//! immediate) as they are, with no block and no guard read ([`driver`]'s "Guards"), as the
+//! owner ruled on 2026-11-20 (decision log, "Owner rulings on the wave 47 questions", row 1);
+//! the spec reads "Every guarded instruction that writes IR becomes a conditional block". Pinned
+//! by `driver::tests::a_guarded_instruction_that_is_not_pure_reads_no_guard`.
 //!
 //! There is one guard rule, the driver's, decided by [`guard_step`]: `!PT` becomes nothing,
 //! unchecked; `PT` or a settled guard is ignored; any other guard makes a conditional block.
 //! The group translators' own entry points that take a guard follow the same function, so
 //! called on their own they give the IR the driver and flow analysis give together: the
-//! integer and memory groups ([`integer::GuardMode`]) and the float and texture groups
-//! (`guard_tested`, through [`conditional_block`]) split with [`split_for_guard`], reading the
-//! guard as a predicate (of the decodable forms only `S2UR` and `VOTEU` are uniform datapath
+//! integer and memory groups ([`integer::GuardMode`]) and the float, half and double
+//! ([`half_double`]) and texture groups (`guard_tested`, through [`conditional_block`]) split
+//! with [`split_for_guard`], reading the guard as a predicate (of the decodable forms only
+//! `S2UR` and `VOTEU` are uniform datapath
 //! instructions, `classify.h`'s `uniform`, whose guard the driver reads as a uniform
 //! predicate, and neither is theirs: `driver::tests::the_guard_of_every_pure_form_is_read_by_its_kind`;
 //! a uniform form the decoder learns later needs its group's read changed too); the control
@@ -63,6 +65,7 @@ mod attribute;
 pub mod control;
 pub mod driver;
 pub mod float;
+pub mod half_double;
 pub mod integer;
 pub mod memory;
 pub(crate) mod source;
@@ -80,7 +83,7 @@ use crate::ir::{BlockId, BuildError, Builder, Imm, Opcode, Operand, Terminator, 
 use crate::sph::PixelIo;
 
 pub use attribute::{AttributeRejection, Deferral};
-pub use driver::{MAX_TRANSLATED_INSTRUCTIONS, translate_flow};
+pub use driver::{MAX_TRANSLATED_INSTRUCTIONS, translate_flow, translates_stage};
 
 /// The guest's pipeline stage of a program (spec, "What the GPU front/back protocol and engine
 /// state (#12) gets": `GuestStage`; slot types from `SET_PIPELINE_SHADER`).
@@ -160,10 +163,6 @@ pub enum Unsupported {
     /// `LDTRAM`; in [`control::translate_control`], `BMOV`, `NANOSLEEP`, `JMX` and `BPT`.
     #[error("{0}")]
     Instruction(&'static str),
-    /// An instruction of the memory group, whose translator (slice 12e) is not joined to the
-    /// driver yet ([`driver`]'s module docs, "Dispatch").
-    #[error("{0}, of the memory group, which is not translated yet,")]
-    MemoryGroup(&'static str),
     /// A control or warp form [`control::translate_control`] does not handle.
     #[error("{0}")]
     Control(#[from] control::ControlUnsupported),
@@ -211,6 +210,10 @@ pub enum Unsupported {
     /// A form of the texture and surface group that is not translated ([`texture`]).
     #[error("{0}")]
     Texture(texture::TextureUnsupported),
+    /// A form of the half- and double-precision group that is not translated
+    /// ([`half_double`]).
+    #[error("{0}")]
+    HalfDouble(half_double::HalfDoubleUnsupported),
 }
 
 /// Why a program was not translated.
@@ -237,6 +240,20 @@ pub enum TranslateError {
         instr: Instr,
         /// Why.
         error: integer::IntegerError,
+    },
+    /// An instruction of the memory group is not translated ([`memory::MemoryError`]: a form or
+    /// field value slice 12e's translator does not handle; its decode, other-group and
+    /// successor-phi refusals cannot be reached from the driver, which hands it a decoded
+    /// instruction of the group with its guard already handled, and its build failures are
+    /// [`TranslateError::Build`]).
+    #[error("instruction {index} ({instr}): {error}")]
+    Memory {
+        /// The instruction's index in the program.
+        index: usize,
+        /// The instruction.
+        instr: Instr,
+        /// Why.
+        error: memory::MemoryError,
     },
     /// An instruction a flow block holds does not decode (flow analysis decodes only control
     /// instructions; the driver decodes the rest).
@@ -355,8 +372,8 @@ pub(crate) fn split_for_guard(
 
 /// What a translator does with an instruction's guard: the translation driver's rule
 /// ([`driver`]'s module docs, "Guards"), made by [`guard_step`], which the driver and every
-/// group translator that takes a guard itself ([`integer`], [`float`], [`texture`],
-/// [`memory`], [`control`]) follow, so that there is one rule.
+/// group translator that takes a guard itself ([`integer`], [`float`], [`half_double`],
+/// [`texture`], [`memory`], [`control`]) follow, so that there is one rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum GuardStep {
     /// The guard is `!PT`: the instruction never runs and becomes nothing, its own checks not
@@ -392,7 +409,7 @@ pub(crate) const fn guard_step(guard: PredSrc, settled: bool) -> GuardStep {
 /// Translates one instruction under `guard` at the end of `builder`'s block by [`guard_step`]
 /// (with `guard_tested` as the guard's being settled), for the groups whose translators take a
 /// guard themselves and check an instruction whole before writing any of it ([`float`],
-/// [`texture`]). For [`GuardStep::Skip`] nothing runs, `check` included. Otherwise `check`
+/// [`half_double`], [`texture`]). For [`GuardStep::Skip`] nothing runs, `check` included. Otherwise `check`
 /// runs first, and its refusal appends nothing; then `body` writes the instruction's IR from
 /// what `check` returned: in `builder`'s block for [`GuardStep::Unguarded`], or, for
 /// [`GuardStep::Conditional`], in the instruction's block of the split [`split_for_guard`]

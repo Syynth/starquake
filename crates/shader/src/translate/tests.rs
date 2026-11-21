@@ -693,10 +693,6 @@ fn rejections_read_as_words() {
              instructions to translate"
         )
     );
-    assert_eq!(
-        Unsupported::MemoryGroup("ld").to_string(),
-        "ld, of the memory group, which is not translated yet,"
-    );
 }
 
 /// The shared guard helper: the split block branches on the condition to the instruction's

@@ -23,7 +23,9 @@
 //!
 //! # The order of the checks
 //!
-//! 1. The stage: vertex and pixel programs only ([`TranslateError::Stage`]), as slice 1 had it.
+//! 1. The stage: vertex, pixel and compute programs, the stages the lowering takes
+//!    ([`translates_stage`]); any other is [`TranslateError::Stage`], named, until the lowering
+//!    takes it (slice 17 owns the graphics stages past vertex and pixel).
 //! 2. Flow analysis ([`TranslateError::Flow`]), which decodes the control instructions it walks.
 //! 3. The size: the instructions of every flow block, counted once per block, so once per
 //!    inlined copy of a function, at most [`MAX_TRANSLATED_INSTRUCTIONS`]
@@ -81,13 +83,15 @@
 //!
 //! By the decoded operation, in this order: `EXIT` (`super`'s `Translator::exit`); the integer
 //! ALU group ([`super::integer::is_integer`], `MOV` included); the float group
-//! ([`super::float::in_group`]); the texture group ([`super::texture::in_group`], with one
+//! ([`super::float::in_group`]); the half and double group ([`super::half_double::in_group`]);
+//! the texture group ([`super::texture::in_group`], with one
 //! [`DescriptorBuffer`] for the program); the control and warp group
-//! ([`super::control::in_group`]); the memory group, whose translator (slice 12e) is not joined
-//! yet, refused by name ([`Unsupported::MemoryGroup`]: `LD`, `ST`, `LDC`, `ATOM`, `CCTL`,
-//! `MEMBAR`, `LDGSTS`, `LDGDEPBAR`, `ERRBAR`, `ATOMS.POPC`); the attribute group (`super`'s
-//! `GROUPS`). An operation none of them takes (the half and double group, the uniform group,
-//! the tensor group) is refused by its mnemonic ([`Unsupported::Instruction`]). The groups are
+//! ([`super::control::in_group`]); the memory group ([`super::memory::is_memory`]: `LD`, `ST`,
+//! `LDC`, `ATOM`, `CCTL`, `MEMBAR`, `LDGSTS`, `LDGDEPBAR`, `ERRBAR`, `ATOMS.POPC`), with slice
+//! 12e's translator ([`super::memory::translate_memory`], its guard already handled), whose
+//! refusals are [`TranslateError::Memory`]; the attribute group (`super`'s `GROUPS`). An
+//! operation none of them takes (the uniform group, the tensor group) is refused by its
+//! mnemonic ([`Unsupported::Instruction`]). The groups are
 //! disjoint, so the order decides nothing but speed: `tests::the_groups_are_disjoint` checks
 //! that every decoded operation (one instruction of each, from the deterministic
 //! `tests::decoded_samples`, which `tests::these_instructions_reach_every_decoded_operation`
@@ -112,11 +116,13 @@
 //! | A guarded pure instruction | A conditional block (the owner's ruling of 2026-11-19) | A select of each value it writes (`guard_select`) | `tests::a_guarded_pure_instruction_becomes_a_conditional_block` |
 //! | The instructions translated | At most [`MAX_TRANSLATED_INSTRUCTIONS`], counted over the inlined graph (a **guess**, four per instruction of a program at the capture's cap, as [`crate::flow::MAX_FLOW_BLOCKS`] is four blocks per instruction) | No bound | `tests::the_translation_budget_at_its_edge` |
 //! | Which undecodable instruction is refused | The lowest-numbered one any flow block holds, after flow analysis's own refusals and before any translation | The first its flow walk meets (`flow.cpp`: `LookupRow`, `FirstUnknownBit`, before `guard.Never()`), in walk order, among the walk's other refusals | `tests::the_lowest_undecodable_instruction_is_refused` |
-//! | Stages | Vertex and pixel only, slice 1's restriction (compute comes with slice 16's lowering) | No stage check in `Translate` | `tests::only_vertex_and_pixel_stages_translate` |
+//! | Stages | Vertex, pixel and compute, the stages the lowering takes; tessellation, geometry and the cull-before-fetch vertex stage are refused by name until slice 17's lowering takes them | No stage check in `Translate` | `tests::only_the_stages_the_lowering_takes_translate` |
 
 use super::control::{self, Emitted};
 use super::float::{self, FloatError};
+use super::half_double::{self, HalfDoubleError};
 use super::integer::{self, GuardMode, IntegerError};
+use super::memory::{self, MemoryError};
 use super::texture::{self, DescriptorBuffer, TextureError};
 use super::{
     Failure, GuardStep, GuestStage, Stage, TranslateError, Translator, Unsupported, guard_step,
@@ -137,6 +143,18 @@ use crate::sph::PixelIo;
 /// [`crate::flow::MAX_FLOW_BLOCKS`] makes for blocks; real programs would confirm or move it.
 pub const MAX_TRANSLATED_INSTRUCTIONS: u32 = 4 * MAX_INSTRUCTIONS;
 
+/// Whether [`translate_flow`] takes programs of `stage`: vertex, pixel and compute, the stages
+/// the lowering takes ([`crate::lower::lower_with`]'s `LowerError::Stage` refuses the others).
+/// Any other stage is refused by name ([`Unsupported::Stage`]) until the lowering takes it
+/// (slice 17; module docs, "The order of the checks").
+#[must_use]
+pub const fn translates_stage(stage: GuestStage) -> bool {
+    matches!(
+        stage,
+        GuestStage::Vertex | GuestStage::Pixel | GuestStage::Compute
+    )
+}
+
 /// Translates `code`, a captured program's instructions, for `stage`: flow analysis with
 /// `tables` giving each `BRX`'s targets, the IR's blocks, and each block filled by the group
 /// translators (see the module docs for the order of the checks). `header` is a pixel program's
@@ -151,7 +169,7 @@ pub fn translate_flow(
     code: &[Instruction],
     tables: &BranchTables,
 ) -> Result<IrBlocks, TranslateError> {
-    if !matches!(stage.stage, GuestStage::Vertex | GuestStage::Pixel) {
+    if !translates_stage(stage.stage) {
         return Err(TranslateError::Stage(Unsupported::Stage(stage.stage)));
     }
     let graph = flow_graph(code, tables)?;
@@ -332,6 +350,15 @@ impl Driver {
                     FloatError::Build(error) => TranslateError::Build(error),
                 });
         }
+        if half_double::in_group(&op) {
+            return half_double::translate_instr(&mut Builder::new(function, block), instr, true)
+                .map_err(|error| match error {
+                    HalfDoubleError::Unsupported(what) => {
+                        unsupported(Unsupported::HalfDouble(what))
+                    }
+                    HalfDoubleError::Build(error) => TranslateError::Build(error),
+                });
+        }
         if texture::in_group(&op) {
             return texture::translate_instr(
                 &mut Builder::new(function, block),
@@ -351,8 +378,20 @@ impl Driver {
                 control::translate_control(function, block, self.stage.stage, index, instr, true)?;
             return Ok(());
         }
-        if in_memory_group(&op) {
-            return Err(unsupported(Unsupported::MemoryGroup(op.mnemonic())));
+        if memory::is_memory(&op) {
+            return memory::translate_memory(
+                &mut Builder::new(function, block),
+                &instr,
+                GuardMode::Tested,
+            )
+            .map_err(|error| match error {
+                MemoryError::Build(error) => TranslateError::Build(error),
+                error => TranslateError::Memory {
+                    index,
+                    instr,
+                    error,
+                },
+            });
         }
         let mut t = Translator {
             b: Builder::new(function, block),
@@ -370,24 +409,6 @@ impl Driver {
             Failure::Build(error) => TranslateError::Build(error),
         })
     }
-}
-
-/// Whether `op` is of the memory group (slice 6e's operations), which the driver refuses by
-/// name until slice 12e's translator is joined (see the module docs, "Dispatch").
-const fn in_memory_group(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::Ld(_)
-            | Op::St(_)
-            | Op::Ldc(_)
-            | Op::Atom(_)
-            | Op::CCtl(_)
-            | Op::MemBar(_)
-            | Op::LdGsts(_)
-            | Op::LdgDepBar(_)
-            | Op::ErrBar(_)
-            | Op::AtomsPopc(_)
-    )
 }
 
 /// The test-support entry for the translators' tests that build their programs as
@@ -426,7 +447,7 @@ pub(crate) fn translate_decoded(
 ) -> Result<Function, TranslateError> {
     use crate::flow::{OpKind, is_never};
     use crate::ir::Terminator;
-    if !matches!(stage.stage, GuestStage::Vertex | GuestStage::Pixel) {
+    if !translates_stage(stage.stage) {
         return Err(TranslateError::Stage(Unsupported::Stage(stage.stage)));
     }
     let mut function = Function::new();

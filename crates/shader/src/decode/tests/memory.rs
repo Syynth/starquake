@@ -1595,11 +1595,9 @@ fn bindless_ldc_handles_decode_every_register() {
 /// and neighbours of the group's opcodes that no reference names, are unknown opcodes.
 #[test]
 fn memory_rows_left_undecoded_are_unknown_opcodes() {
-    // ULDC and ULDC.64 (slice 6d), LDCG, and opcodes with no row: generic LD and ST, SM 9.0's
-    // float atomics, and a gap among the global forms.
-    for opcode in [
-        0xab9, 0xabb, 0x8b8, 0x980, 0x985, 0x9a3, 0x9a6, 0x982, 0x9ac,
-    ] {
+    // Opcodes with no row: generic LD and ST, SM 9.0's float atomics, and a gap among the global
+    // forms. (`ULDC`, `0xabb` and `LDCG` are slice 6d's: `op::uniform`.)
+    for opcode in [0x980, 0x985, 0x9a3, 0x9a6, 0x982, 0x9ac] {
         let word = Instruction::default().with_field(OPCODE, u64::from(opcode));
         assert_eq!(
             decode(word),

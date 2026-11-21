@@ -71,6 +71,33 @@
 //! work queued after the request and before the job's event reads those pages. No reference has
 //! the window (NX2 and PR change their tables at once).
 //!
+//! # The semaphore mirror page
+//!
+//! **Tentative** (decision log, 2026-11-20, "The semaphore mirror page: copy releases, as
+//! Eden-NX2 does"; graphics-server, "The semaphore mirror page", verification item 8). gsv tells
+//! the GPU which registrations are two pages long: each address space's table lists every
+//! registration of exactly 0x2000 bytes that does not start at address 0
+//! (`starquake_gpu::vm::SemaphoreRegistration::new`, NX2's `last - start + 1 == 0x2000` in
+//! `SubRegisterMemory`, `eden-nx2/src/core/hle/service/nx2_gsv.h` @ 50fa86bb; 0 is NX2's empty
+//! slot, which it never stores), and the GPU copies a fenced release
+//! that lands in the second page of one into its first page (`starquake_gpu::vm`, its `mirror`
+//! submodule). When each table learns of it:
+//!
+//! - a 101 lists the registration in every address space at the request, as NX2 adds it there
+//!   (`a_two_page_registration_is_listed_in_every_space`);
+//! - a 102 takes it out of every address space at the request, as NX2's `SubDestroyMemory`
+//!   does, not when the GPU has applied the removal (`a_destroy_unlists_at_the_request`);
+//! - a new table (gpu 33) and a restored one (`gpu::saved`) list every two-page registration
+//!   held (`a_new_space_lists_the_registrations_held`,
+//!   `a_restored_table_lists_its_two_page_registrations`);
+//! - destroying an address space empties its table's list, since the GPU front keeps the table
+//!   (`a_destroyed_space_lists_nothing`).
+//!
+//! Registrations of any other size are not listed (`only_two_page_registrations_are_listed`).
+//! Each registration counts once, so two with the same start keep the copy until both are
+//! destroyed (a divergence from NX2, listed in the GPU crate's `mirror` docs). The list is not
+//! a mapping: it is not published in layers and waits for no job.
+//!
 //! # Destroying an address space
 //!
 //! [`GpuMemory::destroy_address_space`] is what nvhost-as-gpu calls when the last fd holding a
@@ -118,7 +145,7 @@ use std::sync::Arc;
 
 use starquake_gpu::interface::{Kind, RegionId, Target, Ticket, VmUpdate};
 use starquake_gpu::memory::Translate;
-use starquake_gpu::vm::{GpuVm, Mapping};
+use starquake_gpu::vm::{GpuVm, Mapping, SemaphoreRegistration};
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::memory::DeviceShareToken;
 use starquake_kernel::result::KernelError;
@@ -338,7 +365,9 @@ impl Admission<'_> {
     }
 
     /// 101 after the kernel's checks: records the registration with its lock's token, maps it
-    /// at its own address in every address space, and returns its handle.
+    /// at its own address in every address space, lists it in every address space's table for
+    /// the semaphore mirror page when it is two pages long (module docs, "The semaphore mirror
+    /// page"), and returns its handle.
     pub fn register(self, token: DeviceShareToken) -> u32 {
         let Self {
             memory,
@@ -360,6 +389,13 @@ impl Admission<'_> {
         let spaces: Vec<AsId> = memory.spaces.keys().copied().collect();
         for space in spaces {
             memory.republish(space, range);
+        }
+        // The semaphore mirror page (module docs): NX2's `SubRegisterMemory` adds a two-page
+        // registration at the 101 request.
+        if let Some(semaphore) = SemaphoreRegistration::new(range) {
+            for space in memory.spaces.values() {
+                space.vm.add_semaphore_registration(semaphore);
+            }
         }
         handle
     }
@@ -702,6 +738,7 @@ impl GpuMemory {
             .checked_add(1)
             .ok_or(KernelError::OutOfResource)?;
         let vm = Arc::new(GpuVm::new());
+        self.list_semaphore_registrations(&vm);
         front.create_address_space(id, Arc::clone(&vm));
         self.spaces.insert(
             id,
@@ -728,6 +765,9 @@ impl GpuMemory {
         space: AsId,
     ) -> Result<(), KernelError> {
         let held = self.spaces.remove(&space).ok_or(KernelError::NotFound)?;
+        // The front keeps the table: it lists nothing more (module docs, "The semaphore mirror
+        // page").
+        held.vm.clear_semaphore_registrations();
         let mut updates: Vec<VmUpdate> = held
             .regions
             .iter()
@@ -763,6 +803,16 @@ impl GpuMemory {
             job.reveal.retain(|&(id, _)| id != space);
         }
         Ok(())
+    }
+
+    /// Lists in `vm`, a table new to the GPU (gpu 33, a restore), every two-page registration
+    /// held (module docs, "The semaphore mirror page").
+    pub(crate) fn list_semaphore_registrations(&self, vm: &GpuVm) {
+        for registration in self.registrations.values() {
+            if let Some(semaphore) = SemaphoreRegistration::new(registration.range) {
+                vm.add_semaphore_registration(semaphore);
+            }
+        }
     }
 
     /// The address spaces, in id order.
@@ -947,6 +997,13 @@ impl GpuMemory {
         self.registrations.remove(&handle);
         let own = registration.range;
         self.registered.remove(own.start(), own.end());
+        // The semaphore mirror page (module docs): NX2's `SubDestroyMemory` removes a two-page
+        // registration at the 102 request, before the GPU is done.
+        if let Some(semaphore) = SemaphoreRegistration::new(own) {
+            for space in self.spaces.values() {
+                space.vm.remove_semaphore_registration(semaphore);
+            }
+        }
         let mut removed: Vec<(AsId, Vec<(u64, u64)>)> = Vec::new();
         for (&id, space) in &mut self.spaces {
             let mapped: Vec<u64> = space
