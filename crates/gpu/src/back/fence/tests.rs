@@ -3,6 +3,7 @@
 //! completion queue and the front's wake-up. Every wait is bounded.
 
 mod increment;
+mod mirror;
 mod production;
 mod seams;
 mod waiters;

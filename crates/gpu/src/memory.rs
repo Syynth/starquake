@@ -123,6 +123,17 @@ pub trait GpuMemory: Send + Sync {
         let _ = (va, len);
         false
     }
+    /// Where a fenced release at GPU address `va` is also written: `va` minus
+    /// [`crate::vm::SEMAPHORE_MIRROR_OFFSET`] when `va` lies in the second page of a two-page
+    /// registration gsv listed, otherwise `None` (the semaphore mirror page, tentative:
+    /// [`crate::vm::GpuVm::semaphore_mirror`]; the fence path makes the copy).
+    ///
+    /// The default answers `None`: a memory with no address table ([`TestGpuMemory`]) lists no
+    /// registration. [`VmMemory`] answers from its table.
+    fn semaphore_mirror(&self, va: u64) -> Option<u64> {
+        let _ = va;
+        None
+    }
 }
 
 /// What an address table offers a [`TranslationCache`].
