@@ -97,7 +97,9 @@
 //! The cache keeps the pool when the backend falls back to the recording backend, so such a run
 //! still translates its shaders; a pool that cannot be started is the backend's failure
 //! ("the compile pool could not be started", then why), and the run then has no shader cache
-//! ([`NoShaders`]). Pinned by `the_shader_cache_holds_the_pool_the_backend_was_given`, in
+//! ([`NoShaders`]). Pinned by `the_shader_cache_holds_the_pool_the_backend_was_given`, and the
+//! pool that cannot be started, for both choices, by
+//! `a_compile_pool_that_cannot_start_is_the_backend_s_failure` (over [`wgpu_opening`]), both in
 //! `gpu/tests.rs`. A run with the recording choice makes no pool and keeps [`NoShaders`]: its
 //! draws are skipped as before. **Owner question**: whether a recording run should start a pool
 //! of its own for its shaders, which costs every such run (every test run among them) the
@@ -600,30 +602,27 @@ pub(crate) fn graphics_opening<C: HostClock + 'static>(
     };
     let ring = standard_ring()?;
     let keeper = Arc::new(RunFrames::default());
-    let pool = CompileWorkers::for_host()
-        .map(Arc::new)
-        .map_err(|error| format!("the compile pool could not be started: {error}"));
-    let attempt = match &pool {
-        Ok(pool) => opener.open(
-            Arc::<CompileWorkers>::clone(pool),
-            ring.completion_wake(),
-            gpu_config().exec.setting,
-            &keeper,
-            render.window(),
-            PRESENT_TARGET_WAIT,
-        ),
-        Err(reason) => Err(Unopened::Backend(reason.clone())),
-    };
-    let backend = match (attempt, if_unavailable) {
-        (Ok(backend), _) => backend,
-        (Err(Unopened::Backend(reason)), IfUnavailable::UseRecording) => {
+    let pool = started_pool(CompileWorkers::for_host());
+    let outcome = wgpu_opening(
+        &pool,
+        |pool| {
+            opener.open(
+                pool,
+                ring.completion_wake(),
+                gpu_config().exec.setting,
+                &keeper,
+                render.window(),
+                PRESENT_TARGET_WAIT,
+            )
+        },
+        if_unavailable,
+    )?;
+    let backend = match outcome {
+        Opening::Opened(backend) => backend,
+        Opening::FallBack(reason) => {
             tracing::warn!(%reason, "{FELL_BACK}");
             recording_backend(&ring, &keeper)
         }
-        (Err(Unopened::Backend(reason)), IfUnavailable::EndRun) => {
-            return Err(format!("{WGPU_UNAVAILABLE}: {reason}"));
-        }
-        (Err(Unopened::Window(message)), _) => return Err(message),
     };
     let graphics = start_gpu(
         (ring, Arc::clone(&backend), run_shaders(pool.ok())),
@@ -631,6 +630,51 @@ pub(crate) fn graphics_opening<C: HostClock + 'static>(
         (wake, frame_limit, clock),
     )?;
     Ok((graphics, Some((keeper, backend))))
+}
+
+/// The run's compile pool as [`graphics_opening`] hands it on, from what starting it gave: the
+/// pool, or why it could not be started, in words (module docs, "The shader cache shares the
+/// pool").
+fn started_pool(started: std::io::Result<CompileWorkers>) -> Result<Arc<CompileWorkers>, String> {
+    started
+        .map(Arc::new)
+        .map_err(|error| format!("the compile pool could not be started: {error}"))
+}
+
+/// What opening the wgpu backend came to, when the run goes on.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Opening<B> {
+    /// The backend opened.
+    Opened(B),
+    /// It did not, and the run renders with the recording backend instead: why, in words.
+    FallBack(String),
+}
+
+/// What a run that chose the wgpu backend does (module docs, "The wgpu backend" and "The
+/// shader cache shares the pool"), given its compile pool, `open`, which opens the backend on
+/// the pool, and its choice for an unavailable backend. A pool that could not be started is
+/// the backend's failure: `open` is not called, and the choice says whether the run falls back
+/// or ends ([`WGPU_UNAVAILABLE`] and the pool's reason). A window that cannot be presented into
+/// ends the run whatever the choice, with the window's own words.
+pub(crate) fn wgpu_opening<B>(
+    pool: &Result<Arc<CompileWorkers>, String>,
+    open: impl FnOnce(Arc<CompileWorkers>) -> Result<B, Unopened>,
+    if_unavailable: IfUnavailable,
+) -> Result<Opening<B>, String> {
+    let attempt = match pool {
+        Ok(pool) => open(Arc::clone(pool)),
+        Err(reason) => Err(Unopened::Backend(reason.clone())),
+    };
+    match (attempt, if_unavailable) {
+        (Ok(backend), _) => Ok(Opening::Opened(backend)),
+        (Err(Unopened::Backend(reason)), IfUnavailable::UseRecording) => {
+            Ok(Opening::FallBack(reason))
+        }
+        (Err(Unopened::Backend(reason)), IfUnavailable::EndRun) => {
+            Err(format!("{WGPU_UNAVAILABLE}: {reason}"))
+        }
+        (Err(Unopened::Window(message)), _) => Err(message),
+    }
 }
 
 /// The words a run ends with when a GPU thread ended during it, given what stopping the GPU

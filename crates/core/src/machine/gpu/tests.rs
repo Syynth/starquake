@@ -748,6 +748,65 @@ fn the_run_s_shader_cache_is_the_real_one_on_a_pool() {
     assert_eq!(SHADER_TARGET.caps, Requirements::default());
 }
 
+/// A compile pool that could not be started is the wgpu backend's failure
+/// ([`wgpu_opening`]): the backend is not opened, a run that chose to fall back renders with
+/// the recording backend and has no shader cache ([`NoShaders`]), and a run that chose to end
+/// ends with the pool's words. A pool that started reaches the opener, whose backend failure
+/// then follows the same choice.
+#[test]
+fn a_compile_pool_that_cannot_start_is_the_backend_s_failure() {
+    use crate::renderer::IfUnavailable;
+
+    let pool = started_pool(Err(std::io::Error::other("no threads left")));
+    assert_eq!(
+        pool.as_ref().err().map(String::as_str),
+        Some("the compile pool could not be started: no threads left")
+    );
+    // Were the backend opened without a pool, the outcome would be `Opened`, which the
+    // assertions below refuse.
+    let never = |_: Arc<CompileWorkers>| -> Result<(), Unopened> { Ok(()) };
+    assert_eq!(
+        wgpu_opening(&pool, never, IfUnavailable::UseRecording),
+        Ok(Opening::FallBack(
+            "the compile pool could not be started: no threads left".to_owned()
+        ))
+    );
+    let mut shaders = run_shaders(pool.clone().ok());
+    assert!(matches!(
+        shaders.lookup(&[], &VariantKey::default(), &Nothing, &Nothing),
+        SetLookup::Pending(ticket) if ticket == NO_TICKET
+    ));
+    assert_eq!(
+        wgpu_opening(&pool, never, IfUnavailable::EndRun),
+        Err(
+            "the wgpu backend could not be opened: the compile pool could not be started: no \
+             threads left"
+                .to_owned()
+        )
+    );
+
+    let started = started_pool(CompileWorkers::new(std::num::NonZeroUsize::MIN));
+    assert!(started.is_ok());
+    let opens = |_: Arc<CompileWorkers>| -> Result<u8, Unopened> { Ok(7) };
+    let refuses = |_: Arc<CompileWorkers>| -> Result<u8, Unopened> {
+        Err(Unopened::Backend("no GPU adapter".to_owned()))
+    };
+    for if_unavailable in [IfUnavailable::UseRecording, IfUnavailable::EndRun] {
+        assert_eq!(
+            wgpu_opening(&started, opens, if_unavailable),
+            Ok(Opening::Opened(7))
+        );
+    }
+    assert_eq!(
+        wgpu_opening(&started, refuses, IfUnavailable::UseRecording),
+        Ok(Opening::FallBack("no GPU adapter".to_owned()))
+    );
+    assert_eq!(
+        wgpu_opening(&started, refuses, IfUnavailable::EndRun),
+        Err("the wgpu backend could not be opened: no GPU adapter".to_owned())
+    );
+}
+
 /// A run that chose the wgpu backend hands the compile pool it gave the backend to its shader
 /// cache, which keeps it when the backend cannot be opened and the run falls back to the
 /// recording backend; the pool ends with the run (module docs, "The shader cache shares the
