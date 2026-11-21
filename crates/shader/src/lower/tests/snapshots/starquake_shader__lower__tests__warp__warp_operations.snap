@@ -1,0 +1,124 @@
+---
+source: crates/shader/src/lower/tests/warp.rs
+expression: msl(&shader)
+---
+// language: metal2.4
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using metal::uint;
+
+
+struct main_Input {
+};
+[[max_total_threads_per_threadgroup(32)]] kernel void main_(
+  uint lane_id [[thread_index_in_simdgroup]]
+) {
+    uint r0_ = {};
+    uint r1_ = {};
+    uint r2_ = {};
+    uint r3_ = {};
+    uint r4_ = {};
+    uint r5_ = {};
+    uint r6_ = {};
+    uint r7_ = {};
+    uint r8_ = {};
+    uint r9_ = {};
+    uint r10_ = {};
+    uint r11_ = {};
+    uint r12_ = {};
+    uint r13_ = {};
+    uint r14_ = {};
+    uint r15_ = {};
+    uint r16_ = {};
+    uint r17_ = {};
+    uint r18_ = {};
+    uint r19_ = {};
+    uint r20_ = {};
+    uint r21_ = {};
+    uint r22_ = {};
+    uint r23_ = {};
+    uint r24_ = {};
+    uint r25_ = {};
+    uint r26_ = {};
+    uint r27_ = {};
+    uint r28_ = {};
+    uint r29_ = {};
+    uint _e4 = (lane_id * 257u) + 7u;
+    bool _e8 = (lane_id & 1u) != 0u;
+    metal::uint4 unnamed = metal::uint4((uint64_t)metal::simd_ballot(true), 0, 0, 0);
+    metal::uint4 unnamed_1 = metal::uint4((uint64_t)metal::simd_ballot(_e8), 0, 0, 0);
+    bool unnamed_2 = metal::simd_all(lane_id < 32u);
+    bool unnamed_3 = metal::simd_all(lane_id != 5u);
+    bool unnamed_4 = metal::simd_any(lane_id == 5u);
+    bool _e33 = lane_id == 40u;
+    bool unnamed_5 = metal::simd_any(_e33);
+    bool unnamed_6 = metal::simd_all(_e8);
+    bool unnamed_7 = metal::simd_all(!(_e8));
+    bool _e46 = lane_id < 40u;
+    bool unnamed_8 = metal::simd_all(_e46);
+    bool unnamed_9 = metal::simd_all(!(_e46));
+    bool unnamed_10 = metal::simd_all(_e33);
+    bool unnamed_11 = metal::simd_all(!(_e33));
+    uint _e69 = (lane_id >= 32u) ? 0u : (1u << metal::min(lane_id, 31u));
+    uint _e89 = (lane_id >= 32u) ? 0u : (1u << metal::min(lane_id, 31u));
+    uint _e100 = (lane_id >= 32u) ? 0u : (1u << metal::min(lane_id, 31u));
+    uint _e119 = ~(0u);
+    uint _e120 = lane_id & 0u;
+    uint unnamed_12 = metal::simd_broadcast(_e4, 5u);
+    uint _e138 = ~(0u);
+    uint _e139 = lane_id & 0u;
+    uint _e145 = (((lane_id ^ 3u) & 31u) & _e138) | _e139;
+    uint unnamed_13 = metal::simd_shuffle(_e4, _e145);
+    uint _e155 = ~(28u);
+    uint _e156 = lane_id & 28u;
+    uint _e162 = ((1u & 31u) & _e155) | _e156;
+    uint unnamed_14 = metal::simd_shuffle(_e4, _e162);
+    uint _e177 = 1u & 31u;
+    bool _e181 = as_type<int>(lane_id - _e177) >= as_type<int>((lane_id & 0u) | (0u & ~(0u)));
+    uint unnamed_15 = metal::simd_shuffle_up(_e4, _e177);
+    uint _e193 = 2u & 31u;
+    bool _e197 = as_type<int>(lane_id + _e193) <= as_type<int>((lane_id & 0u) | (31u & ~(0u)));
+    uint unnamed_16 = metal::simd_shuffle_down(_e4, _e193);
+    uint _e209 = 1u & 31u;
+    uint unnamed_17 = metal::simd_shuffle_xor(_e4, _e209);
+    uint unnamed_18 = metal::quad_broadcast(_e4, 2u);
+    uint unnamed_19 = metal::simd_shuffle(_e4, (lane_id & 4294967292u) | ((3u + 0u) & 3u));
+    uint unnamed_20 = metal::quad_shuffle_xor(_e4, 1u);
+    uint unnamed_21 = metal::quad_shuffle_xor(_e4, 2u);
+    uint unnamed_22 = metal::quad_shuffle_xor(_e4, 3u);
+    float _e237 = static_cast<float>(lane_id);
+    uint _e246 = (228u >> ((lane_id & 3u) << 1u)) & 3u;
+    uint _e271 = (27u >> ((lane_id & 3u) << 1u)) & 3u;
+    r0_ = lane_id;
+    r1_ = unnamed.x;
+    r2_ = unnamed_1.x;
+    r3_ = unnamed_2 ? 1u : 0u;
+    r4_ = unnamed_3 ? 1u : 0u;
+    r5_ = unnamed_4 ? 1u : 0u;
+    r6_ = unnamed_5 ? 1u : 0u;
+    r7_ = (unnamed_6 || unnamed_7) ? 1u : 0u;
+    r8_ = (unnamed_8 || unnamed_9) ? 1u : 0u;
+    r9_ = (unnamed_10 || unnamed_11) ? 1u : 0u;
+    r10_ = _e69;
+    r11_ = ((lane_id >= 32u) ? 0u : (1u << metal::min(lane_id, 31u))) - 1u;
+    r12_ = (_e89 - 1u) | _e89;
+    r13_ = ~(((_e100 - 1u) | _e100));
+    r14_ = ~((((lane_id >= 32u) ? 0u : (1u << metal::min(lane_id, 31u))) - 1u));
+    r15_ = (as_type<int>(((5u & 31u) & _e119) | _e120) <= as_type<int>(_e120 | (31u & _e119))) ? unnamed_12 : _e4;
+    r16_ = (as_type<int>(_e145) <= as_type<int>(_e139 | (31u & _e138))) ? unnamed_13 : _e4;
+    r17_ = (as_type<int>(_e162) <= as_type<int>(_e156 | (3u & _e155))) ? unnamed_14 : _e4;
+    r18_ = _e181 ? unnamed_15 : _e4;
+    r19_ = _e197 ? unnamed_16 : _e4;
+    r20_ = (as_type<int>(lane_id ^ _e209) <= as_type<int>((lane_id & 0u) | (31u & ~(0u)))) ? unnamed_17 : _e4;
+    r21_ = _e181 ? 1u : 0u;
+    r22_ = _e197 ? 1u : 0u;
+    r23_ = unnamed_18;
+    r24_ = unnamed_19;
+    r25_ = unnamed_20;
+    r26_ = unnamed_21;
+    r27_ = unnamed_22;
+    r28_ = as_type<uint>((_e237 * metal::float4(-1.0, 1.0, -1.0, 0.0)[_e246]) + (0.5 * metal::float4(-1.0, -1.0, 1.0, -1.0)[_e246]));
+    r29_ = as_type<uint>((_e237 * metal::float4(-1.0, 1.0, -1.0, 0.0)[_e271]) + (0.5 * metal::float4(-1.0, -1.0, 1.0, -1.0)[_e271]));
+    return;
+}

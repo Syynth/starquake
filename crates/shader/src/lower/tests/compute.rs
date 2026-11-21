@@ -160,8 +160,18 @@ fn the_workgroup_size_at_its_edges() {
     assert_eq!(pixel.workgroup_size, None);
 }
 
+/// How much of the subgroup features a test function needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Subgroups {
+    None,
+    /// Subgroups of any size: a quad operation.
+    Any,
+    /// Subgroups of 32 lanes: the lane id.
+    Size32,
+}
+
 /// A function that needs 16-bit floats, 64-bit integers or subgroups, as its requirements say.
-fn needing(f16: bool, i64: bool, subgroup: bool) -> Function {
+fn needing(f16: bool, i64: bool, subgroups: Subgroups) -> Function {
     let mut text = String::from("block0:\n");
     if f16 {
         text.push_str("    %0: f16 = ConvertF16F32 f32 1.0\n");
@@ -169,8 +179,10 @@ fn needing(f16: bool, i64: bool, subgroup: bool) -> Function {
     if i64 {
         text.push_str("    %1: u64 = ConvertU64U32 u32 1\n");
     }
-    if subgroup {
-        text.push_str("    %2: u32 = LaneId\n");
+    match subgroups {
+        Subgroups::None => {}
+        Subgroups::Any => text.push_str("    %2: u32 = QuadSwap u32 7, u32 0\n"),
+        Subgroups::Size32 => text.push_str("    %2: u32 = LaneId\n"),
     }
     text.push_str("    return\n");
     ir(&text)
@@ -178,50 +190,26 @@ fn needing(f16: bool, i64: bool, subgroup: bool) -> Function {
 
 /// Every combination of requirements against every combination of the target's features:
 /// lowered exactly when the target has each one needed, else refused with the first missing
-/// one in [`Feature`] order; the requirements recorded are the ones the function needs.
+/// one in [`Feature`] order; the requirements recorded are the ones the function needs. A
+/// quad operation needs subgroups but not the size of 32 (decided by the owner, 2026-11-20).
 #[test]
 fn a_feature_the_target_lacks_is_refused() {
     let bit = |set: u8, index: u8| set & (1 << index) != 0;
-    for needed in 0_u8..8 {
-        let (f16, i64, subgroup) = (bit(needed, 0), bit(needed, 1), bit(needed, 2));
-        let function = needing(f16, i64, subgroup);
-        for offered in 0_u8..8 {
-            let caps = HostCaps {
-                f16: bit(offered, 0),
-                i64: bit(offered, 1),
-                subgroup: bit(offered, 2),
-            };
-            let model = if f16 && !caps.f16 {
-                Some(Feature::Float16)
-            } else if i64 && !caps.i64 {
-                Some(Feature::Int64)
-            } else if subgroup && !caps.subgroup {
-                Some(Feature::Subgroup)
-            } else {
-                None
-            };
-            let result = lower_with(
-                GuestStage::Compute,
-                &function,
-                &LowerInputs {
-                    caps,
-                    ..LowerInputs::DEFAULT
-                },
-            );
-            if let Some(feature) = model {
-                assert_eq!(result.err(), Some(LowerError::Missing(feature)), "{caps:?}");
-            } else {
-                let shader = result.expect("the target has every feature needed");
-                assert_eq!(
-                    shader.requirements,
-                    Requirements {
-                        subgroup,
-                        f16,
-                        i64,
-                        ..Requirements::default()
-                    },
-                    "{caps:?}"
-                );
+    let kinds = [Subgroups::None, Subgroups::Any, Subgroups::Size32];
+    for needed in 0_u8..4 {
+        for subgroups in kinds {
+            let (f16, i64) = (bit(needed, 0), bit(needed, 1));
+            let subgroup = subgroups != Subgroups::None;
+            let subgroup_size_32 = subgroups == Subgroups::Size32;
+            let function = needing(f16, i64, subgroups);
+            for offered in 0_u8..16 {
+                let caps = HostCaps {
+                    f16: bit(offered, 0),
+                    i64: bit(offered, 1),
+                    subgroup: bit(offered, 2),
+                    subgroup_size_32: bit(offered, 3),
+                };
+                check_feature_case(&function, caps, (f16, i64, subgroup, subgroup_size_32));
             }
         }
     }
@@ -229,11 +217,57 @@ fn a_feature_the_target_lacks_is_refused() {
         (Feature::Float16, "16-bit floats"),
         (Feature::Int64, "64-bit integers"),
         (Feature::Subgroup, "subgroup operations"),
+        (Feature::SubgroupSize32, "a subgroup size of 32"),
     ];
     for (feature, name) in words {
         assert_eq!(
             LowerError::Missing(feature).to_string(),
             format!("the shader needs {name}, which the host target lacks")
+        );
+    }
+}
+
+/// One case of [`a_feature_the_target_lacks_is_refused`]: `function`, which needs `needs`
+/// (16-bit floats, 64-bit integers, subgroups, a subgroup size of 32), lowered for `caps`.
+fn check_feature_case(function: &Function, caps: HostCaps, needs: (bool, bool, bool, bool)) {
+    let (f16, i64, subgroup, subgroup_size_32) = needs;
+    let model = if f16 && !caps.f16 {
+        Some(Feature::Float16)
+    } else if i64 && !caps.i64 {
+        Some(Feature::Int64)
+    } else if subgroup && !caps.subgroup {
+        Some(Feature::Subgroup)
+    } else if subgroup_size_32 && !caps.subgroup_size_32 {
+        Some(Feature::SubgroupSize32)
+    } else {
+        None
+    };
+    let result = lower_with(
+        GuestStage::Compute,
+        function,
+        &LowerInputs {
+            caps,
+            ..LowerInputs::DEFAULT
+        },
+    );
+    if let Some(feature) = model {
+        assert_eq!(
+            result.err(),
+            Some(LowerError::Missing(feature)),
+            "{needs:?} {caps:?}"
+        );
+    } else {
+        let shader = result.expect("the target has every feature needed");
+        assert_eq!(
+            shader.requirements,
+            Requirements {
+                subgroup,
+                subgroup_size_32,
+                f16,
+                i64,
+                ..Requirements::default()
+            },
+            "{needs:?} {caps:?}"
         );
     }
 }

@@ -328,6 +328,7 @@ pub enum CacheRefusal {
 fn missing_features(needs: Requirements, caps: Requirements) -> Option<Requirements> {
     let Requirements {
         subgroup,
+        subgroup_size_32,
         f16,
         f64,
         i64,
@@ -335,6 +336,7 @@ fn missing_features(needs: Requirements, caps: Requirements) -> Option<Requireme
     } = needs;
     let missing = Requirements {
         subgroup: subgroup && !caps.subgroup,
+        subgroup_size_32: subgroup_size_32 && !caps.subgroup_size_32,
         f16: f16 && !caps.f16,
         f64: f64 && !caps.f64,
         i64: i64 && !caps.i64,
@@ -347,6 +349,7 @@ fn missing_features(needs: Requirements, caps: Requirements) -> Option<Requireme
 fn feature_names(features: Requirements) -> String {
     let Requirements {
         subgroup,
+        subgroup_size_32,
         f16,
         f64,
         i64,
@@ -354,6 +357,7 @@ fn feature_names(features: Requirements) -> String {
     } = features;
     let names: Vec<&str> = [
         (subgroup, "subgroup operations"),
+        (subgroup_size_32, "a subgroup size of 32"),
         (f16, "16-bit floats"),
         (f64, "64-bit floats"),
         (i64, "64-bit integers"),

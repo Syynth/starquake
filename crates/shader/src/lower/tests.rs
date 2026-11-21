@@ -7,6 +7,7 @@ mod opcodes;
 mod ops;
 mod run;
 mod structured;
+mod warp;
 
 use naga::valid::{ValidationFlags, Validator};
 use naga::{ScalarKind, UnaryOperator};
@@ -216,10 +217,12 @@ fn pair_golden_tables() {
             GuestSlot::RenderTarget(0)
         )]
     );
+    // The lane id depends on the warp having 32 lanes (slice 16b's size flag).
     assert_eq!(
         pixel.requirements,
         Requirements {
             subgroup: true,
+            subgroup_size_32: true,
             ..Requirements::default()
         }
     );
