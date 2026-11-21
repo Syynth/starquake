@@ -1139,3 +1139,44 @@ fn a_large_program_translates_within_the_bound() {
         .count();
     assert!(loads >= (SPEED_INSTRUCTIONS - 3) / 8, "{loads} loads");
 }
+
+/// The variant key's emulation flags reach the lowering through the cache's production
+/// translator: the same vertex program, looked up with the flipped viewport and the depth-range
+/// rewrite set, lists the driver constants in its resource table and reads the position words;
+/// looked up with no flag, it binds nothing.
+#[test]
+fn the_key_s_emulation_reaches_the_lowering() {
+    let header = vertex_header(0);
+    let program = bytes(
+        Some(&header),
+        &words(&[mov(0, 0), ast(0, GENERIC_0_X), exit()]),
+    );
+    let plain = through_the_cache(
+        GuestStage::Vertex,
+        &program,
+        &State::default(),
+        &VariantKey::default(),
+    )
+    .expect("ready");
+    assert!(plain.resources.is_empty());
+    let flipped = VariantKey {
+        emulation: crate::variant::EmulationKey {
+            flipped_viewport: true,
+            ..crate::variant::EmulationKey::default()
+        },
+        ..VariantKey::default()
+    };
+    let shader = through_the_cache(GuestStage::Vertex, &program, &State::default(), &flipped)
+        .expect("ready");
+    assert_eq!(
+        shader.resources,
+        [ResourceSlot {
+            group: 0,
+            binding: 0,
+            kind: ResourceKind::UniformBuffer {
+                size: u32::try_from(crate::driver_constants::DRIVER_CONSTANTS_SIZE).expect("small"),
+            },
+            source: ResourceSource::DriverConstants,
+        }]
+    );
+}

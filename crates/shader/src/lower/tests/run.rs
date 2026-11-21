@@ -361,19 +361,7 @@ fn gpu_run(
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let buffers: Vec<(u32, wgpu::Buffer)> = uniforms
-            .iter()
-            .map(|&(binding, bytes)| {
-                let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("uniform"),
-                    size: u64::try_from(bytes.len()).expect("small"),
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                gpu.queue.write_buffer(&buffer, 0, bytes);
-                (binding, buffer)
-            })
-            .collect();
+        let buffers = uniform_buffers(device, &gpu.queue, uniforms);
         let mut entries = vec![wgpu::BindGroupEntry {
             binding: 0,
             resource: storage.as_entire_binding(),
@@ -432,6 +420,27 @@ fn gpu_run(
             .map(|word| u32::from_le_bytes(*word))
             .collect(),
     )
+}
+
+/// One uniform buffer per `(binding, bytes)` of `uniforms`, holding the bytes, with its binding.
+fn uniform_buffers(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    uniforms: &[(u32, &[u8])],
+) -> Vec<(u32, wgpu::Buffer)> {
+    uniforms
+        .iter()
+        .map(|&(binding, bytes)| {
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("uniform"),
+                size: u64::try_from(bytes.len()).expect("small"),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            queue.write_buffer(&buffer, 0, bytes);
+            (binding, buffer)
+        })
+        .collect()
 }
 
 /// Registers `regs` after the interpreter runs `function` once.

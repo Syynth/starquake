@@ -3,6 +3,8 @@
 
 use super::ops::{ONE_INVOCATION, op, u};
 use super::run::{gpu_registers_with, opaque};
+use std::fmt::Write as _;
+
 use super::*;
 use crate::host::{ResourceKind, ResourceSlot, ResourceSource};
 use crate::info::{CBUF_ALIGNMENT, INDEXED_CBUF_SIZE};
@@ -24,23 +26,27 @@ fn with_bank(inputs: LowerInputs, bank: u8, size: u32) -> LowerInputs {
 fn reading(stage: GuestStage, banks: &[u8]) -> Function {
     let mut text = String::from("block0:\n");
     for (index, bank) in banks.iter().enumerate() {
-        text.push_str(&format!(
-            "    %{index}: f32 = GetCbufF32 u32 {bank}, u32 0\n"
-        ));
+        writeln!(text, "    %{index}: f32 = GetCbufF32 u32 {bank}, u32 0")
+            .expect("writes to a string");
     }
     let last = banks.len().checked_sub(1).expect("a bank");
     let generic_0 = u32::from(GENERIC_0_X) * ATTRIBUTE_WORD_BYTES;
     let next = banks.len();
-    text.push_str(&match stage {
-        GuestStage::Pixel => format!("    %{next} = SetFragColor u32 0, u32 0, %{last}\n"),
+    match stage {
+        GuestStage::Pixel => writeln!(text, "    %{next} = SetFragColor u32 0, u32 0, %{last}"),
         GuestStage::Vertex => {
-            format!("    %{next} = SetAttribute a{generic_0:#x}, %{last}, u32 0\n")
+            writeln!(
+                text,
+                "    %{next} = SetAttribute a{generic_0:#x}, %{last}, u32 0"
+            )
         }
-        _ => format!(
-            "    %{next}: u32 = BitCastU32F32 %{last}\n    %{} = SetRegister r0, %{next}\n",
+        _ => writeln!(
+            text,
+            "    %{next}: u32 = BitCastU32F32 %{last}\n    %{} = SetRegister r0, %{next}",
             next + 1
         ),
-    });
+    }
+    .expect("writes to a string");
     text.push_str("    return\n");
     ir(&text)
 }

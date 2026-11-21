@@ -3,6 +3,8 @@
 //! with constant buffers and driver constants, built from program bytes, with an explicit
 //! pipeline layout from the resource tables.
 
+use std::fmt::Write as _;
+
 use super::*;
 use crate::asm::assemble;
 use crate::driver_constants::DRIVER_CONSTANTS_SIZE;
@@ -20,9 +22,11 @@ fn position_writes() -> String {
     for component in 0..4_u32 {
         let value = f64::from(component + 2);
         let byte = POSITION_BYTE + component * ATTRIBUTE_WORD_BYTES;
-        text.push_str(&format!(
-            "    %{component} = SetAttribute a{byte:#x}, f32 {value:?}, u32 0\n"
-        ));
+        writeln!(
+            text,
+            "    %{component} = SetAttribute a{byte:#x}, f32 {value:?}, u32 0"
+        )
+        .expect("writes to a string");
     }
     text
 }
@@ -44,9 +48,11 @@ fn pixel(target: u32) -> Function {
     let mut text = String::from("block0:\n");
     for component in 0..4_u32 {
         let value = f64::from(component + 2);
-        text.push_str(&format!(
-            "    %{component} = SetFragColor u32 {target}, u32 {component}, f32 {value:?}\n"
-        ));
+        writeln!(
+            text,
+            "    %{component} = SetFragColor u32 {target}, u32 {component}, f32 {value:?}"
+        )
+        .expect("writes to a string");
     }
     text.push_str("    return\n");
     ir(&text)
@@ -118,7 +124,7 @@ fn the_flipped_viewport_reads_three_constants() {
     let base = lowered(GuestStage::Vertex, &vertex(), &LowerInputs::DEFAULT);
     let base_msl = msl(&base);
     assert!(!base_msl.contains("driver_constants") && !base_msl.contains("0.5"));
-    assert!(base.resources.is_empty());
+    assert_eq!(base.resources, []);
 
     let rewrite_key = EmulationKey {
         depth_range_rewrite: true,
@@ -128,7 +134,7 @@ fn the_flipped_viewport_reads_three_constants() {
     let rewrite_msl = msl(&rewrite);
     assert!(rewrite_msl.contains(" * 0.5"), "{rewrite_msl}");
     assert!(!rewrite_msl.contains("driver_constants"), "{rewrite_msl}");
-    assert!(rewrite.resources.is_empty());
+    assert_eq!(rewrite.resources, []);
 
     let flip_key = EmulationKey {
         flipped_viewport: true,
@@ -166,7 +172,7 @@ fn the_alpha_test_reads_the_reference() {
     use naga::BinaryOperator as B;
     let base = lowered(GuestStage::Pixel, &pixel(0), &LowerInputs::DEFAULT);
     assert!(!kills(&base));
-    assert!(comparisons(&base).is_empty());
+    assert_eq!(comparisons(&base), []);
     let with = |function| {
         lowered(
             GuestStage::Pixel,
@@ -179,11 +185,11 @@ fn the_alpha_test_reads_the_reference() {
     };
     let always = with(CompareFunction::Always);
     assert_eq!(msl(&always), msl(&base));
-    assert!(always.resources.is_empty());
+    assert_eq!(always.resources, []);
     let never = with(CompareFunction::Never);
     assert!(kills(&never));
-    assert!(comparisons(&never).is_empty());
-    assert!(never.resources.is_empty());
+    assert_eq!(comparisons(&never), []);
+    assert_eq!(never.resources, []);
     assert!(!msl(&never).contains("alpha_reference"));
     for (function, op) in [
         (CompareFunction::Less, B::Less),
@@ -497,5 +503,26 @@ fn acceptance_pair_is_accepted_by_wgpu() {
     assert!(
         build(&[&shared]).is_err(),
         "a layout with one group for both stages is refused"
+    );
+}
+
+/// A structured tree that does not end in `return` or `unreachable` gets the entry point's
+/// closing return, which does the steps too.
+#[test]
+fn the_closing_return_does_the_steps() {
+    let function = ir(&format!(
+        "block0:\n{}structure:\n    block0\n",
+        position_writes()
+    ));
+    let key = emulating(EmulationKey {
+        depth_range_rewrite: true,
+        ..EmulationKey::default()
+    });
+    let shader = lowered(GuestStage::Vertex, &function, &key);
+    assert_eq!(
+        msl(&shader).matches(" * 0.5").count(),
+        1,
+        "{}",
+        msl(&shader)
     );
 }
