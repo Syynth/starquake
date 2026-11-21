@@ -398,7 +398,7 @@ fn align_up(value: u64, to: u64) -> Result<u64, WorkBufferError> {
 /// A value Eden holds in 32 bits: itself, or [`WorkBufferError::Overflow`] where Eden's would
 /// have wrapped.
 fn narrow(value: u64) -> Result<u64, WorkBufferError> {
-    if value <= u64::from(u32::MAX) {
+    if u32::try_from(value).is_ok() {
         Ok(value)
     } else {
         Err(WorkBufferError::Overflow)

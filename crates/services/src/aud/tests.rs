@@ -368,9 +368,8 @@ fn a_tipc_request_goes_to_the_unknown_command_policy() {
         unreachable!("not a TIPC reply: {:?}", message.body);
     };
     assert_eq!(result, UNKNOWN_COMMAND_ID.raw());
-    assert!(message.move_handles.is_empty());
-    let stubbed: Vec<_> = rig.server.stubbed().collect();
-    assert!(stubbed.is_empty());
+    assert_eq!(message.move_handles, Vec::<u32>::new());
+    assert_eq!(rig.server.stubbed().count(), 0);
 
     let mut rig = Rig::new(UnknownPolicy::AutoStub);
     let reply = rig.send_raw(rig.session, &RequestBuilder::tipc(id));
@@ -379,7 +378,7 @@ fn a_tipc_request_goes_to_the_unknown_command_policy() {
         unreachable!("not a TIPC reply: {:?}", message.body);
     };
     assert_eq!(result, ResultCode::SUCCESS.raw());
-    assert!(message.move_handles.is_empty());
+    assert_eq!(message.move_handles, Vec::<u32>::new());
     let stubbed: Vec<_> = rig.server.stubbed().copied().collect();
     assert_eq!(
         stubbed,

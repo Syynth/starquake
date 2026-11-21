@@ -18,9 +18,9 @@
 //! `docs/switch2-eden-diff-scoping.md`, "Other") records the fault: a title waits for `aud:u`,
 //! the Switch 2 audio entry (`nn::audio::CreateUserClientSessionByHipc`), whose command 2
 //! returns an `IAudioRendererManager`; Eden-NX2's fix is `INx2AudioUserClient`, backed by
-//! Eden's `audren:u` manager. Its header says the title uses the object "exactly like
-//! IAudioRendererManager (vtable slot 1 = GetWorkBufferSize with a Switch 1 parameter block)":
-//! command 1 is the one the title calls next, and the one ported here.
+//! Eden's `audren:u` manager. Its header says the title uses the object exactly like an
+//! `IAudioRendererManager`, calling vtable slot 1 (`GetWorkBufferSize`) with a Switch 1
+//! parameter block: command 1 is the one the title calls next, and the one ported here.
 //!
 //! # Commands
 //!
