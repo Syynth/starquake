@@ -261,3 +261,78 @@ fn a_malformed_function_is_refused() {
         format!("the IR is malformed: {error}")
     );
 }
+
+/// The verifier runs before the scan (module docs, "Checks and their order", step 1 before
+/// step 2): a malformed function (its block is never terminated) that also holds a
+/// `BitCastU16F16`, which the scan would refuse, is refused with the verifier's error by
+/// [`run`] and by [`lower_for_host`].
+#[test]
+fn a_malformed_function_is_refused_before_the_scan() {
+    let mut function = Function::new();
+    let entry = function.entry();
+    let mut b = Builder::new(&mut function, entry);
+    let h = half(&mut b);
+    let cast = value(&mut b, Opcode::BitCastU16F16, &[h]);
+    let original = function.clone();
+    let error = function.verify().expect_err("an unterminated block");
+    assert_eq!(
+        run(&mut function, HostPass::Fp16ToFp32),
+        Err(HostLowerError::Verify(error))
+    );
+    assert_eq!(function, original);
+    assert_eq!(
+        lower_for_host(&mut function, HostCaps::NONE),
+        Err(HostLowerError::Verify(error))
+    );
+    assert_eq!(function, original);
+
+    // The same body, terminated, reaches the scan and is refused there.
+    let mut b = Builder::new(&mut function, entry);
+    b.terminate(Terminator::Return).expect("returns");
+    let wanted = HostLowerError::NoNarrowForm {
+        pass: HostPass::Fp16ToFp32,
+        at: cast,
+        opcode: Opcode::BitCastU16F16,
+    };
+    assert_eq!(
+        run(&mut function.clone(), HostPass::Fp16ToFp32),
+        Err(wanted.clone())
+    );
+    assert_eq!(lower_for_host(&mut function, HostCaps::NONE), Err(wanted));
+}
+
+/// An `Opaque`-slot refusal names the slot that holds the narrowed value: in `PhiMove`'s
+/// second slot, after a first slot holding a 32-bit immediate, the index is 1, for each pass.
+#[test]
+fn an_opaque_slot_refusal_names_its_index() {
+    let cases: [(HostPass, Maker, Type); 2] = [
+        (HostPass::Fp64ToFp32, double, Type::F64),
+        (HostPass::Fp16ToFp32, half, Type::F16),
+    ];
+    for (pass, make, ty) in cases {
+        let (original, marked) = build(|b| {
+            let x = make(b);
+            vec![value(b, Opcode::PhiMove, &[Operand::Imm(Imm::U32(1)), x])]
+        });
+        let mut function = original.clone();
+        let error = run(&mut function, pass).expect_err("refused");
+        assert_eq!(
+            error,
+            HostLowerError::OpaqueSlot {
+                pass,
+                at: marked[0],
+                opcode: Opcode::PhiMove,
+                index: 1,
+                ty
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "{}: argument 1 of PhiMove is a {ty} value, which {pass} cannot narrow there",
+                marked[0]
+            )
+        );
+        assert_eq!(function, original);
+    }
+}

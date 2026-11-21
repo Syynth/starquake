@@ -186,6 +186,27 @@ fn f64_values_below_binary32_normals_become_zeros() {
     assert_eq!(pair(&after, 10), (-0.0_f64).to_bits());
 }
 
+/// A binary32 subnormal operand becomes a zero of its sign: `FPNeg64` of the smallest
+/// binary32 subnormal (`2^-149`, a binary32 value) gives `-0`, and `FPAbs64` of its negation
+/// gives `+0`, where the interpreter gives `-2^-149` and `2^-149`.
+#[test]
+fn binary32_subnormal_operands_become_zeros() {
+    let function = build(|b| {
+        let (x, y) = (b.double(0), b.double(2));
+        let neg = b.op(Opcode::FPNeg64, &[x]);
+        b.put_double(10, neg);
+        let abs = b.op(Opcode::FPAbs64, &[y]);
+        b.put_double(12, abs);
+    });
+    let tiny = f64::from(f32::from_bits(1));
+    let machine = doubles(&[tiny, -tiny]);
+    let (before, after) = before_after(&function, HostPass::Fp64ToFp32, &machine);
+    assert_eq!(double_at(&before, 10), -tiny);
+    assert_eq!(double_at(&before, 12), tiny);
+    assert_eq!(pair(&after, 10), (-0.0_f64).to_bits());
+    assert_eq!(pair(&after, 12), 0.0_f64.to_bits());
+}
+
 /// A binary32 subnormal result widens to a zero: `2^-70 * 2^-70`, both operands binary32
 /// normals, is `2^-140` before and `+0` after.
 #[test]

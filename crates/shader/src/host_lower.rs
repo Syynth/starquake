@@ -27,8 +27,10 @@
 //! **Where it runs, against Eden.** Eden runs these passes before its SSA rewrite. The spec
 //! lists them last, after dead code elimination and collect info ("Passes needed for
 //! correctness", items 7 and 8), and the production translator follows the spec. The order
-//! changes nothing the passes compute: they rewrite each operation by its opcode alone. The
-//! operations they write are not constant-folded afterwards, which Eden's order would allow.
+//! changes nothing the passes compute for an operation: they rewrite each by its opcode alone.
+//! Running after the SSA rewrite, they also meet phis, which Eden's passes never see, and
+//! retype them ("Divergences from Eden"). The operations they write are not constant-folded
+//! afterwards, which Eden's order would allow.
 //!
 //! # What each pass does
 //!
@@ -50,15 +52,22 @@
 //!
 //! **The f64 pass.** A 64-bit value enters 32-bit arithmetic through `PackDouble2x32` or
 //! `BitCastF64U64` (narrowed: [`bits`]) and leaves through `UnpackDouble2x32` or
-//! `BitCastU64F64` (widened). For operands that are binary32 values (NaNs compared as NaNs,
-//! whatever their payload), every mapped operation the interpreter runs (all but the
-//! packed-half atomics, below) gives the 64-bit operation's result within a relative error of
-//! [`F64_RELATIVE_TOLERANCE`] (one binary32 ulp) when it is `FPAdd64`, `FPMul64`, `FPFma64`,
-//! `FPRecip64`, `FPRecipSqrt64` or a conversion from a 32- or 64-bit integer
-//! (`ConvertF64S32`, `ConvertF64U32`, `ConvertF64S64`, `ConvertF64U64`), and exactly for every
-//! other one (`tests::equivalence::f64_programs_match_within_tolerance`, generated, and
+//! `BitCastU64F64` (widened). For operands that are zeros, infinities, NaNs (compared as NaNs,
+//! whatever their payload) or binary32 normals (magnitude in [2^-126, `f32::MAX`]), and whose
+//! exact result is a zero, an infinity, a NaN or of magnitude in [2^-126, `f32::MAX`], every
+//! mapped operation the interpreter runs (all but the packed-half atomics, below) gives the
+//! 64-bit operation's result within a relative error of [`F64_RELATIVE_TOLERANCE`] (one
+//! binary32 ulp) when it is `FPAdd64`, `FPMul64`, `FPFma64`, `FPRecip64`, `FPRecipSqrt64` or a
+//! conversion from a 32- or 64-bit integer (`ConvertF64S32`, `ConvertF64U32`, `ConvertF64S64`,
+//! `ConvertF64U64`), and exactly for every other one
+//! (`tests::equivalence::f64_programs_match_within_tolerance`, generated with operand exponents
+//! between -30 and 30 so that results stay in that range, and
 //! `tests::equivalence::every_mapped_opcode_matches_the_interpreter`, one case per opcode;
-//! the set is the test's `F64_ROUNDED`).
+//! the set is the test's `F64_ROUNDED`). The exceptions are the range-loss rows of the table
+//! below: a binary32 subnormal operand becomes a zero of its sign (for example `FPNeg64` of
+//! 2^-149 gives -0), a result past `f32::MAX` becomes an infinity (`FPAdd64(f32::MAX,
+//! f32::MAX)`), and a result below 2^-126 in magnitude becomes a zero (`2^-70 * 2^-70`, or
+//! `FPRecip64(2^127)`, which gives 0 rather than 2^-127).
 //! What is lost, each pinned by a test in `tests::precision`:
 //!
 //! | Loss | Pinned by |
@@ -67,6 +76,7 @@
 //! | Arithmetic (`FPAdd`, `FPMul`, `FPFma`, `FPRecip`, `FPRecipSqrt`) is rounded at binary32 | `f64_arithmetic_rounds_at_binary32` |
 //! | A finite value past binary32's range becomes an infinity | `f64_values_past_binary32_become_infinities` |
 //! | A value below 2^-126 in magnitude (binary32's smallest normal) becomes a zero of its sign | `f64_values_below_binary32_normals_become_zeros` |
+//! | A binary32 subnormal operand becomes a zero of its sign (`FPNeg64` and `FPAbs64` of 2^-149 give signed zeros) | `binary32_subnormal_operands_become_zeros` |
 //! | A binary32 subnormal result widens to a zero of its sign | `binary32_subnormal_results_widen_to_zero` |
 //! | A NaN's payload is lost: every NaN that crosses the boundary is the canonical one | `nan_payloads_are_lost` |
 //! | Comparisons and conversions to integers see the rounded operand | `f64_comparisons_and_conversions_see_rounded_values` |
@@ -127,8 +137,9 @@
 //! |---|---|---|---|
 //! | Where the passes run | After collect info (the spec's order) | Before the SSA rewrite | `tests::end_to_end::the_production_translator_lowers_a_double_program` (through the production translator) |
 //! | Narrowing and widening at the boundary | Correct rebias, rounding to nearest even, saturation and flushing, canonical NaNs | Wrong-signed rebias, truncation, no range handling (the `bits` module) | `tests::bits` |
-//! | `FPMax64`, `FPMin64`, `FPRecip64`, `FPRecipSqrt64`, `SelectF64`, `BitCastF64U64`, `BitCastU64F64`, phis of 64-bit float types | Lowered | Left as 64-bit operations | `tests::table::every_narrowed_opcode_is_mapped_or_refused`, `tests::passes::phis_take_the_narrowed_type` |
-//! | `SelectF16`, phis of 16-bit float types | Lowered | Left | the same tests |
+//! | `FPMax64`, `FPMin64`, `FPRecip64`, `FPRecipSqrt64`, `SelectF64`, `BitCastF64U64`, `BitCastU64F64` | Lowered | Left as 64-bit operations | `tests::table::every_narrowed_opcode_is_mapped_or_refused` |
+//! | `SelectF16` | Lowered | Left | `tests::table::every_narrowed_opcode_is_mapped_or_refused` |
+//! | Phis of 64-bit and 16-bit float types | Retyped to the 32-bit type: the passes run after the SSA rewrite (the first row), so phis exist when they run | No phis exist when the passes run, since they run before the SSA rewrite (`frontend/maxwell/translate_program.cpp` @ cf654052, lines 376–389); the SSA rewrite then types each phi from its register variable (`ir_opt/ssa_rewrite_pass.cpp` @ cf654052, lines 199–213, `phi->SetFlags(IR::TypeOf(UndefOpcode(variable)))`) | `tests::passes::phis_take_the_narrowed_type` |
 //! | The four half-packing operations | Written out with integer operations | `PackHalf2x16` and `UnpackHalf2x16` kept | `tests::equivalence::every_mapped_opcode_matches_the_interpreter` |
 //! | `BitCastU16F16`, `BitCastF16U16`, a narrowed value in another operation's `Opaque` slot | Refused | Left | `tests::refusals` |
 //! | A 64-bit float immediate | Narrowed with the boundary's conversion | Kept: the renamed operation then takes a 64-bit immediate | `tests::passes::f64_immediates_are_narrowed` |
@@ -151,8 +162,9 @@ use crate::ir::{
 use crate::opt::{Work, arena_len, identity_of};
 use bits::Emitter;
 
-/// The f64 pass's stated precision for operands that are binary32 values (module docs,
-/// "Precision"): a relative error of at most one binary32 ulp, `2^-23`.
+/// The f64 pass's stated precision for operands and results in binary32's normal range, zeros,
+/// infinities and NaNs (module docs, "Precision", which lists the exceptions): a relative error
+/// of at most one binary32 ulp, `2^-23`.
 pub const F64_RELATIVE_TOLERANCE: f64 = f32::EPSILON as f64;
 
 /// The f16 pass's stated precision for `FPFma16` (module docs, "Precision"): at most one

@@ -169,7 +169,8 @@ fn value(b: &mut Builder<'_>, opcode: Opcode, args: &[Operand]) -> Operand {
 }
 
 /// A phi of a 64-bit float and a phi of a 16-bit float take the 32-bit type, and the function
-/// gives the same result down both arms (Eden leaves such phis 64- and 16-bit).
+/// gives the same result down both arms (Eden has no phis when its passes run, since they run
+/// before its SSA rewrite; module docs, "Divergences from Eden").
 #[test]
 fn phis_take_the_narrowed_type() {
     let double = diamond(
