@@ -1,0 +1,9 @@
+---
+source: crates/shader/src/opt/resources/tests/table.rs
+expression: table.to_string()
+---
+texture 0: 2d, float, from cbuf 3 at 0x10
+texture 1: 3d, float, from cbuf 3 at 0x10
+texture 2: 2d, float, multisampled, from cbuf 3 at 0x30
+image 0: 2d, r32_uint, float, header format 0x0, read and written, from cbuf 3 at 0x20
+image 1: 2d, r8_uint, float, header format 0x0, read, from cbuf 3 at 0x20

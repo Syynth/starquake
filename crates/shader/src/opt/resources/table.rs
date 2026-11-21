@@ -3,7 +3,9 @@
 //! `TextureBufferDescriptor`, `ImageBufferDescriptor`, `TextureDescriptor`, `ImageDescriptor`),
 //! merged as Eden's `Descriptors::Add` merges them (`ir_opt/texture_pass.cpp`).
 
+use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
+use std::hash::Hash;
 
 use crate::exchange::{SampledType, TextureFormat};
 use crate::ir::{ImageFormat, TextureType};
@@ -332,16 +334,6 @@ pub struct ResourceTable {
     images: Vec<ImageDescriptor>,
 }
 
-/// The index of the entry of `list` that `same` matches, or of `desc` pushed at the end
-/// (Eden's `Descriptors::Add`).
-fn add<T: Copy>(list: &mut Vec<T>, desc: T, same: impl Fn(&T) -> bool) -> usize {
-    if let Some(index) = list.iter().position(same) {
-        return index;
-    }
-    list.push(desc);
-    list.len() - 1
-}
-
 impl ResourceTable {
     /// The sampled texel buffers.
     pub fn texture_buffers(&self) -> &[TextureBufferDescriptor] {
@@ -370,20 +362,59 @@ impl ResourceTable {
             && self.textures.is_empty()
             && self.images.is_empty()
     }
+}
+
+/// The index of the entry `key` names in `keys`, or of `desc` pushed onto `list` (Eden's
+/// `Descriptors::Add`, which scans the list; looked up here, so adding stays constant time
+/// however many descriptors a hostile program makes), and whether it merged.
+fn add<K: Eq + Hash, T>(
+    keys: &mut HashMap<K, usize>,
+    list: &mut Vec<T>,
+    key: K,
+    desc: T,
+) -> (usize, bool) {
+    if let Some(&index) = keys.get(&key) {
+        return (index, true);
+    }
+    let index = list.len();
+    list.push(desc);
+    keys.insert(key, index);
+    (index, false)
+}
+
+/// Builds a [`ResourceTable`], merging descriptors as Eden's `Descriptors::Add` does: each
+/// kind's merge key is the fields Eden's predicate compares, and a merged entry takes the
+/// flags Eden ORs in. The maps are only looked up, never iterated, so their order cannot reach
+/// the table.
+#[derive(Default)]
+pub(super) struct TableBuilder {
+    table: ResourceTable,
+    texture_buffers: HashMap<HandleSource, usize>,
+    image_buffers: HashMap<(ImageFormat, HandleSource), usize>,
+    textures: HashMap<(TextureType, bool, HandleSource), usize>,
+    images: HashMap<(TextureType, ImageFormat, HandleSource), usize>,
+}
+
+impl TableBuilder {
+    /// The table built.
+    pub(super) fn finish(self) -> ResourceTable {
+        self.table
+    }
 
     /// Adds `desc` or finds the entry it merges into: Eden merges texel buffers with the same
     /// source.
     pub(super) fn add_texture_buffer(&mut self, desc: TextureBufferDescriptor) -> usize {
-        add(&mut self.texture_buffers, desc, |e| e.source == desc.source)
+        let list = &mut self.table.texture_buffers;
+        add(&mut self.texture_buffers, list, desc.source, desc).0
     }
 
     /// Adds `desc` or merges it into an entry with the same format and source, whose read and
     /// written flags take `desc`'s too.
     pub(super) fn add_image_buffer(&mut self, desc: ImageBufferDescriptor) -> usize {
-        let index = add(&mut self.image_buffers, desc, |e| {
-            e.image_format == desc.image_format && e.source == desc.source
-        });
-        if let Some(entry) = self.image_buffers.get_mut(index) {
+        let list = &mut self.table.image_buffers;
+        let key = (desc.image_format, desc.source);
+        let (index, merged) = add(&mut self.image_buffers, list, key, desc);
+        if merged && let Some(entry) = list.get_mut(index) {
             entry.is_written |= desc.is_written;
             entry.is_read |= desc.is_read;
         }
@@ -393,10 +424,10 @@ impl ResourceTable {
     /// Adds `desc` or merges it into an entry with the same dimension, depth flag and source,
     /// which takes `desc`'s multisample flag too.
     pub(super) fn add_texture(&mut self, desc: TextureDescriptor) -> usize {
-        let index = add(&mut self.textures, desc, |e| {
-            e.ty == desc.ty && e.is_depth == desc.is_depth && e.source == desc.source
-        });
-        if let Some(entry) = self.textures.get_mut(index) {
+        let list = &mut self.table.textures;
+        let key = (desc.ty, desc.is_depth, desc.source);
+        let (index, merged) = add(&mut self.textures, list, key, desc);
+        if merged && let Some(entry) = list.get_mut(index) {
             entry.is_multisample |= desc.is_multisample;
         }
         index
@@ -405,10 +436,10 @@ impl ResourceTable {
     /// Adds `desc` or merges it into an entry with the same dimension, format and source,
     /// whose read and written flags take `desc`'s too.
     pub(super) fn add_image(&mut self, desc: ImageDescriptor) -> usize {
-        let index = add(&mut self.images, desc, |e| {
-            e.ty == desc.ty && e.image_format == desc.image_format && e.source == desc.source
-        });
-        if let Some(entry) = self.images.get_mut(index) {
+        let list = &mut self.table.images;
+        let key = (desc.ty, desc.image_format, desc.source);
+        let (index, merged) = add(&mut self.images, list, key, desc);
+        if merged && let Some(entry) = list.get_mut(index) {
             entry.is_written |= desc.is_written;
             entry.is_read |= desc.is_read;
         }

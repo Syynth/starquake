@@ -188,7 +188,7 @@
 //! indexed constant-buffer read, so memory grows linearly with the function.
 
 mod cbuf;
-mod opcodes;
+pub(crate) mod opcodes;
 mod table;
 #[cfg(test)]
 mod tests;
@@ -199,6 +199,7 @@ use std::fmt::{self, Display, Formatter};
 
 use thiserror::Error;
 
+use table::TableBuilder;
 pub use table::{
     HandleSource, HandleWord, ImageBufferDescriptor, ImageDescriptor, IndexWord, ResourceTable,
     TextureBufferDescriptor, TextureDescriptor,
@@ -504,7 +505,7 @@ pub fn run(
     answers: &Answers,
 ) -> Result<(ResourceTable, Work), ResourceError> {
     let mut work = Work::default();
-    let mut table = ResourceTable::default();
+    let mut table = TableBuilder::default();
     let mut rewrites = Vec::with_capacity(scan.entries.len());
     for &entry in &scan.entries {
         work.step();
@@ -538,7 +539,7 @@ pub fn run(
     if VERIFY {
         function.verify().map_err(ResourceError::Verify)?;
     }
-    Ok((table, work))
+    Ok((table.finish(), work))
 }
 
 /// The answer to the word at `bank` and `offset`.
@@ -554,7 +555,7 @@ fn word(answers: &Answers, bank: u8, offset: u32) -> Result<u32, ResourceError> 
 /// `to_replace`).
 fn plan(
     function: &Function,
-    table: &mut ResourceTable,
+    table: &mut TableBuilder,
     entry: Entry,
     answers: &Answers,
 ) -> Result<Rewrite, ResourceError> {
@@ -630,7 +631,7 @@ fn plan(
 /// Adds the descriptor of `entry` to `table` and gives its index; sets `info.is_integer` for a
 /// sampled texture. `count` is the descriptor's array length.
 fn describe(
-    table: &mut ResourceTable,
+    table: &mut TableBuilder,
     entry: Entry,
     info: &mut TextureInfo,
     kind: TextureKind,
