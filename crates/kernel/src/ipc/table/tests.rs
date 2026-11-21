@@ -415,3 +415,65 @@ fn a_server_event_is_one_its_own_server_noted() {
     );
     assert!(!world.ipc.is_server_event(nowhere, event));
 }
+
+// ----- Kept references and open sessions ------------------------------------------------------
+
+#[test]
+fn open_sessions_counts_sessions_whose_server_end_is_open_on_that_server_only() {
+    let mut world = World::new();
+    let other = world.ipc.add_server("other", ServiceId(8)).unwrap();
+    assert_eq!(world.ipc.open_sessions(world.server), 0);
+    let (first, _) = world.connect();
+    let (_, second) = world.connect();
+    world
+        .ipc
+        .open_session(&mut world.objects, other, true)
+        .unwrap();
+    assert_eq!(world.ipc.open_sessions(world.server), 2);
+    assert_eq!(world.ipc.open_sessions(other), 1);
+    // The server closes its end of one: it is no longer counted, though its client end is
+    // still there.
+    world.send(first, request(1, 1)).unwrap();
+    let done = world.ipc.finish(first, Finish::ServerClosed).unwrap();
+    world.release(first, &done);
+    assert_eq!(world.ipc.is_server_open(first), Ok(false));
+    assert_eq!(world.ipc.open_sessions(world.server), 1);
+    // The client of the other goes.
+    world.close(second);
+    assert_eq!(world.ipc.open_sessions(world.server), 0);
+    assert_eq!(world.ipc.open_sessions(other), 1);
+    // A server the table does not know has none.
+    assert_eq!(world.ipc.open_sessions(SlabId::from_parts(0x7F, 3)), 0);
+}
+
+#[test]
+fn kept_notes_count_up_and_down_per_server_and_object() {
+    let mut world = World::new();
+    let other = world.ipc.add_server("other", ServiceId(8)).unwrap();
+    let object = world.objects.create(Object::Session).unwrap();
+    let neighbour = world.objects.create(Object::Session).unwrap();
+    assert_eq!(world.ipc.kept(world.server, object), 0);
+    assert!(!world.ipc.take_kept(world.server, object));
+    world.ipc.add_kept(world.server, object).unwrap();
+    world.ipc.add_kept(world.server, object).unwrap();
+    world.ipc.add_kept(other, neighbour).unwrap();
+    assert_eq!(world.ipc.kept(world.server, object), 2);
+    // Neither the other server nor the other object shares the count.
+    assert_eq!(world.ipc.kept(other, object), 0);
+    assert_eq!(world.ipc.kept(world.server, neighbour), 0);
+    assert!(!world.ipc.take_kept(other, object));
+    assert!(world.ipc.take_kept(world.server, object));
+    assert_eq!(world.ipc.kept(world.server, object), 1);
+    assert!(world.ipc.take_kept(world.server, object));
+    assert_eq!(world.ipc.kept(world.server, object), 0);
+    assert!(!world.ipc.take_kept(world.server, object));
+    assert_eq!(world.ipc.kept(other, neighbour), 1);
+    // A server the table does not know keeps nothing and can note nothing.
+    let unknown = SlabId::from_parts(0x7F, 3);
+    assert_eq!(
+        world.ipc.add_kept(unknown, object),
+        Err(IpcError::UnknownServer(unknown))
+    );
+    assert!(!world.ipc.take_kept(unknown, object));
+    assert_eq!(world.ipc.kept(unknown, object), 0);
+}

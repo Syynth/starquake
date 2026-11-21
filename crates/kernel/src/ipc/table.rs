@@ -169,6 +169,9 @@ struct ServerRow {
     /// The events the server made for itself while it handled requests (either end), which
     /// it alone may clear ([`Ipc::is_server_event`]).
     events: BTreeSet<ObjectId>,
+    /// The references the server keeps to objects a request lent it, by object, with how many
+    /// ([`Ipc::add_kept`]): each is one of the object's references, opened when it was noted.
+    kept: BTreeMap<ObjectId, u32>,
 }
 
 /// One session.
@@ -213,6 +216,7 @@ impl Ipc {
             queue: RequestQueue::new(),
             notices: VecDeque::new(),
             events: BTreeSet::new(),
+            kept: BTreeMap::new(),
         };
         let server = self.servers.insert(row).map_err(|_| IpcError::Full)?;
         self.services.insert(service, server);
@@ -281,6 +285,56 @@ impl Ipc {
     pub fn is_server_event(&self, server: ServerId, event: ObjectId) -> bool {
         self.server(server)
             .is_ok_and(|row| row.events.contains(&event))
+    }
+
+    /// Notes that `server` keeps one more reference to `object`, which the caller has just
+    /// opened for it: the note is how [`Ipc::take_kept`] knows the reference is the server's to
+    /// drop, and no other holder's.
+    pub fn add_kept(&mut self, server: ServerId, object: ObjectId) -> Result<(), IpcError> {
+        let count = self.server_mut(server)?.kept.entry(object).or_insert(0);
+        // Each note is one of the object's references, which the object table counts in a
+        // `u32` and refuses to open past it, so a count that was opened cannot saturate here.
+        *count = count.saturating_add(1);
+        Ok(())
+    }
+
+    /// Takes one of the references `server` keeps to `object` off its notes ([`Ipc::add_kept`]),
+    /// for the caller to drop. False, and nothing changes, when the server keeps none (and for
+    /// a server this table does not know).
+    pub fn take_kept(&mut self, server: ServerId, object: ObjectId) -> bool {
+        let Ok(row) = self.server_mut(server) else {
+            return false;
+        };
+        match row.kept.get_mut(&object) {
+            Some(count) if *count > 1 => *count -= 1,
+            Some(_) => {
+                row.kept.remove(&object);
+            }
+            None => return false,
+        }
+        true
+    }
+
+    /// How many references `server` keeps to `object` ([`Ipc::add_kept`]): zero for an object it
+    /// keeps none of, and for a server this table does not know.
+    #[must_use]
+    pub fn kept(&self, server: ServerId, object: ObjectId) -> u32 {
+        self.server(server)
+            .ok()
+            .and_then(|row| row.kept.get(&object).copied())
+            .unwrap_or(0)
+    }
+
+    /// How many sessions on `server` have their server end open: those whose client end has not
+    /// gone and whose server end has not been closed. Zero for a server this table does not
+    /// know. It walks every session, so it is for rare questions (gsv asks it when the root's
+    /// last session has closed), not for a request's path.
+    #[must_use]
+    pub fn open_sessions(&self, server: ServerId) -> usize {
+        self.sessions
+            .values()
+            .filter(|row| row.server == server && row.server_open)
+            .count()
     }
 
     fn server_mut(&mut self, server: ServerId) -> Result<&mut ServerRow, IpcError> {

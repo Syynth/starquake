@@ -13,6 +13,25 @@
 //! ([`Dispatcher::transfer_memory`]). The copies in and out of a lent transfer memory
 //! ([`Dispatcher::read_transfer_memory`], [`Dispatcher::write_transfer_memory`]) live beside
 //! that lookup, so a request and a host turn outside any request check the same bounds.
+//!
+//! # A server's own reference to a lent transfer memory
+//!
+//! A request lends its server a transfer memory only for as long as the request holds its
+//! handles. A server that goes on using it after the guest has closed its own handle (gsv's
+//! shared syncpoint page) keeps a reference of its own, as Eden PR #4588's
+//! `IGraphicsSupervisor::BindSyncpointMemory` does with `KTransferMemory::Open`, and drops it
+//! with `Close` when it is done (`~IGraphicsSupervisor`;
+//! `eden-pr4588/src/core/hle/service/am/service/graphics_supervisor.cpp` @ e5fb3b97). Here a
+//! handler keeps one with
+//! [`IpcContext::keep_transfer_memory`](super::IpcContext::keep_transfer_memory), and the
+//! kernel notes it against the server ([`crate::ipc::Ipc::add_kept`]); the server drops it
+//! during a request
+//! ([`IpcContext::release_kept_transfer_memory`](super::IpcContext::release_kept_transfer_memory))
+//! or on its own thread ([`Dispatcher::release_kept_transfer_memory`]). Only a reference the
+//! server's notes hold is dropped, so a server can never drop the guest's or another server's
+//! (`only_a_kept_reference_is_released`). The last reference to go tears the transfer memory
+//! down as closing the guest's last handle does: its owner's pages are unlocked before the
+//! kernel lock is let go (`Locked`'s `Drop`, in `dispatch.rs`).
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -21,12 +40,13 @@ use starquake_memory::GuestMemory;
 use starquake_trace::ServiceId;
 
 use super::Dispatcher;
-use crate::id::ObjectId;
+use crate::handle::ObjectRefs;
+use crate::id::{ObjectId, ServerId};
 use crate::ipc::EventHook;
 use crate::memory::TransferMemory;
 use crate::memory::shared::span_within;
 use crate::object::{Object, Objects};
-use crate::result::{KernelError, SvcResult};
+use crate::result::{CallResult, KernelError, SvcError, SvcResult};
 use crate::tables::Scheduler;
 
 #[cfg(test)]
@@ -87,7 +107,110 @@ fn made_by(scheduler: &Scheduler, service: ServiceId, event: ObjectId) -> bool {
         .is_some_and(|server| ipc.is_server_event(server, event))
 }
 
+/// The live transfer memory `object` names in `scheduler`'s object table, with its owner's pages
+/// locked: [`KernelError::InvalidHandle`] for any other id ([`Dispatcher::transfer_memory`]).
+fn locked_transfer_memory(scheduler: &Scheduler, object: ObjectId) -> SvcResult<TransferMemory> {
+    match scheduler.objects().get(object) {
+        Ok(Object::TransferMemory(transfer)) if transfer.is_locked() => Ok(transfer),
+        _ => Err(KernelError::InvalidHandle),
+    }
+}
+
+/// Opens one reference to the transfer memory `object` names for `server` to keep, and notes it
+/// against the server (module docs, "A server's own reference"). [`KernelError::InvalidHandle`],
+/// with nothing opened, unless `object` names a live transfer memory whose owner's pages are
+/// locked. The note is made after the reference is opened; if it cannot be made (a server the
+/// table does not know: the kernel's own bookkeeping), the reference is dropped again and the
+/// error returned, so no reference is left that nobody holds.
+pub(super) fn keep_transfer_memory_in(
+    scheduler: &mut Scheduler,
+    server: ServerId,
+    object: ObjectId,
+) -> CallResult<TransferMemory> {
+    let transfer = locked_transfer_memory(scheduler, object)?;
+    scheduler
+        .objects_mut()
+        .open(object)
+        .map_err(|error| SvcError::internal(&error))?;
+    if let Err(error) = scheduler.ipc_mut().1.add_kept(server, object) {
+        scheduler.close_object(object)?;
+        return Err(error.into());
+    }
+    Ok(transfer)
+}
+
+/// Drops one reference `server` keeps to `object` (module docs, "A server's own reference"):
+/// [`KernelError::InvalidHandle`], with nothing changed, when the server's notes hold none. When
+/// it was the object's last reference the transfer memory goes, and its owner's pages are
+/// unlocked when the kernel lock is let go.
+pub(super) fn release_kept_transfer_memory_in(
+    scheduler: &mut Scheduler,
+    server: ServerId,
+    object: ObjectId,
+) -> CallResult<()> {
+    if !scheduler.ipc_mut().1.take_kept(server, object) {
+        return Err(KernelError::InvalidHandle.into());
+    }
+    scheduler.close_object(object)
+}
+
 impl Dispatcher {
+    /// Drops one reference the server of `service` keeps to the transfer memory `object` names
+    /// (module docs, "A server's own reference"), on the server's own thread, outside any
+    /// request: how gsv lets the shared syncpoint page's memories go once the root's last
+    /// session has closed. [`KernelError::InvalidHandle`], with nothing changed, when that
+    /// server keeps no reference to `object` (it never kept one, it has dropped every one it
+    /// kept, or no server is known as `service`). When it was the last reference the transfer
+    /// memory goes, as closing the guest's last handle makes it go: its owner's pages are
+    /// unlocked before the kernel lock is let go. A failure of the kernel's own bookkeeping is
+    /// logged, and [`KernelError::InvalidState`] here.
+    pub fn release_kept_transfer_memory(
+        &self,
+        service: ServiceId,
+        object: ObjectId,
+    ) -> SvcResult<()> {
+        self.with::<(&mut Scheduler,), _>(|(scheduler,)| {
+            let server = scheduler
+                .ipc()
+                .service(service)
+                .ok_or(KernelError::InvalidHandle)?;
+            release_kept_transfer_memory_in(scheduler, server, object)
+        })
+        .map_err(|error| match error {
+            SvcError::Kernel(error) => error,
+            SvcError::Internal(what) => {
+                tracing::error!(what, "kernel bookkeeping failed releasing a kept transfer memory");
+                KernelError::InvalidState
+            }
+        })
+    }
+
+    /// How many references the server of `service` keeps to `object` (module docs, "A server's
+    /// own reference"): how a service's restore step checks a transfer memory its snapshot says
+    /// it keeps, and how tests count them. Zero for an object it keeps none of and for a service
+    /// with no server.
+    #[must_use]
+    pub fn kept_transfer_memory(&self, service: ServiceId, object: ObjectId) -> u32 {
+        self.with::<(&Scheduler,), _>(|(scheduler,)| {
+            let ipc = scheduler.ipc();
+            ipc.service(service)
+                .map_or(0, |server| ipc.kept(server, object))
+        })
+    }
+
+    /// How many sessions on the server of `service` have their server end open
+    /// ([`crate::ipc::Ipc::open_sessions`]): zero for a service with no server. Run outside any
+    /// request; gsv asks it on its timer thread, before it lets the shared syncpoint page go,
+    /// whether a root session has opened since the last one closed.
+    #[must_use]
+    pub fn open_sessions(&self, service: ServiceId) -> usize {
+        self.with::<(&Scheduler,), _>(|(scheduler,)| {
+            let ipc = scheduler.ipc();
+            ipc.service(service)
+                .map_or(0, |server| ipc.open_sessions(server))
+        })
+    }
+
     /// Attaches `hook` to `event` again after a restore (kernel spec, "Waiting and waking": a
     /// hook "is not snapshotted", and "the owning service re-attaches its hooks in its restore
     /// step, checked against the restored events, before the guest runs again"; owner's ruling
@@ -139,11 +262,7 @@ impl Dispatcher {
     /// [`IpcContext::transfer_memory`](super::IpcContext::transfer_memory), and what a service's
     /// restore step checks a transfer memory its snapshot names against, outside any request.
     pub fn transfer_memory(&self, object: ObjectId) -> SvcResult<TransferMemory> {
-        let found = self.with::<(&Scheduler,), _>(|(scheduler,)| scheduler.objects().get(object));
-        match found {
-            Ok(Object::TransferMemory(transfer)) if transfer.is_locked() => Ok(transfer),
-            _ => Err(KernelError::InvalidHandle),
-        }
+        self.with::<(&Scheduler,), _>(|(scheduler,)| locked_transfer_memory(scheduler, object))
     }
 
     /// Copies `out.len()` bytes at `offset` into the transfer memory `object` names into `out`,
