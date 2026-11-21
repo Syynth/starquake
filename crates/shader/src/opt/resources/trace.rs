@@ -169,7 +169,8 @@ pub(super) const fn imm_u32(operand: Operand) -> Option<u32> {
 }
 
 /// `operand` with `Identity` chains followed, at most [`MAX_TRACE_DEPTH`] links (Eden's
-/// `InstRecursive`).
+/// `InstRecursive`). The links are not charged to [`Work`]; the parent module's "Cost" bounds
+/// how many a trace follows.
 fn resolve(function: &Function, operand: Operand) -> Operand {
     let mut current = operand;
     for _ in 0..MAX_TRACE_DEPTH {
@@ -241,10 +242,12 @@ fn walk(
     in_pair: bool,
     work: &mut Work,
 ) -> Result<Traced, Untraced> {
-    work.step();
+    // The depth is checked before the step is charged, so a refused trace takes no more steps
+    // than the longest accepted one (the parent module's "Tracing is exact").
     if depth > MAX_TRACE_DEPTH {
         return Err(Untraced::TooDeep);
     }
+    work.step();
     let Operand::Value(at) = operand else {
         return Err(Untraced::Immediate);
     };

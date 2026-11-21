@@ -7,8 +7,8 @@ use super::{
 use crate::exchange::{Question, Questioner, SampledType, TextureUsage};
 use crate::opt::resources::trace::dynamic_count;
 use crate::opt::resources::{
-    DESCRIPTOR_MAX_COUNT, DESCRIPTOR_SIZE, DESCRIPTOR_SIZE_SHIFT, DYNAMIC_ARRAY_BYTES, Untraced,
-    run,
+    DESCRIPTOR_MAX_COUNT, DESCRIPTOR_SIZE, DESCRIPTOR_SIZE_SHIFT, DYNAMIC_ARRAY_BYTES,
+    MIN_DYNAMIC_SIZE_SHIFT, Untraced, run,
 };
 use crate::translate::texture::ABSENT;
 
@@ -379,4 +379,153 @@ fn a_later_use_keeps_the_multisample_flag() {
         table.to_string(),
         "texture 0: 2d, float, multisampled, from cbuf 3 at 0x30\n"
     );
+}
+
+/// The lines of an array of handles at 0x200 of bank 3, four bytes apart, indexed by the word
+/// at 0x8 of bank 5, leaving the handle in `%3`.
+const UNIFORMLY_INDEXED: &str = "    %0: u32 = GetCbufU32 u32 0x5, u32 0x8
+    %1: u32 = ShiftLeftLogical32 %0, u32 0x2
+    %2: u32 = IAdd32 u32 0x200, %1
+    %3: u32 = GetCbufU32 u32 0x3, %2
+";
+
+/// The operation `operand` names in `function`, if it is a value naming one.
+fn operation_of(
+    function: &crate::ir::Function,
+    operand: Option<crate::ir::Operand>,
+) -> Option<crate::ir::Operation> {
+    match function.inst(operand?.value()?)? {
+        crate::ir::Inst::Op(op) => Some(op.clone()),
+        crate::ir::Inst::Phi(_) => None,
+    }
+}
+
+/// The array index `run` inserted as the first argument of the operation at `%at`: the
+/// operation's index `%1`, shifted right by the spacing and clamped to the array's last handle.
+fn clamped_index(function: &crate::ir::Function, at: u32, size_shift: u32, last: u32) {
+    use crate::ir::{Imm, Opcode, Operand};
+    let clamp = operation_of(function, op_at(function, at).args.first().copied())
+        .expect("an index operation");
+    assert_eq!(clamp.opcode, Opcode::UMin32, "{function}");
+    assert_eq!(
+        clamp.args.get(1),
+        Some(&Operand::Imm(Imm::U32(last))),
+        "{function}"
+    );
+    let shifted =
+        operation_of(function, clamp.args.first().copied()).expect("a shifted index operation");
+    assert_eq!(shifted.opcode, Opcode::ShiftRightLogical32, "{function}");
+    assert_eq!(
+        shifted.args,
+        vec![Operand::Value(value(1)), Operand::Imm(Imm::U32(size_shift))],
+        "{function}"
+    );
+}
+
+/// A texel buffer and the storage images whose array is indexed by a constant-buffer word keep
+/// the whole array and index it at run time (module docs, "What each operation becomes"):
+/// their descriptors have no index fields, so one handle would read handle 0 for every index.
+#[test]
+fn a_uniform_index_on_other_kinds_indexes_the_array() {
+    let count = dynamic_count(0x200, MIN_DYNAMIC_SIZE_SHIFT);
+    assert_eq!(count, DESCRIPTOR_MAX_COUNT);
+    let cases = [
+        (
+            "%60: f32x4 = ImageFetch %3, %10, u32 0x0, u32 0x0, u32 0x0 {type=buffer}",
+            kind_of(SampledType::Float, true, 0),
+            "texture buffer 0: float, from cbuf 3 at 0x200, 1024 handles 4 bytes apart\n",
+        ),
+        (
+            "%60: u32x4 = ImageRead %3, %11 {type=2d, format=r32_uint}",
+            kind_of(SampledType::UnsignedInt, false, 0x21),
+            "image 0: 2d, r32_uint, unsigned, header format 0x21, read, from cbuf 3 at 0x200, \
+             1024 handles 4 bytes apart\n",
+        ),
+        (
+            "%60: u32x4 = ImageRead %3, %10 {type=buffer, format=r32_uint}",
+            kind_of(SampledType::UnsignedInt, true, 0x22),
+            "image buffer 0: r32_uint, unsigned, header format 0x22, read, from cbuf 3 at \
+             0x200, 1024 handles 4 bytes apart\n",
+        ),
+    ];
+    for (line, kind, expected) in cases {
+        let text = format!(
+            "block0:\n{UNIFORMLY_INDEXED}    %10: u32 = GetRegister r0\n    \
+             %11: u32x2 = CompositeConstructU32x2 u32 0x0, u32 0x0\n    {line}\n    return\n"
+        );
+        let engine = Engine::new().word(3, 0x200, 0x77).kind(0x77, kind);
+        let (function, table) = pass(&text, &engine);
+        assert_eq!(table.to_string(), expected, "{line}");
+        clamped_index(&function, 60, MIN_DYNAMIC_SIZE_SHIFT, count - 1);
+    }
+}
+
+/// Every image atomic reads and writes its image (Eden's `is_written` and `is_read`: true
+/// unless the operation is `ImageRead`, `ImageWrite` respectively), on an image and on an
+/// image buffer.
+#[test]
+fn image_atomics_read_and_write() {
+    // Eden's `IsStorageImageOpcode` atomics, written out.
+    const ATOMICS: [&str; 11] = [
+        "ImageAtomicIAdd32",
+        "ImageAtomicSMin32",
+        "ImageAtomicUMin32",
+        "ImageAtomicSMax32",
+        "ImageAtomicUMax32",
+        "ImageAtomicInc32",
+        "ImageAtomicDec32",
+        "ImageAtomicAnd32",
+        "ImageAtomicOr32",
+        "ImageAtomicXor32",
+        "ImageAtomicExchange32",
+    ];
+    for name in ATOMICS {
+        for (ty, buffer_kind, expected) in [
+            (
+                "2d",
+                false,
+                "image 0: 2d, r32_uint, unsigned, header format 0x0, read and written, from cbuf 3 at 0x10\n",
+            ),
+            (
+                "buffer",
+                true,
+                "image buffer 0: r32_uint, unsigned, header format 0x0, read and written, from cbuf 3 at 0x10\n",
+            ),
+        ] {
+            let text = format!(
+                "block0:\n    %0: u32 = GetCbufU32 u32 0x3, u32 0x10\n    \
+                 %1: u32x2 = CompositeConstructU32x2 u32 0x0, u32 0x0\n    \
+                 %2: u32 = {name} %0, %1, u32 0x1 {{type={ty}, format=r32_uint}}\n    return\n"
+            );
+            let engine = Engine::new()
+                .word(3, 0x10, 0x11)
+                .kind(0x11, kind_of(SampledType::UnsignedInt, buffer_kind, 0));
+            let (_, table) = pass(&text, &engine);
+            assert_eq!(table.to_string(), expected, "{name} on {ty}");
+        }
+    }
+}
+
+/// Two reads of the same image word and format with different types are two descriptors
+/// (Eden's predicate compares the type).
+#[test]
+fn the_type_keeps_image_descriptors_apart() {
+    let text = "block0:
+    %0: u32 = GetCbufU32 u32 0x3, u32 0x10
+    %1: u32x2 = CompositeConstructU32x2 u32 0x0, u32 0x0
+    %2: u32x4 = ImageRead %0, %1 {type=2d, format=r32_uint}
+    %3: u32x4 = ImageRead %0, %1 {type=3d, format=r32_uint}
+    return
+";
+    let engine = Engine::new()
+        .word(3, 0x10, 0x11)
+        .kind(0x11, kind_of(SampledType::UnsignedInt, false, 0));
+    let (function, table) = pass(text, &engine);
+    assert_eq!(
+        table.to_string(),
+        "image 0: 2d, r32_uint, unsigned, header format 0x0, read, from cbuf 3 at 0x10\n\
+         image 1: 3d, r32_uint, unsigned, header format 0x0, read, from cbuf 3 at 0x10\n"
+    );
+    let index = |at| info_at(&function, at).descriptor_index;
+    assert_eq!([2, 3].map(index), [0, 1]);
 }

@@ -6,7 +6,8 @@ use std::fmt::Write as _;
 use super::{BOUND_BANK, buffer, parse, sample_of, sources, untraced, value};
 use crate::interp::Machine;
 use crate::ir::Operand;
-use crate::opt::resources::trace::dynamic_size_shift;
+use crate::opt::Work;
+use crate::opt::resources::trace::{dynamic_size_shift, trace};
 use crate::opt::resources::{
     DESCRIPTOR_SIZE_SHIFT, MAX_TRACE_DEPTH, MIN_DYNAMIC_SIZE_SHIFT, Untraced, scan,
 };
@@ -306,5 +307,77 @@ fn an_index_shift_at_the_edge() {
     assert_eq!(
         sources(&indexed(u32::BITS)),
         "%60: cbuf 3 at 0x0, 1024 handles 8 bytes apart\n"
+    );
+}
+
+/// A refused trace takes no more steps than the longest accepted one: an OR at the top, one
+/// side reaching the depth limit and the other one operation past it is refused after
+/// `2 * MAX_TRACE_DEPTH + 1` steps, as the depth is checked before a step is charged (module
+/// docs, "Tracing is exact").
+#[test]
+fn a_refused_trace_takes_the_documented_steps() {
+    // A chain whose read is `depth` operations below the OR's operand.
+    let side = |first: u32, bank: u32, depth: u32| {
+        let mut lines = format!("    %{first}: u32 = GetCbufU32 u32 {bank:#x}, u32 0x10\n");
+        for k in 1..depth {
+            writeln!(
+                lines,
+                "    %{}: u32 = BitwiseAnd32 %{}, u32 0xffffffff",
+                first + k,
+                first + k - 1
+            )
+            .expect("writes");
+        }
+        (lines, first + depth - 1)
+    };
+    let (left, a) = side(0, 3, MAX_TRACE_DEPTH);
+    let (right, b) = side(20, 4, MAX_TRACE_DEPTH + 1);
+    let lines = format!("{left}{right}    %45: u32 = BitwiseOr32 %{a}, %{b}\n");
+    let function = parse(&sample_of(&lines, "%45"));
+    let mut work = Work::default();
+    assert_eq!(
+        trace(&function, Operand::Value(value(45)), &mut work),
+        Err(Untraced::TooDeep)
+    );
+    assert_eq!(work.steps(), u64::from(2 * MAX_TRACE_DEPTH + 1));
+}
+
+/// `Identity` counts towards the depth limit, so a long chain of them is refused rather than
+/// recursing without bound: `MAX_TRACE_DEPTH` of them over the read are traced, one more is
+/// too deep.
+#[test]
+fn an_identity_chain_counts_towards_the_depth() {
+    let chain = |depth: u32| {
+        let mut lines = String::from("    %0: u32 = GetCbufU32 u32 3, u32 0x10\n");
+        for k in 1..=depth {
+            writeln!(lines, "    %{k}: opaque = Identity %{}", k - 1).expect("writes");
+        }
+        sample_of(&lines, &format!("%{depth}"))
+    };
+    assert_eq!(sources(&chain(MAX_TRACE_DEPTH)), "%60: cbuf 3 at 0x10\n");
+    assert_eq!(untraced(&chain(MAX_TRACE_DEPTH + 1)), Untraced::TooDeep);
+}
+
+/// The operands the trace reads below an operation it reached are followed through
+/// `Identity`: a pair under an element, the sum that is a register offset, the shift that
+/// spaces an array and the word that indexes it.
+#[test]
+fn identities_below_a_read_are_followed() {
+    let pair = "    %0: u32x2 = GetCbufU32x2 u32 3, u32 0x18\n    %1: opaque = Identity %0\n    \
+                %2: u32 = CompositeExtractU32x2 %1, u32 0x1\n";
+    assert_eq!(sources(&sample_of(pair, "%2")), "%60: cbuf 3 at 0x1c\n");
+    let sum = "    %0: u32 = GetRegister r0\n    %1: u32 = IAdd32 %0, u32 0x100\n    \
+               %2: opaque = Identity %1\n    %3: u32 = GetCbufU32 u32 3, %2\n";
+    assert_eq!(
+        sources(&sample_of(sum, "%3")),
+        "%60: cbuf 3 at 0x100, 1024 handles 8 bytes apart\n"
+    );
+    let indexed = "    %0: u32 = GetCbufU32 u32 5, u32 0x8\n    %1: opaque = Identity %0\n    \
+                   %2: u32 = ShiftLeftLogical32 %1, u32 0x4\n    %3: opaque = Identity %2\n    \
+                   %4: u32 = IAdd32 %3, u32 0x100\n    %5: opaque = Identity %4\n    \
+                   %6: u32 = GetCbufU32 u32 3, %5\n";
+    assert_eq!(
+        sources(&sample_of(indexed, "%6")),
+        "%60: cbuf 3 at 0x100, 1008 handles 16 bytes apart, index from cbuf 5 at 0x8 << 4\n"
     );
 }

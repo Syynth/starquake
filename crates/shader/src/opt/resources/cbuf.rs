@@ -27,12 +27,18 @@ pub(super) const fn added(ty: Type) -> usize {
 }
 
 /// Every constant-buffer read whose offset is a value, in the order the blocks list them, each
-/// with its result type.
-pub(super) fn reads(function: &Function, work: &mut Work) -> Vec<(Read, Type)> {
+/// with its result type; `each` is called with every listed instruction and its block, in that
+/// order.
+pub(super) fn reads(
+    function: &Function,
+    work: &mut Work,
+    mut each: impl FnMut(BlockId, Value),
+) -> Vec<(Read, Type)> {
     let mut out = Vec::new();
     for (block, listed) in function.blocks() {
         for &at in &listed.insts {
             work.step();
+            each(block, at);
             let Some(Inst::Op(op)) = function.inst(at) else {
                 continue;
             };

@@ -15,8 +15,9 @@
 //!    and [`TextureUsage::Sampled`] for every other use).
 //! 2. [`run`] takes the answers, builds the [`ResourceTable`] and checks every answer it needs
 //!    before it changes the function; then it rewrites each texture operation (below) and
-//!    bounds each indexed constant-buffer read ("Constant-buffer reads"). A refusal from `run`
-//!    leaves the function as it was.
+//!    bounds each indexed constant-buffer read ("Constant-buffer reads"). Every refusal from
+//!    `run` except [`ResourceError::Verify`] leaves the function as it was (below, "When `run`
+//!    refuses").
 //!
 //! # Sources
 //!
@@ -74,11 +75,14 @@
 //!   order into a primary and a secondary word ([`HandleSource`]).
 //!
 //! Anything else is refused with the exact reason ([`Untraced`]), named by the operation where
-//! the trace stopped. The trace descends at most [`MAX_TRACE_DEPTH`] operations, and an OR
-//! below an OR is refused at once, so tracing one handle takes at most `2 * MAX_TRACE_DEPTH +
-//! 1` steps: an OR and two chains down to the limit (pinned by
-//! `tests::trace::the_longest_trace_takes_the_documented_steps`; the limit's edge by
-//! `tests::trace::the_depth_limit_at_its_edge`).
+//! the trace stopped. The trace descends at most [`MAX_TRACE_DEPTH`] operations, checking the
+//! depth before it charges a step, and an OR below an OR is refused at once, so tracing one
+//! handle takes at most `2 * MAX_TRACE_DEPTH + 1` steps, accepted or refused: an OR and two
+//! chains down to the limit (pinned by
+//! `tests::trace::the_longest_trace_takes_the_documented_steps`, and for a refused trace one
+//! step past the limit by `tests::trace::a_refused_trace_takes_the_documented_steps`; the
+//! limit's edge by `tests::trace::the_depth_limit_at_its_edge`, and through `Identity` by
+//! `tests::trace::an_identity_chain_counts_towards_the_depth`).
 //! Because the handle is computed exactly, the handle the descriptor's words give is the
 //! handle the IR computes from them (`tests::trace::descriptor_handles_match_the_interpreter`).
 //!
@@ -110,6 +114,31 @@
 //!
 //! Descriptors merge as Eden's `Descriptors::Add` merges them ([`ResourceTable`]).
 //!
+//! # When `run` refuses
+//!
+//! [`run`] makes every check that can refuse before its first change: for each scanned
+//! operation, that the function still holds it ([`ResourceError::Stale`], below), its flags,
+//! its answers and its descriptor index; then that the arena has room for every instruction it
+//! adds. After those, adding an instruction cannot fail (its block was checked, and the room
+//! was), so a refusal of any of these kinds leaves the function as it was
+//! (`tests::refusals::a_storage_image_of_two_words_is_refused_and_nothing_changes`,
+//! `tests::refusals::a_changed_function_is_stale`). The exception is
+//! [`ResourceError::Verify`], in test and debug builds only: it is reported after the rewrite,
+//! which has been applied.
+//!
+//! The stale check compares what the scan recorded of each texture operation: that the
+//! function holds an operation at its id with the scanned opcode and the scanned handle
+//! argument, and that the scanned block lists that id
+//! (`tests::refusals::a_changed_handle_is_stale`, `tests::refusals::a_moved_operation_is_stale`).
+//! It does not look below the handle argument: a function whose handle's operand tree changed
+//! below its first operation (the constant-buffer read rewritten in place, say) is not refused,
+//! and the descriptor is built from the words the scan traced
+//! (`tests::refusals::a_change_below_the_handle_is_not_seen`). A scan is meant for one `run`:
+//! running a second time with the same scan is refused as stale where the first run changed a
+//! texture operation's handle argument (every handle but a bound one at offset 0, which the
+//! rewrite's [`ABSENT`] equals; `tests::refusals::a_second_run_with_one_scan_is_stale`), and
+//! otherwise bounds each indexed constant-buffer read a second time.
+//!
 //! # Constant-buffer reads
 //!
 //! Every constant-buffer read keeps its opcode and its immediate bank, which names the host
@@ -131,15 +160,24 @@
 //! bank's bound size too (`video_core/shader_environment.cpp`, `ReadCbufValue`: the word is read
 //! only `if (cbuf_offset < cbuf.size)`). The read itself is clamped as well, so no host
 //! bounds-check policy is needed to keep it inside the binding (spec, "Untrusted input").
-//! **Owner question**: the bound here is the host binding's size, not the size the guest bound
-//! the bank with, which only the draw knows; bounding by the guest's size would need a driver
-//! constant per bank.
+//! **A departure from the approved spec, and an open owner question.** `shader-pipeline.md`,
+//! "Passes needed for correctness", item 2, says: "Reads with a register offset (indexed) are
+//! bounds-checked against the bound size." The bound here is the host binding's size,
+//! [`INDEXED_CBUF_SIZE`](crate::info::INDEXED_CBUF_SIZE), not the size the guest bound the bank
+//! with, which only the draw knows. The two options: keep the host binding's size (what this
+//! pass does: no per-draw state, and the read stays inside the binding), or bound by the
+//! guest's size, which needs a driver constant per bank that the GPU crate fills when drawing.
+//! Every indexed read takes this path (`tests::cbuf::reads_in_every_block_are_bounded`).
 //!
 //! # Where the two references differ
 //!
-//! Decision 8 of the graphics-server spec ("where one answer contains the other, the larger";
-//! otherwise "the one a title ran on") picks the winner of each conflict. Eden mainline accepts
-//! a superset of PR #4588's handles in each row marked "larger".
+//! Decision 8 of the graphics-server spec ("where one answer contains the other, the larger;
+//! otherwise the one a title ran on") picks the winner of each difference. Eden mainline
+//! accepts a superset of PR #4588's handles in each row marked "larger". Where neither answer
+//! contains the other, the one a title ran on is PR #4588's: `shader-pipeline.md` (the slice
+//! 12e paragraph) counts PR #4588, which runs titles through its lowering to Maxwell and then
+//! its own `texture_pass.cpp`, as the one titles ran on. The rows marked **departure** do not
+//! follow that winner; each says why and is an open **owner question**.
 //!
 //! | What | Eden @ cf654052 | PR #4588 @ e5fb3b97 | Here | Pinned by |
 //! |---|---|---|---|---|
@@ -147,11 +185,11 @@
 //! | The smallest array spacing (`DynamicDescriptorSizeShift`) | 4 bytes (shift 2: "Separate texture and sampler handles are 4 bytes apart") | 8 bytes (shift 3) | Eden's (larger) | `tests::trace::the_smallest_spacing_is_four_bytes` |
 //! | A register offset that is not an `IAdd32` | an array from offset 0 | refused | Eden's (larger) | `tests::table::an_index_alone_starts_at_zero` |
 //! | `BitwiseOr32` of an array and a single word | the array is the primary word | refused (`count > 1 \|\| count > 1`) | Eden's (larger) | `tests::table::an_array_or_a_single_word` |
-//! | `BitwiseAnd32` with an immediate | the mask kept, applied after the shift | the shift set to the mask's trailing zero count, the mask dropped | **conflict**, Eden's: it computes the handle the IR computes, the PR's does not | `tests::trace::a_mask_is_applied_after_the_shift` |
-//! | A single word shifted left, with no second word | `(word << shift) & mask` | `(word << shift) \| word`: the PR ORs the primary word into itself when there is no secondary | **conflict**, Eden's: it computes the handle the IR computes | `tests::table::a_shifted_single_word` |
-//! | Handles loaded from global or storage memory | not matched: the search goes on into the load's address, binding a constant-buffer word found there or failing ("Failed to track bindless texture constant buffer") | refused by name | refused, the PR's reason ([`Untraced::GlobalMemory`]) | `tests::refusals::every_reason_reads_as_written` |
-//! | Buffer-backed textures (PR's `buffer_texture.h`, `BufferTexture::Tracker`) | none | traced through storage buffers, host-dependent | not ported: refused as untraceable (decision 8) | `tests::refusals::every_reason_reads_as_written` (the global-memory case) |
-//! | A handle from a vertex attribute (`IsAttributeSourcedHandle`) | accepted where the host sets `support_attribute_texture_handle` | none | refused, [`Untraced::Attribute`] | `tests::refusals::every_reason_reads_as_written` |
+//! | `BitwiseAnd32` with an immediate | the mask kept, applied after the shift | the shift set to the mask's trailing zero count, the mask dropped | **conflict, departure**: decision 8 picks PR #4588's (the one a title ran on); Eden's is kept because it computes the handle the IR computes and the PR's reading does not (with the mask `0xfff00` the IR computes `word & 0xfff00`, the PR's reading `word << 8`). **Owner question**: keep Eden's, or follow decision 8 and take the PR's | `tests::trace::a_mask_is_applied_after_the_shift` |
+//! | A single word shifted left, with no second word | `(word << shift) & mask` | `(word << shift) \| word`: the PR ORs the primary word into itself when there is no secondary | **conflict, departure**: decision 8 picks PR #4588's (the one a title ran on); Eden's is kept because it computes the handle the IR computes and the PR's reading does not. **Owner question**: keep Eden's, or follow decision 8 and take the PR's | `tests::table::a_shifted_single_word` |
+//! | Handles loaded from global or storage memory | not matched: the search goes on into the load's address, binding a constant-buffer word found there or failing ("Failed to track bindless texture constant buffer") | refused by name | refused, with the PR's reason ([`Untraced::GlobalMemory`]). This follows from exact tracing ("Tracing is exact", owner question 1 of the PR), which refuses every operation it does not follow, not from decision 8 | `tests::refusals::every_memory_load_is_refused_by_name` |
+//! | Buffer-backed textures (PR's `buffer_texture.h`, `BufferTexture::Tracker`) | none | traced through storage buffers, host-dependent | not ported: refused as untraceable (decision 8) | `tests::refusals::every_memory_load_is_refused_by_name` |
+//! | A handle from a vertex attribute (`IsAttributeSourcedHandle`) | accepted where the host sets `support_attribute_texture_handle` | none | **departure**: refused, [`Untraced::Attribute`]. Decision 8's "larger" picks Eden's, which accepts it on such hosts; it is refused because the host feature it depends on is not modelled here (the pass does not know the host, as with the SNORM patch below). **Owner question**: refuse, or accept it and leave the host check to the render backend | `tests::refusals::every_reason_reads_as_written` |
 //!
 //! # Where this differs from Eden
 //!
@@ -191,7 +229,12 @@
 //!
 //! [`scan`] takes the steps of [`crate::opt`]'s block order, one step per listed instruction
 //! and one per trace step, at most `2 * MAX_TRACE_DEPTH + 1` per texture operation (pinned by
-//! `tests::trace::the_depth_limit_at_its_edge` for one fixed input). [`run`] takes one step per
+//! `tests::trace::the_depth_limit_at_its_edge` for one fixed input). Not charged: the
+//! `Identity` links the trace follows below an operation it reached (the loop in the trace's
+//! `resolve`, at most [`MAX_TRACE_DEPTH`] links per call), called at most twice per trace (the
+//! vertex-attribute check) and at most four times per trace step (a constant-buffer read at a
+//! register offset: its offset, the spacing and the index word, twice), so a trace follows at
+//! most `(2 + 4 * (2 * MAX_TRACE_DEPTH + 1)) * MAX_TRACE_DEPTH` uncharged links. [`run`] takes one step per
 //! texture operation, one per listed instruction, and one per instruction of each block it adds
 //! to (`tests::cbuf::reads_in_every_block_are_bounded`); it adds at most two instructions per
 //! texture operation and seven per indexed constant-buffer read, and merging descriptors is a
@@ -204,7 +247,7 @@ mod table;
 mod tests;
 mod trace;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::{self, Display, Formatter};
 
 use thiserror::Error;
@@ -274,7 +317,9 @@ pub enum ResourceError {
     /// wrong kind.
     #[error("{0}: a texture operation with an argument or its flags missing or of the wrong kind")]
     Malformed(Value),
-    /// The function no longer holds the texture operation the scan found at this id.
+    /// The function no longer holds, at this id, an operation with the opcode and handle
+    /// argument the scan found, listed in the block the scan found it in (module docs, "When
+    /// `run` refuses": changes below the handle argument are not seen).
     #[error("{0}: the function changed since it was scanned")]
     Stale(Value),
     /// A handle's word was not asked about.
@@ -331,6 +376,8 @@ struct Entry {
     block: BlockId,
     /// Its opcode when scanned.
     opcode: Opcode,
+    /// Its handle argument when scanned.
+    handle: Operand,
     /// The `Image*` form it becomes.
     unbound: Opcode,
     /// Where its handle is found.
@@ -435,6 +482,7 @@ pub fn scan(function: &Function, buffer: DescriptorBuffer) -> Result<TextureScan
                 at,
                 block,
                 opcode: op.opcode,
+                handle,
                 unbound,
                 traced,
                 usage,
@@ -507,21 +555,33 @@ impl Inserter {
 }
 
 /// Builds the resource table from `scan` (taken of `function`) and `answers`, then rewrites
-/// each texture operation and bounds each indexed constant-buffer read. Every check happens
-/// before the first change, so an error leaves `function` as it was.
+/// each texture operation and bounds each indexed constant-buffer read. Every check that can
+/// refuse happens before the first change, so an error other than [`ResourceError::Verify`]
+/// leaves `function` as it was (module docs, "When `run` refuses").
 pub fn run(
     function: &mut Function,
     scan: &TextureScan,
     answers: &Answers,
 ) -> Result<(ResourceTable, Work), ResourceError> {
     let mut work = Work::default();
+    // The block that first lists each scanned operation, found by the walk that finds the
+    // reads to bound, so the stale check needs no scan of a block per operation.
+    let mut homes: HashMap<Value, Option<BlockId>> =
+        scan.entries.iter().map(|e| (e.at, None)).collect();
+    let reads = cbuf::reads(function, &mut work, |block, at| {
+        if let Some(home) = homes.get_mut(&at)
+            && home.is_none()
+        {
+            *home = Some(block);
+        }
+    });
     let mut table = TableBuilder::default();
     let mut rewrites = Vec::with_capacity(scan.entries.len());
     for &entry in &scan.entries {
         work.step();
-        rewrites.push(plan(function, &mut table, entry, answers)?);
+        let home = homes.get(&entry.at).copied().flatten();
+        rewrites.push(plan(function, &mut table, entry, home, answers)?);
     }
-    let reads = cbuf::reads(function, &mut work);
     let added = rewrites
         .iter()
         .filter(|r| r.index.is_some())
@@ -563,15 +623,23 @@ fn word(answers: &Answers, bank: u8, offset: u32) -> Result<u32, ResourceError> 
 
 /// Decides what happens to `entry` and adds its descriptor to `table` (Eden's loop over
 /// `to_replace`).
+/// `home` is the block that lists `entry`'s operation, if any does.
 fn plan(
     function: &Function,
     table: &mut TableBuilder,
     entry: Entry,
+    home: Option<BlockId>,
     answers: &Answers,
 ) -> Result<Rewrite, ResourceError> {
     let at = entry.at;
     let op = match function.inst(at) {
-        Some(Inst::Op(op)) if op.opcode == entry.opcode => op,
+        Some(Inst::Op(op))
+            if op.opcode == entry.opcode
+                && op.args.first() == Some(&entry.handle)
+                && home == Some(entry.block) =>
+        {
+            op
+        }
         _ => return Err(ResourceError::Stale(at)),
     };
     let Flags::Texture(mut info) = op.flags else {

@@ -454,3 +454,150 @@ fn descriptor_indices_at_their_edge() {
         }
     }
 }
+
+/// Each load from global or storage memory in PR #4588's list in `TryGetConstBuffer`
+/// (`eden-pr4588/src/shader_recompiler/ir_opt/texture_pass.cpp` @ e5fb3b97), written out, is
+/// refused by name, with its result type and its operands.
+#[test]
+fn every_memory_load_is_refused_by_name() {
+    const LOADS: [(&str, &str, &str); 14] = [
+        ("LoadGlobalU8", "u32", "u64 0x1000"),
+        ("LoadGlobalS8", "u32", "u64 0x1000"),
+        ("LoadGlobalU16", "u32", "u64 0x1000"),
+        ("LoadGlobalS16", "u32", "u64 0x1000"),
+        ("LoadGlobal32", "u32", "u64 0x1000"),
+        ("LoadGlobal64", "u32x2", "u64 0x1000"),
+        ("LoadGlobal128", "u32x4", "u64 0x1000"),
+        ("LoadStorageU8", "u32", "u32 0x0, u32 0x10"),
+        ("LoadStorageS8", "u32", "u32 0x0, u32 0x10"),
+        ("LoadStorageU16", "u32", "u32 0x0, u32 0x10"),
+        ("LoadStorageS16", "u32", "u32 0x0, u32 0x10"),
+        ("LoadStorage32", "u32", "u32 0x0, u32 0x10"),
+        ("LoadStorage64", "u32x2", "u32 0x0, u32 0x10"),
+        ("LoadStorage128", "u32x4", "u32 0x0, u32 0x10"),
+    ];
+    for (name, ty, args) in LOADS {
+        let text = sample_of(&format!("    %0: {ty} = {name} {args}\n"), "%0");
+        let opcode = Opcode::from_name(name).expect("an opcode of that name");
+        let error = scan_error(&text);
+        assert_eq!(
+            error,
+            ResourceError::Untraced {
+                at: value(60),
+                why: Untraced::GlobalMemory {
+                    at: value(0),
+                    opcode
+                }
+            },
+            "{name}"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "%60: the texture handle cannot be traced: it is loaded from storage or global \
+                 memory by {name} at %0"
+            )
+        );
+    }
+}
+
+/// The scan, the answers and the function of a sample whose handle is the word at 0x10 of
+/// bank 3, with a second word at 0x20 in `%1`.
+fn scanned_sample() -> (Function, super::TextureScan, crate::exchange::Answers) {
+    let text = sample_of(
+        "    %0: u32 = GetCbufU32 u32 3, u32 0x10\n    %1: u32 = GetCbufU32 u32 3, u32 0x20\n",
+        "%0",
+    );
+    let engine = Engine::new()
+        .word(3, 0x10, 0x9)
+        .kind(0x9, FLOAT)
+        .word(3, 0x20, 0xa)
+        .kind(0xa, FLOAT);
+    let function = parse(&text);
+    let (found, answers) = answered(&function, buffer(BOUND_BANK), &engine);
+    (function, found, answers)
+}
+
+/// A texture operation whose handle argument changed after the scan, opcode unchanged, is
+/// stale, and nothing changes.
+#[test]
+fn a_changed_handle_is_stale() {
+    let (function, found, answers) = scanned_sample();
+    let mut changed = function;
+    if let Some(Inst::Op(op)) = changed.inst_mut(value(60))
+        && let Some(first) = op.args.first_mut()
+    {
+        *first = Operand::Value(value(1));
+    }
+    let before = changed.clone();
+    let error = run(&mut changed, &found, &answers).expect_err("refused");
+    assert_eq!(error, ResourceError::Stale(value(60)));
+    assert_eq!(changed, before);
+}
+
+/// A texture operation no longer listed by the block the scan found it in is stale, whether
+/// no block lists it or another one does, and nothing changes.
+#[test]
+fn a_moved_operation_is_stale() {
+    let text = "block0:
+    %0: u32 = GetCbufU32 u32 3, u32 0x10
+    %50: f32x2 = CompositeConstructF32x2 f32 0x0, f32 0x0
+    %60: f32x4 = ImageSampleImplicitLod %0, %50, u32 0x0, u32 0x0 {type=2d}
+    jump block1
+block1:
+    return
+";
+    let engine = Engine::new().word(3, 0x10, 0x9).kind(0x9, FLOAT);
+    let function = parse(text);
+    let (found, answers) = answered(&function, buffer(BOUND_BANK), &engine);
+    let entry = function.entry();
+    let unlist = |function: &mut Function| {
+        if let Some(block) = function.block_mut(entry) {
+            block.insts.retain(|&v| v != value(60));
+        }
+    };
+    let mut unlisted = function.clone();
+    unlist(&mut unlisted);
+    let mut moved = unlisted.clone();
+    let other = moved.blocks().nth(1).map(|(id, _)| id).expect("two blocks");
+    if let Some(block) = moved.block_mut(other) {
+        block.insts.insert(0, value(60));
+    }
+    for mut changed in [unlisted, moved] {
+        let before = changed.clone();
+        let error = run(&mut changed, &found, &answers).expect_err("refused");
+        assert_eq!(error, ResourceError::Stale(value(60)));
+        assert_eq!(changed, before);
+    }
+}
+
+/// The documented limit of the stale check (module docs, "When `run` refuses"): a change below
+/// the handle argument is not seen, and the descriptor is built from the word the scan traced.
+#[test]
+fn a_change_below_the_handle_is_not_seen() {
+    let (function, found, answers) = scanned_sample();
+    let mut changed = function;
+    if let Some(slot) = changed.inst_mut(value(0)) {
+        *slot = Inst::Op(Operation::new(
+            Opcode::GetCbufU32,
+            vec![Operand::Imm(Imm::U32(3)), Operand::Imm(Imm::U32(0x20))],
+        ));
+    }
+    let (table, _) = run(&mut changed, &found, &answers).expect("runs");
+    assert_eq!(
+        table.to_string(),
+        "texture 0: 2d, float, from cbuf 3 at 0x10\n"
+    );
+}
+
+/// A scan is for one run: a second run with it is stale, as the first run set the handle
+/// argument to `ABSENT`, and the second changes nothing.
+#[test]
+fn a_second_run_with_one_scan_is_stale() {
+    let (mut function, found, answers) = scanned_sample();
+    run(&mut function, &found, &answers).expect("runs");
+    let once = function.clone();
+    let error = run(&mut function, &found, &answers).expect_err("refused");
+    assert_eq!(error, ResourceError::Stale(value(60)));
+    assert_eq!(function, once);
+}
