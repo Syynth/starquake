@@ -340,12 +340,13 @@ fn hfma2_fuses_each_lane() {
     }
 }
 
-/// `HFMA2.RELU` clamps each lane as the native translator does: below zero to `+0.0`, a NaN of
-/// either sign to `RELU_NAN` narrowed (the IR's canonical half NaN, `0x7fff`, as the
-/// interpreter models a conversion's NaN result), and everything else kept, `-0.0` and positive
-/// infinity included. The lowering gives `+0.0` for `-0.0` (module docs, owner question).
+/// `HFMA2.RELU` clamps each lane as the lowering does (`lower_to_maxwell.h` case `0x231`, ruling
+/// 7): at or below zero to `+0.0`, `-0.0` and a negative denormal included, a NaN of either sign
+/// to `RELU_NAN` narrowed (the IR's canonical half NaN, `0x7fff`, as the interpreter models a
+/// conversion's NaN result), and everything else kept, positive infinity and a positive
+/// denormal included. The native translator keeps `-0.0` (module docs, "Divergences").
 #[test]
-fn relu_mirrors_the_native_clamp() {
+fn relu_clamps_as_the_lowering_does() {
     let neg_zero = hs(255, HalfSwizzle::H1H0, false, true);
     let op = Op::HFma2(OpHFma2 {
         relu: Some(PredSrc::TRUE),
@@ -358,7 +359,7 @@ fn relu_mirrors_the_native_clamp() {
         (H_NEG_INF, 0),
         (0x7e01, H_CANONICAL_NAN),
         (0xfe01, H_CANONICAL_NAN),
-        (H_NZERO, H_NZERO),
+        (H_NZERO, 0),
         (H_DENORM, H_DENORM),
         (0x8001, 0),
     ];
@@ -396,8 +397,9 @@ fn pr_relu_cases() {
         (0x0000, 0x7c00, 0x7c00),
         (0x7e01, 0x3c00, H_CANONICAL_NAN),
         (0xfe01, 0x3c00, H_CANONICAL_NAN),
-        // The PR's lowering: 0x0000.
-        (0x8000, 0x8000, H_NZERO),
+        // The PR's own row `{0x8000, 0x8000, 0x0000}`, the lowering's result (ruling 7); the
+        // native translator keeps `-0.0`.
+        (0x8000, 0x8000, 0x0000),
     ];
     for (a, c, expected) in cases {
         let machine = run_op(instr.op, &[(13, (a << 16) | 0x4400), (16, 0xc000_0000 | c)]);
@@ -446,37 +448,105 @@ fn pr_absolute_source_cases() {
     }
 }
 
-/// PR #4588's conditional `ReLU` (`native_shader.cpp`, "keeps unclamped results when
-/// disabled"): `R8 * 1 + R11` with bits 87 to 90 as the predicate. Only `PT` (7) is translated,
-/// as the native translator requires; every other predicate is refused (module docs, owner
-/// question), where the PR's lowering keeps the clamped result only where it holds.
+/// PR #4588's conditional `ReLU` (`native_shader.cpp`, "Native conditional half `ReLU` keeps
+/// unclamped results when disabled"): `R8 * 1 + R11` into `R4`, `R8` or `R11`, with bits 87 to
+/// 90 as the predicate (three bits and its negation), translated as the lowering's case
+/// `0x231` does (ruling 7): the clamped lanes where the predicate holds, the unclamped result
+/// elsewhere. The PR's cases, with its predicates `{true, false, true, false, false, true,
+/// false}` and the named one set to each value; `-1 + 1` and `inf` keep their value either way,
+/// `-2 + 1` and `-inf` differ. The predicates are not written.
 #[test]
-fn relu_with_a_predicate_is_refused() {
+fn relu_under_a_predicate_keeps_the_clamp_where_it_holds() {
+    // (`R8`, clamped, unclamped): `R8` plus one in each lane.
+    let values = [
+        (0xbc00_3c00, 0x0000_4000, 0x0000_4000),
+        (0x3c00_bc00, 0x4000_0000, 0x4000_0000),
+        (0xc000_c000, 0x0000_0000, pack(H_NEG_ONE, H_NEG_ONE)),
+        (0x7c00_fc00, 0x7c00_0000, pack(H_NEG_INF, H_INF)),
+    ];
     for condition in [0_u32, 1, 6, 7, 8, 9, 14, 15] {
-        let instr = pr_word([
-            (8 << 24) | (4 << 16) | 0x7831,
-            0x3c00_3c00,
-            0x800b | (condition << 23),
-            0,
-        ]);
-        if condition != 7 {
+        for destination in [4_u32, 8, 11] {
+            let instr = pr_word([
+                (8 << 24) | (destination << 16) | 0x7831,
+                0x3c00_3c00,
+                0x800b | (condition << 23),
+                0,
+            ]);
             let index = u8::try_from(condition & 7).expect("three bits");
-            let relu = PredSrc {
-                reg: Pred::new(index).expect("a predicate"),
-                negated: condition & 8 != 0,
-            };
-            assert_refused(instr.op, HalfDoubleUnsupported::HalfFmaReluPredicate(relu));
-            continue;
+            let negated = condition & 8 != 0;
+            assert_eq!(
+                instr.op,
+                Op::HFma2(OpHFma2 {
+                    relu: Some(PredSrc {
+                        reg: Pred::new(index).expect("a predicate"),
+                        negated,
+                    }),
+                    ..hfma2(
+                        r(u8::try_from(destination).expect("a register")),
+                        h(8),
+                        himm(0x3c00_3c00),
+                        h(11),
+                    )
+                })
+            );
+            for enabled in [false, true] {
+                for (value, clamped, unclamped) in values {
+                    let mut machine = Machine::new();
+                    machine.regs[8] = value;
+                    machine.regs[11] = 0x3c00_3c00;
+                    machine.preds[..7]
+                        .copy_from_slice(&[true, false, true, false, false, true, false]);
+                    if index != 7 {
+                        machine.preds[usize::from(index)] = enabled;
+                    }
+                    let preds = machine.preds;
+                    let clamp = (index == 7 || enabled) != negated;
+                    run_on(&[instr], &mut machine);
+                    let expected = if clamp { clamped } else { unclamped };
+                    let at = usize::try_from(destination).expect("an index");
+                    assert_eq!(machine.regs[at], expected, "{instr} {enabled} {value:#x}");
+                    assert_eq!(machine.preds, preds, "{instr}");
+                }
+            }
         }
-        for (value, expected) in [
-            (0xbc00_3c00, 0x0000_4000),
-            (0x3c00_bc00, 0x4000_0000),
-            (0xc000_c000, 0x0000_0000),
-            (0x7c00_fc00, 0x7c00_0000),
-        ] {
-            let machine = run_op(instr.op, &[(8, value), (11, 0x3c00_3c00)]);
-            assert_eq!(machine.regs[4], expected, "{value:#x}");
-        }
+    }
+}
+
+/// `HFMA2.RELU` under `P0`, `!P0` and `!PT` builds the lowering's final select of the clamped
+/// word over the unclamped one, reading the predicate with its negation; under `PT` there is no
+/// select. A lane of `-2` (clamped to `+0.0`, unclamped `-2`) shows which word is kept.
+#[test]
+fn relu_selects_by_its_predicate() {
+    let fma = |relu: PredSrc| {
+        Op::HFma2(OpHFma2 {
+            relu: Some(relu),
+            ..hfma2(r(0), h(1), himm(pack(H_ONE, H_ONE)), h(255))
+        })
+    };
+    for (relu, p0, clamped) in [
+        (pred(0, false), true, true),
+        (pred(0, false), false, false),
+        (pred(0, true), true, false),
+        (pred(0, true), false, true),
+        (NOT_PT, false, false),
+        (NOT_PT, true, false),
+        (PredSrc::TRUE, false, true),
+    ] {
+        let mut machine = Machine::new();
+        machine.regs[1] = pack(H_NEG_TWO, H_THREE);
+        machine.preds[0] = p0;
+        run_on(&[Instr::new(fma(relu))], &mut machine);
+        let expected = if clamped {
+            pack(0, H_THREE)
+        } else {
+            pack(H_NEG_TWO, H_THREE)
+        };
+        assert_eq!(machine.regs[0], expected, "{relu} {p0}");
+        let selects = opcodes(&translated(&[Instr::new(fma(relu))]))
+            .into_iter()
+            .filter(|&opcode| opcode == Opcode::SelectU32)
+            .count();
+        assert_eq!(selects, usize::from(relu != PredSrc::TRUE), "{relu}");
     }
 }
 
@@ -579,41 +649,51 @@ fn hmnmx2_picks_per_lane() {
     }
 }
 
-/// Each comparison's result on four pairs: (1, 2), (NaN, 1), (2, 2) and (3, 2), written out
-/// from the comparison's meaning (`.u` true when unordered, `.num` when both are numbers,
-/// `.nan` when either is not).
-pub(super) const COMPARISONS: [(FloatCmpOp, [bool; 4]); 16] = [
-    (FloatCmpOp::False, [false, false, false, false]),
-    (FloatCmpOp::Lt, [true, false, false, false]),
-    (FloatCmpOp::Eq, [false, false, true, false]),
-    (FloatCmpOp::Le, [true, false, true, false]),
-    (FloatCmpOp::Gt, [false, false, false, true]),
-    (FloatCmpOp::Ne, [true, false, false, true]),
-    (FloatCmpOp::Ge, [false, false, true, true]),
-    (FloatCmpOp::Num, [true, false, true, true]),
-    (FloatCmpOp::Nan, [false, true, false, false]),
-    (FloatCmpOp::LtU, [true, true, false, false]),
-    (FloatCmpOp::EqU, [false, true, true, false]),
-    (FloatCmpOp::LeU, [true, true, true, false]),
-    (FloatCmpOp::GtU, [false, true, false, true]),
-    (FloatCmpOp::NeU, [true, true, false, true]),
-    (FloatCmpOp::GeU, [false, true, true, true]),
-    (FloatCmpOp::True, [true, true, true, true]),
+/// Each comparison's result on six pairs: (1, 2), (NaN, 1), (2, 2), (3, 2), (1, NaN) and
+/// (NaN, NaN), written out from the comparison's meaning (`.u` true when unordered, `.num` when
+/// both are numbers, `.nan` when either is not). The NaN only in `b` catches a `.num` or `.nan`
+/// that tests `a` twice.
+pub(super) const COMPARISONS: [(FloatCmpOp, [bool; 6]); 16] = [
+    (
+        FloatCmpOp::False,
+        [false, false, false, false, false, false],
+    ),
+    (FloatCmpOp::Lt, [true, false, false, false, false, false]),
+    (FloatCmpOp::Eq, [false, false, true, false, false, false]),
+    (FloatCmpOp::Le, [true, false, true, false, false, false]),
+    (FloatCmpOp::Gt, [false, false, false, true, false, false]),
+    (FloatCmpOp::Ne, [true, false, false, true, false, false]),
+    (FloatCmpOp::Ge, [false, false, true, true, false, false]),
+    (FloatCmpOp::Num, [true, false, true, true, false, false]),
+    (FloatCmpOp::Nan, [false, true, false, false, true, true]),
+    (FloatCmpOp::LtU, [true, true, false, false, true, true]),
+    (FloatCmpOp::EqU, [false, true, true, false, true, true]),
+    (FloatCmpOp::LeU, [true, true, true, false, true, true]),
+    (FloatCmpOp::GtU, [false, true, false, true, true, true]),
+    (FloatCmpOp::NeU, [true, true, false, true, true, true]),
+    (FloatCmpOp::GeU, [false, true, true, true, true, true]),
+    (FloatCmpOp::True, [true, true, true, true, true, true]),
+];
+
+/// [`COMPARISONS`]' six pairs as three runs of a packed-half comparison, `a`'s word and `b`'s,
+/// each run's low lane one pair and its high lane the next.
+const COMPARED_WORDS: [(u32, u32); 3] = [
+    (pack(H_ONE, H_QNAN), pack(H_TWO, H_ONE)),
+    (pack(H_TWO, H_THREE), pack(H_TWO, H_TWO)),
+    (pack(H_ONE, H_QNAN), pack(H_QNAN, H_QNAN)),
 ];
 
 /// `HSETP2` compares each lane, every comparison: the low lane's result to the first
-/// predicate, the high lane's to the second. The pairs (1, 2) and (NaN, 1) are the lanes of
-/// one comparison, (2, 2) and (3, 2) of another.
+/// predicate, the high lane's to the second. Each run of [`COMPARED_WORDS`] holds two of
+/// [`COMPARISONS`]' pairs as its lanes.
 #[test]
 fn hsetp2_compares_each_lane() {
     let ops: Vec<FloatCmpOp> = COMPARISONS.iter().map(|&(cmp, _)| cmp).collect();
     assert_eq!(ops, FloatCmpOp::ALL);
-    for (cmp, [first, second, third, fourth]) in COMPARISONS {
+    for (cmp, results) in COMPARISONS {
         let op = Op::HSetP2(hsetp2(p(1), p(2), cmp, h(3), h(4)));
-        for (a, b, low, high) in [
-            (pack(H_ONE, H_QNAN), pack(H_TWO, H_ONE), first, second),
-            (pack(H_TWO, H_THREE), pack(H_TWO, H_TWO), third, fourth),
-        ] {
+        for (run, (a, b)) in COMPARED_WORDS.into_iter().enumerate() {
+            let (low, high) = (results[2 * run], results[2 * run + 1]);
             let mut machine = Machine::new();
             machine.preds[1] = !low;
             machine.preds[2] = !high;
@@ -700,18 +780,22 @@ fn hsetp2_combines_and_writes() {
 }
 
 /// `HSET2` writes each lane's combined result as `1.0` (`.BF`) or an all-ones lane, and zero
-/// where false; the accumulator and `.FTZ` work as in `HSETP2`.
+/// where false, for every comparison on every pair of [`COMPARISONS`]; the accumulator and
+/// `.FTZ` work as in `HSETP2`.
 #[test]
 fn hset2_writes_each_lane() {
     for (bf, truth) in [(true, HSET2_TRUE_HALF), (false, HSET2_TRUE_MASK)] {
-        for (cmp, [first, second, ..]) in COMPARISONS {
+        for (cmp, results) in COMPARISONS {
             let op = Op::HSet2(OpHSet2 {
                 bf,
                 ..hset2(r(0), cmp, h(3), h(4))
             });
-            let machine = run_op(op, &[(3, pack(H_ONE, H_QNAN)), (4, pack(H_TWO, H_ONE))]);
-            let lane = |on: bool| if on { truth } else { 0 };
-            assert_eq!(machine.regs[0], pack(lane(first), lane(second)), "{op}");
+            for (run, (a, b)) in COMPARED_WORDS.into_iter().enumerate() {
+                let machine = run_op(op, &[(3, a), (4, b)]);
+                let lane = |on: bool| if on { truth } else { 0 };
+                let expected = pack(lane(results[2 * run]), lane(results[2 * run + 1]));
+                assert_eq!(machine.regs[0], expected, "{op} {run}");
+            }
         }
     }
     let op = Op::HSet2(OpHSet2 {
@@ -738,34 +822,145 @@ fn hset2_writes_each_lane() {
     );
 }
 
-/// Swizzle 1 (a 32-bit float) is refused in every packed-half source of every instruction, as
-/// the native translator's `HalfLanes` refuses it (module docs: the lowering widens to single
-/// precision in `HADD2`, `HMUL2`, `HFMA2` and `HSET2`).
+/// A 32-bit float's bits, for a source read with swizzle 1.
+fn f32_bits(value: f32) -> u32 {
+    value.to_bits()
+}
+
+/// Swizzle 1 reads the whole word as one 32-bit float in both lanes, and `HADD2`, `HMUL2`,
+/// `HFMA2` and `HSET2` are promoted as Eden's Maxwell translators promote them (the lowering's
+/// reading, ruling 7): the other sources' half lanes widened, the arithmetic, saturation and
+/// comparison in single precision, each lane narrowed back. The source's absolute value and
+/// negation are the 32-bit ones, in any operand position and from a register or a constant
+/// buffer. `1 + 2^-11`, a float no half holds, plus `2^-11` gives `1 + 2^-10` (`0x3c01`) only
+/// when added before narrowing; narrowing the source first would give `1.0`.
 #[test]
-fn swizzle_1_is_refused_everywhere() {
+fn swizzle_1_promotes_to_single_precision() {
+    let wide = |index: u8, abs: bool, neg: bool| hs(index, HalfSwizzle::F32, abs, neg);
+    let mut machine = Machine::new();
+    machine.regs[1] = f32_bits(1.5);
+    machine.regs[2] = pack(H_ONE, H_TWO);
+    machine.regs[3] = f32_bits(-2.0);
+    machine.regs[4] = 0x3f80_1000; // 1 + 2^-11
+    machine.regs[5] = pack(0x1000, 0x1000); // 2^-11 in both lanes
+    machine.cbufs.insert(2, cbuf_bytes(&[f32_bits(3.0)]));
+    let sat = |op: OpHFma2| OpHFma2 {
+        saturate: true,
+        ..op
+    };
+    let cases = [
+        // 1.5 + (1, 2) = (2.5, 3.5).
+        (
+            Op::HAdd2(hadd2(r(0), wide(1, false, false), h(2))),
+            pack(H_TWO_HALF, 0x4300),
+        ),
+        // (1, 2) - 1.5 = (-0.5, 0.5).
+        (
+            Op::HAdd2(hadd2(r(0), h(2), wide(1, false, true))),
+            pack(0xb800, H_HALF),
+        ),
+        (
+            Op::HAdd2(hadd2(r(0), wide(4, false, false), h(5))),
+            pack(0x3c01, 0x3c01),
+        ),
+        // (1, 2) * 3.0 from the constant buffer = (3, 6).
+        (
+            Op::HMul2(hmul2(
+                r(0),
+                h(2),
+                hcbuf(2, 0, HalfSwizzle::F32, false, false),
+            )),
+            pack(H_THREE, H_SIX),
+        ),
+        // |-2| * (1, 2) = (2, 4); -|-2| * (1, 2) = (-2, -4).
+        (
+            Op::HMul2(hmul2(r(0), wide(3, true, false), h(2))),
+            pack(H_TWO, H_FOUR),
+        ),
+        (
+            Op::HMul2(hmul2(r(0), wide(3, true, true), h(2))),
+            pack(H_NEG_TWO, H_NEG_FOUR),
+        ),
+        // (1, 2) * (1, 2) + 1.5 = (2.5, 5.5).
+        (
+            Op::HFma2(hfma2(r(0), h(2), h(2), wide(1, false, false))),
+            pack(H_TWO_HALF, 0x4580),
+        ),
+        // 1.5 * (1, 2) + 0 = (1.5, 3), saturated in single precision to (1, 1).
+        (
+            Op::HFma2(sat(hfma2(r(0), wide(1, false, false), h(2), h(255)))),
+            pack(H_ONE, H_ONE),
+        ),
+        // -2 * (1, 2) + 0 = (-2, -4), clamped by `.RELU` after the narrowing to (+0, +0).
+        (
+            Op::HFma2(OpHFma2 {
+                relu: Some(PredSrc::TRUE),
+                ..hfma2(r(0), wide(3, false, false), h(2), h(255))
+            }),
+            0,
+        ),
+        // 1.5 > (1, 2) = (true, false).
+        (
+            Op::HSet2(OpHSet2 {
+                bf: true,
+                ..hset2(r(0), FloatCmpOp::Gt, wide(1, false, false), h(2))
+            }),
+            pack(H_ONE, 0),
+        ),
+        (
+            Op::HSet2(OpHSet2 {
+                bf: true,
+                ..hset2(r(0), FloatCmpOp::Gt, h(2), wide(1, false, false))
+            }),
+            pack(0, H_ONE),
+        ),
+    ];
+    for (op, expected) in cases {
+        let mut run = machine.clone();
+        run_on(&[Instr::new(op)], &mut run);
+        assert_eq!(run.regs[0], expected, "{op}");
+    }
+    // The controls carry over to the 32-bit arithmetic, and the narrowing and widening take
+    // Eden's default controls.
+    for ftz in [false, true] {
+        let op = Op::HAdd2(OpHAdd2 {
+            ftz,
+            ..hadd2(r(0), wide(1, false, false), h(2))
+        });
+        let function = translated(&[Instr::new(op)]);
+        let expected = Flags::Fp(control(true, FpRounding::DontCare, flushing(ftz)));
+        assert_eq!(flags_of(&function, Opcode::FPAdd32), [expected, expected]);
+        assert_eq!(flags_of(&function, Opcode::FPAdd16), []);
+        let plain = Flags::Fp(FpControl::default());
+        assert_eq!(flags_of(&function, Opcode::ConvertF32F16), [plain, plain]);
+        assert_eq!(flags_of(&function, Opcode::ConvertF16F32), [plain, plain]);
+    }
+    let function = translated(&[Instr::new(Op::HSet2(hset2(
+        r(0),
+        FloatCmpOp::Gt,
+        wide(1, false, false),
+        h(2),
+    )))]);
+    assert_eq!(flags_of(&function, Opcode::FPOrdGreaterThan32).len(), 2);
+    assert_eq!(flags_of(&function, Opcode::FPOrdGreaterThan16), []);
+}
+
+/// Swizzle 1 is refused in `HMNMX2` and `HSETP2`, in either operand and from a constant buffer,
+/// where neither reference translates it (`HalfLanes`; the lowering's cases `0x240` and
+/// `0x434`).
+#[test]
+fn swizzle_1_is_refused_in_min_max_and_hsetp2() {
     use HalfDoubleUnsupported as U;
     let f = hs(1, HalfSwizzle::F32, false, false);
+    let f_cbuf = hcbuf(1, 0, HalfSwizzle::F32, false, false);
     let cases = [
-        (Op::HAdd2(hadd2(r(0), f, h(2))), 0),
-        (Op::HAdd2(hadd2(r(0), h(2), f)), 1),
-        (Op::HMul2(hmul2(r(0), f, h(2))), 0),
-        (Op::HMul2(hmul2(r(0), h(2), f)), 1),
-        (Op::HFma2(hfma2(r(0), f, h(2), h(3))), 0),
-        (Op::HFma2(hfma2(r(0), h(2), f, h(3))), 1),
-        (Op::HFma2(hfma2(r(0), h(2), h(3), f)), 2),
         (Op::HMnMx2(hmnmx2(r(0), f, h(2), PredSrc::TRUE)), 0),
         (Op::HMnMx2(hmnmx2(r(0), h(2), f, PredSrc::TRUE)), 1),
+        (Op::HMnMx2(hmnmx2(r(0), h(2), f_cbuf, PredSrc::TRUE)), 1),
         (Op::HSetP2(hsetp2(p(0), p(1), FloatCmpOp::Lt, f, h(2))), 0),
         (Op::HSetP2(hsetp2(p(0), p(1), FloatCmpOp::Lt, h(2), f)), 1),
-        (Op::HSet2(hset2(r(0), FloatCmpOp::Lt, f, h(2))), 0),
-        (Op::HSet2(hset2(r(0), FloatCmpOp::Lt, h(2), f)), 1),
         (
-            Op::HSet2(hset2(
-                r(0),
-                FloatCmpOp::Lt,
-                h(2),
-                hcbuf(1, 0, HalfSwizzle::F32, false, false),
-            )),
+            Op::HSetP2(hsetp2(p(0), p(1), FloatCmpOp::Lt, h(2), f_cbuf)),
             1,
         ),
     ];
@@ -774,24 +969,344 @@ fn swizzle_1_is_refused_everywhere() {
     }
 }
 
-/// `.FMZ` is refused in `HMUL2` and `HFMA2`, as the native translator refuses it (module docs,
-/// owner question).
+/// `.FMZ` without `.SAT` on packed halves (no source read as a float) is refused in `HMUL2`
+/// and `HFMA2`: Eden's Maxwell translators, which the lowering forwards to, compare a half lane
+/// with a single-precision zero there and throw (a listed divergence). With `.FTZ` as well it
+/// is refused the same way.
 #[test]
-fn fmz_is_refused() {
-    assert_refused(
-        Op::HMul2(OpHMul2 {
+fn fmz_on_halves_without_saturation_is_refused() {
+    for ftz in [false, true] {
+        assert_refused(
+            Op::HMul2(OpHMul2 {
+                dnz: true,
+                ftz,
+                ..hmul2(r(0), h(1), h(2))
+            }),
+            HalfDoubleUnsupported::HalfMultiplyZero,
+        );
+        assert_refused(
+            Op::HFma2(OpHFma2 {
+                dnz: true,
+                ftz,
+                ..hfma2(r(0), h(1), h(2), h(3))
+            }),
+            HalfDoubleUnsupported::HalfFmaMultiplyZero,
+        );
+    }
+}
+
+/// `.FMZ` is translated where the lowering's path translates it (ruling 7). With `.SAT` only
+/// the controls carry it (and win over `.FTZ`, the lowering's precision field), on halves or
+/// promoted. Without `.SAT` on a promoted instruction Eden's select runs in single precision:
+/// a lane whose `a` or `b` is zero becomes `+0.0` (`HMUL2`) or `c`'s lane (`HFMA2`; a `c` of
+/// `-0.0` shows the select, since an FMZ product of `+0` plus `-0.0` would give `+0.0`).
+#[test]
+fn fmz_with_saturation_or_a_float_source() {
+    let fmz = Flags::Fp(control(true, FpRounding::DontCare, FmzMode::Fmz));
+    let wide = hs(1, HalfSwizzle::F32, false, false);
+    for ftz in [false, true] {
+        // Halves with `.SAT`: inf * 0 is +0 under FMZ, 2 * 0.5 is 1.
+        let op = Op::HMul2(OpHMul2 {
             dnz: true,
+            saturate: true,
+            ftz,
             ..hmul2(r(0), h(1), h(2))
-        }),
-        HalfDoubleUnsupported::HalfMultiplyZero,
-    );
-    assert_refused(
-        Op::HFma2(OpHFma2 {
+        });
+        let function = translated(&[Instr::new(op)]);
+        assert_eq!(flags_of(&function, Opcode::FPMul16), [fmz, fmz]);
+        assert!(!opcodes(&function).contains(&Opcode::FPOrdEqual32));
+        let machine = run_op(op, &[(1, pack(H_INF, H_TWO)), (2, pack(0, H_HALF))]);
+        assert_eq!(machine.regs[0], pack(0, H_ONE), "{op}");
+        let op = Op::HFma2(OpHFma2 {
             dnz: true,
+            saturate: true,
+            ftz,
             ..hfma2(r(0), h(1), h(2), h(3))
-        }),
-        HalfDoubleUnsupported::HalfFmaMultiplyZero,
+        });
+        let function = translated(&[Instr::new(op)]);
+        assert_eq!(flags_of(&function, Opcode::FPFma16), [fmz, fmz]);
+        // Promoted with `.SAT`: the 32-bit arithmetic carries FMZ, and no select.
+        let op = Op::HMul2(OpHMul2 {
+            dnz: true,
+            saturate: true,
+            ftz,
+            ..hmul2(r(0), wide, h(2))
+        });
+        let function = translated(&[Instr::new(op)]);
+        assert_eq!(flags_of(&function, Opcode::FPMul32), [fmz, fmz]);
+        assert!(!opcodes(&function).contains(&Opcode::FPOrdEqual32));
+    }
+    // Promoted without `.SAT`: the select, two comparisons with zero per lane.
+    let op = Op::HMul2(OpHMul2 {
+        dnz: true,
+        ..hmul2(r(0), wide, h(2))
+    });
+    let function = translated(&[Instr::new(op)]);
+    assert_eq!(flags_of(&function, Opcode::FPMul32), [fmz, fmz]);
+    assert_eq!(
+        flags_of(&function, Opcode::FPOrdEqual32),
+        [Flags::Fp(FpControl::default()); 4]
     );
+    for (a, expected) in [
+        (f32_bits(f32::INFINITY), pack(0, H_INF)),
+        (f32_bits(f32::NAN), pack(0, H_CANONICAL_NAN)),
+    ] {
+        let machine = run_op(op, &[(1, a), (2, pack(0, H_ONE))]);
+        assert_eq!(machine.regs[0], expected, "{a:#x}");
+    }
+    let op = Op::HFma2(OpHFma2 {
+        dnz: true,
+        ..hfma2(r(0), wide, h(2), h(3))
+    });
+    let machine = run_op(
+        op,
+        &[
+            (1, f32_bits(f32::INFINITY)),
+            (2, pack(0, H_ONE)),
+            (3, pack(H_NZERO, H_ONE)),
+        ],
+    );
+    assert_eq!(machine.regs[0], pack(H_NZERO, H_INF));
+    // `b` zero in the high lane only, `a` zero: both lanes take `c`.
+    let machine = run_op(
+        op,
+        &[(1, 0), (2, pack(H_TWO, H_TWO)), (3, pack(H_THREE, H_NZERO))],
+    );
+    assert_eq!(machine.regs[0], pack(H_THREE, H_NZERO));
+}
+
+/// A promoted `HFMA2` takes the lowering's source checks (case `0x231`), the only reference that
+/// translates it: `.H0_NH1` needs a `b` with swizzle 0, no absolute value and a register below
+/// `R250` (`R250` and `RZ` refused); an absolute value is refused on `b` or `c`, and on an `a`
+/// in `R248` or above. One step inside each edge is taken
+/// ([`a_promoted_fma_one_step_inside_the_lowerings_edges`]); without a promoted source the same
+/// inputs are translated (the owner-question rows, tested on their own).
+#[test]
+fn a_promoted_fma_takes_the_lowerings_source_checks() {
+    use HalfDoubleUnsupported as U;
+    let wide = |index: u8, abs: bool| hs(index, HalfSwizzle::F32, abs, false);
+    let neg_high = |op: OpHFma2| {
+        Op::HFma2(OpHFma2 {
+            neg_high_b: true,
+            ..op
+        })
+    };
+    let refused = [
+        (
+            neg_high(hfma2(
+                r(0),
+                wide(1, false),
+                hs(2, HalfSwizzle::H0H0, false, false),
+                h(3),
+            )),
+            U::HalfFmaMixedSign,
+        ),
+        (
+            neg_high(hfma2(
+                r(0),
+                wide(1, false),
+                hs(2, HalfSwizzle::H1H1, false, false),
+                h(3),
+            )),
+            U::HalfFmaMixedSign,
+        ),
+        (
+            neg_high(hfma2(r(0), h(1), wide(2, false), h(3))),
+            U::HalfFmaMixedSign,
+        ),
+        (
+            neg_high(hfma2(
+                r(0),
+                wide(1, false),
+                hs(2, HalfSwizzle::H1H0, true, false),
+                h(3),
+            )),
+            U::HalfFmaMixedSign,
+        ),
+        (
+            neg_high(hfma2(
+                r(0),
+                wide(1, false),
+                h(FMA_MIXED_SIGN_FIRST_SCRATCH),
+                h(3),
+            )),
+            U::HalfFmaMixedSign,
+        ),
+        (
+            neg_high(hfma2(r(0), wide(1, false), h(255), h(3))),
+            U::HalfFmaMixedSign,
+        ),
+        (
+            Op::HFma2(hfma2(
+                r(0),
+                wide(1, false),
+                hs(2, HalfSwizzle::H1H0, true, false),
+                h(3),
+            )),
+            U::HalfFmaAbsolute,
+        ),
+        (
+            Op::HFma2(hfma2(
+                r(0),
+                wide(1, false),
+                h(2),
+                hs(3, HalfSwizzle::H1H0, true, false),
+            )),
+            U::HalfFmaAbsolute,
+        ),
+        (
+            Op::HFma2(hfma2(
+                r(0),
+                wide(FMA_ABSOLUTE_FIRST_SCRATCH, true),
+                h(2),
+                h(3),
+            )),
+            U::HalfFmaAbsolute,
+        ),
+        (
+            Op::HFma2(hfma2(r(0), wide(255, true), h(2), h(3))),
+            U::HalfFmaAbsolute,
+        ),
+    ];
+    for (op, what) in refused {
+        assert_refused(op, what);
+    }
+}
+
+/// A promoted `HFMA2` one step inside each of the lowering's edges is translated: `.H0_NH1`
+/// with `b` in `R249`, and `|a|` in `R247`.
+#[test]
+fn a_promoted_fma_one_step_inside_the_lowerings_edges() {
+    let wide = |index: u8, abs: bool| hs(index, HalfSwizzle::F32, abs, false);
+    let neg_high = |op: OpHFma2| {
+        Op::HFma2(OpHFma2 {
+            neg_high_b: true,
+            ..op
+        })
+    };
+    let below_b = FMA_MIXED_SIGN_FIRST_SCRATCH - 1;
+    let below_a = FMA_ABSOLUTE_FIRST_SCRATCH - 1;
+    // 1.5 * (1, -2) + (1, 1) = (2.5, -2); 1.5 * (1, 2) + (1, 1) = (2.5, 4).
+    let mut machine = Machine::new();
+    machine.regs[1] = f32_bits(1.5);
+    machine.regs[usize::from(below_a)] = f32_bits(-1.5);
+    machine.regs[usize::from(below_b)] = pack(H_ONE, H_TWO);
+    machine.regs[3] = pack(H_ONE, H_ONE);
+    for (op, expected) in [
+        (
+            neg_high(hfma2(r(0), wide(1, false), h(below_b), h(3))),
+            pack(H_TWO_HALF, H_NEG_TWO),
+        ),
+        (
+            Op::HFma2(hfma2(r(0), wide(below_a, true), h(below_b), h(3))),
+            pack(H_TWO_HALF, H_FOUR),
+        ),
+    ] {
+        let mut run = machine.clone();
+        run_on(&[Instr::new(op)], &mut run);
+        assert_eq!(run.regs[0], expected, "{op}");
+    }
+}
+
+/// Owner-question row: `HFMA2.H0_NH1` on packed halves with a `b` the lowering refuses
+/// ("native half mixed-sign source mode": a swizzle other than `H1_H0`, an absolute value, a
+/// `b` in `R250` or above, or a constant buffer) is translated as the native translator does,
+/// `b`'s high lane negated after its modifiers. `(1, 2) * (2, -2) + (1, -1) = (3, -5)` in each.
+#[test]
+fn fma_mixed_sign_sources_the_lowering_refuses() {
+    let mut machine = Machine::new();
+    machine.regs[1] = pack(H_ONE, H_TWO);
+    machine.regs[2] = pack(H_TWO, H_FOUR);
+    machine.regs[3] = pack(H_ONE, H_NEG_ONE);
+    machine.regs[4] = pack(H_NEG_TWO, H_NEG_TWO);
+    machine.regs[usize::from(FMA_MIXED_SIGN_FIRST_SCRATCH)] = pack(H_TWO, H_TWO);
+    machine.cbufs.insert(7, cbuf_bytes(&[pack(H_TWO, H_TWO)]));
+    let neg_high = |b: HalfSrc| {
+        Op::HFma2(OpHFma2 {
+            neg_high_b: true,
+            ..hfma2(r(0), h(1), b, h(3))
+        })
+    };
+    for b in [
+        hs(2, HalfSwizzle::H0H0, false, false),
+        hs(4, HalfSwizzle::H1H0, true, false),
+        h(FMA_MIXED_SIGN_FIRST_SCRATCH),
+        hcbuf(7, 0, HalfSwizzle::H1H0, false, false),
+    ] {
+        let op = neg_high(b);
+        let mut run = machine.clone();
+        run_on(&[Instr::new(op)], &mut run);
+        assert_eq!(run.regs[0], pack(H_THREE, 0xc500), "{op}");
+    }
+}
+
+/// Owner-question row: `HFMA2` on packed halves with an absolute value the lowering refuses
+/// ("native half fused multiply-add absolute source": on `b`, on `c`, or on an `a` in `R248` or
+/// above, `RZ` included) is translated as the native translator does.
+#[test]
+fn fma_absolute_sources_the_lowering_refuses() {
+    let first = FMA_ABSOLUTE_FIRST_SCRATCH;
+    let mut machine = Machine::new();
+    machine.regs[1] = pack(H_ONE, H_TWO);
+    machine.regs[2] = pack(H_TWO, H_TWO);
+    machine.regs[3] = pack(H_ONE, H_NEG_ONE);
+    machine.regs[4] = pack(H_NEG_TWO, H_NEG_TWO);
+    machine.regs[usize::from(first)] = pack(H_NEG_ONE, H_NEG_TWO);
+    let abs = |index: u8| hs(index, HalfSwizzle::H1H0, true, false);
+    for (op, expected) in [
+        // (1, 2) * |(-2, -2)| + (1, -1) = (3, 3).
+        (hfma2(r(0), h(1), abs(4), h(3)), pack(H_THREE, H_THREE)),
+        // (1, 2) * (2, 2) + |(1, -1)| = (3, 5).
+        (hfma2(r(0), h(1), h(2), abs(3)), pack(H_THREE, H_FIVE)),
+        // |(-1, -2)| * (2, 2) + (1, -1) = (3, 3).
+        (hfma2(r(0), abs(first), h(2), h(3)), pack(H_THREE, H_THREE)),
+        // |RZ| * (2, 2) + (1, -1) = (1, -1).
+        (hfma2(r(0), abs(255), h(2), h(3)), pack(H_ONE, H_NEG_ONE)),
+    ] {
+        let op = Op::HFma2(op);
+        let mut run = machine.clone();
+        run_on(&[Instr::new(op)], &mut run);
+        assert_eq!(run.regs[0], expected, "{op}");
+    }
+}
+
+/// Owner-question row: `HSETP2` outside the lowering's one case (`0x434`: form 2, an immediate
+/// `b`, `a`'s swizzle 0 or 2) is translated as the native translator does: a register `b` (form
+/// 1), a constant-buffer `b`, and `a`'s swizzle `H1_H1`. `(3, 3) < (2, 4)` is `(false, true)`.
+#[test]
+fn hsetp2_forms_the_lowering_refuses() {
+    let mut machine = Machine::new();
+    machine.regs[3] = pack(H_ONE, H_THREE);
+    machine.regs[4] = pack(H_TWO, H_FOUR);
+    machine.cbufs.insert(5, cbuf_bytes(&[pack(H_TWO, H_FOUR)]));
+    let a = hs(3, HalfSwizzle::H1H1, false, false);
+    for b in [h(4), hcbuf(5, 0, HalfSwizzle::H1H0, false, false)] {
+        let op = Op::HSetP2(hsetp2(p(1), p(2), FloatCmpOp::Lt, a, b));
+        let mut run = machine.clone();
+        run.preds[1] = true;
+        run.preds[2] = false;
+        run_on(&[Instr::new(op)], &mut run);
+        assert_eq!((run.preds[1], run.preds[2]), (false, true), "{op}");
+    }
+}
+
+/// Owner-question row: `HMNMX2` with a `b` the lowering refuses (a constant buffer, opcode
+/// `0xa40`, which has no case; a register from `R250` to `R254`, case `0x240`'s "native half min/max
+/// source mode") is translated as the native translator does. The minimum of `(1, 4)` and
+/// `(2, 3)` is `(1, 3)`.
+#[test]
+fn hmnmx2_sources_the_lowering_refuses() {
+    let mut machine = Machine::new();
+    machine.regs[1] = pack(H_ONE, H_FOUR);
+    machine.regs[250] = pack(H_TWO, H_THREE);
+    machine.regs[254] = pack(H_TWO, H_THREE);
+    machine.cbufs.insert(3, cbuf_bytes(&[pack(H_TWO, H_THREE)]));
+    for b in [h(250), h(254), hcbuf(3, 0, HalfSwizzle::H1H0, false, false)] {
+        let op = Op::HMnMx2(hmnmx2(r(0), h(1), b, PredSrc::TRUE));
+        let mut run = machine.clone();
+        run_on(&[Instr::new(op)], &mut run);
+        assert_eq!(run.regs[0], pack(H_ONE, H_THREE), "{op}");
+    }
 }
 
 /// The IR of one `HADD2`, as the PR's translator builds it: each source unpacked, its lanes
@@ -820,8 +1335,8 @@ fn golden_hadd2() {
     );
 }
 
-/// The IR of `HFMA2.RELU`'s clamp of one lane, as the PR's translator builds it: widened, a
-/// negative value replaced by zero, a NaN by `RELU_NAN`, narrowed back. The NaN replacement
+/// The IR of `HFMA2.RELU`'s clamp of one lane: widened, a value at or below zero (`-0.0`
+/// included, the lowering's sign test) replaced by zero, a NaN by `RELU_NAN`, narrowed back. The NaN replacement
 /// changes no value the interpreter gives (module docs), so this pins it.
 #[test]
 fn golden_relu_clamp() {
@@ -832,7 +1347,7 @@ fn golden_relu_clamp() {
     let text = translated(&[Instr::new(op)]).to_string();
     let clamp = "\
          \x20   %14: f32 = ConvertF32F16 %12\n\
-         \x20   %15: u1 = FPOrdLessThan32 %14, f32 0x0\n\
+         \x20   %15: u1 = FPOrdLessThanEqual32 %14, f32 0x0\n\
          \x20   %16: f32 = SelectF32 %15, f32 0x0, %14\n\
          \x20   %17: u1 = FPIsNan32 %14\n\
          \x20   %18: f32 = SelectF32 %17, f32 0x7fc00000, %16\n\

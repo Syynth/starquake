@@ -362,6 +362,9 @@ fn constants_match_the_reference() {
     assert_eq!(DOUBLE_IMM_SHIFT, 32);
     // `visitor.cpp`, `Visitor::Cbuf`: `cbuf_index >= 32`.
     assert_eq!(CBUF_BANKS, 32);
+    // `lower_to_maxwell.h` case `0x231`: `b.reg >= 250` and `a.absolute && a.reg >= 248`.
+    assert_eq!(FMA_MIXED_SIGN_FIRST_SCRATCH, 250);
+    assert_eq!(FMA_ABSOLUTE_FIRST_SCRATCH, 248);
 }
 
 /// Every operation of the group is in it, and no operation of another group (the float
@@ -615,8 +618,16 @@ fn refusals_read_in_plain_words() {
             "an hadd2.f32 operand of swizzle 0",
         ),
         (
-            HalfDoubleUnsupported::HalfFmaReluPredicate(pred(2, true)),
-            "an hfma2.relu under predicate !p2",
+            HalfDoubleUnsupported::HalfFmaMixedSign,
+            "an hfma2.h0_nh1 with a 32-bit float operand and its b not a plain register",
+        ),
+        (
+            HalfDoubleUnsupported::HalfFmaAbsolute,
+            "an hfma2 with a 32-bit float operand and an absolute value the lowering refuses",
+        ),
+        (
+            HalfDoubleUnsupported::HalfFmaMultiplyZero,
+            "hfma2's multiply-by-zero mode on halves without saturation",
         ),
         (
             HalfDoubleUnsupported::DoubleRegister(r(3)),
@@ -647,8 +658,8 @@ fn refusals_read_in_plain_words() {
             .map(|_| ())
             .map_err(|e| e.to_string()),
         Err(
-            "instruction 0 (hmul2.fmz r0, r1, r2;): hmul2's multiply-by-zero mode is not \
-             supported"
+            "instruction 0 (hmul2.fmz r0, r1, r2;): hmul2's multiply-by-zero mode on halves \
+             without saturation is not supported"
                 .to_owned()
         )
     );
@@ -664,7 +675,8 @@ pub(super) fn refusal_cases() -> Vec<(Op, HalfDoubleUnsupported)> {
     cases
 }
 
-/// The refusals of a source: its form, a bindless constant buffer, swizzle 1.
+/// The refusals of a source: its form, a bindless constant buffer, swizzle 1 where neither
+/// reference translates it (`HMNMX2`, `HSETP2`).
 fn source_refusal_cases() -> Vec<(Op, HalfDoubleUnsupported)> {
     use HalfDoubleUnsupported as U;
     let uniform = HalfSrc::new(ureg_src(4));
@@ -739,25 +751,22 @@ fn source_refusal_cases() -> Vec<(Op, HalfDoubleUnsupported)> {
             Op::DSetP(dsetp(p(0), Pred::PT, FloatCmpOp::Lt, even, bindless_src())),
             U::BindlessConstantBuffer,
         ),
-        // Swizzle 1, in every packed-half instruction and every operand position.
-        (Op::HAdd2(hadd2(r(0), f32_swizzle, h(2))), U::HalfAsFloat(0)),
-        (Op::HAdd2(hadd2(r(0), h(1), f32_swizzle)), U::HalfAsFloat(1)),
-        (Op::HMul2(hmul2(r(0), h(1), f32_swizzle)), U::HalfAsFloat(1)),
-        (
-            Op::HFma2(hfma2(r(0), h(1), h(2), f32_swizzle)),
-            U::HalfAsFloat(2),
-        ),
+        // Swizzle 1, in `HMNMX2` and `HSETP2`, both operand positions.
         (
             Op::HMnMx2(hmnmx2(r(0), f32_swizzle, h(2), PredSrc::TRUE)),
             U::HalfAsFloat(0),
         ),
         (
-            Op::HSetP2(hsetp2(p(0), p(1), FloatCmpOp::Lt, h(1), f32_swizzle)),
+            Op::HMnMx2(hmnmx2(r(0), h(2), f32_swizzle, PredSrc::TRUE)),
             U::HalfAsFloat(1),
         ),
         (
-            Op::HSet2(hset2(r(0), FloatCmpOp::Lt, f32_swizzle, h(2))),
+            Op::HSetP2(hsetp2(p(0), p(1), FloatCmpOp::Lt, f32_swizzle, h(1))),
             U::HalfAsFloat(0),
+        ),
+        (
+            Op::HSetP2(hsetp2(p(0), p(1), FloatCmpOp::Lt, h(1), f32_swizzle)),
+            U::HalfAsFloat(1),
         ),
     ]
 }
@@ -826,9 +835,14 @@ fn mode_refusal_cases() -> Vec<(Op, HalfDoubleUnsupported)> {
     ]
 }
 
-/// The refusals of `HFMA2`'s modes.
+/// The refusals of `HFMA2`'s modes, and of a promoted `HFMA2`'s sources.
 fn fma_refusal_cases() -> Vec<(Op, HalfDoubleUnsupported)> {
     use HalfDoubleUnsupported as U;
+    let f32_at = |index: u8| hs(index, HalfSwizzle::F32, false, false);
+    let neg_high = |op: OpHFma2| OpHFma2 {
+        neg_high_b: true,
+        ..op
+    };
     vec![
         (
             Op::HFma2(OpHFma2 {
@@ -846,20 +860,6 @@ fn fma_refusal_cases() -> Vec<(Op, HalfDoubleUnsupported)> {
         ),
         (
             Op::HFma2(OpHFma2 {
-                relu: Some(pred(0, false)),
-                ..hfma2(r(0), h(1), h(2), h(3))
-            }),
-            U::HalfFmaReluPredicate(pred(0, false)),
-        ),
-        (
-            Op::HFma2(OpHFma2 {
-                relu: Some(NOT_PT),
-                ..hfma2(r(0), h(1), h(2), h(3))
-            }),
-            U::HalfFmaReluPredicate(NOT_PT),
-        ),
-        (
-            Op::HFma2(OpHFma2 {
                 relu: Some(PredSrc::TRUE),
                 saturate: true,
                 ..hfma2(r(0), h(1), h(2), h(3))
@@ -872,6 +872,24 @@ fn fma_refusal_cases() -> Vec<(Op, HalfDoubleUnsupported)> {
                 ..hfma2(r(0), h(1), h(2), h(3))
             }),
             U::HalfFmaBf16,
+        ),
+        (
+            Op::HFma2(neg_high(hfma2(
+                r(0),
+                f32_at(1),
+                hs(2, HalfSwizzle::H0H0, false, false),
+                h(3),
+            ))),
+            U::HalfFmaMixedSign,
+        ),
+        (
+            Op::HFma2(hfma2(
+                r(0),
+                h(1),
+                hs(2, HalfSwizzle::H1H0, true, false),
+                f32_at(3),
+            )),
+            U::HalfFmaAbsolute,
         ),
     ]
 }
@@ -1011,9 +1029,10 @@ fn every_reachable_refusal_has_a_case() {
         U::HalfMultiplyZero,
         U::HalfFmaMultiplyZero,
         U::HalfFmaFloatMode,
-        U::HalfFmaReluPredicate(NOT_PT),
         U::HalfFmaReluSaturate,
         U::HalfFmaBf16,
+        U::HalfFmaMixedSign,
+        U::HalfFmaAbsolute,
         U::HalfMinMaxMode,
         U::DoubleRegister(r(1)),
         U::DoubleUniformRegister(ur(1)),
@@ -1038,9 +1057,10 @@ fn every_reachable_refusal_has_a_case() {
             | U::HalfMultiplyZero
             | U::HalfFmaMultiplyZero
             | U::HalfFmaFloatMode
-            | U::HalfFmaReluPredicate(_)
             | U::HalfFmaReluSaturate
             | U::HalfFmaBf16
+            | U::HalfFmaMixedSign
+            | U::HalfFmaAbsolute
             | U::HalfMinMaxMode
             | U::DoubleRegister(_)
             | U::DoubleUniformRegister(_)
@@ -1083,8 +1103,8 @@ fn a_bank_past_the_last_is_refused() {
 }
 
 /// With two faults at once in `HADD2` and `HMUL2`, the one the PR checks first is reported:
-/// the instruction's form before its modes, a source's constant buffer before the modes and
-/// the swizzles, each mode check before the next, the modes before the swizzles.
+/// the instruction's form before its modes, a source's constant buffer before the modes, each
+/// mode check before the next.
 #[test]
 fn add_and_multiply_refusals_report_in_the_prs_order() {
     use HalfDoubleUnsupported as U;
@@ -1148,9 +1168,9 @@ fn add_and_multiply_refusals_report_in_the_prs_order() {
         (
             Op::HMul2(OpHMul2 {
                 dnz: true,
-                ..hmul2(r(0), f32_at(1), h(2))
+                ..hmul2(r(0), h(1), bindless)
             }),
-            U::HalfMultiplyZero,
+            U::BindlessConstantBuffer,
         ),
     ];
     for (op, what) in cases {
@@ -1159,8 +1179,8 @@ fn add_and_multiply_refusals_report_in_the_prs_order() {
 }
 
 /// With two faults at once in `HFMA2`, the one the PR checks first is reported: the form or
-/// the constant buffer, then `.FMZ`, `.F32`, `.RELU`'s predicate, `.RELU` with `.SAT`,
-/// `.BF16_V2`, and the swizzles in operand order.
+/// the constant buffer, then `.FMZ`, `.F32`, `.RELU` with `.SAT`, `.BF16_V2`, and on a
+/// promoted instruction the lowering's `.H0_NH1` check before its absolute-value check.
 #[test]
 fn fma_refusals_report_in_the_prs_order() {
     use HalfDoubleUnsupported as U;
@@ -1202,14 +1222,6 @@ fn fma_refusals_report_in_the_prs_order() {
             Op::HFma2(OpHFma2 {
                 relu: Some(pred(1, false)),
                 saturate: true,
-                ..hfma2(r(0), h(1), h(2), h(3))
-            }),
-            U::HalfFmaReluPredicate(pred(1, false)),
-        ),
-        (
-            Op::HFma2(OpHFma2 {
-                relu: Some(PredSrc::TRUE),
-                saturate: true,
                 bf16: true,
                 ..hfma2(r(0), h(1), h(2), h(3))
             }),
@@ -1218,17 +1230,28 @@ fn fma_refusals_report_in_the_prs_order() {
         (
             Op::HFma2(OpHFma2 {
                 bf16: true,
-                ..hfma2(r(0), f32_at(1), h(2), h(3))
+                neg_high_b: true,
+                ..hfma2(
+                    r(0),
+                    f32_at(1),
+                    hs(2, HalfSwizzle::H1H1, false, false),
+                    h(3),
+                )
             }),
             U::HalfFmaBf16,
         ),
+        // `.H0_NH1` with `b`'s swizzle `H1_H1`, and an absolute value on `c`.
         (
-            Op::HFma2(hfma2(r(0), f32_at(1), h(2), f32_at(3))),
-            U::HalfAsFloat(0),
-        ),
-        (
-            Op::HFma2(hfma2(r(0), h(1), f32_at(2), f32_at(3))),
-            U::HalfAsFloat(1),
+            Op::HFma2(OpHFma2 {
+                neg_high_b: true,
+                ..hfma2(
+                    r(0),
+                    f32_at(1),
+                    hs(2, HalfSwizzle::H1H1, false, false),
+                    hs(3, HalfSwizzle::H1H0, true, false),
+                )
+            }),
+            U::HalfFmaMixedSign,
         ),
     ];
     for (op, what) in cases {
@@ -1275,7 +1298,7 @@ fn compare_refusals_report_in_the_prs_order() {
             U::BindlessConstantBuffer,
         ),
         (
-            Op::HSet2(hset2(r(0), FloatCmpOp::Lt, f32_at(1), f32_at(2))),
+            Op::HMnMx2(hmnmx2(r(0), f32_at(1), f32_at(2), PredSrc::TRUE)),
             U::HalfAsFloat(0),
         ),
         (

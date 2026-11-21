@@ -30,8 +30,8 @@ fn dreg(index: u8, abs: bool, neg: bool) -> AluSrc {
 }
 
 /// A machine with 1.5 in `R2`, 2.25 in `R4`, -1.5 in `R6`, 2.0 in `UR4`, and in constant
-/// buffer 1 4.0 at byte 4 and 0.25 at byte 16 (each double's high word four bytes after its low
-/// word, with other words between).
+/// buffer 1 4.0 at byte 8 and 0.25 at byte 16 (each double at a multiple of 8, as NAK emits
+/// them, its high word four bytes after its low word, with other words before).
 fn machine() -> Machine {
     let mut machine = Machine::new();
     set_double(&mut machine, 2, 1.5);
@@ -44,9 +44,9 @@ fn machine() -> Machine {
     let [quarter_low, quarter_high] = words(0.25);
     let bytes: Vec<u8> = [
         0xdead_beef,
+        0x1234_5678,
         four_low,
         four_high,
-        0x1234_5678,
         quarter_low,
         quarter_high,
     ]
@@ -58,8 +58,8 @@ fn machine() -> Machine {
 }
 
 /// Every double source kind: register pairs (low word first), `RZ` as a zero, a uniform pair,
-/// `URZ` as a zero, a constant-buffer double at a word-aligned offset (its high word four bytes
-/// on), and an immediate as the high word over a zero low word; each with its absolute value
+/// `URZ` as a zero, a constant-buffer double at an offset that is a multiple of 8 (its high
+/// word four bytes on), and an immediate as the high word over a zero low word; each with its absolute value
 /// and negation, the absolute value first.
 #[test]
 fn dadd_reads_every_source_kind() {
@@ -70,7 +70,7 @@ fn dadd_reads_every_source_kind() {
         (dadd(r(0), dreg(255, false, true), even(4)), 2.25),
         (dadd(r(0), even(2), ureg_src(4)), 3.5),
         (dadd(r(0), even(2), ureg_src(63)), 1.5),
-        (dadd(r(0), even(2), cbuf_src(1, 4)), 5.5),
+        (dadd(r(0), even(2), cbuf_src(1, 8)), 5.5),
         (dadd(r(0), even(2), cbuf_src(1, 16)), 1.75),
         // 0x40000000 is 2.0's high word; 0x3ff80000 is 1.5's.
         (dadd(r(0), even(2), AluSrc::Imm(0x4000_0000)), 3.5),
@@ -145,6 +145,44 @@ fn double_pairs_at_each_edge() {
     assert_eq!(run.regs[254], words(1.5)[0]);
 }
 
+/// A constant-buffer double at an offset that is 4 mod 8, which NAK never emits
+/// (`prop_to_64_src` keeps a pair only at `lo_cb.offset % 8 == 0`), reads the word at the offset
+/// and the word four bytes on, NAK's layout carried over: a guess, listed as a divergence from
+/// Eden's `GetDoubleCbuf` (`impl.cpp`), which reads the high word at `(offset & ~7) | 4`, here
+/// the offset itself, so its low and high words would be one word. Confirmed by an `nvdisasm`
+/// check of such an encoding or a hardware trace. At `0xfffc` the high word's read is at byte
+/// `0x10000`, past what a 16-bit offset names.
+#[test]
+fn a_double_constant_off_eight_byte_alignment_is_a_guess() {
+    let [low, high] = words(1.5);
+    let bytes: Vec<u8> = [
+        0xdead_beef,
+        0x1234_5678,
+        0x0bad_f00d,
+        low,
+        high,
+        0x5555_aaaa,
+    ]
+    .iter()
+    .flat_map(|word| word.to_le_bytes())
+    .collect();
+    let mut machine = Machine::new();
+    machine.cbufs.insert(1, bytes);
+    let op = Op::DAdd(dadd(r(0), AluSrc::reg(Gpr::RZ), cbuf_src(1, 12)));
+    run_on(&[Instr::new(op)], &mut machine);
+    assert_eq!(get_double(&machine, 0), f64::to_bits(1.5));
+    // Eden's reading at 12 would pack the word at 12 twice: neither 1.5 nor this machine's result.
+    assert_ne!(u64::from(low) << 32 | u64::from(low), f64::to_bits(1.5));
+    let text = translated(&[Instr::new(Op::DAdd(dadd(
+        r(0),
+        AluSrc::reg(Gpr::RZ),
+        cbuf_src(1, 0xfffc),
+    )))])
+    .to_string();
+    assert!(text.contains("GetCbufU32 u32 0x1, u32 0xfffc\n"), "{text}");
+    assert!(text.contains("GetCbufU32 u32 0x1, u32 0x10000\n"), "{text}");
+}
+
 /// `DMUL` and `DFMA` compute in 64 bits, in every form: `b` a register, an immediate (form
 /// 4), a constant buffer (form 5) or a uniform pair (form 6); `DFMA`'s `c` likewise in forms
 /// 2, 3 and 7; with modifiers on every source.
@@ -154,7 +192,7 @@ fn dmul_and_dfma_compute_in_64_bits() {
     let cases = [
         (Op::DMul(dmul(r(0), even(2), even(4))), 3.375),
         (Op::DMul(dmul(r(0), even(2), AluSrc::Imm(0x4000_0000))), 3.0),
-        (Op::DMul(dmul(r(0), even(2), cbuf_src(1, 4))), 6.0),
+        (Op::DMul(dmul(r(0), even(2), cbuf_src(1, 8))), 6.0),
         (Op::DMul(dmul(r(0), even(2), ureg_src(4))), 3.0),
         (
             Op::DMul(dmul(r(0), dreg(6, true, false), dreg(4, false, true))),
@@ -174,7 +212,7 @@ fn dmul_and_dfma_compute_in_64_bits() {
             Op::DFma(dfma(r(0), even(2), even(4), cbuf_src(1, 16))),
             3.625,
         ),
-        (Op::DFma(dfma(r(0), even(2), cbuf_src(1, 4), even(6))), 4.5),
+        (Op::DFma(dfma(r(0), even(2), cbuf_src(1, 8), even(6))), 4.5),
         (Op::DFma(dfma(r(0), even(2), ureg_src(4), even(6))), 1.5),
         (Op::DFma(dfma(r(0), even(2), even(4), ureg_src(4))), 5.375),
         // 1.5 * -2.25 + |-1.5| = -1.875.
@@ -242,7 +280,14 @@ fn double_arithmetic_carries_its_rounding() {
 /// accumulator to the first predicate and its negation combined likewise to the second.
 #[test]
 fn dsetp_compares_and_writes_both_predicates() {
-    let pairs = [(1.0, 2.0), (f64::NAN, 1.0), (2.0, 2.0), (3.0, 2.0)];
+    let pairs = [
+        (1.0, 2.0),
+        (f64::NAN, 1.0),
+        (2.0, 2.0),
+        (3.0, 2.0),
+        (1.0, f64::NAN),
+        (f64::NAN, f64::NAN),
+    ];
     for (cmp, results) in COMPARISONS {
         let op = Op::DSetP(dsetp(p(1), p(2), cmp, AluSrc::reg(r(2)), AluSrc::reg(r(4))));
         for ((a, b), expected) in pairs.into_iter().zip(results) {
