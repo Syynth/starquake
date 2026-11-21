@@ -1944,10 +1944,7 @@ fn a_parked_request_its_handler_then_defers_keeps_its_sender_waiting_until_the_r
     let (_, b, _, parked) =
         park_a_request_behind_a_delivery(&world, Box::new(|_, _, _| Ok(Handled::Deferred)));
     // Run and deferred: B still waits, in the one wait it began when parked.
-    assert_eq!(
-        reply_state(&world, b, parked),
-        (ThreadState::Waiting, true)
-    );
+    assert_eq!(reply_state(&world, b, parked), (ThreadState::Waiting, true));
     // The delivery woke A alone.
     assert_eq!(
         world.dispatcher.take_woken(),
