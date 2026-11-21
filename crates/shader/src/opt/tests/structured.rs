@@ -4,7 +4,7 @@
 
 use super::{check_phi_scope, error, parse, ran, value};
 use crate::interp::Machine;
-use crate::ir::Function;
+use crate::ir::{Function, VerifyError};
 use crate::opt::{Pass, PassError, optimize, run};
 use crate::structure::{MAX_STRUCTURE_WORK, structure};
 
@@ -515,52 +515,58 @@ block3:
     ))
 }
 
-/// The test-side scope checker the equivalence proptests and the flow tests run
-/// ([`check_phi_scope`]): it accepts a value in scope at the end of the block named, and an
-/// immediate, and refuses a value not yet computed there, one whose `if` body has ended, and a
-/// block the tree does not place, each with its own message. The verifier accepts the first
-/// two refused cases (it only checks that the value is listed somewhere); it refuses the third
-/// itself, so on verified functions that branch of the checker cannot fire.
+/// The scope checker the equivalence proptests, the rewrites here and the flow tests run
+/// ([`check_phi_scope`]) is the verifier: it accepts a value in scope at the end of block2 (the
+/// one block that can run last before block3) and an immediate, and refuses a value whose `if`
+/// body has ended there, a block that cannot run last before block3 (block1, inside the `if`,
+/// and block0, where %1 is not computed yet either), and a block the tree does not place, each
+/// with the verifier's own error. The verifier's own tests are `ir::verify::phis::tests`.
 #[test]
 fn the_scope_checker_refuses_a_phi_value_out_of_scope() {
-    for incoming in [
-        "[block1: %1]",
-        "[block2: %2]",
-        "[block2: u32 9]",
-        "[block0: %0]",
-    ] {
+    for incoming in ["[block2: %2]", "[block2: u32 9]"] {
         assert_eq!(
             check_phi_scope(&phi_taking(incoming, "")),
             Ok(()),
             "{incoming}"
         );
     }
-    let message = |text: &str, function: &Function| format!("{text}\n{function}");
-    for (incoming, from) in [("[block0: %1]", 0), ("[block2: %1]", 2)] {
-        let function = phi_taking(incoming, "");
-        function.verify().expect("the verifier accepts it");
+    let function = phi_taking("[block2: %1]", "");
+    let block = |index: usize| {
+        function
+            .blocks()
+            .nth(index)
+            .map(|(id, _)| id)
+            .expect("a block")
+    };
+    assert_eq!(
+        check_phi_scope(&function),
+        Err(VerifyError::PhiOutOfScope {
+            at: value(3),
+            operand: value(1),
+            block: block(2),
+        })
+    );
+    for (incoming, from) in [("[block1: %1]", 1), ("[block0: %1]", 0)] {
         assert_eq!(
-            check_phi_scope(&function),
-            Err(message(
-                &format!("%3 takes %1 from block{from}, where it is not in scope"),
-                &function
-            )),
+            check_phi_scope(&phi_taking(incoming, "")),
+            Err(VerifyError::PhiNotPredecessor {
+                at: value(3),
+                block: block(from),
+            }),
             "{incoming}"
         );
     }
     let function = phi_taking("[block4: %1]", "block4:\n");
+    let block4 = function.blocks().nth(4).map(|(id, _)| id).expect("block4");
     assert_eq!(
         check_phi_scope(&function),
-        Err(message(
-            "a phi takes a value from block4, which the tree does not place",
-            &function
-        ))
+        Err(VerifyError::NotPlaced(block4))
     );
-    // A control-flow graph has nothing to check.
+    // A control-flow graph's phi takes a value that dominates the end of its predecessor.
     assert_eq!(
         check_phi_scope(&parse(
-            "block0:\n    jump block1\nblock1:\n    %0: u32 = Phi [block0: %1]\n    \
-             %1: u32 = IAdd32 u32 1, u32 2\n    return\n"
+            "block0:\n    %1: u32 = IAdd32 u32 1, u32 2\n    jump block1\nblock1:\n    \
+             %0: u32 = Phi [block0: %1]\n    return\n"
         )),
         Ok(())
     );

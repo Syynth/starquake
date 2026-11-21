@@ -403,13 +403,22 @@ fn the_size_before_its_page_alignment_is_edens() {
     assert_eq!(work_buffer_size(&params), Ok(122_880));
 }
 
+/// A revision word from its four characters, low byte first (`Common::MakeMagic`).
+const fn tag(chars: [u8; 4]) -> u32 {
+    u32::from_le_bytes(chars)
+}
+
 #[test]
-fn a_revision_past_15_is_refused_before_any_term() {
+fn a_revision_past_the_bound_is_refused_before_any_term() {
     for (word, number) in [
         (CURRENT_REVISION + 1, 16),
         (0xFF, 0xFF),
-        (u32::from_le_bytes(*b"REV@"), 16),
+        // Not tagged native: Eden-NX2's bound, 15.
+        (tag(*b"REV@"), 16),
         (REVISION_TAG_FROM, 0xCF),
+        // Tagged native: PR #4588's bound, 16.
+        (tag(*b"REvA"), 17),
+        (tag(*b"REv\xFF"), 0xCF),
     ] {
         let expected = Err(WorkBufferError::InvalidRevision { word, number });
         assert_eq!(work_buffer_size(&only(word, |_| {})), expected, "{word:#x}");
@@ -421,19 +430,135 @@ fn a_revision_past_15_is_refused_before_any_term() {
         });
         assert_eq!(work_buffer_size(&both), expected, "{word:#x}");
     }
-    // The newest revision is accepted, as number and as tag.
-    assert!(work_buffer_size(&only(CURRENT_REVISION, |_| {})).is_ok());
-    assert!(work_buffer_size(&only(u32::from_le_bytes(*b"REV?"), |_| {})).is_ok());
+    // A native word whose top byte is below '0' names no revision, and is refused first too.
+    let word = tag(*b"REv/");
+    let both = only(word, |p| {
+        p.sub_mixes = u32::MAX;
+        p.splitter_destinations = -1;
+    });
+    assert_eq!(
+        work_buffer_size(&both),
+        Err(WorkBufferError::NoRevision { word })
+    );
+    // The newest revisions are accepted: 15 as number and as either tag, 16 as native tag.
+    for word in [
+        CURRENT_REVISION,
+        tag(*b"REV?"),
+        tag(*b"REv?"),
+        tag(*b"REv@"),
+    ] {
+        assert!(work_buffer_size(&only(word, |_| {})).is_ok(), "{word:#x}");
+    }
 }
 
 #[test]
-fn a_native_revision_16_is_refused_as_eden_nx2_does() {
-    // PR #4588 accepts `REv@` (`NativeCurrentRevision` = 16); Eden-NX2 reads it as 16 and
-    // refuses it (module docs, "The revision word").
-    let word = u32::from_le_bytes(*b"REv@");
+fn the_revision_bound_depends_on_the_native_tag() {
+    // Each pair differs only at the edge, and the parameter wraps `sub_mixes * MAX_EFFECTS`: an
+    // accepted word reaches that term and is `Overflow`, a refused one is refused by its
+    // revision.
+    let wraps = |word| {
+        work_buffer_size(&only(word, |p| {
+            p.sub_mixes = u32::MAX / MAX_EFFECTS + 1;
+        }))
+    };
+    let overflow = Err(WorkBufferError::Overflow);
+    // Native: 16 (`REv@`) is accepted, 17 (`REvA`) refused.
+    assert_eq!(wraps(tag(*b"REv@")), overflow);
     assert_eq!(
-        work_buffer_size(&only(word, |_| {})),
-        Err(WorkBufferError::InvalidRevision { word, number: 16 })
+        wraps(tag(*b"REvA")),
+        Err(WorkBufferError::InvalidRevision {
+            word: tag(*b"REvA"),
+            number: 17
+        })
+    );
+    // Not native: 15 (`REV?`) is accepted, 16 (`REV@`) refused under Eden-NX2's bound.
+    assert_eq!(wraps(tag(*b"REV?")), overflow);
+    assert_eq!(
+        wraps(tag(*b"REV@")),
+        Err(WorkBufferError::InvalidRevision {
+            word: tag(*b"REV@"),
+            number: 16
+        })
+    );
+    // Native, at the bottom: '0' is revision 0, accepted; '/' is below '0' and names none.
+    assert_eq!(wraps(tag(*b"REv0")), overflow);
+    assert_eq!(
+        wraps(tag(*b"REv/")),
+        Err(WorkBufferError::NoRevision {
+            word: tag(*b"REv/")
+        })
+    );
+    // A plain number: 15 accepted, 16 refused.
+    assert_eq!(wraps(CURRENT_REVISION), overflow);
+    assert_eq!(
+        wraps(CURRENT_REVISION + 1),
+        Err(WorkBufferError::InvalidRevision {
+            word: CURRENT_REVISION + 1,
+            number: 16
+        })
+    );
+}
+
+#[test]
+fn a_native_revision_16_is_sized_as_revision_15() {
+    // No feature in `CheckFeatureSupported`'s table needs more than 15, so `REv@` turns on
+    // exactly revision 15's: every golden parameter accepted as revision 15 has the same size
+    // at `REv@`.
+    let native_16 = tag(*b"REv@");
+    assert_eq!(revision_number(native_16), Some(NATIVE_CURRENT_REVISION));
+    let mut compared = 0;
+    for (params, size) in GOLDEN {
+        if revision_number(params.revision) != Some(CURRENT_REVISION) {
+            continue;
+        }
+        let native = RendererParameter {
+            revision: native_16,
+            ..*params
+        };
+        assert_eq!(work_buffer_size(&native), Ok(*size), "{params:?}");
+        compared += 1;
+    }
+    // Counted by hand in `GOLDEN`: row 15, the `REV?` and `REv?` rows, the row of fields with
+    // high bytes at 15, the nine fields alone at 15, and two rows of the sequence.
+    assert_eq!(compared, 15);
+    for feature in [
+        Feature::Splitter,
+        Feature::SplitterBugFix,
+        Feature::VariadicCommandBufferSize,
+        Feature::PerformanceMetricsVersion2,
+        Feature::WaveBufferVersion2,
+        Feature::EffectInfoVersion2,
+    ] {
+        assert_eq!(
+            feature.in_revision(NATIVE_CURRENT_REVISION),
+            feature.in_revision(CURRENT_REVISION),
+            "{feature:?}"
+        );
+    }
+}
+
+#[test]
+fn pr_4588s_own_revision_cases_are_answered_as_it_answers_them() {
+    // `eden-pr4588/src/tests/core/audio_revision.cpp` @ e5fb3b97: `GetRevisionNum` and
+    // `CheckValidRevision` of each word, written out as its literals.
+    assert_eq!(revision_number(0x3f56_4552), Some(15));
+    assert_eq!(revision_number(0x4076_4552), Some(16));
+    for word in [0x3f56_4552, 0x4076_4552] {
+        assert!(work_buffer_size(&only(word, |_| {})).is_ok(), "{word:#x}");
+    }
+    // `0x41764552` (`REvA`) and `0x40564552` (`REV@`) are past their bounds, and `0x40764553`
+    // carries no tag, so Eden-NX2's reading applies and reads it as 16, also past the bound.
+    for (word, number) in [(0x4176_4552, 17), (0x4056_4552, 16), (0x4076_4553, 16)] {
+        assert_eq!(
+            work_buffer_size(&only(word, |_| {})),
+            Err(WorkBufferError::InvalidRevision { word, number }),
+            "{word:#x}"
+        );
+    }
+    // `0x2f764552` (`REv/`) names no revision.
+    assert_eq!(
+        work_buffer_size(&only(0x2f76_4552, |_| {})),
+        Err(WorkBufferError::NoRevision { word: 0x2f76_4552 })
     );
 }
 
@@ -441,7 +566,7 @@ fn a_native_revision_16_is_refused_as_eden_nx2_does() {
 fn a_word_without_the_rev_tag_is_read_as_eden_nx2_reads_it() {
     // PR #4588 refuses a word whose low three bytes are not `REV` or `REv`; Eden-NX2 reads
     // `0x3900_0000` as (0x3900_0000 - 0x3056_4552) >> 24 = 8 (module docs).
-    assert_eq!(revision_number(0x3900_0000), 8);
+    assert_eq!(revision_number(0x3900_0000), Some(8));
     let (rev_8, size) = GOLDEN[8];
     let untagged = RendererParameter {
         revision: 0x3900_0000,
@@ -451,23 +576,29 @@ fn a_word_without_the_rev_tag_is_read_as_eden_nx2_reads_it() {
 }
 
 #[test]
-fn revision_number_reads_numbers_and_tags_as_eden_nx2_does() {
-    // Hand-worked from `GetRevisionNum`: 'R' 0x52, 'E' 0x45, 'V' 0x56, 'v' 0x76, '0' 0x30.
+fn revision_number_reads_each_word_as_its_tag_says() {
+    // Hand-worked from both `GetRevisionNum`s: 'R' 0x52, 'E' 0x45, 'V' 0x56, 'v' 0x76, '0' 0x30.
     assert_eq!(REVISION_MAGIC, 0x3056_4552);
     let cases = [
-        (0, 0),
-        (15, 15),
+        (0, Some(0)),
+        (15, Some(15)),
         // Below the tag's start every word is its own number.
-        (0xFF, 0xFF),
-        // The tag's start: 0x100 - 0x3056_4552 wraps to 0xCFA9_BBAE.
-        (0x100, 0xCF),
-        (0x3056_4552, 0),
-        (0x3F56_4552, 15),
-        (0x3F76_4552, 15),
-        (0x4056_4552, 16),
-        (0x4076_4552, 16),
+        (0xFF, Some(0xFF)),
+        // Eden-NX2's reading. The tag's start: 0x100 - 0x3056_4552 wraps to 0xCFA9_BBAE.
+        (0x100, Some(0xCF)),
+        (0x3056_4552, Some(0)),
+        (0x3F56_4552, Some(15)),
+        (0x4056_4552, Some(16)),
         // The top byte below '0': wraps.
-        (0x2F56_4552, 0xFF),
+        (0x2F56_4552, Some(0xFF)),
+        // PR #4588's reading of a native word: the top byte less '0', none below '0'.
+        (0x3076_4552, Some(0)),
+        (0x3F76_4552, Some(15)),
+        (0x4076_4552, Some(16)),
+        (0x4176_4552, Some(17)),
+        (0xFF76_4552, Some(0xCF)),
+        (0x2F76_4552, None),
+        (0x0076_4552, None),
     ];
     for (word, number) in cases {
         assert_eq!(revision_number(word), number, "{word:#x}");
@@ -476,6 +607,116 @@ fn revision_number_reads_numbers_and_tags_as_eden_nx2_does() {
         (REVISION_TAG_FROM, REVISION_TAG_SHIFT, CURRENT_REVISION),
         (0x100, 24, 15)
     );
+}
+
+#[test]
+fn the_native_revision_constants_are_pr_4588s() {
+    // `feature_support.h` @ e5fb3b97: `NativeCurrentRevision = 16`, `IsNativeRevision`'s
+    // `(revision & 0xffffff) == Common::MakeMagic('R', 'E', 'v', '\0')`, and `GetRevisionNum`'s
+    // `encoded - '0'`.
+    assert_eq!(
+        (
+            NATIVE_CURRENT_REVISION,
+            REVISION_TAG_MASK,
+            NATIVE_REVISION_TAG,
+            REVISION_DIGIT_ZERO
+        ),
+        (16, 0x00FF_FFFF, 0x0076_4552, 0x30)
+    );
+    assert_eq!(newest_revision(tag(*b"REv@")), 16);
+    assert_eq!(newest_revision(tag(*b"REV@")), 15);
+    assert_eq!(newest_revision(16), 15);
+    // Only the low three bytes are compared: the top byte never matters, and each of the three
+    // matters on its own.
+    for top in [0x00, 0x30, 0x40, 0xFF] {
+        assert!(is_native_revision(0x0076_4552 | (top << 24)), "{top:#x}");
+    }
+    for word in [
+        0x4076_4553,
+        0x4076_4452,
+        0x4077_4552,
+        0x4056_4552,
+        0x4076_4500,
+    ] {
+        assert!(!is_native_revision(word), "{word:#x}");
+    }
+}
+
+/// Eden-NX2's `GetRevisionNum` and `CheckValidRevision`
+/// (`eden-nx2/src/audio_core/common/feature_support.h` @ 50fa86bb), transcribed with their
+/// literals: the number and whether it is accepted.
+const fn eden_nx2_reading(word: u32) -> (u32, bool) {
+    let number = if word >= 0x100 {
+        word.wrapping_sub(0x3056_4552) >> 24
+    } else {
+        word
+    };
+    (number, number <= 15)
+}
+
+/// PR #4588's `GetRevisionNum` and `CheckValidRevision`
+/// (`eden-pr4588/src/audio_core/common/feature_support.h` @ e5fb3b97), transcribed with their
+/// literals.
+const fn pr_4588_reading(word: u32) -> (u32, bool) {
+    let native = word & 0xFF_FFFF == 0x76_4552;
+    let number = if word < 0x100 {
+        word
+    } else if !native && word & 0xFF_FFFF != 0x56_4552 {
+        u32::MAX
+    } else if word >> 24 >= 0x30 {
+        (word >> 24) - 0x30
+    } else {
+        u32::MAX
+    };
+    (number, number <= if native { 16 } else { 15 })
+}
+
+/// The words the union test walks, each once: every word below 0x1000, and every top byte over
+/// low three bytes of `REV`, `REv`, each of those with one of its 24 bits flipped, zero and all
+/// ones. (`REV` with bit 21 flipped is `REv`, hence the dedup.)
+fn union_words() -> Vec<u32> {
+    let mut lows = vec![0x56_4552_u32, 0x76_4552, 0, 0xFF_FFFF];
+    for bit in 0..24 {
+        lows.push(0x56_4552 ^ (1 << bit));
+        lows.push(0x76_4552 ^ (1 << bit));
+    }
+    let mut words: Vec<u32> = (0..0x1000).collect();
+    for top in 0..=0xFF_u32 {
+        for low in &lows {
+            words.push((top << 24) | low);
+        }
+    }
+    words.sort_unstable();
+    words.dedup();
+    words
+}
+
+#[test]
+fn the_accepted_words_are_the_union_of_both_readings() {
+    // Over `union_words`, a word is accepted exactly when either reference accepts it, at the
+    // number the accepting reference reads; where both accept they read the same number.
+    let (mut both, mut only_nx2, mut only_pr) = (0, 0, 0);
+    for word in union_words() {
+        let (nx2_number, nx2) = eden_nx2_reading(word);
+        let (pr_number, pr) = pr_4588_reading(word);
+        let result = work_buffer_size(&only(word, |_| {}));
+        assert_eq!(result.is_ok(), nx2 || pr, "{word:#x}: {result:?}");
+        match (nx2, pr) {
+            (true, true) => {
+                assert_eq!(nx2_number, pr_number, "{word:#x}");
+                both += 1;
+            }
+            (true, false) => only_nx2 += 1,
+            (false, true) => only_pr += 1,
+            (false, false) => continue,
+        }
+        let number = if pr { pr_number } else { nx2_number };
+        assert_eq!(revision_number(word), Some(number), "{word:#x}");
+    }
+    // Each class is reached: words both accept; words only Eden-NX2 accepts (untagged ones of
+    // 0x100 or more); and `REv@`, the one word only PR #4588 accepts.
+    assert_eq!(only_pr, 1, "{both} {only_nx2} {only_pr}");
+    assert!(both > 0 && only_nx2 > 0, "{both} {only_nx2} {only_pr}");
 }
 
 #[test]
@@ -640,6 +881,19 @@ fn the_error_messages_are_plain_words() {
         }
         .to_string(),
         "revision word 0x40564552 reads as revision 16, past the newest, 15"
+    );
+    // A native word names PR #4588's bound instead.
+    assert_eq!(
+        WorkBufferError::InvalidRevision {
+            word: 0x4176_4552,
+            number: 17
+        }
+        .to_string(),
+        "revision word 0x41764552 reads as revision 17, past the newest, 16"
+    );
+    assert_eq!(
+        WorkBufferError::NoRevision { word: 0x2f76_4552 }.to_string(),
+        "revision word 0x2f764552 is tagged native but names no revision"
     );
     assert_eq!(
         WorkBufferError::Overflow.to_string(),

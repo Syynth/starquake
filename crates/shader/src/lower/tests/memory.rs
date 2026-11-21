@@ -89,28 +89,33 @@ struct Probe {
 }
 
 /// Runs `body` (which writes registers r0 up, one per probe) as a compute shader with
-/// `inputs`, and compares the registers the GPU leaves with each probe's expected value. The
-/// operands are made opaque to the host compiler first. The interpreter refuses an access past
-/// the end, so the expected values are written out (see `memory`'s module docs).
+/// `inputs`, and compares the registers the GPU leaves with each probe's expected value. It
+/// runs twice: once with the operands made opaque to the host compiler, so it computes every
+/// index at run time, and once as written, so an immediate index reaches the lowering, and
+/// naga's validation, as a constant (which naga refuses past the end unless the lowering clamps
+/// it). The interpreter refuses an access past the end, so the expected values are written out
+/// (see `memory`'s module docs).
 fn check_on_gpu(test: &str, body: &str, inputs: &LowerInputs, probes: &[Probe]) {
-    let function = opaque(&compute(body));
-    let shader = lowered(GuestStage::Compute, &function, inputs);
+    let written = compute(body);
     let regs: Vec<u8> = (0..u8::try_from(probes.len()).expect("few")).collect();
-    let Some(found) = gpu_registers(test, &shader, &regs) else {
-        return;
-    };
-    let wrong: Vec<String> = probes
-        .iter()
-        .zip(&found)
-        .filter(|(probe, found)| probe.expected != **found)
-        .map(|(probe, found)| {
-            format!(
-                "{}: expected {:#x}, GPU {found:#x}",
-                probe.name, probe.expected
-            )
-        })
-        .collect();
-    assert!(wrong.is_empty(), "{wrong:#?}");
+    for (form, function) in [("opaque", opaque(&written)), ("constant", written.clone())] {
+        let shader = lowered(GuestStage::Compute, &function, inputs);
+        let Some(found) = gpu_registers(test, &shader, &regs) else {
+            return;
+        };
+        let wrong: Vec<String> = probes
+            .iter()
+            .zip(&found)
+            .filter(|(probe, found)| probe.expected != **found)
+            .map(|(probe, found)| {
+                format!(
+                    "{}: expected {:#x}, GPU {found:#x}",
+                    probe.name, probe.expected
+                )
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{form} operands: {wrong:#?}");
+    }
 }
 
 /// Local memory of three words: a write and a read at the last word (index 2) land, a write at
@@ -399,4 +404,381 @@ fn memory_snapshot() {
         },
     );
     insta::assert_snapshot!("memory", msl(&shader));
+}
+
+/// `LDL` or `STL` of one word at byte `offset` (`[RZ + offset]`).
+fn local_access(load: bool, reg: u8, offset: u32) -> crate::decode::Instr {
+    local_access_with(
+        load,
+        reg,
+        crate::decode::Gpr::RZ,
+        offset,
+        crate::decode::MemType::B32,
+    )
+}
+
+/// `LDL` or `STL` of `mem_type` at `[base + offset]`, as the translator takes them; `LDL`
+/// encodes the uniform register field (register 0, off), as PR #4588 takes it.
+fn local_access_with(
+    load: bool,
+    reg: u8,
+    base: crate::decode::Gpr,
+    offset: u32,
+    mem_type: crate::decode::MemType,
+) -> crate::decode::Instr {
+    use crate::decode::{
+        Gpr, Instr, MemAddr, MemEvictionPriority, MemSpace, Op, OpLd, OpSt, Pred, PredSrc,
+        UniformAddr, UniformReg,
+    };
+    let addr = MemAddr {
+        reg: base,
+        reg_64: false,
+        uniform: None,
+        offset: i32::try_from(offset).expect("small"),
+    };
+    let space = MemSpace::Local(MemEvictionPriority::Normal);
+    if load {
+        Instr::new(Op::Ld(OpLd {
+            dst: Gpr::new(reg),
+            addr: MemAddr {
+                uniform: Some(UniformAddr {
+                    reg: UniformReg::new(0).expect("a uniform register"),
+                    wide: false,
+                    enabled: false,
+                }),
+                ..addr
+            },
+            mem_type,
+            space,
+            pred: PredSrc::TRUE,
+            pred_dst: Pred::PT,
+            zd: false,
+            bit76: false,
+        }))
+    } else {
+        Instr::new(Op::St(OpSt {
+            data: Gpr::new(reg),
+            addr,
+            mem_type,
+            space,
+            bit76: false,
+        }))
+    }
+}
+
+/// `program` (with `MOV`s of `values` into their registers first and `EXIT` last), translated
+/// by the translation driver.
+fn translated_local(values: &[(u8, u32)], program: &[crate::decode::Instr]) -> Function {
+    use crate::decode::{Gpr, Instr, MovSrc, Op, OpExit, OpMov, PredSrc};
+    use crate::translate::driver::translate_instrs;
+    use crate::translate::{COLOR_TARGETS, ColorOutputs, Stage};
+    let mut code: Vec<Instr> = values
+        .iter()
+        .map(|&(reg, bits)| {
+            Instr::new(Op::Mov(OpMov {
+                dst: Gpr::new(reg),
+                src: MovSrc::Imm(bits),
+                quad_lanes: OpMov::ALL_LANES,
+            }))
+        })
+        .collect();
+    code.extend_from_slice(program);
+    code.push(Instr::new(Op::Exit(OpExit {
+        keep_ref_count: false,
+        no_at_exit: false,
+        pred: PredSrc::TRUE,
+    })));
+    // The translator takes vertex and pixel programs; a vertex program's exit adds nothing
+    // the compute lowering refuses.
+    let stage = Stage {
+        stage: GuestStage::Vertex,
+        color_outputs: ColorOutputs {
+            targets: [0; COLOR_TARGETS],
+        },
+    };
+    translate_instrs(stage, None, &code).expect("translates")
+}
+
+/// The `n`th `opcode` instruction `function` lists.
+fn nth_listed(function: &Function, opcode: Opcode, n: usize) -> crate::ir::Value {
+    function
+        .listed()
+        .filter(|(_, inst)| matches!(inst, crate::ir::Inst::Op(op) if op.opcode == opcode))
+        .nth(n)
+        .map(|(value, _)| value)
+        .expect("listed")
+}
+
+/// Runs translated `function` as a compute shader with `inputs` on the GPU and returns
+/// registers `regs`, or `None` when the host cannot run it: once with opaque operands, so the
+/// host compiler computes every index at run time, and once as translated. The translation
+/// driver alone does not fold a `[RZ + imm]` offset's word index to a constant (the passes do),
+/// so the second run does not reach naga's check of a constant index past the end:
+/// `local_accesses_at_and_past_the_end` (literal indices) and the pipeline's
+/// `a_local_store_at_a_constant_offset_past_the_end_lowers` (the production passes) do. Both
+/// runs must give the same registers.
+fn gpu_both(
+    test: &str,
+    function: &Function,
+    inputs: &LowerInputs,
+    regs: &[u8],
+) -> Option<Vec<u32>> {
+    let run = |function: &Function| {
+        gpu_registers(test, &lowered(GuestStage::Compute, function, inputs), regs)
+    };
+    let opaque_regs = run(&opaque(function));
+    let constant_regs = run(function);
+    assert_eq!(
+        opaque_regs, constant_regs,
+        "{test}: opaque and constant operands"
+    );
+    opaque_regs
+}
+
+/// Translated `STL` and `LDL` against the interpreter, with local memory of three words on
+/// both: at the last word (byte 8) the GPU gives what the interpreter gives; one word past it
+/// (byte 12, the size the lowering was given) the interpreter refuses the access with its exact
+/// error, at the access itself, and the GPU reads 0 for the load and drops the store, leaving
+/// the last word's value and nothing to read back past the end (the divergence
+/// `lower::memory` lists), for a store at an immediate
+/// offset and at a register offset. Eden's translator selects 0 for an `LDL` whose byte offset
+/// is not below `LocalMemorySize()`, and drops an `STL` at an immediate offset not below it
+/// (`load_store_local_shared.cpp`), so for those accesses the GPU's results are also Eden's;
+/// Eden does not bound the register-offset store (`lower::memory`'s divergences). Each GPU run
+/// is made with opaque operands and as translated ([`gpu_both`]).
+#[test]
+fn translated_local_accesses_match_the_interpreter_at_the_edge() {
+    let length: u32 = 3;
+    let last = bytes(length - 1);
+    let end = bytes(length);
+    let inputs = LowerInputs {
+        local_memory_bytes: u64::from(end),
+        ..LowerInputs::DEFAULT
+    };
+    let interp = |function: &Function| {
+        let mut machine = crate::interp::Machine::new();
+        machine.local = vec![0; usize::try_from(length).expect("small")];
+        machine.run(function).map(|_| machine.regs)
+    };
+    let gpu =
+        |test: &str, function: &Function, regs: &[u8]| gpu_both(test, function, &inputs, regs);
+    let out_of_bounds = |at| crate::interp::InterpError::OutOfBounds {
+        at,
+        space: crate::interp::Space::Local,
+        offset: u64::from(end),
+        size: u64::from(MEMORY_WORD_BYTES),
+        len: u64::from(end),
+    };
+
+    // At the last word: both sides agree.
+    let inside = translated_local(
+        &[(0, 0x22)],
+        &[local_access(false, 0, last), local_access(true, 1, last)],
+    );
+    let regs = interp(&inside).expect("in bounds");
+    assert_eq!(regs[1], 0x22, "the interpreter");
+    if let Some(found) = gpu("translated_local_inside", &inside, &[1]) {
+        assert_eq!(found, [regs[1]], "the GPU");
+    }
+
+    // A load one word past the end.
+    let load_past = translated_local(
+        &[(0, 0x11)],
+        &[
+            local_access(false, 0, last),
+            local_access(true, 1, end),
+            local_access(true, 3, last),
+        ],
+    );
+    assert_eq!(
+        interp(&load_past).map(|_| ()),
+        Err(out_of_bounds(nth_listed(&load_past, Opcode::LoadLocal, 0)))
+    );
+    if let Some(found) = gpu("translated_local_load_past", &load_past, &[1, 3]) {
+        assert_eq!(found, [0, 0x11], "the GPU");
+    }
+
+    // A store one word past the end.
+    let store_past = translated_local(
+        &[(0, 0x11), (2, 0x33)],
+        &[
+            local_access(false, 0, last),
+            local_access(false, 2, end),
+            local_access(true, 3, last),
+            local_access(true, 5, end),
+        ],
+    );
+    assert_eq!(
+        interp(&store_past).map(|_| ()),
+        Err(out_of_bounds(nth_listed(
+            &store_past,
+            Opcode::WriteLocal,
+            1
+        )))
+    );
+    // The dropped store leaves no word to read back: the word past the end still reads 0.
+    if let Some(found) = gpu("translated_local_store_past", &store_past, &[3, 5]) {
+        assert_eq!(found, [0x11, 0], "the GPU");
+    }
+
+    // A store one word past the end at a register offset (`STL [R4]`, R4 = 12).
+    let register_past = translated_local(
+        &[(0, 0x11), (2, 0x33), (4, end)],
+        &[
+            local_access(false, 0, last),
+            local_access_with(
+                false,
+                2,
+                crate::decode::Gpr::new(4),
+                0,
+                crate::decode::MemType::B32,
+            ),
+            local_access(true, 3, last),
+            local_access(true, 5, end),
+        ],
+    );
+    assert_eq!(
+        interp(&register_past).map(|_| ()),
+        Err(out_of_bounds(nth_listed(
+            &register_past,
+            Opcode::WriteLocal,
+            1
+        )))
+    );
+    if let Some(found) = gpu("translated_local_register_past", &register_past, &[3, 5]) {
+        assert_eq!(found, [0x11, 0], "the GPU");
+    }
+}
+
+/// Divergence (`lower::memory`): with a local-memory size that is not a multiple of 4 (13
+/// bytes, four words), a translated `LDL.U8` at byte 13, in the last word but at the byte size,
+/// reads the stored byte here, on the interpreter and on the GPU alike (0xcc of `0xaabb_ccdd`),
+/// where Eden's translator selects 0 (`ILessThan(13, 13)` is false). The store at byte 12 is
+/// below the size, so Eden keeps it too.
+#[test]
+fn divergence_a_narrow_load_past_the_byte_size_in_the_last_word_reads_it() {
+    let size: u32 = 13;
+    let words = u32::try_from(words(u64::from(size))).expect("small");
+    assert_eq!(words, 4);
+    let last = bytes(words - 1);
+    let function = translated_local(
+        &[(0, 0xaabb_ccdd)],
+        &[
+            local_access(false, 0, last),
+            local_access_with(
+                true,
+                1,
+                crate::decode::Gpr::RZ,
+                size,
+                crate::decode::MemType::U8,
+            ),
+        ],
+    );
+    let mut machine = crate::interp::Machine::new();
+    machine.local = vec![0; usize::try_from(words).expect("small")];
+    machine.run(&function).expect("in bounds by word");
+    assert_eq!(machine.regs[1], 0xcc, "the interpreter");
+    let inputs = LowerInputs {
+        local_memory_bytes: u64::from(size),
+        ..LowerInputs::DEFAULT
+    };
+    let shader = lowered(GuestStage::Compute, &opaque(&function), &inputs);
+    if let Some(found) = gpu_registers(
+        "divergence_a_narrow_load_past_the_byte_size_in_the_last_word_reads_it",
+        &shader,
+        &[1],
+    ) {
+        assert_eq!(found, [0xcc], "the GPU");
+    }
+}
+
+/// Divergence (`lower::memory`): with local memory of three words, a translated
+/// `STL.128 [RZ + 8]` writes words 2 to 5. Eden's translator checks only the first byte offset
+/// against `LocalMemorySize()` (8 is below 12) and then writes `word_offset + i` with no bound
+/// (`load_store_local_shared.cpp`, `STL`), so it writes words 3 to 5 out of bounds; the
+/// interpreter refuses at the store's second `WriteLocal` (word 3, byte 12) with its exact
+/// error; and here the GPU keeps the last word and drops the three past it: a load back from
+/// byte 8 gives R4's value, a load from byte 12 gives 0, and the neighbour word 1 keeps its own
+/// value. Run with opaque and constant operands ([`gpu_both`]).
+#[test]
+fn divergence_a_wide_store_at_the_last_word_drops_the_words_past_the_end() {
+    use crate::decode::{Gpr, MemType};
+    let length: u32 = 3;
+    let last = bytes(length - 1);
+    let end = bytes(length);
+    let before = bytes(length - 2);
+    let function = translated_local(
+        &[(0, 0x11), (4, 0x44), (5, 0x55), (6, 0x66), (7, 0x77)],
+        &[
+            local_access(false, 0, before),
+            local_access_with(false, 4, Gpr::RZ, last, MemType::B128),
+            local_access(true, 1, last),
+            local_access(true, 2, end),
+            local_access(true, 3, before),
+        ],
+    );
+    let mut machine = crate::interp::Machine::new();
+    machine.local = vec![0; usize::try_from(length).expect("small")];
+    assert_eq!(
+        machine.run(&function).map(|_| ()),
+        Err(crate::interp::InterpError::OutOfBounds {
+            at: nth_listed(&function, Opcode::WriteLocal, 2),
+            space: crate::interp::Space::Local,
+            offset: u64::from(end),
+            size: u64::from(MEMORY_WORD_BYTES),
+            len: u64::from(end),
+        })
+    );
+    let inputs = LowerInputs {
+        local_memory_bytes: u64::from(end),
+        ..LowerInputs::DEFAULT
+    };
+    if let Some(found) = gpu_both(
+        "divergence_a_wide_store_at_the_last_word_drops_the_words_past_the_end",
+        &function,
+        &inputs,
+        &[1, 2, 3],
+    ) {
+        assert_eq!(found, [0x44, 0, 0x11], "the GPU");
+    }
+}
+
+/// Divergence (`lower::memory`), the store half of the partial last word: with 13 bytes of
+/// local memory (four words), a translated `STL.U8 [RZ + 13]` lands in the last word here, on
+/// the interpreter and on the GPU alike, where Eden's translator drops it (an immediate offset
+/// not below the size: `offset.U32() >= env.LocalMemorySize()`, 13 >= 13). Word 3 is first
+/// written with `0xaabb_ccdd` at byte 12 (below the size, so Eden keeps that store); the byte
+/// store puts 0xee at bits 8 to 15, so a load of word 3 gives `0xaabb_eedd`, where Eden leaves
+/// `0xaabb_ccdd`. Run with opaque and constant operands ([`gpu_both`]).
+#[test]
+fn divergence_a_narrow_store_past_the_byte_size_in_the_last_word_lands() {
+    use crate::decode::{Gpr, MemType};
+    let size: u32 = 13;
+    let words = u32::try_from(words(u64::from(size))).expect("small");
+    assert_eq!(words, 4);
+    let last = bytes(words - 1);
+    let function = translated_local(
+        &[(0, 0xaabb_ccdd), (2, 0xee)],
+        &[
+            local_access(false, 0, last),
+            local_access_with(false, 2, Gpr::RZ, size, MemType::U8),
+            local_access(true, 1, last),
+        ],
+    );
+    let mut machine = crate::interp::Machine::new();
+    machine.local = vec![0; usize::try_from(words).expect("small")];
+    machine.run(&function).expect("in bounds by word");
+    assert_eq!(machine.regs[1], 0xaabb_eedd, "the interpreter");
+    let inputs = LowerInputs {
+        local_memory_bytes: u64::from(size),
+        ..LowerInputs::DEFAULT
+    };
+    if let Some(found) = gpu_both(
+        "divergence_a_narrow_store_past_the_byte_size_in_the_last_word_lands",
+        &function,
+        &inputs,
+        &[1],
+    ) {
+        assert_eq!(found, [0xaabb_eedd], "the GPU");
+    }
 }

@@ -350,9 +350,11 @@ fn observable(machine: &Machine) -> Machine {
     }
 }
 
-/// Runs every pass on `function`, checking each output verifies, keeps the result and, when
-/// structured, keeps each phi's incoming values in scope ([`super::check_phi_scope`]): so the
-/// output of the SSA rewrite alone (the first pass) and of all of them (what
+/// Runs every pass on `function`, checking each output verifies and keeps the result. When
+/// structured, verifying includes the verifier's step 5 (`ir::verify`): each phi takes its
+/// values from blocks that can run last before its own, each in scope at the end of its block
+/// (what [`super::check_phi_scope`] checked here before the verifier did). So the output of
+/// the SSA rewrite alone (the first pass) and of all of them (what
 /// [`optimize`](crate::opt::optimize) runs) are both checked.
 fn check_equivalence(function: &Function, start: &Machine) -> Result<Function, TestCaseError> {
     let reference = super::ran(function, start);
@@ -361,9 +363,7 @@ fn check_equivalence(function: &Function, start: &Machine) -> Result<Function, T
         run(&mut current, pass).map_err(|e| TestCaseError::fail(format!("{pass}: {e}")))?;
         current
             .verify()
-            .map_err(|e| TestCaseError::fail(format!("{pass}: {e}")))?;
-        super::check_phi_scope(&current)
-            .map_err(|e| TestCaseError::fail(format!("{pass}: {e}")))?;
+            .map_err(|e| TestCaseError::fail(format!("{pass}: {e}\n{current}")))?;
         let mut machine = start.clone();
         machine
             .run(&current)

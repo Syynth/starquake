@@ -78,6 +78,10 @@
 //! passes, in the spec's order) and the lowering, with each `BRX`'s targets from slice 9's
 //! answers.
 //!
+//! Slice 18 is the host lowering passes ([`host_lower`]): where the host target lacks 64- or
+//! 16-bit floats, their operations become 32-bit ones before the lowering, with every
+//! precision loss listed.
+//!
 //! Slice 19 is the shader cache ([`cache`]): the address map, program entries and shader
 //! entries, invalidation by guest range, the negative cache, and translations queued on the
 //! shared compile pool behind tickets, driven through a translator seam until slice 17.
@@ -95,6 +99,7 @@ pub mod flow;
 #[cfg(test)]
 mod gpu_harness;
 pub mod host;
+pub mod host_lower;
 pub mod info;
 pub mod interp;
 pub mod ir;

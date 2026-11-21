@@ -442,12 +442,10 @@ fn a_wait_through_the_seam_returns_once_a_worker_runs_the_job() {
     waiter.join().expect("the waiter ends");
 }
 
-/// The production translator's shaders go through the seam: a real vertex program (a parsed
-/// header and an `EXIT`) translated by `PipelineTranslator` comes back as a ready set of its
-/// host shader, which binds no resources until slice 17 (module docs, "The production
-/// translator's shaders").
-#[test]
-fn a_host_shader_binds_nothing_yet() {
+/// The seam's resources for a vertex program of `code` (after an encoded vertex header)
+/// translated by the production translator (`PipelineTranslator`) with `variant`, through the
+/// cache.
+fn production_resources(code: &[Instr], variant: &VariantKey) -> Vec<ResourceUse> {
     use starquake_shader::pipeline::PipelineTranslator;
     use starquake_shader::sph::encode::encode_bytes;
     use starquake_shader::sph::{Common, Io, ProgramHeader, VtgIo, VtgMap, VtgStage};
@@ -470,19 +468,10 @@ fn a_host_shader_binds_nothing_yet() {
     };
     let mut memory = Memory::new();
     let mut bytes = encode_bytes(&header).expect("encodable").to_vec();
-    bytes.extend(
-        assemble_program(&[Instr::new(Op::Exit(OpExit {
-            keep_ref_count: false,
-            no_at_exit: false,
-            pred: PredSrc::TRUE,
-        }))])
-        .expect("encodable"),
-    );
+    bytes.extend(assemble_program(code).expect("encodable"));
     memory.0[..bytes.len()].copy_from_slice(&bytes);
     let requests = [vertex(A)];
-    let SetLookup::Pending(ticket) =
-        seam.lookup(&requests, &VariantKey::default(), &memory, &NoState)
-    else {
+    let SetLookup::Pending(ticket) = seam.lookup(&requests, variant, &memory, &NoState) else {
         unreachable!("a first lookup is pending");
     };
     executor.run_all();
@@ -490,12 +479,159 @@ fn a_host_shader_binds_nothing_yet() {
         unreachable!("the translation is done");
     };
     assert_eq!(set.stages.len(), 1);
-    assert_eq!(set.stages[0].resources, Vec::new());
     assert_eq!(
         set.shaders.stages[0].stage,
         starquake_shader::host::HostStage::Vertex
     );
-    let shader = host_shader(GuestStage::Vertex);
-    assert_eq!(SeamShader::resources(&shader), Vec::new());
+    set.stages[0].resources.clone()
+}
+
+/// The bank, immediate offset and destination of [`ldc_program`]'s load.
+const LDC_BANK: u8 = 3;
+const LDC_OFFSET: u16 = 0x24;
+
+/// `LDC.32 R0, c[LDC_BANK][LDC_OFFSET]`, `AST a[generic 0 x], R0`, `EXIT`.
+fn ldc_program() -> Vec<Instr> {
+    use starquake_shader::decode::{CBuf, CBufRef, Gpr, LdcMode, MemType, OpASt, OpLdc};
+    use starquake_shader::ir::{ATTRIBUTE_WORD_BYTES, GENERIC_0_X};
+
+    vec![
+        Instr::new(Op::Ldc(OpLdc {
+            dst: Gpr::new(0),
+            cbuf: CBufRef {
+                buf: CBuf::Binding(LDC_BANK),
+                offset: LDC_OFFSET,
+            },
+            offset: Gpr::RZ,
+            mode: LdcMode::Indexed,
+            mem_type: MemType::B32,
+        })),
+        Instr::new(Op::ASt(OpASt {
+            data: Gpr::new(0),
+            vtx: Gpr::RZ,
+            offset: Gpr::RZ,
+            addr: GENERIC_0_X * u16::try_from(ATTRIBUTE_WORD_BYTES).expect("4"),
+            comps: 1,
+            patch: false,
+            phys: false,
+        })),
+        Instr::new(Op::Exit(OpExit {
+            keep_ref_count: false,
+            no_at_exit: false,
+            pred: PredSrc::TRUE,
+        })),
+    ]
+}
+
+/// The production translator's shaders go through the seam with their resource table (module
+/// docs, "The production translator's shaders"): a real vertex program that loads a word of a
+/// constant buffer, translated by `PipelineTranslator`, comes back as a ready set whose
+/// [`StageInfo::resources`] has the bank's row (the bank and the bytes collect info sized it to,
+/// at the vertex group and the bank's binding); looked up with the flipped viewport, the
+/// driver constants' row comes first. With no load and no flag, nothing is bound.
+#[test]
+fn a_host_shader_s_resource_table_reaches_the_seam() {
+    use starquake_shader::info::CBUF_ALIGNMENT;
+    use starquake_shader::lower::{
+        DRIVER_CONSTANTS_BINDING, constant_buffer_binding, resource_group,
+    };
+    use starquake_shader::variant::EmulationKey;
+
+    let group = resource_group(starquake_shader::host::HostStage::Vertex);
+    let bank = ResourceUse {
+        slot: Slot {
+            group,
+            binding: constant_buffer_binding(LDC_BANK),
+        },
+        kind: ResourceKind::UniformBuffer,
+        count: None,
+        source: ResourceSource::ConstantBuffer {
+            bank: LDC_BANK,
+            // Collect info sizes the bank to the end of the word read, rounded up.
+            size: (u32::from(LDC_OFFSET) + 4).next_multiple_of(CBUF_ALIGNMENT),
+        },
+    };
+    assert_eq!(
+        production_resources(&ldc_program(), &VariantKey::default()),
+        [bank]
+    );
+    let flipped = VariantKey {
+        emulation: EmulationKey {
+            flipped_viewport: true,
+            ..EmulationKey::default()
+        },
+        ..VariantKey::default()
+    };
+    let driver_constants = ResourceUse {
+        slot: Slot {
+            group,
+            binding: DRIVER_CONSTANTS_BINDING,
+        },
+        kind: ResourceKind::UniformBuffer,
+        count: None,
+        source: ResourceSource::DriverConstants,
+    };
+    assert_eq!(
+        production_resources(&ldc_program(), &flipped),
+        [driver_constants, bank]
+    );
+    let exit_only = [Instr::new(Op::Exit(OpExit {
+        keep_ref_count: false,
+        no_at_exit: false,
+        pred: PredSrc::TRUE,
+    }))];
+    assert_eq!(production_resources(&exit_only, &VariantKey::default()), []);
+}
+
+/// Each field of a host table row reaches its seam field, with distinct values in each (a
+/// fragment-group row, a bank and size that differ from the binding), so a swapped field
+/// fails; the host shader's [`SeamShader::host`] is itself.
+#[test]
+fn each_row_field_reaches_the_seam() {
+    use starquake_shader::host::{
+        ResourceKind as HostKind, ResourceSlot, ResourceSource as HostSource,
+    };
+
+    let mut shader = host_shader(GuestStage::Pixel);
+    shader.resources = vec![
+        ResourceSlot {
+            group: 1,
+            binding: 0,
+            kind: HostKind::UniformBuffer { size: 0x50 },
+            source: HostSource::DriverConstants,
+        },
+        ResourceSlot {
+            group: 7,
+            binding: 9,
+            kind: HostKind::UniformBuffer { size: 0x230 },
+            source: HostSource::ConstantBuffer { bank: 5 },
+        },
+    ];
+    assert_eq!(
+        SeamShader::resources(&shader),
+        [
+            ResourceUse {
+                slot: Slot {
+                    group: 1,
+                    binding: 0,
+                },
+                kind: ResourceKind::UniformBuffer,
+                count: None,
+                source: ResourceSource::DriverConstants,
+            },
+            ResourceUse {
+                slot: Slot {
+                    group: 7,
+                    binding: 9,
+                },
+                kind: ResourceKind::UniformBuffer,
+                count: None,
+                source: ResourceSource::ConstantBuffer {
+                    bank: 5,
+                    size: 0x230,
+                },
+            },
+        ]
+    );
     assert_eq!(SeamShader::host(&shader).stage, shader.stage);
 }

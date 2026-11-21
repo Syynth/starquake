@@ -561,6 +561,11 @@ fn golden_draw() {
     insta::assert_snapshot!(rig.submit());
 }
 
+/// The local-memory fields of [`compute_qmd`]: the QMD's low (`local_pos_alloc`) and high
+/// (`local_crs_alloc`) sizes, distinct, so a key that took one alone fails.
+const COMPUTE_LOCAL_LOW: u32 = 0x130;
+const COMPUTE_LOCAL_HIGH: u32 = 0x8;
+
 /// The size [`compute_qmd`] binds constant buffer 0 with.
 const COMPUTE_BANK_SIZE: u32 = 0x100;
 
@@ -574,6 +579,8 @@ fn compute_qmd() -> [u32; QMD_WORDS] {
     spec.dispatch.grid = [2, 3, 1];
     spec.dispatch.block = [8, 4, 1];
     spec.dispatch.shared_memory = 0x400;
+    spec.dispatch.local_memory_low = COMPUTE_LOCAL_LOW;
+    spec.dispatch.local_memory_high = COMPUTE_LOCAL_HIGH;
     spec.dispatch.constant_buffers[0] = ConstantBuffer {
         valid: true,
         address: UNIFORMS,
@@ -617,8 +624,8 @@ fn golden_dispatch_with_qmd_releases() {
     rig.write_words(UNIFORMS, &[0xcafe_f00d]);
     rig.run(&compute_signal());
     assert_eq!(rig.exec.counters().dispatches, 1);
-    // The program, the workgroup size and the shared memory reached the lookup, and the
-    // constant buffer question was answered from the QMD's binding.
+    // The program, the workgroup size and the shared and local memory reached the lookup, and
+    // the constant buffer question was answered from the QMD's binding.
     {
         let log = rig.log();
         let (requests, key) = log.lookups.last().unwrap();
@@ -631,6 +638,9 @@ fn golden_dispatch_with_qmd_releases() {
         );
         assert_eq!(key.workgroup_size, [8, 4, 1]);
         assert_eq!(key.shared_memory_size, 0x400);
+        // The local-memory size is the QMD's two fields summed, as every reference's
+        // `ComputeEnvironment` sums `local_pos_alloc` and `local_crs_alloc`.
+        assert_eq!(key.local_memory_size, 0x138);
         assert_eq!(log.compute_word, vec![Some(0xcafe_f00d)]);
     }
     // The releases wait on the list holding the dispatch.

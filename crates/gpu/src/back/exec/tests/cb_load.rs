@@ -145,7 +145,8 @@ fn a_load_drops_a_cached_buffer_it_overlaps_and_not_its_neighbours() {
 }
 
 #[test]
-fn a_load_past_the_size_is_the_exact_error_and_keeps_the_words_in_the_mirror() {
+fn a_load_past_the_size_writes_the_words_that_fit_and_keeps_every_word_in_the_mirror() {
+    // Offsets `size - 4` (ends at the size: written) and `size` (refused).
     let size = 0x100;
     let mut rig = Rig::new();
     rig.run("bind channel=3 subchannel=0 class=0xc797\n");
@@ -159,16 +160,54 @@ fn a_load_past_the_size_is_the_exact_error_and_keeps_the_words_in_the_mirror() {
         }))
     );
     assert_eq!(rig.exec.counters().failed, 1);
-    assert_eq!(rig.word(CB + u64::from(size) - 4), 0);
+    assert_eq!(rig.word(CB + u64::from(size) - 4), 0x4444_4444);
+    assert_eq!(rig.word(CB + u64::from(size)), 0);
     let mirror = rig.exec.mirror(CHANNEL, ClassId(THREE_D)).unwrap();
     assert_eq!(
         mirror.value(u32::from(load(0))),
         Some(0x5555_5555),
         "the mirror stores the words whatever the load did"
     );
-    // One word ending exactly at the size is written.
+    // A later load of one word ending exactly at the size is written.
     rig.run(&load_run(0, &[0x6666_6666]));
     assert_eq!(rig.word(CB + u64::from(size) - 4), 0x6666_6666);
+}
+
+#[test]
+fn a_load_past_the_size_hands_the_words_it_wrote_to_the_caches_at_the_next_draw() {
+    // A load straddling the size writes its first word over the uniforms' page, and that page
+    // reaches the caches at the next draw; a load starting at the size writes nothing, and the
+    // next draw invalidates nothing.
+    let size = 0x44;
+    let cases: [(&str, u32, Vec<PageRange>); 2] = [
+        ("straddling", size - 4, vec![page(UNIFORMS)]),
+        ("from the size", size, vec![]),
+    ];
+    for (name, offset, invalidated) in cases {
+        let mut rig = Rig::new();
+        rig.run(&draw_state());
+        let first = UNIFORMS + u64::from(offset);
+        let before = [rig.word(first), rig.word(first + 4)];
+        rig.run(&select(UNIFORMS, size, offset));
+        let entry = parse_text(&load_run(1, &[0x7777_0001, 0x7777_0002])).unwrap();
+        assert_eq!(
+            rig.exec.apply(&entry[0]),
+            Err(ExecError::ConstantBuffer(ConstantBufferError::PastEnd {
+                offset: size,
+                size,
+            })),
+            "{name}"
+        );
+        let written = if offset < size {
+            [0x7777_0001, before[1]]
+        } else {
+            before
+        };
+        assert_eq!([rig.word(first), rig.word(first + 4)], written, "{name}");
+        assert_eq!(rig.log().invalidated, vec![], "{name}");
+        rig.run(&draw());
+        assert_eq!(rig.log().invalidated, invalidated, "{name}");
+    }
 }
 
 #[test]
@@ -194,11 +233,11 @@ fn only_the_3d_class_loads_constant_buffers() {
 }
 
 #[test]
-fn a_split_run_whose_second_entry_passes_the_size_keeps_the_first_and_writes_none_of_the_second() {
+fn a_split_run_whose_second_entry_passes_the_size_keeps_every_word_that_fits() {
     // The front's own register file splits a run of `MAX_RUN_WORDS` + 3 words into two `Run`
     // entries. The size ends two words into the second entry, so its third word passes it: the
-    // all-or-nothing unit is one entry, so the first entry's words stay written and none of the
-    // second's are.
+    // first entry is written whole, and of the second entry the two words that fit are written
+    // and the third is refused.
     let first_words = u32::try_from(MAX_RUN_WORDS).unwrap();
     let size = (first_words + 2) * WORD_BYTES;
     let words: Vec<u32> = (0..first_words + 3).map(|k| 0xe000_0000 | k).collect();
@@ -240,15 +279,13 @@ fn a_split_run_whose_second_entry_passes_the_size_keeps_the_first_and_writes_non
             size,
         }))
     );
-    // The first entry's words landed.
-    for (k, &word) in (0u64..).zip(&words[..MAX_RUN_WORDS]) {
+    // Every word ending within the size landed: the first entry's and two of the second's.
+    let fit = MAX_RUN_WORDS + 2;
+    for (k, &word) in (0u64..).zip(&words[..fit]) {
         assert_eq!(rig.word(CB + 4 * k), word, "word {k}");
     }
-    // None of the second entry's bytes were written, the two that fit included.
-    let second = CB + u64::from(first_words * WORD_BYTES);
-    for k in 0..3 {
-        assert_eq!(rig.word(second + 4 * k), 0, "second entry, word {k}");
-    }
+    // The third word of the second entry, the first past the size, was not written.
+    assert_eq!(rig.word(CB + u64::from(size)), 0, "the refused word");
 }
 
 #[test]

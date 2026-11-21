@@ -208,6 +208,7 @@ use starquake_trace::{
     EnvError, EventKind, GuestTicks, Recorder, SVC_ARG_COUNT, ServiceId, ThreadId,
 };
 
+use super::hooks;
 use super::sync::drain_wakes;
 use super::{
     Call, Caller, Dispatcher, Locked, Outcome, State, Tables, complete, fault, mismatch,
@@ -608,6 +609,37 @@ impl IpcContext<'_> {
     ) -> SvcResult<()> {
         self.dispatcher
             .write_transfer_memory(self.memory, object, offset, data)
+    }
+
+    /// Keeps a reference of the server's own to the transfer memory `object` names, one of the
+    /// request's own handles resolved, so it stays after the request and after the guest closes
+    /// its handles, until the server drops it ([`IpcContext::release_kept_transfer_memory`],
+    /// [`Dispatcher::release_kept_transfer_memory`]): Eden PR #4588's `KTransferMemory::Open` in
+    /// `BindSyncpointMemory` (`dispatch/hooks.rs`, "A server's own reference"). Returns the
+    /// transfer memory. [`KernelError::InvalidHandle`], with nothing kept, as for
+    /// [`IpcContext::transfer_memory`]. Keeping it twice keeps two references, each dropped by
+    /// one release.
+    pub fn keep_transfer_memory(&mut self, object: ObjectId) -> SvcResult<TransferMemory> {
+        let server = self.server;
+        self.dispatcher
+            .with::<(&mut Scheduler,), _>(|(scheduler,)| {
+                hooks::keep_transfer_memory_in(scheduler, server, object)
+            })
+            .map_err(call_error)
+    }
+
+    /// Drops one reference the server keeps to the transfer memory `object` names
+    /// ([`IpcContext::keep_transfer_memory`]), during a request: what a handler does when a
+    /// request that kept one fails afterwards. [`KernelError::InvalidHandle`], with nothing
+    /// changed, when the server keeps none; when it was the last reference the transfer memory
+    /// goes, as [`Dispatcher::release_kept_transfer_memory`] says.
+    pub fn release_kept_transfer_memory(&mut self, object: ObjectId) -> SvcResult<()> {
+        let server = self.server;
+        self.dispatcher
+            .with::<(&mut Scheduler,), _>(|(scheduler,)| {
+                hooks::release_kept_transfer_memory_in(scheduler, server, object)
+            })
+            .map_err(call_error)
     }
 
     /// Records an event for the request. It is recorded, stamped with the request's sender and

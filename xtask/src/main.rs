@@ -9,6 +9,7 @@
 
 mod gen_classes;
 mod host_access;
+mod packages;
 mod table_deps;
 mod tools;
 mod unused_deps;
@@ -227,6 +228,9 @@ enum Action {
     /// Fail if the committed GPU class tables differ from a fresh generation; skipped when the
     /// reference folder has no class headers (`gen_classes`).
     Classes,
+    /// Run clippy on each workspace package on its own, so that no other member's features
+    /// reach its build (`packages`).
+    Packages,
 }
 
 /// One gate step: a display name and what it does.
@@ -355,6 +359,10 @@ fn steps(plan: Plan) -> Vec<Step> {
                 "-D",
                 "warnings",
             ]),
+        },
+        Step {
+            name: "packages",
+            action: Action::Packages,
         },
         Step {
             name: "test",
@@ -643,6 +651,46 @@ fn classes() -> bool {
     true
 }
 
+/// The gate's `packages` step for the checkout at `root`: clippy on each workspace package on
+/// its own, each command run through `run` (which returns whether it succeeded). A member list
+/// that cannot be read, or names no package, fails the step without running anything. Returns
+/// whether the step passes.
+fn each_package(root: &Path, run: impl FnMut(&[String]) -> bool) -> bool {
+    match packages::workspace_packages(root) {
+        Ok(packages) => check_each(&packages, run),
+        Err(error) => {
+            eprintln!("{error}");
+            false
+        }
+    }
+}
+
+/// Runs `cargo clippy -p <package>` ([`packages::commands`]) for each of `packages` in order
+/// through `run`, stopping at the first that fails. Returns whether every one passed.
+fn check_each(packages: &[String], mut run: impl FnMut(&[String]) -> bool) -> bool {
+    for (package, args) in packages.iter().zip(packages::commands(packages)) {
+        eprintln!("    cargo {}", args.join(" "));
+        if !run(&args) {
+            eprintln!(
+                "{package} does not build on its own, or warns when built on its own: the \
+                 workspace-wide build turns on features (test-support, say) that this package \
+                 alone does not get. Gate items used only by tests behind the same cfg, and \
+                 build it with `cargo clippy -p {package} -- -D warnings`."
+            );
+            return false;
+        }
+    }
+    true
+}
+
+/// Runs `cargo` with `args` in the current folder. Returns whether it exited successfully.
+fn run_cargo(args: &[String]) -> bool {
+    cargo()
+        .args(args)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 /// `cargo xtask gen-classes [--check]`: needs the class headers, unlike the gate step.
 fn gen_classes_command(check: bool) -> ExitCode {
     let root = match workspace_root(Path::new(env!("CARGO_MANIFEST_DIR"))) {
@@ -742,42 +790,7 @@ fn ci(offline: bool) -> ExitCode {
     let total = Instant::now();
     for Step { name, action } in steps(plan) {
         let start = Instant::now();
-        let ok = match action {
-            Action::Cargo(args) => {
-                eprintln!("==> {name}: cargo {}", args.join(" "));
-                cargo()
-                    .args(&args)
-                    .status()
-                    .is_ok_and(|status| status.success())
-            }
-            Action::WorkspaceDependencies => {
-                eprintln!("==> {name}: [workspace.dependencies] against the members");
-                workspace_dependencies()
-            }
-            Action::TableDependencies => {
-                eprintln!("==> {name}: dev, build and target dependencies against the sources");
-                table_dependencies()
-            }
-            Action::HostAccess => {
-                eprintln!(
-                    "==> {name}: no host clock, randomness, file or network access in {}",
-                    host_access::CRATES.join(", ")
-                );
-                host_access()
-            }
-            Action::Machete => {
-                eprintln!("==> {name}: cargo machete against xtask/unused-deps.toml");
-                run_machete()
-            }
-            Action::Classes => {
-                eprintln!(
-                    "==> {name}: {} against a fresh generation from the class headers",
-                    gen_classes::OUTPUT_FOLDER
-                );
-                classes()
-            }
-        };
-        if !ok {
+        if !run_step(name, action, Path::new("."), &mut run_cargo) {
             eprintln!("==> {name} FAILED");
             return ExitCode::FAILURE;
         }
@@ -785,6 +798,58 @@ fn ci(offline: bool) -> ExitCode {
     }
     eprintln!("==> gate passed in {:.1}s", total.elapsed().as_secs_f64());
     ExitCode::SUCCESS
+}
+
+/// Announces one gate step and runs it. Returns whether it passes.
+///
+/// The `cargo` commands of the cargo and packages steps go through `run` (which returns whether
+/// the command succeeded), and the packages step lists the members of the checkout at `root`;
+/// the other steps read the current folder, which [`ci`] has set to the workspace root.
+fn run_step(
+    name: &str,
+    action: Action,
+    root: &Path,
+    run: &mut impl FnMut(&[String]) -> bool,
+) -> bool {
+    match action {
+        Action::Cargo(args) => {
+            eprintln!("==> {name}: cargo {}", args.join(" "));
+            run(&args.into_iter().map(str::to_owned).collect::<Vec<_>>())
+        }
+        Action::WorkspaceDependencies => {
+            eprintln!("==> {name}: [workspace.dependencies] against the members");
+            workspace_dependencies()
+        }
+        Action::TableDependencies => {
+            eprintln!("==> {name}: dev, build and target dependencies against the sources");
+            table_dependencies()
+        }
+        Action::HostAccess => {
+            eprintln!(
+                "==> {name}: no host clock, randomness, file or network access in {}",
+                host_access::CRATES.join(", ")
+            );
+            host_access()
+        }
+        Action::Machete => {
+            eprintln!("==> {name}: cargo machete against xtask/unused-deps.toml");
+            run_machete()
+        }
+        Action::Classes => {
+            eprintln!(
+                "==> {name}: {} against a fresh generation from the class headers",
+                gen_classes::OUTPUT_FOLDER
+            );
+            classes()
+        }
+        Action::Packages => {
+            eprintln!(
+                "==> {name}: each workspace package on its own (cargo clippy -p <package> \
+                     --locked -- -D warnings)"
+            );
+            each_package(root, run)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -985,6 +1050,7 @@ mod tests {
                 "machete",
                 "deny",
                 "clippy",
+                "packages",
                 "test",
                 "doctest"
             ]
@@ -1007,6 +1073,7 @@ mod tests {
                 "host-access",
                 "classes",
                 "clippy",
+                "packages",
                 "test",
                 "doctest"
             ]
@@ -1032,6 +1099,145 @@ mod tests {
         assert_eq!(action_of("host-access"), Some(&Action::HostAccess));
         assert_eq!(action_of("machete"), Some(&Action::Machete));
         assert_eq!(action_of("classes"), Some(&Action::Classes));
+        assert_eq!(action_of("packages"), Some(&Action::Packages));
+    }
+
+    fn strings(list: &[&str]) -> Vec<String> {
+        list.iter().map(|item| (*item).to_owned()).collect()
+    }
+
+    /// A fake cargo runner: records each command it is given and fails the `fail_at`th (from 0).
+    fn fake_cargo(
+        commands: &mut Vec<Vec<String>>,
+        fail_at: Option<usize>,
+    ) -> impl FnMut(&[String]) -> bool + '_ {
+        move |args| {
+            let ok = fail_at != Some(commands.len());
+            commands.push(args.to_vec());
+            ok
+        }
+    }
+
+    #[test]
+    fn each_package_runs_every_command_in_member_order_when_all_pass() {
+        let packages = strings(&["first", "second", "third"]);
+        let mut commands = Vec::new();
+        assert!(check_each(&packages, fake_cargo(&mut commands, None)));
+        assert_eq!(commands, packages::commands(&packages));
+        assert_eq!(commands.len(), 3);
+    }
+
+    #[test]
+    fn a_failing_package_fails_the_step_and_stops_it() {
+        let packages = strings(&["first", "second", "third"]);
+        for fail_at in 0..packages.len() {
+            let mut commands = Vec::new();
+            assert!(
+                !check_each(&packages, fake_cargo(&mut commands, Some(fail_at))),
+                "failure at {fail_at}"
+            );
+            // Every command up to and including the failing one ran, and none after it.
+            assert_eq!(
+                commands,
+                packages::commands(&packages)[..=fail_at],
+                "failure at {fail_at}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_member_list_that_cannot_be_read_fails_the_step_without_running_anything() {
+        for (name, manifest) in [
+            ("unreadable", "[workspace]\nmembers = [\"crates/gone\"]\n"),
+            ("empty", "[workspace]\nmembers = []\n"),
+        ] {
+            let root = walk::scratch_checkout("each-package", name, &[("Cargo.toml", manifest)]);
+            let mut commands = Vec::new();
+            assert!(
+                !each_package(&root, fake_cargo(&mut commands, None)),
+                "{name}"
+            );
+            assert!(commands.is_empty(), "{name}: {commands:?}");
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+        // One step off: a readable list with one package runs its one command and passes.
+        let root = walk::scratch_checkout(
+            "each-package",
+            "one",
+            &[
+                ("Cargo.toml", "[workspace]\nmembers = [\"crates/a\"]\n"),
+                ("crates/a/Cargo.toml", "[package]\nname = \"a\"\n"),
+            ],
+        );
+        let mut commands = Vec::new();
+        assert!(each_package(&root, fake_cargo(&mut commands, None)));
+        assert_eq!(commands, packages::commands(&strings(&["a"])));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_packages_step_checks_each_workspace_member_through_the_runner() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let expected = packages::commands(&packages::workspace_packages(root).unwrap());
+        assert!(expected.len() > 1, "{expected:?}");
+        let mut commands = Vec::new();
+        assert!(run_step(
+            "packages",
+            Action::Packages,
+            root,
+            &mut fake_cargo(&mut commands, None)
+        ));
+        assert_eq!(commands, expected);
+        // A failure of the last member's command fails the step.
+        let mut commands = Vec::new();
+        assert!(!run_step(
+            "packages",
+            Action::Packages,
+            root,
+            &mut fake_cargo(&mut commands, Some(expected.len() - 1))
+        ));
+        assert_eq!(commands, expected);
+    }
+
+    #[test]
+    fn a_cargo_step_runs_its_arguments_through_the_runner_and_reports_its_outcome() {
+        let args = vec!["fmt", "--all", "--check"];
+        for (fail_at, passes) in [(None, true), (Some(0), false)] {
+            let mut commands = Vec::new();
+            assert_eq!(
+                run_step(
+                    "fmt",
+                    Action::Cargo(args.clone()),
+                    Path::new("."),
+                    &mut fake_cargo(&mut commands, fail_at)
+                ),
+                passes
+            );
+            assert_eq!(commands, vec![strings(&args)]);
+        }
+    }
+
+    #[test]
+    fn every_plan_checks_each_package_on_its_own_after_the_workspace_clippy() {
+        for nextest in [false, true] {
+            for deny in [
+                None,
+                Some(DenyChecks::All),
+                Some(DenyChecks::WithoutAdvisories),
+            ] {
+                for machete in [false, true] {
+                    let plan = Plan {
+                        nextest,
+                        deny,
+                        machete,
+                    };
+                    let names = names(&steps(plan));
+                    let at = |name| names.iter().position(|step| *step == name);
+                    assert_eq!(at("packages"), at("clippy").map(|at| at + 1), "{plan:?}");
+                    assert_eq!(at("test"), at("packages").map(|at| at + 1), "{plan:?}");
+                }
+            }
+        }
     }
 
     #[test]

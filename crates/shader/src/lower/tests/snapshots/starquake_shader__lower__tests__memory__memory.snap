@@ -25,19 +25,19 @@ struct type_3 {
     }
     metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     if (1u < 2u) {
-        local_memory.inner[1u] = 7u;
+        local_memory.inner[metal::min(1u, 1u)] = 7u;
     }
-    uint _e14 = local_memory.inner[metal::min(1u, 1u)];
-    uint _e18 = 4u >> 2u;
-    uint _e26 = shared_memory.inner[metal::min(_e18, 2u)];
-    uint _e30 = _e18 + 1u;
-    uint _e37 = shared_memory.inner[metal::min(_e30, 2u)];
-    uint _e42 = 2u >> 2u;
-    uint _e50 = shared_memory.inner[metal::min(_e42, 2u)];
-    uint _e55 = (2u << 3u) & 16u;
-    uint _e62 = 8u >> 2u;
-    if (_e62 < 3u) {
-        shared_memory.inner[_e62] = (1u < 2u) ? _e14 : 0u;
+    uint _e16 = local_memory.inner[metal::min(1u, 1u)];
+    uint _e20 = 4u >> 2u;
+    uint _e28 = shared_memory.inner[metal::min(_e20, 2u)];
+    uint _e32 = _e20 + 1u;
+    uint _e39 = shared_memory.inner[metal::min(_e32, 2u)];
+    uint _e44 = 2u >> 2u;
+    uint _e52 = shared_memory.inner[metal::min(_e44, 2u)];
+    uint _e57 = (2u << 3u) & 16u;
+    uint _e64 = 8u >> 2u;
+    if (_e64 < 3u) {
+        shared_memory.inner[metal::min(_e64, 2u)] = (1u < 2u) ? _e16 : 0u;
     }
     return;
 }

@@ -64,6 +64,12 @@
 //!   the structurizer's job. Whether real shaders' output needs the looser rule is a guess to
 //!   check against the output of slices 8 (passes) and 11 (structurizer). Pinned by
 //!   `verify::tests::structured_scopes`.
+//! - In a structured function, a phi takes each value from a block that can run last before
+//!   the phi's block, and the value is in scope at the end of that block, where the lowering
+//!   stores it (`PhiNotPredecessor`, `PhiOutOfScope`: the verifier's step 5, issue #488).
+//!   Eden's `ValidateTypes` and `ValidateForwardDeclarations` skip phis. Pinned by
+//!   `verify::phis::tests::the_blocks_that_can_run_last` and
+//!   `verify::phis::tests::a_structured_phis_value_is_in_scope_at_the_end_of_its_block`.
 //! - A structured tree may nest at most [`MAX_NESTING`] levels; Eden has no bound. The bound
 //!   is a starquake choice (a guess at what real shaders need, to be checked against the
 //!   structurizer's output, slice 11) that keeps the verifier's recursion bounded. Pinned by

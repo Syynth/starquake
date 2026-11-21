@@ -28,17 +28,20 @@ use starquake_shader::exchange::{
 use starquake_shader::host::{
     GuestSlot, HostBuiltIn, HostShader, InterfaceSlot, SlotBinding, SlotType,
 };
+use starquake_shader::info::Interpolation;
 use starquake_shader::lookup::{
     EngineState, GuestStage, ProgramMemory, ProgramRequest, Rejection, ShaderSet, Ticket, Unmapped,
     VariantKey,
 };
 use starquake_shader::program::translate_program;
+use starquake_shader::sph::{HEADER_BYTES as SPH_BYTES, HEADER_WORDS as SPH_WORDS};
 use starquake_shader::translate::{
     COLOR_TARGETS, ColorOutputs, Stage, TranslateError, Unsupported,
 };
 use starquake_shader::variant::{
     ATTRIBUTE_MASK_LANES, AttributeMask, AttributeType, ColorType, CompareFunction as KeyCompare,
-    EmulationKey, FollowingStage, PreviousStores, Swizzle, SwizzleSource, VERTEX_ATTRIBUTES,
+    EmulationKey, FollowingStage, OUTPUT_GENERICS, OutputInterpolation, PreviousStores, Swizzle,
+    SwizzleSource, VERTEX_ATTRIBUTES,
 };
 
 use super::call::{DrawCalls, Source, Started};
@@ -1779,6 +1782,11 @@ fn every_emulation_flag_reaches_the_key_through_a_draw() {
     assert_eq!(seen.key.vertex_attributes[2], AttributeType::Disabled);
     assert_eq!(seen.key.color_targets[0], ColorType::UnsignedInt);
     assert_eq!(seen.key.color_targets[1], ColorType::Float);
+    // The compute fields stay zero for a draw: the shader crate ignores them for a graphics
+    // program, so a non-zero value would only split the shader cache.
+    assert_eq!(seen.key.workgroup_size, [0; 3]);
+    assert_eq!(seen.key.shared_memory_size, 0);
+    assert_eq!(seen.key.local_memory_size, 0);
     // The pipeline gets the same flags. With the second attribute past the device's one, the
     // backend refuses the pipeline (the fetch-from-buffer path is not built: every attribute is
     // still in the vertex layout), so that draw is skipped; without it the pipeline is made with
@@ -4830,5 +4838,465 @@ fn a_format_change_keeps_a_sampled_answer_through_engine_state() {
             .flatten()
             .map(|kind| kind.format),
         Some(TextureFormat::from_texhead_word0(snorm[0]))
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The vertex outputs' interpolation (shaders module docs).
+
+/// The input map's two-bit modes (`NVC797_SPHV4T2_GENERIC_IMAP_X_*`,
+/// `mesa-nouveau/src/nouveau/headers/nvidia/classes/clc797sph.h` @ 52238762), written out.
+const IMAP_UNUSED: u32 = 0;
+const IMAP_CONSTANT: u32 = 1;
+const IMAP_PERSPECTIVE: u32 = 2;
+const IMAP_SCREEN_LINEAR: u32 = 3;
+
+/// The input-map byte of one generic: the modes of x, y, z and w, two bits each, x lowest.
+const fn imap(x: u32, y: u32, z: u32, w: u32) -> u32 {
+    x | y << 2 | z << 4 | w << 6
+}
+
+/// A header built by hand from `clc797sph.h`: `SPH_TYPE` (`MW(4:0)`) `sph_type`, `VERSION`
+/// (`MW(9:5)`) 4, `SHADER_TYPE` (`MW(13:10)`) `shader_type`, and word 6 (bits 192 to 223) set
+/// to `input_map`, which in a type 2 header holds generics 0 to 3 of the input map
+/// (`GENERIC_IMAP_X(i)` = `MW((193+i*8):(192+i*8))`, then y, z and w).
+fn header_words(sph_type: u32, shader_type: u32, input_map: u32) -> [u32; SPH_WORDS] {
+    let mut words = [0; SPH_WORDS];
+    words[0] = sph_type | 4 << 5 | shader_type << 10;
+    words[6] = input_map;
+    words
+}
+
+/// A header's words as the bytes guest memory holds, little-endian.
+fn sph_bytes(words: [u32; SPH_WORDS]) -> [u8; SPH_BYTES] {
+    let mut out = [0; SPH_BYTES];
+    for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(words) {
+        *chunk = word.to_le_bytes();
+    }
+    out
+}
+
+/// A pixel header (`SPH_TYPE_TYPE_02_PS` = 2, `SHADER_TYPE_PIXEL` = 5) with generics 0 to 3 of
+/// the input map given by `generics`, one byte each.
+fn pixel_header(generics: [u32; 4]) -> [u32; SPH_WORDS] {
+    let [g0, g1, g2, g3] = generics;
+    header_words(2, 5, g0 | g1 << 8 | g2 << 16 | g3 << 24)
+}
+
+/// An output interpolation with generics 0 to 3 set to `first` and every other generic
+/// smooth.
+fn modes(first: [Interpolation; 4]) -> OutputInterpolation {
+    let mut modes = [Interpolation::Smooth; OUTPUT_GENERICS];
+    modes[..4].copy_from_slice(&first);
+    OutputInterpolation::new(modes)
+}
+
+/// Where the output interpolation starts in an encoded key: found from a key whose only
+/// non-default field is generic 0's mode.
+fn interpolation_offset() -> usize {
+    let key = VariantKey {
+        output_interpolation: modes([
+            Interpolation::Flat,
+            Interpolation::Smooth,
+            Interpolation::Smooth,
+            Interpolation::Smooth,
+        ]),
+        ..VariantKey::default()
+    };
+    let bytes = key.encode();
+    let base = VariantKey::default().encode();
+    bytes
+        .iter()
+        .zip(&base)
+        .position(|(a, b)| a != b)
+        .expect("one byte differs")
+}
+
+#[test]
+fn the_pixel_programs_interpolation_reaches_the_key() {
+    use Interpolation::{Flat, NoPerspective, Smooth};
+    let mut rig = Rig::new(ready_with(
+        vertex_storing(&[0, 1, 2]),
+        host_shader(GuestStage::Pixel),
+    ));
+    rig.basic();
+    // Generic 0 perspective, 1 flat, 2 screen-linear (no perspective), 3 flat in y and w only.
+    let header = pixel_header([
+        imap(
+            IMAP_PERSPECTIVE,
+            IMAP_PERSPECTIVE,
+            IMAP_PERSPECTIVE,
+            IMAP_PERSPECTIVE,
+        ),
+        imap(IMAP_CONSTANT, IMAP_CONSTANT, IMAP_CONSTANT, IMAP_CONSTANT),
+        imap(
+            IMAP_SCREEN_LINEAR,
+            IMAP_SCREEN_LINEAR,
+            IMAP_SCREEN_LINEAR,
+            IMAP_SCREEN_LINEAR,
+        ),
+        imap(IMAP_UNUSED, IMAP_CONSTANT, IMAP_UNUSED, IMAP_CONSTANT),
+    ]);
+    rig.write_words(PIXEL_PROGRAM, &header);
+    assert_eq!(rig.draw(), Outcome::Drawn);
+    let first = modes([Smooth, Flat, NoPerspective, Flat]);
+    // Every lookup of the draw carries the modes (the second has the learned stores).
+    assert_eq!(rig.shaders.seen.len(), 2);
+    for seen in &rig.shaders.seen {
+        assert_eq!(seen.key.output_interpolation, first);
+    }
+    // Golden: the key's bytes of generics 0 to 3 (Eden's codes: smooth 0, flat 1, no
+    // perspective 2), and every later generic smooth.
+    let bytes = rig.shaders.seen[1].key.encode();
+    let at = interpolation_offset();
+    assert_eq!(bytes[at..at + 4], [0, 1, 2, 1]);
+    assert!(bytes[at + 4..at + OUTPUT_GENERICS].iter().all(|&b| b == 0));
+
+    // The program is rewritten in place: generic 1 becomes perspective. The next draw reads
+    // the new header and the key changes.
+    let header = pixel_header([
+        imap(
+            IMAP_PERSPECTIVE,
+            IMAP_PERSPECTIVE,
+            IMAP_PERSPECTIVE,
+            IMAP_PERSPECTIVE,
+        ),
+        imap(
+            IMAP_PERSPECTIVE,
+            IMAP_PERSPECTIVE,
+            IMAP_PERSPECTIVE,
+            IMAP_PERSPECTIVE,
+        ),
+        imap(
+            IMAP_SCREEN_LINEAR,
+            IMAP_SCREEN_LINEAR,
+            IMAP_SCREEN_LINEAR,
+            IMAP_SCREEN_LINEAR,
+        ),
+        imap(IMAP_UNUSED, IMAP_CONSTANT, IMAP_UNUSED, IMAP_CONSTANT),
+    ]);
+    rig.write_words(PIXEL_PROGRAM, &header);
+    assert_eq!(rig.draw(), Outcome::Drawn);
+    let second = modes([Smooth, Smooth, NoPerspective, Flat]);
+    let last = rig.shaders.seen.last().expect("a lookup").key.clone();
+    assert_eq!(last.output_interpolation, second);
+    // Only the interpolation differs from the first draw's key.
+    let mut earlier = rig.shaders.seen[1].key.clone();
+    assert_ne!(earlier, last);
+    earlier.output_interpolation = second;
+    assert_eq!(earlier, last);
+
+    // The header changes but not its modes: components partly unused, generic 4 made
+    // perspective (smooth either way, word 7), and colour target 0's output map written
+    // (`OMAP_TARGET`, word 18). The same key.
+    let mut header = pixel_header([
+        imap(IMAP_PERSPECTIVE, IMAP_UNUSED, IMAP_UNUSED, IMAP_PERSPECTIVE),
+        imap(IMAP_PERSPECTIVE, IMAP_UNUSED, IMAP_PERSPECTIVE, IMAP_UNUSED),
+        imap(IMAP_SCREEN_LINEAR, IMAP_UNUSED, IMAP_UNUSED, IMAP_UNUSED),
+        imap(IMAP_UNUSED, IMAP_CONSTANT, IMAP_UNUSED, IMAP_UNUSED),
+    ]);
+    header[7] = imap(
+        IMAP_PERSPECTIVE,
+        IMAP_PERSPECTIVE,
+        IMAP_PERSPECTIVE,
+        IMAP_PERSPECTIVE,
+    );
+    header[18] = 0xf;
+    rig.write_words(PIXEL_PROGRAM, &header);
+    let before = rig.shaders.seen.len();
+    assert_eq!(rig.draw(), Outcome::Drawn);
+    assert_eq!(rig.shaders.seen.len(), before + 1);
+    assert_eq!(rig.shaders.seen.last().expect("a lookup").key, last);
+
+    // Rasterisation off: no pixel program, every generic smooth.
+    rig.set(
+        &clc797::SET_RASTER_ENABLE,
+        &[],
+        clc797::SET_RASTER_ENABLE_V_FALSE,
+    );
+    let before = rig.shaders.seen.len();
+    rig.draw();
+    assert!(rig.shaders.seen.len() > before);
+    let seen = rig.shaders.seen.last().expect("a lookup");
+    assert!(seen.requests.iter().all(|r| r.stage != GuestStage::Pixel));
+    assert_eq!(seen.key.output_interpolation, OutputInterpolation::SMOOTH);
+}
+
+#[test]
+fn a_pixel_header_the_key_cannot_use_leaves_every_generic_smooth() {
+    use Interpolation::{Flat, Smooth};
+    let flat_header = pixel_header([
+        imap(IMAP_CONSTANT, IMAP_CONSTANT, IMAP_CONSTANT, IMAP_CONSTANT),
+        0,
+        0,
+        0,
+    ]);
+    let flat = modes([Flat, Smooth, Smooth, Smooth]);
+    let header_bytes = u64::try_from(SPH_BYTES).expect("fits");
+    let end = BASE + PAGES * PAGE_SIZE;
+    // (what, the pixel program's address, the header written there, the modes expected)
+    let cases: [(&str, u64, Option<[u32; SPH_WORDS]>, OutputInterpolation); 6] = [
+        // Version 0: not a header the shader crate reads.
+        (
+            "zeros",
+            PIXEL_PROGRAM,
+            Some([0; SPH_WORDS]),
+            OutputInterpolation::SMOOTH,
+        ),
+        // A type 1 (vertex) header in the pixel slot, with the same word 6.
+        (
+            "vertex header",
+            PIXEL_PROGRAM,
+            Some(header_words(1, 1, flat_header[6])),
+            OutputInterpolation::SMOOTH,
+        ),
+        // Generic 2 perspective in x and flat in y.
+        (
+            "mixed modes",
+            PIXEL_PROGRAM,
+            Some(pixel_header([
+                imap(IMAP_CONSTANT, IMAP_CONSTANT, IMAP_CONSTANT, IMAP_CONSTANT),
+                0,
+                imap(IMAP_PERSPECTIVE, IMAP_CONSTANT, IMAP_UNUSED, IMAP_UNUSED),
+                0,
+            ])),
+            OutputInterpolation::SMOOTH,
+        ),
+        // Nothing mapped at the address.
+        ("unmapped", end, None, OutputInterpolation::SMOOTH),
+        // The header's last byte is the first unmapped one.
+        (
+            "one byte short",
+            end - header_bytes + 1,
+            None,
+            OutputInterpolation::SMOOTH,
+        ),
+        // The header ends exactly at the end of memory: mapped, and read.
+        ("at the end", end - header_bytes, Some(flat_header), flat),
+    ];
+    for (what, address, header, expected) in cases {
+        let mut rig = Rig::new(ready_with(
+            vertex_storing(&[0]),
+            host_shader(GuestStage::Pixel),
+        ));
+        rig.basic();
+        // First a flat header, so a key that kept the last modes would fail.
+        rig.write_words(PIXEL_PROGRAM, &flat_header);
+        assert_eq!(rig.draw(), Outcome::Drawn, "{what}");
+        assert_eq!(
+            rig.shaders
+                .seen
+                .last()
+                .expect("a lookup")
+                .key
+                .output_interpolation,
+            flat,
+            "{what}"
+        );
+        if let Some(header) = header {
+            rig.write_words(address, &header);
+        }
+        rig.address(
+            &clc797::SET_PIPELINE_PROGRAM_ADDRESS_A,
+            &clc797::SET_PIPELINE_PROGRAM_ADDRESS_B,
+            &[5],
+            address,
+        );
+        let before = rig.shaders.seen.len();
+        // The draw still looks the set up.
+        assert_eq!(rig.draw(), Outcome::Drawn, "{what}");
+        assert!(rig.shaders.seen.len() > before, "{what}");
+        for seen in &rig.shaders.seen[before..] {
+            assert_eq!(seen.key.output_interpolation, expected, "{what}");
+        }
+    }
+}
+
+#[test]
+fn pixel_interpolation_reads_the_shader_crates_header() {
+    use Interpolation::{Flat, NoPerspective, Smooth};
+    let bytes = sph_bytes;
+    let header = pixel_header([
+        imap(IMAP_SCREEN_LINEAR, IMAP_UNUSED, IMAP_UNUSED, IMAP_UNUSED),
+        imap(IMAP_UNUSED, IMAP_UNUSED, IMAP_UNUSED, IMAP_CONSTANT),
+        0,
+        imap(IMAP_PERSPECTIVE, IMAP_UNUSED, IMAP_PERSPECTIVE, IMAP_UNUSED),
+    ]);
+    assert_eq!(
+        shaders::pixel_interpolation(&bytes(header)),
+        modes([NoPerspective, Flat, Smooth, Smooth])
+    );
+    // The same words as a type 1 header: smooth.
+    assert_eq!(
+        shaders::pixel_interpolation(&bytes(header_words(1, 1, header[6]))),
+        OutputInterpolation::SMOOTH
+    );
+    // Generic 0 screen-linear in x and perspective in w: smooth.
+    let mixed = pixel_header([
+        imap(
+            IMAP_SCREEN_LINEAR,
+            IMAP_UNUSED,
+            IMAP_UNUSED,
+            IMAP_PERSPECTIVE,
+        ),
+        0,
+        0,
+        0,
+    ]);
+    assert_eq!(
+        shaders::pixel_interpolation(&bytes(mixed)),
+        OutputInterpolation::SMOOTH
+    );
+}
+
+/// Program memory holding one header at one address; every other read is unmapped.
+struct OneHeader {
+    address: u64,
+    bytes: [u8; SPH_BYTES],
+}
+
+impl ProgramMemory for OneHeader {
+    fn read(&self, address: u64, out: &mut [u8]) -> Result<(), Unmapped> {
+        if address != self.address || out.len() != SPH_BYTES {
+            return Err(Unmapped { address });
+        }
+        out.copy_from_slice(&self.bytes);
+        Ok(())
+    }
+}
+
+impl OneHeader {
+    fn new(address: u64, words: [u32; SPH_WORDS]) -> Self {
+        Self {
+            address,
+            bytes: sph_bytes(words),
+        }
+    }
+}
+
+/// Every [`PixelModes::read`](shaders::PixelModes::read) gives the current header's modes,
+/// never a stale answer from the memo: a new header, an unchanged one, one seen two draws ago,
+/// and a header read after a draw with no pixel request or an unmapped header (which give
+/// smooth). What the memo retains is unobservable by design, so this test cannot pin it.
+#[test]
+fn pixel_modes_remember_only_the_last_header() {
+    use Interpolation::{Flat, NoPerspective, Smooth};
+    const ADDRESS: u64 = 0x4_0000;
+    let flat_words = pixel_header([
+        imap(IMAP_CONSTANT, IMAP_CONSTANT, IMAP_CONSTANT, IMAP_CONSTANT),
+        0,
+        0,
+        0,
+    ]);
+    let linear_words = pixel_header([
+        0,
+        imap(IMAP_SCREEN_LINEAR, IMAP_UNUSED, IMAP_UNUSED, IMAP_UNUSED),
+        0,
+        0,
+    ]);
+    let flat = modes([Flat, Smooth, Smooth, Smooth]);
+    let linear = modes([Smooth, NoPerspective, Smooth, Smooth]);
+    // A vertex request first, at another address, so a read of the first request fails.
+    let requests = [
+        ProgramRequest {
+            stage: GuestStage::Vertex,
+            address: ADDRESS + 0x1000,
+        },
+        ProgramRequest {
+            stage: GuestStage::Pixel,
+            address: ADDRESS,
+        },
+    ];
+    let mut memo = shaders::PixelModes::default();
+    let a = OneHeader::new(ADDRESS, flat_words);
+    let b = OneHeader::new(ADDRESS, linear_words);
+    // A, A, B, A, B: each change is seen at the draw that makes it.
+    for (memory, expected) in [
+        (&a, flat),
+        (&a, flat),
+        (&b, linear),
+        (&a, flat),
+        (&b, linear),
+    ] {
+        assert_eq!(memo.read(&requests, memory), expected);
+    }
+    // No pixel request, then an unmapped header: smooth; the reads after them give A's and
+    // B's own modes.
+    assert_eq!(memo.read(&requests[..1], &b), OutputInterpolation::SMOOTH);
+    let elsewhere = OneHeader::new(ADDRESS + 0x2000, flat_words);
+    assert_eq!(
+        memo.read(&requests, &elsewhere),
+        OutputInterpolation::SMOOTH
+    );
+    assert_eq!(memo.read(&requests, &a), flat);
+    assert_eq!(memo.read(&requests, &b), linear);
+    // A fresh memo with B as its first header: nothing remembered gives B's own modes.
+    assert_eq!(shaders::PixelModes::default().read(&requests, &b), linear);
+}
+
+/// Program memory holding several headers, each at its own address; every other read is
+/// unmapped.
+struct Headers(Vec<(u64, [u8; SPH_BYTES])>);
+
+impl ProgramMemory for Headers {
+    fn read(&self, address: u64, out: &mut [u8]) -> Result<(), Unmapped> {
+        let (_, bytes) = self
+            .0
+            .iter()
+            .find(|(at, _)| *at == address)
+            .filter(|_| out.len() == SPH_BYTES)
+            .ok_or(Unmapped { address })?;
+        out.copy_from_slice(bytes);
+        Ok(())
+    }
+}
+
+/// [`PixelModes::read`](shaders::PixelModes::read) reads the request whose stage is pixel, not
+/// the first request past the vertex stage: with every stage's header mapped, and the
+/// tessellation and geometry headers carrying the pixel header's word 6 as type 1 headers, the
+/// key takes the pixel header's modes.
+#[test]
+fn pixel_modes_read_the_pixel_request_after_other_stages() {
+    use Interpolation::{Flat, NoPerspective, Smooth};
+    const PIXEL: u64 = 0x10_0000;
+    let pixel_words = pixel_header([
+        imap(IMAP_CONSTANT, IMAP_CONSTANT, IMAP_CONSTANT, IMAP_CONSTANT),
+        imap(IMAP_SCREEN_LINEAR, IMAP_UNUSED, IMAP_UNUSED, IMAP_UNUSED),
+        0,
+        0,
+    ]);
+    // `SHADER_TYPE` of each stage (`clc797sph.h`): vertex 1, tessellation init 2,
+    // tessellation 3, geometry 4; each a type 1 header.
+    let stages = [
+        (GuestStage::Vertex, 1),
+        (GuestStage::TessellationInit, 2),
+        (GuestStage::Tessellation, 3),
+        (GuestStage::Geometry, 4),
+    ];
+    let mut headers = Vec::new();
+    let mut requests = Vec::new();
+    for ((stage, shader_type), address) in stages.into_iter().zip((1_u64..).map(|i| i << 16)) {
+        headers.push((
+            address,
+            sph_bytes(header_words(1, shader_type, pixel_words[6])),
+        ));
+        requests.push(ProgramRequest { stage, address });
+    }
+    headers.push((PIXEL, sph_bytes(pixel_words)));
+    requests.push(ProgramRequest {
+        stage: GuestStage::Pixel,
+        address: PIXEL,
+    });
+    let memory = Headers(headers);
+    let expected = modes([Flat, NoPerspective, Smooth, Smooth]);
+    // Every list that keeps the pixel request last: a geometry slot alone, and every stage.
+    let geometry_only = [requests[0], requests[3], requests[4]];
+    assert_eq!(
+        shaders::PixelModes::default().read(&geometry_only, &memory),
+        expected
+    );
+    assert_eq!(
+        shaders::PixelModes::default().read(&requests, &memory),
+        expected
     );
 }

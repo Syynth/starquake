@@ -358,37 +358,48 @@ structure:
     ))
 }
 
+/// The lowering stores a phi's incoming value at the end of the block it names, so the value
+/// must be in scope there and the block must be one that can run last before the phi's; the
+/// verifier refuses any other (`ir::verify`, step 5) before the lowering starts, so
+/// [`LowerError::PhiIncoming`] is not reached through [`lower_with`].
 #[test]
 fn a_phi_value_out_of_scope_is_refused() {
-    // %1 is in scope at the end of block1, not yet computed at the end of block0, and out of
-    // scope at the end of block2 (the `if` body that holds it has ended).
-    for incoming in ["[block1: %1]", "[block2: %2]", "[block2: u32 9]"] {
+    // block2 is the one block that can run last before block3; %2 is in scope at its end.
+    for incoming in ["[block2: %2]", "[block2: u32 9]"] {
         lowered(
             GuestStage::Compute,
             &phi_taking(incoming),
             &LowerInputs::DEFAULT,
         );
     }
-    for (incoming, from) in [("[block0: %1]", 0), ("[block2: %1]", 2)] {
-        let function = phi_taking(incoming);
-        let block = function
+    let block = |function: &Function, index: usize| {
+        function
             .blocks()
-            .nth(from)
+            .nth(index)
             .map(|(id, _)| id)
-            .expect("a block");
-        let error =
-            lower_with(GuestStage::Compute, &function, &LowerInputs::DEFAULT).expect_err("refused");
+            .expect("a block")
+    };
+    // %1 is out of scope at the end of block2 (the `if` body that holds it has ended).
+    let function = phi_taking("[block2: %1]");
+    assert_eq!(
+        lower_with(GuestStage::Compute, &function, &LowerInputs::DEFAULT).err(),
+        Some(LowerError::Verify(VerifyError::PhiOutOfScope {
+            at: value_at(&function, 3),
+            operand: value_at(&function, 1),
+            block: block(&function, 2),
+        }))
+    );
+    // block1 (inside the `if`) and block0 (where %1 is not computed yet either) cannot run last
+    // before block3.
+    for (incoming, from) in [("[block1: %1]", 1), ("[block0: %1]", 0)] {
+        let function = phi_taking(incoming);
         assert_eq!(
-            error,
-            LowerError::PhiIncoming {
+            lower_with(GuestStage::Compute, &function, &LowerInputs::DEFAULT).err(),
+            Some(LowerError::Verify(VerifyError::PhiNotPredecessor {
                 at: value_at(&function, 3),
-                from: block,
-                value: value_at(&function, 1),
-            }
-        );
-        assert_eq!(
-            error.to_string(),
-            format!("%3 takes %1 from block{from}, where it is not in scope")
+                block: block(&function, from),
+            })),
+            "{incoming}"
         );
     }
 }
@@ -415,8 +426,9 @@ structure:
 
 #[test]
 fn a_loop_bodys_value_leaves_scope_at_its_end() {
-    // %0 is in scope at the end of block1, in the loop body, and out of it at block2's.
-    let text = |from: &str| {
+    // %0 is in scope at the end of block1, in the loop body, and out of it at block2's; the
+    // phi in block3 takes it from the block run right before block3.
+    let text = |after_loop: &str, from: &str| {
         format!(
             "block0:
 block1:
@@ -430,26 +442,24 @@ structure:
     loop {{
         block1
     }} repeat u1 false
-    block2
-    block3
-    return
+{after_loop}    return
 "
         )
     };
     lowered(
         GuestStage::Compute,
-        &ir(&text("block1")),
+        &ir(&text("    block3\n    block2\n", "block1")),
         &LowerInputs::DEFAULT,
     );
-    let function = ir(&text("block2"));
+    let function = ir(&text("    block2\n    block3\n", "block2"));
     let block2 = function.blocks().nth(2).map(|(id, _)| id).expect("block2");
     assert_eq!(
         lower_with(GuestStage::Compute, &function, &LowerInputs::DEFAULT).err(),
-        Some(LowerError::PhiIncoming {
+        Some(LowerError::Verify(VerifyError::PhiOutOfScope {
             at: value_at(&function, 1),
-            from: block2,
-            value: value_at(&function, 0),
-        })
+            operand: value_at(&function, 0),
+            block: block2,
+        }))
     );
 }
 

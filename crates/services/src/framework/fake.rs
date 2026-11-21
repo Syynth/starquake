@@ -57,7 +57,17 @@
 //! kernel does once the process has ended (`KernelError::TerminationRequested`). A transfer memory is a range of the caller's memory
 //! a test lends ([`FakeKernel::lend`]); writes through it are bounded by the kernel's own check
 //! (`starquake_kernel::memory::shared::span_within`) and reach only mapped memory. The fake
-//! does not lock the lent pages or take the owner's permission away, as the kernel does.
+//! does not lock the lent pages or take the owner's permission away, as the kernel does. A
+//! server keeps a reference of its own to a lent transfer memory as on the kernel
+//! ([`Kernel::keep_transfer_memory`]): the fake counts the keeps per service (the one
+//! [`FakeKernel::set_current_service`] names, as the kernel notes the server handling the
+//! request) and transfer memory ([`FakeKernel::kept_transfer_memory`]), refuses a release that
+//! has no keep behind it with [`KernelError::InvalidHandle`], and a transfer memory the test
+//! ended while a keep was held ([`FakeKernel::end_transfer_memory`], the guest closing its
+//! handle) stays until the last keep is released ([`FakeKernel::release_kept`], the kernel's
+//! `Dispatcher::release_kept_transfer_memory` for a server's own thread). The kernel's rules are
+//! pinned by `dispatch/hooks/tests/kept.rs` in the kernel crate, and the fake's by
+//! `a_kept_transfer_memory_stays_after_the_guest_ends_it_until_the_last_release`.
 //!
 //! Clearing and ending are modelled as plainly. An event the fake made is signalled from a
 //! signal until a clear ([`FakeKernel::is_signalled`]). Either end of a hooked event clears it,
@@ -147,6 +157,12 @@ pub struct FakeKernel {
     shared: BTreeMap<ObjectId, (SharedPages, SvcPermission)>,
     /// The transfer memories a test lent ([`FakeKernel::lend`]).
     transfers: BTreeMap<ObjectId, TransferMemory>,
+    /// The references servers keep to lent transfer memories, by service and transfer memory,
+    /// with how many ([`Kernel::keep_transfer_memory`]).
+    kept: BTreeMap<(ServiceId, ObjectId), u32>,
+    /// The lent transfer memories the test ended while a server kept one
+    /// ([`FakeKernel::end_transfer_memory`]): each goes with its last keep.
+    guest_closed: BTreeSet<ObjectId>,
     sessions: Vec<ObjectId>,
     regions: Vec<Region>,
     /// The services [`Kernel::connect`] knows.
@@ -190,6 +206,8 @@ impl FakeKernel {
             device_locks: BTreeMap::new(),
             shared: BTreeMap::new(),
             transfers: BTreeMap::new(),
+            kept: BTreeMap::new(),
+            guest_closed: BTreeSet::new(),
             sessions: Vec::new(),
             regions: Vec::new(),
             services: BTreeSet::new(),
@@ -260,7 +278,10 @@ impl FakeKernel {
 
     /// Makes every call that creates a kernel object for a server ([`Kernel::create_event`],
     /// [`Kernel::create_shared_memory`]) fail with `refusal`, as the kernel's do when its object
-    /// table is full ([`KernelError::OutOfResource`]); `None` lets them succeed again.
+    /// table is full ([`KernelError::OutOfResource`]); `None` lets them succeed again. Keeping a
+    /// transfer memory ([`Kernel::keep_transfer_memory`]), which takes a reference the kernel can
+    /// fail to take (its own bookkeeping, `KernelError::InvalidState`), counts as such a call
+    /// once the transfer memory is found live.
     pub fn refuse_objects(&mut self, refusal: Option<KernelError>) {
         self.refuse_objects_after(0, refusal);
     }
@@ -379,10 +400,53 @@ impl FakeKernel {
         object
     }
 
-    /// Ends the transfer memory `object`, as closing its last handle does: later calls on it
-    /// are [`KernelError::InvalidHandle`]. False if it named no transfer memory.
+    /// Ends the guest's hold on the transfer memory `object`, as closing its last handle does:
+    /// unless a server keeps a reference to it ([`Kernel::keep_transfer_memory`]), it goes, and
+    /// later calls on it are [`KernelError::InvalidHandle`]; if one does, it goes when the last
+    /// keep is released ([`FakeKernel::release_kept`]). False if it named no transfer memory the
+    /// guest still held.
     pub fn end_transfer_memory(&mut self, object: ObjectId) -> bool {
-        self.transfers.remove(&object).is_some()
+        if !self.transfers.contains_key(&object) || self.guest_closed.contains(&object) {
+            return false;
+        }
+        if self.is_kept(object) {
+            self.guest_closed.insert(object);
+        } else {
+            self.transfers.remove(&object);
+        }
+        true
+    }
+
+    /// How many references the server of `service` keeps to the transfer memory `object`
+    /// ([`Kernel::keep_transfer_memory`]), as the kernel's `Dispatcher::kept_transfer_memory`.
+    #[must_use]
+    pub fn kept_transfer_memory(&self, service: ServiceId, object: ObjectId) -> u32 {
+        self.kept.get(&(service, object)).copied().unwrap_or(0)
+    }
+
+    /// Drops one reference the server of `service` keeps to the transfer memory `object`, as
+    /// the kernel's `Dispatcher::release_kept_transfer_memory` does on a server's own thread:
+    /// [`KernelError::InvalidHandle`], with nothing changed, when it keeps none. When it was the
+    /// last keep of a transfer memory the guest no longer holds
+    /// ([`FakeKernel::end_transfer_memory`]), the transfer memory goes.
+    pub fn release_kept(&mut self, service: ServiceId, object: ObjectId) -> SvcResult<()> {
+        let count = self
+            .kept
+            .get_mut(&(service, object))
+            .ok_or(KernelError::InvalidHandle)?;
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            self.kept.remove(&(service, object));
+        }
+        if !self.is_kept(object) && self.guest_closed.remove(&object) {
+            self.transfers.remove(&object);
+        }
+        Ok(())
+    }
+
+    /// Whether any server keeps a reference to `object`.
+    fn is_kept(&self, object: ObjectId) -> bool {
+        self.kept.keys().any(|(_, kept)| *kept == object)
     }
 
     /// The caller's address of `len` bytes at `offset` into the transfer memory `object`, as
@@ -582,6 +646,24 @@ impl Kernel for FakeKernel {
     ) -> SvcResult<()> {
         let address = self.lent_range(object, offset, data.len())?;
         self.write_memory(address, data)
+    }
+
+    /// Counts one keep of `object` for the current service ([`FakeKernel::set_current_service`]);
+    /// [`KernelError::InvalidHandle`], with nothing kept, unless it is a live lent transfer
+    /// memory.
+    fn keep_transfer_memory(&mut self, object: ObjectId) -> SvcResult<TransferMemory> {
+        let lent = self.transfer_memory(object)?;
+        if let Some(refusal) = self.refused() {
+            return Err(refusal);
+        }
+        let count = self.kept.entry((self.current, object)).or_insert(0);
+        *count = count.saturating_add(1);
+        Ok(lent)
+    }
+
+    /// [`FakeKernel::release_kept`] for the current service.
+    fn release_kept_transfer_memory(&mut self, object: ObjectId) -> SvcResult<()> {
+        self.release_kept(self.current, object)
     }
 
     fn create_session(&mut self) -> SvcResult<(ObjectId, Handle)> {
@@ -1122,5 +1204,80 @@ mod tests {
             Err(KernelError::InvalidHandle)
         );
         assert_eq!(kernel.memory(0x1000, 4), Some(&[0; 4][..]));
+    }
+
+    #[test]
+    fn a_kept_transfer_memory_stays_after_the_guest_ends_it_until_the_last_release() {
+        const SERVICE: ServiceId = ServiceId(0x31);
+        const OTHER: ServiceId = ServiceId(0x32);
+        let mut kernel = FakeKernel::new(0).unwrap();
+        kernel.map(0x1000, vec![0; 4]);
+        let lent = kernel.lend(0x1000, 4, SvcPermission::None);
+        let event = kernel.create_event().unwrap();
+        kernel.set_current_service(SERVICE);
+        // Only a live lent transfer memory is kept.
+        assert_eq!(
+            kernel.keep_transfer_memory(event).map(|_| ()),
+            Err(KernelError::InvalidHandle)
+        );
+        assert_eq!(kernel.kept_transfer_memory(SERVICE, event), 0);
+        let found = kernel.keep_transfer_memory(lent).unwrap();
+        assert_eq!((found.address(), found.size()), (0x1000, 4));
+        // A refused keep keeps nothing; the refusal counts against the allowance.
+        kernel.refuse_objects_after(1, Some(KernelError::InvalidState));
+        kernel.keep_transfer_memory(lent).unwrap();
+        assert_eq!(
+            kernel.keep_transfer_memory(lent).map(|_| ()),
+            Err(KernelError::InvalidState)
+        );
+        kernel.refuse_objects(None);
+        assert_eq!(kernel.kept_transfer_memory(SERVICE, lent), 2);
+        assert_eq!(kernel.kept_transfer_memory(OTHER, lent), 0);
+        // Another service's release has nothing behind it.
+        assert_eq!(
+            kernel.release_kept(OTHER, lent),
+            Err(KernelError::InvalidHandle)
+        );
+        // The guest ends it: it stays while a keep is held.
+        assert!(kernel.end_transfer_memory(lent));
+        assert!(!kernel.end_transfer_memory(lent));
+        kernel.write_transfer_memory(lent, 0, &[5]).unwrap();
+        kernel.release_kept_transfer_memory(lent).unwrap();
+        assert_eq!(kernel.kept_transfer_memory(SERVICE, lent), 1);
+        kernel.write_transfer_memory(lent, 1, &[6]).unwrap();
+        // The last keep goes, and the transfer memory with it.
+        kernel.release_kept(SERVICE, lent).unwrap();
+        assert_eq!(kernel.kept_transfer_memory(SERVICE, lent), 0);
+        assert_eq!(
+            kernel.transfer_memory(lent),
+            Err(KernelError::InvalidHandle)
+        );
+        assert_eq!(
+            kernel.release_kept(SERVICE, lent),
+            Err(KernelError::InvalidHandle)
+        );
+        assert_eq!(kernel.memory(0x1000, 4), Some(&[5, 6, 0, 0][..]));
+    }
+
+    #[test]
+    fn releasing_a_keep_before_the_guest_ends_it_leaves_it_live() {
+        const SERVICE: ServiceId = ServiceId(0x31);
+        let mut kernel = FakeKernel::new(0).unwrap();
+        kernel.map(0x1000, vec![0; 4]);
+        let lent = kernel.lend(0x1000, 4, SvcPermission::None);
+        kernel.set_current_service(SERVICE);
+        kernel.keep_transfer_memory(lent).unwrap();
+        kernel.release_kept_transfer_memory(lent).unwrap();
+        assert!(kernel.transfer_memory(lent).is_ok());
+        assert_eq!(
+            kernel.release_kept_transfer_memory(lent),
+            Err(KernelError::InvalidHandle)
+        );
+        // Ending it now makes it go at once.
+        assert!(kernel.end_transfer_memory(lent));
+        assert_eq!(
+            kernel.transfer_memory(lent),
+            Err(KernelError::InvalidHandle)
+        );
     }
 }
