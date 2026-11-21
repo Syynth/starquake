@@ -1,8 +1,7 @@
 //! The three handle forms the pass takes, and Eden's opcode table.
 
 use super::{
-    BOUND_BANK, Engine, FLOAT, buffer, op_at, parse, pass, sample_of, scan_error, sources,
-    untraced, value,
+    BOUND_BANK, Engine, FLOAT, op_at, parse, pass, sample_of, scan_error, sources, untraced, value,
 };
 use crate::ir::Opcode;
 use crate::opt::resources::opcodes::{Form, classify, is_storage_image};
@@ -110,14 +109,12 @@ fn a_bound_handle_needs_a_descriptor_buffer() {
     );
     // A bindless handle needs none.
     let bindless = sample_of("    %0: u32 = GetCbufU32 u32 3, u32 0x10\n", "%0");
-    assert!(
-        scan(
-            &parse(&bindless),
-            crate::translate::texture::DescriptorBuffer::new()
-        )
-        .is_ok()
-    );
-    let _ = buffer(BOUND_BANK);
+    let found = scan(
+        &parse(&bindless),
+        crate::translate::texture::DescriptorBuffer::new(),
+    )
+    .expect("scans");
+    assert_eq!(found.to_string(), "%60: cbuf 3 at 0x10\n");
 }
 
 /// Eden's `IndexedInstruction` rows, written out from
