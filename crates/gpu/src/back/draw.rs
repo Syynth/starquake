@@ -28,7 +28,9 @@
 //!    `SET_PIPELINE_SHADER_TYPE` is not read: Eden takes the stage from the slot.
 //! 4. **The variant key** ([`shaders::variant_key`]), with the backend's [`EmulationFlags`](starquake_render::EmulationFlags)
 //!    from [`starquake_render::emulation`], the previous stages' stores
-//!    ([`shaders::previous_stage_stores`]) and, without view swizzle, the texture swizzles.
+//!    ([`shaders::previous_stage_stores`]), the paired pixel program's interpolation modes for
+//!    the vertex outputs, read from its header ([`shaders::PixelModes`]) and, without view
+//!    swizzle, the texture swizzles.
 //! 5. **The lookup** ([`ShaderLookup::lookup`]): `Ready` gives the set; `Pending` follows the
 //!    one wait-while-compiling setting ([`WaitWhileCompiling`], owner's decision 9 and the
 //!    first of the graphics decisions of 2026-11-12): wait for the ticket, or skip
@@ -468,6 +470,8 @@ pub struct Draws {
     /// The previous stages' stores each request set's last ready answer gave.
     previous_stores: HashMap<Vec<ProgramRequest>, PreviousStores>,
     previous_stores_limit: usize,
+    /// The last pixel header read and the vertex outputs' interpolation it gave.
+    pixel_modes: shaders::PixelModes,
     constants: Option<BufferId>,
     /// What the last upload held: the root tables' generation and the encoded driver constants.
     uploaded: Option<(u64, [u8; DRIVER_CONSTANTS_SIZE])>,
@@ -513,6 +517,7 @@ impl Draws {
             swizzle_handles: HashMap::new(),
             previous_stores: HashMap::new(),
             previous_stores_limit: MAX_STORE_SETS,
+            pixel_modes: shaders::PixelModes::default(),
             constants: None,
             uploaded: None,
             last_targets: None,
@@ -850,6 +855,7 @@ impl Draws {
             memory: ctx.memory,
         };
         let programs = GuestPrograms(ctx.memory);
+        let output_interpolation = self.pixel_modes.read(&requests, &programs);
         let key_for = |swizzles: Vec<Swizzle>, stores: PreviousStores| -> Result<_, DrawError> {
             Ok(shaders::variant_key(
                 &vertex.types,
@@ -857,6 +863,7 @@ impl Draws {
                 blend.dual_source,
                 emulation_key,
                 stores,
+                output_interpolation,
                 TextureSwizzles::new(swizzles)?,
             ))
         };

@@ -86,10 +86,11 @@ pub enum Error {
         /// `package` or `workspace`: the table the list is under.
         table: &'static str,
     },
-    /// A `members` or `exclude` entry of the root manifest that this module cannot expand.
+    /// A `members` or `exclude` entry of the root manifest that this module cannot expand. The
+    /// workspace-deps, table-deps and packages steps all list members this way.
     #[error(
-        "Cargo.toml: workspace {list} entry {pattern:?} is not supported by the workspace-deps \
-         check (only literal paths, and a trailing `/*` in `members`)"
+        "Cargo.toml: workspace {list} entry {pattern:?} is not supported by the gate's member \
+         listing (only literal paths, and a trailing `/*` in `members`)"
     )]
     UnsupportedPattern {
         /// `members` or `exclude`.
@@ -510,14 +511,31 @@ pub fn member_manifests(root_dir: &Path, root: &str) -> Result<Vec<PathBuf>, Err
     Ok(manifests)
 }
 
-/// Runs the workspace-dependency check against the checkout at `root_dir`.
-pub fn check_workspace_dependencies(root_dir: &Path) -> Result<Vec<Unused>, Error> {
+/// The root manifest's text of the checkout at `root_dir`, and each member manifest's path and
+/// text in member order ([`member_manifests`]). The workspace-deps and packages steps read the
+/// workspace through this one helper.
+pub(crate) fn member_texts(root_dir: &Path) -> Result<(String, Vec<(String, String)>), Error> {
     let read = |path: &Path| walk::read_text(path).map_err(Error::from);
     let root = read(&root_dir.join("Cargo.toml"))?;
     let members = member_manifests(root_dir, &root)?
         .into_iter()
         .map(|path| read(&path).map(|text| (path.display().to_string(), text)))
         .collect::<Result<Vec<_>, _>>()?;
+    Ok((root, members))
+}
+
+/// The `[package] name` string of a parsed manifest, or `None` when it has no `[package]` table
+/// or its `name` is not a string. A `name` anywhere else (top level, `[workspace]`) is not read.
+pub(crate) fn package_name(manifest: &toml::Table) -> Option<&str> {
+    manifest
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(toml::Value::as_str)
+}
+
+/// Runs the workspace-dependency check against the checkout at `root_dir`.
+pub fn check_workspace_dependencies(root_dir: &Path) -> Result<Vec<Unused>, Error> {
+    let (root, members) = member_texts(root_dir)?;
     unused_workspace_dependencies(&root, &members)
 }
 
@@ -920,7 +938,7 @@ via_target_build = "7.0.0"
                 error.to_string(),
                 format!(
                     "Cargo.toml: workspace {list} entry {pattern:?} is not supported by the \
-                     workspace-deps check (only literal paths, and a trailing `/*` in `members`)"
+                     gate's member listing (only literal paths, and a trailing `/*` in `members`)"
                 )
             );
         }

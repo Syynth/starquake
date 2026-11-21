@@ -21,7 +21,11 @@
 //!
 //! Two more, with the same kind of default, give a server the transfer memories a request
 //! carries (graphics-server spec, "What this spec needs from the kernel": "Transfer memory
-//! (204, video 200)"): [`Kernel::transfer_memory`] and [`Kernel::write_transfer_memory`].
+//! (204, video 200)"): [`Kernel::transfer_memory`] and [`Kernel::write_transfer_memory`]. And
+//! two let a server keep a reference of its own to one, so that it stays after the guest closes
+//! its handle, and drop it again: [`Kernel::keep_transfer_memory`] and
+//! [`Kernel::release_kept_transfer_memory`] (gsv's shared syncpoint page, as Eden PR #4588's
+//! `BindSyncpointMemory` keeps its two with `KTransferMemory::Open`).
 //!
 //! # Clearing an event, and ending the caller's process
 //!
@@ -179,6 +183,31 @@ pub trait Kernel {
         _offset: u64,
         _data: &[u8],
     ) -> SvcResult<()> {
+        Err(KernelError::NotImplemented)
+    }
+
+    /// Keeps a reference of the server's own to the transfer memory `object` names, one of the
+    /// request's copied handles resolved, so that it stays after the request and after the
+    /// caller closes its handles, until the server drops it: during a request with
+    /// [`Kernel::release_kept_transfer_memory`], or on the server's own thread through the
+    /// kernel's dispatcher (`Dispatcher::release_kept_transfer_memory`). Returns the transfer
+    /// memory. [`KernelError::InvalidHandle`], with nothing kept, as for
+    /// [`Kernel::transfer_memory`]. Keeping it twice keeps two references (the kernel's
+    /// `IpcContext::keep_transfer_memory`).
+    ///
+    /// The default answers [`KernelError::NotImplemented`].
+    fn keep_transfer_memory(&mut self, _object: ObjectId) -> SvcResult<TransferMemory> {
+        Err(KernelError::NotImplemented)
+    }
+
+    /// Drops one reference the server keeps to the transfer memory `object` names
+    /// ([`Kernel::keep_transfer_memory`]): what a service does when a request that kept one
+    /// fails afterwards. [`KernelError::InvalidHandle`], with nothing changed, when the server
+    /// keeps none; when it was the last reference the transfer memory goes (the kernel's
+    /// `IpcContext::release_kept_transfer_memory`).
+    ///
+    /// The default answers [`KernelError::NotImplemented`].
+    fn release_kept_transfer_memory(&mut self, _object: ObjectId) -> SvcResult<()> {
         Err(KernelError::NotImplemented)
     }
 

@@ -122,12 +122,12 @@
 //!   `vec4<f32>` at location `n`. Its outputs are one struct: the position built-in, then
 //!   generic `n` at location `n`, with perspective interpolation at the pixel centre. That is
 //!   still slice 1's guess: slice 15 now collects the pixel header's modes
-//!   ([`crate::info::ShaderInfo::interpolation`]), but nothing here reads them yet. The rest
-//!   of slice 17 lowers them: the vertex stage's variant key carries the paired pixel
-//!   program's modes and its outputs take them (spec, "Pipeline-state specialisation"; decided
-//!   by the owner, 2026-11-20; the key's field is #476's). Pixel generic inputs are refused
-//!   here ([`LowerError::Input`]) until then. Components the program does not
-//!   write are zero. Generics from [`HOST_LOCATIONS`] up (generic 31) are refused, read or
+//!   ([`crate::info::ShaderInfo::interpolation`]), but nothing here reads them yet. A vertex
+//!   program's outputs get the pixel program's modes through
+//!   [`crate::variant::VariantKey::output_interpolation`] (owner's ruling 2 of 2026-11-20;
+//!   [`crate::info`], "The vertex outputs' interpolation"), which slice 17 applies. Pixel
+//!   generic inputs are refused here ([`LowerError::Input`]) until then. Components the program
+//!   does not write are zero. Generics from [`HOST_LOCATIONS`] up (generic 31) are refused, read or
 //!   written, because wgpu on Metal binds no location past 30.
 //! - A pixel function's colour target `n` is a `vec4<f32>` output at location `n`; unwritten
 //!   components are zero. `SR_LANEID` is the subgroup invocation id built-in, which needs the

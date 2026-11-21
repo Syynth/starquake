@@ -25,17 +25,24 @@
 //!    The front advances the offset and sends it as a `Write` after the run (gpu-protocol,
 //!    "Engine methods: the register file", step 2), so the mirror still holds the value before
 //!    the first word.
-//! 3. Checks every word before anything is written ([`check`]), in word order, and for each word
+//! 3. Checks the words before anything is written ([`check`]), in word order, and for each word
 //!    first the size bound, then the address: a word whose end (offset plus 4) passes the size
-//!    is [`ConstantBufferError::PastEnd`]; a word whose end passes the 64-bit address space is
-//!    [`ConstantBufferError::AddressOverflow`]. The first word that fails is reported, and a
-//!    refused load writes nothing and invalidates nothing. The unit of this all-or-nothing rule
-//!    is one `Write` or `Run` ring entry, not one guest upload: the front splits a long run into
-//!    entries of at most [`crate::ring::MAX_RUN_WORDS`] words (Eden-NX2's
-//!    `MaxMultiWords`), and guest data can span GPFIFO entries, so an upload whose second
-//!    entry passes the size keeps the first entry's words in guest memory
-//!    (`a_split_run_whose_second_entry_passes_the_size_keeps_the_first_and_writes_none_of_the_second`
-//!    in the executor's tests).
+//!    (end greater than size; a word ending exactly at the size passes) is
+//!    [`ConstantBufferError::PastEnd`]; a word whose end passes the 64-bit address space is
+//!    [`ConstantBufferError::AddressOverflow`]. The walk stops at the first word that fails, the
+//!    refused word. The words before it are written (steps 4 and 5); the refused word and every
+//!    word after it in the entry are not written and not invalidated, even a later word that
+//!    would pass (once the offset wraps within its 16-bit field, below, a later word can lie
+//!    inside the size again). The refused word's error is returned after the words before it
+//!    are written (owner ruling 7 of 2026-11-19; gpu-protocol, "Constant-buffer loads": "writes
+//!    its words that end within the size and refuses the rest, reporting the first refused
+//!    word"). The rule applies within one `Write` or `Run` ring entry, not one guest upload:
+//!    the front splits a long run into entries of at most [`crate::ring::MAX_RUN_WORDS`] words
+//!    (Eden-NX2's `MaxMultiWords`), and guest data can span GPFIFO entries, so an upload whose
+//!    second entry passes the size has the first entry's words, and the second entry's words
+//!    before the refused one, in guest memory
+//!    (`a_split_run_whose_second_entry_passes_the_size_keeps_every_word_that_fits` in the
+//!    executor's tests). A later entry of the same upload is checked on its own.
 //! 4. Writes the words in pieces: words whose offsets follow one another go to guest memory in
 //!    one [`GpuMemory::write`], as Eden-NX2 writes a run with one `WriteBlockCached`; a jump in
 //!    the offset (its wrap within the 16-bit field, below) starts a new piece. A run of `n`
@@ -45,7 +52,10 @@
 //!    or copy (row 134). Eden-NX2's `WriteBlockCached` likewise adds the range to the memory
 //!    manager's accumulator instead of invalidating at once. A piece whose write faulted is added
 //!    too, since the pages before the fault may have been written; the pieces after it are not
-//!    written, and the fault is returned ([`ConstantBufferError::Fault`]).
+//!    written, and the fault is returned ([`ConstantBufferError::Fault`]). A faulting piece holds
+//!    only words before the refused word, so when an entry has both a fault and a refused word,
+//!    the fault comes first in word order and is the error returned
+//!    (`a_fault_writing_the_words_that_fit_is_reported_before_the_refused_word`).
 //!
 //! Nothing is written back first: `WriteBlockCached` writes with `CacheType::None` and asks no
 //! cache to flush, and here no [`crate::back::copy::CopySink::make_current`] is made either.
@@ -54,23 +64,34 @@
 //!
 //! Each is pinned by the test named (in `tests`).
 //!
-//! - **The whole extent is bounded by the size, and a load past it writes nothing (an open
-//!   owner question).** The approved gpu-protocol spec says: "The back writes each run of data
-//!   words to guest memory at the constant buffer's address plus the upload offset, as Eden's
-//!   `ProcessCBMultiData` does". Eden-NX2 checks only where the run starts,
-//!   `ASSERT(regs.const_buffer.offset <= regs.const_buffer.size)`, and an `ASSERT` logs without
-//!   stopping, so Eden-NX2 writes the run wherever it reaches, past the size or from an offset
-//!   at the size. Here the bounds check against the size covers every word's end (issue #429),
-//!   and one word past it refuses the whole entry, the words before it included (the house rule
-//!   that every check runs before the first write). This departs from the spec sentence and is
-//!   not settled: the owner chooses between (a) keeping this refusal, and amending the spec to
-//!   say the load is bounded by the size, or (b) following the spec sentence and Eden-NX2,
-//!   writing every word wherever it reaches and only logging a word past the size. The unit of
-//!   the refusal is one ring entry (step 3), so a guest upload split across entries can be half
-//!   written either way. `the_size_edge_accepts_a_word_ending_at_it_and_refuses_one_past`,
-//!   `a_run_whose_last_word_passes_the_size_writes_none_of_its_words`,
-//!   `a_run_with_two_words_past_the_size_reports_the_first`, and the executor's
-//!   `a_split_run_whose_second_entry_passes_the_size_keeps_the_first_and_writes_none_of_the_second`.
+//! - **Words past the size are not written (decided by the owner, 2026-11-19, ruling 7; the
+//!   gpu-protocol spec lists it as a divergence).** Eden-NX2's one bound in
+//!   `Maxwell3D::ProcessCBMultiData` is `ASSERT(regs.const_buffer.offset <=
+//!   regs.const_buffer.size)`: it compares the run's start offset, the whole `offset` register,
+//!   with the whole `size` register, before the first word only. Its `ASSERT`
+//!   (`eden-nx2/src/common/assert.h`, `ASSERT_MSG`) logs at critical level and, unless debug
+//!   asserts are enabled, goes on (`AssertFailSoftImpl`, `eden-nx2/src/common/assert.cpp`), and
+//!   the next lines write all `amount * sizeof(u32)` bytes with one `WriteBlockCached`. So
+//!   Eden-NX2 writes every word of the run, those past the size included. Here each word's end
+//!   is compared with the size, and the words from the first one past it to the end of the entry
+//!   are not written (step 3), with [`ConstantBufferError::PastEnd`] naming the first. The
+//!   cases, each with words that Eden-NX2 writes and this layer does not: a run that starts
+//!   inside the size and passes it (Eden-NX2's check passes; here the words that end within the
+//!   size are written and the rest are not); a run that starts exactly at the size (Eden-NX2's
+//!   `offset <= size` passes; here its first word is refused and nothing is written); and a run
+//!   that starts past the size (Eden-NX2's check fails, logs, and the run is written anyway;
+//!   here nothing is written).
+//!   `a_run_ending_at_the_size_is_written_whole_and_one_word_further_writes_the_words_that_fit`,
+//!   `a_run_straddling_the_size_writes_its_words_that_fit_and_a_load_from_the_size_writes_none`,
+//!   `a_run_with_two_words_past_the_size_reports_the_first_and_writes_the_word_before`,
+//!   `the_size_edge_accepts_a_word_ending_at_it_and_refuses_one_past`, and the executor's
+//!   `a_split_run_whose_second_entry_passes_the_size_keeps_every_word_that_fits` and
+//!   `a_load_past_the_size_hands_the_words_it_wrote_to_the_caches_at_the_next_draw`.
+//! - **A refused word ends the entry.** After the 16-bit offset wraps (below), a word after the
+//!   refused one can lie inside the size again; it is not written, since the spec's rule
+//!   refuses "the rest" of the run once a word passes the size. Eden-NX2 has no wrap and no
+//!   refusal, so it has no such case.
+//!   `a_refused_word_ends_the_entry_even_where_a_later_word_fits_after_the_offset_wraps`.
 //! - **A buffer address of zero is not refused here.** Eden-NX2 asserts `buffer_address != 0` (a
 //!   log) and writes anyway; here the write goes to the address space too, whose memory refuses
 //!   an unmapped page. `a_buffer_at_address_zero_is_written_like_any_other`.
@@ -124,7 +145,8 @@ use crate::regs::{CONSTANT_BUFFER_LOADS, WORD_BYTES};
 /// Why a constant-buffer load was refused, or failed while writing.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum ConstantBufferError {
-    /// A word's end, its offset plus 4, passes the selected buffer's size; nothing was written.
+    /// A word's end, its offset plus 4, passes the selected buffer's size: the first such word of
+    /// the entry. The words before it were written; it and the words after it were not.
     #[error(
         "a constant-buffer word at byte offset {offset:#x} ends past the buffer's size of \
          {size:#x} bytes"
@@ -136,7 +158,8 @@ pub enum ConstantBufferError {
         size: u32,
     },
     /// A word's end, the buffer's address plus its offset plus 4, passes the end of the 64-bit
-    /// address space; nothing was written.
+    /// address space: the first such word of the entry. The words before it were written; it and
+    /// the words after it were not.
     #[error(
         "a constant-buffer word at byte offset {offset:#x} of the buffer at {address:#x} runs \
          past the end of the address space"
@@ -164,27 +187,39 @@ pub fn is_constant_buffer_load(method: u32) -> bool {
     CONSTANT_BUFFER_LOADS.contains(method)
 }
 
+/// How far a load may write ([`check`]): the words before the first that fails a check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub(crate) struct Checked {
+    /// How many words, from the first, pass every check.
+    accepted: usize,
+    /// The error of the word after those, the first that fails; `None` when every word passes.
+    refused: Option<ConstantBufferError>,
+}
+
 /// Checks the words of a load of the buffer at `address` of `size` bytes, whose byte offsets are
 /// `offsets`, in order (module docs, step 3): for each word, the size bound, then the address.
-///
-/// # Errors
-///
-/// The first word's [`ConstantBufferError::PastEnd`] or [`ConstantBufferError::AddressOverflow`].
-pub(crate) fn check(
-    address: u64,
-    size: u32,
-    offsets: impl Iterator<Item = u32>,
-) -> Result<(), ConstantBufferError> {
+/// The walk stops at the first word that fails; the words after it are not looked at.
+pub(crate) fn check(address: u64, size: u32, offsets: impl Iterator<Item = u32>) -> Checked {
+    let mut accepted = 0;
     for offset in offsets {
         let end = u64::from(offset) + WORD_LEN;
-        if end > u64::from(size) {
-            return Err(ConstantBufferError::PastEnd { offset, size });
+        let refused = if end > u64::from(size) {
+            Some(ConstantBufferError::PastEnd { offset, size })
+        } else if address.checked_add(end).is_none() {
+            Some(ConstantBufferError::AddressOverflow { address, offset })
+        } else {
+            None
+        };
+        if refused.is_some() {
+            return Checked { accepted, refused };
         }
-        if address.checked_add(end).is_none() {
-            return Err(ConstantBufferError::AddressOverflow { address, offset });
-        }
+        accepted += 1;
     }
-    Ok(())
+    Checked {
+        accepted,
+        refused: None,
+    }
 }
 
 /// The constant-buffer upload of one 3D engine's channel, or of the executor (module docs): it
@@ -201,14 +236,18 @@ impl ConstantBufferLoad {
     }
 
     /// Handles `words` written to 3D method `method`, after `mirror` (the channel's 3D mirror)
-    /// has stored them: for a constant-buffer load, writes them to `memory` and adds their
-    /// ranges to `pending` (module docs); for any other method, or no words, does nothing.
+    /// has stored them: for a constant-buffer load, writes the words before the first refused
+    /// word (all of them when none is refused) to `memory` and adds their ranges to `pending`
+    /// (module docs); for any other method, or no words, does nothing.
     ///
     /// # Errors
     ///
-    /// [`ConstantBufferError::PastEnd`] or [`ConstantBufferError::AddressOverflow`] before
-    /// anything is written; [`ConstantBufferError::Fault`] for a piece whose write faulted, with
-    /// the pieces before it written and every attempted piece's range in `pending`.
+    /// [`ConstantBufferError::State`] before anything is written.
+    /// [`ConstantBufferError::PastEnd`] or [`ConstantBufferError::AddressOverflow`] for the first
+    /// refused word, once the words before it are written and their ranges are in `pending`.
+    /// [`ConstantBufferError::Fault`] for a piece whose write faulted, with the pieces before it
+    /// written, every attempted piece's range in `pending`, and no later piece attempted; a
+    /// fault is returned in place of a refused word later in the entry.
     pub fn method<M: GpuMemory + ?Sized>(
         &mut self,
         mirror: &Mirror,
@@ -227,9 +266,9 @@ impl ConstantBufferLoad {
             words.len(),
         )?;
         let offsets = positions.map(|position| clc797::LOAD_CONSTANT_BUFFER_OFFSET_V.get(position));
-        check(buffer.address, buffer.size, offsets.clone())?;
+        let checked = check(buffer.address, buffer.size, offsets.clone());
         let mut piece: Option<(u32, Range<usize>)> = None;
-        for (index, offset) in offsets.enumerate() {
+        for (index, offset) in offsets.take(checked.accepted).enumerate() {
             let next = index + 1;
             piece = match piece {
                 Some((start, words_range))
@@ -247,7 +286,7 @@ impl ConstantBufferLoad {
         if let Some((start, words_range)) = piece {
             self.write_piece(buffer.address, start, &words[words_range], memory, pending)?;
         }
-        Ok(())
+        checked.refused.map_or(Ok(()), Err)
     }
 
     /// Writes `words` at `address` plus `offset`, then adds the range to `pending` whatever the

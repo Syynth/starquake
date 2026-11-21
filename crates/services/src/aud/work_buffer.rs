@@ -19,6 +19,10 @@
 //!   `CheckValidRevision`, `CheckFeatureSupported`'s table) and
 //!   `renderer/behavior/behavior_info.cpp` (`SetUserLibRevision` and the `Is..Supported`
 //!   queries): the revision and the features it turns on ([`revision_number`], [`Feature`]);
+//! - `eden-pr4588/src/audio_core/common/feature_support.h` @ e5fb3b97 (`NativeCurrentRevision`,
+//!   `IsNativeRevision`, `GetRevisionNum`, `CheckValidRevision`): how a native-tagged revision
+//!   word is read and bounded ([`is_native_revision`], [`newest_revision`]; "The revision
+//!   word");
 //! - `eden-nx2/src/audio_core/common/common.h`: the counts ([`MAX_EFFECTS`] and the rest).
 //!
 //! Every file above except `feature_support.h` and `behavior_info.*` is byte for byte the same in
@@ -46,24 +50,54 @@
 //! # The revision word
 //!
 //! Conflict (graphics-server decision 8's rule, `docs/specs/graphics-server.md`): the references
-//! read the parameter's revision word differently. Eden-NX2 (and Eden) read a word of `0x100` or
-//! more as `(word - 'REV0') >> 24` with wrapping 32-bit arithmetic, whatever its low three bytes
-//! hold, and accept a revision of at most [`CURRENT_REVISION`] (15). PR #4588 accepts only a word
-//! whose low three bytes are `REV` or `REv` (the "native" tag, row 39), takes the top byte less
-//! `'0'`, and accepts at most 15 for `REV` and 16 (`NativeCurrentRevision`) for `REv`. Neither
-//! set contains the other, so the rule picks the reading a title ran on: Eden-NX2's, whose
-//! `aud:u` row 38 records a title getting further with ([`revision_number`]). The two readings
-//! agree on every word both accept: a word below `0x100` is its own number in both, and a `REv`
-//! word's lowercase `v` adds `0x20 << 16`, which the shift by 24 drops. They differ on:
+//! read the parameter's revision word differently.
 //!
-//! - `REv@`, revision 16 tagged native: PR #4588 accepts it, here it is
-//!   [`WorkBufferError::InvalidRevision`] (`a_native_revision_16_is_refused_as_eden_nx2_does`);
-//! - a word of `0x100` or more whose low bytes are not `REV` or `REv` but whose wrapped
-//!   difference is at most 15 after the shift: PR #4588 refuses it, here it is accepted as that
-//!   number (`a_word_without_the_rev_tag_is_read_as_eden_nx2_reads_it`).
+//! - **Eden-NX2** (and Eden) read a word of `0x100` or more as `(word - 'REV0') >> 24` with
+//!   wrapping 32-bit arithmetic, whatever its low three bytes hold, and accept a revision of at
+//!   most [`CURRENT_REVISION`] (15) (`GetRevisionNum`, `CheckValidRevision` @ 50fa86bb).
+//! - **PR #4588** (`feature_support.h` @ e5fb3b97) reads a word of `0x100` or more only when its
+//!   low three bytes are `REV` or `REv` (`REv` is the "native" tag, row 39: `IsNativeRevision`),
+//!   as the top byte less `'0'`, and none (`~u32{0}`) when the top byte is below `'0'` or the
+//!   tag is neither (`GetRevisionNum`). It accepts at most 15 for `REV` and 16
+//!   (`NativeCurrentRevision`) for `REv` (`CheckValidRevision`: `IsNativeRevision(user_revision)
+//!   ? NativeCurrentRevision : CurrentRevision`).
 //!
-//! A trace of a native title's `GetWorkBufferSize` (the revision word it sends, and whether a
-//! console accepts `REv@`) would settle it.
+//! Neither accepted set contains the other, so the rule picks the reading a title ran on, without
+//! ruling out the other. A native title sends `REv@` (`0x40764552`, revision 16) and calls
+//! `svc::Break` when it is refused (seen in a local bring-up run): it ran only on PR #4588's
+//! reading of that word. Eden-NX2's `aud:u` row 38 records a title that ran on Eden-NX2's
+//! reading. So the bound depends on the tag:
+//!
+//! - **a native-tagged word** ([`is_native_revision`]) is read and bounded as PR #4588 does: the
+//!   top byte less `'0'`, accepted up to [`NATIVE_CURRENT_REVISION`] (16); a top byte below `'0'`
+//!   is [`WorkBufferError::NoRevision`];
+//! - **every other word** keeps Eden-NX2's reading and bound (15), so a title that row 38 saw gets
+//!   the same answer.
+//!
+//! The accepted words are exactly the union of the two references' accepted sets: on a native
+//! word Eden-NX2 accepts only top bytes `'0'` to `'?'` (the lowercase `v` adds `0x20 << 16`,
+//! which the shift by 24 drops), at the number PR #4588 reads too, and PR #4588 accepts those and
+//! `REv@`; on any other word PR #4588 accepts a subset of Eden-NX2's, at the same number
+//! (`the_accepted_words_are_the_union_of_both_readings`, which compares both references'
+//! functions, transcribed, over every word below `0x1000` and every top byte over the low three
+//! bytes `REV` and `REv`, each with one bit flipped, zero and all ones).
+//!
+//! `REv@` turns on exactly revision 15's features: no tag in PR #4588's `CheckFeatureSupported`
+//! table needs more than 15 (`a_native_revision_16_is_sized_as_revision_15`).
+//!
+//! What remains different from a reference:
+//!
+//! - from PR #4588: a word of `0x100` or more whose low bytes are not `REV` or `REv` but whose
+//!   wrapped difference is at most 15 after the shift: PR #4588 refuses it, here it is accepted as
+//!   that number, as Eden-NX2 does (`a_word_without_the_rev_tag_is_read_as_eden_nx2_reads_it`);
+//! - from Eden-NX2: `REv@`, which Eden-NX2 reads as 16 and refuses, is accepted here, as the
+//!   native title's run needs (`a_native_revision_16_is_sized_as_revision_15`).
+//!
+//! A native word whose top byte is below `'0'` is not a divergence: both references refuse it
+//! with `ResultInvalidRevision`, and so does this ([`WorkBufferError::NoRevision`] maps to the
+//! same result; its own variant only names the reason,
+//! `the_revision_bound_depends_on_the_native_tag`). A console trace of a title sending an
+//! untagged word of `0x100` or more would settle the first divergence.
 //!
 //! # Where this differs from Eden
 //!
@@ -141,6 +175,18 @@ pub const REVISION_MAGIC: u32 = u32::from_le_bytes(*b"REV0");
 pub const REVISION_TAG_FROM: u32 = 0x100;
 /// How far [`revision_number`] shifts a tag's difference (`user_revision >>= 24`).
 pub const REVISION_TAG_SHIFT: u32 = 24;
+/// `NativeCurrentRevision` (`eden-pr4588/src/audio_core/common/feature_support.h` @ e5fb3b97:
+/// `constexpr u32 NativeCurrentRevision = 16`): the highest revision a native-tagged word may
+/// name ([`newest_revision`]).
+pub const NATIVE_CURRENT_REVISION: u32 = 16;
+/// The bytes of a revision word that hold its tag: the low three (PR #4588's
+/// `IsNativeRevision` and `GetRevisionNum`: `revision & 0xffffff`).
+pub const REVISION_TAG_MASK: u32 = 0x00FF_FFFF;
+/// The native tag: `Common::MakeMagic('R', 'E', 'v', '\0')` (PR #4588's `IsNativeRevision`).
+pub const NATIVE_REVISION_TAG: u32 = u32::from_le_bytes(*b"REv\0");
+/// What PR #4588's `GetRevisionNum` takes from a tagged word's top byte: `'0'` (`encoded >= '0'
+/// ? encoded - '0' : ~u32{0}`).
+pub const REVISION_DIGIT_ZERO: u32 = u32::from_le_bytes([b'0', 0, 0, 0]);
 
 /// The size of `AudioRendererParameterInternal`
 /// (`static_assert(sizeof(AudioRendererParameterInternal) == 0x34, ..)`).
@@ -314,17 +360,25 @@ impl RendererParameter {
 /// Why [`work_buffer_size`] has no size for a parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum WorkBufferError {
-    /// The revision is past [`CURRENT_REVISION`] (Eden's `CheckValidRevision`), checked before
-    /// any size.
+    /// The revision is past the newest the word's tag allows, [`newest_revision`]
+    /// (`CheckValidRevision`; module docs, "The revision word"), checked before any size.
     #[error(
         "revision word {word:#x} reads as revision {number}, past the newest, {newest}",
-        newest = CURRENT_REVISION
+        newest = newest_revision(*word)
     )]
     InvalidRevision {
         /// The parameter's revision word.
         word: u32,
         /// What [`revision_number`] reads it as.
         number: u32,
+    },
+    /// The word is tagged native but its top byte is below `'0'`, so it names no revision
+    /// ([`revision_number`] is `None`; PR #4588's `GetRevisionNum` answers `~u32{0}`, which
+    /// `CheckValidRevision` refuses), checked before any size.
+    #[error("revision word {word:#x} is tagged native but names no revision")]
+    NoRevision {
+        /// The parameter's revision word.
+        word: u32,
     },
     /// A term of the size would wrap where Eden's arithmetic wraps (module docs, "Where this
     /// differs from Eden").
@@ -376,15 +430,44 @@ impl Feature {
     }
 }
 
-/// The revision number a revision word names, as Eden-NX2 reads it (`GetRevisionNum`; module
-/// docs, "The revision word"): a word below [`REVISION_TAG_FROM`] is the number itself; any
-/// other is `(word - REVISION_MAGIC) >> 24`, the subtraction wrapping at 32 bits.
+/// Whether a revision word carries the native tag: its low three bytes are `REv`
+/// (`eden-pr4588/src/audio_core/common/feature_support.h` @ e5fb3b97, `IsNativeRevision`:
+/// `(revision & 0xffffff) == Common::MakeMagic('R', 'E', 'v', '\0')`).
 #[must_use]
-pub const fn revision_number(word: u32) -> u32 {
-    if word >= REVISION_TAG_FROM {
-        word.wrapping_sub(REVISION_MAGIC) >> REVISION_TAG_SHIFT
+pub const fn is_native_revision(word: u32) -> bool {
+    word & REVISION_TAG_MASK == NATIVE_REVISION_TAG
+}
+
+/// The highest revision a word may name (module docs, "The revision word"):
+/// [`NATIVE_CURRENT_REVISION`] for a native-tagged word, [`CURRENT_REVISION`] for any other
+/// (PR #4588's `CheckValidRevision`: `IsNativeRevision(user_revision) ? NativeCurrentRevision :
+/// CurrentRevision`; Eden-NX2's: `CurrentRevision` for every word).
+#[must_use]
+pub const fn newest_revision(word: u32) -> u32 {
+    if is_native_revision(word) {
+        NATIVE_CURRENT_REVISION
     } else {
-        word
+        CURRENT_REVISION
+    }
+}
+
+/// The revision number a revision word names (module docs, "The revision word").
+///
+/// - A native-tagged word ([`is_native_revision`]) is read as PR #4588 reads it
+///   (`GetRevisionNum` @ e5fb3b97): its top byte less [`REVISION_DIGIT_ZERO`], or `None` where
+///   the top byte is below it (PR #4588's `~u32{0}`).
+/// - Any other word is read as Eden-NX2 reads it (`GetRevisionNum` @ 50fa86bb): a word below
+///   [`REVISION_TAG_FROM`] is the number itself; any other is `(word - REVISION_MAGIC) >> 24`,
+///   the subtraction wrapping at 32 bits.
+#[must_use]
+pub const fn revision_number(word: u32) -> Option<u32> {
+    if is_native_revision(word) {
+        let encoded = word >> REVISION_TAG_SHIFT;
+        encoded.checked_sub(REVISION_DIGIT_ZERO)
+    } else if word >= REVISION_TAG_FROM {
+        Some(word.wrapping_sub(REVISION_MAGIC) >> REVISION_TAG_SHIFT)
+    } else {
+        Some(word)
     }
 }
 
@@ -573,14 +656,17 @@ fn command_buffer_size(params: &RendererParameter, revision: u32) -> Result<u64,
 /// The work-buffer size a renderer with `params` needs: Eden's `Manager::GetWorkBufferSize`,
 /// the revision check and then `System::GetWorkBufferSize` (module docs).
 ///
-/// [`WorkBufferError::InvalidRevision`] comes first, before any term is computed; then
-/// [`WorkBufferError::NegativeSplitterDestinations`] or [`WorkBufferError::Overflow`], whichever
-/// term meets its fault first in Eden's order.
+/// [`WorkBufferError::NoRevision`] or [`WorkBufferError::InvalidRevision`] comes first, before
+/// any term is computed; then [`WorkBufferError::NegativeSplitterDestinations`] or
+/// [`WorkBufferError::Overflow`], whichever term meets its fault first in Eden's order.
 pub fn work_buffer_size(params: &RendererParameter) -> Result<u64, WorkBufferError> {
-    let revision = revision_number(params.revision);
-    if revision > CURRENT_REVISION {
+    let word = params.revision;
+    let Some(revision) = revision_number(word) else {
+        return Err(WorkBufferError::NoRevision { word });
+    };
+    if revision > newest_revision(word) {
         return Err(WorkBufferError::InvalidRevision {
-            word: params.revision,
+            word,
             number: revision,
         });
     }

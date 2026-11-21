@@ -23,6 +23,8 @@ use crate::slab::SlabId;
 use crate::svc::{DebugSink, SvcId};
 use crate::tables::Scheduler;
 
+mod kept;
+
 /// The guest thread of these tests.
 const THREAD: ThreadId = ThreadId(0xB2);
 /// Its message buffer: the data's second page.
