@@ -1,29 +1,31 @@
 //! The three handle forms the pass takes, and Eden's opcode table.
 
 use super::{
-    BOUND_BANK, Engine, FLOAT, buffer, parse, pass, sample_of, scan_error, sources, untraced,
-    value,
+    BOUND_BANK, Engine, FLOAT, buffer, op_at, parse, pass, sample_of, scan_error, sources,
+    untraced, value,
 };
-use crate::ir::{Inst, Opcode};
+use crate::ir::Opcode;
 use crate::opt::resources::opcodes::{Form, classify, is_storage_image};
 use crate::opt::resources::{ResourceError, Untraced, scan};
 use crate::translate::texture::ABSENT;
 
 /// The operation at `%60` of `function`.
 fn op60(function: &crate::ir::Function) -> crate::ir::Operation {
-    match function.inst(value(60)) {
-        Some(Inst::Op(op)) => op.clone(),
-        other => panic!("no operation: {other:?}"),
-    }
+    op_at(function, 60)
 }
 
 #[test]
 fn an_immediate_handle_is_an_offset_in_the_descriptor_buffer() {
     let text = sample_of("", "u32 0x40");
     assert_eq!(sources(&text), "%60: cbuf 2 at 0x40\n");
-    let engine = Engine::new().word(BOUND_BANK, 0x40, 0x1234).kind(0x1234, FLOAT);
+    let engine = Engine::new()
+        .word(BOUND_BANK, 0x40, 0x1234)
+        .kind(0x1234, FLOAT);
     let (function, table) = pass(&text, &engine);
-    assert_eq!(table.to_string(), "texture 0: 2d, float, from cbuf 2 at 0x40\n");
+    assert_eq!(
+        table.to_string(),
+        "texture 0: 2d, float, from cbuf 2 at 0x40\n"
+    );
     let op = op60(&function);
     assert_eq!(op.opcode, Opcode::ImageSampleImplicitLod);
     assert_eq!(op.args.first(), Some(&ABSENT));
@@ -96,8 +98,11 @@ fn a_folded_register_handle_reads_as_bound() {
 #[test]
 fn a_bound_handle_needs_a_descriptor_buffer() {
     let text = sample_of("", "u32 0x40");
-    let error = scan(&parse(&text), crate::translate::texture::DescriptorBuffer::new())
-        .expect_err("refused");
+    let error = scan(
+        &parse(&text),
+        crate::translate::texture::DescriptorBuffer::new(),
+    )
+    .expect_err("refused");
     assert_eq!(error, ResourceError::NoDescriptorBuffer(value(60)));
     assert_eq!(
         error.to_string(),
@@ -118,29 +123,105 @@ fn a_bound_handle_needs_a_descriptor_buffer() {
 /// Eden's `IndexedInstruction` rows, written out from
 /// `eden/src/shader_recompiler/ir_opt/texture_pass.cpp` @ cf654052: bound, bindless, indexed.
 const EDEN_ROWS: [(&str, &str, &str); 23] = [
-    ("BoundImageSampleImplicitLod", "BindlessImageSampleImplicitLod", "ImageSampleImplicitLod"),
-    ("BoundImageSampleExplicitLod", "BindlessImageSampleExplicitLod", "ImageSampleExplicitLod"),
-    ("BoundImageSampleDrefImplicitLod", "BindlessImageSampleDrefImplicitLod", "ImageSampleDrefImplicitLod"),
-    ("BoundImageSampleDrefExplicitLod", "BindlessImageSampleDrefExplicitLod", "ImageSampleDrefExplicitLod"),
+    (
+        "BoundImageSampleImplicitLod",
+        "BindlessImageSampleImplicitLod",
+        "ImageSampleImplicitLod",
+    ),
+    (
+        "BoundImageSampleExplicitLod",
+        "BindlessImageSampleExplicitLod",
+        "ImageSampleExplicitLod",
+    ),
+    (
+        "BoundImageSampleDrefImplicitLod",
+        "BindlessImageSampleDrefImplicitLod",
+        "ImageSampleDrefImplicitLod",
+    ),
+    (
+        "BoundImageSampleDrefExplicitLod",
+        "BindlessImageSampleDrefExplicitLod",
+        "ImageSampleDrefExplicitLod",
+    ),
     ("BoundImageGather", "BindlessImageGather", "ImageGather"),
-    ("BoundImageGatherDref", "BindlessImageGatherDref", "ImageGatherDref"),
+    (
+        "BoundImageGatherDref",
+        "BindlessImageGatherDref",
+        "ImageGatherDref",
+    ),
     ("BoundImageFetch", "BindlessImageFetch", "ImageFetch"),
-    ("BoundImageQueryDimensions", "BindlessImageQueryDimensions", "ImageQueryDimensions"),
-    ("BoundImageQueryLod", "BindlessImageQueryLod", "ImageQueryLod"),
-    ("BoundImageGradient", "BindlessImageGradient", "ImageGradient"),
+    (
+        "BoundImageQueryDimensions",
+        "BindlessImageQueryDimensions",
+        "ImageQueryDimensions",
+    ),
+    (
+        "BoundImageQueryLod",
+        "BindlessImageQueryLod",
+        "ImageQueryLod",
+    ),
+    (
+        "BoundImageGradient",
+        "BindlessImageGradient",
+        "ImageGradient",
+    ),
     ("BoundImageRead", "BindlessImageRead", "ImageRead"),
     ("BoundImageWrite", "BindlessImageWrite", "ImageWrite"),
-    ("BoundImageAtomicIAdd32", "BindlessImageAtomicIAdd32", "ImageAtomicIAdd32"),
-    ("BoundImageAtomicSMin32", "BindlessImageAtomicSMin32", "ImageAtomicSMin32"),
-    ("BoundImageAtomicUMin32", "BindlessImageAtomicUMin32", "ImageAtomicUMin32"),
-    ("BoundImageAtomicSMax32", "BindlessImageAtomicSMax32", "ImageAtomicSMax32"),
-    ("BoundImageAtomicUMax32", "BindlessImageAtomicUMax32", "ImageAtomicUMax32"),
-    ("BoundImageAtomicInc32", "BindlessImageAtomicInc32", "ImageAtomicInc32"),
-    ("BoundImageAtomicDec32", "BindlessImageAtomicDec32", "ImageAtomicDec32"),
-    ("BoundImageAtomicAnd32", "BindlessImageAtomicAnd32", "ImageAtomicAnd32"),
-    ("BoundImageAtomicOr32", "BindlessImageAtomicOr32", "ImageAtomicOr32"),
-    ("BoundImageAtomicXor32", "BindlessImageAtomicXor32", "ImageAtomicXor32"),
-    ("BoundImageAtomicExchange32", "BindlessImageAtomicExchange32", "ImageAtomicExchange32"),
+    (
+        "BoundImageAtomicIAdd32",
+        "BindlessImageAtomicIAdd32",
+        "ImageAtomicIAdd32",
+    ),
+    (
+        "BoundImageAtomicSMin32",
+        "BindlessImageAtomicSMin32",
+        "ImageAtomicSMin32",
+    ),
+    (
+        "BoundImageAtomicUMin32",
+        "BindlessImageAtomicUMin32",
+        "ImageAtomicUMin32",
+    ),
+    (
+        "BoundImageAtomicSMax32",
+        "BindlessImageAtomicSMax32",
+        "ImageAtomicSMax32",
+    ),
+    (
+        "BoundImageAtomicUMax32",
+        "BindlessImageAtomicUMax32",
+        "ImageAtomicUMax32",
+    ),
+    (
+        "BoundImageAtomicInc32",
+        "BindlessImageAtomicInc32",
+        "ImageAtomicInc32",
+    ),
+    (
+        "BoundImageAtomicDec32",
+        "BindlessImageAtomicDec32",
+        "ImageAtomicDec32",
+    ),
+    (
+        "BoundImageAtomicAnd32",
+        "BindlessImageAtomicAnd32",
+        "ImageAtomicAnd32",
+    ),
+    (
+        "BoundImageAtomicOr32",
+        "BindlessImageAtomicOr32",
+        "ImageAtomicOr32",
+    ),
+    (
+        "BoundImageAtomicXor32",
+        "BindlessImageAtomicXor32",
+        "ImageAtomicXor32",
+    ),
+    (
+        "BoundImageAtomicExchange32",
+        "BindlessImageAtomicExchange32",
+        "ImageAtomicExchange32",
+    ),
 ];
 
 /// Eden's `IsStorageImageOpcode` list, written out.
@@ -161,20 +242,28 @@ const EDEN_STORAGE: [&str; 13] = [
 ];
 
 fn named(name: &str) -> Opcode {
-    Opcode::from_name(name).unwrap_or_else(|| panic!("no opcode {name}"))
+    Opcode::from_name(name).expect("an opcode of that name")
 }
 
 #[test]
 fn every_row_matches_edens_table() {
     for (bound, bindless, indexed) in EDEN_ROWS {
         let indexed = named(indexed);
-        assert_eq!(classify(named(bound)), Some((Form::Bound, indexed)), "{bound}");
+        assert_eq!(
+            classify(named(bound)),
+            Some((Form::Bound, indexed)),
+            "{bound}"
+        );
         assert_eq!(
             classify(named(bindless)),
             Some((Form::Bindless, indexed)),
             "{bindless}"
         );
-        assert_eq!(classify(indexed), Some((Form::Unbound, indexed)), "{indexed}");
+        assert_eq!(
+            classify(indexed),
+            Some((Form::Unbound, indexed)),
+            "{indexed}"
+        );
     }
     let listed: Vec<Opcode> = EDEN_ROWS
         .iter()

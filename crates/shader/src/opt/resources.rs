@@ -75,8 +75,10 @@
 //!
 //! Anything else is refused with the exact reason ([`Untraced`]), named by the operation where
 //! the trace stopped. The trace descends at most [`MAX_TRACE_DEPTH`] operations, and an OR
-//! below an OR is refused at once, so tracing one handle takes at most `2 *
-//! (MAX_TRACE_DEPTH + 1)` steps (pinned by `tests::trace::the_depth_limit_at_its_edge`).
+//! below an OR is refused at once, so tracing one handle takes at most `2 * MAX_TRACE_DEPTH +
+//! 1` steps: an OR and two chains down to the limit (pinned by
+//! `tests::trace::the_longest_trace_takes_the_documented_steps`; the limit's edge by
+//! `tests::trace::the_depth_limit_at_its_edge`).
 //! Because the handle is computed exactly, the handle the descriptor's words give is the
 //! handle the IR computes from them (`tests::trace::descriptor_handles_match_the_interpreter`).
 //!
@@ -151,7 +153,7 @@
 //! | What | Eden | Here | Pinned by |
 //! |---|---|---|---|
 //! | Tracing | breadth-first, the first matching operation anywhere in the tree | exact forms ("Tracing is exact"); a refusal names the operation | `tests::refusals::an_add_after_the_read_is_refused` |
-//! | A phi in the handle | `ResolveConditionalPhi` picks one side of a phi under a conditional header | refused, [`Untraced::Phi`] | `tests::refusals::every_reason_reads_as_written` |
+//! | A phi in the handle | `ResolveConditionalPhi` picks one side of a phi under a conditional header | refused, [`Untraced::Phi`] | `tests::refusals::a_phi_is_refused` |
 //! | A shift of a shifted word | the second shift replaces the first | refused, [`Untraced::ShiftOfShifted`] | `tests::refusals::every_reason_reads_as_written` |
 //! | A shift or mask of a two-word handle | applied to the primary word only | refused, [`Untraced::ShiftOfPair`], [`Untraced::MaskOfPair`] | same |
 //! | An OR of an OR | refused, then the search goes on below it | refused, [`Untraced::MoreThanTwoWords`] | same |
@@ -182,10 +184,13 @@
 //!
 //! # Cost
 //!
-//! [`scan`] takes one step per listed instruction and per trace step, at most `2 *
-//! (MAX_TRACE_DEPTH + 1)` per texture operation; [`run`] one per texture operation and per
-//! listed instruction, and adds at most two instructions per texture operation and seven per
-//! indexed constant-buffer read, so memory grows linearly with the function.
+//! [`scan`] takes the steps of [`crate::opt`]'s block order, one step per listed instruction
+//! and one per trace step, at most `2 * MAX_TRACE_DEPTH + 1` per texture operation (pinned by
+//! `tests::trace::the_depth_limit_at_its_edge` for one fixed input). [`run`] takes one step per
+//! texture operation, one per listed instruction, and one per instruction of each block it adds
+//! to (`tests::cbuf::reads_in_every_block_are_bounded`); it adds at most two instructions per
+//! texture operation and seven per indexed constant-buffer read, and merging descriptors is a
+//! hash lookup, so time and memory grow linearly with the function.
 
 mod cbuf;
 pub(crate) mod opcodes;

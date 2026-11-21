@@ -14,10 +14,8 @@ mod trace;
 use std::collections::BTreeMap;
 
 use super::{ResourceError, ResourceTable, TextureScan, Untraced, run, scan};
-use crate::exchange::{
-    Answers, EngineState, SampledType, TextureFormat, TextureKind, exchange,
-};
-use crate::ir::{Function, Value};
+use crate::exchange::{Answers, EngineState, SampledType, TextureFormat, TextureKind, exchange};
+use crate::ir::{Flags, Function, Inst, Operation, TextureInfo, Value};
 use crate::translate::GuestStage;
 use crate::translate::texture::DescriptorBuffer;
 
@@ -78,10 +76,8 @@ const FLOAT: TextureKind = kind_of(SampledType::Float, false, 0);
 
 /// Parses `text`, which must be well-formed and verify.
 fn parse(text: &str) -> Function {
-    let function = Function::parse(text).unwrap_or_else(|e| panic!("{e}\n{text}"));
-    function
-        .verify()
-        .unwrap_or_else(|e| panic!("{e}\n{function}"));
+    let function = Function::parse(text).expect("parses");
+    assert_eq!(function.verify(), Ok(()), "{function}");
     function
 }
 
@@ -117,9 +113,10 @@ fn scan_error(text: &str) -> ResourceError {
 /// Why the handle of the texture operation in `text` cannot be traced.
 fn untraced(text: &str) -> Untraced {
     match scan_error(text) {
-        ResourceError::Untraced { why, .. } => why,
-        other => panic!("not an untraced handle: {other}"),
+        ResourceError::Untraced { why, .. } => Some(why),
+        _ => None,
     }
+    .expect("an untraced handle")
 }
 
 /// The value id `index`, taken from a parsed function (ids have no public constructor).
@@ -150,4 +147,22 @@ fn sources(text: &str) -> String {
     scan(&parse(text), buffer(BOUND_BANK))
         .expect("scans")
         .to_string()
+}
+
+/// The operation at `%at` of `function`.
+fn op_at(function: &Function, at: u32) -> Operation {
+    match function.inst(value(at)) {
+        Some(Inst::Op(op)) => Some(op.clone()),
+        _ => None,
+    }
+    .expect("an operation")
+}
+
+/// The texture information of the operation at `%at`.
+fn info_at(function: &Function, at: u32) -> TextureInfo {
+    match op_at(function, at).flags {
+        Flags::Texture(info) => Some(info),
+        _ => None,
+    }
+    .expect("texture flags")
 }

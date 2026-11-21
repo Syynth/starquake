@@ -1,6 +1,8 @@
 //! Tracing: each traced form, its offsets, the edges of its bounds, and the handle a
 //! descriptor's words give against the handle the interpreter computes.
 
+use std::fmt::Write as _;
+
 use super::{BOUND_BANK, buffer, parse, sample_of, sources, untraced, value};
 use crate::interp::Machine;
 use crate::ir::Operand;
@@ -60,10 +62,7 @@ fn banks_at_the_edge() {
         )
     };
     assert_eq!(sources(&read(last)), format!("%60: cbuf {last} at 0x10\n"));
-    assert_eq!(
-        untraced(&read(last + 1)),
-        Untraced::BankPastLast(last + 1)
-    );
+    assert_eq!(untraced(&read(last + 1)), Untraced::BankPastLast(last + 1));
     // An index word in the last bank is kept; one past it is not, and the array is indexed at
     // run time instead.
     let indexed = |bank: u32| {
@@ -93,20 +92,19 @@ fn banks_at_the_edge() {
 fn masked(depth: u32) -> String {
     let mut lines = String::from("    %0: u32 = GetCbufU32 u32 3, u32 0x10\n");
     for k in 1..=depth {
-        lines.push_str(&format!(
-            "    %{k}: u32 = BitwiseAnd32 %{}, u32 0xffffffff\n",
+        writeln!(
+            lines,
+            "    %{k}: u32 = BitwiseAnd32 %{}, u32 0xffffffff",
             k - 1
-        ));
+        )
+        .expect("writes");
     }
     sample_of(&lines, &format!("%{depth}"))
 }
 
 #[test]
 fn the_depth_limit_at_its_edge() {
-    assert_eq!(
-        sources(&masked(MAX_TRACE_DEPTH)),
-        "%60: cbuf 3 at 0x10\n"
-    );
+    assert_eq!(sources(&masked(MAX_TRACE_DEPTH)), "%60: cbuf 3 at 0x10\n");
     assert_eq!(untraced(&masked(MAX_TRACE_DEPTH + 1)), Untraced::TooDeep);
     // The work of one fixed input: the three listed instructions and the trace's two steps.
     let text = sample_of(
@@ -225,11 +223,20 @@ fn the_smallest_spacing_is_four_bytes() {
         dynamic_size_shift(&function, Operand::Value(value(1)))
     };
     let shl = |n: u32| format!("    %1: u32 = ShiftLeftLogical32 %0, u32 {n:#x}\n");
-    assert_eq!(spacing(&shl(MIN_DYNAMIC_SIZE_SHIFT)), MIN_DYNAMIC_SIZE_SHIFT);
-    assert_eq!(spacing(&shl(MIN_DYNAMIC_SIZE_SHIFT - 1)), DESCRIPTOR_SIZE_SHIFT);
+    assert_eq!(
+        spacing(&shl(MIN_DYNAMIC_SIZE_SHIFT)),
+        MIN_DYNAMIC_SIZE_SHIFT
+    );
+    assert_eq!(
+        spacing(&shl(MIN_DYNAMIC_SIZE_SHIFT - 1)),
+        DESCRIPTOR_SIZE_SHIFT
+    );
     assert_eq!(spacing(&shl(u32::BITS - 2)), u32::BITS - 2);
     assert_eq!(spacing(&shl(u32::BITS - 1)), DESCRIPTOR_SIZE_SHIFT);
-    assert_eq!(spacing("    %1: u32 = IMul32 %0, u32 0x10\n"), DESCRIPTOR_SIZE_SHIFT);
+    assert_eq!(
+        spacing("    %1: u32 = IMul32 %0, u32 0x10\n"),
+        DESCRIPTOR_SIZE_SHIFT
+    );
     // Eden's literal values (`size_shift >= 2`, `countr_zero(8)`).
     assert_eq!((MIN_DYNAMIC_SIZE_SHIFT, DESCRIPTOR_SIZE_SHIFT), (2, 3));
     // Through the scan, an index scaled by four bytes gives an array four bytes apart.
@@ -239,4 +246,38 @@ fn the_smallest_spacing_is_four_bytes() {
         sources(&sample_of(lines, "%2")),
         "%60: cbuf 3 at 0x0, 1024 handles 4 bytes apart\n"
     );
+}
+
+/// The most a handle's trace takes: an OR at the top and two chains reaching the depth limit,
+/// `2 * MAX_TRACE_DEPTH + 1` steps (module docs, "Tracing is exact").
+#[test]
+fn the_longest_trace_takes_the_documented_steps() {
+    let side = |first: u32, bank: u32| {
+        let mut lines = format!("    %{first}: u32 = GetCbufU32 u32 {bank:#x}, u32 0x10\n");
+        for k in 1..MAX_TRACE_DEPTH {
+            writeln!(
+                lines,
+                "    %{}: u32 = BitwiseAnd32 %{}, u32 0xffffffff",
+                first + k,
+                first + k - 1
+            )
+            .expect("writes");
+        }
+        (lines, first + MAX_TRACE_DEPTH - 1)
+    };
+    let (left, a) = side(0, 3);
+    let (right, b) = side(20, 4);
+    let lines = format!("{left}{right}    %40: u32 = BitwiseOr32 %{a}, %{b}\n");
+    let function = parse(&sample_of(&lines, "%40"));
+    let found = scan(&function, buffer(BOUND_BANK)).expect("scans");
+    let listed = function.listed().count();
+    let steps = u64::from(2 * MAX_TRACE_DEPTH + 1);
+    // One block in the block order, every listed instruction, then the trace.
+    assert_eq!(
+        found.work().steps(),
+        1 + u64::try_from(listed).expect("fits") + steps
+    );
+    // One more operation on either side is past the limit.
+    let deeper = format!("{lines}    %41: u32 = BitwiseAnd32 %40, u32 0xff\n");
+    assert_eq!(untraced(&sample_of(&deeper, "%41")), Untraced::TooDeep);
 }

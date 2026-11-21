@@ -1,28 +1,12 @@
 //! What each texture operation becomes: the array index, the type changes, the sample
 //! argument, the integer flag, descriptor order, and interpreter equivalence.
 
-use super::{BOUND_BANK, Engine, FLOAT, kind_of, parse, pass, value};
+use super::{BOUND_BANK, Engine, FLOAT, info_at, kind_of, op_at, parse, pass, value};
 use crate::exchange::SampledType;
 use crate::interp::{ImageCall, Machine, ScriptedImage, Val};
-use crate::ir::{Flags, Function, Inst, Opcode, Operation, TextureInfo, TextureType};
+use crate::ir::{Opcode, TextureInfo, TextureType};
 use crate::opt::resources::DESCRIPTOR_MAX_COUNT;
 use crate::translate::texture::ABSENT;
-
-/// The operation at `at`.
-fn op_at(function: &Function, at: u32) -> Operation {
-    match function.inst(value(at)) {
-        Some(Inst::Op(op)) => op.clone(),
-        other => panic!("no operation at %{at}: {other:?}"),
-    }
-}
-
-/// The texture information of the operation at `at`.
-fn info_at(function: &Function, at: u32) -> TextureInfo {
-    match op_at(function, at).flags {
-        Flags::Texture(info) => info,
-        other => panic!("not texture flags: {other:?}"),
-    }
-}
 
 /// An array of handles at 0x100 of bank 3, eight bytes apart, indexed by r0; the red channel
 /// of the sample goes to r1.
@@ -77,17 +61,17 @@ fn sample(first: Val, info: TextureInfo, reply: Val) -> ScriptedImage {
 #[test]
 fn an_indexed_sample_gives_the_same_texel_after_the_pass() {
     let before = parse(ARRAY);
-    let engine = Engine::new().word(3, 0x100, handle_of(0)).kind(handle_of(0), FLOAT);
+    let engine = Engine::new()
+        .word(3, 0x100, handle_of(0))
+        .kind(handle_of(0), FLOAT);
     let (after, _) = pass(ARRAY, &engine);
     let last = DESCRIPTOR_MAX_COUNT - 1;
     for r0 in [0, 1, 7, last] {
         let handle = handle_of(r0);
         let mut start = array_machine(r0);
-        start.images.push_back(sample(
-            Val::U32(handle),
-            info_at(&before, 5),
-            texel(handle),
-        ));
+        start
+            .images
+            .push_back(sample(Val::U32(handle), info_at(&before, 5), texel(handle)));
         let mut ran_before = start.clone();
         ran_before.run(&before).expect("runs before");
         // After the pass the operation names element r0 of descriptor 0; the texel is that
@@ -105,9 +89,11 @@ fn an_indexed_sample_gives_the_same_texel_after_the_pass() {
     }
     // Past the array the index is clamped to its last element, as Eden clamps it.
     let mut start = array_machine(last + 1);
-    start
-        .images
-        .push_back(sample(Val::U32(last), info_at(&after, 5), texel(handle_of(last))));
+    start.images.push_back(sample(
+        Val::U32(last),
+        info_at(&after, 5),
+        texel(handle_of(last)),
+    ));
     start.run(&after).expect("runs after");
     assert_eq!(start.regs[1], handle_of(last));
 }

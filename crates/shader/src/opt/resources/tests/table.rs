@@ -1,11 +1,10 @@
 //! Golden resource tables, the merge rules, the ordering of OR-ed words, and array lengths.
 
 use super::{
-    BOUND_BANK, Engine, FLOAT, answered, buffer, kind_of, parse, pass, sample_of, sources,
-    untraced, value,
+    BOUND_BANK, Engine, FLOAT, answered, buffer, info_at, kind_of, op_at, parse, pass, sample_of,
+    sources, untraced, value,
 };
 use crate::exchange::{Question, Questioner, SampledType, TextureUsage};
-use crate::ir::{Inst, Operand};
 use crate::opt::resources::trace::dynamic_count;
 use crate::opt::resources::{
     DESCRIPTOR_MAX_COUNT, DESCRIPTOR_SIZE, DESCRIPTOR_SIZE_SHIFT, DYNAMIC_ARRAY_BYTES, Untraced,
@@ -90,15 +89,9 @@ fn a_uniform_index_keeps_one_descriptor() {
     assert_eq!(cube.source.count(), 1);
     let index = cube.source.index().expect("an index word");
     assert_eq!((index.bank(), index.offset(), index.shift()), (5, 8, 2));
-    let Some(Inst::Op(op)) = function.inst(value(18)) else {
-        panic!("no operation");
-    };
-    assert_eq!(op.args.first(), Some(&ABSENT));
+    assert_eq!(op_at(&function, 18).args.first(), Some(&ABSENT));
     // The array indexed at run time takes the clamped index instead.
-    let Some(Inst::Op(op)) = function.inst(value(13)) else {
-        panic!("no operation");
-    };
-    assert_ne!(op.args.first(), Some(&ABSENT));
+    assert_ne!(op_at(&function, 13).args.first(), Some(&ABSENT));
 }
 
 #[test]
@@ -229,7 +222,10 @@ fn a_shifted_single_word() {
 /// Eden's `DynamicDescriptorCount`, at each edge, with literal expectations.
 #[test]
 fn array_lengths_at_the_edge() {
-    assert_eq!((DESCRIPTOR_SIZE, DESCRIPTOR_MAX_COUNT, DYNAMIC_ARRAY_BYTES), (8, 1024, 0x4000));
+    assert_eq!(
+        (DESCRIPTOR_SIZE, DESCRIPTOR_MAX_COUNT, DYNAMIC_ARRAY_BYTES),
+        (8, 1024, 0x4000)
+    );
     // From offset 0, eight bytes apart, 2048 fit: held to the limit.
     assert_eq!(dynamic_count(0, DESCRIPTOR_SIZE_SHIFT), 1024);
     // Sixteen bytes apart: 1 + (0x4000 - 8) / 16 = 1024, exactly the limit.
@@ -282,17 +278,10 @@ fn descriptors_merge_as_edens_do() {
     assert_eq!(table.images().len(), 2);
     let descriptor = |at: u32| {
         let (function, _) = pass(text, &engine);
-        match function.inst(value(at)) {
-            Some(Inst::Op(op)) => match op.flags {
-                crate::ir::Flags::Texture(info) => info.descriptor_index,
-                _ => panic!("no texture flags"),
-            },
-            _ => panic!("no operation"),
-        }
+        info_at(&function, at).descriptor_index
     };
     assert_eq!(
         [3, 4, 5, 7, 8, 9, 11, 12].map(descriptor),
         [0, 1, 0, 0, 0, 1, 2, 2]
     );
-    let _ = Operand::Value(value(0));
 }
