@@ -33,7 +33,10 @@
 //!      lowering declares ([`constant_buffer_sizes`]); its interface tables are not passed on
 //!      yet;
 //!   5. for a compute program, its local memory ([`PipelineRefusal::ComputeLocalMemory`]);
-//!   6. the lowering ([`lower_with`], [`Rejection::Lower`]), with the variant key's workgroup
+//!   6. the host lowering passes the host target's features call for ([`lower_for_host`],
+//!      slice 18, [`Rejection::HostLower`]): 64-bit floats become 32-bit ones where the target
+//!      lacks them, and 16-bit floats likewise; the spec's pass 8;
+//!   7. the lowering ([`lower_with`], [`Rejection::Lower`]), with the variant key's workgroup
 //!      and shared-memory sizes and emulation flags, the header's local-memory size, the
 //!      constant-buffer sizes of step 4 and the host target's features.
 //!
@@ -86,6 +89,7 @@ use crate::decode::Instruction;
 use crate::exchange::{Answers, Question, Questioner};
 use crate::flow::{BranchTables, JumpTableQuestions, resolve_jump_tables};
 use crate::host::{HostCaps, HostShader, Requirements};
+use crate::host_lower::lower_for_host;
 use crate::info::{check_header, collect, translation_stage};
 use crate::ir::{Function, Inst, Opcode};
 use crate::lower::{LowerInputs, constant_buffer_sizes, lower_with};
@@ -189,13 +193,14 @@ impl Translator for PipelineTranslator {
     }
 }
 
-/// The host target's features as the lowering takes them: the features of [`Requirements`] the
-/// lowering can need ([`HostCaps`]); 64-bit floats and 64-bit atomics are refused by the
+/// The host target's features as the lowering and the host lowering passes take them: the
+/// features of [`Requirements`] they can need ([`HostCaps`]); 64-bit atomics are refused by the
 /// lowering whatever the target has.
 #[must_use]
 pub const fn host_caps(caps: Requirements) -> HostCaps {
     HostCaps {
         f16: caps.f16,
+        f64: caps.f64,
         i64: caps.i64,
         subgroup: caps.subgroup,
         subgroup_size_32: caps.subgroup_size_32,
@@ -220,16 +225,18 @@ pub fn translate_shader(input: &ShaderInput<'_, PipelineProgram>) -> Result<Host
         Io::Vtg(_) => None,
     });
     let code: Vec<Instruction> = program.capture.instructions().collect();
-    let function = pipeline_ir(stage, pixel, &code, &tables)?;
+    let mut function = pipeline_ir(stage, pixel, &code, &tables)?;
     let info = collect(input.stage, header, &function)?;
     if input.stage == GuestStage::Compute && uses_local_memory(&function) {
         return Err(PipelineRefusal::ComputeLocalMemory.into());
     }
+    let caps = host_caps(input.target.caps);
+    lower_for_host(&mut function, caps)?;
     let inputs = LowerInputs {
         workgroup_size: input.variant.workgroup_size,
         local_memory_bytes: header.map_or(0, |header| header.common.local_memory_size()),
         shared_memory_bytes: input.variant.shared_memory_size,
-        caps: host_caps(input.target.caps),
+        caps,
         constant_buffers: constant_buffer_sizes(&info),
         emulation: input.variant.emulation,
     };

@@ -995,6 +995,15 @@ fn host_caps_take_each_feature() {
         (
             Requirements {
                 f64: true,
+                ..all_off
+            },
+            HostCaps {
+                f64: true,
+                ..HostCaps::NONE
+            },
+        ),
+        (
+            Requirements {
                 i64_atomics: true,
                 ..all_off
             },
