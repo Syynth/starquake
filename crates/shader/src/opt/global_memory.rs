@@ -62,10 +62,16 @@
 //! is left as it was (`tests::rejections::a_refused_function_is_unchanged`). The checks run
 //! access by access in collection order, and for one access in this order: the low address
 //! (each [`UntracedReason`] in the order above), the pointer ([`UntracedReason::ImmediateLowWord`],
-//! then [`UntracedReason::NoPointer`]), then the pointer's bank ([`GlobalMemoryError::Bank`])
-//! and its offset ([`GlobalMemoryError::Offset`]). The first fault is the error
+//! then [`UntracedReason::NoPointer`]), then the pointer's bank ([`GlobalMemoryError::Bank`]),
+//! its offset ([`GlobalMemoryError::Offset`]) and, for a store or an atomic, its data argument
+//! ([`GlobalMemoryError::MissingData`]). The first fault is the error
 //! (`tests::rejections::the_first_access_in_post_order_is_reported`,
-//! `tests::rejections::bank_is_checked_before_offset`).
+//! `tests::rejections::bank_is_checked_before_offset`). A malformed function
+//! ([`GlobalMemoryError::Pass`]: an `Identity` chain that loops, an id with no instruction) is
+//! reported when the walk meets it, before those checks; and once every access has passed
+//! them, an arena without room for the replacements ([`BuildError::Full`];
+//! `tests::arena_room_edges`). After that the replacement cannot fail: [`Function::push`]
+//! refuses only a full arena.
 //!
 //! # Where this pass departs from Eden's
 //!
@@ -141,7 +147,8 @@
 //! start's match is found by stepping to the rightmost argument one step nearer, remembering
 //! each instruction's match. Each instruction and argument is visited a fixed number of times,
 //! so the [`Work`] the pass returns is linear in the function's size, and so is the memory it
-//! holds (a few words per arena slot and per argument): `tests::linear` pins it on a program
+//! holds (eight 32-bit words and an optional bank and offset per arena slot, two 32-bit words
+//! per argument of a reached instruction, and the access lists): `tests::linear` pins it on a program
 //! at the translation driver's cap ([`crate::translate::driver::MAX_TRANSLATED_INSTRUCTIONS`])
 //! and the exact work of one fixed function.
 
@@ -151,7 +158,9 @@ mod tests;
 use thiserror::Error;
 
 use crate::info::INDEXED_CBUF_SIZE;
-use crate::ir::{BlockId, Function, Imm, Inst, Opcode, Operand, Operation, Value, VerifyError};
+use crate::ir::{
+    BlockId, BuildError, Function, Imm, Inst, Opcode, Operand, Operation, Value, VerifyError,
+};
 use crate::translate::float::CBUF_BANKS;
 
 use super::identity::Resolver;
@@ -278,7 +287,8 @@ pub enum UntracedReason {
     OffsetNotImmediate,
     /// The address is an `IAdd64` whose base is an immediate.
     ImmediateBase,
-    /// The address is a `PackUint2x32` of an immediate.
+    /// The address is a `PackUint2x32` of an immediate (only a function that does not verify
+    /// has one: no immediate is a vector).
     ImmediatePair,
     /// The address is not built from two 32-bit words (`CompositeConstructU32x2`).
     NotAPair,
@@ -349,8 +359,17 @@ pub enum GlobalMemoryError {
         /// The offset.
         offset: u32,
     },
-    /// The function is malformed: an `Identity` chain that loops, an id with no instruction,
-    /// or a full arena.
+    /// A store or an atomic without its data argument (argument 1), which only a function that
+    /// does not verify has.
+    #[error("{at}: {opcode} has no data argument")]
+    MissingData {
+        /// The access.
+        at: Value,
+        /// Its opcode.
+        opcode: Opcode,
+    },
+    /// The function is malformed (an `Identity` chain that loops, an id with no instruction),
+    /// or its arena has no room for the replacements ([`BuildError::Full`]).
     #[error(transparent)]
     Pass(#[from] PassError),
     /// The output does not verify (checked in tests and debug builds, as the parent module's
@@ -526,12 +545,27 @@ pub fn to_storage_buffers(
                 offset,
             });
         }
+        let data = match found.access {
+            Access::Load => None,
+            Access::Write | Access::Atomic => {
+                Some(operation(function, found.value)?.1.get(1).copied().ok_or(
+                    GlobalMemoryError::MissingData {
+                        at: found.value,
+                        opcode: found.opcode,
+                    },
+                )?)
+            }
+        };
         collected.push(Collected {
             low: low.word,
             imm_offset: low.imm_offset,
             bank,
             offset,
+            data,
         });
+    }
+    if !arena_fits(arena_len(function), accesses.len()) {
+        return Err(PassError::Build(BuildError::Full).into());
     }
 
     // The table: each buffer once, by bank then offset, written when any access writes.
@@ -598,6 +632,29 @@ struct Collected {
     imm_offset: u32,
     bank: u8,
     offset: u32,
+    /// A store's or an atomic's argument 1; `None` for a load.
+    data: Option<Operand>,
+}
+
+/// The instructions the replacement makes per access, at most: `IAdd32`, `GetCbufU32`,
+/// `BitwiseAnd32`, `ISub32` and the storage opcode.
+const MADE_PER_ACCESS: u64 = 5;
+
+/// How many instructions an arena can hold: ids are 32-bit ([`Value::index`]), and
+/// [`Function::push`] refuses an instruction whose id would not fit.
+const ARENA_CAPACITY: u64 = 1 << u32::BITS;
+
+/// Whether an arena of `len` instructions has room for the replacements of `accesses`
+/// accesses (at most [`ARENA_CAPACITY`] instructions after them), checked before the first
+/// change so that [`Function::push`] cannot refuse part-way.
+fn arena_fits(len: usize, accesses: usize) -> bool {
+    let (Ok(len), Ok(accesses)) = (u64::try_from(len), u64::try_from(accesses)) else {
+        return false;
+    };
+    accesses
+        .checked_mul(MADE_PER_ACCESS)
+        .and_then(|made| made.checked_add(len))
+        .is_some_and(|total| total <= ARENA_CAPACITY)
 }
 
 /// The low address of an access (Eden's `LowAddrInfo`).
@@ -992,13 +1049,7 @@ fn replace_block(
                 .binary_search_by_key(&(collected.bank, collected.offset), |d| (d.bank, d.offset))
                 .unwrap_or(0);
             let binding = u32::try_from(binding).map_err(|_| PassError::Missing(value))?;
-            let data = match (found.access, function.inst(value)) {
-                (Access::Load, _) => None,
-                (Access::Write | Access::Atomic, Some(Inst::Op(op))) => {
-                    Some(op.args.get(1).copied().ok_or(PassError::Missing(value))?)
-                }
-                (Access::Write | Access::Atomic, _) => return Err(PassError::Missing(value)),
-            };
+            let data = collected.data;
             let mut make = |opcode: Opcode, args: Vec<Operand>| -> Result<Operand, PassError> {
                 work.step();
                 let made = function.push(block, Inst::Op(Operation::new(opcode, args)))?;

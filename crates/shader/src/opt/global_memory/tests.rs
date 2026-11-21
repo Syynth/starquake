@@ -349,6 +349,21 @@ block1:
     );
 }
 
+/// The room check at its edge: the last access's storage opcode may take the last id.
+#[test]
+fn arena_room_edges() {
+    let room = |made: u64| usize::try_from(ARENA_CAPACITY - made).expect("fits on a 64-bit host");
+    assert!(arena_fits(room(MADE_PER_ACCESS), 1));
+    assert!(!arena_fits(room(MADE_PER_ACCESS - 1), 1));
+    assert!(arena_fits(room(2 * MADE_PER_ACCESS), 2));
+    assert!(!arena_fits(room(2 * MADE_PER_ACCESS - 1), 2));
+    assert!(arena_fits(room(0), 0));
+    assert!(!arena_fits(room(0) + 1, 0));
+    assert!(!arena_fits(0, usize::MAX));
+    // The capacity is what 32-bit ids can name.
+    assert_eq!(ARENA_CAPACITY, u64::from(u32::MAX) + 1);
+}
+
 #[test]
 fn alignment_is_a_power_of_two() {
     for bytes in [0, 3, 6, 255, 257, u32::MAX] {
@@ -768,6 +783,51 @@ block1:
              \x20   %8: u64 = IAdd64 %2, u32 0x10\n",
         );
         assert_eq!(refuse(&add), untraced(UntracedReason::OffsetNotImmediate));
+    }
+
+    /// A store or an atomic without its data argument is refused, with its words; a bad bank
+    /// is reported before it.
+    #[test]
+    fn a_missing_data_argument_is_refused() {
+        let pointer = |bank: u32| {
+            format!(
+                "block0:
+    %0: u32 = GetCbufU32 u32 {bank:#x}, u32 0x100
+    %1: u32x2 = CompositeConstructU32x2 %0, u32 0x0
+    %2: u64 = PackUint2x32 %1
+"
+            )
+        };
+        for (access, opcode) in [
+            ("    %3 = WriteGlobal32 %2\n", Opcode::WriteGlobal32),
+            (
+                "    %3: u32 = GlobalAtomicIAdd32 %2\n",
+                Opcode::GlobalAtomicIAdd32,
+            ),
+        ] {
+            let text = format!("{}{access}    return\n", pointer(0));
+            let error = refuse(&text);
+            assert_eq!(
+                error,
+                GlobalMemoryError::MissingData {
+                    at: value(3),
+                    opcode,
+                }
+            );
+            assert_eq!(
+                error.to_string(),
+                format!("%3: {opcode} has no data argument")
+            );
+            let bad_bank = format!("{}{access}    return\n", pointer(u32::from(CBUF_BANKS)));
+            assert_eq!(
+                refuse(&bad_bank),
+                GlobalMemoryError::Bank {
+                    at: value(3),
+                    opcode,
+                    bank: u32::from(CBUF_BANKS),
+                }
+            );
+        }
     }
 
     /// An `Identity` chain that loops is a malformed function, refused before anything
