@@ -495,6 +495,6 @@ fn a_host_shader_binds_nothing_yet() {
         starquake_shader::host::HostStage::Vertex
     );
     let shader = host_shader(GuestStage::Vertex);
-    assert!(SeamShader::resources(&shader).is_empty());
+    assert_eq!(SeamShader::resources(&shader), Vec::new());
     assert_eq!(SeamShader::host(&shader).stage, shader.stage);
 }
