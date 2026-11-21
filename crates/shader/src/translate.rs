@@ -8,6 +8,7 @@
 //!
 //! - [`integer`]: the integer ALU group (slice 12a), `MOV` included;
 //! - [`float`]: the 32-bit float and conversion group (slice 12b);
+//! - [`half_double`]: the half- and double-precision group (slice 12c);
 //! - [`texture`]: the texture and surface group (slice 12f);
 //! - [`memory`]: the memory group (slice 12e), joined to the driver ([`driver`]'s module docs,
 //!   "Dispatch");
@@ -32,11 +33,11 @@
 //! guarded pure instruction with [`split_for_guard`], the shared guard helper, and translates
 //! the guarded instructions that write no IR (`NOP`, `DEPBAR`, `BREAK`, `WARPSYNC` with an
 //! immediate) as they are, with no block ([`driver`]'s "Guards", which lists this as an owner
-//! question). The group translators that take a guard themselves ([`integer`]; [`float`] and
-//! [`texture`] through [`conditional_block`]) use the same helper. Slice 1's straight-line `translate()`, which kept a guarded
-//! pure instruction as a select, is retired (the owner's ruling of 2026-11-19, row 1), and so is
-//! its `MOV` path, which took only register and immediate sources: `MOV` is the integer
-//! group's, which reads every source form.
+//! question). The group translators that take a guard themselves ([`integer`]; [`float`],
+//! [`half_double`] and [`texture`] through [`conditional_block`]) use the same helper. Slice 1's
+//! straight-line `translate()`, which kept a guarded pure instruction as a select, is retired
+//! (the owner's ruling of 2026-11-19, row 1), and so is its `MOV` path, which took only
+//! register and immediate sources: `MOV` is the integer group's, which reads every source form.
 //!
 //! **Sources.** The translators read their source operands through one shared reader (the
 //! `source` module: registers, uniform registers, constant-buffer words, predicates and uniform
@@ -46,6 +47,7 @@ mod attribute;
 pub mod control;
 pub mod driver;
 pub mod float;
+pub mod half_double;
 pub mod integer;
 pub mod memory;
 pub(crate) mod source;
@@ -190,6 +192,10 @@ pub enum Unsupported {
     /// A form of the texture and surface group that is not translated ([`texture`]).
     #[error("{0}")]
     Texture(texture::TextureUnsupported),
+    /// A form of the half- and double-precision group that is not translated
+    /// ([`half_double`]).
+    #[error("{0}")]
+    HalfDouble(half_double::HalfDoubleUnsupported),
 }
 
 /// Why a program was not translated.
@@ -347,9 +353,9 @@ pub(crate) fn split_for_guard(
 }
 
 /// Appends `body` at the end of `builder`'s block under `guard`, for the groups whose
-/// translators take a guard themselves ([`float`], [`texture`]): unless `guard_tested` (the
-/// block already runs only where the guard holds, flow analysis's `guard_tested`) or the guard
-/// is `PT`, the guard is read ([`source`]'s `pred`) and [`split_for_guard`] makes the
+/// translators take a guard themselves ([`float`], [`half_double`], [`texture`]): unless
+/// `guard_tested` (the block already runs only where the guard holds, flow analysis's
+/// `guard_tested`) or the guard is `PT`, the guard is read ([`source`]'s `pred`) and [`split_for_guard`] makes the
 /// conditional block, `body`'s IR goes in the instruction's block, and `builder` is left in the
 /// block after, where translation continues. `@!PT` makes a block that never runs (the driver
 /// skips such an instruction before it gets here).
