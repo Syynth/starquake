@@ -782,3 +782,70 @@ fn host_caps_take_each_feature() {
         assert_eq!(host_caps(caps), wanted, "{caps:?}");
     }
 }
+
+/// A pixel program's header reaches the driver: its colour outputs make the `EXIT` write
+/// colour target 0, which the lowered shader outputs; and its input map tells `IPA` how
+/// generic 0 is interpolated, so the program gets past the driver (which refuses an `IPA` of a
+/// generic attribute without the map) and is refused only by the lowering, which takes pixel
+/// generic inputs with slice 17.
+#[test]
+fn a_pixel_program_s_header_reaches_the_driver() {
+    use crate::decode::{InterpFreq, InterpLoc, OpIpa};
+    use crate::host::{GuestSlot, SlotBinding, SlotType};
+    use crate::sph::{ComponentMask, Components, PixelImap, PixelIo};
+
+    let mut io = PixelIo::default();
+    io.targets[0] = ComponentMask {
+        x: true,
+        y: false,
+        z: false,
+        w: false,
+    };
+    io.generic[0] = Components {
+        x: PixelImap::Perspective,
+        ..Components::default()
+    };
+    let header = ProgramHeader {
+        common: Common::default(),
+        io: Io::Pixel(Box::new(io)),
+    };
+    let one = 1.0_f32.to_bits();
+    let colour = through_the_cache(
+        GuestStage::Pixel,
+        &bytes(Some(&header), &words(&[mov(0, one), exit()])),
+        &State::default(),
+        &VariantKey::default(),
+    )
+    .expect("lowers");
+    assert_eq!(
+        colour.outputs,
+        [crate::host::InterfaceSlot {
+            binding: SlotBinding::Location(0),
+            ty: SlotType::F32x4,
+            guest: GuestSlot::RenderTarget(0),
+        }]
+    );
+    let ipa = Instr::new(Op::Ipa(OpIpa {
+        dst: r(0),
+        addr: GENERIC_0_X,
+        freq: InterpFreq::Pass,
+        loc: InterpLoc::Default,
+        offset: Gpr::RZ,
+        pred: Pred::PT,
+    }));
+    let refused = through_the_cache(
+        GuestStage::Pixel,
+        &bytes(Some(&header), &words(&[ipa, exit()])),
+        &State::default(),
+        &VariantKey::default(),
+    )
+    .expect_err("pixel generic inputs are slice 17's");
+    assert!(
+        matches!(*refused, Rejection::Lower(LowerError::Input { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(
+        refused.to_string(),
+        "a pixel program cannot read attribute a0x80"
+    );
+}
