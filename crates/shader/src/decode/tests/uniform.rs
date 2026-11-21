@@ -7,6 +7,7 @@
 use proptest::prelude::*;
 use proptest::strategy::Union;
 
+use super::super::fields::COMMON;
 use super::super::form::Reader;
 use super::super::op::uniform::{self, TWIN_MNEMONICS, TWINS, Twin};
 use super::*;
@@ -842,6 +843,207 @@ fn uniform_registers_at_the_edges_of_their_encoding() {
     assert_eq!(add.op().dst, Gpr::RZ);
     assert_eq!(add.op().srcs, [AluSrc::reg(Gpr::RZ); 3]);
     assert_eq!(text(twin_rz), "uiadd3 urz, urz, urz, urz;");
+}
+
+/// A twin base word's fields, as `(start, value)`.
+type Fields = &'static [(u32, u128)];
+
+/// `UIADD3` with its overflow outputs read (`ADD_X`: `.X`, its carry inputs read).
+const ADD: Fields = &[
+    (16, 1),
+    (24, 2),
+    (32, 3),
+    (64, 4),
+    (77, 7),
+    (81, 5),
+    (84, 6),
+    (87, 7),
+];
+const ADD_X: Fields = &[
+    (16, 1),
+    (24, 2),
+    (32, 3),
+    (64, 4),
+    (74, 1),
+    (77, 2),
+    (81, 7),
+    (84, 7),
+    (87, 3),
+];
+/// `ULEA` with its overflow output read (`LEA_X`: `.X`, its carry input read).
+const LEA: Fields = &[(16, 1), (24, 2), (32, 3), (64, 4), (81, 3), (87, 7)];
+const LEA_X: Fields = &[
+    (16, 1),
+    (24, 2),
+    (32, 3),
+    (64, 4),
+    (74, 1),
+    (81, 3),
+    (87, 2),
+];
+/// `ULOP3` with its predicate output and the fixed `!UPT` input.
+const LOP3: Fields = &[
+    (16, 1),
+    (24, 2),
+    (32, 3),
+    (64, 4),
+    (72, 0x96),
+    (81, 2),
+    (87, 15),
+];
+/// `UIMAD.X` with its carry input and the fixed `UPT` output.
+const IMAD_X: Fields = &[
+    (16, 1),
+    (24, 2),
+    (32, 3),
+    (64, 4),
+    (74, 1),
+    (81, 7),
+    (87, 4),
+];
+/// `UISETP.EX`, which reads its low comparison.
+const SETP_EX: Fields = &[
+    (24, 2),
+    (32, 3),
+    (68, 5),
+    (72, 1),
+    (74, 2),
+    (76, 6),
+    (81, 1),
+    (84, 2),
+    (87, 3),
+];
+/// `USEL` with its condition.
+const SEL: Fields = &[(16, 1), (24, 2), (32, 3), (87, 6)];
+
+/// Each twin predicate field, as `(twin base, base word fields, field start)`.
+const TWIN_PREDICATE_CASES: &[(u16, Fields, u32)] = &[
+    (uniform::UIADD3_OPCODE, ADD, 81),
+    (uniform::UIADD3_OPCODE, ADD, 84),
+    (uniform::UIADD3_OPCODE, ADD_X, 77),
+    (uniform::UIADD3_OPCODE, ADD_X, 87),
+    (uniform::ULEA_OPCODE, LEA, 81),
+    (uniform::ULEA_OPCODE, LEA_X, 87),
+    (uniform::ULOP3_OPCODE, LOP3, 81),
+    (uniform::UIMAD_OPCODE, IMAD_X, 87),
+    (uniform::UISETP_OPCODE, SETP_EX, 68),
+    (uniform::UISETP_OPCODE, SETP_EX, 81),
+    (uniform::UISETP_OPCODE, SETP_EX, 84),
+    (uniform::UISETP_OPCODE, SETP_EX, 87),
+    (uniform::USEL_OPCODE, SEL, 87),
+];
+
+/// The uniform predicates `UP0`, `UP6` and `UPT` (values 0, 6 and 7 of the three-bit field) in
+/// every predicate field of `LDCG` and the twins, in every form the instruction has: each word
+/// decodes and re-assembles to itself. `LDCG`'s predicate (87..90, NAK `set_upred_src(87..90,
+/// 90, pred)`) is tried with its negation (bit 90) clear and set; the twins' fields are the
+/// vector ops' (`op::integer`), each tried on a base word in which it is read (`.X` for the
+/// carry inputs, `.EX` for `UISETP`'s low comparison).
+#[test]
+fn uniform_predicates_at_the_edges_of_their_encoding() {
+    let edges = [0, 6, UniformPred::UPT.index()];
+    let round_trips = |word: Instruction| {
+        let decoded = decode(word);
+        assert!(decoded.is_ok(), "{word:?}: {decoded:?}");
+        let instr = decoded.expect("decodes");
+        assert_eq!(
+            assemble(&instr).map(Instruction::bits),
+            Ok(word.bits()),
+            "{instr}"
+        );
+    };
+    let mut checked = 0;
+    for &(base, fields, start) in TWIN_PREDICATE_CASES {
+        let twin = Twin::of_base(u64::from(base)).expect("a twin");
+        for &form in twin.forms() {
+            let opcode = form.opcode(base);
+            let base_word = word(u128::from(opcode), fields).with_field(Field::bit(91), 1);
+            for value in edges {
+                round_trips(base_word.with_field(Field::new(start, 3), u64::from(value)));
+                checked += 1;
+            }
+        }
+    }
+    // UIADD3, ULEA, ULOP3 and UIMAD have three forms, UISETP and USEL two.
+    assert_eq!(checked, 3 * (4 * 3 + 2 * 3 + 3 + 3) + 3 * (4 * 2 + 2));
+    let ldcg = word(
+        u128::from(uniform::LDCG_OPCODE),
+        &[(16, 2), (24, 4), (73, 4), (91, 1)],
+    );
+    for negated in [false, true] {
+        for value in edges {
+            round_trips(
+                ldcg.with_field(Field::new(87, 3), u64::from(value))
+                    .with_flag(Field::bit(90), negated),
+            );
+        }
+    }
+}
+
+/// Each known bit of each twin form that is not in a register field, a fixed bit, or the
+/// opcode, guard and scheduling bits, flipped alone on the form's canonical word: the word
+/// decodes and re-assembles to itself, so each modifier bit is read where the encoder writes
+/// it (an unread bit would be refused at step 5). No single flip reaches one of the vector ops'
+/// refused values (`UISETP`'s combination 3 and `UPRMT`'s mode 7 need two bits). The bits a
+/// hand-built case sets only together with others (`ULEA`'s 72, 73 and 74, `UISETP`'s 72, 73,
+/// 74 and 76, `UIADD3`'s 72 and its form 1's 63, `USHF`'s 75) are checked to be among those
+/// flipped alone.
+#[test]
+fn each_twin_bit_alone_decodes_and_reassembles() {
+    let mut flipped = std::collections::BTreeSet::new();
+    for twin in TWINS {
+        for &form in twin.forms() {
+            let uniform_form = twin.form(form);
+            let registers: u128 = twin
+                .register_fields(form)
+                .into_iter()
+                .flatten()
+                .map(Field::mask)
+                .sum();
+            let flippable = uniform_form.known & !uniform_form.fixed & !COMMON & !registers;
+            let canonical = canonical_word(uniform_form.opcode);
+            for bit in 0..u128::BITS {
+                if flippable & (1 << bit) == 0 {
+                    continue;
+                }
+                let word = Instruction::from_bits(canonical.bits() ^ (1 << bit));
+                let decoded = decode(word);
+                assert!(
+                    decoded.is_ok(),
+                    "{:#x} {bit}: {decoded:?}",
+                    uniform_form.opcode
+                );
+                let instr = decoded.expect("decodes");
+                assert_eq!(
+                    assemble(&instr).map(Instruction::bits),
+                    Ok(word.bits()),
+                    "{:#x} {bit}: {instr}",
+                    uniform_form.opcode
+                );
+                flipped.insert((uniform_form.opcode, bit));
+            }
+        }
+    }
+    let with_form = |base: u16, form: AluForm| form.opcode(base);
+    let mut alone = vec![];
+    for form in [AluForm::Reg, AluForm::ImmSrc2, AluForm::ImmSrc1] {
+        for bit in [72, 73, 74] {
+            alone.push((with_form(uniform::ULEA_OPCODE, form), bit));
+        }
+        alone.push((with_form(uniform::UIADD3_OPCODE, form), 72));
+        alone.push((with_form(uniform::USHF_OPCODE, form), 75));
+    }
+    for form in [AluForm::Reg, AluForm::ImmSrc1] {
+        for bit in [72, 73, 74, 76] {
+            alone.push((with_form(uniform::UISETP_OPCODE, form), bit));
+        }
+    }
+    alone.push((with_form(uniform::UIADD3_OPCODE, AluForm::Reg), 63));
+    let missing: Vec<_> = alone
+        .into_iter()
+        .filter(|pair| !flipped.contains(pair))
+        .collect();
+    assert_eq!(missing, []);
 }
 
 /// The text of the twins rewrites every register and predicate operand of the vector op's and
