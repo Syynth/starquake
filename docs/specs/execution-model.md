@@ -203,9 +203,10 @@ backed lazily: a host page is committed only when the guest first touches it, so
 host what the title touches, not what it may map. This replaces `WORKING_RAM`, a fixed 16 MiB guess
 added to the program image (`crates/core/src/system/ram.rs`), which the first retail title brought
 up used up early in its start-up; its replacement is the pool itself, the size
-`GuestRam::for_program` gives every program that fits. The backend's translation table pool, fixed
-at 4 MiB (about 2 GiB of scattered 2 MiB windows), then bounds what a title can touch until it is
-sized with the address space.
+`GuestRam::for_program` gives every program that fits. The backend's translation table pool is sized
+with the address space (PR #480): every table of one 39-bit, 4 KiB-granule address space
+(`stage1::MAX_TABLE_PAGES`, 262,657 pages), reserved whole and backed lazily like RAM, so loading
+cannot run out of tables.
 
 GPU-only memory (the graphics server's sparse regions, two of about 5.7 GiB in one title) is not
 guest memory at all: the CPU never maps it. The GPU crate backs it lazily on the host, the first

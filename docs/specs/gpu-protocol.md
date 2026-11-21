@@ -553,10 +553,11 @@ a `Write` or `Run` of its 3D class, and every channel's before a `Syncpoint`, `M
 `Present`, so the work after them in the stream comes after the draw. A listed divergence, as
 built in G19 (decided by the owner, 2026-11-19).
 
-**Clears.** `CLEAR_SURFACE` becomes a `Command::Clear` of the bound targets, or a draw when the
-clear is masked or scissored in a way a render-pass clear cannot express, as Eden's
-`DrawManager::Clear` decides (`eden-nx2/src/video_core/engines/draw_manager.cpp`). Slice G24
-owns it (decided by the owner, 2026-11-19).
+**Clears.** `CLEAR_SURFACE` becomes a `Command::Clear` of the bound targets, with the write masks
+and rectangle the guest asks for. Slice G24 owns it (decided by the owner, 2026-11-19). G24 first
+drew masked and scissored clears itself, as Eden's `DrawManager::Clear` decides
+(`eden-nx2/src/video_core/engines/draw_manager.cpp`); #455 (PR #483) moved those draws into the
+render backend, as the next paragraph says.
 
 Masked clears are the render backend's (decided by the owner, 2026-11-19). `ClearDesc` carries the
 colour channels and stencil bits a clear writes (render-backend, "Commands"), so a masked clear is
