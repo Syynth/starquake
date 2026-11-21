@@ -546,11 +546,7 @@ impl Lowering {
             return self.done(at, Some(expr));
         }
         let expr = match opcode {
-            Opcode::Void | Opcode::Prologue => None,
-            Opcode::Epilogue => {
-                self.epilogue(body)?;
-                None
-            }
+            Opcode::Void | Opcode::Prologue | Opcode::Epilogue => None,
             Opcode::Identity | Opcode::ConditionRef => Some(self.arg(body, at, op, 0)?),
             Opcode::UndefU1 => Some(self.lit(body, Literal::Bool(false))),
             Opcode::UndefU32 => Some(self.lit(body, Literal::U32(0))),

@@ -629,8 +629,6 @@ struct Interface {
     requirements: Requirements,
     /// The constant-buffer banks read.
     constant_buffers: BTreeSet<u8>,
-    /// Whether the function has an `Epilogue` (the `emulation` submodule).
-    epilogue: bool,
     /// Whether the module reads the driver constants, decided from the epilogue's plan.
     driver_constants: bool,
 }
@@ -723,7 +721,6 @@ impl Interface {
                     .insert(resources::read_bank(at, op, inputs)?);
             }
             match op.opcode {
-                Opcode::Epilogue => found.epilogue = true,
                 Opcode::GetAttribute => match classify(attribute_arg(at, op, 1)?) {
                     Some(AttributeKind::Generic { index, .. }) if vertex => {
                         found.inputs.insert(host_location(index)?);
@@ -861,7 +858,9 @@ pub fn lower_with(
     check_inputs(stage, inputs)?;
     let nodes = tree(function)?;
     let mut interface = Interface::collect(stage, function, inputs)?;
-    let epilogue = if interface.epilogue {
+    // The steps run before each return (the `emulation` submodule), so a function with none
+    // (it ends in `unreachable` everywhere) plans none and declares no driver constants.
+    let epilogue = if emulation::returns(&nodes) {
         emulation::Epilogue::plan(
             stage == GuestStage::Vertex,
             stage == GuestStage::Pixel,
@@ -907,6 +906,7 @@ pub fn lower_with(
     let mut body = Block::new();
     lowering.nodes(function, &nodes, &mut body)?;
     if !matches!(nodes.last(), Some(Node::Return | Node::Unreachable)) {
+        lowering.epilogue(&mut body)?;
         lowering.ret(&mut body);
     }
     if let Some(feature) = requirements.missing(inputs.caps) {

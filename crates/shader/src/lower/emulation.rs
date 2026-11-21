@@ -1,13 +1,18 @@
-//! The fixed-function state the host lacks, done in the shader at the function's `Epilogue`
-//! (slice 17; spec, "Pipeline-state specialisation": the render backend's `EmulationFlags`,
-//! mirrored in [`crate::variant::EmulationKey`]; render-backend, "Fixed-function state the host
-//! lacks").
+//! The fixed-function state the host lacks, done in the shader before each return (slice 17;
+//! spec, "Pipeline-state specialisation": the render backend's `EmulationFlags`, mirrored in
+//! [`crate::variant::EmulationKey`]; render-backend, "Fixed-function state the host lacks").
 //!
 //! Eden runs its emulation in `EmitEpilogue`
 //! (`eden/src/shader_recompiler/backend/spirv/emit_spirv_special.cpp` @ cf654052), at each
-//! `Epilogue` operation; the structurizer puts one before every `return`
-//! ([`crate::structure`]), as Eden's does. The lowering does the same: each `Epilogue` lowers to
-//! the steps below, in this order, and a function with none does none of them.
+//! `Epilogue` operation, which its structurizer puts before every return; starquake's
+//! structurizer does the same ([`crate::structure`]). A program of one block is not structured
+//! (the lowering takes it as that block and a return, [`super::lower_with`]'s "What it takes"),
+//! so it has no `Epilogue`. The lowering therefore does the steps below, in this order, before
+//! each return it writes for the tree's `return` nodes and before the entry point's closing
+//! return, and lowers `Epilogue` itself as a no-op; a structured function's returns are exactly
+//! where its `Epilogue`s are, so the two placements agree there. An `unreachable` node, which
+//! the lowering also writes as a return, does no step: Eden writes `OpUnreachable` there and
+//! runs no epilogue.
 //!
 //! 1. **The depth-range rewrite** (vertex programs, [`EmulationKey::depth_range_rewrite`]):
 //!    the written position's z becomes `(z + w) * 0.5`, moving the guest's -1..1 depth range
@@ -42,12 +47,14 @@
 //! |---|---|---|---|
 //! | The alpha reference | Read from the driver constants each draw (decision 16) | Compiled in from `RuntimeInfo::alpha_test_reference` | `tests::emulation::the_alpha_test_reads_the_reference` |
 //! | The flipped viewport | Done in the vertex shader | Not done: Vulkan takes the viewport | `tests::emulation::the_flipped_viewport_reads_three_constants` |
+//! | Where the steps run | Before each `return` the lowering writes for a `return` node or at the end of the entry point | At each `Epilogue`, which Eden's structurizer puts before each return | `tests::emulation::each_return_does_the_steps`, `tests::emulation::a_program_of_one_block_does_the_steps` |
 
 use naga::{BinaryOperator, Block, Expression, Handle, Literal, Statement};
 
 use super::builder::push;
 use super::{LowerError, Lowering, OutputMember};
 use crate::driver_constants::DriverConstant;
+use crate::ir::Node;
 use crate::variant::{CompareFunction, EmulationKey};
 
 /// The component of a `vec4` that is y, z or w (alpha).
@@ -94,6 +101,21 @@ impl Epilogue {
     }
 }
 
+/// Whether the entry point lowered from `nodes` writes a return that does the steps: a
+/// `return` node anywhere in the tree, or a closing return (the tree does not end in `return`
+/// or `unreachable`). The recursion is as deep as the tree, which the verifier bounds
+/// ([`crate::ir::MAX_NESTING`]).
+pub(super) fn returns(nodes: &[Node]) -> bool {
+    fn any_return(nodes: &[Node]) -> bool {
+        nodes.iter().any(|node| match node {
+            Node::Return => true,
+            Node::If { body, .. } | Node::Loop { body, .. } => any_return(body),
+            Node::Block(_) | Node::Break { .. } | Node::Unreachable => false,
+        })
+    }
+    !matches!(nodes.last(), Some(Node::Return | Node::Unreachable)) || any_return(nodes)
+}
+
 /// The ordered comparison `function` makes, as `ops`' float comparisons take it: the operator
 /// for the four relational functions and the two equalities; `None` for `Never` and `Always`.
 const fn comparison(function: CompareFunction) -> Option<BinaryOperator> {
@@ -109,7 +131,7 @@ const fn comparison(function: CompareFunction) -> Option<BinaryOperator> {
 }
 
 impl Lowering {
-    /// Lowers an `Epilogue` (module docs).
+    /// Does the steps before a return (module docs).
     pub(super) fn epilogue(&mut self, body: &mut Block) -> Result<(), LowerError> {
         let plan = self.epilogue;
         if plan.depth_rewrite || plan.flip {

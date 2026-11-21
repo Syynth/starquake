@@ -1,0 +1,52 @@
+---
+source: crates/shader/src/lower/tests/emulation.rs
+expression: both_msl
+---
+// language: metal2.4
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using metal::uint;
+
+struct Output {
+    metal::float4 position;
+};
+struct DriverConstants {
+    float alpha_reference;
+    float viewport_flip;
+    float render_area_width;
+    float render_area_height;
+    uint base_vertex;
+    uint base_instance;
+    float position_y_scale;
+    float position_z_scale;
+    float position_z_offset;
+    char _pad9[12];
+};
+
+struct main_Output {
+    metal::float4 position [[position]];
+};
+vertex main_Output main_(
+  constant DriverConstants& driver_constants [[user(fake0)]]
+) {
+    Output out = {};
+    out.position.x = 2.0;
+    out.position.y = 3.0;
+    out.position.z = 4.0;
+    out.position.w = 5.0;
+    float _e22 = out.position.z;
+    float _e23 = out.position.w;
+    out.position.z = (_e22 + _e23) * 0.5;
+    float _e30 = out.position.y;
+    float _e33 = driver_constants.position_y_scale;
+    out.position.y = _e30 * _e33;
+    float _e35 = out.position.z;
+    float _e36 = out.position.w;
+    float _e39 = driver_constants.position_z_scale;
+    float _e42 = driver_constants.position_z_offset;
+    out.position.z = (_e35 * _e39) + (_e36 * _e42);
+    Output _e47 = out;
+    const auto _tmp = _e47;
+    return main_Output { _tmp.position };
+}

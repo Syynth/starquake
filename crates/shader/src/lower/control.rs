@@ -91,8 +91,14 @@ impl Lowering {
                         },
                     );
                 }
-                // `unreachable` returns too (a divergence in the parent module's docs).
-                Node::Return | Node::Unreachable => self.ret(body),
+                // A return does the epilogue's emulation first (the `emulation` submodule).
+                Node::Return => {
+                    self.epilogue(body)?;
+                    self.ret(body);
+                }
+                // `unreachable` returns too (a divergence in the parent module's docs), with no
+                // epilogue.
+                Node::Unreachable => self.ret(body),
             }
         }
         Ok(())
