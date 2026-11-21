@@ -330,13 +330,15 @@ fn convert_half(half: u16) -> u32 {
     (if half & 0x8000 == 0 { value } else { -value }).to_bits()
 }
 
-/// The packing's edges: zeros, the largest finite binary16 and the tie past it, the smallest
+/// The packing's edges: zeros, the largest finite binary16, the tie past it and a value past
+/// the binary16 exponent range, the smallest
 /// subnormal and the ties around it, infinities and NaNs.
 fn pack_edges() -> Vec<u64> {
     [
         0.0_f32,
         -0.0,
         65504.0,
+        98304.0,
         65519.996,
         65520.0,
         -65520.0,

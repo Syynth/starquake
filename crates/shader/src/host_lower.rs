@@ -50,12 +50,15 @@
 //!
 //! **The f64 pass.** A 64-bit value enters 32-bit arithmetic through `PackDouble2x32` or
 //! `BitCastF64U64` (narrowed: [`bits`]) and leaves through `UnpackDouble2x32` or
-//! `BitCastU64F64` (widened). For operands that are binary32 values, every mapped operation
-//! gives the 64-bit operation's result within a relative error of [`F64_RELATIVE_TOLERANCE`]
-//! (one binary32 ulp), and exactly for comparisons, selects, composites, sign operations,
-//! minimum and maximum, clamps, roundings to an integer and conversions to integers
-//! (`tests::equivalence::f64_programs_match_within_tolerance`, generated, and
-//! `tests::equivalence::every_mapped_opcode_matches_the_interpreter`, one case per opcode).
+//! `BitCastU64F64` (widened). For operands that are binary32 values (NaNs compared as NaNs,
+//! whatever their payload), every mapped operation the interpreter runs (all but the
+//! packed-half atomics, below) gives the 64-bit operation's result within a relative error of
+//! [`F64_RELATIVE_TOLERANCE`] (one binary32 ulp) when it is `FPAdd64`, `FPMul64`, `FPFma64`,
+//! `FPRecip64`, `FPRecipSqrt64` or a conversion from a 32- or 64-bit integer
+//! (`ConvertF64S32`, `ConvertF64U32`, `ConvertF64S64`, `ConvertF64U64`), and exactly for every
+//! other one (`tests::equivalence::f64_programs_match_within_tolerance`, generated, and
+//! `tests::equivalence::every_mapped_opcode_matches_the_interpreter`, one case per opcode;
+//! the set is the test's `F64_ROUNDED`).
 //! What is lost, each pinned by a test in `tests::precision`:
 //!
 //! | Loss | Pinned by |
@@ -73,7 +76,8 @@
 //! **The f16 pass.** A packed half enters through `UnpackFloat2x16` (exact) and leaves through
 //! `PackFloat2x16` (rounded to nearest even, as the interpreter rounds); in between the values
 //! are binary32. One operation on binary16 operands then packed gives the 16-bit operation's
-//! result exactly for every mapped operation but `FPFma16`, which may differ by
+//! result exactly (NaNs compared as NaNs) for every mapped operation the interpreter runs but
+//! `FPFma16`, which may differ by
 //! [`F16_FMA_TOLERANCE_ULPS`] binary16 ulp (rounding the exact result to binary32 and then to
 //! binary16 is innocuous for addition and multiplication, since binary32 has more than twice
 //! binary16's precision plus two bits, but not for a fused multiply-add)
