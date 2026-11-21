@@ -138,11 +138,21 @@
 //! GPU snapshot that reads them back is deferred, gpu-protocol "GPU-only memory"): a restored
 //! table starts with an empty store, so its `GpuOnly` pages read as zero.
 //!
+//! # The semaphore mirror page
+//!
+//! A table also lists the registrations gsv says are two pages long
+//! ([`GpuVm::add_semaphore_registration`]) and answers where a fenced release in the second page
+//! of one is copied ([`GpuVm::semaphore_mirror`]); the fence path makes the copy. Tentative, by
+//! the owner's ruling of 2026-11-20; the rule, its sources and its divergences from Eden-NX2 are
+//! in the `mirror` submodule's docs. The list is not a translation: it does not move the version
+//! and is not in the snapshot.
+//!
 //! # Bounds
 //!
 //! Each map adds one mapping and splits at most two; each update splits at most two. The table
-//! therefore grows by at most three mappings per request gsv accepts, and nothing else allocates.
-//! A snapshot's mapping list is bounded by the snapshot's own length.
+//! therefore grows by at most three mappings per request gsv accepts. The semaphore list holds
+//! one entry per start of a listed registration, so at most as many as gsv holds registrations;
+//! nothing else allocates. A snapshot's mapping list is bounded by the snapshot's own length.
 //!
 //! # Snapshot format
 //!
@@ -172,8 +182,12 @@ use thiserror::Error;
 use crate::interface::{Kind, RegionId, Target, VmUpdate};
 use crate::memory::{GpuOnlyRangeError, GpuOnlyStore, Translate};
 
+mod mirror;
 #[cfg(test)]
 mod tests;
+
+pub use mirror::{SEMAPHORE_MIRROR_OFFSET, SEMAPHORE_REGISTRATION_BYTES, SemaphoreRegistration};
+use mirror::SemaphorePages;
 
 /// The size of the syncpoint shim in pages: PR's `nvhost_as_gpu::GetNativeSyncpointShim`
 /// (`eden-pr4588/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp` @ e5fb3b97) reserves
@@ -412,6 +426,8 @@ pub struct GpuVm {
     table: RwLock<Table>,
     generation: AtomicU64,
     gpu_only: GpuOnlyStore,
+    /// The two-page registrations gsv lists (module docs, "The semaphore mirror page").
+    semaphores: SemaphorePages,
 }
 
 /// What [`GpuVm::write_gpu_only`] found when it translated the page afresh.
@@ -546,6 +562,36 @@ impl GpuVm {
         }
     }
 
+    /// Lists `registration` as one whose second page is mirrored into its first (module docs,
+    /// "The semaphore mirror page"): gsv calls it for each address space when it accepts a
+    /// two-page 101, and for each two-page registration it holds when it gives a new or restored
+    /// table. Each call counts once. The version does not move.
+    pub fn add_semaphore_registration(&self, registration: SemaphoreRegistration) {
+        self.semaphores.add(registration);
+    }
+
+    /// Lists `registration` once less: gsv calls it for each address space when a 102 destroys a
+    /// two-page registration. Once no registration with its start is listed, releases there are
+    /// no longer mirrored. A registration never added changes nothing. The version does not
+    /// move.
+    pub fn remove_semaphore_registration(&self, registration: SemaphoreRegistration) {
+        self.semaphores.remove(registration);
+    }
+
+    /// Forgets every listed registration: gsv calls it when it destroys the address space. The
+    /// version does not move.
+    pub fn clear_semaphore_registrations(&self) {
+        self.semaphores.clear();
+    }
+
+    /// The address a fenced release at `va` is also written at: `va` minus
+    /// [`SEMAPHORE_MIRROR_OFFSET`] when `va` lies in the second page of a listed registration,
+    /// otherwise `None` (module docs, "The semaphore mirror page"). Only `va` is looked at, not
+    /// the release's length, as Eden-NX2's `Nx2SemaphoreMirror` does.
+    pub fn semaphore_mirror(&self, va: u64) -> Option<u64> {
+        self.semaphores.mirror_of(va)
+    }
+
     /// Every mapping, in address order. Neighbouring mappings are not merged: a split leaves two.
     pub fn mappings(&self) -> Vec<Mapping> {
         mappings_of(&self.read())
@@ -600,6 +646,7 @@ impl GpuVm {
             table: RwLock::new(table),
             generation: AtomicU64::new(state.generation),
             gpu_only: GpuOnlyStore::new(),
+            semaphores: SemaphorePages::default(),
         })
     }
 }
