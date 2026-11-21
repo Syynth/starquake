@@ -1782,6 +1782,11 @@ fn every_emulation_flag_reaches_the_key_through_a_draw() {
     assert_eq!(seen.key.vertex_attributes[2], AttributeType::Disabled);
     assert_eq!(seen.key.color_targets[0], ColorType::UnsignedInt);
     assert_eq!(seen.key.color_targets[1], ColorType::Float);
+    // The compute fields stay zero for a draw: the shader crate ignores them for a graphics
+    // program, so a non-zero value would only split the shader cache.
+    assert_eq!(seen.key.workgroup_size, [0; 3]);
+    assert_eq!(seen.key.shared_memory_size, 0);
+    assert_eq!(seen.key.local_memory_size, 0);
     // The pipeline gets the same flags. With the second attribute past the device's one, the
     // backend refuses the pipeline (the fetch-from-buffer path is not built: every attribute is
     // still in the vertex layout), so that draw is skipped; without it the pipeline is made with

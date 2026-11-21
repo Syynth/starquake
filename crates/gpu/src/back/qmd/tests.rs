@@ -2439,12 +2439,14 @@ fn errors_read_as_plain_words() {
 /// The local-memory size is the low field plus the high field (every reference's
 /// `ComputeEnvironment`: `qmd.local_pos_alloc + qmd.local_crs_alloc`), decoded from a laid-out
 /// QMD with a distinct value in each, and with either field alone, so a size that took only
-/// one field, or either field twice, fails.
+/// one field, or either field twice, fails; and with two values that share bits (0x130 and
+/// 0x110, whose sum carries), so an OR of the fields in place of their sum fails.
 #[test]
 fn the_local_memory_size_is_the_sum_of_both_fields() {
     let mut w = encode(&Spec::new(0x1_0000));
     for (low, high, size) in [
         (0x0001_2000, 0x0000_0300, 0x0001_2300),
+        (0x0000_0130, 0x0000_0110, 0x0000_0240),
         (0x0000_0040, 0, 0x0000_0040),
         (0, 0x0000_0500, 0x0000_0500),
         (0, 0, 0),
