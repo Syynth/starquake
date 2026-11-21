@@ -1,5 +1,5 @@
-//! Shared test helpers: the property-test configuration and generators of instructions and
-//! words.
+//! Shared test helpers: the property-test configuration, generators of instructions and words,
+//! and the words of a jump table's selector pattern.
 
 use proptest::prelude::*;
 use proptest::strategy::Union;
@@ -143,4 +143,47 @@ pub(crate) fn any_unmodified_src() -> impl Strategy<Value = AluSrc> {
 pub(crate) fn any_instr() -> impl Strategy<Value = Instr> {
     let ops = GROUP_HOOKS.iter().flat_map(|hooks| (hooks.any_ops)());
     (any_pred_src(), Union::new(ops)).prop_map(|(guard, op)| Instr { guard, op })
+}
+
+// The reference's literals (`program_capture.h`, `TrackCaptureIndirectBranches` @ e5fb3b97),
+// written out to build words independently of the shipping constants.
+const REF_LDC: u128 = 0xb82;
+const REF_SHF: u128 = 0x819;
+const REF_IMNMX: u128 = 0x817;
+const REF_ALWAYS: u128 = 7 << 12;
+
+/// `IMNMX.U32 dst, src, clamp, PT` as the reference matches it.
+pub(crate) fn imnmx(dst: u8, src: u8, clamp: u32) -> Instruction {
+    Instruction::from_bits(
+        REF_IMNMX
+            | REF_ALWAYS
+            | u128::from(dst) << 16
+            | u128::from(src) << 24
+            | u128::from(clamp) << 32
+            | 0x0380_0000 << 64,
+    )
+}
+
+/// `SHF.L.U32 dst, src, 0x2, RZ`.
+pub(crate) fn shf(dst: u8, src: u8) -> Instruction {
+    Instruction::from_bits(
+        REF_SHF
+            | REF_ALWAYS
+            | u128::from(dst) << 16
+            | u128::from(src) << 24
+            | 2 << 32
+            | 0x6ff << 64,
+    )
+}
+
+/// `LDC.32 dst, c[bank][src + offset]`.
+pub(crate) fn ldc(dst: u8, src: u8, bank: u8, offset: u32) -> Instruction {
+    Instruction::from_bits(
+        REF_LDC
+            | REF_ALWAYS
+            | u128::from(dst) << 16
+            | u128::from(src) << 24
+            | (u128::from(bank) << 22 | u128::from(offset) << 6) << 32
+            | 0x800 << 64,
+    )
 }
