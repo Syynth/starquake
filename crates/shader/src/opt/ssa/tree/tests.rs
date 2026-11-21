@@ -145,14 +145,16 @@ fn verifier_accepts(function: &Function, block: BlockId, from: BlockId) -> bool 
         incoming: vec![(from, Operand::Imm(Imm::U32(0)))],
     });
     let at = probe.push(block, phi).expect("a phi");
-    match probe.verify() {
-        Ok(()) => true,
-        Err(VerifyError::PhiNotPredecessor { at: refused, block }) => {
-            assert_eq!((refused, block), (at, from), "{probe}");
-            false
-        }
-        Err(other) => panic!("{other}\n{probe}"),
+    let result = probe.verify();
+    if result.is_ok() {
+        return true;
     }
+    assert_eq!(
+        result,
+        Err(VerifyError::PhiNotPredecessor { at, block: from }),
+        "{probe}"
+    );
+    false
 }
 
 proptest! {

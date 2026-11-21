@@ -89,6 +89,8 @@ pub(super) fn check(
             .and_then(|&value| function.inst(value))
             .is_some_and(Inst::is_phi)
     });
+    // With no phi there is nothing to check, so the walk is skipped (the structurizer's output,
+    // verified before SSA, has none); walking anyway would give the same answer.
     if !has_phi {
         return Ok(());
     }

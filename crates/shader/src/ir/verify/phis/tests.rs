@@ -2,6 +2,8 @@
 //! every block of the function as a phi's one incoming block; the scope of incoming values;
 //! the documented order with two faults at once; and what step 5 does not check.
 
+use std::fmt::Write as _;
+
 use super::super::super::*;
 use crate::interp::Machine;
 
@@ -30,136 +32,153 @@ fn can_run_last(count: u32, tree: &str, phi: u32) -> Vec<u32> {
     for from in 0..count {
         let mut text = String::new();
         for index in 0..count {
-            text.push_str(&format!("block{index}:\n"));
+            writeln!(text, "block{index}:").expect("writes");
             if index == phi {
-                text.push_str(&format!("    %0: u32 = Phi [block{from}: u32 0]\n"));
+                writeln!(text, "    %0: u32 = Phi [block{from}: u32 0]").expect("writes");
             }
         }
         text.push_str("structure:\n");
         text.push_str(tree);
-        match ir(&text).verify() {
-            Ok(()) => found.push(from),
-            Err(VerifyError::PhiNotPredecessor { at, block }) => {
-                assert_eq!((at, block), (v(0), b(from)), "{text}");
-            }
-            Err(other) => panic!("{other}\n{text}"),
+        let result = ir(&text).verify();
+        if result.is_ok() {
+            found.push(from);
+        } else {
+            assert_eq!(
+                result,
+                Err(VerifyError::PhiNotPredecessor {
+                    at: v(0),
+                    block: b(from)
+                }),
+                "{text}"
+            );
         }
     }
     found
 }
 
+/// One case of [`CASES`]: what it shows, the block count, the tree, and each block named with
+/// the blocks that can run last before it.
+type Case = (
+    &'static str,
+    u32,
+    &'static str,
+    &'static [(u32, &'static [u32])],
+);
+
 /// Each kind of node, with the blocks that can run last before each block named, written out
 /// from the rule in the module docs (and the interpreter's: the block run last).
 #[test]
 fn the_blocks_that_can_run_last() {
-    let cases: &[(&str, u32, &str, &[(u32, &[u32])])] = &[
-        (
-            "a sequence; the first block follows nothing",
-            3,
-            "    block0\n    block1\n    block2\n",
-            &[(0, &[]), (1, &[0]), (2, &[1])],
-        ),
-        (
-            "an if: the block after it follows the body's end and the block before it",
-            3,
-            "    block0\n    if u1 true {\n        block1\n    }\n    block2\n",
-            &[(1, &[0]), (2, &[0, 1])],
-        ),
-        (
-            "an immediate false condition removes no edge",
-            3,
-            "    block0\n    if u1 false {\n        block1\n    }\n    block2\n",
-            &[(1, &[0]), (2, &[0, 1])],
-        ),
-        (
-            "an empty if body",
-            2,
-            "    block0\n    if u1 true {\n    }\n    block1\n",
-            &[(1, &[0])],
-        ),
-        (
-            "nested ifs that end together",
-            4,
-            "    block0\n    if u1 true {\n        block1\n        if u1 true {\n            \
-             block2\n        }\n    }\n    block3\n",
-            &[(1, &[0]), (2, &[1]), (3, &[0, 1, 2])],
-        ),
-        (
-            "a loop: its first block also follows the body's end, and an immediate false \
-             repeat removes no edge",
-            4,
-            "    block0\n    loop {\n        block1\n        block2\n    } repeat u1 false\n    \
-             block3\n",
-            &[(1, &[0, 2]), (2, &[1]), (3, &[2])],
-        ),
-        (
-            "a loop of one block follows itself",
-            3,
-            "    block0\n    loop {\n        block1\n    } repeat u1 true\n    block2\n",
-            &[(1, &[0, 1]), (2, &[1])],
-        ),
-        (
-            "an empty loop body",
-            2,
-            "    block0\n    loop {\n    } repeat u1 true\n    block1\n",
-            &[(1, &[0])],
-        ),
-        (
-            "a break in an if: its block reaches the loop's exit and, the condition being \
-             possibly false, the rest of the body",
-            5,
-            "    block0\n    loop {\n        block1\n        if u1 true {\n            block2\n            \
-             break u1 true\n        }\n        block3\n    } repeat u1 true\n    block4\n",
-            &[(1, &[0, 3]), (2, &[1]), (3, &[1, 2]), (4, &[2, 3])],
-        ),
-        (
-            "a break first in a loop body passes on what ran before the body",
-            3,
-            "    block0\n    loop {\n        break u1 true\n        block1\n    } repeat u1 true\n    \
-             block2\n",
-            &[(1, &[0, 1]), (2, &[0, 1])],
-        ),
-        (
-            "a break leaves the innermost loop only",
-            6,
-            "    block0\n    loop {\n        block1\n        loop {\n            block2\n            \
-             break u1 true\n            block3\n        } repeat u1 true\n        block4\n    } \
-             repeat u1 true\n    block5\n",
-            &[
-                (1, &[0, 4]),
-                (2, &[1, 3]),
-                (3, &[2]),
-                (4, &[2, 3]),
-                (5, &[4]),
-            ],
-        ),
-        (
-            "nothing runs last after a return",
-            3,
-            "    block0\n    if u1 true {\n        block1\n        return\n    }\n    block2\n",
-            &[(1, &[0]), (2, &[0])],
-        ),
-        (
-            "nothing runs last after an unreachable",
-            2,
-            "    block0\n    unreachable\n    block1\n",
-            &[(1, &[])],
-        ),
-        (
-            "a loop body that starts with an if: the body's end reaches the if's body and \
-             the block after it",
-            4,
-            "    block0\n    loop {\n        if u1 true {\n            block1\n        }\n        \
-             block2\n    } repeat u1 true\n    block3\n",
-            &[(1, &[0, 2]), (2, &[0, 1, 2]), (3, &[2])],
-        ),
-    ];
-    for &(name, count, tree, expected) in cases {
+    for &(name, count, tree, expected) in CASES {
         for &(phi, blocks) in expected {
             assert_eq!(can_run_last(count, tree, phi), blocks, "{name}: block{phi}");
         }
     }
 }
+
+/// The cases of [`the_blocks_that_can_run_last`].
+const CASES: &[Case] = &[
+    (
+        "a sequence; the first block follows nothing",
+        3,
+        "    block0\n    block1\n    block2\n",
+        &[(0, &[]), (1, &[0]), (2, &[1])],
+    ),
+    (
+        "an if: the block after it follows the body's end and the block before it",
+        3,
+        "    block0\n    if u1 true {\n        block1\n    }\n    block2\n",
+        &[(1, &[0]), (2, &[0, 1])],
+    ),
+    (
+        "an immediate false condition removes no edge",
+        3,
+        "    block0\n    if u1 false {\n        block1\n    }\n    block2\n",
+        &[(1, &[0]), (2, &[0, 1])],
+    ),
+    (
+        "an empty if body",
+        2,
+        "    block0\n    if u1 true {\n    }\n    block1\n",
+        &[(1, &[0])],
+    ),
+    (
+        "nested ifs that end together",
+        4,
+        "    block0\n    if u1 true {\n        block1\n        if u1 true {\n            \
+             block2\n        }\n    }\n    block3\n",
+        &[(1, &[0]), (2, &[1]), (3, &[0, 1, 2])],
+    ),
+    (
+        "a loop: its first block also follows the body's end, and an immediate false \
+             repeat removes no edge",
+        4,
+        "    block0\n    loop {\n        block1\n        block2\n    } repeat u1 false\n    \
+             block3\n",
+        &[(1, &[0, 2]), (2, &[1]), (3, &[2])],
+    ),
+    (
+        "a loop of one block follows itself",
+        3,
+        "    block0\n    loop {\n        block1\n    } repeat u1 true\n    block2\n",
+        &[(1, &[0, 1]), (2, &[1])],
+    ),
+    (
+        "an empty loop body",
+        2,
+        "    block0\n    loop {\n    } repeat u1 true\n    block1\n",
+        &[(1, &[0])],
+    ),
+    (
+        "a break in an if: its block reaches the loop's exit and, the condition being \
+             possibly false, the rest of the body",
+        5,
+        "    block0\n    loop {\n        block1\n        if u1 true {\n            block2\n            \
+             break u1 true\n        }\n        block3\n    } repeat u1 true\n    block4\n",
+        &[(1, &[0, 3]), (2, &[1]), (3, &[1, 2]), (4, &[2, 3])],
+    ),
+    (
+        "a break first in a loop body passes on what ran before the body",
+        3,
+        "    block0\n    loop {\n        break u1 true\n        block1\n    } repeat u1 true\n    \
+             block2\n",
+        &[(1, &[0, 1]), (2, &[0, 1])],
+    ),
+    (
+        "a break leaves the innermost loop only",
+        6,
+        "    block0\n    loop {\n        block1\n        loop {\n            block2\n            \
+             break u1 true\n            block3\n        } repeat u1 true\n        block4\n    } \
+             repeat u1 true\n    block5\n",
+        &[
+            (1, &[0, 4]),
+            (2, &[1, 3]),
+            (3, &[2]),
+            (4, &[2, 3]),
+            (5, &[4]),
+        ],
+    ),
+    (
+        "nothing runs last after a return",
+        3,
+        "    block0\n    if u1 true {\n        block1\n        return\n    }\n    block2\n",
+        &[(1, &[0]), (2, &[0])],
+    ),
+    (
+        "nothing runs last after an unreachable",
+        2,
+        "    block0\n    unreachable\n    block1\n",
+        &[(1, &[])],
+    ),
+    (
+        "a loop body that starts with an if: the body's end reaches the if's body and \
+             the block after it",
+        4,
+        "    block0\n    loop {\n        if u1 true {\n            block1\n        }\n        \
+             block2\n    } repeat u1 true\n    block3\n",
+        &[(1, &[0, 2]), (2, &[0, 1, 2]), (3, &[2])],
+    ),
+];
 
 /// The interpreter runs a loop body that starts with an `if` as the module docs say: on the
 /// second pass, block2 ran last before block2 (the `if` is skipped), which the rewrite's walk
