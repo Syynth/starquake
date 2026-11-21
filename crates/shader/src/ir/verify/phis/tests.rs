@@ -287,6 +287,33 @@ fn a_structured_phis_value_is_in_scope_at_the_end_of_its_block() {
         verify(&around_a_loop("%3", "%1", "%1")),
         out_of_scope(1, 3, 0)
     );
+    // Sibling bodies: %1's `if` body opens before block3's and closes before it opens, so %1
+    // is out of scope at block3's end though block1 comes earlier in the tree.
+    let siblings = |value: &str| {
+        format!(
+            "block0:
+    %0: u32 = IAdd32 u32 1, u32 2
+block1:
+    %1: u32 = IAdd32 u32 3, u32 4
+block2:
+block3:
+block4:
+    %2: u32 = Phi [block2: u32 0], [block3: {value}]
+structure:
+    block0
+    if u1 true {{
+        block1
+    }}
+    block2
+    if u1 true {{
+        block3
+    }}
+    block4
+"
+        )
+    };
+    assert_eq!(verify(&siblings("%0")), Ok(()));
+    assert_eq!(verify(&siblings("%1")), out_of_scope(2, 1, 3));
 }
 
 /// The two step-5 errors read in plain words.
@@ -372,6 +399,12 @@ structure:
         verify(&after_an_if("[block0: u32 0], [block2: %1]")),
         not_predecessor(3, 0)
     );
+    // A later pair is checked too when the first is sound (a scope fault in a later pair is
+    // `around_a_loop("%0", "%2", "%1")` above).
+    assert_eq!(
+        verify(&after_an_if("[block2: %2], [block0: u32 0]")),
+        not_predecessor(3, 0)
+    );
     // A block's phis in order.
     let two_phis = |first: &str, second: &str| {
         after_an_if(first).replace(
@@ -389,6 +422,15 @@ structure:
     assert_eq!(
         verify(&two_phis("[block0: u32 0]", "[block2: %1]")),
         not_predecessor(3, 0)
+    );
+    // A later phi is checked too when the first is sound.
+    assert_eq!(
+        verify(&two_phis("[block2: %2]", "[block0: u32 0]")),
+        not_predecessor(4, 0)
+    );
+    assert_eq!(
+        verify(&two_phis("[block2: %2]", "[block2: %1]")),
+        out_of_scope(4, 1, 2)
     );
     // Blocks in tree order, not arena order: the tree places block2 before block1, and each
     // holds a phi naming a block that cannot run last before it.

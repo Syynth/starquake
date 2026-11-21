@@ -308,6 +308,9 @@ impl Walk {
             (self.place.get(def), self.place.get(at)),
             (Some(def_place), Some(at_place)) if def_place <= at_place
         );
+        // Bodies nest, so given `placed`, `open <= at_open` follows from `at_close <= close`:
+        // a body that opened later and closed later would be a later sibling, placing `def`
+        // after `at`. Dropping it changes no answer; it is kept so the test reads as the rule.
         let enclosed = matches!(
             (interval(def), interval(at)),
             (Some((open, close)), Some((at_open, at_close))) if open <= at_open && at_close <= close
