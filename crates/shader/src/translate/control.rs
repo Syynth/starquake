@@ -12,8 +12,8 @@
 //! `Visitor::Run` in `visitor.cpp` for `NOP` (`0x918`), `BREAK` (`0x942`), `WARPSYNC`
 //! (`0x948`), `DEPBAR` (`0x91a`), `KILL` (`0x95b`), `CALL` (`0x944`), `RET` (`0x950`), `BRX`
 //! (`0x949`), `BRXU` (`0x958`), `BSSY` (`0x945`) and `BSYNC` (`0x941`), with the guard rules
-//! of `Visitor::Run` (`guard.Never()`, `guard_select`) and the register and predicate writes
-//! of `Visitor::SetPred`, `Visitor::UR` and `Visitor::SetUPred`. Cross-checked with Eden's
+//! of `Visitor::Run` (`guard.Never()`; its `guard_select` is not kept, "Guards" below) and the
+//! register and predicate writes of `Visitor::SetPred`, `Visitor::UR` and `Visitor::SetUPred`. Cross-checked with Eden's
 //! Maxwell translators (`eden/src/shader_recompiler/frontend/maxwell/translate/impl/` @
 //! cf654052): `vote.cpp` (the same three votes and the ballot), `warp_shuffle.cpp` (the same
 //! clamp and segment fields, `QUAD_MASK` and quad cases, and `GetInBoundsFromOp`) and
@@ -51,21 +51,27 @@
 //!
 //! # Guards
 //!
-//! In this order (`Visitor::Run`): an instruction under `@!PT` never runs and becomes nothing,
-//! whatever its fields. An instruction under `PT`, or the one instruction of a block whose
-//! guard flow analysis has tested ([`crate::flow::FlowBlock::guard_tested`]), is translated
-//! as if unguarded. Otherwise the instruction is under a guard flow analysis left in its
-//! block: `VOTEU`, the only pure instruction of the group (`classify.h`), keeps it as a select
-//! of each result against the old value, read as a uniform predicate, as the PR's
-//! `guard_select` does for a uniform instruction; an instruction that becomes no IR ignores
-//! it; and the others (`BAR`, `VOTE`, `SHFL`, `REDUX`, `MATCH`) are refused,
-//! [`ControlUnsupported::UntestedGuard`], since flow analysis gives each such instruction a
-//! conditional block of its own and the translator does not build blocks. The translation
-//! driver ([`super::driver`]) never hands this module an untested guard: it makes a guarded
-//! `VOTEU` a conditional block first (the owner's ruling of 2026-11-19, row 2), so the select
-//! is this entry's own behaviour when called directly. Then the PR's
-//! checks run, each instruction's in the PR's order, every one before any IR is written, so a
-//! refused instruction leaves its block as it was.
+//! By the translation driver's rule, the one function the driver and every group's own entry
+//! point use (`super`'s `guard_step`; its module docs, "Guards"), after the group check (an
+//! instruction of another group is [`ControlUnsupported::OtherGroup`], whatever its guard): an
+//! instruction under `@!PT` never runs and becomes nothing, whatever its fields, as
+//! `Visitor::Run` returns at `guard.Never()`. An instruction under `PT`, or the one instruction
+//! of a block whose guard flow analysis has tested ([`crate::flow::FlowBlock::guard_tested`]),
+//! is translated as if unguarded. Otherwise the guard would make a conditional block, which
+//! this translator does not build (it writes into one given block): an instruction that
+//! becomes no IR ignores the guard, as the driver translates the guarded `OpKind::Nop`
+//! instructions flow analysis leaves in their block; and the ones that write IR (`BAR`,
+//! `VOTE`, `VOTEU`, `SHFL`, `REDUX`, `MATCH`) are refused,
+//! [`ControlUnsupported::UntestedGuard`]. The translation driver ([`super::driver`]) never
+//! hands this module an untested guard: flow analysis gives each of these but `VOTEU` a
+//! conditional block of its own, and the driver makes a guarded `VOTEU`, the group's only pure
+//! instruction (`classify.h`), a conditional block first, reading its guard as a uniform
+//! predicate (the owner's ruling of 2026-11-19, row 2, which leaves selects to a later
+//! optimisation pass). PR #4588 keeps a guarded `VOTEU`'s guard as a select of each result
+//! (`guard_select`); here, called on its own with that guard untested, it is refused like the
+//! rest (`tests::a_guarded_uniform_vote_is_left_to_its_conditional_block`). Then
+//! the PR's checks run, each instruction's in the PR's order, every one before any IR is
+//! written, so a refused instruction leaves its block as it was.
 //!
 //! # Refusals
 //!
@@ -92,6 +98,7 @@
 //! | `DEPBAR` other than `.LE SB5` | Refused, [`ControlUnsupported::DepBarMode`] | The native visitor refuses it; the lowering path accepts scoreboard 0 too (its test "Native multi-scoreboard dependency waits retain surrounding dataflow", `0x800e` and `0x8000`) | `tests::depbar_needs_le_sb5` |
 //! | `WARPSYNC 0xffffffff` | No IR | The native visitor makes none; the lowering path writes a device memory barrier (its test "Native full warp synchronization retains ordering after reconvergence") | `tests::instructions_with_no_ir` |
 //! | A guarded `BAR`, `VOTE`, `SHFL`, `REDUX` or `MATCH` outside its conditional block | Refused, [`ControlUnsupported::UntestedGuard`] | Cannot happen: the PR's control-flow builder always makes the block | `tests::untested_guards_are_refused` |
+//! | A guarded `VOTEU` outside a conditional block | Refused, [`ControlUnsupported::UntestedGuard`] (the driver makes its block) | A select of each result against the old value, the guard read as a uniform predicate (`guard_select`) | `tests::a_guarded_uniform_vote_is_left_to_its_conditional_block` |
 //! | `GetInBoundsFromOp` of a `SHFL` whose predicate is `PT` | Not written | Written and left unused (`PredOut` drops it) | `tests::shuffle_golden_ir` |
 //! | `MATCH`'s source register | Read once per word | Read twice per word (`X(source)` for the comparison and the shuffle): the same value | `tests::match_golden_ir` |
 //!
@@ -115,8 +122,8 @@ mod tests;
 use thiserror::Error;
 
 use super::{
-    ColorOutputs, Failure, GuestStage, Stage, TranslateError, Translator, Unsupported, imm32,
-    source,
+    ColorOutputs, Failure, GuardStep, GuestStage, Stage, TranslateError, Translator, Unsupported,
+    guard_step, imm32, source,
 };
 use crate::decode::{
     AluSrc, BarMode, BarRed, Gpr, Instr, MatchOp, Op, OpBar, OpMatch, OpRedux, OpShfl, OpVote,
@@ -151,8 +158,9 @@ pub const WHOLE_WARP_CLAMP: u32 = WARP_SIZE - 1;
 /// A control or warp form, or a field value, the translator does not handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum ControlUnsupported {
-    /// An instruction that writes IR under a guard that flow analysis did not test (see the
-    /// module docs, "Guards").
+    /// An instruction that writes IR (`BAR`, `VOTE`, `VOTEU`, `SHFL`, `REDUX`, `MATCH`) under a
+    /// guard other than `PT` or `!PT` that is not tested (`GuardStep::Conditional`; see
+    /// the module docs, "Guards").
     #[error("a guarded instruction outside its conditional block")]
     UntestedGuard,
     /// A `BRA` handed to the translator: flow analysis ends a block with it.
@@ -361,11 +369,14 @@ const fn imm1(bit: bool) -> Operand {
 impl Translator<'_> {
     /// One instruction of the group (see the module docs).
     fn control(&mut self, instr: Instr, guard_tested: bool) -> Result<(), Failure> {
-        let guard = instr.guard;
-        if guard.reg.is_true() && guard.negated {
-            return Ok(());
+        if !in_group(&instr.op) {
+            return Err(refuse(ControlUnsupported::OtherGroup(instr.op.mnemonic())));
         }
-        let untested = !guard_tested && !guard.is_true();
+        let untested = match guard_step(instr.guard, guard_tested) {
+            GuardStep::Skip => return Ok(()),
+            GuardStep::Unguarded => false,
+            GuardStep::Conditional => true,
+        };
         let tested = |ok: bool| need(!ok, ControlUnsupported::UntestedGuard);
         match instr.op {
             Op::Kill(op) => need(op.pred.is_true(), ControlUnsupported::PredicatedKill),
@@ -388,8 +399,8 @@ impl Translator<'_> {
                     self.vote(op.op, op.pred, ballot, vote)
                 }
                 VoteDst::Uniform { ballot, vote } => {
-                    let select = if untested { Some(guard) } else { None };
-                    self.voteu(op, ballot, vote, select)
+                    tested(untested)?;
+                    self.voteu(op, ballot, vote)
                 }
             },
             Op::Shfl(op) => {
@@ -456,49 +467,23 @@ impl Translator<'_> {
         Ok(())
     }
 
-    /// `VOTEU` (`Visitor::VOTEU`), with the guard `select` kept as a select of each result
-    /// (`Visitor::UR`, `Visitor::SetUPred`).
-    fn voteu(
-        &mut self,
-        op: OpVote,
-        ballot: UniformReg,
-        vote: UniformPred,
-        select: Option<PredSrc>,
-    ) -> Result<(), Failure> {
-        let guard = match select {
-            Some(guard) => Some(self.uniform_guard(guard)?),
-            None => None,
-        };
+    /// `VOTEU` (`Visitor::VOTEU`): the ballot into the uniform register, then the vote into
+    /// the uniform predicate. Its guard is handled before it gets here (see the module docs,
+    /// "Guards"), so PR #4588's select of each result (`Visitor::UR`, `Visitor::SetUPred`) is
+    /// not kept.
+    fn voteu(&mut self, op: OpVote, ballot: UniformReg, vote: UniformPred) -> Result<(), Failure> {
         let source = self.pred(op.pred)?;
         if !ballot.is_zero() {
             let name = Operand::Imm(Imm::UniformReg(ballot));
-            let mut bits: Operand = self.op(Opcode::SubgroupBallot, &[source])?.into();
-            if let Some(guard) = guard {
-                let old = self.op(Opcode::GetUniformRegister, &[name])?;
-                bits = self
-                    .op(Opcode::SelectU32, &[guard, bits, old.into()])?
-                    .into();
-            }
-            self.op(Opcode::SetUniformRegister, &[name, bits])?;
+            let bits = self.op(Opcode::SubgroupBallot, &[source])?;
+            self.op(Opcode::SetUniformRegister, &[name, bits.into()])?;
         }
         if !vote.is_true() {
             let name = Operand::Imm(Imm::UniformPred(vote));
-            let mut result = self.vote_op(op.op, source)?;
-            if let Some(guard) = guard {
-                let old = self.op(Opcode::GetUniformPred, &[name])?;
-                result = self
-                    .op(Opcode::SelectU1, &[guard, result, old.into()])?
-                    .into();
-            }
+            let result = self.vote_op(op.op, source)?;
             self.op(Opcode::SetUniformPred, &[name, result])?;
         }
         Ok(())
-    }
-
-    /// A uniform instruction's guard, read as the uniform predicate of the same number
-    /// (`Visitor::Run`: `UPred(guard.index, guard.negated)`; the shared reader).
-    fn uniform_guard(&mut self, guard: PredSrc) -> Result<Operand, Failure> {
-        Ok(source::uniform_guard(&mut self.b, guard)?)
     }
 
     /// `SHFL` (`Visitor::SHFL`; see the module docs).

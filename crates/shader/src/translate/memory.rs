@@ -67,19 +67,23 @@
 //!
 //! # Guards
 //!
-//! An instruction under a guard predicate other than `PT` becomes a conditional block (spec,
+//! The guard follows the translation driver's rule, the one function the driver and every
+//! group's own entry point use (`super`'s `guard_step`; its module docs, "Guards"). An
+//! instruction under a guard predicate other than `PT` becomes a conditional block (spec,
 //! "Instruction translation"), made with the shared guard helper (`super`'s
-//! `split_for_guard`, which the integer translator uses too): the block tests the guard and branches to a new block holding the
-//! instruction, which jumps to a second new block that takes the first block's terminator, and
-//! the builder is left there. The split is made after every check, so a refused instruction
-//! leaves the function untouched (`tests::guards::refusals_leave_the_function_untouched`). A
-//! guarded instruction in a block with a successor whose phi names the block is refused
-//! ([`MemoryError::SuccessorPhi`], as the integer translator refuses it). An instruction under
-//! `!PT` never runs and appends nothing, without its checks, as PR #4588's `Visitor::Run`
-//! returns when `guard.Never()`; with [`GuardMode::Tested`] the guard is ignored (flow analysis
-//! has tested it). Every instruction of this group but `LDC` is a side effect in the PR's
-//! `classify.h`, which flow analysis also puts in a conditional block; `LDC` is pure there and
-//! keeps its guard as a select (divergence below).
+//! `split_for_guard`, which the integer translator uses too): the block tests the guard and
+//! branches to a new block holding the instruction, which jumps to a second new block that
+//! takes the first block's terminator, and the builder is left there. The split is made after
+//! every check, so a refused instruction leaves the function untouched
+//! (`tests::guards::refusals_leave_the_function_untouched`). A guarded instruction in a block
+//! with a successor whose phi names the block is refused ([`MemoryError::SuccessorPhi`], as the
+//! integer translator refuses it). An instruction under `!PT` never runs and appends nothing,
+//! without its checks, as PR #4588's `Visitor::Run` returns when `guard.Never()`, in either
+//! [`GuardMode`] (`tests::guards::never_guarded_instructions_append_nothing`); with
+//! [`GuardMode::Tested`] any other guard is ignored (flow analysis has tested it). Every
+//! instruction of this group but `LDC` is a side effect in the PR's `classify.h`, which flow
+//! analysis puts in a conditional block of its own; `LDC` is pure there, and the PR keeps its
+//! guard as a select where this module makes a conditional block (divergence below).
 //!
 //! # Checks
 //!
@@ -243,7 +247,7 @@ use std::fmt::{self, Display, Formatter};
 use thiserror::Error;
 
 use super::integer::{GuardMode, successor_phi};
-use super::{source, split_for_guard};
+use super::{GuardStep, guard_step, source, split_for_guard};
 use crate::decode::memory::MEM_OFFSET;
 use crate::decode::{
     AtomDst, AtomOp, AtomType, CBuf, DecodeError, GlobalAccess, Gpr, Instr, Instruction, LdcMode,
@@ -671,11 +675,10 @@ pub fn translate_memory(
     if !is_memory(&instr.op) {
         return Err(MemoryError::OtherGroup(instr.op.mnemonic()));
     }
-    let pending = match guard {
-        GuardMode::Tested => None,
-        GuardMode::Honour if instr.guard.is_true() => None,
-        GuardMode::Honour if instr.guard.reg.is_true() => return Ok(()),
-        GuardMode::Honour => Some(instr.guard),
+    let pending = match guard_step(instr.guard, guard == GuardMode::Tested) {
+        GuardStep::Skip => return Ok(()),
+        GuardStep::Unguarded => None,
+        GuardStep::Conditional => Some(instr.guard),
     };
     check(&instr.op)?;
     let join = match pending {

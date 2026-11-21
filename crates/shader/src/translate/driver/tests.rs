@@ -11,13 +11,13 @@ use crate::asm::assemble;
 use crate::capture::MAX_INSTRUCTIONS;
 use crate::decode::{
     AluSrc, BREAK_OPCODE, BraCond, BranchOffset, BrxSrc, DecodeError, GUARD, Gpr, IntCmpOp,
-    MemAddr, MemEvictionPriority, MemSpace, MemType, MovSrc, OPCODE, OpALd, OpASt, OpBra, OpBrx,
-    OpCall, OpDepBar, OpExit, OpFAdd, OpHmma, OpIAdd3, OpISetP, OpKill, OpLd, OpMov, OpNop, OpRet,
-    OpS2R, OpVote, OpWarpSync, Pred, PredSetOp, PredSrc, RoundMode, S2RDst, SpecialReg,
-    UniformAddr, UniformPred, UniformReg, VoteDst, VoteOp,
+    MemAddr, MemEvictionPriority, MemSpace, MemType, MovSrc, OPCODE, OffsetStride, OpALd, OpASt,
+    OpBra, OpBrx, OpCall, OpDepBar, OpExit, OpFAdd, OpHmma, OpIAdd3, OpISetP, OpKill, OpLd, OpMov,
+    OpNop, OpRet, OpS2R, OpVote, OpWarpSync, Pred, PredSetOp, PredSrc, RoundMode, S2RDst,
+    SpecialReg, UniformAddr, UniformPred, UniformReg, VoteDst, VoteOp,
 };
 use crate::interp::Machine;
-use crate::ir::{Attribute, Inst, Node, Opcode};
+use crate::ir::{Attribute, BuildError, Inst, Node, Opcode};
 use crate::structure::MAX_STRUCTURE_WORK;
 use crate::testing::{canonical_word, forms};
 use crate::translate::control::{DEPBAR_REQUIRED_SCOREBOARD, FULL_WARP_MASK};
@@ -811,21 +811,74 @@ fn the_lowest_undecodable_instruction_is_refused() {
             error: DecodeError::UnknownOpcode { opcode: 0 }
         })
     );
-    // With every word decodable, the memory instruction is refused by name.
+    // With every word decodable, the memory translator refuses the `LDL` with its uniform
+    // address on (`ops_memory.cpp`, `LDL`: `Require(!use_uniform)`).
     assert_eq!(
         refusal(&[ld_word, exit_word]),
-        Err(TranslateError::Unsupported {
+        Err(TranslateError::Memory {
             index: 0,
             instr: ld,
-            what: Unsupported::MemoryGroup(ld.op.mnemonic()),
+            error: MemoryError::Unsupported(LDL_UNIFORM),
         })
     );
 }
 
-/// The memory group, whose translator is not joined yet, is refused by name with the exact
-/// message.
+/// What slice 12e's translator refuses an `LDL` with its uniform address on as.
+const LDL_UNIFORM: crate::translate::memory::MemoryUnsupported =
+    crate::translate::memory::MemoryUnsupported::UniformAddress(
+        crate::translate::memory::Space::Local,
+    );
+
+/// A memory instruction reaches slice 12e's translator through the driver: an `LDS` of a word
+/// from a register plus an offset becomes the translator's `LoadSharedU32` at the address
+/// `Visitor::SharedOffset` makes (exact golden IR), in a compute program.
 #[test]
-fn memory_instructions_are_refused_by_name() {
+fn a_memory_instruction_reaches_the_memory_translator() {
+    let lds = Instr::new(Op::Ld(OpLd {
+        dst: r(2),
+        addr: MemAddr {
+            reg: r(1),
+            reg_64: false,
+            uniform: Some(UniformAddr {
+                reg: UniformReg::new(0).expect("a uniform register"),
+                wide: false,
+                enabled: false,
+            }),
+            offset: 0x10,
+        },
+        mem_type: MemType::B32,
+        space: MemSpace::Shared(OffsetStride::X1),
+        pred: PredSrc::TRUE,
+        pred_dst: Pred::PT,
+        zd: false,
+        bit76: false,
+    }));
+    let code = Program::default()
+        .op(mov(1, 0x20))
+        .op(lds)
+        .op(exit())
+        .build();
+    let compute = Stage {
+        stage: GuestStage::Compute,
+        ..VERTEX
+    };
+    let blocks = translated(compute, &code);
+    assert_eq!(
+        blocks.function.to_string(),
+        "block0:\n\
+         \x20   %0 = SetRegister r1, u32 0x20\n\
+         \x20   %1: u32 = GetRegister r1\n\
+         \x20   %2: u32 = IAdd32 %1, u32 0x10\n\
+         \x20   %3: u32 = LoadSharedU32 %2\n\
+         \x20   %4 = SetRegister r2, %3\n\
+         \x20   return\n"
+    );
+}
+
+/// A memory form slice 12e's translator refuses is refused through the driver with its error,
+/// the exact message naming the instruction.
+#[test]
+fn a_refused_memory_instruction_names_the_memory_translator_s_reason() {
     let mut program = vec![];
     let ld = OpLd {
         dst: r(0),
@@ -851,16 +904,51 @@ fn memory_instructions_are_refused_by_name() {
     let error = translate_instrs(VERTEX, None, &program).expect_err("refused");
     assert_eq!(
         error,
-        TranslateError::Unsupported {
+        TranslateError::Memory {
             index: 0,
             instr: program[0],
-            what: Unsupported::MemoryGroup("ld"),
+            error: MemoryError::Unsupported(LDL_UNIFORM),
         }
     );
     assert_eq!(
         error.to_string(),
-        "instruction 0 (ldl r0, [rz];): ld, of the memory group, which is not translated yet, is \
-         not supported"
+        "instruction 0 (ldl r0, [rz];): a uniform register in a local address is not supported"
+    );
+}
+
+/// A memory instruction dispatched into a block that does not exist is the builder's error,
+/// reported as [`TranslateError::Build`] as every group's is, not as
+/// [`TranslateError::Memory`] (the dispatch's `MemoryError::Build` arm).
+#[test]
+fn a_memory_instruction_into_a_missing_block_is_the_builder_s_error() {
+    let mut function = Function::new();
+    let missing = {
+        let mut other = Function::new();
+        other.add_block().expect("a block")
+    };
+    let lds = Instr::new(Op::Ld(OpLd {
+        dst: r(2),
+        addr: MemAddr {
+            reg: r(1),
+            reg_64: false,
+            uniform: Some(UniformAddr {
+                reg: UniformReg::new(0).expect("a uniform register"),
+                wide: false,
+                enabled: false,
+            }),
+            offset: 0x10,
+        },
+        mem_type: MemType::B32,
+        space: MemSpace::Shared(OffsetStride::X1),
+        pred: PredSrc::TRUE,
+        pred_dst: Pred::PT,
+        zd: false,
+        bit76: false,
+    }));
+    let mut driver = Driver::new(VERTEX, None);
+    assert_eq!(
+        driver.dispatch(&mut function, missing, 2, lds),
+        Err(TranslateError::Build(BuildError::NoBlock(missing)))
     );
 }
 
@@ -882,13 +970,59 @@ fn an_instruction_no_group_takes_is_refused_by_its_mnemonic() {
     );
 }
 
-/// A decoded operation of the half and double group, whose translator is not joined yet, is
-/// refused by its mnemonic, one of each operation that [`decoded_samples`] reaches.
+/// A decoded operation of the half and double group reaches its translator (slice 12c): one of
+/// each operation that [`decoded_samples`] reaches is translated or refused with the group's
+/// own rejection, never by its mnemonic as an instruction no group takes.
 #[test]
-fn a_decoded_half_double_instruction_is_refused_by_its_mnemonic() {
+fn a_decoded_half_double_instruction_reaches_its_group() {
     let mut seen = std::collections::BTreeSet::new();
     for instr in decoded_samples() {
-        if !is_half_double(&instr.op) || !seen.insert(instr.op.mnemonic()) {
+        if !half_double::in_group(&instr.op) || !seen.insert(instr.op.mnemonic()) {
+            continue;
+        }
+        let mut function = Function::new();
+        let entry = function.entry();
+        let mut driver = Driver::new(VERTEX, None);
+        let expected = {
+            let mut scratch = Function::new();
+            let at = scratch.entry();
+            half_double::translate_instr(&mut Builder::new(&mut scratch, at), instr, true).map_err(
+                |error| match error {
+                    HalfDoubleError::Unsupported(what) => TranslateError::Unsupported {
+                        index: 5,
+                        instr,
+                        what: Unsupported::HalfDouble(what),
+                    },
+                    HalfDoubleError::Build(error) => TranslateError::Build(error),
+                },
+            )
+        };
+        assert_eq!(
+            driver.dispatch(&mut function, entry, 5, instr),
+            expected,
+            "{instr}"
+        );
+        assert_ne!(
+            expected,
+            Err(TranslateError::Unsupported {
+                index: 5,
+                instr,
+                what: Unsupported::Instruction(instr.op.mnemonic()),
+            }),
+            "{instr}"
+        );
+    }
+    assert_eq!(seen.len(), 10, "{seen:?}");
+}
+
+/// A decoded operation of the uniform datapath (slice 6d), whose translator does not exist yet,
+/// is refused by its mnemonic, one of each operation that [`decoded_samples`] reaches: every
+/// decoded one of [`is_uniform_datapath`]'s 20.
+#[test]
+fn a_decoded_uniform_datapath_instruction_is_refused_by_its_mnemonic() {
+    let mut seen = std::collections::BTreeSet::new();
+    for instr in decoded_samples() {
+        if !is_uniform_datapath(&instr.op) || !seen.insert(instr.op.mnemonic()) {
             continue;
         }
         let mut function = Function::new();
@@ -904,7 +1038,7 @@ fn a_decoded_half_double_instruction_is_refused_by_its_mnemonic() {
             "{instr}"
         );
     }
-    assert_eq!(seen.len(), 10, "{seen:?}");
+    assert_eq!(seen.len(), 20, "{seen:?}");
 }
 
 /// The translation budget: a count of exactly the cap is accepted, one past it refused, whether
@@ -967,23 +1101,30 @@ fn an_inlined_program_past_the_budget_is_refused() {
     assert!(translate_flow(VERTEX, None, &program(4), &BranchTables::new(0)).is_ok());
 }
 
+/// The stages the lowering takes (vertex, pixel and compute) translate; every other stage is
+/// refused by name, each stage listed by hand.
 #[test]
-fn only_vertex_and_pixel_stages_translate() {
+fn only_the_stages_the_lowering_takes_translate() {
     let code = Program::default().op(exit()).build();
     for stage in [
         GuestStage::VertexCullBeforeFetch,
         GuestStage::TessellationInit,
         GuestStage::Tessellation,
         GuestStage::Geometry,
-        GuestStage::Compute,
     ] {
+        assert!(!translates_stage(stage), "{stage}");
         let stage = Stage { stage, ..VERTEX };
         assert_eq!(
             translate_flow(stage, None, &code, &BranchTables::new(0)).map(|_| ()),
             Err(TranslateError::Stage(Unsupported::Stage(stage.stage)))
         );
     }
-    for stage in [VERTEX, PIXEL] {
+    let compute = Stage {
+        stage: GuestStage::Compute,
+        ..VERTEX
+    };
+    for stage in [VERTEX, PIXEL, compute] {
+        assert!(translates_stage(stage.stage), "{}", stage.stage);
         assert!(translate_flow(stage, None, &code, &BranchTables::new(0)).is_ok());
     }
 }
@@ -1014,9 +1155,10 @@ fn groups_of(op: Op) -> Vec<&'static str> {
         ("exit", matches!(op, Op::Exit(_))),
         ("integer", integer::is_integer(&op)),
         ("float", float::in_group(&op)),
+        ("half and double", half_double::in_group(&op)),
         ("texture", texture::in_group(&op)),
         ("control", control::in_group(&op)),
-        ("memory", in_memory_group(&op)),
+        ("memory", memory::is_memory(&op)),
         ("attribute", attribute::translate(&mut t, op).is_some()),
     ]
     .into_iter()
@@ -1025,12 +1167,11 @@ fn groups_of(op: Op) -> Vec<&'static str> {
 }
 
 /// The shells: operations no word decodes to yet, each built by hand (a field added to one
-/// stops this compiling), as PR #4588's tables name them: the uniform group's `R2UR` and
-/// `UP2UR`, the control group's `JMX` and `BPT`, and the tensor group.
+/// stops this compiling), as PR #4588's tables name them: the uniform group's `UP2UR`, the
+/// control group's `JMX` and `BPT`, and the tensor group.
 fn shells() -> Vec<Op> {
-    use crate::decode::{OpBpt, OpImma, OpJmx, OpLdsm, OpMovm, OpR2UR, OpUP2UR};
+    use crate::decode::{OpBpt, OpImma, OpJmx, OpLdsm, OpMovm, OpUP2UR};
     vec![
-        Op::R2UR(OpR2UR {}),
         Op::UP2UR(OpUP2UR {}),
         Op::Jmx(OpJmx {}),
         Op::Bpt(OpBpt {}),
@@ -1073,7 +1214,7 @@ fn these_instructions_reach_every_decoded_operation() {
         .map(|instr| instr.op.mnemonic())
         .collect();
     let shells: std::collections::BTreeSet<&str> = shells().iter().map(Op::mnemonic).collect();
-    assert_eq!(shells.len(), 8);
+    assert_eq!(shells.len(), 7);
     assert!(reached.is_disjoint(&shells), "{reached:?}");
     let all: std::collections::BTreeSet<&str> = crate::decode::MNEMONICS.iter().copied().collect();
     assert_eq!(all.len(), crate::decode::MNEMONICS.len());
@@ -1086,36 +1227,50 @@ fn these_instructions_reach_every_decoded_operation() {
     );
 }
 
-/// Whether `op` is of the half and double group, which words decode to (slice 6c) but whose
-/// translator is not joined yet, so no group takes it and the dispatch refuses it by its
-/// mnemonic.
-const fn is_half_double(op: &Op) -> bool {
+/// Whether `op` is of the uniform datapath group (slice 6d's `R2UR`, `UMOV`, `ULDC`, `UPLOP3`
+/// and the twins), which words decode to but which no translator takes yet, so no group takes
+/// it and the dispatch refuses it by its mnemonic. `UP2UR` is a shell, not decoded.
+const fn is_uniform_datapath(op: &Op) -> bool {
     matches!(
         op,
-        Op::HAdd2(_)
-            | Op::HFma2(_)
-            | Op::HMul2(_)
-            | Op::HSet2(_)
-            | Op::HSetP2(_)
-            | Op::HMnMx2(_)
-            | Op::DAdd(_)
-            | Op::DMul(_)
-            | Op::DFma(_)
-            | Op::DSetP(_)
+        Op::R2UR(_)
+            | Op::UMov(_)
+            | Op::ULdc(_)
+            | Op::UPLop3(_)
+            | Op::UIAdd3(_)
+            | Op::UIAdd3X(_)
+            | Op::ULea(_)
+            | Op::ULeaX(_)
+            | Op::ULop3(_)
+            | Op::UPrmt(_)
+            | Op::UShf(_)
+            | Op::UIMad(_)
+            | Op::UIMad64(_)
+            | Op::UISetP(_)
+            | Op::USel(_)
+            | Op::USgxt(_)
+            | Op::UBMsk(_)
+            | Op::UFlo(_)
+            | Op::UBRev(_)
+            | Op::UPopC(_)
     )
 }
 
 /// The groups are disjoint, and every decoded operation (every one of [`decoded_samples`])
-/// belongs to exactly one of them, but for the half and double group's ([`is_half_double`]),
-/// which belong to none, so the dispatch order decides nothing; a shell belongs to none but the
+/// belongs to exactly one of them, but for the uniform datapath's ([`is_uniform_datapath`]),
+/// which belongs to none, so the dispatch order decides nothing; a shell belongs to none but the
 /// control group's `JMX` and `BPT`, which it refuses by name, so the fallback refusal is reached
-/// only by the half and double group and the other shells.
+/// only by the uniform datapath and the other shells.
 #[test]
 fn the_groups_are_disjoint() {
     let mut half_double = 0;
+    let mut uniform = 0;
     for instr in decoded_samples() {
-        let wanted = if is_half_double(&instr.op) {
+        let wanted = if half_double::in_group(&instr.op) {
             half_double += 1;
+            1
+        } else if is_uniform_datapath(&instr.op) {
+            uniform += 1;
             0
         } else {
             1
@@ -1123,6 +1278,7 @@ fn the_groups_are_disjoint() {
         assert_eq!(groups_of(instr.op).len(), wanted, "{instr}");
     }
     assert!(half_double > 0);
+    assert!(uniform > 0);
     for op in shells() {
         let wanted: &[&str] = if matches!(op, Op::Jmx(_) | Op::Bpt(_)) {
             &["control"]
@@ -1174,11 +1330,42 @@ fn a_guarded_instruction_that_is_not_pure_reads_no_guard() {
     }
 }
 
+/// The driver's rule (`super::super::guard_step`) settles a guard on either of its two inputs:
+/// a pure instruction (`MOV`) handed over in a block whose guard is tested is translated as if
+/// unguarded, with no read and no split, as is one that is not pure (`AST`) in a block whose
+/// guard is not tested; only a pure one in an untested block splits. Flow analysis gives a
+/// tested block only to an instruction that is not pure, so a whole program cannot reach the
+/// first case: this drives [`Driver::instruction`] directly.
+#[test]
+fn either_a_tested_block_or_an_impure_instruction_settles_the_guard() {
+    let cases = [
+        (under(p(2), mov(0, 7)), true, false),
+        (under(p(2), ast(0, 0x80)), false, false),
+        (under(p(2), mov(0, 7)), false, true),
+    ];
+    for (instr, guard_tested, splits) in cases {
+        let info = classify(opcode_of(assemble(&instr).expect("encodable")));
+        let mut function = Function::new();
+        let entry = function.entry();
+        let after = Driver::new(VERTEX, None)
+            .instruction(&mut function, entry, 0, instr, info, guard_tested)
+            .expect("translates");
+        assert_eq!(after != entry, splits, "{instr} {guard_tested}");
+        assert_eq!(
+            count(&function, Opcode::GetPred),
+            usize::from(splits),
+            "{instr} {guard_tested}"
+        );
+    }
+}
+
 /// The guard of every decodable pure form (`classify.h`'s `pure`) is read before the split:
-/// as the uniform predicate of the same number for a uniform one (of the decodable forms only
-/// `S2UR`, `0x9c3`, and `VOTEU`, `0x886`), as the predicate for the others, which come from the
-/// integer, float, attribute and memory groups. The instruction itself may be refused after
-/// (a canonical word is not always a form the group translates); the guard's read comes first.
+/// as the uniform predicate of the same number for a uniform one (of the decodable forms
+/// `S2UR`, `0x9c3`, `VOTEU`, `0x886`, and slice 6d's `UMOV`, `ULDC`, `UPLOP3` and the twins
+/// `classify.h` names pure: the list in the test), as the predicate for the others, which come
+/// from the integer, float, half and double, attribute and memory groups (or from no group yet:
+/// `R2UR`). The instruction itself may be refused after (a canonical word is not always a form
+/// the group translates); the guard's read comes first.
 #[test]
 fn the_guard_of_every_pure_form_is_read_by_its_kind() {
     let mut uniform = vec![];
@@ -1215,10 +1402,21 @@ fn the_guard_of_every_pure_form_is_read_by_its_kind() {
             "{instr}: {text}"
         );
     }
-    assert_eq!(uniform, [0x9c3, 0x886]);
+    // `classify.h`'s uniform pure opcodes, as literals: `S2UR`, `VOTEU`, "UMOV imm", "UMOV UR",
+    // "ULDC", "ULDC.64", "UPLOP3", and the twelve "Uniform ALU" bases in forms 1 (`0x200`) and
+    // 4 (`0x800`), each of which slice 6d decodes.
+    let mut expected = vec![0x9c3_u16, 0x886, 0x882, 0xc82, 0xab9, 0xabb, 0x89c];
+    for base in [
+        0x090_u16, 0x091, 0x092, 0x099, 0x0a4, 0x0a5, 0x0be, 0x09a, 0x0bd, 0x0bf, 0x08c, 0x087,
+    ] {
+        expected.extend([base | 0x200, base | 0x800]);
+    }
+    expected.sort_unstable();
+    uniform.sort_unstable();
+    assert_eq!(uniform, expected);
     assert_eq!(
         groups.into_iter().collect::<Vec<_>>(),
-        ["attribute", "float", "integer", "memory"]
+        ["attribute", "float", "half and double", "integer", "memory"]
     );
 }
 
@@ -1295,12 +1493,12 @@ fn a_guarded_float_instruction_is_one_conditional_block() {
     );
 }
 
-/// The stage is checked before flow analysis: a compute program with no instructions is
+/// The stage is checked before flow analysis: a geometry program with no instructions is
 /// refused for its stage, though flow analysis would refuse its size.
 #[test]
 fn the_stage_is_checked_before_flow_analysis() {
-    let compute = Stage {
-        stage: GuestStage::Compute,
+    let geometry = Stage {
+        stage: GuestStage::Geometry,
         ..VERTEX
     };
     assert_eq!(
@@ -1308,9 +1506,9 @@ fn the_stage_is_checked_before_flow_analysis() {
         Err(TranslateError::Flow(FlowError::ProgramSize { len: 0 }))
     );
     assert_eq!(
-        translate_flow(compute, None, &[], &BranchTables::new(0)).map(|_| ()),
+        translate_flow(geometry, None, &[], &BranchTables::new(0)).map(|_| ()),
         Err(TranslateError::Stage(Unsupported::Stage(
-            GuestStage::Compute
+            GuestStage::Geometry
         )))
     );
 }

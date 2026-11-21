@@ -43,9 +43,9 @@
 //!
 //! The memory spaces share a variant, as in NAK: [`OpLd`], [`OpSt`] and [`OpAtom`] carry a
 //! [`MemSpace`]; `RED` is an [`OpAtom`] whose [`AtomDst`] is [`AtomDst::Reduction`], and the
-//! compare-and-swap forms are [`AtomOp::CmpExch`]. The uniform datapath's `ULDC` (`0xab9`) and
-//! `ULDC.64` (`0xabb`) are slice 6d's (spec, port slices), which will give [`OpLdc`] its uniform
-//! destination.
+//! compare-and-swap forms are [`AtomOp::CmpExch`]. The uniform datapath's `ULDC` (`0xab9`), the
+//! indexed `ULDC` (`0xabb`) and `LDCG` (`0x8b8`) are slice 6d's (`op::uniform`), as a variant of
+//! their own ([`super::OpULdc`]).
 //!
 //! # Decisions taken here
 //!
@@ -125,8 +125,7 @@
 //! | `LDGSTS` bits 74..77, 84, 90 and 91 | Fixed bits: PR #4588 requires them set (`Take(74, 3) == 7`, `Take(84, 1) == 1`, `Take(90, 2) == 3`) | `ldgsts_requires_the_bits_pr_4588_requires` |
 //! | `ATOMS.POPC` bits 32..64, 73..76, 87 and 89 | Rejected: PR #4588 requires them clear (`Take(32, 32) == 0`, `Take(73, 3) == 0`, the operation 10 in bits 87..91) | `memory_rows_drop_exactly_the_listed_bits`, `atoms_popc_requires_the_bits_pr_4588_requires` |
 //! | `ATOMS.POPC` bits 16..24, 64..70, 88, 90 and 91 | Fixed bits: PR #4588 requires `RZ`, `URZ`, the operation 10 and bit 91 (`dest == 255`, `Take(64, 6) == 63`, `Take(87, 4) == 10 && Take(91, 1) == 1`) | `atoms_popc_requires_the_bits_pr_4588_requires` |
-//! | `ULDC` and `ULDC.64` (`0xab9`, `0xabb`) | Unknown opcodes here: slice 6d's | `memory_rows_left_undecoded_are_unknown_opcodes` |
-//! | `LDCG` (`0x8b8`, NAK's `OpLdcg`) | Unknown opcode: no slice owns it yet (no slice lists it) | `memory_rows_left_undecoded_are_unknown_opcodes` |
+//! | `ULDC`, the indexed `ULDC` and `LDCG` (`0xab9`, `0xabb`, `0x8b8`) | Not this group's: slice 6d decodes them (`op::uniform`) | `decode::tests::uniform` |
 //!
 //! Every other form's mask is its row's exactly (`decode::tests::masks_match_the_reference_table`).
 //!
@@ -515,7 +514,7 @@ fn read_addr(reader: &mut Reader, layout: AddrLayout) -> MemAddr {
 }
 
 /// Reads a field holding a [`coded!`] value, refusing a value that names nothing.
-fn read_coded<T>(
+pub(crate) fn read_coded<T>(
     reader: &mut Reader,
     field: Field,
     from_bits: fn(u64) -> Option<T>,
@@ -570,7 +569,7 @@ fn stride(reader: &mut Reader) -> OffsetStride {
 
 /// Writes `value` as a signed hexadecimal offset after a `+`: `+0x12`, `+-0x1` (NAK's
 /// `test_ld_st_atom`), nothing for 0.
-fn offset_text(f: &mut Formatter<'_>, value: i64) -> fmt::Result {
+pub(crate) fn offset_text(f: &mut Formatter<'_>, value: i64) -> fmt::Result {
     match value.cmp(&0) {
         Ordering::Equal => Ok(()),
         Ordering::Less => write!(f, "+-{:#x}", value.unsigned_abs()),
@@ -927,7 +926,7 @@ coded! {
 }
 
 /// `LDC dst, c[buf][offset + imm]`: a constant-buffer load (NAK's `OpLdc`, the vector
-/// datapath's forms; `ULDC` is slice 6d's).
+/// datapath's forms; `ULDC` is slice 6d's [`super::OpULdc`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct OpLdc {
     /// The first destination register.

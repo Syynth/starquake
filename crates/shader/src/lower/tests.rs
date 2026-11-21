@@ -20,7 +20,10 @@ use crate::decode::{
 };
 use crate::gpu_harness::TestDevice;
 use crate::ir::ATTRIBUTE_WORD_BYTES;
-use crate::program::{Rejection, translate_program};
+// The lowering's tests lower the IR the driver and the structurizer leave, before the passes, so
+// each form the translators write reaches the lowering (`crate::program`'s
+// `lowered_before_passes`); the production order is `crate::program::pipeline_ir`'s.
+use crate::program::{Rejection, lowered_before_passes as translate_program};
 use crate::translate::{ColorOutputs, Stage};
 
 fn r(index: u8) -> Gpr {

@@ -21,7 +21,8 @@
 //! per name, known by [`PCTL`], [`PCTL_A`], [`PCTL_S`] and [`PCTL_R`]: each name's factory has a
 //! capability of its own (`starquake_services::pctl`, "Capabilities").
 //!
-//! `lm`, `ectx:aw` and `aoc:u` are one server each, known by [`LM`], [`ECTX_AW`] and [`AOC_U`].
+//! `lm`, `ectx:aw`, `aoc:u` and `aud:u` are one server each, known by [`LM`], [`ECTX_AW`],
+//! [`AOC_U`] and [`AUD_U`].
 //! `lm`'s loggers write each finished message's text to the guest log [`install_with_guest_log`]
 //! is given (the run's, in a run); [`install`] gives them one that keeps nothing.
 //!
@@ -71,7 +72,7 @@ use starquake_services::pctl;
 use starquake_services::set::{self, FirmwareVersion, Settings};
 use starquake_services::sm::{self, NameError, Registry, RegistryError, ServiceName};
 use starquake_services::time::{self, TimeSettings};
-use starquake_services::{aoc, ectx, lm};
+use starquake_services::{aoc, aud, ectx, lm};
 use starquake_trace::{Env, ServiceId};
 
 mod fsp_host;
@@ -122,6 +123,8 @@ pub const GSV_NVSRV: ServiceId = ServiceId(21);
 pub const GSV_VI2: ServiceId = ServiceId(22);
 /// The number the kernel knows the graphics server's video server by.
 pub const GSV_VIDEO: ServiceId = ServiceId(23);
+/// The number the kernel knows `aud:u`'s server by.
+pub const AUD_U: ServiceId = ServiceId(24);
 
 /// The parental-control names, each with the number its server is known by: one server per
 /// name, since each name's factory has its own capability ([`pctl::Name::capability`]).
@@ -154,6 +157,7 @@ const SERVICES: &[(ServiceId, &str)] = &[
     (GSV_NVSRV, nvsrv::NVSRV_NAME),
     (GSV_VI2, vi2::VI2_NAME),
     (GSV_VIDEO, video::VIDEO_NAME),
+    (AUD_U, aud::U_NAME),
 ];
 
 /// The name of the service a number stands for, if a run has it.
@@ -311,6 +315,7 @@ pub fn install_with_clocks(
     registry.register(ServiceName::new(lm::NAME)?, LM)?;
     registry.register(ServiceName::new(ectx::AW_NAME)?, ECTX_AW)?;
     registry.register(ServiceName::new(aoc::U_NAME)?, AOC_U)?;
+    registry.register(ServiceName::new(aud::U_NAME)?, AUD_U)?;
 
     let manager = sm::server(registry, policy).with_service_id(SM);
     let port = PortName::new(sm::PORT_NAME)?;
@@ -371,6 +376,9 @@ pub fn install_with_clocks(
 
     let add_ons = aoc::u_server(policy).with_service_id(AOC_U);
     dispatcher.add_server(aoc::U_NAME, AOC_U, None, Box::new(add_ons))?;
+
+    let audio = aud::u_server(policy).with_service_id(AUD_U);
+    dispatcher.add_server(aud::U_NAME, AUD_U, None, Box::new(audio))?;
     Ok(())
 }
 
