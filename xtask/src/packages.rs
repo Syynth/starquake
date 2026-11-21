@@ -30,6 +30,22 @@
 //! - Feature sets other than the default: `--no-default-features` (the app without `wgpu`, say)
 //!   and each optional feature alone.
 //! - Other targets: the Linux-target clippy in CLAUDE.md is run by hand, outside the gate.
+//! - Agreement with cargo's member list in every layout. The list is read from the root
+//!   manifest's `members` and `exclude` only, not from `cargo metadata`, so it differs from
+//!   cargo's in these cases (each pinned by
+//!   `tests::member_lists_that_cargo_reads_differently_are_pinned`):
+//!   - a root manifest with both `[package]` and `[workspace]`: cargo counts the root package as
+//!     a member, this list does not;
+//!   - a path dependency of a member that lies inside the workspace but is not listed (an
+//!     implicit member): cargo counts it, this list does not;
+//!   - a member listed twice: cargo counts it once, this list checks it twice;
+//!   - `members` written as a string rather than an array: cargo refuses the manifest, this list
+//!     sees no members and fails with [`Error::NoPackages`], whose message does not name the
+//!     cause.
+//!
+//!   None of these arise in this repository today:
+//!   `tests::this_workspace_checks_exactly_the_members_cargo_knows` compares the list with
+//!   `cargo metadata --no-deps` and fails if one does.
 //!
 //! # Members
 //!
@@ -41,7 +57,6 @@
 use std::path::Path;
 
 use crate::unused_deps;
-use crate::walk;
 
 /// Why the package list could not be read.
 #[derive(Debug, thiserror::Error)]
@@ -60,27 +75,13 @@ pub enum Error {
     },
 }
 
-impl From<walk::Unreadable> for Error {
-    fn from(unreadable: walk::Unreadable) -> Self {
-        Self::Members(unreadable.into())
-    }
-}
-
 /// The package names of the member manifests `members` (path and text), in the given order.
 pub fn package_names(members: &[(String, String)]) -> Result<Vec<String>, Error> {
     members
         .iter()
         .map(|(path, text)| {
-            let manifest =
-                text.parse::<toml::Table>()
-                    .map_err(|source| unused_deps::Error::Manifest {
-                        path: path.clone(),
-                        source,
-                    })?;
-            manifest
-                .get("package")
-                .and_then(|package| package.get("name"))
-                .and_then(toml::Value::as_str)
+            let manifest = unused_deps::parse_manifest(path, text)?;
+            unused_deps::package_name(&manifest)
                 .map(str::to_owned)
                 .ok_or_else(|| Error::NoName { path: path.clone() })
         })
@@ -103,11 +104,7 @@ pub fn commands(packages: &[String]) -> Vec<Vec<String>> {
 /// The workspace packages of the checkout at `root_dir`, in member order. An empty list is
 /// [`Error::NoPackages`], so the step cannot pass without checking anything.
 pub fn workspace_packages(root_dir: &Path) -> Result<Vec<String>, Error> {
-    let root = walk::read_text(&root_dir.join("Cargo.toml"))?;
-    let members = unused_deps::member_manifests(root_dir, &root)?
-        .into_iter()
-        .map(|path| walk::read_text(&path).map(|text| (path.display().to_string(), text)))
-        .collect::<Result<Vec<_>, _>>()?;
+    let (_, members) = unused_deps::member_texts(root_dir)?;
     let packages = package_names(&members)?;
     if packages.is_empty() {
         return Err(Error::NoPackages);
@@ -122,6 +119,7 @@ mod tests {
     use std::process::Command;
 
     use super::*;
+    use crate::walk;
 
     fn member(path: &str, text: &str) -> (String, String) {
         (path.to_owned(), text.to_owned())
@@ -155,6 +153,8 @@ mod tests {
             "[package]\nversion = \"1.0.0\"\n",
             "[package]\nname = 3\n",
             "package = \"x\"\n",
+            // A `name` outside `[package]` is not the package name.
+            "name = \"top\"\n[workspace]\nname = \"w\"\nmembers = []\n",
         ] {
             let members = [
                 member("ok/Cargo.toml", "[package]\nname = \"ok\"\n"),
@@ -323,6 +323,62 @@ mod tests {
             ],
         );
         assert_eq!(workspace_packages(&root).unwrap(), strings(&["a"]));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The cases the module docs list under "Not covered", where this list and cargo's differ.
+    #[test]
+    fn member_lists_that_cargo_reads_differently_are_pinned() {
+        let crate_a = ("crates/a/Cargo.toml", "[package]\nname = \"a\"\n");
+        let crate_b = ("crates/b/Cargo.toml", "[package]\nname = \"b\"\n");
+        for (name, manifest, files, expected) in [
+            (
+                "root-package",
+                "[package]\nname = \"root-app\"\n[workspace]\nmembers = [\"crates/a\"]\n",
+                vec![crate_a],
+                vec!["a"],
+            ),
+            (
+                "implicit",
+                "[workspace]\nmembers = [\"crates/a\"]\n",
+                vec![
+                    (
+                        "crates/a/Cargo.toml",
+                        "[package]\nname = \"a\"\n[dependencies]\nb = { path = \"../b\" }\n",
+                    ),
+                    crate_b,
+                ],
+                vec!["a"],
+            ),
+            (
+                "twice",
+                "[workspace]\nmembers = [\"crates/a\", \"crates/a\"]\n",
+                vec![crate_a],
+                vec!["a", "a"],
+            ),
+        ] {
+            let mut all = vec![("Cargo.toml", manifest)];
+            all.extend(files);
+            let root = walk::scratch_checkout("packages", name, &all);
+            assert_eq!(
+                workspace_packages(&root).unwrap(),
+                strings(&expected),
+                "{name}"
+            );
+            fs::remove_dir_all(&root).unwrap();
+        }
+        let root = walk::scratch_checkout(
+            "packages",
+            "string-members",
+            &[
+                ("Cargo.toml", "[workspace]\nmembers = \"crates/*\"\n"),
+                crate_a,
+            ],
+        );
+        assert!(matches!(
+            workspace_packages(&root).unwrap_err(),
+            Error::NoPackages
+        ));
         fs::remove_dir_all(&root).unwrap();
     }
 
