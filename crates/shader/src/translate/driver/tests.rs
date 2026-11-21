@@ -1015,30 +1015,89 @@ fn a_decoded_half_double_instruction_reaches_its_group() {
     assert_eq!(seen.len(), 10, "{seen:?}");
 }
 
-/// A decoded operation of the uniform datapath (slice 6d), whose translator does not exist yet,
-/// is refused by its mnemonic, one of each operation that [`decoded_samples`] reaches: every
-/// decoded one of [`is_uniform_datapath`]'s 20.
+/// Every decoded operation of the uniform datapath (slice 6d) reaches slice 12d's translator:
+/// each sample [`decoded_samples`] reaches translates or is refused with that translator's
+/// reason ([`TranslateError::Uniform`]), never by the dispatch's fallback; between them every
+/// decoded one of the group's 20 operations (all but the shell `UP2UR`) is reached. The samples
+/// are canonical words and their one-bit changes, whose predicate fields are mostly `P0`, so
+/// the forms PR #4588 requires `!PT` carries of translate in no sample (the uniform group's
+/// `tests::every_decoded_form_translates_or_is_refused`); `UBMSK`'s refusal names it.
 #[test]
-fn a_decoded_uniform_datapath_instruction_is_refused_by_its_mnemonic() {
+fn a_decoded_uniform_datapath_instruction_reaches_its_group() {
     let mut seen = std::collections::BTreeSet::new();
+    let mut translated = std::collections::BTreeSet::new();
     for instr in decoded_samples() {
-        if !is_uniform_datapath(&instr.op) || !seen.insert(instr.op.mnemonic()) {
+        if !uniform::in_group(&instr.op) {
             continue;
         }
+        seen.insert(instr.op.mnemonic());
         let mut function = Function::new();
         let entry = function.entry();
         let mut driver = Driver::new(VERTEX, None);
-        assert_eq!(
-            driver.dispatch(&mut function, entry, 5, instr),
-            Err(TranslateError::Unsupported {
-                index: 5,
-                instr,
-                what: Unsupported::Instruction(instr.op.mnemonic()),
-            }),
-            "{instr}"
-        );
+        match driver.dispatch(&mut function, entry, 5, instr) {
+            Ok(()) => {
+                translated.insert(instr.op.mnemonic());
+            }
+            Err(TranslateError::Uniform { index, error, .. }) => {
+                assert_eq!(index, 5);
+                if matches!(instr.op, Op::UBMsk(_)) {
+                    assert_eq!(
+                        error,
+                        UniformError::Unsupported(uniform::UniformUnsupported::Instruction(
+                            "ubmsk"
+                        ))
+                    );
+                }
+            }
+            Err(other) => panic!("{instr}: {other}"),
+        }
     }
     assert_eq!(seen.len(), 20, "{seen:?}");
+    assert_eq!(translated.len(), 15, "{translated:?}");
+    assert!(!translated.contains("ubmsk"));
+}
+
+/// A refusal of the uniform datapath's translator reaches the program's error with the
+/// instruction's index and its reason in plain words.
+#[test]
+fn a_refused_uniform_instruction_names_its_reason() {
+    use crate::decode::{OpR2UR, OpULdc, ULdcSrc};
+    let ldcg = Instr::new(Op::ULdc(OpULdc {
+        dst: ur(4),
+        src: ULdcSrc::Global {
+            addr: ur(2),
+            offset: 0,
+            pred: crate::decode::UniformPredSrc {
+                reg: UniformPred::UPT,
+                negated: true,
+            },
+        },
+        mem_type: MemType::B128,
+    }));
+    let r2ur = Instr::new(Op::R2UR(OpR2UR {
+        dst: UniformReg::URZ,
+        src: r(1),
+    }));
+    for (instr, text) in [
+        (
+            ldcg,
+            "instruction 1 (uldc.128 ur4, [ur2], !upt;): a 128-bit ldcg is not supported",
+        ),
+        (
+            r2ur,
+            "instruction 1 (r2ur urz, r1;): an r2ur into urz is not supported",
+        ),
+    ] {
+        let code = [
+            assemble(&mov(0, 1)).expect("encodable"),
+            assemble(&instr).expect("encodable"),
+            assemble(&exit()).expect("encodable"),
+        ];
+        let error = translate_flow(VERTEX, None, &code, &BranchTables::new(0))
+            .expect_err("refused");
+        assert!(matches!(error, TranslateError::Uniform { index: 1, .. }), "{error}");
+        assert_eq!(error.to_string(), text);
+    }
 }
 
 /// The translation budget: a count of exactly the cap is accepted, one past it refused, whether
@@ -1159,6 +1218,7 @@ fn groups_of(op: Op) -> Vec<&'static str> {
         ("texture", texture::in_group(&op)),
         ("control", control::in_group(&op)),
         ("memory", memory::is_memory(&op)),
+        ("uniform", uniform::in_group(&op)),
         ("attribute", attribute::translate(&mut t, op).is_some()),
     ]
     .into_iter()
@@ -1227,61 +1287,30 @@ fn these_instructions_reach_every_decoded_operation() {
     );
 }
 
-/// Whether `op` is of the uniform datapath group (slice 6d's `R2UR`, `UMOV`, `ULDC`, `UPLOP3`
-/// and the twins), which words decode to but which no translator takes yet, so no group takes
-/// it and the dispatch refuses it by its mnemonic. `UP2UR` is a shell, not decoded.
-const fn is_uniform_datapath(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::R2UR(_)
-            | Op::UMov(_)
-            | Op::ULdc(_)
-            | Op::UPLop3(_)
-            | Op::UIAdd3(_)
-            | Op::UIAdd3X(_)
-            | Op::ULea(_)
-            | Op::ULeaX(_)
-            | Op::ULop3(_)
-            | Op::UPrmt(_)
-            | Op::UShf(_)
-            | Op::UIMad(_)
-            | Op::UIMad64(_)
-            | Op::UISetP(_)
-            | Op::USel(_)
-            | Op::USgxt(_)
-            | Op::UBMsk(_)
-            | Op::UFlo(_)
-            | Op::UBRev(_)
-            | Op::UPopC(_)
-    )
-}
-
 /// The groups are disjoint, and every decoded operation (every one of [`decoded_samples`])
-/// belongs to exactly one of them, but for the uniform datapath's ([`is_uniform_datapath`]),
-/// which belongs to none, so the dispatch order decides nothing; a shell belongs to none but the
-/// control group's `JMX` and `BPT`, which it refuses by name, so the fallback refusal is reached
-/// only by the uniform datapath and the other shells.
+/// belongs to exactly one of them, so the dispatch order decides nothing; a shell belongs to
+/// none but the control group's `JMX` and `BPT` and the uniform group's `UP2UR`, which they
+/// refuse by name, so the fallback refusal is reached only by the tensor group's shells.
 #[test]
 fn the_groups_are_disjoint() {
     let mut half_double = 0;
     let mut uniform = 0;
     for instr in decoded_samples() {
-        let wanted = if half_double::in_group(&instr.op) {
+        if half_double::in_group(&instr.op) {
             half_double += 1;
-            1
-        } else if is_uniform_datapath(&instr.op) {
+        }
+        if uniform::in_group(&instr.op) {
             uniform += 1;
-            0
-        } else {
-            1
-        };
-        assert_eq!(groups_of(instr.op).len(), wanted, "{instr}");
+        }
+        assert_eq!(groups_of(instr.op).len(), 1, "{instr}");
     }
     assert!(half_double > 0);
     assert!(uniform > 0);
     for op in shells() {
         let wanted: &[&str] = if matches!(op, Op::Jmx(_) | Op::Bpt(_)) {
             &["control"]
+        } else if matches!(op, Op::UP2UR(_)) {
+            &["uniform"]
         } else {
             &[]
         };
@@ -1363,9 +1392,10 @@ fn either_a_tested_block_or_an_impure_instruction_settles_the_guard() {
 /// as the uniform predicate of the same number for a uniform one (of the decodable forms
 /// `S2UR`, `0x9c3`, `VOTEU`, `0x886`, and slice 6d's `UMOV`, `ULDC`, `UPLOP3` and the twins
 /// `classify.h` names pure: the list in the test), as the predicate for the others, which come
-/// from the integer, float, half and double, attribute and memory groups (or from no group yet:
-/// `R2UR`). The instruction itself may be refused after (a canonical word is not always a form
-/// the group translates); the guard's read comes first.
+/// from the integer, float, half and double, attribute and memory groups, and `R2UR`, the
+/// uniform group's, which reads its guard as data with no split (`classify.h`: "reads the guard
+/// as data, so it is not split into a block"). The instruction itself may be refused after (a
+/// canonical word is not always a form the group translates); the guard's read comes first.
 #[test]
 fn the_guard_of_every_pure_form_is_read_by_its_kind() {
     let mut uniform = vec![];
@@ -1395,6 +1425,17 @@ fn the_guard_of_every_pure_form_is_read_by_its_kind() {
             "GetPred p3"
         };
         let text = function.to_string();
+        if matches!(instr.op, Op::R2UR(_)) {
+            // `R2UR` reads its guard as data, the ballot's input, and makes no block.
+            assert!(
+                text.starts_with(
+                    "block0:\n    %0: u1 = GetPred p3\n    %1: u1 = LogicalNot %0\n    \
+                     %2: u32 = SubgroupBallot %1\n"
+                ),
+                "{instr}: {text}"
+            );
+            continue;
+        }
         assert!(
             text.starts_with(&format!(
                 "block0:\n    %0: u1 = {read}\n    %1: u1 = LogicalNot %0\n    branch %1, block1, block2\n"
@@ -1416,7 +1457,14 @@ fn the_guard_of_every_pure_form_is_read_by_its_kind() {
     assert_eq!(uniform, expected);
     assert_eq!(
         groups.into_iter().collect::<Vec<_>>(),
-        ["attribute", "float", "half and double", "integer", "memory"]
+        [
+            "attribute",
+            "float",
+            "half and double",
+            "integer",
+            "memory",
+            "uniform"
+        ]
     );
 }
 
