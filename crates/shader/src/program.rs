@@ -1,12 +1,25 @@
-//! The walking skeleton end to end: program bytes to a validated naga module and its tables.
+//! The translation pipeline end to end: program bytes to a validated naga module and its tables.
 //!
-//! Bytes are split into instructions; the translation driver ([`translate_flow`], slice 12i)
-//! rebuilds their control flow, decodes the instructions its blocks hold and translates them to
-//! IR; the structurizer (slice 11) structures the IR, and the IR is lowered and validated. The
-//! first failure is the rejection; there is no partial translation (spec, "Instruction
-//! translation"). The bytes carry no jump tables, so a `BRX` has no target and is refused
-//! ([`crate::flow::FlowError::NoTarget`]); jump tables come with the questions and answers
-//! (slice 9) when the shader cache drives the chain.
+//! [`pipeline_ir`] is the IR half, in the spec's order ("The translation pipeline", the
+//! flowchart; "Building the IR"; the owner's ruling of 2026-11-19, row 3, Eden's order): the
+//! translation driver ([`translate_flow`], slice 12i) rebuilds the program's control flow with
+//! the jump tables it is given, decodes the instructions its blocks hold and translates them to
+//! IR; the structurizer ([`IrBlocks::structure`], slice 11) structures the IR; and the SSA
+//! rewrite and the passes after it ([`optimize`], slices 8 and 8b) run on the structured
+//! function. The one production path is the shader cache's production translator
+//! ([`crate::pipeline`]), which lowers it with the program's jump tables from slice 9's answers.
+//! [`translate_program`] (used by the GPU crate's draw tests) and [`graphics_program_ir`] (used
+//! by the shader crate's tests) run it too. The first failure is the rejection; there is no
+//! partial translation (spec, "Instruction translation").
+//!
+//! [`translate_program`] and [`graphics_program_ir`] take bytes only, which carry no jump
+//! tables, so a `BRX` there has no target and is refused ([`crate::flow::FlowError::NoTarget`]);
+//! the shader cache's translator gives the driver the tables the answers resolve.
+//!
+//! A program the driver leaves as one block (no control flow and no guard) is not structured:
+//! the SSA rewrite and the lowering take a one-block graph as it is (the lowering's "What it
+//! takes"), so the structurizer's goto-variable resets do not reach a straight-line program.
+//! Pinned by `tests::a_straight_program_is_not_structured`.
 
 use thiserror::Error;
 
@@ -70,6 +83,10 @@ pub enum Rejection {
     /// (slice 15).
     #[error(transparent)]
     Info(#[from] InfoError),
+    /// The shader cache's production translator refused the program itself
+    /// ([`crate::pipeline`]'s module docs, "What it does not do yet").
+    #[error(transparent)]
+    Pipeline(#[from] crate::pipeline::PipelineRefusal),
 }
 
 impl From<TranslateError> for Rejection {
@@ -92,37 +109,72 @@ pub fn decode_program(code: &[u8]) -> Result<Vec<Instr>, Rejection> {
         .collect()
 }
 
-/// Splits `code` into instructions and runs the translation driver on them, with `header` for a
-/// pixel program and no jump tables.
-fn translated(stage: Stage, header: Option<&PixelIo>, code: &[u8]) -> Result<IrBlocks, Rejection> {
+/// The IR half of the translation pipeline, in the spec's order (module docs): the translation
+/// driver on `code` for `stage`, with `header` for a pixel program and `tables` giving each
+/// `BRX`'s targets ([`translate_flow`]); the structurizer with [`MAX_STRUCTURE_WORK`]
+/// ([`IrBlocks::structure`], [`Rejection::Structure`]), unless the driver left one block; and
+/// the SSA rewrite and the passes after it ([`optimize`], [`Rejection::Pass`]). The result is
+/// what the lowering takes.
+pub fn pipeline_ir(
+    stage: Stage,
+    header: Option<&PixelIo>,
+    code: &[Instruction],
+    tables: &BranchTables,
+) -> Result<Function, Rejection> {
+    let mut function = structured(translate_flow(stage, header, code, tables)?)?;
+    optimize(&mut function)?;
+    Ok(function)
+}
+
+/// `blocks` structured with [`MAX_STRUCTURE_WORK`], or its function as it is when it is one
+/// block (module docs).
+fn structured(blocks: IrBlocks) -> Result<Function, Rejection> {
+    if blocks.function.block_count() == 1 {
+        Ok(blocks.function)
+    } else {
+        Ok(blocks.structure(MAX_STRUCTURE_WORK)?.blocks.function)
+    }
+}
+
+/// Splits `code` into instructions and runs [`pipeline_ir`] on them, with `header` for a pixel
+/// program and no jump tables.
+fn pipeline_bytes(
+    stage: Stage,
+    header: Option<&PixelIo>,
+    code: &[u8],
+) -> Result<Function, Rejection> {
     let words = Instruction::from_program(code)?;
-    Ok(translate_flow(
-        stage,
-        header,
-        &words,
-        &BranchTables::new(0),
-    )?)
+    pipeline_ir(stage, header, &words, &BranchTables::new(0))
+}
+
+/// Splits `code` into instructions and runs the translation driver on them, with no header and
+/// no jump tables.
+fn translated(stage: Stage, code: &[u8]) -> Result<IrBlocks, Rejection> {
+    let words = Instruction::from_program(code)?;
+    Ok(translate_flow(stage, None, &words, &BranchTables::new(0))?)
 }
 
 /// Translates `code` to IR with the translation driver: the filled control-flow graph, before
 /// structuring.
 pub fn program_ir(stage: Stage, code: &[u8]) -> Result<Function, Rejection> {
-    Ok(translated(stage, None, code)?.function)
+    Ok(translated(stage, code)?.function)
 }
 
-/// Translates a program to a host shader: the translation driver, the structurizer with
-/// [`MAX_STRUCTURE_WORK`], and the lowering (no SSA pass runs between them until slice 8b, as
-/// the lowering's module docs say). A program the driver leaves as one block (no control flow
-/// and no guard) is lowered as it is, as the lowering takes a one-block graph (its "What it
-/// takes"), so the structurizer's goto-variable resets do not reach a straight-line program's
-/// module (pinned by `lower`'s `tests::skeleton_modules_are_unchanged`).
+/// Translates a program's instructions to a host shader: [`pipeline_ir`] with no header and no
+/// jump tables, then the lowering ([`lower`], [`Rejection::Lower`]).
 pub fn translate_program(stage: Stage, code: &[u8]) -> Result<HostShader, Rejection> {
-    let blocks = translated(stage, None, code)?;
-    let function = if blocks.function.block_count() == 1 {
-        blocks.function
-    } else {
-        blocks.structure(MAX_STRUCTURE_WORK)?.blocks.function
-    };
+    let function = pipeline_bytes(stage, None, code)?;
+    Ok(lower(stage.stage, &function)?)
+}
+
+/// `code` lowered from the IR the translation driver and the structurizer leave, before the
+/// SSA rewrite and the passes: the lowering's input for the lowering's own tests, so that each
+/// IR form the translators write reaches the lowering (dead code elimination would remove an
+/// unused read the lowering is tested to refuse). Not a production path: every production path
+/// runs [`pipeline_ir`].
+#[cfg(test)]
+pub(crate) fn lowered_before_passes(stage: Stage, code: &[u8]) -> Result<HostShader, Rejection> {
+    let function = structured(translated(stage, code)?)?;
     Ok(lower(stage.stage, &function)?)
 }
 
@@ -131,7 +183,7 @@ pub fn translate_program(stage: Stage, code: &[u8]) -> Result<HostShader, Reject
 pub struct GraphicsIr {
     /// The program's header.
     pub header: ProgramHeader,
-    /// The IR, after the slice 8 passes ([`optimize`]).
+    /// The IR, structured and after the passes ([`pipeline_ir`]).
     pub function: Function,
     /// What collect info found ([`crate::info`]).
     pub info: ShaderInfo,
@@ -141,13 +193,10 @@ pub struct GraphicsIr {
 /// byte onwards) to IR and its info, stopping at the first failure, in this order: the header
 /// ([`ProgramHeader::from_program`], [`Rejection::Header`]); the header against the slot
 /// ([`check_header`], [`Rejection::Info`]; compute has no header, so a compute slot is refused
-/// here as [`InfoError::ComputeHeader`]); the translation driver on the instructions after the
-/// header ([`translate_flow`]: flow analysis, decoding, translation), given the header's colour
-/// outputs ([`translation_stage`]) and, for a pixel program, its input map; the slice 8 passes
-/// ([`optimize`], [`Rejection::Pass`]); and collect info ([`collect`], [`Rejection::Info`]).
-/// The passes run on the control-flow graph, not structured: slice 8's SSA rewrite refuses a
-/// structured function until slice 8b reworks it (the owner's ruling of 2026-11-19, row 3, puts
-/// the structurizer first once it does).
+/// here as [`InfoError::ComputeHeader`]); the IR half of the pipeline on the instructions after
+/// the header ([`pipeline_ir`]: the translation driver, given the header's colour outputs
+/// ([`translation_stage`]) and, for a pixel program, its input map; the structurizer; the SSA
+/// rewrite and the passes); and collect info ([`collect`], [`Rejection::Info`]).
 pub fn graphics_program_ir(slot: GuestStage, program: &[u8]) -> Result<GraphicsIr, Rejection> {
     let (header, code) = ProgramHeader::from_program(program)?;
     check_header(slot, Some(&header))?;
@@ -156,8 +205,7 @@ pub fn graphics_program_ir(slot: GuestStage, program: &[u8]) -> Result<GraphicsI
         Io::Pixel(io) => Some(&**io),
         Io::Vtg(_) => None,
     };
-    let mut function = translated(stage, pixel, code)?.function;
-    optimize(&mut function)?;
+    let function = pipeline_bytes(stage, pixel, code)?;
     let info = collect(slot, Some(&header), &function)?;
     Ok(GraphicsIr {
         header,
@@ -187,6 +235,40 @@ mod tests {
             pred: PredSrc::TRUE,
         }))])
         .expect("encodable")
+    }
+
+    /// A program the driver leaves as one block is not structured, and keeps its one block; one
+    /// with a guarded instruction (a conditional block) is structured before the passes, which
+    /// leave no guest register behind in either.
+    #[test]
+    fn a_straight_program_is_not_structured() {
+        let words = |instrs: &[Instr]| {
+            Instruction::from_program(&assemble_program(instrs).expect("encodable"))
+                .expect("whole words")
+        };
+        let exit = Instr::new(Op::Exit(OpExit {
+            keep_ref_count: false,
+            no_at_exit: false,
+            pred: PredSrc::TRUE,
+        }));
+        let mov = Instr {
+            guard: PredSrc {
+                reg: crate::decode::Pred::new(0).expect("P0"),
+                negated: false,
+            },
+            ..Instr::new(Op::Mov(crate::decode::OpMov {
+                dst: crate::decode::Gpr::new(0),
+                src: crate::decode::MovSrc::Imm(7),
+                quad_lanes: crate::decode::OpMov::ALL_LANES,
+            }))
+        };
+        let tables = BranchTables::new(0);
+        let straight = pipeline_ir(VERTEX, None, &words(&[exit]), &tables).expect("translates");
+        assert_eq!(straight.structure(), None);
+        assert_eq!(straight.block_count(), 1);
+        let guarded = pipeline_ir(VERTEX, None, &words(&[mov, exit]), &tables).expect("translates");
+        assert!(guarded.structure().is_some(), "{guarded}");
+        assert!(!guarded.to_string().contains("Register"), "{guarded}");
     }
 
     #[test]

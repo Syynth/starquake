@@ -69,12 +69,40 @@
 //!
 //! When the calling core runs a scheduler thread ([`Sender::waiter`]), its registers are saved
 //! as its context when the request is queued or started (step 1), and it waits for its reply
-//! ([`crate::sync::Wait::Reply`]) when the request waits behind another (step 1) or is deferred
-//! (step 2, before the lock goes, so that a reply delivered at once finds it waiting). Settling
-//! a request writes the reply into the sender's message buffer and then, under the same lock,
-//! writes the result into its saved `x0` and makes it runnable
-//! ([`Scheduler::end_reply_wait`]); the core that schedules it next loads that context. A
-//! sender is still reported woken too ([`Dispatcher::take_woken`]).
+//! ([`crate::sync::Wait::Reply`]) when the request waits behind another (step 1), is deferred
+//! (step 2), or is parked because its handler is out of its slot (step 2). The wait begins
+//! under the lock that queues, defers or parks the request, before it goes, so that a reply
+//! delivered at once finds the sender waiting. This follows Eden, where every synchronous
+//! request begins its sender's wait (`KServerSession::OnRequest`,
+//! `eden/src/core/hle/kernel/k_server_session.cpp` @ cf654052, `BeginWait` after the request
+//! is listed), and its reply ends it. Settling a request writes the reply into the sender's
+//! message buffer and then, under the same lock, writes the result into its saved `x0` and makes
+//! it runnable ([`Scheduler::end_reply_wait`]); the core that schedules it next loads that
+//! context. A sender is still reported woken too ([`Dispatcher::take_woken`]).
+//!
+//! A dispatch that ends in [`Outcome::Waiting`] writes no register: the core reloads the
+//! context saved in step 1, so a sender that is not in its reply wait would read its own
+//! session handle back as the result. `SendSyncRequest` ends in [`Outcome::Waiting`] in exactly
+//! two places, and the sender waits on each path through them except those listed after:
+//!
+//! - **The request is queued** behind another (`begin`, [`Admission::Queued`]): the sender
+//!   waits, and one that cannot is an internal fault, its request withdrawn first. Test:
+//!   `senders_that_wait_are_blocked_threads_and_the_reply_makes_them_runnable` (B).
+//! - **The caller's own request is not among those this dispatch settled**, which is so when
+//!   it was deferred or parked (both waits begin in `run_request`). Tests:
+//!   `senders_that_wait_are_blocked_threads_and_the_reply_makes_them_runnable` (A, deferred),
+//!   `a_request_parked_while_a_delivery_has_the_handler_leaves_its_sender_waiting_for_the_reply`
+//!   and `a_parked_request_its_handler_then_defers_keeps_its_sender_waiting_until_the_reply`.
+//!
+//! The exceptions, where the dispatch ends in [`Outcome::Waiting`] with no reply wait: a
+//! sender with no scheduler thread (only a caller that drives the dispatcher without a core
+//! loop; it is only reported woken), a sender that ended while its handler ran (below), and
+//! two failures of the kernel's own bookkeeping, each logged as an error: `wait_for_reply`
+//! refusing on the deferred or parked path ("a sender could not wait for its reply"), and
+//! [`crate::ipc::Ipc::finish`] failing for the caller's request ("a request could not be
+//! ended"), which leaves nothing to settle. A sender that did wait may be out of its wait by
+//! the time its dispatch returns, when another core or the timer thread settled its request
+//! meanwhile; its result is then in the saved context already, which is what the core loads.
 //!
 //! A sender that ends while it waits leaves its session's queue if its request has not
 //! started (`Scheduler::forget_waits`); a request already in flight stays with its handler,
@@ -1103,7 +1131,8 @@ impl Dispatcher {
     /// requests parked for the handler while it ran, which the caller runs.
     ///
     /// When the handler is out of its slot (another core delivers its deferred replies), the
-    /// request is parked instead, still in flight: nothing is over yet.
+    /// request is parked instead, still in flight, and its sender waits for its reply (module
+    /// docs, "Senders wait as scheduler threads"): nothing is over yet.
     fn run_request(
         &self,
         server: ServerId,
@@ -1129,8 +1158,13 @@ impl Dispatcher {
             return (finish(ipc, session, failed, Vec::new()), Vec::new());
         };
         let Some(mut handler) = slot.take() else {
-            // Out of its slot without a worker: whoever puts it back runs this request.
+            // Out of its slot without a worker: whoever puts it back runs this request. The
+            // sender waits for its reply now, as on the queued and deferred paths, before the
+            // lock goes: the thread that puts the handler back may run and answer the request
+            // at once, and its answer must find the sender waiting. Eden: every synchronous
+            // request begins its sender's wait (`KServerSession::OnRequest`, module docs).
             state.parked.entry(server).or_default().push(session);
+            await_reply(&mut state.tables.scheduler, request.sender, session);
             return (Vec::new(), Vec::new());
         };
         give_notices(&mut state.tables, server, &mut *handler);

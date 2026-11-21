@@ -24,51 +24,8 @@ use crate::decode::{
     OpBrx, PredSrc, SHF_OPCODE, SRC2, UniformReg,
 };
 use crate::exchange::{Answers, EngineState, Question, TextureKind, exchange};
-use crate::testing::config;
+use crate::testing::{config, imnmx, ldc, shf};
 use crate::translate::GuestStage;
-
-// The reference's literals (`program_capture.h`, `TrackCaptureIndirectBranches` @ e5fb3b97),
-// written out to build words independently of the shipping constants.
-const REF_LDC: u128 = 0xb82;
-const REF_SHF: u128 = 0x819;
-const REF_IMNMX: u128 = 0x817;
-const REF_ALWAYS: u128 = 7 << 12;
-
-/// `IMNMX.U32 dst, src, clamp, PT` as the reference matches it.
-fn imnmx(dst: u8, src: u8, clamp: u32) -> Instruction {
-    Instruction::from_bits(
-        REF_IMNMX
-            | REF_ALWAYS
-            | u128::from(dst) << 16
-            | u128::from(src) << 24
-            | u128::from(clamp) << 32
-            | 0x0380_0000 << 64,
-    )
-}
-
-/// `SHF.L.U32 dst, src, 0x2, RZ`.
-fn shf(dst: u8, src: u8) -> Instruction {
-    Instruction::from_bits(
-        REF_SHF
-            | REF_ALWAYS
-            | u128::from(dst) << 16
-            | u128::from(src) << 24
-            | 2 << 32
-            | 0x6ff << 64,
-    )
-}
-
-/// `LDC.32 dst, c[bank][src + offset]`.
-fn ldc(dst: u8, src: u8, bank: u8, offset: u32) -> Instruction {
-    Instruction::from_bits(
-        REF_LDC
-            | REF_ALWAYS
-            | u128::from(dst) << 16
-            | u128::from(src) << 24
-            | (u128::from(bank) << 22 | u128::from(offset) << 6) << 32
-            | 0x800 << 64,
-    )
-}
 
 /// `word` with `bits` toggled.
 fn toggle(word: Instruction, bits: u128) -> Instruction {
