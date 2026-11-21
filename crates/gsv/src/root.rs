@@ -248,6 +248,7 @@ use starquake_services::framework::{
 };
 use starquake_trace::ServiceId;
 
+use crate::completion::Completion;
 use crate::gpu::low_byte;
 use crate::native;
 use crate::native::pools;
@@ -1369,5 +1370,20 @@ impl Family for RootFamily {
         }
         self.state = saved;
         Ok(())
+    }
+
+    /// When the server's last session has closed (`open` is 0) in a run with the shared page,
+    /// queues [`Completion::RootClosed`] for the timer thread's drain, which lets the page and
+    /// its two transfer memories go if no root session is open by then (module docs, "The
+    /// shared syncpoint page (204)"). Called with the kernel's lock held when a process's end
+    /// closed the session: it only pushes, which takes only the queue's lock
+    /// ([`crate::completion`], "Never blocking"), never gsv's shared lock or the kernel's.
+    fn session_closed(&mut self, open: usize) {
+        if open != 0 {
+            return;
+        }
+        if let Some(shared) = &self.shared {
+            shared.queue().push(Completion::RootClosed);
+        }
     }
 }

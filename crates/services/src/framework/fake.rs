@@ -278,7 +278,10 @@ impl FakeKernel {
 
     /// Makes every call that creates a kernel object for a server ([`Kernel::create_event`],
     /// [`Kernel::create_shared_memory`]) fail with `refusal`, as the kernel's do when its object
-    /// table is full ([`KernelError::OutOfResource`]); `None` lets them succeed again.
+    /// table is full ([`KernelError::OutOfResource`]); `None` lets them succeed again. Keeping a
+    /// transfer memory ([`Kernel::keep_transfer_memory`]), which takes a reference the kernel can
+    /// fail to take (its own bookkeeping, `KernelError::InvalidState`), counts as such a call
+    /// once the transfer memory is found live.
     pub fn refuse_objects(&mut self, refusal: Option<KernelError>) {
         self.refuse_objects_after(0, refusal);
     }
@@ -650,6 +653,9 @@ impl Kernel for FakeKernel {
     /// memory.
     fn keep_transfer_memory(&mut self, object: ObjectId) -> SvcResult<TransferMemory> {
         let lent = self.transfer_memory(object)?;
+        if let Some(refusal) = self.refused() {
+            return Err(refusal);
+        }
         let count = self.kept.entry((self.current, object)).or_insert(0);
         *count = count.saturating_add(1);
         Ok(lent)
@@ -1217,7 +1223,14 @@ mod tests {
         assert_eq!(kernel.kept_transfer_memory(SERVICE, event), 0);
         let found = kernel.keep_transfer_memory(lent).unwrap();
         assert_eq!((found.address(), found.size()), (0x1000, 4));
+        // A refused keep keeps nothing; the refusal counts against the allowance.
+        kernel.refuse_objects_after(1, Some(KernelError::InvalidState));
         kernel.keep_transfer_memory(lent).unwrap();
+        assert_eq!(
+            kernel.keep_transfer_memory(lent).map(|_| ()),
+            Err(KernelError::InvalidState)
+        );
+        kernel.refuse_objects(None);
         assert_eq!(kernel.kept_transfer_memory(SERVICE, lent), 2);
         assert_eq!(kernel.kept_transfer_memory(OTHER, lent), 0);
         // Another service's release has nothing behind it.

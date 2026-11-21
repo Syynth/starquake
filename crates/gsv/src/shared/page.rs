@@ -223,7 +223,7 @@ use starquake_kernel::dispatch::Dispatcher;
 use starquake_kernel::id::ObjectId;
 use starquake_kernel::ipc::EventHook;
 use starquake_kernel::result::{KernelError, SvcResult};
-use starquake_services::framework::{Context, Outcome, Reply, Request};
+use starquake_services::framework::{Context, Fault, Outcome, Reply, Request};
 use starquake_trace::{HostNanos, ServiceId};
 use thiserror::Error;
 
@@ -631,6 +631,10 @@ pub enum PageSnapshotError {
         /// Its size.
         size: u64,
     },
+    /// The root's server does not keep exactly one reference to the writable memory, as 204
+    /// leaves it.
+    #[error("the root does not keep exactly one reference to the syncpoint page's writable memory")]
+    WritableNotKept,
     /// The read-only memory is not a live transfer memory.
     #[error("the syncpoint page's read-only memory is not a live transfer memory: {0}")]
     ReadOnlyMemory(KernelError),
@@ -640,6 +644,12 @@ pub enum PageSnapshotError {
         /// Its size.
         size: u64,
     },
+    /// The root's server does not keep exactly one reference to the read-only memory, as 204
+    /// leaves it.
+    #[error(
+        "the root does not keep exactly one reference to the syncpoint page's read-only memory"
+    )]
+    ReadOnlyNotKept,
     /// The kernel refused to re-attach the request event's hook.
     #[error("the kernel refused to re-attach the syncpoint page's request hook: {0}")]
     Rehook(KernelError),
@@ -665,6 +675,10 @@ pub trait RestoreKernel {
     /// The size of the live transfer memory `memory` names, or why there is none
     /// ([`Dispatcher::transfer_memory`]: `InvalidHandle`).
     fn transfer_memory_size(&self, memory: ObjectId) -> SvcResult<u64>;
+
+    /// How many references the server of `service` keeps to `memory`
+    /// ([`Dispatcher::kept_transfer_memory`]).
+    fn kept_transfer_memory(&self, service: ServiceId, memory: ObjectId) -> u32;
 }
 
 impl RestoreKernel for Dispatcher {
@@ -687,6 +701,11 @@ impl RestoreKernel for Dispatcher {
     fn transfer_memory_size(&self, memory: ObjectId) -> SvcResult<u64> {
         Ok(self.transfer_memory(memory)?.size())
     }
+
+    /// [`Dispatcher::kept_transfer_memory`].
+    fn kept_transfer_memory(&self, service: ServiceId, memory: ObjectId) -> u32 {
+        Dispatcher::kept_transfer_memory(self, service, memory)
+    }
 }
 
 /// The checks of the objects `page` names against what `kernel` holds, for the root's server,
@@ -708,11 +727,17 @@ fn check_kernel_objects(
         if size != u64::from(WRITABLE_SIZE) {
             return Err(PageSnapshotError::WritableSize { size });
         }
+        if kernel.kept_transfer_memory(root, binding.writable) != 1 {
+            return Err(PageSnapshotError::WritableNotKept);
+        }
         let size = kernel
             .transfer_memory_size(binding.read_only)
             .map_err(PageSnapshotError::ReadOnlyMemory)?;
         if size != u64::from(READ_ONLY_SIZE) {
             return Err(PageSnapshotError::ReadOnlySize { size });
+        }
+        if kernel.kept_transfer_memory(root, binding.read_only) != 1 {
+            return Err(PageSnapshotError::ReadOnlyNotKept);
         }
     }
     Ok(())
@@ -911,6 +936,40 @@ impl Locked<'_> {
         Ok(())
     }
 
+    /// The drain's answer to [`Completion::RootClosed`](crate::completion::Completion) (module
+    /// docs, "When the root closes"): if the page is bound and the kernel says no root session
+    /// is open, gives back the hold's watches, unbinds the page, and drops the root's reference
+    /// to each memory, the writable one first. A host that cannot say how many root sessions
+    /// are open leaves the page bound; a refused release is logged, and the page is unbound
+    /// either way.
+    pub(super) fn root_closed(&mut self, host: &mut dyn TimerHost) {
+        let Some(binding) = self.state.page.binding else {
+            return;
+        };
+        match host.root_sessions() {
+            Ok(0) => {}
+            Ok(open) => {
+                tracing::debug!(open, "gsv: a root session is open again; the page stays bound");
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "gsv: the kernel did not say whether the root is open");
+                return;
+            }
+        }
+        self.release_hold();
+        let page = &mut self.state.page;
+        page.binding = None;
+        page.shown = CounterExtension::default();
+        page.signalled = false;
+        for memory in [binding.writable, binding.read_only] {
+            if let Err(error) = host.release_kept_transfer_memory(memory) {
+                tracing::error!(%error, "gsv: the kernel refused to let a page memory go");
+            }
+        }
+        tracing::debug!("gsv: the root closed; the shared syncpoint page is unbound");
+    }
+
     /// The checks a page snapshot passes against this state, in the documented order (module
     /// docs, "What is saved"): the page's own relations, then each syncpoint's waiter count.
     fn check_page(&self, page: &Page) -> Result<(), PageSnapshotError> {
@@ -1038,6 +1097,30 @@ impl Shared {
     }
 }
 
+/// Clears both memories and writes the header and [`UNALLOCATED`] for every value into the
+/// read-only one (module docs, "Binding (204)"). A refused write stops it where it is.
+fn clear_and_write_header(
+    cx: &mut Context<'_>,
+    writable: ObjectId,
+    read_only: ObjectId,
+) -> Result<(), Fault> {
+    cx.write_transfer_memory(writable, 0, &[0; WRITABLE_SIZE as usize])?;
+    cx.write_transfer_memory(read_only, 0, &[0; READ_ONLY_SIZE as usize])?;
+    cx.write_transfer_memory(read_only, 0, &header())?;
+    let unallocated: Vec<u8> = (0..COUNT).flat_map(|_| UNALLOCATED.to_le_bytes()).collect();
+    cx.write_transfer_memory(read_only, u64::from(VALUES_OFFSET), &unallocated)
+}
+
+/// Gives back the references a failing 204 kept to `memories`. The root keeps one of each, so
+/// a refusal means gsv's own bookkeeping is wrong, and is logged.
+fn give_back(cx: &mut Context<'_>, memories: &[ObjectId]) {
+    for memory in memories {
+        if let Err(error) = cx.release_kept_transfer_memory(*memory) {
+            tracing::error!(%error, "gsv: a failing 204 could not give back a transfer memory");
+        }
+    }
+}
+
 /// gsv 204 in a run with gsv's `shared` state (module docs, "Binding (204)").
 pub(crate) fn bind(
     shared: &Shared,
@@ -1108,13 +1191,21 @@ pub(crate) fn bind(
         state.state.page.answer = Some(answer);
         answer
     };
+    // The root keeps a reference of its own to each memory, as PR opens both
+    // (`m_syncpoint_rw->Open(kernel)`, `m_syncpoint_ro->Open(kernel)`) once its event is made,
+    // so the page outlives the title's handles (module docs, "Binding (204)"). A refused keep
+    // gives back what this 204 kept.
+    cx.keep_transfer_memory(writable)?;
+    if let Err(error) = cx.keep_transfer_memory(read_only) {
+        give_back(cx, &[writable]);
+        return Err(error);
+    }
     // The memories are written only once both events are there, as PR makes its event before
     // it writes: a refused event leaves them as they were.
-    cx.write_transfer_memory(writable, 0, &[0; WRITABLE_SIZE as usize])?;
-    cx.write_transfer_memory(read_only, 0, &[0; READ_ONLY_SIZE as usize])?;
-    cx.write_transfer_memory(read_only, 0, &header())?;
-    let unallocated: Vec<u8> = (0..COUNT).flat_map(|_| UNALLOCATED.to_le_bytes()).collect();
-    cx.write_transfer_memory(read_only, u64::from(VALUES_OFFSET), &unallocated)?;
+    if let Err(error) = clear_and_write_header(cx, writable, read_only) {
+        give_back(cx, &[writable, read_only]);
+        return Err(error);
+    }
     state.state.page.binding = Some(Binding {
         writable,
         read_only,

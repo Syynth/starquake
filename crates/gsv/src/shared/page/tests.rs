@@ -32,6 +32,7 @@ use crate::root::{RootState, root_server_with_page};
 use crate::shared::WatchError;
 use crate::testing::{SPECIAL, STALE, copied, halves, le, result_only, success, tipc_type};
 
+mod kept;
 mod on_the_kernel;
 
 /// The number the tests' root server is known by.
@@ -109,18 +110,38 @@ enum Act {
     },
     /// An event signalled.
     Signal(ObjectId),
+    /// Asked how many root sessions are open.
+    RootSessions,
+    /// The root's reference to a transfer memory dropped, or asked to be.
+    Release(ObjectId),
 }
 
 /// A [`TimerHost`] over the fake kernel, as the wiring's is over the real one: it reaches a
 /// transfer memory through the fake's bounds check, which is the kernel's own (`span_within`),
 /// so its refusals are the kernel's `IpcContext::read_transfer_memory`'s (`InvalidHandle` for an
 /// object that is no live transfer memory, `InvalidCurrentMemory` past its end). A test can make
-/// it refuse reads, or writes after a number of them.
+/// it refuse reads, or writes after a number of them. It drops the root's references through the
+/// fake's own count of them ([`FakeKernel::release_kept`] for [`ROOT`]), and says as many root
+/// sessions are open as the test sets.
 struct PageHost<'a> {
     kernel: &'a mut FakeKernel,
     acts: Vec<Act>,
     refuse_reads: bool,
     writes_left: Option<usize>,
+    root_sessions: usize,
+}
+
+impl<'a> PageHost<'a> {
+    /// A host over `kernel` that refuses nothing and says no root session is open.
+    fn new(kernel: &'a mut FakeKernel) -> Self {
+        Self {
+            kernel,
+            acts: Vec::new(),
+            refuse_reads: false,
+            writes_left: None,
+            root_sessions: 0,
+        }
+    }
 }
 
 impl TimerHost for PageHost<'_> {
@@ -171,6 +192,16 @@ impl TimerHost for PageHost<'_> {
         });
         Ok(())
     }
+
+    fn release_kept_transfer_memory(&mut self, memory: ObjectId) -> SvcResult<()> {
+        self.acts.push(Act::Release(memory));
+        self.kernel.release_kept(ROOT, memory)
+    }
+
+    fn root_sessions(&mut self) -> SvcResult<usize> {
+        self.acts.push(Act::RootSessions);
+        Ok(self.root_sessions)
+    }
 }
 
 /// gsv's shared state over fresh syncpoints and a fresh queue.
@@ -195,6 +226,8 @@ struct Rig {
     /// What the next turn's host refuses.
     refuse_reads: bool,
     writes_left: Option<usize>,
+    /// How many root sessions the next turn's host says are open.
+    root_sessions: usize,
 }
 
 impl Rig {
@@ -225,6 +258,7 @@ impl Rig {
             handles,
             refuse_reads: false,
             writes_left: None,
+            root_sessions: 0,
         }
     }
 
@@ -326,10 +360,10 @@ impl Rig {
     /// asked.
     fn turn(&mut self, now: HostNanos) -> Vec<Act> {
         let mut host = PageHost {
-            kernel: &mut self.kernel,
-            acts: Vec::new(),
             refuse_reads: self.refuse_reads,
             writes_left: self.writes_left,
+            root_sessions: self.root_sessions,
+            ..PageHost::new(&mut self.kernel)
         };
         self.shared.drain(&mut host);
         self.shared.tick_page(&mut host, now);
@@ -1232,8 +1266,39 @@ fn each_written_value_is_recorded_after_its_write() {
 }
 
 #[test]
-fn a_closed_transfer_memory_is_refused_by_the_kernel() {
+fn the_page_answers_after_the_title_closes_its_handles_to_the_memories() {
+    // The fault of issue 499: with no reference of the root's own, the title's close made every
+    // later page access `InvalidHandle`. The root keeps one of each, so the page goes on.
     let mut rig = shown();
+    assert!(rig.kernel.end_transfer_memory(rig.writable));
+    assert!(rig.kernel.end_transfer_memory(rig.read_only));
+    assert_eq!(rig.kernel.kept_transfer_memory(ROOT, rig.writable), 1);
+    assert_eq!(rig.kernel.kept_transfer_memory(ROOT, rig.read_only), 1);
+    let value = rig.increment(SP);
+    rig.ask(&[SP]);
+    rig.signal();
+    assert_eq!(
+        rig.turn(T0),
+        [
+            value_write(&rig, SP),
+            answered(SP, value),
+            group_ack_write(&rig, 0),
+            summary_write(&rig),
+            acknowledged(1),
+            Act::Signal(rig.answer_event()),
+        ]
+    );
+    assert_eq!(rig.value(SP), u64::from(value));
+    assert_eq!(rig.answers(), 2);
+    assert!(all_acknowledged(&rig));
+}
+
+#[test]
+fn a_transfer_memory_the_kernel_no_longer_has_is_refused() {
+    // Not a state 204 leaves (the root keeps both), but what the page turn does if the kernel
+    // refuses: the turn stops and drops the hold.
+    let mut rig = shown();
+    rig.kernel.release_kept(ROOT, rig.read_only).unwrap();
     assert!(rig.kernel.end_transfer_memory(rig.read_only));
     rig.ask(&[SP]);
     rig.signal();
@@ -1265,12 +1330,7 @@ fn a_host_without_transfer_memory_answers_nothing() {
     rig.increment(SP);
     rig.ask(&[SP]);
     rig.signal();
-    let mut host = Bare(PageHost {
-        kernel: &mut rig.kernel,
-        acts: Vec::new(),
-        refuse_reads: false,
-        writes_left: None,
-    });
+    let mut host = Bare(PageHost::new(&mut rig.kernel));
     rig.shared.drain(&mut host);
     rig.shared.tick_page(&mut host, T0);
     assert_eq!(host.0.acts, []);
@@ -1309,12 +1369,7 @@ fn only_the_bound_page_s_request_event_marks_it_signalled() {
     assert_eq!(rig.answers(), 0);
     // The drain alone marks it; the page turn reads and clears the mark.
     rig.signal();
-    let mut host = PageHost {
-        kernel: &mut rig.kernel,
-        acts: Vec::new(),
-        refuse_reads: false,
-        writes_left: None,
-    };
+    let mut host = PageHost::new(&mut rig.kernel);
     rig.shared.drain(&mut host);
     drop(host);
     assert!(rig.page().is_signalled());
@@ -1358,7 +1413,8 @@ type Attached = (ServiceId, ObjectId, Arc<dyn EventHook>);
 /// memories with their sizes, answers each question as the dispatcher does from what it holds,
 /// and keeps what it attached. A re-attach is taken only for a hooked writable end the service
 /// made (the dispatcher's `InvalidHandle` otherwise); an event is the service's if it holds it
-/// either way; a memory it does not hold is `InvalidHandle`. It does not model objects ending:
+/// either way; a memory it does not hold is `InvalidHandle`; a service keeps the references it
+/// was given to keep, and none of any other memory. It does not model objects ending:
 /// what it holds stays live. Parity with the dispatcher, on the same corrupt snapshots:
 /// `on_the_kernel::each_kernel_check_refuses_on_the_kernel_as_on_the_fake`.
 #[derive(Default)]
@@ -1369,13 +1425,15 @@ struct Holding {
     events: BTreeSet<(ServiceId, ObjectId)>,
     /// The live transfer memories, with their sizes.
     memories: BTreeMap<ObjectId, u64>,
+    /// The references each service's server keeps to a transfer memory, with how many.
+    kept: BTreeMap<(ServiceId, ObjectId), u32>,
     attached: Mutex<Vec<Attached>>,
 }
 
 impl Holding {
     /// A kernel holding what `page` names, as the root's 204 made and was lent them: the request
     /// event's writable end hooked, its readable end and the answer event, and the two memories
-    /// at their sizes.
+    /// at their sizes, each kept once by the root.
     fn of(page: &Page) -> Self {
         let mut holding = Self::default();
         if let Some(request) = page.request {
@@ -1392,6 +1450,8 @@ impl Holding {
             holding
                 .memories
                 .insert(binding.read_only, u64::from(READ_ONLY_SIZE));
+            holding.kept.insert((ROOT, binding.writable), 1);
+            holding.kept.insert((ROOT, binding.read_only), 1);
         }
         holding
     }
@@ -1431,6 +1491,10 @@ impl RestoreKernel for Holding {
             .get(&memory)
             .copied()
             .ok_or(KernelError::InvalidHandle)
+    }
+
+    fn kept_transfer_memory(&self, service: ServiceId, memory: ObjectId) -> u32 {
+        self.kept.get(&(service, memory)).copied().unwrap_or(0)
     }
 }
 
