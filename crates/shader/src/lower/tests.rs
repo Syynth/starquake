@@ -5,6 +5,7 @@ mod compute;
 mod memory;
 mod opcodes;
 mod ops;
+mod resources;
 mod run;
 mod structured;
 mod warp;

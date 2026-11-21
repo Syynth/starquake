@@ -49,14 +49,14 @@
 //!
 //! # Checks
 //!
-//! In [`super::lower_with`]'s order: each bank's size in [`LowerInputs::constant_buffers`] is 0
-//! (not declared) or a multiple of [`CBUF_ALIGNMENT`] no larger than [`INDEXED_CBUF_SIZE`], the
-//! most a bank holds ([`LowerError::ConstantBufferSize`], step 3, the lowest bank first); then,
-//! per read, in the walk of step 5: the bank is an immediate `u32` ([`LowerError::Operand`]
-//! for another immediate) and not a value ([`LowerError::ConstantBufferRegisterBank`]), below
-//! [`CBUF_BANKS`] ([`LowerError::ConstantBufferBank`]); the offset is an immediate `u32` or a
-//! value ([`LowerError::Operand`]); and the bank's size is not 0
-//! ([`LowerError::ConstantBufferUnsized`]).
+//! In [`super::lower_with`]'s order: the verifier (step 1) refuses a bank or offset that is
+//! not a `u32` ([`LowerError::Verify`]); each bank's size in [`LowerInputs::constant_buffers`]
+//! is 0 (not declared) or a multiple of [`CBUF_ALIGNMENT`] no larger than
+//! [`INDEXED_CBUF_SIZE`], the most a bank holds ([`LowerError::ConstantBufferSize`], step 3,
+//! the lowest bank first, read or not); then, per read, in the walk of step 5: the bank is an
+//! immediate, not a value ([`LowerError::ConstantBufferRegisterBank`]), below [`CBUF_BANKS`]
+//! ([`LowerError::ConstantBufferBank`]), and its size is not 0
+//! ([`LowerError::ConstantBufferUnsized`]). The offset may be an immediate or a value.
 //!
 //! # Where this differs from Eden
 //!
@@ -196,7 +196,9 @@ pub(super) const fn is_cbuf_read(opcode: Opcode) -> bool {
     Read::of(opcode).is_some()
 }
 
-/// The bank a constant-buffer read names, after the checks of the module docs ("Checks").
+/// The bank a constant-buffer read names, after the checks of the module docs ("Checks"). The
+/// verifier has checked that both arguments are `u32`s (an immediate `u32` or a `u32` value),
+/// so the [`LowerError::Operand`] arm is not reached after it.
 pub(super) fn read_bank(at: Value, op: &Operation, inputs: &LowerInputs) -> Result<u8, LowerError> {
     let bank = match op.args.first() {
         Some(Operand::Imm(Imm::U32(bank))) => *bank,
@@ -207,11 +209,6 @@ pub(super) fn read_bank(at: Value, op: &Operation, inputs: &LowerInputs) -> Resu
         .ok()
         .filter(|&bank| bank < CBUF_BANKS)
         .ok_or(LowerError::ConstantBufferBank { at, bank })?;
-    match op.args.get(1) {
-        Some(Operand::Value(_)) => {}
-        _ if matches!(imm_arg(op, 1), Some(Imm::U32(_))) => {}
-        _ => return Err(LowerError::Operand { at, index: 1 }),
-    }
     let size = inputs
         .constant_buffers
         .get(usize::from(bank))

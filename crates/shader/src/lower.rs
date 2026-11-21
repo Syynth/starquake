@@ -421,8 +421,8 @@ pub enum LowerError {
     /// A constant-buffer bank's size in [`LowerInputs::constant_buffers`] is not a multiple
     /// of [`crate::info::CBUF_ALIGNMENT`] or is past [`crate::info::INDEXED_CBUF_SIZE`].
     #[error(
-        "constant buffer bank {bank} is given {size} bytes, which is not a multiple of {align} \
-         up to {max}",
+        "constant buffer bank {bank} is given {size} bytes; a bank's size is a multiple of \
+         {align}, at most {max}",
         align = crate::info::CBUF_ALIGNMENT, max = crate::info::INDEXED_CBUF_SIZE
     )]
     ConstantBufferSize {
