@@ -5169,9 +5169,10 @@ impl OneHeader {
     }
 }
 
-/// [`PixelModes`](shaders::PixelModes) remembers only the last header's bytes: a header that
-/// differs from the last one is parsed again, whether it is new or one seen two draws ago, and
-/// a draw with no pixel request or an unmapped header gives smooth without touching the memo.
+/// Every [`PixelModes::read`](shaders::PixelModes::read) gives the current header's modes,
+/// never a stale answer from the memo: a new header, an unchanged one, one seen two draws ago,
+/// and a header read after a draw with no pixel request or an unmapped header (which give
+/// smooth). What the memo retains is unobservable by design, so this test cannot pin it.
 #[test]
 fn pixel_modes_remember_only_the_last_header() {
     use Interpolation::{Flat, NoPerspective, Smooth};
@@ -5214,8 +5215,8 @@ fn pixel_modes_remember_only_the_last_header() {
     ] {
         assert_eq!(memo.read(&requests, memory), expected);
     }
-    // No pixel request, then an unmapped header: smooth, and the memo still holds B, so the
-    // next read of A is parsed and B is read from the memo afterwards.
+    // No pixel request, then an unmapped header: smooth; the reads after them give A's and
+    // B's own modes.
     assert_eq!(memo.read(&requests[..1], &b), OutputInterpolation::SMOOTH);
     let elsewhere = OneHeader::new(ADDRESS + 0x2000, flat_words);
     assert_eq!(
@@ -5226,4 +5227,71 @@ fn pixel_modes_remember_only_the_last_header() {
     assert_eq!(memo.read(&requests, &b), linear);
     // A fresh memo with B as its first header: nothing remembered gives B's own modes.
     assert_eq!(shaders::PixelModes::default().read(&requests, &b), linear);
+}
+
+/// Program memory holding several headers, each at its own address; every other read is
+/// unmapped.
+struct Headers(Vec<(u64, [u8; SPH_BYTES])>);
+
+impl ProgramMemory for Headers {
+    fn read(&self, address: u64, out: &mut [u8]) -> Result<(), Unmapped> {
+        let (_, bytes) = self
+            .0
+            .iter()
+            .find(|(at, _)| *at == address)
+            .filter(|_| out.len() == SPH_BYTES)
+            .ok_or(Unmapped { address })?;
+        out.copy_from_slice(bytes);
+        Ok(())
+    }
+}
+
+/// [`PixelModes::read`](shaders::PixelModes::read) reads the request whose stage is pixel, not
+/// the first request past the vertex stage: with every stage's header mapped, and the
+/// tessellation and geometry headers carrying the pixel header's word 6 as type 1 headers, the
+/// key takes the pixel header's modes.
+#[test]
+fn pixel_modes_read_the_pixel_request_after_other_stages() {
+    use Interpolation::{Flat, NoPerspective, Smooth};
+    const PIXEL: u64 = 0x10_0000;
+    let pixel_words = pixel_header([
+        imap(IMAP_CONSTANT, IMAP_CONSTANT, IMAP_CONSTANT, IMAP_CONSTANT),
+        imap(IMAP_SCREEN_LINEAR, IMAP_UNUSED, IMAP_UNUSED, IMAP_UNUSED),
+        0,
+        0,
+    ]);
+    // `SHADER_TYPE` of each stage (`clc797sph.h`): vertex 1, tessellation init 2,
+    // tessellation 3, geometry 4; each a type 1 header.
+    let stages = [
+        (GuestStage::Vertex, 1),
+        (GuestStage::TessellationInit, 2),
+        (GuestStage::Tessellation, 3),
+        (GuestStage::Geometry, 4),
+    ];
+    let mut headers = Vec::new();
+    let mut requests = Vec::new();
+    for ((stage, shader_type), address) in stages.into_iter().zip((1_u64..).map(|i| i << 16)) {
+        headers.push((
+            address,
+            sph_bytes(header_words(1, shader_type, pixel_words[6])),
+        ));
+        requests.push(ProgramRequest { stage, address });
+    }
+    headers.push((PIXEL, sph_bytes(pixel_words)));
+    requests.push(ProgramRequest {
+        stage: GuestStage::Pixel,
+        address: PIXEL,
+    });
+    let memory = Headers(headers);
+    let expected = modes([Flat, NoPerspective, Smooth, Smooth]);
+    // Every list that keeps the pixel request last: a geometry slot alone, and every stage.
+    let geometry_only = [requests[0], requests[3], requests[4]];
+    assert_eq!(
+        shaders::PixelModes::default().read(&geometry_only, &memory),
+        expected
+    );
+    assert_eq!(
+        shaders::PixelModes::default().read(&requests, &memory),
+        expected
+    );
 }

@@ -120,11 +120,15 @@
 //! [`OutputInterpolation::from_pixel_io`] ([`pixel_interpolation`]). [`PixelModes`] remembers the
 //! last header and its modes, so a draw whose header bytes are unchanged parses nothing; the
 //! bytes are read and compared every draw, so a program rewritten in place is seen at the next
-//! draw (`tests::the_pixel_programs_interpolation_reaches_the_key`). Only the last header is
-//! remembered: a header that differs from it is parsed again, whether new or seen before, and
-//! a draw with no pixel request or an unmapped header leaves the memo as it was
-//! (`tests::pixel_modes_remember_only_the_last_header`). The memo saves parsing only, so no test
-//! sees it: dropping it (never storing, or a fresh [`PixelModes`] per draw) gives the same keys.
+//! draw (`tests::the_pixel_programs_interpolation_reaches_the_key`). Every read gives the
+//! current header's modes and never a stale answer from the memo: a new header, an unchanged
+//! one, one seen two draws ago, and a header read after a draw with no pixel request or an
+//! unmapped header each give their own modes (`tests::pixel_modes_remember_only_the_last_header`).
+//! Which header the memo keeps is unobservable by design: the memo saves parsing only, so
+//! dropping it (never storing, or a fresh [`PixelModes`] per draw) gives the same keys, and no
+//! test pins what it retains. The pixel request is found by its stage, not its position, so a
+//! tessellation or geometry request before it is not read
+//! (`tests::pixel_modes_read_the_pixel_request_after_other_stages`).
 //!
 //! The key holds [`OutputInterpolation::SMOOTH`] (every generic smooth, Eden's value-initialised
 //! `Info::interpolation`) when:
@@ -136,11 +140,13 @@
 //! - the header gives a generic two modes ([`starquake_shader::variant::KeyError::MixedInterpolation`]).
 //!
 //! The draw still looks the set up rather than failing: the shader crate refuses the same pixel
-//! programs when it translates them (an unmapped or unparsable header in
-//! `program::translate_program`, which parses the header first; a type 1 header in the pixel
-//! slot or a generic with two modes in `info::collect`, `HeaderStage` and `MixedInterpolation`,
-//! once production translation runs collect info), and the draw path skips a rejected set once
-//! per set, as for any rejection. This keeps one place, the shader cache, that refuses
+//! programs when it translates them (an unmapped header in the capture, `capture::capture`,
+//! `CaptureError::HeaderUnreadable`; bytes that are not a header it reads in
+//! `pipeline::PipelineProgram::new`, through `ProgramHeader::from_program`; a type 1 header in
+//! the pixel slot in `pipeline::translate_shader`, through `info::check_header`, `HeaderStage`;
+//! and a generic with two modes in the same function, through `info::collect`,
+//! `MixedInterpolation`), and the draw path skips a rejected set once per set, as for any
+//! rejection. This keeps one place, the shader cache, that refuses
 //! programs. `tests::a_pixel_header_the_key_cannot_use_leaves_every_generic_smooth`.
 //!
 //! The flipped viewport ([`viewport_flip`], [`constants_flip`]): the backend's `emulation()`

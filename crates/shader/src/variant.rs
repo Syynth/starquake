@@ -90,9 +90,15 @@
 //!
 //! Not covered, as in Eden: the legacy colours and fixed-function texture coordinates of the
 //! input map (Eden's `CollectInterpolationInfo` reads the 32 generics only, and
-//! [`crate::info`] does not fill the legacy varyings). Eden also decorates a pixel input of an
-//! integer type flat whatever its mode (`backend/spirv/spirv_emit_context.cpp`); the key carries
-//! the header's modes only, and slice 17 applies such a rule to both stages alike.
+//! [`crate::info`] does not fill the legacy varyings). Eden's SPIR-V backend has a branch that
+//! decorates a fragment input flat whatever its mode when its `generic_input_types` entry is an
+//! integer type (`eden/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp` @ cf654052),
+//! but no fragment input reaches it: `MakeRuntimeInfo`
+//! (`eden/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp` @ cf654052) fills
+//! `generic_input_types` only under `case Shader::Stage::VertexB`, so a fragment program's
+//! entries keep the value-initialised `AttributeType::Float` and take the header's mode. The key
+//! carries the header's modes only, as Eden applies them; a flat rule for integer inputs in
+//! slice 17 would be a listed divergence from Eden.
 //!
 //! # The texture swizzles' binding order
 //!
