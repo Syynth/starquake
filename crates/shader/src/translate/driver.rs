@@ -23,7 +23,9 @@
 //!
 //! # The order of the checks
 //!
-//! 1. The stage: vertex and pixel programs only ([`TranslateError::Stage`]), as slice 1 had it.
+//! 1. The stage: vertex, pixel and compute programs, the stages the lowering takes
+//!    ([`translates_stage`]); any other is [`TranslateError::Stage`], named, until the lowering
+//!    takes it (slice 17 owns the graphics stages past vertex and pixel).
 //! 2. Flow analysis ([`TranslateError::Flow`]), which decodes the control instructions it walks.
 //! 3. The size: the instructions of every flow block, counted once per block, so once per
 //!    inlined copy of a function, at most [`MAX_TRANSLATED_INSTRUCTIONS`]
@@ -46,7 +48,9 @@
 //!
 //! As `Visitor::Run` reads them (`visitor.cpp`: it reads a guard only when `info.pure &&
 //! !guard.Always()`, after the `guard.Never()` return), with a conditional block where the PR
-//! keeps a select:
+//! keeps a select. The rule is [`super::guard_step`]'s, with the guard settled when its block's
+//! `guard_tested` is set or the instruction is not pure; the group translators' own entry
+//! points that take a guard follow the same function (`super`'s module docs, "Guards"):
 //!
 //! - An instruction under `!PT` never runs and becomes nothing, as `Visitor::Run` returns when
 //!   `guard.Never()` (flow analysis leaves such an instruction in its block's range and skips it
@@ -67,11 +71,11 @@
 //!   indirect-branch checks, and ends a block at a `BRA`, `BSYNC`, `CALL` or `RET`). It is
 //!   translated as is, its guard not read and no block made, as `Visitor::Run` reads no guard
 //!   for an instruction that is not pure; none of the four writes IR (the control group's
-//!   module docs). The spec says "Every guarded instruction becomes a conditional block, pure
-//!   ones included" ("Instruction translation", "Guards"): for these four a block would hold
-//!   nothing, so leaving it out changes no result. **Owner question**: whether a guarded
-//!   instruction that writes no IR should still get its (empty) conditional block. Pinned by
-//!   `tests::a_guarded_instruction_that_is_not_pure_reads_no_guard`.
+//!   module docs). The owner ruled this on 2026-11-20 (decision log, "Owner rulings on the
+//!   wave 47 questions", row 1): a guarded instruction that writes no IR gets no conditional
+//!   block and no guard read, and the spec now reads "Every guarded instruction that writes IR
+//!   becomes a conditional block, pure ones included" ("Instruction translation", "Guards").
+//!   Pinned by `tests::a_guarded_instruction_that_is_not_pure_reads_no_guard`.
 //!
 //! Every group's translator is so handed its instruction with the guard already handled.
 //!
@@ -79,13 +83,15 @@
 //!
 //! By the decoded operation, in this order: `EXIT` (`super`'s `Translator::exit`); the integer
 //! ALU group ([`super::integer::is_integer`], `MOV` included); the float group
-//! ([`super::float::in_group`]); the texture group ([`super::texture::in_group`], with one
+//! ([`super::float::in_group`]); the half and double group ([`super::half_double::in_group`]);
+//! the texture group ([`super::texture::in_group`], with one
 //! [`DescriptorBuffer`] for the program); the control and warp group
-//! ([`super::control::in_group`]); the memory group, whose translator (slice 12e) is not joined
-//! yet, refused by name ([`Unsupported::MemoryGroup`]: `LD`, `ST`, `LDC`, `ATOM`, `CCTL`,
-//! `MEMBAR`, `LDGSTS`, `LDGDEPBAR`, `ERRBAR`, `ATOMS.POPC`); the attribute group (`super`'s
-//! `GROUPS`). An operation none of them takes (the half and double group, the uniform group,
-//! the tensor group) is refused by its mnemonic ([`Unsupported::Instruction`]). The groups are
+//! ([`super::control::in_group`]); the memory group ([`super::memory::is_memory`]: `LD`, `ST`,
+//! `LDC`, `ATOM`, `CCTL`, `MEMBAR`, `LDGSTS`, `LDGDEPBAR`, `ERRBAR`, `ATOMS.POPC`), with slice
+//! 12e's translator ([`super::memory::translate_memory`], its guard already handled), whose
+//! refusals are [`TranslateError::Memory`]; the attribute group (`super`'s `GROUPS`). An
+//! operation none of them takes (the uniform group, the tensor group) is refused by its
+//! mnemonic ([`Unsupported::Instruction`]). The groups are
 //! disjoint, so the order decides nothing but speed: `tests::the_groups_are_disjoint` checks
 //! that every decoded operation (one instruction of each, from the deterministic
 //! `tests::decoded_samples`, which `tests::these_instructions_reach_every_decoded_operation`
@@ -110,20 +116,23 @@
 //! | A guarded pure instruction | A conditional block (the owner's ruling of 2026-11-19) | A select of each value it writes (`guard_select`) | `tests::a_guarded_pure_instruction_becomes_a_conditional_block` |
 //! | The instructions translated | At most [`MAX_TRANSLATED_INSTRUCTIONS`], counted over the inlined graph (a **guess**, four per instruction of a program at the capture's cap, as [`crate::flow::MAX_FLOW_BLOCKS`] is four blocks per instruction) | No bound | `tests::the_translation_budget_at_its_edge` |
 //! | Which undecodable instruction is refused | The lowest-numbered one any flow block holds, after flow analysis's own refusals and before any translation | The first its flow walk meets (`flow.cpp`: `LookupRow`, `FirstUnknownBit`, before `guard.Never()`), in walk order, among the walk's other refusals | `tests::the_lowest_undecodable_instruction_is_refused` |
-//! | Stages | Vertex and pixel only, slice 1's restriction (compute comes with slice 16's lowering) | No stage check in `Translate` | `tests::only_vertex_and_pixel_stages_translate` |
+//! | Stages | Vertex, pixel and compute, the stages the lowering takes; tessellation, geometry and the cull-before-fetch vertex stage are refused by name until slice 17's lowering takes them | No stage check in `Translate` | `tests::only_the_stages_the_lowering_takes_translate` |
 
 use super::control::{self, Emitted};
 use super::float::{self, FloatError};
+use super::half_double::{self, HalfDoubleError};
 use super::integer::{self, GuardMode, IntegerError};
+use super::memory::{self, MemoryError};
 use super::texture::{self, DescriptorBuffer, TextureError};
 use super::{
-    Failure, GuestStage, Stage, TranslateError, Translator, Unsupported, source, split_for_guard,
+    Failure, GuardStep, GuestStage, Stage, TranslateError, Translator, Unsupported, guard_step,
+    source, split_for_guard,
 };
 use crate::capture::MAX_INSTRUCTIONS;
 use crate::decode::{Instr, Instruction, Op, decode};
 use crate::flow::{
     BranchTables, FlowError, FlowGraph, Invariant, IrBlocks, OpInfo, classify, flow_graph,
-    is_never, opcode_of,
+    opcode_of,
 };
 use crate::ir::{BlockId, Builder, Function};
 use crate::sph::PixelIo;
@@ -133,6 +142,18 @@ use crate::sph::PixelIo;
 /// instruction of a program at the capture's cap, the same allowance
 /// [`crate::flow::MAX_FLOW_BLOCKS`] makes for blocks; real programs would confirm or move it.
 pub const MAX_TRANSLATED_INSTRUCTIONS: u32 = 4 * MAX_INSTRUCTIONS;
+
+/// Whether [`translate_flow`] takes programs of `stage`: vertex, pixel and compute, the stages
+/// the lowering takes ([`crate::lower::lower_with`]'s `LowerError::Stage` refuses the others).
+/// Any other stage is refused by name ([`Unsupported::Stage`]) until the lowering takes it
+/// (slice 17; module docs, "The order of the checks").
+#[must_use]
+pub const fn translates_stage(stage: GuestStage) -> bool {
+    matches!(
+        stage,
+        GuestStage::Vertex | GuestStage::Pixel | GuestStage::Compute
+    )
+}
 
 /// Translates `code`, a captured program's instructions, for `stage`: flow analysis with
 /// `tables` giving each `BRX`'s targets, the IR's blocks, and each block filled by the group
@@ -148,7 +169,7 @@ pub fn translate_flow(
     code: &[Instruction],
     tables: &BranchTables,
 ) -> Result<IrBlocks, TranslateError> {
-    if !matches!(stage.stage, GuestStage::Vertex | GuestStage::Pixel) {
+    if !translates_stage(stage.stage) {
         return Err(TranslateError::Stage(Unsupported::Stage(stage.stage)));
     }
     let graph = flow_graph(code, tables)?;
@@ -262,14 +283,14 @@ impl Driver {
         info: OpInfo,
         guard_tested: bool,
     ) -> Result<BlockId, TranslateError> {
-        if is_never(instr.guard) {
-            return Ok(at);
+        match guard_step(instr.guard, guard_tested || !info.pure) {
+            GuardStep::Skip => Ok(at),
+            GuardStep::Unguarded => {
+                self.dispatch(function, at, index, instr)?;
+                Ok(at)
+            }
+            GuardStep::Conditional => self.conditional(function, at, index, instr, info.uniform),
         }
-        if guard_tested || instr.guard.is_true() || !info.pure {
-            self.dispatch(function, at, index, instr)?;
-            return Ok(at);
-        }
-        self.conditional(function, at, index, instr, info.uniform)
     }
 
     /// Makes `instr`, instruction `index`, a conditional block at the end of block `at`: reads
@@ -329,6 +350,15 @@ impl Driver {
                     FloatError::Build(error) => TranslateError::Build(error),
                 });
         }
+        if half_double::in_group(&op) {
+            return half_double::translate_instr(&mut Builder::new(function, block), instr, true)
+                .map_err(|error| match error {
+                    HalfDoubleError::Unsupported(what) => {
+                        unsupported(Unsupported::HalfDouble(what))
+                    }
+                    HalfDoubleError::Build(error) => TranslateError::Build(error),
+                });
+        }
         if texture::in_group(&op) {
             return texture::translate_instr(
                 &mut Builder::new(function, block),
@@ -348,8 +378,20 @@ impl Driver {
                 control::translate_control(function, block, self.stage.stage, index, instr, true)?;
             return Ok(());
         }
-        if in_memory_group(&op) {
-            return Err(unsupported(Unsupported::MemoryGroup(op.mnemonic())));
+        if memory::is_memory(&op) {
+            return memory::translate_memory(
+                &mut Builder::new(function, block),
+                &instr,
+                GuardMode::Tested,
+            )
+            .map_err(|error| match error {
+                MemoryError::Build(error) => TranslateError::Build(error),
+                error => TranslateError::Memory {
+                    index,
+                    instr,
+                    error,
+                },
+            });
         }
         let mut t = Translator {
             b: Builder::new(function, block),
@@ -367,24 +409,6 @@ impl Driver {
             Failure::Build(error) => TranslateError::Build(error),
         })
     }
-}
-
-/// Whether `op` is of the memory group (slice 6e's operations), which the driver refuses by
-/// name until slice 12e's translator is joined (see the module docs, "Dispatch").
-const fn in_memory_group(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::Ld(_)
-            | Op::St(_)
-            | Op::Ldc(_)
-            | Op::Atom(_)
-            | Op::CCtl(_)
-            | Op::MemBar(_)
-            | Op::LdGsts(_)
-            | Op::LdgDepBar(_)
-            | Op::ErrBar(_)
-            | Op::AtomsPopc(_)
-    )
 }
 
 /// The test-support entry for the translators' tests that build their programs as
@@ -421,9 +445,9 @@ pub(crate) fn translate_decoded(
     header: Option<&PixelIo>,
     program: &[Instr],
 ) -> Result<Function, TranslateError> {
-    use crate::flow::OpKind;
+    use crate::flow::{OpKind, is_never};
     use crate::ir::Terminator;
-    if !matches!(stage.stage, GuestStage::Vertex | GuestStage::Pixel) {
+    if !translates_stage(stage.stage) {
         return Err(TranslateError::Stage(Unsupported::Stage(stage.stage)));
     }
     let mut function = Function::new();

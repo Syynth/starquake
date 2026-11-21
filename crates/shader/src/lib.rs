@@ -62,15 +62,21 @@
 //!
 //! Slice 12i is the translation driver ([`translate::translate_flow`]): it runs the group
 //! translators over a whole program, block by block of the flow graph, with one guard helper and
-//! one source reader they share; [`program::translate_program`] runs it, then the structurizer
-//! ([`structure`]) and the lowering.
+//! one source reader they share; [`program::pipeline_ir`] runs it, then the structurizer
+//! ([`structure`]), the SSA rewrite and the passes ([`opt`]), and [`program::translate_program`]
+//! lowers the result.
 //!
 //! Slice 15 maps attribute loads and stores, system values and pixel outputs to the
 //! shader's interface and collects what the lowering and the host need to know ([`info`]):
 //! the attribute words read and written, the interface tables with each pixel input's
 //! interpolation, the constant buffers read, and the host [`host::Requirements`];
-//! [`program::graphics_program_ir`] runs a graphics program's bytes through the header, the
-//! translator, the slice 8 passes and collect info.
+//! [`program::graphics_program_ir`] runs a graphics program's bytes through the header,
+//! [`program::pipeline_ir`] and collect info.
+//!
+//! [`pipeline::PipelineTranslator`] is the shader cache's production translator (issue #484):
+//! it runs [`program::pipeline_ir`] (the driver, the structurizer, the SSA rewrite and the
+//! passes, in the spec's order) and the lowering, with each `BRX`'s targets from slice 9's
+//! answers.
 //!
 //! Slice 19 is the shader cache ([`cache`]): the address map, program entries and shader
 //! entries, invalidation by guest range, the negative cache, and translations queued on the
@@ -95,6 +101,7 @@ pub mod ir;
 pub mod lookup;
 pub mod lower;
 pub mod opt;
+pub mod pipeline;
 pub mod program;
 pub mod sph;
 pub mod structure;

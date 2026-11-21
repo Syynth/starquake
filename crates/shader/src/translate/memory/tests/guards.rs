@@ -85,7 +85,9 @@ fn a_guarded_ldc_is_a_conditional_block() {
 }
 
 /// An instruction under `!PT` never runs and appends nothing, without its checks (a refused
-/// form under `!PT` translates to nothing too), as PR #4588's `Visitor::Run` returns.
+/// form under `!PT` translates to nothing too), as PR #4588's `Visitor::Run` returns; with
+/// [`GuardMode::Tested`] too, as the translation driver skips `!PT` whether or not flow
+/// analysis tested the guard (`crate::translate::guard_step`).
 #[test]
 fn never_guarded_instructions_append_nothing() {
     let refused = Op::MemBar(OpMemBar {
@@ -96,6 +98,28 @@ fn never_guarded_instructions_append_nothing() {
     for op in [sts(), refused] {
         let function = build(&[guarded(op, ps(7, true))]).expect("translates");
         assert_eq!(function.to_string(), "block0:\n    return\n", "{op}");
+        let mut function = Function::new();
+        let entry = function.entry();
+        let mut builder = Builder::new(&mut function, entry);
+        let result = translate_memory(&mut builder, &guarded(op, ps(7, true)), GuardMode::Tested);
+        assert_eq!(result, Ok(()), "{op}");
+        assert_eq!(builder.function(), &Function::new(), "{op}");
+        assert_eq!(builder.block(), entry);
+    }
+    // The group check still comes first, in either mode.
+    let mov = Op::Mov(crate::decode::OpMov {
+        dst: r(1),
+        src: crate::decode::MovSrc::Reg(r(2)),
+        quad_lanes: crate::decode::OpMov::ALL_LANES,
+    });
+    for mode in [GuardMode::Honour, GuardMode::Tested] {
+        let mut function = Function::new();
+        let entry = function.entry();
+        let mut builder = Builder::new(&mut function, entry);
+        assert_eq!(
+            translate_memory(&mut builder, &guarded(mov, ps(7, true)), mode),
+            Err(MemoryError::OtherGroup("mov"))
+        );
     }
 }
 
