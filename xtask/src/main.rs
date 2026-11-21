@@ -9,6 +9,7 @@
 
 mod gen_classes;
 mod host_access;
+mod packages;
 mod table_deps;
 mod tools;
 mod unused_deps;
@@ -227,6 +228,9 @@ enum Action {
     /// Fail if the committed GPU class tables differ from a fresh generation; skipped when the
     /// reference folder has no class headers (`gen_classes`).
     Classes,
+    /// Run clippy on each workspace package on its own, so that no other member's features
+    /// reach its build (`packages`).
+    Packages,
 }
 
 /// One gate step: a display name and what it does.
@@ -355,6 +359,10 @@ fn steps(plan: Plan) -> Vec<Step> {
                 "-D",
                 "warnings",
             ]),
+        },
+        Step {
+            name: "packages",
+            action: Action::Packages,
         },
         Step {
             name: "test",
@@ -643,6 +651,35 @@ fn classes() -> bool {
     true
 }
 
+/// The gate's `packages` step: clippy on each workspace package on its own, stopping at the first
+/// that fails. Returns whether the step passes.
+fn each_package() -> bool {
+    let packages = match packages::workspace_packages(Path::new(".")) {
+        Ok(packages) => packages,
+        Err(error) => {
+            eprintln!("{error}");
+            return false;
+        }
+    };
+    for (package, args) in packages.iter().zip(packages::commands(&packages)) {
+        eprintln!("    cargo {}", args.join(" "));
+        let ok = cargo()
+            .args(&args)
+            .status()
+            .is_ok_and(|status| status.success());
+        if !ok {
+            eprintln!(
+                "{package} does not build on its own, or warns when built on its own: the \
+                 workspace-wide build turns on features (test-support, say) that this package \
+                 alone does not get. Gate items used only by tests behind the same cfg, and \
+                 build it with `cargo clippy -p {package} -- -D warnings`."
+            );
+            return false;
+        }
+    }
+    true
+}
+
 /// `cargo xtask gen-classes [--check]`: needs the class headers, unlike the gate step.
 fn gen_classes_command(check: bool) -> ExitCode {
     let root = match workspace_root(Path::new(env!("CARGO_MANIFEST_DIR"))) {
@@ -775,6 +812,13 @@ fn ci(offline: bool) -> ExitCode {
                     gen_classes::OUTPUT_FOLDER
                 );
                 classes()
+            }
+            Action::Packages => {
+                eprintln!(
+                    "==> {name}: each workspace package on its own (cargo clippy -p <package> \
+                     --locked -- -D warnings)"
+                );
+                each_package()
             }
         };
         if !ok {
@@ -985,6 +1029,7 @@ mod tests {
                 "machete",
                 "deny",
                 "clippy",
+                "packages",
                 "test",
                 "doctest"
             ]
@@ -1007,6 +1052,7 @@ mod tests {
                 "host-access",
                 "classes",
                 "clippy",
+                "packages",
                 "test",
                 "doctest"
             ]
@@ -1032,6 +1078,30 @@ mod tests {
         assert_eq!(action_of("host-access"), Some(&Action::HostAccess));
         assert_eq!(action_of("machete"), Some(&Action::Machete));
         assert_eq!(action_of("classes"), Some(&Action::Classes));
+        assert_eq!(action_of("packages"), Some(&Action::Packages));
+    }
+
+    #[test]
+    fn every_plan_checks_each_package_on_its_own_after_the_workspace_clippy() {
+        for nextest in [false, true] {
+            for deny in [
+                None,
+                Some(DenyChecks::All),
+                Some(DenyChecks::WithoutAdvisories),
+            ] {
+                for machete in [false, true] {
+                    let plan = Plan {
+                        nextest,
+                        deny,
+                        machete,
+                    };
+                    let names = names(&steps(plan));
+                    let at = |name| names.iter().position(|step| *step == name);
+                    assert_eq!(at("packages"), at("clippy").map(|at| at + 1), "{plan:?}");
+                    assert_eq!(at("test"), at("packages").map(|at| at + 1), "{plan:?}");
+                }
+            }
+        }
     }
 
     #[test]

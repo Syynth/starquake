@@ -86,10 +86,11 @@ pub enum Error {
         /// `package` or `workspace`: the table the list is under.
         table: &'static str,
     },
-    /// A `members` or `exclude` entry of the root manifest that this module cannot expand.
+    /// A `members` or `exclude` entry of the root manifest that this module cannot expand. The
+    /// workspace-deps, table-deps and packages steps all list members this way.
     #[error(
-        "Cargo.toml: workspace {list} entry {pattern:?} is not supported by the workspace-deps \
-         check (only literal paths, and a trailing `/*` in `members`)"
+        "Cargo.toml: workspace {list} entry {pattern:?} is not supported by the gate's member \
+         listing (only literal paths, and a trailing `/*` in `members`)"
     )]
     UnsupportedPattern {
         /// `members` or `exclude`.
@@ -920,7 +921,7 @@ via_target_build = "7.0.0"
                 error.to_string(),
                 format!(
                     "Cargo.toml: workspace {list} entry {pattern:?} is not supported by the \
-                     workspace-deps check (only literal paths, and a trailing `/*` in `members`)"
+                     gate's member listing (only literal paths, and a trailing `/*` in `members`)"
                 )
             );
         }
