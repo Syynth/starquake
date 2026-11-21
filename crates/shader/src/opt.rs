@@ -18,7 +18,9 @@
 //! `ir_opt/passes.h`, but nothing calls it); the spec lists it between the SSA rewrite and
 //! constant propagation ("Passes needed for correctness", item 1), so it runs there. The
 //! passes of slices 13 to 16 go between [`Pass::ConstantPropagation`] and
-//! [`Pass::DeadCodeElimination`] when they are built.
+//! [`Pass::DeadCodeElimination`] when they are built. Slice 14's pass, [`global_memory`], lives
+//! here but is not in [`Pass::ORDER`]: it takes the host alignment and returns the storage
+//! buffer table, as its "Where it runs" section explains.
 //!
 //! [`run`] runs one pass and, in tests and debug builds, then runs [`Function::verify`],
 //! returning [`PassError::Verify`] if the output does not verify (spec, "The intermediate
@@ -46,7 +48,9 @@
 
 mod constant;
 mod dce;
+pub mod global_memory;
 mod identity;
+pub mod resources;
 mod ssa;
 #[cfg(test)]
 pub(crate) mod tests;

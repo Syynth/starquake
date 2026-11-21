@@ -318,8 +318,8 @@ graph into the structured IR, and SSA runs after it, on the structured function,
 before SSA: it refuses phis and values that cross blocks, so guest registers carry values between
 blocks, and the goto and condition variables it adds are left for the SSA rewrite to turn into
 values. One SSA pass so cleans up the structurizer's variables too, and the passes after it (slices
-13 to 17) see a single SSA form. Slice 8's SSA rewrite, as built, runs on the control-flow graph
-and refuses a structured function; it is reworked (slice 8b) to accept structured functions, take
+13 to 17) see a single SSA form. Slice 8's SSA rewrite first ran on the control-flow graph and
+refused a structured function; slice 8b (PR #482) reworked it to accept structured functions, take
 each block's predecessors from the structured tree, and turn the goto and condition variables into
 values.
 
@@ -376,8 +376,12 @@ not be copied from Eden's Maxwell code:
 An instruction a translator does not handle produces a rejection naming it; there is no partial
 translation.
 
-**Guards** (decided by the owner, 2026-11-19). Every guarded instruction becomes a conditional
-block, pure ones included, as the first paragraph says; PR #4588 keeps a guarded pure
+**Guards** (decided by the owner, 2026-11-19). Every guarded instruction that writes IR becomes a
+conditional block, pure ones included, as the first paragraph says. The driver splits on a guard
+exactly where Eden's `Visitor::Run` does (on `classify().pure`), so a guarded instruction that
+writes no IR (a guarded `NOP`, `DEPBAR`, `BREAK` or immediate `WARPSYNC`) adds no guard read and no
+empty block, with the same outcome (decided by the owner, 2026-11-20; pinned by
+`a_guarded_instruction_that_is_not_pure_reads_no_guard`). PR #4588 keeps a guarded pure
 instruction as a select (`guard_select`), and turning such blocks into selects is a later
 optimisation pass, not the translators' work. Flow analysis's own docs follow this (slice 10's
 "What a block holds"). A block whose guard flow analysis has already tested (`guard_tested`)
@@ -415,8 +419,17 @@ the uniform `LDG` and `STG` (`0x981`, `0x986`) with the uniform address on makes
 register a memory descriptor, checked like an address register but not added to the address
 (`lower_to_maxwell.h`, `descriptor_address`); and `LDGSTS` takes any enable predicate, where
 the native translator passes only `P0`. Strong ordering (`.STRONG.SM`) is ignored, as the native
-translator ignores it. Each is a guess until an `nvdisasm` or hardware check, listed in the
+translator ignores it. These readings are settled; code notes that still call them owner questions
+are stale. Each is a guess until an `nvdisasm` or hardware check, listed in the
 translator's module docs and pinned by a test there.
+
+**The lowering's reading wins in general** (decided by the owner, 2026-11-20). For the same
+reason, wherever PR #4588's lowering to Maxwell (`lower_to_maxwell.h`) and its native translator
+read an encoding differently, every decoder and translator slice follows the lowering, not only
+12e. Each such case is a listed divergence with a named test, and a guess until an `nvdisasm` or
+hardware check. The decoder groups merged before this ruling are rechecked against
+`lower_to_maxwell.h`. The open decoder questions of slices 6c and 6d (`HFMA2.MMA`, the `nvdisasm`
+checks, `UP2UR`, the uniform ALU twins) are decided with 6d's pull request.
 
 **The texture translator's bounds, as built in slice 12f** (decided by the owner, 2026-11-20).
 A texture handle's constant buffer must be below `DESCRIPTOR_BUFFERS` = 18, PR #4588's bound

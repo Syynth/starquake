@@ -93,8 +93,12 @@
 //!
 //! - `GpuMemory::view` (a raw view for hot paths) waits for the memory crate's `RawView`, which
 //!   is only proposed (`docs/proposals.md`); copies are enough here.
-//! - The semaphore mirror page (row 35, graphics-server verification item 8): releases land at
-//!   the address given.
+//! - The copy of a release into the semaphore mirror page (row 35, graphics-server verification
+//!   item 8; tentative, decision log 2026-11-20, "The semaphore mirror page: copy releases, as
+//!   Eden-NX2 does"). A write lands at the address given, whatever it is. This memory only
+//!   answers [`GpuMemory::semaphore_mirror`] from its table's list
+//!   ([`GpuVm::semaphore_mirror`]); the fence path (`back::fence`, "The semaphore mirror page")
+//!   writes a release there too.
 //! - The fence path (`back::fence`) latches waiters with the words a release would have
 //!   written, so a release to the shim latches with its payload, not the counter's new value;
 //!   an open item listed in that module's docs.
@@ -275,6 +279,10 @@ impl<G: GuestMemory + ?Sized> GpuMemory for VmMemory<G> {
 
     fn generation(&self) -> u64 {
         Translate::generation(&*self.vm)
+    }
+
+    fn semaphore_mirror(&self, va: u64) -> Option<u64> {
+        self.vm.semaphore_mirror(va)
     }
 
     fn is_gpu_only(&self, va: u64, len: u64) -> bool {

@@ -1,4 +1,4 @@
-//! Guards: a conditional block for a guard other than `PT`, `@!PT` checked and never run, the
+//! Guards: a conditional block for a guard other than `PT`, nothing for `@!PT`, the
 //! guard ignored once tested, and refusals under a guard that leave the function as it was.
 
 use super::*;
@@ -60,31 +60,59 @@ fn a_guard_makes_a_conditional_block() {
     }
 }
 
-/// `@!PT` is checked like any other guard (a refusal is still a refusal) and goes in a block
-/// that never runs (the module's divergence table).
+/// `@!PT` never runs and appends nothing, unchecked, whether or not the guard is tested: the
+/// translation driver's rule (`crate::translate::guard_step`), as the PR's `Visitor::Run`
+/// returns at `guard.Never()`. A form the group refuses is not refused there, and the
+/// descriptor buffer is left as it was; an instruction of another group is still refused
+/// (the group comes first).
 #[test]
-fn never_guarded_instructions_are_checked() {
+fn never_guarded_instructions_append_nothing() {
     let never = PredSrc {
         reg: Pred::PT,
         negated: true,
     };
-    let instr = encodable(Instr {
+    let valid = encodable(Instr {
         guard: never,
         op: Op::Tex(tex()),
     });
-    let function = build(instr, false);
-    let mut machine = machine_with(&[(10, X), (20, Y), (0, 9)]);
-    run_script(&function, &mut machine, vec![]);
-    assert_eq!(machine.regs[0], 9);
     let refused = encodable(Instr {
         guard: never,
         op: Op::Tex(OpTex { ndv: true, ..tex() }),
     });
-    assert_refused_raw(
-        refused,
-        DescriptorBuffer::new(),
-        TextureUnsupported::Derivative,
-    );
+    for guard_tested in [false, true] {
+        for instr in [valid, refused] {
+            let mut function = Function::new();
+            let entry = function.entry();
+            let mut builder = Builder::new(&mut function, entry);
+            let mut buffer = DescriptorBuffer::new();
+            assert_eq!(
+                translate_instr(&mut builder, instr, guard_tested, &mut buffer),
+                Ok(()),
+                "{instr} {guard_tested}"
+            );
+            assert_eq!(builder.block(), entry);
+            assert_eq!(
+                builder.function(),
+                &Function::new(),
+                "{instr} {guard_tested}"
+            );
+            assert_eq!(buffer, DescriptorBuffer::new());
+        }
+        let other = Instr {
+            guard: never,
+            op: Op::Nop(crate::decode::OpNop {}),
+        };
+        let mut function = Function::new();
+        let entry = function.entry();
+        let mut builder = Builder::new(&mut function, entry);
+        let mut buffer = DescriptorBuffer::new();
+        assert_eq!(
+            translate_instr(&mut builder, other, guard_tested, &mut buffer),
+            Err(TextureError::Unsupported(TextureUnsupported::OtherGroup(
+                "nop"
+            )))
+        );
+    }
 }
 
 /// With the guard tested by flow analysis, the instruction is translated in place: no branch,

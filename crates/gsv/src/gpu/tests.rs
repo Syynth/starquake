@@ -2609,4 +2609,5 @@ fn a_later_102_is_ordered_after_the_destroy_s_removals() {
     );
 }
 
+mod mirror;
 mod sparse_map;

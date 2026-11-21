@@ -131,6 +131,55 @@ fn a_shader_needing_a_feature_the_target_lacks_is_rejected() {
     assert_eq!(rig.counters().rejections, 1);
 }
 
+/// The narrower "needs subgroup size 32" flag is checked on its own (decided by the owner,
+/// 2026-11-20): a target with subgroups but not of size 32 refuses a shader that needs both,
+/// naming only the size, and hands out one that needs subgroups alone (a quad-only shader).
+#[test]
+fn a_target_without_subgroup_size_32_refuses_only_the_shaders_needing_it() {
+    let mut rig = Rig::new();
+    let lacking = HostTarget {
+        caps: Requirements {
+            subgroup: true,
+            ..Requirements::default()
+        },
+        ..TARGET
+    };
+    rig.cache = ShaderCache::with_limits(
+        Arc::clone(&rig.fake),
+        Arc::<Scripted>::clone(&rig.executor),
+        lacking,
+        Limits::SHIPPING,
+    );
+    let sized = rig.place(A, GuestStage::Vertex, &program(GuestStage::Vertex, &[1]));
+    let quad = rig.place(B, GuestStage::Vertex, &program(GuestStage::Vertex, &[2]));
+    let subgroups = Requirements {
+        subgroup: true,
+        ..Requirements::default()
+    };
+    rig.fake.script().needs.insert(
+        sized,
+        Requirements {
+            subgroup_size_32: true,
+            ..subgroups
+        },
+    );
+    rig.fake.script().needs.insert(quad, subgroups);
+    pending(rig.lookup(&[vertex(A)]));
+    pending(rig.lookup(&[vertex(B)]));
+    rig.executor.run_all();
+    let rejection = rejected(rig.lookup(&[vertex(A)]));
+    assert_eq!(
+        *rejection.reason,
+        Rejection::Cache(CacheRefusal::Unsupported {
+            missing: Requirements {
+                subgroup_size_32: true,
+                ..Requirements::default()
+            }
+        })
+    );
+    assert_eq!(ready(rig.lookup(&[vertex(B)])).len(), 1);
+}
+
 #[test]
 fn a_shader_needing_a_feature_the_target_has_is_ready() {
     let mut rig = Rig::new();
@@ -383,6 +432,7 @@ fn every_refusal_reads_in_plain_words() {
         CacheRefusal::Unsupported {
             missing: Requirements {
                 subgroup: true,
+                subgroup_size_32: true,
                 f16: true,
                 f64: true,
                 i64: true,
@@ -390,8 +440,18 @@ fn every_refusal_reads_in_plain_words() {
             }
         }
         .to_string(),
-        "the shader needs subgroup operations, 16-bit floats, 64-bit floats, 64-bit integers, \
-         64-bit integer atomics, which the host lacks"
+        "the shader needs subgroup operations, a subgroup size of 32, 16-bit floats, 64-bit \
+         floats, 64-bit integers, 64-bit integer atomics, which the host lacks"
+    );
+    assert_eq!(
+        CacheRefusal::Unsupported {
+            missing: Requirements {
+                subgroup_size_32: true,
+                ..Requirements::default()
+            }
+        }
+        .to_string(),
+        "the shader needs a subgroup size of 32, which the host lacks"
     );
     assert_eq!(
         Rejection::Cache(CacheRefusal::Abandoned).to_string(),

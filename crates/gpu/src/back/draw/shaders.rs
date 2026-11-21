@@ -692,6 +692,9 @@ fn variable(binding: SlotBinding, ty: SlotType) -> Option<InterfaceVariable> {
 pub const fn requirements(requirements: Requirements) -> ShaderRequirements {
     let Requirements {
         subgroup,
+        // Not passed on yet: #473 adds the field to the render crate. A shader that sets it
+        // also sets `subgroup`, which the render backend checks the size against meanwhile.
+        subgroup_size_32: _,
         f16,
         f64,
         i64,

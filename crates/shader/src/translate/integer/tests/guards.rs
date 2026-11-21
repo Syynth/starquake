@@ -97,7 +97,9 @@ fn an_instruction_may_write_its_own_guard() {
 }
 
 /// `@!PT` never runs: nothing is appended, not even for a form that would be refused, a
-/// bindless constant-buffer source included (the guard is checked before the sources).
+/// bindless constant-buffer source included (the guard is checked before the sources), in
+/// either [`GuardMode`], as the translation driver skips `@!PT` whether or not flow analysis
+/// tested the guard (`crate::translate::guard_step`).
 #[test]
 fn never_guarded_instructions_append_nothing() {
     let never = PredSrc {
@@ -123,37 +125,33 @@ fn never_guarded_instructions_append_nothing() {
         }),
         quad_lanes: OpMov::ALL_LANES,
     });
-    for op in [mov(1, 2), bmsk, partial, bindless] {
+    for mode in [GuardMode::Honour, GuardMode::Tested] {
+        for op in [mov(1, 2), bmsk, partial, bindless] {
+            let mut function = Function::new();
+            let entry = function.entry();
+            let mut builder = Builder::new(&mut function, entry);
+            let result = translate_integer(&mut builder, &guarded(op, never), mode);
+            assert_eq!(result, Ok(()), "{mode:?}");
+            assert_eq!(builder.function(), &Function::new(), "{mode:?}");
+            assert_eq!(builder.block(), entry);
+        }
+        // The group check still comes first.
+        let nop = Op::Nop(crate::decode::OpNop {});
         let mut function = Function::new();
         let entry = function.entry();
         let mut builder = Builder::new(&mut function, entry);
-        let result = translate_integer(&mut builder, &guarded(op, never), GuardMode::Honour);
-        assert_eq!(result, Ok(()));
-        assert_eq!(builder.function(), &Function::new());
-        assert_eq!(builder.block(), entry);
+        assert_eq!(
+            translate_integer(&mut builder, &guarded(nop, never), mode),
+            Err(IntegerError::OtherGroup("nop"))
+        );
     }
-    // The group check still comes first.
-    let nop = Op::Nop(crate::decode::OpNop {});
-    let mut function = Function::new();
-    let entry = function.entry();
-    let mut builder = Builder::new(&mut function, entry);
-    assert_eq!(
-        translate_integer(&mut builder, &guarded(nop, never), GuardMode::Honour),
-        Err(IntegerError::OtherGroup("nop"))
-    );
 }
 
-/// With [`GuardMode::Tested`] the guard is ignored: the instruction runs in the block, `@!PT`
-/// and an unset predicate included.
+/// With [`GuardMode::Tested`] a guard other than `@!PT` is ignored: the instruction runs in
+/// the block, under an unset predicate and its negation alike.
 #[test]
 fn a_tested_guard_is_ignored() {
-    for guard in [
-        ps(1, false),
-        PredSrc {
-            reg: Pred::PT,
-            negated: true,
-        },
-    ] {
+    for guard in [ps(1, false), ps(1, true)] {
         let mut function = Function::new();
         let entry = function.entry();
         let mut builder = Builder::new(&mut function, entry);

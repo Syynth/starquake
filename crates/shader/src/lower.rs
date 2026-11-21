@@ -4,7 +4,9 @@
 //! through naga"), so a naga upgrade touches one place. Slice 1 built the skeleton for
 //! straight-line vertex and pixel functions; slice 16 widens it to the structured IR the
 //! structurizer makes (slice 11), compute entry points, arithmetic, conversions, comparisons and
-//! predicates, and the local and shared memory pass ("Passes needed for correctness", item 6).
+//! predicates, and the local and shared memory pass ("Passes needed for correctness", item 6);
+//! slice 16b adds the warp operations and derivatives (the `warp` submodule) and the narrower
+//! "needs subgroup size 32" requirement.
 //!
 //! # The entry points
 //!
@@ -83,6 +85,11 @@
 //!   with an 8- or 16-bit type (`ConvertU16U32` to `ConvertS32S16`) are refused: the lowering
 //!   has no 8- or 16-bit integer type.
 //! - Local and shared memory (below).
+//! - The warp operations and derivatives (slice 16b, the `warp` submodule): the votes, the
+//!   ballot, the lane masks, the four shuffles and `GetInBoundsFromOp` of one, `QuadBroadcast`,
+//!   `QuadSwap`, `FSwizzleAdd`, and the four derivatives, which only pixel programs may use;
+//!   the warp operations are refused in vertex programs. The submodule lists what each
+//!   becomes, from Eden's SPIR-V backend, and where it differs.
 //!
 //! Each operation follows the interpreter's semantics ([`crate::interp`], "Semantics") where
 //! naga's (which are WGSL's) leave a case undefined or differ: a shift by the width or more
@@ -116,7 +123,9 @@
 //!   components are zero. `SR_LANEID` is the subgroup invocation id built-in, which needs the
 //!   subgroup capability; naga 30.0.1 does not allow it in a vertex shader
 //!   (`naga/src/valid/interface.rs`: `SubgroupInvocationId` is an input of compute, fragment,
-//!   task, mesh and ray stages, not vertex).
+//!   task, mesh and ray stages, not vertex). The same built-in, and its input slot
+//!   ([`GuestSlot::LaneId`]), is declared when a warp operation reads the lane id (the `warp`
+//!   submodule's `reads_lane_id`) though `LaneId` itself is not used.
 //! - A compute function has no outputs. Its workgroup and local invocation ids are the
 //!   built-ins of those names; they are arguments of the entry point but not interface slots,
 //!   since nothing outside the shader binds them. The workgroup size is the entry point's
@@ -145,11 +154,15 @@
 //! # Requirements and the host target
 //!
 //! A function needs [`Requirements::f16`] when an operation it lowers has a 16-bit float in its
-//! signature, [`Requirements::i64`] when one has a 64-bit integer, and
-//! [`Requirements::subgroup`] when it reads the lane id. A requirement the target lacks
-//! ([`LowerInputs::caps`]) is [`LowerError::Missing`], checked after the body is lowered, in
-//! [`Feature`] order. The module is validated with exactly the capabilities its requirements
-//! name ([`capabilities`]).
+//! signature, [`Requirements::i64`] when one has a 64-bit integer,
+//! [`Requirements::subgroup`] when it reads the lane id or uses any warp operation (Eden's
+//! subgroup lists, [`crate::info::opcode_requirements`]), and
+//! [`Requirements::subgroup_size_32`] when one of them depends on the warp having 32 lanes
+//! ([`needs_subgroup_size_32`]: not the quad operations nor `FSwizzleAdd`; decided by the
+//! owner, 2026-11-20). A requirement the target lacks ([`LowerInputs::caps`]) is
+//! [`LowerError::Missing`], checked after the body is lowered, in [`Feature`] order. The
+//! module is validated with exactly the capabilities its requirements name ([`capabilities`]);
+//! the size flag adds no naga capability.
 //!
 //! # Checks and their order
 //!
@@ -187,6 +200,7 @@
 //! | Shared-memory word index | `offset >> 2`, logical | `OpShiftRightArithmetic` (`emit_spirv_shared_memory.cpp`), which differs only for offsets of 2^31 and up, all out of bounds here | `tests::memory::shared_offsets_at_and_past_the_end` |
 //! | `PackHalf2x16` and `UnpackHalf2x16` | Need [`Requirements::f16`] (see [`capabilities`]) | Eden needs no feature (`OpExtInst PackHalf2x16`) | `tests::opcodes::f16_packing_needs_f16` |
 //! | Out-of-bounds local and shared accesses | Read 0, write dropped, word by word | Eden does not check; the interpreter refuses | `tests::memory` |
+//! | The warp operations and derivatives | The `warp` submodule's own table: vertex programs, derivatives outside pixel programs, subgroups wider than 32 lanes, the lane masks, `QuadSwap`'s direction, `QuadBroadcast`'s index, Metal's derivative controls | Eden's `emit_spirv_warp.cpp` | `tests::warp` |
 
 pub(crate) mod builder;
 mod control;
@@ -196,6 +210,9 @@ mod memory;
 mod ops;
 #[cfg(test)]
 mod tests;
+mod warp;
+
+pub use warp::needs_subgroup_size_32;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -579,7 +596,7 @@ fn stage_allows(opcode: Opcode, stage: GuestStage) -> bool {
         | Opcode::LocalInvocationId => compute,
         Opcode::DemoteToHelperInvocation => stage == GuestStage::Pixel,
         _ if memory::is_shared(opcode) => compute,
-        _ => true,
+        _ => warp::allowed_in(opcode, stage),
     }
 }
 
@@ -626,6 +643,11 @@ impl Interface {
                 matches!(op.opcode, Opcode::PackHalf2x16 | Opcode::UnpackHalf2x16);
             found.memory.local |= memory::is_local(op.opcode);
             found.memory.shared |= memory::is_shared(op.opcode);
+            // The warp operations and the lane id (`warp`, "Requirements").
+            let subgroups = crate::info::opcode_requirements(op.opcode);
+            found.requirements.subgroup |= subgroups.subgroup;
+            found.requirements.subgroup_size_32 |= subgroups.subgroup_size_32;
+            found.system.lane_id |= warp::reads_lane_id(op);
             match op.opcode {
                 Opcode::GetAttribute => match classify(attribute_arg(at, op, 1)?) {
                     Some(AttributeKind::Generic { index, .. }) if vertex => {
@@ -891,6 +913,8 @@ struct Lowering {
     generic_members: BTreeMap<u8, OutputMember>,
     target_members: BTreeMap<u8, OutputMember>,
     memory: memory::Memory,
+    /// Each shuffle's in-range flag, for a `GetInBoundsFromOp` of it (`warp`).
+    in_bounds: BTreeMap<Value, Handle<Expression>>,
 }
 
 impl Lowering {
@@ -914,6 +938,7 @@ impl Lowering {
             generic_members: BTreeMap::new(),
             target_members: BTreeMap::new(),
             memory: memory::Memory::default(),
+            in_bounds: BTreeMap::new(),
         }
     }
 

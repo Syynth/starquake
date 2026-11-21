@@ -480,10 +480,13 @@ pub fn translation_stage(slot: GuestStage, header: &ProgramHeader) -> Stage {
 /// module docs' divergence table) (`uses_fp16`, `uses_fp64`, `uses_int64` and the global-memory
 /// case that sets it, `uses_int64_bit_atomics`, and the subgroup flags: `uses_subgroup_invocation_id`,
 /// `uses_subgroup_mask`, `uses_subgroup_vote`, `uses_subgroup_shuffles`, `uses_quad_shuffles`,
-/// `uses_fswzadd`, all of which [`Requirements::subgroup`] covers).
+/// `uses_fswzadd`, all of which [`Requirements::subgroup`] covers). Eden has no flag for
+/// [`Requirements::subgroup_size_32`]; the lowering's rule sets it
+/// ([`crate::lower::needs_subgroup_size_32`], slice 16b).
 pub const fn opcode_requirements(opcode: Opcode) -> Requirements {
     Requirements {
         subgroup: uses_subgroup(opcode),
+        subgroup_size_32: crate::lower::needs_subgroup_size_32(opcode),
         f16: uses_f16(opcode),
         f64: uses_f64(opcode),
         i64: uses_i64(opcode) || is_global_store_or_atomic(opcode),
@@ -787,6 +790,7 @@ const fn uses_subgroup(opcode: Opcode) -> bool {
 const fn union(a: Requirements, b: Requirements) -> Requirements {
     Requirements {
         subgroup: a.subgroup || b.subgroup,
+        subgroup_size_32: a.subgroup_size_32 || b.subgroup_size_32,
         f16: a.f16 || b.f16,
         f64: a.f64 || b.f64,
         i64: a.i64 || b.i64,
@@ -796,7 +800,7 @@ const fn union(a: Requirements, b: Requirements) -> Requirements {
 
 /// The size of one constant-buffer read of `opcode`, or `None` for other opcodes (Eden's
 /// `GetElementSize`).
-const fn cbuf_element_size(opcode: Opcode) -> Option<u32> {
+pub(crate) const fn cbuf_element_size(opcode: Opcode) -> Option<u32> {
     Some(match opcode {
         Opcode::GetCbufU8 | Opcode::GetCbufS8 => 1,
         Opcode::GetCbufU16 | Opcode::GetCbufS16 => 2,

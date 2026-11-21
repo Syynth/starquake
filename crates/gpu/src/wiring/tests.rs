@@ -6,11 +6,12 @@
 //! `back` drives the back thread's loop one pass at a time, with no thread, where an order
 //! between a control and an entry has to be pinned exactly; `recorder` tests the flight
 //! recorder's text; `idle` drives idleness with the acquire poll, some of it on a front clock
-//! held still.
+//! held still; `mirror` copies a release into a semaphore mirror page through the threads.
 
 mod back;
 mod counters;
 mod idle;
+mod mirror;
 mod recorder;
 mod threads;
 

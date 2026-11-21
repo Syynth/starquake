@@ -2044,7 +2044,7 @@ fn decode_r2p(reader: &mut Reader) -> Op {
 
 /// Bits `bits`, as a mask.
 #[cfg(test)]
-const fn bits(bits: &[u32]) -> u128 {
+pub(crate) const fn bits(bits: &[u32]) -> u128 {
     let mut mask = 0;
     let mut index = 0;
     while index < bits.len() {
