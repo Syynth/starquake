@@ -83,11 +83,21 @@
 //! `UnpackUint2x32`) whose high word gives the carry, so the chain's result is exact at the
 //! 32-bit carry boundary (`tests::alu::a_two_instruction_carry_chain_adds_64_bits`).
 //!
+//! # The uniform datapath's twins
+//!
+//! The uniform datapath's translator (slice 12d, [`super::uniform`]) runs this module's code
+//! on a twin's vector operation (and on `UPLOP3` as a `PLOP3`) through `translate_in`, with
+//! the register files the operands name (`Files`): its [`Gpr`] operands then name the uniform
+//! registers of the same numbers and its predicates the file that module picks, as PR #4588
+//! runs the same visitor functions with `uniform_op` set. This group's own instructions use
+//! the per-thread files (`Files::VECTOR`), unchanged.
+//!
 //! # Register pairs
 //!
 //! `IMAD.WIDE` writes a register pair and reads one as its addend. The PR's checks are kept
 //! (`Visitor::IMAD_WIDE`: `dest % 2 == 0 && dest < limit` with `limit` 254 for the vector
-//! datapath, and the same for a register or uniform-register addend other than `RZ`), so a pair
+//! datapath, [`UNIFORM_WIDE_PAIR_LIMIT`] (62) for the uniform one, and the same for a register
+//! or uniform-register addend other than `RZ`), so a pair
 //! starts at an even register and ends at or below `R253`; a uniform-register addend must be an
 //! even register too, which refuses `URZ` (63 is odd), as the PR does. An immediate addend is
 //! refused (the PR's `default` case, "native wide multiply addend").
@@ -131,7 +141,7 @@ use crate::decode::{
     AluSrc, CBuf, CBufRef, DecodeError, Gpr, IMadMode, Instr, Instruction, IntCmpOp, Op, OpBRev,
     OpFlo, OpIAbs, OpIAdd3, OpIAdd3X, OpIDp4, OpIMad, OpIMad64, OpIMnMx, OpISetP, OpLea, OpLeaX,
     OpLop3, OpMov, OpP2R, OpPLop3, OpPopC, OpPrmt, OpR2P, OpSel, OpSgxt, OpShf, PLop3Src, Pred,
-    PredSetOp, PredSrc, PrmtMode, ShfType, UniformPredSrc, UniformReg, decode,
+    PredSetOp, PredSrc, PrmtMode, ShfType, UniformPred, UniformPredSrc, UniformReg, decode,
 };
 use crate::ir::{BlockId, BuildError, Builder, Function, Imm, Inst, Opcode, Operand};
 
@@ -207,12 +217,19 @@ pub enum IntegerUnsupported {
     /// [`WIDE_PAIR_LIMIT`] (`Visitor::IMAD_WIDE`: "native wide multiply destination").
     #[error("an imad.wide destination pair at {0}")]
     WideDestination(Gpr),
+    /// The uniform `UIMAD.WIDE` whose destination pair does not start at an even uniform
+    /// register below [`UNIFORM_WIDE_PAIR_LIMIT`] (`Visitor::IMAD_WIDE`: "native wide multiply
+    /// destination", with `uniform_op` set).
+    #[error("an imad.wide destination pair at {0}")]
+    WideUniformDestination(UniformReg),
     /// `IMAD.WIDE` whose register addend pair, other than `RZ`, does not start at an even
     /// register below [`WIDE_PAIR_LIMIT`] (`Visitor::IMAD_WIDE`: "native wide multiply addend").
     #[error("an imad.wide addend pair at {0}")]
     WideAddendRegister(Gpr),
     /// `IMAD.WIDE` whose uniform-register addend pair does not start at an even register
-    /// (`Visitor::IMAD_WIDE`: "native wide multiply addend"; `URZ` is odd).
+    /// (`Visitor::IMAD_WIDE`: "native wide multiply addend"; `URZ` is odd), or the uniform
+    /// `UIMAD.WIDE` whose addend pair, other than `URZ`, does not start at an even uniform
+    /// register below [`UNIFORM_WIDE_PAIR_LIMIT`].
     #[error("an imad.wide addend pair at {0}")]
     WideAddendUniform(UniformReg),
     /// `IMAD.WIDE` with an immediate addend (`Visitor::IMAD_WIDE`, the `default` case: "native
@@ -278,6 +295,65 @@ impl From<IntegerUnsupported> for IntegerError {
 /// The register a pair of `IMAD.WIDE` must start below (`Visitor::IMAD_WIDE`: `limit =
 /// uniform_op ? 62 : 254`, the vector datapath's).
 pub const WIDE_PAIR_LIMIT: u8 = 254;
+
+/// The register a pair of the uniform `UIMAD.WIDE` must start below (`Visitor::IMAD_WIDE`:
+/// `limit = uniform_op ? 62 : 254`, the uniform datapath's).
+pub const UNIFORM_WIDE_PAIR_LIMIT: u8 = 62;
+
+/// Which file a predicate operand names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum PredFile {
+    /// The per-thread predicates (`Visitor::Pred`, `SetPred`).
+    Vector,
+    /// The uniform predicates (`Visitor::UPred`, `SetUPred`).
+    Uniform,
+}
+
+/// The register files an instruction's operands name. This group's own instructions name the
+/// per-thread files ([`Files::VECTOR`]); a uniform datapath twin (slice 12d,
+/// [`super::uniform`]) names the uniform registers with its [`Gpr`] operands and whichever
+/// predicate files its translator reads for it (that module's docs, "Predicate files").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) struct Files {
+    /// Whether the [`Gpr`] operands (destinations and register sources) name the uniform
+    /// registers of the same numbers, [`Gpr::RZ`] naming `URZ`.
+    pub(super) uniform_regs: bool,
+    /// The file the predicate sources (carry inputs, the `ISETP` accumulator, the `SEL`
+    /// condition, `PLOP3`'s inputs) name.
+    pub(super) pred_in: PredFile,
+    /// The file the predicate destinations (carry outputs, `LOP3`'s, `ISETP`'s and `PLOP3`'s
+    /// results) name.
+    pub(super) pred_out: PredFile,
+    /// The file the guard of a conditional block is read from.
+    pub(super) guard: PredFile,
+}
+
+impl Files {
+    /// The per-thread files of this group's own instructions.
+    pub(super) const VECTOR: Self = Self {
+        uniform_regs: false,
+        pred_in: PredFile::Vector,
+        pred_out: PredFile::Vector,
+        guard: PredFile::Vector,
+    };
+}
+
+/// The uniform register a [`Gpr`] operand of a twin names: the one of the same number, `URZ`
+/// for [`Gpr::RZ`]. Every twin's registers are `UR0` to `UR62` or `RZ` (the decoder's
+/// `Uniform::new` refuses any other, and only this crate makes a `Uniform`), so the fallback to
+/// `URZ` is not reached by a decoded twin.
+fn uniform_of(reg: Gpr) -> UniformReg {
+    if reg.is_zero() {
+        return UniformReg::URZ;
+    }
+    UniformReg::new(reg.index()).unwrap_or(UniformReg::URZ)
+}
+
+/// The uniform predicate a predicate operand of a uniform instruction names: the one of the
+/// same number, `PT` naming `UPT`.
+fn uniform_pred_of(pred: Pred) -> UniformPred {
+    UniformPred::new(pred.index()).unwrap_or(UniformPred::UPT)
+}
 
 /// The predicates `P2R` and `R2P` move: `P0` to `P6`, one mask bit each (`Visitor::P2R`,
 /// `Visitor::R2P`: `bit_index < 7`).
@@ -353,7 +429,21 @@ pub fn translate_integer(
         GuardStep::Unguarded => None,
         GuardStep::Conditional => Some(instr.guard),
     };
-    if sources(&instr.op).iter().flatten().any(|src| {
+    translate_in(builder, instr.op, pending, Files::VECTOR)
+}
+
+/// The rest of [`translate_integer`] after the group and the guard, shared with the uniform
+/// datapath's translator (slice 12d, [`super::uniform`]), which hands over a twin's vector
+/// operation (and `UPLOP3` as a `PLOP3`) with the register files its operands name: the checks
+/// from the constant-buffer sources on, then the instruction's IR at `builder`'s position, made
+/// a conditional block on `pending` (read from `files.guard`) when it is set.
+pub(super) fn translate_in(
+    builder: &mut Builder<'_>,
+    op: Op,
+    pending: Option<PredSrc>,
+    files: Files,
+) -> Result<(), IntegerError> {
+    if sources(&op).iter().flatten().any(|src| {
         matches!(
             src,
             AluSrc::CBuf {
@@ -367,9 +457,9 @@ pub fn translate_integer(
     }) {
         return Err(IntegerUnsupported::BindlessConstantBuffer.into());
     }
-    let dropped = sources(&instr.op)
+    let dropped = sources(&op)
         .into_iter()
-        .zip(reads_negation(&instr.op))
+        .zip(reads_negation(&op))
         .any(|(src, reads)| {
             src.is_some_and(|src| {
                 let (abs, neg) = src.modifiers();
@@ -377,7 +467,7 @@ pub fn translate_integer(
             })
         });
     if dropped {
-        return Err(IntegerError::Modifier(instr.op.mnemonic()));
+        return Err(IntegerError::Modifier(op.mnemonic()));
     }
     if pending.is_some() {
         let block = builder.block();
@@ -389,8 +479,9 @@ pub fn translate_integer(
         b: builder,
         pending,
         join: None,
+        files,
     };
-    e.instr(instr.op)?;
+    e.instr(op)?;
     e.finish()
 }
 
@@ -525,6 +616,8 @@ struct Emitter<'b, 'f> {
     pending: Option<PredSrc>,
     /// The block after the conditional block, once the guard is tested.
     join: Option<BlockId>,
+    /// The register files the operands name.
+    files: Files,
 }
 
 impl source::Emit for Emitter<'_, '_> {
@@ -546,7 +639,10 @@ impl Emitter<'_, '_> {
     /// the current block tests `guard` and branches to a new block, which jumps to a second new
     /// block that takes the current block's terminator.
     fn split(&mut self, guard: PredSrc) -> Result<(), BuildError> {
-        let cond = source::pred(self.b, guard)?;
+        let cond = match self.files.guard {
+            PredFile::Vector => source::pred(self.b, guard)?,
+            PredFile::Uniform => source::uniform_guard(self.b, guard)?,
+        };
         self.join = Some(super::split_for_guard(self.b, cond)?);
         Ok(())
     }
@@ -560,22 +656,46 @@ impl Emitter<'_, '_> {
         Ok(())
     }
 
-    /// Reads a register's bits; `RZ` reads zero (`Visitor::X`, the shared reader).
+    /// Reads a register's bits; `RZ` reads zero (`Visitor::X`, the shared reader), or with
+    /// uniform registers the uniform register of its number (`Visitor::UR`).
     fn get(&mut self, reg: Gpr) -> Result<Operand, BuildError> {
+        if self.files.uniform_regs {
+            return source::uniform_reg(self, uniform_of(reg));
+        }
         source::reg(self, reg)
     }
 
-    /// Writes a register; a write to `RZ` is dropped (`Visitor::X`).
+    /// Writes a register; a write to `RZ` is dropped (`Visitor::X`), or with uniform registers
+    /// the uniform register of its number, a write to `URZ` dropped (`Visitor::UR`).
     fn set(&mut self, reg: Gpr, value: Operand) -> Result<(), BuildError> {
-        if !reg.is_zero() {
+        if reg.is_zero() {
+            return Ok(());
+        }
+        if self.files.uniform_regs {
+            let reg = uniform_of(reg);
+            self.op(
+                Opcode::SetUniformRegister,
+                &[Operand::Imm(Imm::UniformReg(reg)), value],
+            )?;
+        } else {
             self.op(Opcode::SetRegister, &[Operand::Imm(Imm::Reg(reg)), value])?;
         }
         Ok(())
     }
 
-    /// Reads a predicate source; `PT` reads true (`Visitor::Pred`, the shared reader).
+    /// Reads a predicate source; `PT` reads true (`Visitor::Pred`, the shared reader), or from
+    /// the uniform predicates when the inputs name them (`Visitor::UPred`).
     fn pred(&mut self, src: PredSrc) -> Result<Operand, BuildError> {
-        source::pred(self, src)
+        match self.files.pred_in {
+            PredFile::Vector => source::pred(self, src),
+            PredFile::Uniform => source::uniform_pred(
+                self,
+                UniformPredSrc {
+                    reg: uniform_pred_of(src.reg),
+                    negated: src.negated,
+                },
+            ),
+        }
     }
 
     /// Reads a uniform predicate source; `UPT` reads true (`Visitor::UPred`, the shared
@@ -584,18 +704,35 @@ impl Emitter<'_, '_> {
         source::uniform_pred(self, src)
     }
 
-    /// Writes a predicate; a write to `PT` is dropped (`Visitor::SetPred`).
+    /// Writes a predicate; a write to `PT` is dropped (`Visitor::SetPred`), or to the uniform
+    /// predicates when the outputs name them, a write to `UPT` dropped (`Visitor::SetUPred`).
     fn set_pred(&mut self, pred: Pred, value: Operand) -> Result<(), BuildError> {
-        if !pred.is_true() {
-            self.op(Opcode::SetPred, &[Operand::Imm(Imm::Pred(pred)), value])?;
+        if pred.is_true() {
+            return Ok(());
+        }
+        match self.files.pred_out {
+            PredFile::Vector => {
+                self.op(Opcode::SetPred, &[Operand::Imm(Imm::Pred(pred)), value])?;
+            }
+            PredFile::Uniform => {
+                let pred = uniform_pred_of(pred);
+                self.op(
+                    Opcode::SetUniformPred,
+                    &[Operand::Imm(Imm::UniformPred(pred)), value],
+                )?;
+            }
         }
         Ok(())
     }
 
-    /// A source's bits, without its modifier (the caller applies it; the shared reader). A
+    /// A source's bits, without its modifier (the caller applies it; the shared reader); a
+    /// register source names a uniform register with uniform registers ([`Self::get`]). A
     /// bindless constant buffer is refused before any instruction is translated, so it reads
     /// zero here.
     fn src(&mut self, src: AluSrc) -> Result<Operand, BuildError> {
+        if let AluSrc::Reg { reg, .. } = src {
+            return self.get(reg);
+        }
         Ok(source::alu_bits(self, src)?.unwrap_or(imm32(0)))
     }
 
@@ -1136,14 +1273,30 @@ impl Emitter<'_, '_> {
     fn imad_wide(&mut self, op: OpIMad64) -> Result<(), IntegerError> {
         use IntegerUnsupported as U;
         require(op.carry == NOT_PT, U::WideCarryInput)?;
-        require(pair_start(op.dst.index()), U::WideDestination(op.dst))?;
+        let uniform = self.files.uniform_regs;
+        let limit = if uniform {
+            UNIFORM_WIDE_PAIR_LIMIT
+        } else {
+            WIDE_PAIR_LIMIT
+        };
+        let destination = if uniform {
+            U::WideUniformDestination(uniform_of(op.dst))
+        } else {
+            U::WideDestination(op.dst)
+        };
+        require(pair_start(op.dst.index(), limit), destination)?;
         let [a, b, c] = op.srcs;
         match c {
             AluSrc::Reg { reg, .. } if !reg.is_zero() => {
-                require(pair_start(reg.index()), U::WideAddendRegister(reg))?;
+                let addend = if uniform {
+                    U::WideAddendUniform(uniform_of(reg))
+                } else {
+                    U::WideAddendRegister(reg)
+                };
+                require(pair_start(reg.index(), limit), addend)?;
             }
             AluSrc::UniformReg { reg, .. } => {
-                require(pair_start(reg.index()), U::WideAddendUniform(reg))?;
+                require(pair_start(reg.index(), limit), U::WideAddendUniform(reg))?;
             }
             AluSrc::Imm(_) => return Err(U::WideAddendImmediate.into()),
             AluSrc::Reg { .. } | AluSrc::CBuf { .. } => {}
@@ -1312,8 +1465,8 @@ impl Emitter<'_, '_> {
     }
 }
 
-/// Whether a register pair of `IMAD.WIDE` may start at `index`: even and below
-/// [`WIDE_PAIR_LIMIT`].
-const fn pair_start(index: u8) -> bool {
-    index.is_multiple_of(2) && index < WIDE_PAIR_LIMIT
+/// Whether a register pair of `IMAD.WIDE` may start at `index`: even and below `limit`
+/// ([`WIDE_PAIR_LIMIT`], or [`UNIFORM_WIDE_PAIR_LIMIT`] for the uniform datapath's).
+const fn pair_start(index: u8, limit: u8) -> bool {
+    index.is_multiple_of(2) && index < limit
 }

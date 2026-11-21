@@ -64,7 +64,16 @@
 //!   number for a uniform datapath instruction, `classify.h`'s `uniform`, as `Visitor::Run`
 //!   reads it with `UPred`; a predicate for the others, `Pred`), splits the block with the shared
 //!   guard helper ([`super::split_for_guard`]), translates the instruction into the new block as
-//!   if unguarded, and carries on in the block after it.
+//!   if unguarded, and carries on in the block after it. The exception is `R2UR`, which both
+//!   references read the guard of as data (`classify.h`: "reads the guard as data, so it is not
+//!   split into a block"): the driver hands it to the uniform group's translator with its guard
+//!   ([`GuardMode::Honour`]), which reads the guard as the ballot's input and makes no block (an
+//!   owner question against the spec's sentence, quoted in the uniform group's module docs,
+//!   "Divergences"; pinned by `uniform::tests::guards::r2ur_reads_its_guard_as_data`). The
+//!   references do not both write the uniform register in every lane: when no active lane's
+//!   guard holds, the lowering keeps it (its `VOTE.ANY` and `SEL`) and the native translator
+//!   writes an undefined shuffle; the uniform translator keeps it, as the lowering does
+//!   (`uniform::tests::guards::r2ur_with_no_lane_keeps_its_register`).
 //! - Any other guarded instruction flow analysis leaves in its block is one of `classify.h`'s
 //!   `OpKind::Nop`: `NOP`, `DEPBAR`, `BREAK` and `WARPSYNC` with an immediate (flow analysis
 //!   refuses a guarded `BSSY` and a guarded `BRX`, [`FlowError::PredicatedBssy`] and its
@@ -77,7 +86,8 @@
 //!   becomes a conditional block, pure ones included" ("Instruction translation", "Guards").
 //!   Pinned by `tests::a_guarded_instruction_that_is_not_pure_reads_no_guard`.
 //!
-//! Every group's translator is so handed its instruction with the guard already handled.
+//! Every group's translator is so handed its instruction with the guard already handled, but
+//! `R2UR`'s.
 //!
 //! # Dispatch
 //!
@@ -89,9 +99,12 @@
 //! ([`super::control::in_group`]); the memory group ([`super::memory::is_memory`]: `LD`, `ST`,
 //! `LDC`, `ATOM`, `CCTL`, `MEMBAR`, `LDGSTS`, `LDGDEPBAR`, `ERRBAR`, `ATOMS.POPC`), with slice
 //! 12e's translator ([`super::memory::translate_memory`], its guard already handled), whose
-//! refusals are [`TranslateError::Memory`]; the attribute group (`super`'s `GROUPS`). An
-//! operation none of them takes (the uniform group, the tensor group) is refused by its
-//! mnemonic ([`Unsupported::Instruction`]). The groups are
+//! refusals are [`TranslateError::Memory`]; the uniform datapath ([`super::uniform::in_group`]:
+//! `R2UR`, `UP2UR`, `UMOV`, `ULDC` with `LDCG`, `UPLOP3` and the twins), with slice 12d's
+//! translator ([`super::uniform::translate_uniform`]), whose refusals are
+//! [`TranslateError::Uniform`]; the attribute group (`super`'s `GROUPS`). An operation none of
+//! them takes (the tensor group) is refused by its mnemonic ([`Unsupported::Instruction`]).
+//! The groups are
 //! disjoint, so the order decides nothing but speed: `tests::the_groups_are_disjoint` checks
 //! that every decoded operation (one instruction of each, from the deterministic
 //! `tests::decoded_samples`, which `tests::these_instructions_reach_every_decoded_operation`
@@ -124,6 +137,7 @@ use super::half_double::{self, HalfDoubleError};
 use super::integer::{self, GuardMode, IntegerError};
 use super::memory::{self, MemoryError};
 use super::texture::{self, DescriptorBuffer, TextureError};
+use super::uniform::{self, UniformError};
 use super::{
     Failure, GuardStep, GuestStage, Stage, TranslateError, Translator, Unsupported, guard_step,
     source, split_for_guard,
@@ -283,6 +297,12 @@ impl Driver {
         info: OpInfo,
         guard_tested: bool,
     ) -> Result<BlockId, TranslateError> {
+        if matches!(instr.op, Op::R2UR(_)) && !guard_tested {
+            // `R2UR` reads its guard as data and makes no block (`classify.h`; the uniform
+            // group's module docs, "Divergences"): its translator honours the guard itself.
+            Self::uniform(function, at, index, instr, GuardMode::Honour)?;
+            return Ok(at);
+        }
         match guard_step(instr.guard, guard_tested || !info.pure) {
             GuardStep::Skip => Ok(at),
             GuardStep::Unguarded => {
@@ -315,6 +335,27 @@ impl Driver {
         let then = b.block();
         self.dispatch(function, then, index, instr)?;
         Ok(join)
+    }
+
+    /// Translates `instr`, instruction `index`, a uniform datapath instruction, at the end of
+    /// `block` with slice 12d's translator ([`uniform::translate_uniform`]) in `mode`.
+    fn uniform(
+        function: &mut Function,
+        block: BlockId,
+        index: usize,
+        instr: Instr,
+        mode: GuardMode,
+    ) -> Result<(), TranslateError> {
+        uniform::translate_uniform(&mut Builder::new(function, block), &instr, mode).map_err(
+            |error| match error {
+                UniformError::Build(error) => TranslateError::Build(error),
+                error => TranslateError::Uniform {
+                    index,
+                    instr,
+                    error,
+                },
+            },
+        )
     }
 
     /// Translates `instr`, instruction `index`, at the end of `block` as if unguarded, with the
@@ -377,6 +418,9 @@ impl Driver {
             let _subgroup: Emitted =
                 control::translate_control(function, block, self.stage.stage, index, instr, true)?;
             return Ok(());
+        }
+        if uniform::in_group(&op) {
+            return Self::uniform(function, block, index, instr, GuardMode::Tested);
         }
         if memory::is_memory(&op) {
             return memory::translate_memory(
