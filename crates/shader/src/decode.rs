@@ -22,11 +22,13 @@
 //! its uniform form `S2UR`; slice 6b's 32-bit float and conversion group (`op::float`), every
 //! instruction of it in the vector datapath's forms; slice 6a's integer group
 //! (`op::integer`), every instruction of it in the vector datapath's forms; slice 6e's memory
-//! group (`op::memory`), every instruction of it in the vector datapath's forms; and slice 6f's
+//! group (`op::memory`), every instruction of it in the vector datapath's forms; slice 6f's
 //! texture and surface group (`op::texture`), every instruction of it, with PR #4588's `.UR`
-//! texture forms; and slice 6c's half and double group (`op::half_double`), every instruction
-//! of it in the vector datapath's forms, with its packed-half sources' swizzles (`alu`). Every
-//! other opcode is [`DecodeError::UnknownOpcode`].
+//! texture forms; slice 6c's half and double group (`op::half_double`), every instruction of it
+//! in the vector datapath's forms, with its packed-half sources' swizzles (`alu`); and slice 6d's
+//! uniform datapath (`op::uniform`), every instruction of it but `UP2UR`, with the integer
+//! group's uniform forms (its module docs list the rows it leaves undecoded). Every other opcode
+//! is [`DecodeError::UnknownOpcode`].
 //!
 //! **Strict decoding** (owner's decision 4, 2026-11-12): a word with a bit set that its form
 //! does not explain is rejected, never decoded with the bit ignored. The decoder checks, in this
@@ -40,7 +42,8 @@
 //!    `op::attribute`; the integer group's fixed predicate fields, `op::integer`; bit 91 of the
 //!    bindless `LDC` and the bits PR #4588 requires set in `LDGSTS` and `ATOMS.POPC`,
 //!    `op::memory`; bit 59 of the `.B` texture forms and bit 91 of the `.UR` ones,
-//!    `op::texture`), else
+//!    `op::texture`; bit 91 of the uniform datapath's ALU forms, `UMOV`'s register form, the
+//!    indexed `ULDC` and `LDCG`, and `R2UR`'s predicate destination, `op::uniform`), else
 //!    [`DecodeError::MissingBit`] naming the lowest clear one;
 //! 4. the form's function reads its fields, else [`DecodeError::UnknownValue`] for a field whose
 //!    value names nothing (a vote or reduction operation past the defined ones: `op::control`;
@@ -53,13 +56,17 @@
 //!    includes memory orders in the holes between NAK's values as well as past them, `TLD4`'s
 //!    offset mode 3 and `TXQ`'s query 3, is listed in `op::texture`'s module docs under "Values
 //!    the decoder refuses"; the combine operation 3 of `HSET2`, `HSETP2` and `DSETP`, and
-//!    `HFMA2`'s bits 87 to 90 set without `.RELU`: `op::half_double`);
+//!    `HFMA2`'s bits 87 to 90 set without `.RELU`: `op::half_double`; the uniform datapath's
+//!    twins refuse their vector ops' values, and `ULDC` a memory type of 7, `op::uniform`), or a
+//!    register or predicate field whose value names no register (only a field wider than its
+//!    file's, which no form has: `form`'s `Reader`);
 //! 5. every set bit was read, else [`DecodeError::UnknownBit`] naming the lowest unread one. A
 //!    form explains some bits only in some of its layouts or operations: in the constant-buffer
 //!    ALU forms a bound buffer reads its index (bits 54..59) and a bindless one its uniform
 //!    register (bits 32..38), and `REDUX` reads its signed bit (73) only for `MIN` and `MAX`
 //!    (`op::control`), and the high-half and byte selects and `F2FP`'s `.H1` are read only for
-//!    the source widths and modes that have them (`op::float`), so a word with a bit the decoded
+//!    the source widths and modes that have them (`op::float`), and `ULDC` `0xab9` reads its
+//!    bound index or its bindless handle (`op::uniform`), so a word with a bit the decoded
 //!    layout or operation does not read fails here.
 //!
 //! Step 5 is what lets an accepted word re-assemble to itself, scheduling bits aside
@@ -92,7 +99,9 @@
 //! constant-buffer handle left unknown, and the `.F16` and `.CL` bits its `TEX` and `TLD` forms
 //! add) in `op::texture`'s, pinned in `tests::texture`; the half and double group's (the unused
 //! register slot's bits, NAK's SM 7.x and SM 9.0 bits, and the forms PR #4588's translator
-//! refuses) in `op::half_double`'s, pinned in `tests::half_double`.
+//! refuses) in `op::half_double`'s, pinned in `tests::half_double`; the uniform datapath's (the
+//! integer group's, carried to the twins, and `UMOV`'s bits 38..64) in `op::uniform`'s, pinned in
+//! `tests::uniform`.
 //!
 //! **Known bits and canonical words** (slice 4b; owner's ruling 33, 2026-11-19). A form may know
 //! a bit its PR #4588 row leaves out when another reference names it (NAK's encoder, a comment
@@ -150,9 +159,15 @@ pub(crate) use op::integer::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use op::texture;
+// The uniform datapath's opcodes flow analysis classifies, named once in slice 6d's group.
+pub(crate) use op::uniform::{
+    R2UR_OPCODE, UBREV_OPCODE, UFLO_OPCODE, UIADD3_OPCODE, UIMAD_OPCODE, UIMAD_WIDE_OPCODE,
+    UISETP_OPCODE, ULDC_OPCODE, ULDC64_OPCODE, ULEA_OPCODE, ULOP3_OPCODE, UMOV_IMM_OPCODE,
+    UMOV_UR_OPCODE, UPLOP3_OPCODE, UPOPC_OPCODE, USEL_OPCODE, USGXT_OPCODE, USHF_OPCODE,
+};
 pub use op::*;
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) use op::{Named, attribute, control, float, integer, memory, op_list};
+pub(crate) use op::{Named, attribute, control, float, integer, memory, op_list, uniform};
 pub use operand::{
     AluSrc, CBuf, CBufRef, Gpr, Pred, PredSrc, RoundMode, UniformPred, UniformPredSrc, UniformReg,
 };
@@ -239,6 +254,12 @@ fn read(word: Instruction) -> Result<(u16, Instr, Reader), DecodeError> {
     let mut reader = Reader::new(word);
     let guard = reader.guard();
     let op = (form.decode)(&mut reader)?;
+    // No form reads a register or predicate field wider than its file, so no word reaches this
+    // return today; the reader's fault itself is pinned by
+    // `tests::uniform::the_reader_refuses_a_too_wide_field_with_the_exact_error`.
+    if let Some(fault) = reader.fault() {
+        return Err(fault);
+    }
     Ok((opcode, Instr { guard, op }, reader))
 }
 

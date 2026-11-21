@@ -1015,6 +1015,32 @@ fn a_decoded_half_double_instruction_reaches_its_group() {
     assert_eq!(seen.len(), 10, "{seen:?}");
 }
 
+/// A decoded operation of the uniform datapath (slice 6d), whose translator does not exist yet,
+/// is refused by its mnemonic, one of each operation that [`decoded_samples`] reaches: every
+/// decoded one of [`is_uniform_datapath`]'s 20.
+#[test]
+fn a_decoded_uniform_datapath_instruction_is_refused_by_its_mnemonic() {
+    let mut seen = std::collections::BTreeSet::new();
+    for instr in decoded_samples() {
+        if !is_uniform_datapath(&instr.op) || !seen.insert(instr.op.mnemonic()) {
+            continue;
+        }
+        let mut function = Function::new();
+        let entry = function.entry();
+        let mut driver = Driver::new(VERTEX, None);
+        assert_eq!(
+            driver.dispatch(&mut function, entry, 5, instr),
+            Err(TranslateError::Unsupported {
+                index: 5,
+                instr,
+                what: Unsupported::Instruction(instr.op.mnemonic()),
+            }),
+            "{instr}"
+        );
+    }
+    assert_eq!(seen.len(), 20, "{seen:?}");
+}
+
 /// The translation budget: a count of exactly the cap is accepted, one past it refused, whether
 /// the count comes from one block or several; and the production cap is four per instruction
 /// of a program at the capture's cap.
@@ -1141,12 +1167,11 @@ fn groups_of(op: Op) -> Vec<&'static str> {
 }
 
 /// The shells: operations no word decodes to yet, each built by hand (a field added to one
-/// stops this compiling), as PR #4588's tables name them: the uniform group's `R2UR` and
-/// `UP2UR`, the control group's `JMX` and `BPT`, and the tensor group.
+/// stops this compiling), as PR #4588's tables name them: the uniform group's `UP2UR`, the
+/// control group's `JMX` and `BPT`, and the tensor group.
 fn shells() -> Vec<Op> {
-    use crate::decode::{OpBpt, OpImma, OpJmx, OpLdsm, OpMovm, OpR2UR, OpUP2UR};
+    use crate::decode::{OpBpt, OpImma, OpJmx, OpLdsm, OpMovm, OpUP2UR};
     vec![
-        Op::R2UR(OpR2UR {}),
         Op::UP2UR(OpUP2UR {}),
         Op::Jmx(OpJmx {}),
         Op::Bpt(OpBpt {}),
@@ -1189,7 +1214,7 @@ fn these_instructions_reach_every_decoded_operation() {
         .map(|instr| instr.op.mnemonic())
         .collect();
     let shells: std::collections::BTreeSet<&str> = shells().iter().map(Op::mnemonic).collect();
-    assert_eq!(shells.len(), 8);
+    assert_eq!(shells.len(), 7);
     assert!(reached.is_disjoint(&shells), "{reached:?}");
     let all: std::collections::BTreeSet<&str> = crate::decode::MNEMONICS.iter().copied().collect();
     assert_eq!(all.len(), crate::decode::MNEMONICS.len());
@@ -1202,20 +1227,58 @@ fn these_instructions_reach_every_decoded_operation() {
     );
 }
 
+/// Whether `op` is of the uniform datapath group (slice 6d's `R2UR`, `UMOV`, `ULDC`, `UPLOP3`
+/// and the twins), which words decode to but which no translator takes yet, so no group takes
+/// it and the dispatch refuses it by its mnemonic. `UP2UR` is a shell, not decoded.
+const fn is_uniform_datapath(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::R2UR(_)
+            | Op::UMov(_)
+            | Op::ULdc(_)
+            | Op::UPLop3(_)
+            | Op::UIAdd3(_)
+            | Op::UIAdd3X(_)
+            | Op::ULea(_)
+            | Op::ULeaX(_)
+            | Op::ULop3(_)
+            | Op::UPrmt(_)
+            | Op::UShf(_)
+            | Op::UIMad(_)
+            | Op::UIMad64(_)
+            | Op::UISetP(_)
+            | Op::USel(_)
+            | Op::USgxt(_)
+            | Op::UBMsk(_)
+            | Op::UFlo(_)
+            | Op::UBRev(_)
+            | Op::UPopC(_)
+    )
+}
+
 /// The groups are disjoint, and every decoded operation (every one of [`decoded_samples`])
-/// belongs to exactly one of them, so the dispatch order decides nothing; a shell belongs to
-/// none but the control group's `JMX` and `BPT`, which it refuses by name, so the fallback
-/// refusal is reached only by the other shells.
+/// belongs to exactly one of them, but for the uniform datapath's ([`is_uniform_datapath`]),
+/// which belong to none, so the dispatch order decides nothing; a shell belongs to none but the
+/// control group's `JMX` and `BPT`, which it refuses by name, so the fallback refusal is reached
+/// only by the uniform datapath group and the other shells.
 #[test]
 fn the_groups_are_disjoint() {
     let mut half_double = 0;
+    let mut uniform = 0;
     for instr in decoded_samples() {
-        if half_double::in_group(&instr.op) {
+        let wanted = if half_double::in_group(&instr.op) {
             half_double += 1;
-        }
-        assert_eq!(groups_of(instr.op).len(), 1, "{instr}");
+            1
+        } else if is_uniform_datapath(&instr.op) {
+            uniform += 1;
+            0
+        } else {
+            1
+        };
+        assert_eq!(groups_of(instr.op).len(), wanted, "{instr}");
     }
     assert!(half_double > 0);
+    assert!(uniform > 0);
     for op in shells() {
         let wanted: &[&str] = if matches!(op, Op::Jmx(_) | Op::Bpt(_)) {
             &["control"]
@@ -1268,10 +1331,12 @@ fn a_guarded_instruction_that_is_not_pure_reads_no_guard() {
 }
 
 /// The guard of every decodable pure form (`classify.h`'s `pure`) is read before the split:
-/// as the uniform predicate of the same number for a uniform one (of the decodable forms only
-/// `S2UR`, `0x9c3`, and `VOTEU`, `0x886`), as the predicate for the others, which come from the
-/// integer, float, half and double, attribute and memory groups. The instruction itself may be refused after
-/// (a canonical word is not always a form the group translates); the guard's read comes first.
+/// as the uniform predicate of the same number for a uniform one (of the decodable forms
+/// `S2UR`, `0x9c3`, `VOTEU`, `0x886`, and slice 6d's `UMOV`, `ULDC`, `UPLOP3` and the twins
+/// `classify.h` names pure: the list in the test), as the predicate for the others, which come
+/// from the integer, float, half and double, attribute and memory groups (or from no group yet:
+/// `R2UR`). The instruction itself may be refused after (a canonical word is not always a form
+/// the group translates); the guard's read comes first.
 #[test]
 fn the_guard_of_every_pure_form_is_read_by_its_kind() {
     let mut uniform = vec![];
@@ -1308,7 +1373,18 @@ fn the_guard_of_every_pure_form_is_read_by_its_kind() {
             "{instr}: {text}"
         );
     }
-    assert_eq!(uniform, [0x9c3, 0x886]);
+    // `classify.h`'s uniform pure opcodes, as literals: `S2UR`, `VOTEU`, "UMOV imm", "UMOV UR",
+    // "ULDC", "ULDC.64", "UPLOP3", and the twelve "Uniform ALU" bases in forms 1 (`0x200`) and
+    // 4 (`0x800`), each of which slice 6d decodes.
+    let mut expected = vec![0x9c3_u16, 0x886, 0x882, 0xc82, 0xab9, 0xabb, 0x89c];
+    for base in [
+        0x090_u16, 0x091, 0x092, 0x099, 0x0a4, 0x0a5, 0x0be, 0x09a, 0x0bd, 0x0bf, 0x08c, 0x087,
+    ] {
+        expected.extend([base | 0x200, base | 0x800]);
+    }
+    expected.sort_unstable();
+    uniform.sort_unstable();
+    assert_eq!(uniform, expected);
     assert_eq!(
         groups.into_iter().collect::<Vec<_>>(),
         ["attribute", "float", "half and double", "integer", "memory"]
