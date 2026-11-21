@@ -337,6 +337,63 @@ fn each_return_does_the_steps() {
     assert_eq!(msl(&one).matches(" * 0.5").count(), 1, "{}", msl(&one));
 }
 
+/// A function `block0` (of `writes`), then `loop { block1; return } repeat %5`, then
+/// `unreachable`: its only return is inside the loop body.
+fn returning_in_a_loop(writes: &str) -> Function {
+    ir(&format!(
+        "block0:\n{writes}\
+         \x20   %4: u1 = ULessThan u32 1, u32 2\n\
+         \x20   %5: u1 = ConditionRef %4\n\
+         block1:\n\
+         \x20   %6 = Epilogue\n\
+         structure:\n\
+         \x20   block0\n\
+         \x20   loop {{\n\
+         \x20       block1\n\
+         \x20       return\n\
+         \x20   }} repeat %5\n\
+         \x20   unreachable\n"
+    ))
+}
+
+/// A return inside a loop body does the steps, though the tree ends in `unreachable` (so there
+/// is no closing return to plan them): a vertex function gives exactly one depth rewrite, and a
+/// pixel function with an alpha test lists the driver constants and discards.
+#[test]
+fn a_return_inside_a_loop_does_the_steps() {
+    let rewrite = emulating(EmulationKey {
+        depth_range_rewrite: true,
+        ..EmulationKey::default()
+    });
+    let vertex = lowered(
+        GuestStage::Vertex,
+        &returning_in_a_loop(&position_writes()),
+        &rewrite,
+    );
+    assert_eq!(
+        msl(&vertex).matches(" * 0.5").count(),
+        1,
+        "{}",
+        msl(&vertex)
+    );
+    let mut colour = String::new();
+    for component in 0..4_u32 {
+        let value = f64::from(component + 2);
+        writeln!(
+            colour,
+            "    %{component} = SetFragColor u32 0, u32 {component}, f32 {value:?}"
+        )
+        .expect("writes to a string");
+    }
+    let alpha = emulating(EmulationKey {
+        alpha_test: Some(CompareFunction::Less),
+        ..EmulationKey::default()
+    });
+    let pixel = lowered(GuestStage::Pixel, &returning_in_a_loop(&colour), &alpha);
+    assert_eq!(pixel.resources, [driver_row(1)]);
+    assert!(kills(&pixel), "{}", msl(&pixel));
+}
+
 /// A program of one block from program bytes has no `Epilogue` (it is not structured) and
 /// still does the steps at its return.
 #[test]
@@ -456,6 +513,16 @@ fn acceptance_pair_tables_are_golden() {
     };
     assert_eq!(vertex.resources, [driver_row(0), bank(0)]);
     assert_eq!(pixel.resources, [driver_row(1), bank(1)]);
+}
+
+/// The pair's resource tables are its modules' bound globals, the driver constants included
+/// (CPU-only: where no GPU runs `acceptance_pair_is_accepted_by_wgpu`, this still fails when a
+/// global's binding and its row's differ).
+#[test]
+fn acceptance_pair_rows_are_module_globals() {
+    let (vertex, pixel) = acceptance_pair();
+    super::resources::assert_rows_are_globals(&vertex);
+    super::resources::assert_rows_are_globals(&pixel);
 }
 
 /// wgpu acceptance (spec, "The offline test harness"): the pair's modules are created as

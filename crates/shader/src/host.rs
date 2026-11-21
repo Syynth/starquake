@@ -238,6 +238,16 @@ pub enum ResourceSource {
     /// [`HostShader::driver_constants`] names.
     DriverConstants,
     /// Guest constant-buffer bank `bank` (0 to 31) of the shader's stage, from its start.
+    ///
+    /// The row's [`ResourceKind::UniformBuffer`] size is what the module declares, which can be
+    /// more than the size the guest bound the bank with (an indexed read declares the whole
+    /// bank, [`crate::info::INDEXED_CBUF_SIZE`]). The module bounds each read by the declared
+    /// size only (the `lower::resources` module docs, "Bounds", an open owner question), so the GPU
+    /// crate must bind the declared size and fill the bytes between the guest's bound size and
+    /// the declared size with zeros: Eden's reads there give zero too (the host's robust buffer
+    /// access in its SPIR-V backend, and `ReadCbufValue`'s `cbuf_offset < cbuf.size` check for
+    /// the words translation reads, `video_core/shader_environment.cpp`). The GPU crate's draw
+    /// path does not do this yet: it binds `size.min(bound)` bytes of guest memory.
     ConstantBuffer {
         /// The bank.
         bank: u8,

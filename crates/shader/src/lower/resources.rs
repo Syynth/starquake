@@ -39,6 +39,19 @@
 //! down to its width, as the interpreter does ([`crate::interp`]); the 8- and 16-bit reads
 //! extract the field at bit `8 * (offset % 4)` of the word, zero- or sign-extended.
 //!
+//! **The pair's alignment.** `GetCbufU32x2` reads its two words at the offset aligned down to
+//! 8, as the interpreter does. Eden has two paths for it, and they disagree at an offset that
+//! is 4 mod 8 (`emit_spirv_context_get_set.cpp` @ cf654052, `EmitGetCbufU32x2`): where the host
+//! supports descriptor aliasing it indexes an array of `u32x2` at `offset / 8` (aligned down to
+//! 8, as here); without it, it reads words `(offset / 4) % 4` and the next one of a `u32x4`
+//! element (`GetCbufElement`), unaligned, and at an offset of 12 mod 16 its second word is past
+//! the vector. The aliasing path is mirrored, because it agrees with the interpreter
+//! ([`crate::interp`]), the one semantics this crate's tests check the GPU against, and stays
+//! inside the element. Pinned at offsets 4 mod 8 (6, 7, 0x14 and `SIZE - 5`, 0x2b) by
+//! `tests::resources::reads_match_the_interpreter_on_the_gpu` (on a GPU) and, where no GPU is,
+//! by the pair at the immediate offset 0x14 and at a register offset in
+//! `tests::resources::reads_snapshot`.
+//!
 //! **Bounds.** A read whose offset is at or past the declared size gives zero, and reads the
 //! buffer at offset 0 instead, so the host never sees an index past the array. Because every
 //! width divides [`CBUF_ALIGNMENT`] and the size is a multiple of it, "offset below the size"
@@ -46,6 +59,34 @@
 //! to indexed reads ([`crate::opt::resources`], "Constant-buffer reads"; its zero is a guess at
 //! the hardware's answer), applied here to every read, immediate offsets included, so the
 //! module is in bounds whatever pass ran before it.
+//!
+//! **A departure from the approved spec, and the same open owner question as slice 13's.**
+//! `shader-pipeline.md`, "Passes needed for correctness", item 2, says: "Reads with a register
+//! offset (indexed) are bounds-checked against the bound size." The bound here is the declared
+//! size ([`LowerInputs::constant_buffers`]: collect info's size, [`INDEXED_CBUF_SIZE`] for an
+//! indexed read), not the size the guest bound the bank with, which only the draw knows. The
+//! two options are those of [`crate::opt::resources`]: keep the declared size (what this
+//! lowering does: no per-draw state, and the read stays inside the binding), or bound by the
+//! guest's size, through a driver constant per bank that the GPU crate fills when drawing.
+//! Under the first, the bytes between the guest's bound size and the declared size are the GPU
+//! crate's to fill, with zeros ([`crate::host::ResourceSource::ConstantBuffer`]).
+//!
+//! # Limits this lowering does not count
+//!
+//! - **Uniform buffers per stage.** Each bank a function reads is its own uniform buffer, and
+//!   the driver constants one more, so one stage can declare up to [`CBUF_BANKS`] + 1 (33)
+//!   uniform-buffer rows. Nothing here or in [`crate::host::HostCaps`] counts them against a
+//!   host limit: the shader is lowered and reported ready, and the render backend refuses it
+//!   when the pipeline is made (`starquake_render`'s `check_resource_counts` against
+//!   `Limits::max_uniform_buffers_per_stage`, 12 by wgpu's default; an Apple adapter reports
+//!   29), so the draw fails then instead of the shader being refused by name. This conflicts
+//!   with the render crate's documentation of that limit, which says "the shader crate's
+//!   mapping of them meets this limit": it does not, for a program that reads more banks than
+//!   the limit. **Owner question**: refuse such a shader here by name against a per-stage cap
+//!   carried in [`crate::host::HostCaps`], or pack the banks into fewer buffers, or narrow the
+//!   render crate's sentence. Pinned, as "no cap here", by
+//!   `tests::resources::every_bank_and_the_driver_constants_lower_in_one_stage` (all 32 banks
+//!   at a register offset and the alpha test's driver constants: 33 rows).
 //!
 //! # Checks
 //!
@@ -64,7 +105,8 @@
 //! |---|---|---|---|
 //! | A bank that is a register (`LDC` with a register bank) | Refused, [`LowerError::ConstantBufferRegisterBank`] | A switch over every bank the program reads (`emit_spirv_context_get_set.cpp`, `GetCbuf`'s non-immediate binding arm) | `tests::resources::a_register_bank_is_refused` |
 //! | A read past the declared size | Zero, read at offset 0 | Left to the host's robust buffer access, or zero past element `0xFFFF` where the host's robustness is broken (`GetCbuf`, `has_broken_robust`) | `tests::resources::reads_match_the_interpreter_on_the_gpu` |
-//! | The buffer's declared type | `array<vec4<u32>, size / 16>`, one declaration per bank | One declaration per element type the program reads (`DefineConstantBuffers`, `used_constant_buffer_types`), each `array<T, 0x10000 / sizeof(T)>` | `tests::resources::resource_tables_are_golden` |
+//! | The buffer's declared type | `array<vec4<u32>, size / 16>`, one declaration per bank | Two paths (`spirv_emit_context.cpp`, `DefineConstantBuffers`). Without descriptor aliasing (`!profile.support_descriptor_aliasing`: Eden's OpenGL profile sets it false, `gl_shader_cache.cpp`; its Vulkan profile from the device, `vk_pipeline_cache.cpp`): one `array<U32x4, 0x10000 / 16>` per bank (`DefineConstBuffers`), close to this one but sized to the whole bank. With it: one declaration per element type the program reads (`used_constant_buffer_types`), each `array<T, 0x10000 / sizeof(T)>`, aliased at one binding | `tests::resources::resource_tables_are_golden` |
+//! | `GetCbufU32x2` at an offset 4 mod 8 | Aligned down to 8 (the aliasing path and the interpreter; "The pair's alignment") | Aligned down to 8 with aliasing; words `(offset / 4) % 4` and the next, unaligned, without it | `tests::resources::reads_match_the_interpreter_on_the_gpu`, `tests::resources::reads_snapshot` |
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;

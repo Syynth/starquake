@@ -299,9 +299,11 @@ fn reads_match_the_interpreter_on_the_gpu() {
     assert!(mismatches.is_empty(), "{mismatches:#?}");
 }
 
-/// The reads' MSL, one module per width with an immediate offset and a register offset each:
-/// the alignment mask, the bound against the declared size, the element and word indices and,
-/// for the narrow reads, the field (`tests::resources::reads_match_the_interpreter_on_the_gpu`
+/// The reads' MSL, one module with every width at an immediate or a register offset: the
+/// alignment mask, the bound against the declared size, the element and word indices and,
+/// for the narrow reads, the field and its sign extension (`GetCbufS8` and `GetCbufS16` signed,
+/// `GetCbufU16` not), and the pair at the immediate offset 0x14 (4 mod 8, aligned down to
+/// 0x10) and at a register offset (`tests::resources::reads_match_the_interpreter_on_the_gpu`
 /// runs the same arithmetic on the GPU; this pins it where no GPU is).
 #[test]
 fn reads_snapshot() {
@@ -316,7 +318,12 @@ fn reads_snapshot() {
          \x20   %7: u32 = IAdd32 %1, %2\n\
          \x20   %8: u32 = IAdd32 %5, %6\n\
          \x20   %9: u32 = IAdd32 %7, %8\n\
-         \x20   %10 = SetRegister r0, %9\n\
+         \x20   %10: u32 = GetCbufS16 u32 5, %0\n\
+         \x20   %11: u32x2 = GetCbufU32x2 u32 5, u32 0x14\n\
+         \x20   %12: u32 = CompositeExtractU32x2 %11, u32 0\n\
+         \x20   %13: u32 = IAdd32 %9, %10\n\
+         \x20   %14: u32 = IAdd32 %13, %12\n\
+         \x20   %15 = SetRegister r0, %14\n\
          \x20   return\n");
     let shader = lowered(
         GuestStage::Compute,
@@ -493,5 +500,153 @@ fn resource_errors_read_as_words() {
         ),
     ] {
         assert_eq!(error.to_string(), text);
+    }
+}
+
+/// Each module global with a binding, in declaration order: its group, its binding and the
+/// bytes it declares (an array's length times its stride, a struct's span), with whether it is
+/// in the uniform address space.
+fn declared_globals(shader: &HostShader) -> Vec<(u32, u32, Option<u32>, bool)> {
+    let module = naga_module(shader);
+    module
+        .global_variables
+        .iter()
+        .filter_map(|(_, global)| {
+            let binding = global.binding?;
+            let bytes = match module.types[global.ty].inner {
+                TypeInner::Array {
+                    size: naga::ArraySize::Constant(length),
+                    stride,
+                    ..
+                } => length.get().checked_mul(stride),
+                TypeInner::Struct { span, .. } => Some(span),
+                _ => None,
+            };
+            Some((
+                binding.group,
+                binding.binding,
+                bytes,
+                global.space == naga::AddressSpace::Uniform,
+            ))
+        })
+        .collect()
+}
+
+/// Asserts that `shader`'s resource table and its module's bound globals are the same list:
+/// each row is a uniform global at the row's group and binding declaring the row's size, the
+/// driver constants included, and no global is bound without a row.
+pub(super) fn assert_rows_are_globals(shader: &HostShader) {
+    let rows: Vec<(u32, u32, Option<u32>, bool)> = shader
+        .resources
+        .iter()
+        .map(|row| {
+            let ResourceKind::UniformBuffer { size } = row.kind;
+            (row.group, row.binding, Some(size), true)
+        })
+        .collect();
+    assert_eq!(declared_globals(shader), rows, "{:?}", shader.stage);
+}
+
+/// A pixel function that reads a word of every bank at a register offset and writes their
+/// sum's last read to target 0's alpha, lowered with every bank given the whole bank and an
+/// alpha test that reads the reference: one stage declares [`CBUF_BANKS`] + 1 uniform buffers
+/// (33), and the lowering does not refuse it, whatever host limit on uniform buffers per stage
+/// the render backend later applies (module docs, "Limits this lowering does not count").
+#[test]
+fn every_bank_and_the_driver_constants_lower_in_one_stage() {
+    let mut text = String::from("block0:\n    %0: u32 = GetRegister r0\n");
+    let banks = u32::from(CBUF_BANKS);
+    for bank in 0..banks {
+        writeln!(text, "    %{}: f32 = GetCbufF32 u32 {bank}, %0", bank + 1)
+            .expect("writes to a string");
+    }
+    for component in 0..4 {
+        writeln!(
+            text,
+            "    %{} = SetFragColor u32 0, u32 {component}, %{banks}",
+            banks + 1 + component
+        )
+        .expect("writes to a string");
+    }
+    text.push_str("    return\n");
+    let inputs = LowerInputs {
+        constant_buffers: [INDEXED_CBUF_SIZE; CONSTANT_BUFFER_SLOTS],
+        emulation: crate::variant::EmulationKey {
+            alpha_test: Some(crate::variant::CompareFunction::Less),
+            ..crate::variant::EmulationKey::default()
+        },
+        caps: HostCaps::NONE,
+        ..LowerInputs::DEFAULT
+    };
+    let shader = lowered(GuestStage::Pixel, &ir(&text), &inputs);
+    let group = resource_group(HostStage::Fragment);
+    let mut expected = vec![ResourceSlot {
+        group,
+        binding: DRIVER_CONSTANTS_BINDING,
+        kind: ResourceKind::UniformBuffer {
+            size: u32::try_from(crate::driver_constants::DRIVER_CONSTANTS_SIZE).expect("small"),
+        },
+        source: ResourceSource::DriverConstants,
+    }];
+    expected.extend((0..CBUF_BANKS).map(|bank| ResourceSlot {
+        group,
+        binding: constant_buffer_binding(bank),
+        kind: ResourceKind::UniformBuffer {
+            size: INDEXED_CBUF_SIZE,
+        },
+        source: ResourceSource::ConstantBuffer { bank },
+    }));
+    assert_eq!(shader.resources, expected);
+    assert_eq!(shader.resources.len(), usize::from(CBUF_BANKS) + 1);
+    assert_rows_are_globals(&shader);
+}
+
+/// The resource table is the module's bound globals in each stage (CPU-only, so it holds where
+/// no GPU runs `tests::emulation::acceptance_pair_is_accepted_by_wgpu`): the vertex program
+/// with the flipped viewport and three banks, the pixel program with an alpha test and three
+/// banks, and a compute program with three banks. A driver-constants global declared at another
+/// binding than its row's fails here.
+#[test]
+fn every_row_is_a_module_global() {
+    let mut inputs = with_bank(ONE_INVOCATION, 0, 0x30);
+    inputs = with_bank(inputs, 3, 0x10);
+    inputs = with_bank(inputs, 31, INDEXED_CBUF_SIZE);
+    for (stage, emulation) in [
+        (
+            GuestStage::Vertex,
+            crate::variant::EmulationKey {
+                flipped_viewport: true,
+                ..crate::variant::EmulationKey::default()
+            },
+        ),
+        (
+            GuestStage::Pixel,
+            crate::variant::EmulationKey {
+                alpha_test: Some(crate::variant::CompareFunction::Greater),
+                ..crate::variant::EmulationKey::default()
+            },
+        ),
+        (GuestStage::Compute, crate::variant::EmulationKey::default()),
+    ] {
+        let shader = lowered(
+            stage,
+            &reading(stage, &[31, 0, 3]),
+            &LowerInputs {
+                emulation,
+                ..inputs
+            },
+        );
+        let driver_constants = shader
+            .resources
+            .iter()
+            .filter(|row| row.source == ResourceSource::DriverConstants)
+            .count();
+        assert_eq!(
+            driver_constants,
+            usize::from(stage != GuestStage::Compute),
+            "{stage}"
+        );
+        assert_eq!(shader.resources.len(), 3 + driver_constants, "{stage}");
+        assert_rows_are_globals(&shader);
     }
 }
