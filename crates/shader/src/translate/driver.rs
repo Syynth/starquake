@@ -71,11 +71,11 @@
 //!   indirect-branch checks, and ends a block at a `BRA`, `BSYNC`, `CALL` or `RET`). It is
 //!   translated as is, its guard not read and no block made, as `Visitor::Run` reads no guard
 //!   for an instruction that is not pure; none of the four writes IR (the control group's
-//!   module docs). The spec says "Every guarded instruction becomes a conditional block, pure
-//!   ones included" ("Instruction translation", "Guards"): for these four a block would hold
-//!   nothing, so leaving it out changes no result. **Owner question**: whether a guarded
-//!   instruction that writes no IR should still get its (empty) conditional block. Pinned by
-//!   `tests::a_guarded_instruction_that_is_not_pure_reads_no_guard`.
+//!   module docs). The owner ruled this on 2026-11-20 (decision log, "Owner rulings on the
+//!   wave 47 questions", row 1): a guarded instruction that writes no IR gets no conditional
+//!   block and no guard read, and the spec now reads "Every guarded instruction that writes IR
+//!   becomes a conditional block, pure ones included" ("Instruction translation", "Guards").
+//!   Pinned by `tests::a_guarded_instruction_that_is_not_pure_reads_no_guard`.
 //!
 //! Every group's translator is so handed its instruction with the guard already handled.
 //!

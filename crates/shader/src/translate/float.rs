@@ -74,11 +74,13 @@
 //! | `I2F`, `I2FP` (integer to float) | carried on the conversion (decision 10 lists only float-to-integer and float-to-half conversions for emulation) | none | `tests::convert::i2f_carries_its_rounding` |
 //! | `MUFU`, `FSWZADD`, `F2FP` | none: the PR accepts only to-nearest (`F2FP`, `FSWZADD`) or has no field (`MUFU`) | none | `tests::arith::fswzadd_refuses_its_modes`, `tests::convert::f2fp_refuses_the_selector_and_rounding` |
 //!
-//! **Owner question.** `F2I.FTZ` with a 16-bit operand is not emulated: the PR leaves the
-//! denormal mode of a half operand unset (`ops_convert.cpp`, `F2I`: `denorm_cares =
+//! **Ruled as built, still a guess.** `F2I.FTZ` with a 16-bit operand is not emulated: the PR
+//! leaves the denormal mode of a half operand unset (`ops_convert.cpp`, `F2I`: `denorm_cares =
 //! !half_source`), and this module follows it, where decision 10 reads as emulating
-//! flush-to-zero on every float-to-integer conversion. A half denormal rounded up gives 1 with
-//! or without `.FTZ` (`tests::convert::f2i_flushes_denormals_before_rounding`).
+//! flush-to-zero on every float-to-integer conversion. The owner accepted this as built (decision
+//! log, 2026-11-19, "Owner rulings on the wave 44 and 45 questions", row 5); it stays a guess
+//! until a hardware check of a half denormal under `.FTZ`. A half denormal rounded up gives 1
+//! with or without `.FTZ` (`tests::convert::f2i_flushes_denormals_before_rounding`).
 //!
 //! An emulated control is carried as well, so the IR means the same whether or not a backend
 //! honours the flag: the emulation is idempotent (a correctly rounded or flushed value is left

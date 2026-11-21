@@ -178,10 +178,13 @@
 //! `program_info`, is not repeated: there is no environment here, and [`DescriptorBuffer`] is
 //! the program's record that the texture pass reads. The PR's bound on the buffer index,
 //! [`DESCRIPTOR_BUFFERS`] (18, Eden's `MaxConstBuffers`), is kept as the issue asks, though the
-//! spec gives the host 32 constant-buffer slots ("Passes needed for correctness", item 2):
-//! whether a texture handle may sit in buffers 18 to 31 is an owner question.
+//! spec gives the host 32 constant-buffer slots ("Passes needed for correctness", item 2): a
+//! handle in buffers 18 to 31 is refused by name. The owner ruled this as built (spec, "The
+//! texture translator's bounds, as built in slice 12f", decided by the owner, 2026-11-20); it
+//! stays a guess until a title whose handle sits in buffer 18 or above settles it.
 //!
-//! **Owner question** (`TEX.B`'s operand layout): the PR puts the level or depth reference at
+//! **Ruled as built, still a guess** (`TEX.B`'s operand layout; the same spec section and
+//! ruling, until an `nvdisasm` check of a `TEX.B` with a level): the PR puts the level or depth reference at
 //! `B` and the handle after it (`gpr_handle = source_b + (count > dim.coordinates ? 1 : 0)`),
 //! from the forms it saw, and requires the scalar layout; NAK's packing puts the handle first in
 //! `B` (`nak_nir_lower_tex.c`: `PUSH(src1, tex_h)` before the level) but never scalarises a

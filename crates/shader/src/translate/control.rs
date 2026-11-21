@@ -159,7 +159,8 @@ pub const WHOLE_WARP_CLAMP: u32 = WARP_SIZE - 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum ControlUnsupported {
     /// An instruction that writes IR (`BAR`, `VOTE`, `VOTEU`, `SHFL`, `REDUX`, `MATCH`) under a
-    /// guard other than `PT` that is not tested (see the module docs, "Guards").
+    /// guard other than `PT` or `!PT` that is not tested (`GuardStep::Conditional`; see
+    /// the module docs, "Guards").
     #[error("a guarded instruction outside its conditional block")]
     UntestedGuard,
     /// A `BRA` handed to the translator: flow analysis ends a block with it.
