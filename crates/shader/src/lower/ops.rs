@@ -46,7 +46,7 @@ const WIDTH64: u8 = 8;
 
 /// How a shift fills.
 #[derive(Clone, Copy)]
-enum Shift {
+pub(super) enum Shift {
     Left,
     Logical,
     Arithmetic,
@@ -213,7 +213,7 @@ impl Lowering {
         self.expr(body, Expression::Literal(literal))
     }
 
-    fn binary(
+    pub(super) fn binary(
         &mut self,
         body: &mut Block,
         op: BinaryOperator,
@@ -223,7 +223,7 @@ impl Lowering {
         self.expr(body, Expression::Binary { op, left, right })
     }
 
-    fn unary(
+    pub(super) fn unary(
         &mut self,
         body: &mut Block,
         op: UnaryOperator,
@@ -325,7 +325,7 @@ impl Lowering {
     }
 
     /// A shift of a `bits`-wide integer by a `u32` amount (see the module docs).
-    fn shift(
+    pub(super) fn shift(
         &mut self,
         body: &mut Block,
         kind: Shift,
@@ -535,6 +535,10 @@ impl Lowering {
         }
         if super::memory::is_local(opcode) || super::memory::is_shared(opcode) {
             let expr = self.memory_op(body, at, op)?;
+            return self.done(at, expr);
+        }
+        if let Some(kind) = super::warp::Warp::of(opcode) {
+            let expr = self.warp(body, at, op, kind)?;
             return self.done(at, expr);
         }
         let expr = match opcode {

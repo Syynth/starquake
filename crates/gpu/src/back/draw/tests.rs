@@ -3474,9 +3474,18 @@ fn requirements_map_field_by_field() {
             },
         ),
         (none, ShaderRequirements::default()),
+        // The narrower size flag is not passed on until #473 adds it to the render crate.
+        (
+            Requirements {
+                subgroup_size_32: true,
+                ..none
+            },
+            ShaderRequirements::default(),
+        ),
         (
             Requirements {
                 subgroup: true,
+                subgroup_size_32: true,
                 f16: true,
                 f64: true,
                 i64: true,

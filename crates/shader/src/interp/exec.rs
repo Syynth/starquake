@@ -11,6 +11,8 @@ use super::{ImageCall, Input, InterpError, Run, Space, Val, type_error};
 
 mod warp;
 
+pub(crate) use warp::QUAD_LANE_MASK;
+
 /// The most arguments any opcode takes.
 const MAX_ARGS: usize = {
     let mut most = 0;
@@ -1642,7 +1644,7 @@ fn lane_masks(lane: u32) -> (u32, u32) {
 /// `FSwizzleAdd`'s multipliers of `a` and of `b`, by the lane's two bits of the swizzle: Eden's
 /// `fswzadd_lut_a` and `fswzadd_lut_b` (`spirv_emit_context.cpp` @ cf654052: `-1, 1, -1, 0` and
 /// `-1, -1, 1, -1`), as binary32 bits.
-pub(super) const SWIZZLE_ADD_FACTORS: [(u32, u32); 4] = [
+pub(crate) const SWIZZLE_ADD_FACTORS: [(u32, u32); 4] = [
     (0xbf80_0000, 0xbf80_0000),
     (0x3f80_0000, 0xbf80_0000),
     (0xbf80_0000, 0x3f80_0000),

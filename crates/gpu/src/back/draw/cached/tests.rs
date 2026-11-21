@@ -188,6 +188,7 @@ const TARGET: HostTarget = HostTarget {
     form: CodeForm::NagaModule,
     caps: Requirements {
         subgroup: true,
+        subgroup_size_32: true,
         f16: false,
         f64: false,
         i64: false,
@@ -439,4 +440,62 @@ fn a_wait_through_the_seam_returns_once_a_worker_runs_the_job() {
     // Bounded: the waiter answers within the watchdog, or the test fails.
     assert_eq!(receiver.recv_timeout(Duration::from_secs(10)), Ok(true));
     waiter.join().expect("the waiter ends");
+}
+
+/// The production translator's shaders go through the seam: a real vertex program (a parsed
+/// header and an `EXIT`) translated by `PipelineTranslator` comes back as a ready set of its
+/// host shader, which binds no resources until slice 17 (module docs, "The production
+/// translator's shaders").
+#[test]
+fn a_host_shader_binds_nothing_yet() {
+    use starquake_shader::pipeline::PipelineTranslator;
+    use starquake_shader::sph::encode::encode_bytes;
+    use starquake_shader::sph::{Common, Io, ProgramHeader, VtgIo, VtgMap, VtgStage};
+
+    let executor = Arc::new(Scripted::default());
+    let cache = ShaderCache::new(
+        Arc::new(PipelineTranslator),
+        Arc::<Scripted>::clone(&executor),
+        TARGET,
+    );
+    let mut seam = CachedShaders::new(cache);
+    let header = ProgramHeader {
+        common: Common::default(),
+        io: Io::Vtg(Box::new(VtgIo {
+            stage: VtgStage::Vertex,
+            input: VtgMap::default(),
+            output: VtgMap::default(),
+            vmap: VtgMap::default(),
+        })),
+    };
+    let mut memory = Memory::new();
+    let mut bytes = encode_bytes(&header).expect("encodable").to_vec();
+    bytes.extend(
+        assemble_program(&[Instr::new(Op::Exit(OpExit {
+            keep_ref_count: false,
+            no_at_exit: false,
+            pred: PredSrc::TRUE,
+        }))])
+        .expect("encodable"),
+    );
+    memory.0[..bytes.len()].copy_from_slice(&bytes);
+    let requests = [vertex(A)];
+    let SetLookup::Pending(ticket) =
+        seam.lookup(&requests, &VariantKey::default(), &memory, &NoState)
+    else {
+        unreachable!("a first lookup is pending");
+    };
+    executor.run_all();
+    let SetLookup::Ready(set) = seam.wait(ticket) else {
+        unreachable!("the translation is done");
+    };
+    assert_eq!(set.stages.len(), 1);
+    assert_eq!(set.stages[0].resources, Vec::new());
+    assert_eq!(
+        set.shaders.stages[0].stage,
+        starquake_shader::host::HostStage::Vertex
+    );
+    let shader = host_shader(GuestStage::Vertex);
+    assert_eq!(SeamShader::resources(&shader), Vec::new());
+    assert_eq!(SeamShader::host(&shader).stage, shader.stage);
 }

@@ -1,0 +1,13 @@
+---
+source: crates/shader/src/opt/resources/tests/table.rs
+expression: table.to_string()
+---
+texture buffer 0: float, from cbuf 4 at 0x34
+image buffer 0: r32_uint, unsigned, header format 0x23, read, from cbuf 4 at 0x38
+texture 0: 2d, float, from cbuf 2 at 0x40
+texture 1: 2d, signed, from cbuf 2 at 0x44
+texture 2: 3d, float, from cbuf 3 at 0x20 & 0xfffff | cbuf 3 at 0x24 << 20 & 0xfff00000
+texture 3: 2d, float, from cbuf 3 at 0x100, 1024 handles 8 bytes apart
+texture 4: cube, signed, from cbuf 3 at 0x200, index from cbuf 5 at 0x8 << 2
+texture 5: 2d, float, depth, from cbuf 24 at 0x10
+image 0: 2d, r32_uint, unsigned, header format 0x12345, read and written, from cbuf 4 at 0x30

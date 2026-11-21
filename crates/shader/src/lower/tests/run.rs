@@ -47,34 +47,42 @@ pub(super) fn opaque(function: &Function) -> Function {
         .expect("no phi");
         let mut args = Vec::new();
         for (slot, &arg) in op.args.iter().enumerate() {
-            let kept = matches!(
+            // Kept as immediates too: the warp operations' operands whose being an immediate
+            // picks the lowering (`warp`: a quad direction or index, a shuffle's lane and
+            // segment mask).
+            let warp_kept = matches!(
                 (op.opcode, slot),
-                (Opcode::GetGotoVariable | Opcode::SetGotoVariable, 0)
-                    | (
-                        Opcode::CompositeExtractU32x2
-                            | Opcode::CompositeExtractU32x3
-                            | Opcode::CompositeExtractU32x4
-                            | Opcode::CompositeExtractF16x2
-                            | Opcode::CompositeExtractF16x3
-                            | Opcode::CompositeExtractF16x4
-                            | Opcode::CompositeExtractF32x2
-                            | Opcode::CompositeExtractF32x3
-                            | Opcode::CompositeExtractF32x4,
-                        1
-                    )
-                    | (
-                        Opcode::CompositeInsertU32x2
-                            | Opcode::CompositeInsertU32x3
-                            | Opcode::CompositeInsertU32x4
-                            | Opcode::CompositeInsertF16x2
-                            | Opcode::CompositeInsertF16x3
-                            | Opcode::CompositeInsertF16x4
-                            | Opcode::CompositeInsertF32x2
-                            | Opcode::CompositeInsertF32x3
-                            | Opcode::CompositeInsertF32x4,
-                        2
-                    )
+                (Opcode::QuadBroadcast | Opcode::QuadSwap, 1) | (Opcode::ShuffleIndex, 1 | 3)
             );
+            let kept = warp_kept
+                || matches!(
+                    (op.opcode, slot),
+                    (Opcode::GetGotoVariable | Opcode::SetGotoVariable, 0)
+                        | (
+                            Opcode::CompositeExtractU32x2
+                                | Opcode::CompositeExtractU32x3
+                                | Opcode::CompositeExtractU32x4
+                                | Opcode::CompositeExtractF16x2
+                                | Opcode::CompositeExtractF16x3
+                                | Opcode::CompositeExtractF16x4
+                                | Opcode::CompositeExtractF32x2
+                                | Opcode::CompositeExtractF32x3
+                                | Opcode::CompositeExtractF32x4,
+                            1
+                        )
+                        | (
+                            Opcode::CompositeInsertU32x2
+                                | Opcode::CompositeInsertU32x3
+                                | Opcode::CompositeInsertU32x4
+                                | Opcode::CompositeInsertF16x2
+                                | Opcode::CompositeInsertF16x3
+                                | Opcode::CompositeInsertF16x4
+                                | Opcode::CompositeInsertF32x2
+                                | Opcode::CompositeInsertF32x3
+                                | Opcode::CompositeInsertF32x4,
+                            2
+                        )
+                );
             let mut emit = |opcode, args: &[Operand]| -> Operand {
                 builder.op(opcode, args).expect("a wrapper").into()
             };
@@ -169,8 +177,10 @@ fn before_returns(block: &mut Block, stores: &[Statement]) {
 }
 
 /// A copy of `shader`'s module that writes registers `regs` to a storage buffer at every
-/// return; registers the shader never names read as 0.
-fn patched(shader: &HostShader, regs: &[u8]) -> naga::Module {
+/// return; registers the shader never names read as 0. With more than one invocation
+/// (`lanes`), invocation `i` writes its registers from word `i * regs.len()` on, by its local
+/// invocation index, an argument the patch adds.
+fn patched(shader: &HostShader, regs: &[u8], lanes: u32) -> naga::Module {
     let mut module = naga_module(shader).clone();
     let count = u32::try_from(regs.len()).expect("few registers");
     let u32_ty = ty(&mut module, TypeInner::Scalar(naga::Scalar::U32));
@@ -178,7 +188,9 @@ fn patched(shader: &HostShader, regs: &[u8]) -> naga::Module {
         &mut module,
         TypeInner::Array {
             base: u32_ty,
-            size: ArraySize::Constant(NonZeroU32::new(count).expect("a register")),
+            size: ArraySize::Constant(
+                NonZeroU32::new(count * lanes).expect("a register and a lane"),
+            ),
             stride: MEMORY_WORD_BYTES,
         },
     );
@@ -203,6 +215,27 @@ fn patched(shader: &HostShader, regs: &[u8]) -> naga::Module {
     let append = |function: &mut naga::Function, expression| -> Handle<Expression> {
         function.expressions.append(expression, Span::UNDEFINED)
     };
+    // Invocation `i`'s first word, `i * count`, when there are several.
+    let first_word = (lanes > 1).then(|| {
+        let index = u32::try_from(function.arguments.len()).expect("few arguments");
+        function.arguments.push(naga::FunctionArgument {
+            name: Some("invocation_index".into()),
+            ty: u32_ty,
+            binding: Some(naga::Binding::BuiltIn(naga::BuiltIn::LocalInvocationIndex)),
+        });
+        let invocation = append(function, Expression::FunctionArgument(index));
+        let stride = append(function, Expression::Literal(naga::Literal::U32(count)));
+        let first = append(
+            function,
+            Expression::Binary {
+                op: naga::BinaryOperator::Multiply,
+                left: invocation,
+                right: stride,
+            },
+        );
+        stores.push(Statement::Emit(naga::Range::new_from_bounds(first, first)));
+        first
+    });
     for (slot, &reg) in (0_u32..).zip(regs) {
         let name = format!("r{reg}");
         let local = function
@@ -220,7 +253,22 @@ fn patched(shader: &HostShader, regs: &[u8]) -> naga::Module {
             None => append(function, Expression::Literal(naga::Literal::U32(0))),
         };
         let base = append(function, Expression::GlobalVariable(out));
-        let element = append(function, Expression::AccessIndex { base, index: slot });
+        let element = match first_word {
+            None => append(function, Expression::AccessIndex { base, index: slot }),
+            Some(first) => {
+                let offset = append(function, Expression::Literal(naga::Literal::U32(slot)));
+                let word = append(
+                    function,
+                    Expression::Binary {
+                        op: naga::BinaryOperator::Add,
+                        left: first,
+                        right: offset,
+                    },
+                );
+                stores.push(Statement::Emit(naga::Range::new_from_bounds(word, word)));
+                append(function, Expression::Access { base, index: word })
+            }
+        };
         stores.push(Statement::Emit(naga::Range::new_from_bounds(
             element, element,
         )));
@@ -236,6 +284,25 @@ fn patched(shader: &HostShader, regs: &[u8]) -> naga::Module {
 /// Runs `shader` (a compute shader with a workgroup of one) once on the GPU and returns
 /// registers `regs`; `None` when the host cannot run it (a notice says why).
 pub(super) fn gpu_registers(test: &str, shader: &HostShader, regs: &[u8]) -> Option<Vec<u32>> {
+    gpu_run(test, shader, regs, 1)
+}
+
+/// Runs one workgroup of `shader` (a compute shader whose workgroup has `lanes` invocations
+/// along x) on the GPU and returns each invocation's registers `regs`, by local invocation
+/// index; `None` when the host cannot run it (a notice says why).
+pub(super) fn gpu_lanes(
+    test: &str,
+    shader: &HostShader,
+    regs: &[u8],
+    lanes: u32,
+) -> Option<Vec<Vec<u32>>> {
+    assert_eq!(shader.workgroup_size, Some([lanes, 1, 1]));
+    let words = gpu_run(test, shader, regs, lanes)?;
+    Some(words.chunks(regs.len()).map(<[u32]>::to_vec).collect())
+}
+
+/// [`gpu_lanes`], as one list of words.
+fn gpu_run(test: &str, shader: &HostShader, regs: &[u8], lanes: u32) -> Option<Vec<u32>> {
     let wanted = features(shader.requirements);
     let gpu = TestDevice::open(test, wanted)?;
     if !gpu.has(wanted) {
@@ -245,8 +312,9 @@ pub(super) fn gpu_registers(test: &str, shader: &HostShader, regs: &[u8]) -> Opt
         );
         return None;
     }
-    let module = patched(shader, regs);
-    let size = u64::try_from(regs.len()).expect("few") * u64::from(MEMORY_WORD_BYTES);
+    let module = patched(shader, regs, lanes);
+    let size =
+        u64::try_from(regs.len()).expect("few") * u64::from(lanes) * u64::from(MEMORY_WORD_BYTES);
     let result = gpu.scoped(|device| {
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(test),

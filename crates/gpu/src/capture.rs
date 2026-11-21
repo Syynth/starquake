@@ -113,7 +113,8 @@
 //!   when the front changed it (releases close the open list on a waiter, and latch them); and
 //!   shader lookups and waits.
 //! - both: writes (with their bytes and outcome: an outcome is an input, the bytes an output),
-//!   and the two queries a memory answers.
+//!   and two of the three queries a memory answers (the version and whether a range is
+//!   GPU-only; the semaphore mirror query is not recorded, below).
 //!
 //! # Replay
 //!
@@ -186,6 +187,14 @@
 //!   holds a syncpoint entry diverges at that entry's record; the hash a counted entry records
 //!   is pinned by `tests::replay::a_counted_syncpoint_entry_is_one_ring_record`. Once captures
 //!   ship, a change to the ring encoding bumps the version.
+//! - **The semaphore mirror query is not recorded.** [`RecordingMemory`] passes
+//!   `GpuMemory::semaphore_mirror` on to the memory it wraps, so a recorded run copies releases
+//!   as a live one does, but keeps no record of the answer, and [`ReplayMemory`] answers `None`
+//!   (the trait's default). A capture whose run copied a release into a semaphore mirror page
+//!   therefore diverges on replay at the copy's write. No capture can hold one yet: the builder
+//!   lists no two-page registration in its tables, and nothing records a running title. A
+//!   `mirror` record (format change) is the follow-up. Pinned by
+//!   `tests::mirror::the_recording_memory_passes_the_mirror_on_and_the_replay_answers_none`.
 //! - **Report records keep what the front keeps.** A `report` holds the markers and the two
 //!   flags [`crate::front::FrontShared`]'s wake reduces a back report to, not the counts or the
 //!   failed releases.

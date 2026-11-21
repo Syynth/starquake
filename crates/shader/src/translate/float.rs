@@ -32,7 +32,8 @@
 //! - `FMNMX`: `FPMax32` and `FPMin32`, the predicate (read plain, the two swapped when it is
 //!   negated) selecting the minimum; with `.NAN` an unordered pair gives `0x7fffffff`.
 //! - `FSETP`, `FSET`: Eden's `FloatingPointCompare` (`.num` and `.nan` through `FPIsNan32`, `.f`
-//!   and `.t` as constants) combined with the accumulator by `PredicateCombine`; `FSETP` writes
+//!   and `.t` as constants; [`compare`], the one comparison the half and double group shares,
+//!   parameterised by width) combined with the accumulator by `PredicateCombine`; `FSETP` writes
 //!   the combination to its first predicate and the combination of the negated comparison to
 //!   its second (a `PT` destination writes nothing), `FSET` writes `1.0` or `0`.
 //! - `FSEL`: a select of the two modified sources' bits.
@@ -73,11 +74,13 @@
 //! | `I2F`, `I2FP` (integer to float) | carried on the conversion (decision 10 lists only float-to-integer and float-to-half conversions for emulation) | none | `tests::convert::i2f_carries_its_rounding` |
 //! | `MUFU`, `FSWZADD`, `F2FP` | none: the PR accepts only to-nearest (`F2FP`, `FSWZADD`) or has no field (`MUFU`) | none | `tests::arith::fswzadd_refuses_its_modes`, `tests::convert::f2fp_refuses_the_selector_and_rounding` |
 //!
-//! **Owner question.** `F2I.FTZ` with a 16-bit operand is not emulated: the PR leaves the
-//! denormal mode of a half operand unset (`ops_convert.cpp`, `F2I`: `denorm_cares =
+//! **Ruled as built, still a guess.** `F2I.FTZ` with a 16-bit operand is not emulated: the PR
+//! leaves the denormal mode of a half operand unset (`ops_convert.cpp`, `F2I`: `denorm_cares =
 //! !half_source`), and this module follows it, where decision 10 reads as emulating
-//! flush-to-zero on every float-to-integer conversion. A half denormal rounded up gives 1 with
-//! or without `.FTZ` (`tests::convert::f2i_flushes_denormals_before_rounding`).
+//! flush-to-zero on every float-to-integer conversion. The owner accepted this as built (decision
+//! log, 2026-11-19, "Owner rulings on the wave 44 and 45 questions", row 5); it stays a guess
+//! until a hardware check of a half denormal under `.FTZ`. A half denormal rounded up gives 1
+//! with or without `.FTZ` (`tests::convert::f2i_flushes_denormals_before_rounding`).
 //!
 //! An emulated control is carried as well, so the IR means the same whether or not a backend
 //! honours the flag: the emulation is idempotent (a correctly rounded or flushed value is left
@@ -89,10 +92,15 @@
 //!
 //! # Guards
 //!
-//! An instruction under a guard predicate becomes a conditional block (spec, "Instruction
-//! translation"): the guard is read, the block branches to a block holding the instruction or
-//! past it, and translation continues in the block after. [`translate_instr`] skips this when
-//! its block already tests the guard (flow analysis's `guard_tested`), and for `PT`.
+//! The guard follows the translation driver's rule, the one function the driver and every
+//! group's own entry point use (`super`'s `guard_step`, through its `conditional_block`; its
+//! module docs, "Guards"). After the group check, an instruction under `!PT` never runs and
+//! appends nothing, unchecked, as PR #4588's `Visitor::Run` returns at `guard.Never()`
+//! (`tests::never_guarded_instructions_append_nothing`). An instruction under any other guard
+//! predicate but `PT` becomes a conditional block (spec, "Instruction translation"): once it
+//! is checked, the guard is read, the block branches to a block holding the instruction or
+//! past it, and translation continues in the block after. [`translate_instr`] skips the block
+//! when its block already tests the guard (flow analysis's `guard_tested`), and for `PT`.
 //!
 //! # Refusals
 //!
@@ -132,7 +140,6 @@
 //! | What | PR #4588 | Here | Pinned by |
 //! |---|---|---|---|
 //! | A guard on these instructions | a select of the result (`Visitor::Run`: `guard_select` for the pure ops `classify.h` lists) | a conditional block (spec, "Instruction translation") | `tests::guarded_instructions_become_conditional_blocks` |
-//! | `@!PT` | the instruction is skipped unchecked (`guard.Never()`) | checked, and put in a block that never runs | `tests::never_guarded_instructions_are_checked` |
 //! | `MUFU.SIN`, `MUFU.COS` | `FPSin`, `FPCos` of the argument as it is | of the argument times `2 pi` (row 95) | `tests::arith::mufu_sine_and_cosine_take_turns` |
 //! | `F2I.FTZ` with a 32-bit operand, `F2F` rounding and `.FTZ` | carried as flags only | emulated as well (decision 10) | `tests::convert::f2i_flushes_denormals_before_rounding`, `tests::convert::f2f_emulation_matches_the_modelled_conversion` |
 //! | `FSETP` with a `PT` destination | computes the combination, then `SetPred` discards it | computes nothing for it | `tests::arith::fsetp_writes_both_predicates` |
@@ -421,18 +428,25 @@ pub const fn in_group(op: &Op) -> bool {
 
 /// Translates `instr`, one of this group's instructions, at the end of `builder`'s block, and
 /// leaves `builder` in the block where translation continues: the same block, or for a guarded
-/// instruction the block after its conditional block (module docs). `guard_tested` says the
-/// block already runs only where the guard holds (flow analysis's `guard_tested`), so the guard
-/// is ignored. A refusal appends nothing.
+/// instruction the block after its conditional block (module docs, "Guards"). `guard_tested`
+/// says the block already runs only where the guard holds (flow analysis's `guard_tested`), so
+/// a guard other than `!PT` is ignored. The checks run in this order: the group, then the
+/// guard (`!PT` appends nothing), then the PR's checks. A refusal appends nothing.
 pub fn translate_instr(
     builder: &mut Builder<'_>,
     instr: Instr,
     guard_tested: bool,
 ) -> Result<(), FloatError> {
-    check(&instr.op)?;
-    super::conditional_block(builder, instr.guard, guard_tested, |b| {
-        Emit { b }.op(&instr.op)
-    })
+    if !in_group(&instr.op) {
+        return Err(FloatUnsupported::OtherGroup(instr.op.mnemonic()).into());
+    }
+    super::conditional_block(
+        builder,
+        instr.guard,
+        guard_tested,
+        || Ok::<_, FloatError>(check(&instr.op)?),
+        |b, ()| Emit { b }.op(&instr.op),
+    )
 }
 
 /// Whether `function` uses a quad operation of this group (`FSwizzleAdd`, from `FSWZADD`), so
@@ -691,13 +705,17 @@ pub(crate) const fn rounding_of(mode: RoundMode) -> FpRounding {
     }
 }
 
-/// `FTZ` or no flushing, as the PR's controls say it.
-const fn flushing(ftz: bool) -> FmzMode {
+/// `FTZ` or no flushing, as the PR's controls say it (shared with [`super::half_double`]).
+pub(crate) const fn flushing(ftz: bool) -> FmzMode {
     if ftz { FmzMode::Ftz } else { FmzMode::None }
 }
 
-/// Floating-point controls.
-const fn control(no_contraction: bool, rounding: FpRounding, fmz_mode: FmzMode) -> FpControl {
+/// Floating-point controls (shared with [`super::half_double`]).
+pub(crate) const fn control(
+    no_contraction: bool,
+    rounding: FpRounding,
+    fmz_mode: FmzMode,
+) -> FpControl {
     FpControl {
         no_contraction,
         rounding,
@@ -724,28 +742,121 @@ const fn round_op(mode: RoundMode, half: bool) -> Opcode {
     }
 }
 
-/// A float comparison's opcode, ordered and unordered (Eden's `FloatingPointCompare`, the
-/// `.u` forms unordered); `None` for the four that are not one comparison.
-const fn compare_op(cmp: FloatCmpOp) -> Option<Opcode> {
-    Some(match cmp {
-        FloatCmpOp::Lt => Opcode::FPOrdLessThan32,
-        FloatCmpOp::Eq => Opcode::FPOrdEqual32,
-        FloatCmpOp::Le => Opcode::FPOrdLessThanEqual32,
-        FloatCmpOp::Gt => Opcode::FPOrdGreaterThan32,
-        FloatCmpOp::Ne => Opcode::FPOrdNotEqual32,
-        FloatCmpOp::Ge => Opcode::FPOrdGreaterThanEqual32,
-        FloatCmpOp::LtU => Opcode::FPUnordLessThan32,
-        FloatCmpOp::EqU => Opcode::FPUnordEqual32,
-        FloatCmpOp::LeU => Opcode::FPUnordLessThanEqual32,
-        FloatCmpOp::GtU => Opcode::FPUnordGreaterThan32,
-        FloatCmpOp::NeU => Opcode::FPUnordNotEqual32,
-        FloatCmpOp::GeU => Opcode::FPUnordGreaterThanEqual32,
-        FloatCmpOp::False | FloatCmpOp::True | FloatCmpOp::Num | FloatCmpOp::Nan => return None,
-    })
+/// The width of a floating-point comparison's operands: the one parameter of the comparison
+/// [`compare`] builds, shared by `FSETP` and `FSET` (32 bits), `HSETP2` and `HSET2` (16 bits,
+/// or 32 for an `HSET2` source read as a float) and `DSETP` (64 bits).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FloatWidth {
+    /// Binary16.
+    F16,
+    /// Binary32.
+    F32,
+    /// Binary64.
+    F64,
 }
 
-/// Eden's `PredicateCombine`.
-const fn combine_op(set_op: PredSetOp) -> Opcode {
+impl FloatWidth {
+    /// The one of `ops` (16, 32 and 64 bits, in that order) for this width.
+    const fn pick(self, [half, single, double]: [Opcode; 3]) -> Opcode {
+        match self {
+            Self::F16 => half,
+            Self::F32 => single,
+            Self::F64 => double,
+        }
+    }
+}
+
+/// A float comparison's opcode in `width`, ordered and unordered (Eden's
+/// `FloatingPointCompare`, the `.u` forms unordered); `None` for the four that are not one
+/// comparison.
+pub(crate) const fn compare_op(cmp: FloatCmpOp, width: FloatWidth) -> Option<Opcode> {
+    use Opcode as O;
+    let ops = match cmp {
+        FloatCmpOp::Lt => [O::FPOrdLessThan16, O::FPOrdLessThan32, O::FPOrdLessThan64],
+        FloatCmpOp::Eq => [O::FPOrdEqual16, O::FPOrdEqual32, O::FPOrdEqual64],
+        FloatCmpOp::Le => [
+            O::FPOrdLessThanEqual16,
+            O::FPOrdLessThanEqual32,
+            O::FPOrdLessThanEqual64,
+        ],
+        FloatCmpOp::Gt => [
+            O::FPOrdGreaterThan16,
+            O::FPOrdGreaterThan32,
+            O::FPOrdGreaterThan64,
+        ],
+        FloatCmpOp::Ne => [O::FPOrdNotEqual16, O::FPOrdNotEqual32, O::FPOrdNotEqual64],
+        FloatCmpOp::Ge => [
+            O::FPOrdGreaterThanEqual16,
+            O::FPOrdGreaterThanEqual32,
+            O::FPOrdGreaterThanEqual64,
+        ],
+        FloatCmpOp::LtU => [
+            O::FPUnordLessThan16,
+            O::FPUnordLessThan32,
+            O::FPUnordLessThan64,
+        ],
+        FloatCmpOp::EqU => [O::FPUnordEqual16, O::FPUnordEqual32, O::FPUnordEqual64],
+        FloatCmpOp::LeU => [
+            O::FPUnordLessThanEqual16,
+            O::FPUnordLessThanEqual32,
+            O::FPUnordLessThanEqual64,
+        ],
+        FloatCmpOp::GtU => [
+            O::FPUnordGreaterThan16,
+            O::FPUnordGreaterThan32,
+            O::FPUnordGreaterThan64,
+        ],
+        FloatCmpOp::NeU => [
+            O::FPUnordNotEqual16,
+            O::FPUnordNotEqual32,
+            O::FPUnordNotEqual64,
+        ],
+        FloatCmpOp::GeU => [
+            O::FPUnordGreaterThanEqual16,
+            O::FPUnordGreaterThanEqual32,
+            O::FPUnordGreaterThanEqual64,
+        ],
+        FloatCmpOp::False | FloatCmpOp::True | FloatCmpOp::Num | FloatCmpOp::Nan => return None,
+    };
+    Some(width.pick(ops))
+}
+
+/// Eden's `FloatingPointCompare` (`common_funcs.cpp`) on two floats of `width`, appended to
+/// `b`: one comparison with `ctl` (`compare_op`), `.f` and `.t` as constants, `.num` as both
+/// operands not NaN and `.nan` as either NaN (`FPOrdered`, `FPUnordered`, through `FPIsNan16`,
+/// `FPIsNan32` or `FPIsNan64`). The one comparison of the float and the half and double groups
+/// (shared with [`super::half_double`]).
+pub(crate) fn compare(
+    b: &mut Builder<'_>,
+    cmp: FloatCmpOp,
+    (x, y): (Operand, Operand),
+    width: FloatWidth,
+    ctl: FpControl,
+) -> Result<Operand, BuildError> {
+    if let Some(opcode) = compare_op(cmp, width) {
+        return Ok(b.op_with(opcode, &[x, y], Flags::Fp(ctl))?.into());
+    }
+    let is_nan = width.pick([Opcode::FPIsNan16, Opcode::FPIsNan32, Opcode::FPIsNan64]);
+    match cmp {
+        FloatCmpOp::False => Ok(Operand::Imm(Imm::U1(false))),
+        FloatCmpOp::True => Ok(Operand::Imm(Imm::U1(true))),
+        FloatCmpOp::Num => {
+            let x_nan = b.op(is_nan, &[x])?.into();
+            let y_nan = b.op(is_nan, &[y])?.into();
+            let x_num = b.op(Opcode::LogicalNot, &[x_nan])?.into();
+            let y_num = b.op(Opcode::LogicalNot, &[y_nan])?.into();
+            Ok(b.op(Opcode::LogicalAnd, &[x_num, y_num])?.into())
+        }
+        _ => {
+            let x_nan = b.op(is_nan, &[x])?.into();
+            let y_nan = b.op(is_nan, &[y])?.into();
+            Ok(b.op(Opcode::LogicalOr, &[x_nan, y_nan])?.into())
+        }
+    }
+}
+
+/// Eden's `PredicateCombine` (shared with [`super::half_double`]).
+pub(crate) const fn combine_op(set_op: PredSetOp) -> Opcode {
     match set_op {
         PredSetOp::And => Opcode::LogicalAnd,
         PredSetOp::Or => Opcode::LogicalOr,
@@ -1042,7 +1153,7 @@ impl Emit<'_, '_> {
         self.set(op.dst, value)
     }
 
-    /// Eden's `FloatingPointCompare` on two 32-bit floats.
+    /// Eden's `FloatingPointCompare` on two 32-bit floats ([`compare`]).
     fn compare(
         &mut self,
         cmp: FloatCmpOp,
@@ -1050,26 +1161,8 @@ impl Emit<'_, '_> {
         b: Operand,
         ftz: bool,
     ) -> Result<Operand, FloatError> {
-        if let Some(opcode) = compare_op(cmp) {
-            let ctl = control(false, FpRounding::DontCare, flushing(ftz));
-            return self.emit_fp(opcode, &[a, b], ctl);
-        }
-        match cmp {
-            FloatCmpOp::False => Ok(Operand::Imm(Imm::U1(false))),
-            FloatCmpOp::True => Ok(Operand::Imm(Imm::U1(true))),
-            FloatCmpOp::Num => {
-                let a_nan = self.emit(Opcode::FPIsNan32, &[a])?;
-                let b_nan = self.emit(Opcode::FPIsNan32, &[b])?;
-                let a_num = self.emit(Opcode::LogicalNot, &[a_nan])?;
-                let b_num = self.emit(Opcode::LogicalNot, &[b_nan])?;
-                self.emit(Opcode::LogicalAnd, &[a_num, b_num])
-            }
-            _ => {
-                let a_nan = self.emit(Opcode::FPIsNan32, &[a])?;
-                let b_nan = self.emit(Opcode::FPIsNan32, &[b])?;
-                self.emit(Opcode::LogicalOr, &[a_nan, b_nan])
-            }
-        }
+        let ctl = control(false, FpRounding::DontCare, flushing(ftz));
+        Ok(compare(self.b, cmp, (a, b), FloatWidth::F32, ctl)?)
     }
 
     /// `FSETP` (`ops_alu.cpp`, `FSETP`).
