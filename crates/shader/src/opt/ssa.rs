@@ -83,12 +83,13 @@
 //!   operands that are all one value (`tests::structured::a_break_and_the_repeat_both_reach_the_block_after_the_loop`).
 //!   Every value a read finds is so in scope at the end of the block it is read for, which is
 //!   where the lowering stores a phi's incoming value (`crate::lower`, "Structured control
-//!   flow"). The structured verifier checks only that a phi's incoming value is listed
-//!   somewhere, so a test-side checker (`tests::check_phi_scope`, itself pinned by
-//!   `tests::structured::the_scope_checker_refuses_a_phi_value_out_of_scope`) checks this after
-//!   the rewrite and after every later pass in `tests::equivalence`'s proptests, in
-//!   `tests::structured`'s rewrites and in `flow`'s whole-program tests. Eden keeps neither
-//!   rule (its verifier accepts a use past a body's end).
+//!   flow"). The verifier checks it, and that each incoming block can run last before the
+//!   phi's block (`ir::verify`'s step 5), so [`run`](super::run) checks it after the rewrite
+//!   and after every later pass in tests and debug builds: in `tests::equivalence`'s
+//!   proptests, in `tests::structured`'s rewrites and in `flow`'s whole-program tests, the
+//!   last two through `tests::check_phi_scope`, a call to the verifier (pinned by
+//!   `tests::structured::the_scope_checker_refuses_a_phi_value_out_of_scope`). Eden keeps
+//!   neither rule (its verifier accepts a use past a body's end).
 //! - **The shortcut to the entry.** Eden's lookup walks back block by block. The structurizer
 //!   resets every goto variable at the start of the program and sets each again near its goto,
 //!   so a read on a path that skipped the goto walked back to the start: on `tests::linear`'s
