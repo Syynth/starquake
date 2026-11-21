@@ -1,6 +1,6 @@
-//! The 3D class's report semaphore: what a write to `SET_REPORT_SEMAPHORE_D` asks the back to
-//! do (gpu-protocol spec, "Releases and completion", "Report semaphores", decided by the owner
-//! on 2026-11-19).
+//! The 3D and compute classes' report semaphores: what a write to `SET_REPORT_SEMAPHORE_D` asks
+//! the back to do (gpu-protocol spec, "Releases and completion", "Report semaphores", decided
+//! by the owner on 2026-11-19).
 //!
 //! A report of **no counter** (`REPORT` = `NONE`) releases the payload in
 //! `SET_REPORT_SEMAPHORE_C` at the address in `SET_REPORT_SEMAPHORE_A/B`, as a fenced release
@@ -8,8 +8,10 @@
 //! work with one and waits for the word to change, so without it a title stops after its first
 //! submissions. A counter report (occlusion counts, primitive counts, timestamps) writes
 //! nothing, as the spec has it until a title needs one (below, "Divergences"). The compute
-//! class's report semaphore (`clc7c0.h`'s `SET_REPORT_SEMAPHORE_A`–`D`), which the spec's
-//! paragraph also covers, is not handled here: it is issue #458.
+//! class's report semaphore (`clc7c0.h`'s `SET_REPORT_SEMAPHORE_A`–`D`) shares the decision,
+//! over its own registers, and has no counter to report (below, "The compute class").
+//!
+//! [`FencedAction::Release`]: crate::back::fence::FencedAction::Release
 //!
 //! Method numbers and fields are `clc797.h`'s (`mesa-nouveau/src/nouveau/headers/nvidia/classes/`
 //! @ 52238762, MIT), read through the generated [`clc797`]. The behaviour is that of Eden-NX2's
@@ -49,7 +51,7 @@
 //! The executor (`back::exec`) attaches it for the channel's address space, after drawing the
 //! channel's deferred instances, as it does for a `Release` entry.
 //!
-//! # Divergences from Eden-NX2
+//! # Divergences from Eden-NX2 (3D)
 //!
 //! - **Every payload release is fenced** (owner's decision 2, "Releases happen after the work
 //!   they follow"). Eden-NX2 fences only a one-word `RELEASE`: `ProcessQueryGet` sets
@@ -58,9 +60,9 @@
 //!   `RELEASE` and every `REPORT_ONLY`, unless its GPU accuracy is High, are written at the
 //!   write itself (`!Settings::IsGPULevelHigh() && counter_type == QueryType::Payload`). Here
 //!   every form of both operations waits for the host work before it
-//!   (`back::exec::tests::a_report_semaphore_release_waits_for_the_work_before_it`), and is
+//!   (`back::exec::tests::report::a_report_semaphore_release_waits_for_the_work_before_it`), and is
 //!   written at once when there is none
-//!   (`back::exec::tests::a_one_word_payload_report_writes_four_bytes`).
+//!   (`back::exec::tests::report::a_one_word_payload_report_writes_four_bytes`).
 //! - **The address keeps 8 bits of `OFFSET_UPPER`.** `clc797.h` gives the field bits 7:0, so a
 //!   value above them is dropped and the address has 40 bits. Eden-NX2 reads `address_high` as
 //!   a whole `u32` and shifts all 32 bits up (`Address()`,
@@ -71,7 +73,7 @@
 //!   The owner's ruling of 2026-11-19 (`docs/decision-log.md`, ruling 29) makes it guest time
 //!   from the kernel's clock; issue #435 changes it for every release, this one included.
 //!   Eden-NX2 writes `gpu.GetTicks()`. Not pinned here: the executor's tests use the fence
-//!   path's fake clock (`back::exec::tests::a_four_word_payload_report_writes_the_payload_and_the_timestamp`).
+//!   path's fake clock (`back::exec::tests::report::a_four_word_payload_report_writes_the_payload_and_the_timestamp`).
 //! - **A counter report writes nothing.** Eden-NX2 answers the kinds its backend counts from
 //!   host queries, and every other kind as a payload of 1 (`streamer == nullptr`:
 //!   `counter_type = QueryType::Payload; payload = 1U`). The spec writes nothing until a title
@@ -100,6 +102,71 @@
 //! - `REPORT_SEMAPHORE_EXECUTE` and the 64-bit `SET_REPORT_SEMAPHORE_PAYLOAD_LOWER/UPPER` and
 //!   `_ADDRESS_LOWER/UPPER` registers `clc797.h` adds are not acted on: neither reference acts
 //!   on them, and no title has been seen to write them.
+//!
+//! # The compute class
+//!
+//! [`decide_compute`] reads the compute engine's four registers, `clc7c0.h`'s
+//! `SET_REPORT_SEMAPHORE_A`–`D` (`mesa-nouveau/src/nouveau/headers/nvidia/classes/clc7c0.h` @
+//! 52238762, MIT, read through the generated [`clc7c0`]), with the same code as [`decide`]
+//! (one table of registers per class). The behaviour is that of Eden-NX2's
+//! `KeplerCompute::ProcessNativeReportSemaphore`
+//! (`eden-nx2/src/video_core/engines/kepler_compute.cpp` @ 50fa86bb, GPL-3.0-or-later), which
+//! `ProcessNativeMethod` calls for method `0x6c3` (`SET_REPORT_SEMAPHORE_D`, byte address
+//! `0x1b0c`) and which calls `rasterizer->Query` with `QueryType::Payload`, the case the 3D
+//! class's payload report reaches.
+//!
+//! | `OPERATION` (1:0) | Action |
+//! |---|---|
+//! | `RELEASE` (0) or 2 | [`ReportAction::Release`] of the payload |
+//! | 1 or `TRAP` (3) | [`ReportAction::Nothing`] |
+//!
+//! - **No counter.** The compute class's query word has no `REPORT` field (`clc7c0.h` names
+//!   none, and bits 27:23, the 3D class's `REPORT`, are unnamed), and Eden-NX2 reads none: every
+//!   releasing word releases its payload, and [`ReportAction::Counter`] is never the answer
+//!   (`tests::compute_words_built_by_hand_give_eden_nx2s_answer`).
+//! - **Operation 2.** `clc7c0.h` names only `RELEASE` (0) and `TRAP` (3) for this word.
+//!   Eden-NX2 releases for 0 and 2 (`operation != 0 && operation != 2` returns with a warning)
+//!   and calls 2 "report only"; the value is taken from `REPORT_SEMAPHORE_EXECUTE`'s
+//!   `OPERATION_REPORT_ONLY` in the same header, a **guess** that the two words share the
+//!   encoding, as the 3D class's do (`tests::the_compute_registers_are_the_headers`).
+//! - **Address, payload and form** are read as for the 3D class: `OFFSET_UPPER` (7:0) as bits
+//!   39:32 over `OFFSET_LOWER`, the 32-bit `PAYLOAD`, and `STRUCTURE_SIZE` (28) `ONE_WORD` for
+//!   the 4 payload bytes, `FOUR_WORDS` for the 16-byte structure with the timestamp. Eden-NX2
+//!   reads bit 28 the same way (`one_word`), passing `HasTimeout` when it is clear.
+//!
+//! The executor attaches the release exactly as it does the 3D class's (`back::exec`, "Report
+//! semaphores").
+//!
+//! ## Divergences from Eden-NX2 (compute)
+//!
+//! - **Every payload release is fenced**, as for the 3D class. Eden-NX2 passes `IsAFence` only
+//!   for the one-word form (`one_word ? IsAFence : HasTimeout`), for both operations
+//!   (`back::exec::tests::compute_report::a_compute_report_waits_for_the_dispatch_before_it`,
+//!   both forms).
+//! - **The address keeps 8 bits of `OFFSET_UPPER`**, per `clc7c0.h`. Eden-NX2 keeps 25
+//!   (`native_registers[0x6c0] & 0x1ffffff`)
+//!   (`tests::the_compute_address_takes_eight_upper_bits_and_all_lower_ones`).
+//! - **The reduction fields are ignored and the payload is written.** Eden-NX2 does read them
+//!   here, unlike for the 3D class: with `REDUCTION_ENABLE` (bit 3) set it applies the
+//!   reduction in `REDUCTION_OP` (11:9) to the 32-bit word after a fence (`SignalFence`),
+//!   comparing unsigned whatever `REDUCTION_FORMAT` says, and writes no timestamp. The spec's
+//!   paragraph says "an ordinary fenced release of its payload", which is what is built; an
+//!   **open owner question** whether to follow Eden-NX2 here. Adding it is one branch: a
+//!   [`Release`] with [`ReleaseOp::Reduce`], decoded by `sema`'s `RED_*` helper
+//!   (`tests::compute_words_built_by_hand_give_eden_nx2s_answer`,
+//!   `back::exec::tests::compute_report::a_compute_report_writes_the_payload_whatever_its_reduction_and_upper_bits`).
+//! - The timestamp, an unmapped address and the deferred instances are as for the 3D class
+//!   (above). The deferred instances are drawn before any word of the compute class, the query
+//!   word included (`back::exec`, "Deferred instanced draws";
+//!   `back::exec::tests::compute_report::deferred_instances_are_drawn_before_a_compute_report_release`).
+//! - Eden-NX2 logs the first 32 compute report words at info level; nothing is logged here for
+//!   a release that succeeds.
+//!
+//! `AWAKEN_ENABLE` (20), `FLUSH_DISABLE` (2) and `CONDITIONAL_TRAP` (19) are ignored, as in
+//! Eden-NX2. The compute class's `REPORT_SEMAPHORE_EXECUTE` and 64-bit
+//! `SET_REPORT_SEMAPHORE_PAYLOAD_LOWER/UPPER` and `_ADDRESS_LOWER/UPPER` registers are not
+//! acted on: Eden-NX2's `ProcessNativeMethod` only stores them (it traces
+//! `REPORT_SEMAPHORE_EXECUTE`, `0x5a`, when its draw diagnostics are on).
 
 use crate::back::state::{Mirror, StateError};
 use crate::classes::{Method, clc7c0, clc797};

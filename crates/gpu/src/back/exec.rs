@@ -142,6 +142,13 @@
 //! an `ACQUIRE` or a `TRAP` does nothing. `back::report` has the fields, the reference and the
 //! divergences. Pinned in `tests/report.rs`.
 //!
+//! A `SET_REPORT_SEMAPHORE_D` word of the compute class, once the mirror stored it, is decided
+//! by [`report::decide_compute`] and takes the same path from there: a `RELEASE` or operation 2
+//! becomes the same fenced release, and an operation 1 or a `TRAP` does nothing. The compute
+//! class has no counter report. Its words, the query word among them, draw the channel's
+//! deferred instances before they reach the engine (above, "Deferred instanced draws"). Pinned
+//! in `tests/compute_report.rs`.
+//!
 //! The native SDK writes a payload report to GPU address 0, which the title seen had not
 //! mapped, and may do so at every queue flush. Such a release fails when it is performed, as
 //! any release to an unmapped address does (`back::fence`, "A failed release is reported and
@@ -151,6 +158,9 @@
 //! debug level ([`FailureLog::Debug`]), so a title that writes one per flush does not fill the
 //! log. A failed release to any other address warns every time.
 //! `tests::report::a_report_to_address_0_is_logged_once_per_channel_and_each_failure_counted`.
+//! The channel's first is counted across both classes: after a compute report to address 0, a
+//! 3D one on the same channel logs at debug level
+//! (`tests::compute_report::a_report_to_address_0_is_logged_once_per_channel_across_both_classes`).
 //!
 //! # Conditional rendering
 //!
