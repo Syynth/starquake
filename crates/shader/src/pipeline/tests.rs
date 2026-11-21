@@ -665,12 +665,15 @@ fn local_words(shader: &HostShader) -> Option<u32> {
         .global_variables
         .iter()
         .find(|(_, global)| global.name.as_deref() == Some("local_memory"))
-        .map(|(_, global)| match module.types[global.ty].inner {
-            naga::TypeInner::Array {
-                size: naga::ArraySize::Constant(length),
-                ..
-            } => length.get(),
-            ref other => panic!("local memory is a sized array, not {other:?}"),
+        .map(|(_, global)| {
+            match module.types[global.ty].inner {
+                naga::TypeInner::Array {
+                    size: naga::ArraySize::Constant(length),
+                    ..
+                } => Some(length.get()),
+                _ => None,
+            }
+            .expect("local memory is a sized array")
         })
 }
 

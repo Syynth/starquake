@@ -401,6 +401,10 @@ fn every_prefix_is_truncated_in_the_right_field() {
             "prefix of {len} bytes"
         );
     }
+}
+
+#[test]
+fn truncation_errors_read_as_plain_words() {
     assert_eq!(
         KeyError::Truncated {
             field: KeyField::WorkgroupSize(1),
@@ -408,6 +412,14 @@ fn every_prefix_is_truncated_in_the_right_field() {
         }
         .to_string(),
         "the variant key ends after 80 bytes, inside the workgroup size along axis 1"
+    );
+    assert_eq!(
+        KeyError::Truncated {
+            field: KeyField::LocalMemorySize,
+            len: 187
+        }
+        .to_string(),
+        "the variant key ends after 187 bytes, inside the local-memory size"
     );
     assert_eq!(
         KeyError::Truncated {

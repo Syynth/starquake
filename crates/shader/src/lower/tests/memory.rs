@@ -622,7 +622,7 @@ fn translated_local_accesses_match_the_interpreter_at_the_edge() {
 
 /// Divergence (`lower::memory`): with a local-memory size that is not a multiple of 4 (13
 /// bytes, four words), a translated `LDL.U8` at byte 13, in the last word but at the byte size,
-/// reads the stored byte here, on the interpreter and on the GPU alike (0xcc of 0xaabb_ccdd),
+/// reads the stored byte here, on the interpreter and on the GPU alike (0xcc of `0xaabb_ccdd`),
 /// where Eden's translator selects 0 (`ILessThan(13, 13)` is false). The store at byte 12 is
 /// below the size, so Eden keeps it too.
 #[test]
