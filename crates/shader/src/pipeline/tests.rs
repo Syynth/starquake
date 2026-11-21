@@ -1178,7 +1178,7 @@ fn the_key_s_emulation_reaches_the_lowering() {
         &VariantKey::default(),
     )
     .expect("ready");
-    assert!(plain.resources.is_empty());
+    assert_eq!(plain.resources, []);
     let flipped = VariantKey {
         emulation: crate::variant::EmulationKey {
             flipped_viewport: true,
