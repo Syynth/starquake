@@ -1063,7 +1063,13 @@ What this spec assumes of gsv:
   frame whose fence is reached, and frees the buffer that frame replaces on the same tick; this
   crate is not asked to wait on a fence or to report the buffer free.
 - gsv tells this crate which registrations are two pages long (the semaphore mirror question,
-  row 35).
+  row 35). A fenced release that lands in the second page of such a registration is also written
+  at the same offset in its first page, as Eden-NX2's `Nx2SemaphoreMirror` does
+  (`eden-nx2/src/video_core/nx2.h`, `engines/puller.cpp`; the two-page list from `nx2_gsv.h`,
+  `SubRegisterMemory`). A release anywhere else, a one-page neighbour included, is not copied.
+  Tentative (decided by the owner, 2026-11-20, graphics-server verification item 8): the title
+  brought up waits on the first page while the GPU writes the second; a hardware trace may show
+  a different cause.
 
 Thread rules: every `GpuFront` method only enqueues and never blocks. `Completions::push` is
 called from the front thread (`GpuQueueRoom`), the back thread (`SyncpointChanged`,

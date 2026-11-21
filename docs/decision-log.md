@@ -662,3 +662,12 @@ Entry format:
   7. The lowering's reading wins in general: wherever PR #4588's lowering to Maxwell and its native translator read an encoding differently, every decoder and translator slice follows the lowering, as a listed divergence with a named test and a guess until an `nvdisasm` or hardware check; the decoder groups merged earlier are rechecked against `lower_to_maxwell.h` (#368).
   The work rows (structurizer time on long guarded runs, IR verifier phi checks, local memory and LDCG, the lavapipe experiment and hand checks, render-wgpu follow-ups, small chores, accounts and launch for M2, the M4 items, and the #449 review notes) are taken as recommended and become issues; the production translation wiring was filed earlier as #484.
 - **WHY:** The owner's batch ruling ("Take all", 2026-11-20) on the lead's recommendations, for the reasons each row gives. In brief: splitting where Eden splits gives the same result without empty blocks (1); spec text that contradicts merged, ruled code misleads the next builder (2, 5); a fallback to recording was visible only in `log.txt`, and present feedback was dropped unread (3); host APIs take an 8-bit stencil mask (4); 6d's pull request carries the evidence for its own questions (6); PR #4588 runs titles through its lowering by default, so the lowering's reading is the one titles ran on (graphics-server decision 8), for every slice, not only 12e (7).
+
+## The semaphore mirror page: copy releases, as Eden-NX2 does
+- **WHEN:** 2026-11-20
+- **PROJECT:** starquake
+- **SYSTEM:** graphics-server, gpu-protocol
+- **SCOPE:** moderate
+- **STATUS:** tentative
+- **WHAT:** Graphics-server verification item 8 (the semaphore mirror page, scoping row 35) is answered "no" for now: gsv passes the GPU crate the registrations that are two pages long, and a fenced release that lands in the second page of one is also written at the same offset in its first page, as Eden-NX2's `Nx2SemaphoreMirror` does. A release anywhere else is not copied.
+- **WHY:** In the first retail title brought up, the main thread spins on a semaphore in the first page of a 0x2000-byte registration while the GPU writes its releases into the second page; a scratch copy of those releases got the boot past the stall, to the next missing service. The owner chose to log it as tentative: a hardware trace may show a different cause (a registration or mapping starquake gets wrong), and the copy is revisited then.
