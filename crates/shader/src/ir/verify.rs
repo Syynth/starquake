@@ -27,6 +27,11 @@
 //!    graph, listed in some block in a structured function), has a result and has the phi's
 //!    type; (d) in a control-flow graph, every predecessor has an incoming pair. A condition:
 //!    defined, with a result, of type `u1`.
+//! 5. A structured function's phis (the `phis` submodule): the blocks in tree order, each
+//!    block's phis in order, each incoming pair in order: (a) the block can run last before the
+//!    phi's block (`PhiNotPredecessor`); (b) a value is in scope at the end of that block, where
+//!    the lowering stores it (`PhiOutOfScope`). A predecessor with no pair is not checked here
+//!    (the interpreter refuses it when that block does run last, `PhiNoIncoming`).
 //!
 //! "Defined where it is used" means, in a control-flow graph, defined earlier in the same block
 //! or in a block that dominates the use's block (a use in a block the entry cannot reach is
@@ -34,6 +39,7 @@
 //! function, defined earlier in the tree and not inside an `if` or loop body that has already
 //! ended.
 
+mod phis;
 #[cfg(test)]
 mod tests;
 
@@ -206,7 +212,9 @@ pub enum VerifyError {
         /// The block.
         block: BlockId,
     },
-    /// A phi names a block that is not a predecessor.
+    /// A phi names a block that is not a predecessor: in a control-flow graph, a block whose
+    /// terminator does not name the phi's block; in a structured function, a block that cannot
+    /// run last before the phi's block (step 5).
     #[error("{at} has an incoming value from {block}, which is not a predecessor")]
     PhiNotPredecessor {
         /// The phi.
@@ -220,6 +228,17 @@ pub enum VerifyError {
         /// The phi.
         at: Value,
         /// The predecessor.
+        block: BlockId,
+    },
+    /// A structured phi takes a value that is not in scope at the end of the block it names
+    /// (step 5), where the lowering stores it.
+    #[error("{at} takes {operand} from {block}, where it is not in scope")]
+    PhiOutOfScope {
+        /// The phi.
+        at: Value,
+        /// The value.
+        operand: Value,
+        /// The block it takes the value from.
         block: BlockId,
     },
 }
@@ -260,7 +279,8 @@ impl Function {
                     visible: vec![false; self.insts.len()],
                     log: Vec::new(),
                 }
-                .nodes(nodes)
+                .nodes(nodes)?;
+                phis::check(self, nodes, &sites)
             }
         }
     }
@@ -859,7 +879,8 @@ impl Structured<'_> {
         Ok(())
     }
 
-    /// A phi in a structured function: its incoming values need only be listed somewhere.
+    /// A phi in a structured function, step 4: its incoming values need only be listed
+    /// somewhere here; step 5 (the `phis` submodule) checks their blocks and their scope.
     fn phi(&self, at: Value, phi: &Phi) -> Result<(), VerifyError> {
         if !phi.ty.is_value() {
             return Err(VerifyError::PhiType { at, ty: phi.ty });

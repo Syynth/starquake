@@ -46,7 +46,9 @@
 //! the entry point's body always ends with that return. A phi's incoming value is stored at
 //! the end of the block it names, where it must already be computed and in scope (an `if` or
 //! loop body's values leave scope when the body ends, as naga's do); the SSA rewrite only
-//! names such values (`opt::ssa`), and any other is [`LowerError::PhiIncoming`]
+//! names such values (`opt::ssa`), and the verifier refuses any other, and a block that cannot
+//! run last before the phi's, before the lowering starts (`ir::verify`, step 5), so
+//! [`LowerError::PhiIncoming`] is not reached through [`lower_with`]
 //! (`tests::structured::a_phi_value_out_of_scope_is_refused`). **Divergence:** `unreachable` lowers as
 //! the same return. Eden emits `OpUnreachable` (`emit_spirv_control_flow.cpp`), whose
 //! behaviour is undefined when reached; naga has no such statement, and a return is defined.
@@ -323,7 +325,8 @@ pub enum LowerError {
         ty: Type,
     },
     /// A phi names a value that is not computed, or not in scope, at the end of the block it
-    /// takes it from (see the module docs, "Structured control flow").
+    /// takes it from (see the module docs, "Structured control flow"). The verifier refuses
+    /// such a phi first (`VerifyError::PhiOutOfScope`), so [`lower_with`] does not reach this.
     #[error("{at} takes {value} from {from}, where it is not in scope")]
     PhiIncoming {
         /// The phi.

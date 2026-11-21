@@ -340,10 +340,12 @@ block1:
             .map(|e| e.to_string()),
         Some("%0 is a phi in the first block run, so no value flows into it".to_owned())
     );
+    // The verifier does not check that a structured phi has a pair from every block that can
+    // run last (`ir::verify`'s step 5), so the run refuses it.
     let no_incoming = "block0:
     %0 = LaneId
 block1:
-    %1: u32 = Phi [block2: u32 7]
+    %1: u32 = Phi
 block2:
 structure:
     block0
@@ -356,6 +358,8 @@ structure:
             .map(|e| e.to_string()),
         Some("%1 has no incoming value from block0".to_owned())
     );
+    // A value not yet computed at the end of the block named is out of scope there, which the
+    // verifier refuses before the run starts.
     let not_computed = "block0:
     %0 = LaneId
 block1:
@@ -371,7 +375,10 @@ structure:
         run(not_computed, &mut Machine::new())
             .err()
             .map(|e| e.to_string()),
-        Some("%1 reads %2, which the run has not computed".to_owned())
+        Some(
+            "the function is malformed: %1 takes %2 from block0, where it is not in scope"
+                .to_owned()
+        )
     );
 }
 
