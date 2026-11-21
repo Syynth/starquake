@@ -80,8 +80,10 @@
 //!
 //! Eden's Maxwell `S2R` reads more registers than the PR (the invocation id and info, the
 //! packed thread id, the thread-kill flag, the Y direction, and zero for every other one); they
-//! are rejected here, as in the PR. Owner question: `IPA.OFFSET` follows the issue and the
-//! spec's gap table, not the PR's rejection.
+//! are rejected here, as in the PR. `IPA.OFFSET` follows the spec's gap table, not the PR's
+//! rejection, and `AL2P` and `PIXLD` come from Eden: the owner accepted both as built (decision
+//! log, 2026-11-19, "Owner rulings on the wave 44 and 45 questions", row 5); the W at the
+//! offset stays a guess (the divergence table).
 
 #[cfg(test)]
 mod tests;
