@@ -32,8 +32,14 @@
 //!      `static_cast<s32>(static_cast<s64>(U64()))`), and whose base, argument 0, is not an
 //!      immediate; then a `PackUint2x32` is looked through when its argument is not an
 //!      immediate; what is left must be a `CompositeConstructU32x2`, whose argument 0 is the
-//!      low address. `Identity` chains are looked through everywhere, as Eden's
-//!      `InstRecursive` and `IsImmediate` do.
+//!      low address. `Identity` chains are looked through at each of these steps, as Eden's
+//!      `InstRecursive` and `IsImmediate` do (`tests::look_through`). An argument one of these
+//!      steps reads that is not there (the access's argument 0, the `IAdd64`'s argument 1 or
+//!      0, the `PackUint2x32`'s argument 0, the pair's argument 0) is
+//!      [`UntracedReason::MissingArgument`], reported at that step
+//!      (`tests::rejections::a_missing_address_argument_is_refused`). Only a function that does
+//!      not verify has one; Eden's instructions always carry their opcode's arguments, and its
+//!      `Inst::Arg` does not check the index (`frontend/ir/value.h`).
 //!    - **The pointer** (Eden's `Track`). A search from the low address for a `GetCbufU32` or
 //!      `GetCbufU32x2` whose bank and offset are `u32` immediates, the offset a multiple of
 //!      the alignment, first with NVN's bias ([`NVN_BIAS`]: bank 0, offsets `0x100` to `0x700`,
@@ -58,21 +64,36 @@
 //!    until identity removal or dead code elimination takes it out. The new instructions
 //!    carry their opcode's default flags, as Eden's `PrependNewInst` gives them.
 //!
-//! Every refusal happens while collecting, before anything is changed, so a refused function
-//! is left as it was (`tests::rejections::a_refused_function_is_unchanged`). The checks run
-//! access by access in collection order, and for one access in this order: the low address
-//! (each [`UntracedReason`] in the order above), the pointer ([`UntracedReason::ImmediateLowWord`],
-//! then [`UntracedReason::NoPointer`]), then the pointer's bank ([`GlobalMemoryError::Bank`]),
-//! its offset ([`GlobalMemoryError::Offset`]) and, for a store or an atomic, its data argument
-//! ([`GlobalMemoryError::MissingData`]). The first fault is the error
-//! (`tests::rejections::the_first_access_in_post_order_is_reported`,
-//! `tests::rejections::bank_is_checked_before_offset`). A malformed function
+//! Every refusal but one happens while collecting, before anything is changed, so a function
+//! refused with [`GlobalMemoryError::Untraced`], [`GlobalMemoryError::Bank`],
+//! [`GlobalMemoryError::Offset`], [`GlobalMemoryError::MissingData`] or
+//! [`GlobalMemoryError::Pass`] is left as it was (`tests::rejections::a_refused_function_is_unchanged`;
+//! every refusal test checks it). The checks run access by access in collection order, and for
+//! one access in this order: the low address (each [`UntracedReason`] in the order above), the
+//! pointer ([`UntracedReason::ImmediateLowWord`], then [`UntracedReason::NoPointer`]), then the
+//! pointer's bank ([`GlobalMemoryError::Bank`]), its offset ([`GlobalMemoryError::Offset`])
+//! and, for a store or an atomic, its data argument ([`GlobalMemoryError::MissingData`]). The
+//! first fault is the error (`tests::rejections::the_first_access_in_post_order_is_reported`,
+//! `tests::rejections::bank_is_checked_before_offset`,
+//! `tests::rejections::offset_is_checked_before_data`, and bank before data in
+//! `tests::rejections::a_missing_data_argument_is_refused`). A malformed function
 //! ([`GlobalMemoryError::Pass`]: an `Identity` chain that loops, an id with no instruction) is
-//! reported when the walk meets it, before those checks; and once every access has passed
-//! them, an arena without room for the replacements ([`BuildError::Full`];
-//! `tests::arena_room_edges` pins the decision, the pure `arena_fits`; no test reaches its
-//! call, which needs an arena of about 2^32 instructions). After that the replacement cannot
-//! fail: [`Function::push`] refuses only a full arena.
+//! reported when the walk meets it, before those checks: every access's low address is walked
+//! before any access's pointer is checked, so a loop in a later access's low address is the
+//! error even when an earlier access would be refused
+//! (`tests::rejections::a_malformed_low_address_is_reported_before_an_earlier_refusal`). Once
+//! every access has passed them, an arena without room for the replacements is refused
+//! ([`BuildError::Full`]; `tests::arena_room_edges` pins the decision, the pure `arena_fits`; no
+//! test reaches its call, which needs an arena of about 2^32 instructions).
+//!
+//! The replacement then changes the function block by block. [`Function::push`] refuses a
+//! full arena, which `arena_fits` has ruled out, and a block that does not exist, which cannot
+//! happen, as the blocks replaced are the ones the walk listed; either would be returned as
+//! [`GlobalMemoryError::Pass`] with the blocks before it already converted. The one refusal
+//! that comes after the change is [`GlobalMemoryError::Verify`]: in tests and debug builds the
+//! output is verified, and a function that does not verify is returned converted, as the
+//! parent module's `run` leaves a pass's output
+//! (`tests::a_function_that_does_not_verify_is_converted_then_refused`).
 //!
 //! # Where this pass departs from Eden's
 //!
@@ -117,14 +138,29 @@
 //! (`tests::golden::an_offset_with_a_zero_low_word_adds_nothing`), and the float atomics'
 //! controls are dropped, as the storage opcodes carry none in Eden's table.
 //!
-//! **Not followed: PR #4588's change for native programs.** PR #4588's version of this pass
+//! **Conflict: PR #4588's search, not followed.** The two Switch 2 references disagree here.
+//! PR #4588's version of this pass
 //! (`eden-pr4588/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp`
-//! @ e5fb3b97, `CollectStorageBuffers` and `Track` with `native_env`) searches native programs
-//! without the NVN bias, only through `IAdd32`, phis, the two values of a `SelectU32` and
-//! component 0 of a `CompositeExtractU32x2`, and accepts a pointer only when the environment
-//! finds a mapped GPU address in that constant-buffer word (`IsCbufStorageBufferPointer`,
-//! `video_core/shader_environment.cpp`). The spec ports Eden's pass "as is", which this
-//! follows; whether native programs should take the PR's search is an **owner question**.
+//! @ e5fb3b97, `CollectStorageBuffers` and `Track` with `native_env`) takes a different search
+//! whenever the environment's `HasNativeRegisterCopies()` is true, and that is every Switch 2
+//! program it lowers: `GenericEnvironment::HasNativeRegisterCopies` returns true whenever
+//! `native_source_size` is set (`video_core/shader_environment.cpp` @ e5fb3b97), and the
+//! default lowering path sets it (`native_source_size = native_header_size +
+//! lowered.source_size;` after `LowerToMaxwell`), so it runs no Switch 2 program through
+//! Eden's search. That search has no NVN bias, follows only
+//! `IAdd32`, phis, the two values of a `SelectU32` and component 0 of a
+//! `CompositeExtractU32x2`, and accepts a pointer only when the environment finds a mapped GPU
+//! address in that constant-buffer word (`IsCbufStorageBufferPointer`). The PR's stated
+//! reason for dropping the bias is that applying it "can skip the pointer and select a
+//! dimension or stride instead". Eden-NX2's copy of the pass
+//! (`eden-nx2/src/shader_recompiler/ir_opt/global_memory_to_storage_buffer_pass.cpp`
+//! @ 50fa86bb) keeps Eden's biased breadth-first search, adding only a memo of each start's
+//! result. Graphics-server decision 8 (the larger answer where one contains the other,
+//! otherwise the one a title ran on) names no winner: neither search contains the other, and
+//! both references ran titles. So this follows the spec's sentence for the pass, "Ported as
+//! is" (shader-pipeline, "Passes needed for correctness", item 4), which is Eden's and
+//! Eden-NX2's search. Whether Switch 2 programs should take PR #4588's search instead is an
+//! **owner question**.
 //!
 //! # Where it runs
 //!
@@ -282,6 +318,11 @@ impl StorageBuffers {
 /// docs, "What the pass does").
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UntracedReason {
+    /// The access, or an instruction its low address is built from, lacks an argument the
+    /// walk reads: the access's argument 0, an `IAdd64`'s argument 0 or 1, a `PackUint2x32`'s
+    /// argument 0 or a `CompositeConstructU32x2`'s argument 0 (only a function that does not
+    /// verify has one).
+    MissingArgument,
     /// The address is an immediate.
     ImmediateAddress,
     /// The address is an `IAdd64` whose offset is not a `u64` immediate.
@@ -303,6 +344,9 @@ impl UntracedReason {
     /// The reason in words.
     pub const fn describe(self) -> &'static str {
         match self {
+            Self::MissingArgument => {
+                "the access or an instruction its address is built from lacks an argument"
+            }
             Self::ImmediateAddress => "the address is an immediate",
             Self::OffsetNotImmediate => "the 64-bit addition's offset is not a u64 immediate",
             Self::ImmediateBase => "the 64-bit addition's base is an immediate",
@@ -374,7 +418,7 @@ pub enum GlobalMemoryError {
     #[error(transparent)]
     Pass(#[from] PassError),
     /// The output does not verify (checked in tests and debug builds, as the parent module's
-    /// `run` checks).
+    /// `run` checks). The function is left converted, as `run` leaves a pass's output.
     #[error("after global memory to storage buffers: {0}")]
     Verify(VerifyError),
 }
@@ -452,7 +496,9 @@ const fn storage_opcode(opcode: Opcode) -> Option<(Opcode, Access)> {
 
 /// Runs the pass on `function` with the host's storage-buffer alignment (see the module docs):
 /// every global memory access becomes a storage-buffer access, and the storage buffers are
-/// returned. A refused function is left unchanged.
+/// returned. A function refused with any error but [`GlobalMemoryError::Verify`] is left
+/// unchanged; `Verify`, checked in tests and debug builds after the replacement, is returned
+/// with the function already converted (module docs).
 pub fn to_storage_buffers(
     function: &mut Function,
     alignment: StorageAlignment,
@@ -705,30 +751,47 @@ fn low_address(
                 None => Ok(None),
             }
         };
-    let Some(Operand::Value(mut current)) = arg(access, 0, work)? else {
+    let Some(address) = arg(access, 0, work)? else {
+        return Ok(Err(UntracedReason::MissingArgument));
+    };
+    let Operand::Value(mut current) = address else {
         return Ok(Err(UntracedReason::ImmediateAddress));
     };
     let mut imm_offset = 0_u32;
     if operation(function, current)?.0 == Some(Opcode::IAdd64) {
-        let Some(Operand::Imm(Imm::U64(bits))) = arg(current, 1, work)? else {
+        let Some(offset) = arg(current, 1, work)? else {
+            return Ok(Err(UntracedReason::MissingArgument));
+        };
+        let Operand::Imm(Imm::U64(bits)) = offset else {
             return Ok(Err(UntracedReason::OffsetNotImmediate));
         };
         // The low 32 bits: Eden's `static_cast<s32>(static_cast<s64>(U64()))`.
         imm_offset = u32::try_from(bits & u64::from(u32::MAX)).unwrap_or_default();
-        let Some(Operand::Value(base)) = arg(current, 0, work)? else {
+        // An operation with argument 1 has argument 0, so this `None` cannot be reached; it
+        // is kept so that a missing base reads as what it is.
+        let Some(base) = arg(current, 0, work)? else {
+            return Ok(Err(UntracedReason::MissingArgument));
+        };
+        let Operand::Value(base) = base else {
             return Ok(Err(UntracedReason::ImmediateBase));
         };
         current = base;
     }
     if operation(function, current)?.0 == Some(Opcode::PackUint2x32) {
-        let Some(Operand::Value(vector)) = arg(current, 0, work)? else {
+        let Some(vector) = arg(current, 0, work)? else {
+            return Ok(Err(UntracedReason::MissingArgument));
+        };
+        let Operand::Value(vector) = vector else {
             return Ok(Err(UntracedReason::ImmediatePair));
         };
         current = vector;
     }
     let (opcode, args) = operation(function, current)?;
-    let (Some(Opcode::CompositeConstructU32x2), Some(&low_word)) = (opcode, args.first()) else {
+    if opcode != Some(Opcode::CompositeConstructU32x2) {
         return Ok(Err(UntracedReason::NotAPair));
+    }
+    let Some(&low_word) = args.first() else {
+        return Ok(Err(UntracedReason::MissingArgument));
     };
     let Operand::Value(start) = resolver.resolve(function, low_word, work)? else {
         return Ok(Err(UntracedReason::ImmediateLowWord));

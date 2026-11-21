@@ -573,6 +573,10 @@ mod rejections {
     fn the_words_are_plain() {
         use UntracedReason as R;
         let words = [
+            (
+                R::MissingArgument,
+                "the access or an instruction its address is built from lacks an argument",
+            ),
             (R::ImmediateAddress, "the address is an immediate"),
             (
                 R::OffsetNotImmediate,
@@ -839,11 +843,200 @@ block1:
              \x20   %1: opaque = Identity %0\n\
              \x20   %8: u64 = IAdd64 %0, u64 0x10\n",
         );
-        assert!(matches!(
+        assert_eq!(
             refuse(&text),
-            GlobalMemoryError::Pass(PassError::Identity(_))
-        ));
+            GlobalMemoryError::Pass(PassError::Identity(value(0)))
+        );
     }
+
+    /// A malformed function is reported when the walk meets it, before the checks of an
+    /// earlier access: the low addresses are all walked first (module docs). The earlier
+    /// access alone would be refused for its pointer (no pointer, or a bank past the last).
+    #[test]
+    fn a_malformed_low_address_is_reported_before_an_earlier_refusal() {
+        for (bank, offset) in [(0, 0x104), (u32::from(CBUF_BANKS), 0x8)] {
+            let text = format!(
+                "block0:
+    %0: u32 = GetCbufU32 u32 {bank:#x}, u32 {offset:#x}
+    %1: u32x2 = CompositeConstructU32x2 %0, u32 0x0
+    %2: u64 = PackUint2x32 %1
+    %3: u32 = LoadGlobal32 %2
+    %4: opaque = Identity %5
+    %5: opaque = Identity %4
+    %6: u64 = IAdd64 %4, u64 0x10
+    %7: u32 = LoadGlobal32 %6
+    return
+"
+            );
+            assert_eq!(
+                refuse(&text),
+                GlobalMemoryError::Pass(PassError::Identity(value(4))),
+                "{bank} {offset:#x}"
+            );
+            // Without the cycle, the earlier access's own refusal is the error.
+            let alone = text.replace(
+                "    %4: opaque = Identity %5\n    %5: opaque = Identity %4\n    %6: u64 = IAdd64 %4, u64 0x10\n    %7: u32 = LoadGlobal32 %6\n",
+                "",
+            );
+            let expected = if bank == 0 {
+                GlobalMemoryError::Untraced {
+                    at: value(3),
+                    opcode: Opcode::LoadGlobal32,
+                    reason: UntracedReason::NoPointer,
+                }
+            } else {
+                GlobalMemoryError::Bank {
+                    at: value(3),
+                    opcode: Opcode::LoadGlobal32,
+                    bank,
+                }
+            };
+            assert_eq!(refuse(&alone), expected, "{bank} {offset:#x}");
+        }
+    }
+
+    /// A store or an atomic with no data argument and a pointer that ends past its bank: the
+    /// offset is reported before the data argument (module docs' order).
+    #[test]
+    fn offset_is_checked_before_data() {
+        for (access, opcode) in [
+            ("    %3 = WriteGlobal32 %2\n", Opcode::WriteGlobal32),
+            (
+                "    %3: u32 = GlobalAtomicIAdd32 %2\n",
+                Opcode::GlobalAtomicIAdd32,
+            ),
+        ] {
+            let text = format!(
+                "block0:
+    %0: u32 = GetCbufU32 u32 0x2, u32 {INDEXED_CBUF_SIZE:#x}
+    %1: u32x2 = CompositeConstructU32x2 %0, u32 0x0
+    %2: u64 = PackUint2x32 %1
+{access}    return
+"
+            );
+            assert_eq!(
+                refuse(&text),
+                GlobalMemoryError::Offset {
+                    at: value(3),
+                    opcode,
+                    bank: 2,
+                    offset: INDEXED_CBUF_SIZE,
+                },
+                "{opcode}"
+            );
+        }
+    }
+
+    /// A missing argument where the low address is read is its own reason, at each step that
+    /// reads one: the access's address, the `IAdd64`'s offset, the `PackUint2x32`'s pair and
+    /// the pair's low word (only a function that does not verify has one).
+    #[test]
+    fn a_missing_address_argument_is_refused() {
+        let missing = untraced(UntracedReason::MissingArgument);
+        assert_eq!(
+            refuse("block0:\n    %9: u32 = LoadGlobal32\n    return\n"),
+            missing
+        );
+        let pair = "    %0: u32 = GetCbufU32 u32 0x0, u32 0x100\n\
+                    \x20   %1: u32x2 = CompositeConstructU32x2 %0, u32 0x0\n\
+                    \x20   %2: u64 = PackUint2x32 %1\n";
+        for body in [
+            "    %8: u64 = IAdd64\n".to_owned(),
+            format!("{pair}    %8: u64 = IAdd64 %2\n"),
+            "    %8: u64 = PackUint2x32\n".to_owned(),
+            "    %1: u32x2 = CompositeConstructU32x2\n    %8: u64 = PackUint2x32 %1\n".to_owned(),
+        ] {
+            assert_eq!(refuse(&through(&body)), missing, "{body}");
+        }
+    }
+}
+
+/// `Identity` is looked through at each step of the low address (module docs): the `IAdd64`'s
+/// offset, the `PackUint2x32`'s pair and the pair's low word.
+mod look_through {
+    use super::*;
+
+    #[test]
+    fn an_identity_offset_is_an_immediate_offset() {
+        let (text, buffers) = convert(
+            "block0:
+    %0: u32 = GetCbufU32 u32 0x0, u32 0x100
+    %1: u32x2 = CompositeConstructU32x2 %0, u32 0x0
+    %2: u64 = PackUint2x32 %1
+    %3: opaque = Identity u64 0x10
+    %4: u64 = IAdd64 %2, %3
+    %5: u32 = LoadGlobal32 %4
+    return
+",
+        );
+        assert!(text.contains("%6: u32 = IAdd32 %0, u32 0x10"), "{text}");
+        assert_eq!(buffers.descriptors(), [descriptor(0, 0x100, false)]);
+    }
+
+    #[test]
+    fn an_identity_of_an_immediate_low_word_is_an_immediate() {
+        let text = "block0:
+    %0: u32 = GetCbufU32 u32 0x0, u32 0x104
+    %1: opaque = Identity u32 0x1000
+    %2: u32x2 = CompositeConstructU32x2 %1, %0
+    %3: u64 = PackUint2x32 %2
+    %4: u32 = LoadGlobal32 %3
+    return
+";
+        assert_eq!(
+            refuse(text),
+            GlobalMemoryError::Untraced {
+                at: value(4),
+                opcode: Opcode::LoadGlobal32,
+                reason: UntracedReason::ImmediateLowWord,
+            }
+        );
+    }
+
+    #[test]
+    fn an_identity_of_the_pair_is_packed() {
+        let (text, buffers) = convert(
+            "block0:
+    %0: u32 = GetCbufU32 u32 0x3, u32 0x8
+    %1: u32x2 = CompositeConstructU32x2 %0, u32 0x0
+    %2: opaque = Identity %1
+    %3: u64 = PackUint2x32 %2
+    %4: u32 = LoadGlobal32 %3
+    return
+",
+        );
+        assert!(text.contains("LoadStorage32 u32 0x0"), "{text}");
+        assert_eq!(buffers.descriptors(), [descriptor(3, 0x8, false)]);
+    }
+}
+
+/// In tests and debug builds the output is verified after the replacement: a function that
+/// does not verify for a reason the pass does not touch is converted, then refused with
+/// [`GlobalMemoryError::Verify`] (module docs: the one error that keeps the change).
+#[test]
+fn a_function_that_does_not_verify_is_converted_then_refused() {
+    let mut function = parse(
+        "block0:
+    %0: u32 = GetCbufU32 u32 0x0, u32 0x100
+    %1: u32x2 = CompositeConstructU32x2 %0, u32 0x0
+    %2: u64 = PackUint2x32 %1
+    %3: u32 = LoadGlobal32 %2
+    %4 = SetAttribute a0x80, u32 0x1, u32 0x0
+    return
+",
+    );
+    assert_eq!(
+        to_storage_buffers(&mut function, align(ALIGN)),
+        Err(GlobalMemoryError::Verify(VerifyError::Type {
+            at: crate::ir::Site::Inst(value(4)),
+            index: 1,
+            wanted: Type::F32,
+            found: Type::U32,
+        }))
+    );
+    let text = function.to_string();
+    assert!(text.contains("LoadStorage32 u32 0x0"), "{text}");
+    assert!(!text.contains("LoadGlobal32"), "{text}");
 }
 
 mod search {
