@@ -5,9 +5,10 @@
 //! constructs each backend with the shared compile pool, the GPU crate's wait-while-compiling
 //! setting and the completion wake", in that call (`WgpuBackend::with_compile_pool`):
 //!
-//! - **the compile pool**: a fresh [`CompileWorkers`] sized for the host
-//!   (`crate::compile_pool`), which the backend holds and which shuts down when the backend is
-//!   dropped at the end of the run;
+//! - **the compile pool**: the run's one `CompileWorkers`, sized for the host
+//!   (`crate::compile_pool`), which the parent module makes and hands both to this call and to
+//!   the run's shader cache (the parent module's "The shader cache shares the pool"); it shuts
+//!   down when the last of the two is dropped at the end of the run;
 //! - **the wait setting**: the GPU crate's, from the run's `GpuConfig` ([`while_compiling`], the
 //!   one place the GPU crate's `WaitWhileCompiling` becomes the render crate's
 //!   `WhileCompiling`: the render crate depends on no workspace crate, so it cannot name the
@@ -42,7 +43,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use starquake_gpu::back::draw::WaitWhileCompiling;
-use starquake_render::{Backend, CompletionWake, RenderError, WhileCompiling};
+use starquake_render::{Backend, CompilePool, CompletionWake, RenderError, WhileCompiling};
 
 use super::RunFrames;
 use crate::renderer::{MainThread, WindowTarget};
@@ -144,16 +145,15 @@ mod built {
         }
     }
 
-    /// Opens the backend with `open` (module docs).
+    /// Opens the backend with `open` over the run's compile pool `pool` (module docs).
     pub(super) fn open(
         open: &Open,
+        pool: Arc<dyn CompilePool>,
         wake: CompletionWake,
         setting: WhileCompiling,
         keeper: &Arc<RunFrames>,
     ) -> Result<Arc<WgpuBackend>, String> {
-        let pool = crate::compile_pool::CompileWorkers::for_host()
-            .map_err(|error| format!("the compile pool could not be started: {error}"))?;
-        let backend = open(WgpuConfig::DEFAULT, wake, Arc::new(pool), setting)
+        let backend = open(WgpuConfig::DEFAULT, wake, pool, setting)
             .map(Arc::new)
             .map_err(|error| error.to_string())?;
         backend.set_frame_sink(Some(Arc::new(RunSink {
@@ -191,19 +191,21 @@ impl WgpuOpener {
         Self { open }
     }
 
-    /// Opens the wgpu backend for a run (module docs): built with `wake` and the GPU crate's
-    /// `setting`, dumping into `keeper`, and presenting into `window` if there is one, whose
-    /// surface is made on the frontend's main thread within `present_wait`.
+    /// Opens the wgpu backend for a run (module docs): built over the run's compile pool `pool`
+    /// with `wake` and the GPU crate's `setting`, dumping into `keeper`, and presenting into
+    /// `window` if there is one, whose surface is made on the frontend's main thread within
+    /// `present_wait`.
     #[cfg(feature = "wgpu")]
     pub(crate) fn open(
         &self,
+        pool: Arc<dyn CompilePool>,
         wake: CompletionWake,
         setting: WaitWhileCompiling,
         keeper: &Arc<RunFrames>,
         window: Option<&WindowTarget>,
         present_wait: Duration,
     ) -> Result<Arc<dyn Backend>, Unopened> {
-        let backend = built::open(&*self.open, wake, while_compiling(setting), keeper)
+        let backend = built::open(&*self.open, pool, wake, while_compiling(setting), keeper)
             .map_err(Unopened::Backend)?;
         if let Some(window) = window {
             let target = Arc::clone(&backend);
@@ -220,6 +222,7 @@ impl WgpuOpener {
     #[cfg(not(feature = "wgpu"))]
     pub(crate) fn open(
         &self,
+        _pool: Arc<dyn CompilePool>,
         _wake: CompletionWake,
         _setting: WaitWhileCompiling,
         _keeper: &Arc<RunFrames>,
