@@ -42,12 +42,18 @@ fn the_constants_are_nx2_s_literals() {
 #[test]
 fn only_a_registration_of_exactly_two_pages_is_a_semaphore_registration() {
     let bytes = SEMAPHORE_REGISTRATION_BYTES;
-    assert_eq!(SemaphoreRegistration::new(range(S, bytes - PAGE_SIZE)), None);
+    assert_eq!(
+        SemaphoreRegistration::new(range(S, bytes - PAGE_SIZE)),
+        None
+    );
     assert_eq!(
         SemaphoreRegistration::new(range(S, bytes)).map(SemaphoreRegistration::start),
         Some(S)
     );
-    assert_eq!(SemaphoreRegistration::new(range(S, bytes + PAGE_SIZE)), None);
+    assert_eq!(
+        SemaphoreRegistration::new(range(S, bytes + PAGE_SIZE)),
+        None
+    );
 }
 
 /// Each edge of the second page, on both sides, and a release in the first page.
@@ -77,7 +83,10 @@ fn a_release_is_mirrored_from_exactly_the_second_page() {
 fn a_neighbour_starting_at_the_end_bound_keeps_its_own_pages() {
     let next = S + SEMAPHORE_REGISTRATION_BYTES;
     let pages = listing(&[S, next]);
-    assert_eq!(pages.mirror_of(next - 4), Some(next - 4 - SEMAPHORE_MIRROR_OFFSET));
+    assert_eq!(
+        pages.mirror_of(next - 4),
+        Some(next - 4 - SEMAPHORE_MIRROR_OFFSET)
+    );
     assert_eq!(pages.mirror_of(next), None);
     assert_eq!(pages.mirror_of(next + 0x10), None);
     assert_eq!(
@@ -140,7 +149,11 @@ fn more_than_32_registrations_all_mirror() {
         .collect();
     let pages = listing(&starts);
     for start in starts {
-        assert_eq!(pages.mirror_of(start + 0x1004), Some(start + 4), "{start:#x}");
+        assert_eq!(
+            pages.mirror_of(start + 0x1004),
+            Some(start + 4),
+            "{start:#x}"
+        );
     }
 }
 
@@ -157,7 +170,10 @@ fn lookups_at_the_ends_of_the_address_space_do_not_wrap() {
     let top = u64::MAX - (SEMAPHORE_REGISTRATION_BYTES + PAGE_SIZE) + 1;
     let high = listing(&[top]);
     let end = top + SEMAPHORE_REGISTRATION_BYTES;
-    assert_eq!(high.mirror_of(end - 1), Some(end - 1 - SEMAPHORE_MIRROR_OFFSET));
+    assert_eq!(
+        high.mirror_of(end - 1),
+        Some(end - 1 - SEMAPHORE_MIRROR_OFFSET)
+    );
     assert_eq!(high.mirror_of(end), None);
     assert_eq!(high.mirror_of(u64::MAX), None);
 }
@@ -172,7 +188,10 @@ fn a_start_whose_end_overflows_still_answers() {
         mirror_in(&starts, u64::MAX),
         Some(u64::MAX - SEMAPHORE_MIRROR_OFFSET)
     );
-    assert_eq!(mirror_in(&starts, start + SEMAPHORE_MIRROR_OFFSET - 1), None);
+    assert_eq!(
+        mirror_in(&starts, start + SEMAPHORE_MIRROR_OFFSET - 1),
+        None
+    );
 }
 
 /// The table's list: what gsv calls, answered by the table; not a translation, so the version

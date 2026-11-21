@@ -144,7 +144,9 @@ fn only_a_release_starting_in_the_second_page_is_copied() {
     ] {
         let mut r = rig();
         let m = mirrored(&r);
-        r.fences.attach(m.action(four(address, 0x5a5a_0001))).unwrap();
+        r.fences
+            .attach(m.action(four(address, 0x5a5a_0001)))
+            .unwrap();
         assert_eq!(m.word(address), 0x5a5a_0001, "{address:#x}");
         match copied {
             Some(at) => assert_eq!(m.word(at), 0x5a5a_0001, "{address:#x}"),
@@ -172,13 +174,17 @@ fn only_a_release_starting_in_the_second_page_is_copied() {
 fn a_release_across_a_page_edge_is_decided_by_its_first_byte() {
     let mut r = rig();
     let m = mirrored(&r);
-    r.fences.attach(m.action(sixteen(SECOND - 8, 0x11))).unwrap();
+    r.fences
+        .attach(m.action(sixteen(SECOND - 8, 0x11)))
+        .unwrap();
     assert_eq!(m.bytes(SECOND - 8, 16), sixteen_bytes(0x11));
     assert!(m.untouched(S - 8, 16));
 
     let mut r = rig();
     let m = mirrored(&r);
-    r.fences.attach(m.action(sixteen(NEIGHBOUR - 8, 0x22))).unwrap();
+    r.fences
+        .attach(m.action(sixteen(NEIGHBOUR - 8, 0x22)))
+        .unwrap();
     assert_eq!(m.bytes(NEIGHBOUR - 8, 16), sixteen_bytes(0x22));
     assert_eq!(m.bytes(SECOND - 8, 16), sixteen_bytes(0x22));
     assert!(m.untouched(SECOND + 8, 8));
@@ -216,7 +222,10 @@ fn every_release_form_is_copied() {
         assert_ne!(written, vec![FILL; len]);
         let copy = release.address - SEMAPHORE_MIRROR_OFFSET;
         assert_eq!(m.bytes(copy, len), written, "{release:?}");
-        assert!(m.untouched(copy + u64::try_from(len).unwrap(), 4), "{release:?}");
+        assert!(
+            m.untouched(copy + u64::try_from(len).unwrap(), 4),
+            "{release:?}"
+        );
     }
 }
 
@@ -365,7 +374,11 @@ fn a_waiter_on_the_copy_closes_the_open_list() {
         });
         r.fences.record(command(1)).unwrap();
         let attached = r.fences.attach(m.action(four(address, 7))).unwrap();
-        assert_eq!(matches!(attached, Attached::InFlight(_)), closed, "{address:#x}");
+        assert_eq!(
+            matches!(attached, Attached::InFlight(_)),
+            closed,
+            "{address:#x}"
+        );
         assert_eq!(r.fences.counters().closed.waiter, u64::from(closed));
     }
 }

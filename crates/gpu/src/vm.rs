@@ -186,8 +186,8 @@ mod mirror;
 #[cfg(test)]
 mod tests;
 
-pub use mirror::{SEMAPHORE_MIRROR_OFFSET, SEMAPHORE_REGISTRATION_BYTES, SemaphoreRegistration};
 use mirror::SemaphorePages;
+pub use mirror::{SEMAPHORE_MIRROR_OFFSET, SEMAPHORE_REGISTRATION_BYTES, SemaphoreRegistration};
 
 /// The size of the syncpoint shim in pages: PR's `nvhost_as_gpu::GetNativeSyncpointShim`
 /// (`eden-pr4588/src/core/hle/service/nvdrv/devices/nvhost_as_gpu.cpp` @ e5fb3b97) reserves

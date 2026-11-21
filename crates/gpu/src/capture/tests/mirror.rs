@@ -17,10 +17,9 @@ use crate::vm::{GpuVm, SEMAPHORE_REGISTRATION_BYTES, SemaphoreRegistration};
 #[test]
 fn the_recording_memory_passes_the_mirror_on_and_the_replay_answers_none() {
     let vm = Arc::new(GpuVm::new());
-    let registration = SemaphoreRegistration::new(
-        PageRange::new(GPU_BASE, SEMAPHORE_REGISTRATION_BYTES).unwrap(),
-    )
-    .unwrap();
+    let registration =
+        SemaphoreRegistration::new(PageRange::new(GPU_BASE, SEMAPHORE_REGISTRATION_BYTES).unwrap())
+            .unwrap();
     vm.add_semaphore_registration(registration);
     let inner = Arc::new(VmMemory::new(
         vm,

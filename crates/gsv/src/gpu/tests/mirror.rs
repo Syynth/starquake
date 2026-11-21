@@ -75,7 +75,10 @@ fn only_two_page_registrations_are_listed() {
 #[test]
 fn a_new_space_lists_the_registrations_held() {
     let (mut gpu, front) = bare();
-    register_bare(&mut gpu, page_range(SEMAPHORES, SEMAPHORE_REGISTRATION_BYTES));
+    register_bare(
+        &mut gpu,
+        page_range(SEMAPHORES, SEMAPHORE_REGISTRATION_BYTES),
+    );
     register_bare(&mut gpu, page_range(MEMORY, MEMORY_SIZE));
     let space = gpu.create_address_space(&front).unwrap();
     let table = front.table(space);
@@ -97,7 +100,10 @@ fn a_destroy_unlists_at_the_request() {
     for space in [s.space, other] {
         let table = s.rig.front.table(AsId(space));
         assert!(!lists(&table, SEMAPHORES), "{space}");
-        assert!(s.rig.at(space, SEMAPHORES).is_some(), "still mapped: {space}");
+        assert!(
+            s.rig.at(space, SEMAPHORES).is_some(),
+            "still mapped: {space}"
+        );
     }
 }
 
@@ -136,7 +142,10 @@ fn a_destroyed_space_lists_nothing() {
     let (mut gpu, front) = bare();
     let space = gpu.create_address_space(&front).unwrap();
     let other = gpu.create_address_space(&front).unwrap();
-    register_bare(&mut gpu, page_range(SEMAPHORES, SEMAPHORE_REGISTRATION_BYTES));
+    register_bare(
+        &mut gpu,
+        page_range(SEMAPHORES, SEMAPHORE_REGISTRATION_BYTES),
+    );
     let destroyed = front.table(space);
     gpu.destroy_address_space(&front, space).unwrap();
     assert!(!lists(&destroyed, SEMAPHORES));

@@ -36,7 +36,9 @@ fn a_release_into_the_second_page_reaches_the_first_through_the_threads() {
     let release = REGISTRATION + SEMAPHORE_MIRROR_OFFSET + 0x10;
     r.gpu
         .submit(channel, plain(vec![r.entry(CMD, &releases(release, 0x77))]));
-    wait_until("the copy is written", || r.word(REGISTRATION + 0x10) == 0x77);
+    wait_until("the copy is written", || {
+        r.word(REGISTRATION + 0x10) == 0x77
+    });
     assert_eq!(r.word(release), 0x77);
     r.gpu.stop().unwrap();
 }
