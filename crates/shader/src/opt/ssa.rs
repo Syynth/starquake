@@ -34,8 +34,12 @@
 //! The rewrite runs after the structurizer, on the structured function, in Eden's order (the
 //! owner's ruling of 2026-11-19, decision log, "Owner rulings on the wave 44 and 45 questions",
 //! row 3: `frontend/maxwell/translate_program.cpp` @ cf654052 calls `BuildASL` at line 337 and
-//! `SsaRewritePass` at line 389). It also still takes a control-flow graph, as slice 8 built it
-//! (the departures below that name a graph are about that form). On a structured function:
+//! `SsaRewritePass` at line 389). In that order it is handed the structured function: the
+//! translation driver fills the control-flow graph (`crate::translate::translate_flow`), the
+//! structurizer structures it (`crate::structure`), then this pass and the rest run. It also
+//! still takes a control-flow graph, the form slice 8 first took, which its tests keep
+//! covering (the departures below that name a graph are about that form). On a structured
+//! function:
 //!
 //! - **Predecessors come from the tree** (the `tree` submodule). Eden's structurizer records
 //!   them as it emits the tree (`frontend/maxwell/structured_control_flow.cpp`,

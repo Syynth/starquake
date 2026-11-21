@@ -55,8 +55,10 @@
 //! its block, before the block's gotos, and the conditional goto tests that variable. A
 //! variable set next to its block is never separated from it: every run of statements goto
 //! elimination moves starts after a goto, at a label or at an `if` or loop, and ends at a
-//! label, a goto, an `if` or loop, or the end of a list. The SSA pass (slice 8) turns these
-//! variables into values, as it does Eden's goto variables.
+//! label, a goto, an `if` or loop, or the end of a list. The SSA pass (slice 8, reworked as 8b
+//! to take the structured tree), which runs after this one, turns these variables into values,
+//! as Eden's turns its goto variables (the owner's ruling of 2026-11-19, row 3, which also
+//! accepted keeping conditions in variables, row 4).
 //!
 //! # What it takes
 //!
@@ -143,12 +145,14 @@
 //! condition walk's own stacks are bounded by the condition it walks and freed after it. So a
 //! run of [`MAX_STRUCTURE_WORK`] units can make a hostile input allocate up to about 55 GiB
 //! (2^28 × 220 bytes), or twice that in capacity: far more than a host has, so the limit as it
-//! stands bounds time, not memory (an owner question, with the limit's own: lower it, or
-//! charge allocations against a byte budget). The tree may nest at most [`MAX_NESTING`] levels
-//! ([`StructureError::TooDeep`], `tests::limits::nesting_at_its_edge`), the verifier's bound,
-//! which also bounds the emission's recursion. Eden has neither limit. A chain of 257
-//! conditional branches to one block already nests 256 levels deep, so whether real programs
-//! fit is to be checked (an owner question, with `MAX_NESTING`'s own).
+//! stands bounds time, not memory. The owner accepted the limit as built, still a guess
+//! (decision log, 2026-11-19, "Owner rulings on the wave 44 and 45 questions", row 4); real
+//! programs would show whether to lower it or to charge allocations against a byte budget.
+//! The tree may nest at most [`MAX_NESTING`] levels ([`StructureError::TooDeep`],
+//! `tests::limits::nesting_at_its_edge`), the verifier's bound, which also bounds the
+//! emission's recursion. Eden has neither limit. A chain of 257 conditional branches to one
+//! block already nests 256 levels deep, so whether real programs fit is to be checked: the
+//! same ruling accepted `MAX_NESTING` = 256 as built, a guess too.
 //!
 //! # Divergences from Eden
 //!
@@ -182,13 +186,14 @@ use crate::ir::{
 };
 
 /// The work limit [`structure`] and [`IrBlocks::structure`] use (see the module docs, "Limits").
-/// A **guess**: 2^28 units, to check against real programs (an owner question, like flow
-/// analysis's `MAX_FLOW_BLOCKS`). A run of diamonds takes the same work for each diamond
-/// (`tests::limits::work_grows_linearly_with_a_run_of_diamonds`; 145 units each when this
-/// was written), so the limit allows about 1.8 million of them; graphs that nest deeply cost
-/// more per block. It also bounds memory, at up to 220 bytes a unit, so about 55 GiB (twice
-/// that in vector capacity) for a hostile input (the module docs, "Limits"): too much for a
-/// host, which is part of the owner question.
+/// A **guess**: 2^28 units, to check against real programs, like flow analysis's
+/// `MAX_FLOW_BLOCKS`; the owner accepted it as built (decision log, 2026-11-19, "Owner rulings
+/// on the wave 44 and 45 questions", row 4). A run of diamonds takes the same work for each
+/// diamond (`tests::limits::work_grows_linearly_with_a_run_of_diamonds`; 145 units each when
+/// this was written), so the limit allows about 1.8 million of them; graphs that nest deeply
+/// cost more per block. It also bounds memory, at up to 220 bytes a unit, so about 55 GiB
+/// (twice that in vector capacity) for a hostile input (the module docs, "Limits"): too much
+/// for a host, so real programs are also what would show whether to lower it.
 pub const MAX_STRUCTURE_WORK: u64 = 1 << 28;
 
 /// Why a function cannot be structured.

@@ -1,0 +1,35 @@
+---
+source: crates/shader/src/lower/tests/warp.rs
+expression: msl(&shader)
+---
+// language: metal2.4
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using metal::uint;
+
+struct Output {
+    metal::float4 color0_;
+};
+
+struct main_Output {
+    metal::float4 color0_ [[color(0)]];
+};
+fragment main_Output main_(
+) {
+    Output out = {};
+    uint r0_ = {};
+    uint _e1 = r0_;
+    float _e2 = as_type<float>(_e1);
+    float _e3 = metal::dfdx(_e2);
+    out.color0_.x = _e3;
+    float _e7 = metal::dfdy(_e2);
+    out.color0_.y = _e7;
+    float _e11 = metal::dfdx(_e2);
+    out.color0_.z = _e11;
+    float _e15 = metal::dfdy(_e2);
+    out.color0_.w = _e15;
+    Output _e20 = out;
+    const auto _tmp = _e20;
+    return main_Output { _tmp.color0_ };
+}
