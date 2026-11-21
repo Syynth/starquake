@@ -1258,9 +1258,9 @@ const fn is_uniform_datapath(op: &Op) -> bool {
 
 /// The groups are disjoint, and every decoded operation (every one of [`decoded_samples`])
 /// belongs to exactly one of them, but for the uniform datapath's ([`is_uniform_datapath`]),
-/// which belong to none, so the dispatch order decides nothing; a shell belongs to none but the
+/// which belongs to none, so the dispatch order decides nothing; a shell belongs to none but the
 /// control group's `JMX` and `BPT`, which it refuses by name, so the fallback refusal is reached
-/// only by the uniform datapath group and the other shells.
+/// only by the uniform datapath and the other shells.
 #[test]
 fn the_groups_are_disjoint() {
     let mut half_double = 0;
