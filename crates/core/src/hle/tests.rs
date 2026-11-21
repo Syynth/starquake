@@ -353,9 +353,10 @@ fn every_service_has_its_name_and_no_other_number_has_one() {
     assert_eq!(service_name(GSV_NVSRV), Some("nvsrv"));
     assert_eq!(service_name(GSV_VI2), Some("gsv:vi2"));
     assert_eq!(service_name(GSV_VIDEO), Some("gsv:video"));
+    assert_eq!(service_name(AUD_U), Some("aud:u"));
     assert_eq!(service_name(ServiceId(0)), None);
     assert_eq!(service_name(ServiceId(9)), None);
-    assert_eq!(service_name(ServiceId(24)), None);
+    assert_eq!(service_name(ServiceId(25)), None);
 }
 
 #[test]
@@ -1090,4 +1091,39 @@ fn ectx_aw_and_aoc_u_have_servers_of_their_own() {
     let (word, data, _) = reply(&buffer, 4);
     assert_eq!((code, word, data), (ResultCode::SUCCESS, 0, vec![0; 4]));
     assert_eq!(rig.ipc().last(), Some(&(AOC_U, count)));
+}
+
+/// `aud:u` behind the real dispatcher: `GetService` hands out a session on its own server, whose
+/// command 2 hands out an audio renderer manager that answers `GetWorkBufferSize` with Eden's
+/// size (`starquake_services::aud::work_buffer`'s golden row for these values at revision 15).
+#[test]
+fn aud_u_hands_out_a_renderer_manager_that_sizes_a_work_buffer() {
+    let rig = Rig::new();
+    let session = rig.service(aud::U_NAME);
+    let get_manager = command(&aud::IAudioUserClient, "get_audio_renderer_manager");
+    let (code, buffer) = rig.send(session, &libnx(get_manager));
+    let (word, _, moved) = reply(&buffer, 0);
+    assert_eq!((code, word, moved.len()), (ResultCode::SUCCESS, 0, 1));
+    assert_eq!(rig.ipc().last(), Some(&(AUD_U, get_manager)));
+
+    // sample_rate 48000, sample_count 240, mixes 3, sub_mixes 5, voices 7, sinks 2, effects 11,
+    // perf_frames 13, voice_drop_enabled 1 and three zero bytes, splitter_infos 17,
+    // splitter_destinations 19, external_context_size 23, revision 15.
+    let mut parameter = Vec::new();
+    for word in [48_000_u32, 240, 3, 5, 7, 2, 11, 13] {
+        parameter.extend(word.to_le_bytes());
+    }
+    parameter.extend([1, 0, 0, 0]);
+    for word in [17_u32, 19, 23, 15] {
+        parameter.extend(word.to_le_bytes());
+    }
+    let manager = Handle::from_raw(moved[0]);
+    let size = command(&aud::IAudioRendererManager, "get_work_buffer_size");
+    let (code, buffer) = rig.send(manager, &libnx(size).data(&parameter));
+    let (word, data, _) = reply(&buffer, 8);
+    assert_eq!(
+        (code, word, data),
+        (ResultCode::SUCCESS, 0, 266_240_u64.to_le_bytes().to_vec())
+    );
+    assert_eq!(rig.ipc().last(), Some(&(AUD_U, size)));
 }
