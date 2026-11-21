@@ -745,6 +745,30 @@ Landed: the translation driver (slice 12i, #453, PR #478), SSA on structured fun
 | decided (decision log, 2026-11-20, "Owner rulings on the wave 47 questions") | **Later (M4):** snapshot-reader bounds that now scale to GiBs; returning host pages on unmap; tessellation and geometry previous-stage masks; consuming `previous_stage_stores` and per-stage key projection | #460, #432 | area:core, area:shader |
 | decided (decision log, 2026-11-20, "Owner rulings on the wave 47 questions") | **#449 review notes:** a zero-count macro loop with a JAL in the other slot, and a two-slot register write, diverge from Eden in ways no test pins | #449 | area:gpu |
 
+### From waves 48, 48b and 49 (ledger: #22)
+
+Landed in wave 48: slices 13 (#372, PR #512), 14 (#373, PR #504), 12c (#366, PR #503) and 6d (#354, PR #486); the guard rule (#454, PR #506); #484 (PR #501); #474 (PR #505); #458 (PR #511). In 48b: the semaphore mirror (#500, PR #507), the IPC race (#497, PR #502) and aud:u command 2 (#498, PR #509). In 49: the native revision-16 audio word that blocked the title's boot (#514, PR #515), gsv keeping the shared page's transfer memories (#499, PR #520), #456 (PR #508), the gate's per-package step (#461, PR #510), vertex-output interpolation (#476, PR #519), slices 17 (#376, PR #522), 18 (#377, PR #524) and 12d (#367, PR #523), the local-memory size (#489, PR #521) and the structured-phi verifier (#488, PR #525).
+
+The owner promoted the work items on 2026-11-21: #516, #517 and #518 (the gaps between slices 13, 14 and the GPU and render sides), and #526 to #539. Folded as comments: #473 (stale subgroup rules), #477 (the sweep's remaining notes), #494 (the uniform datapath and HFMA2/HSET2 rechecks), #331 (the mirror's capture record), #518 (the uniform-buffer limit) and #493 (the `CmifReplyWrapImpl` divergence and session caps). Dropped for now: aud:u commands 0 and 1 (`IAudioInManager`, `IAudioOutManager`), until a title asks.
+
+The questions below wait for the owner.
+
+| Status | Proposal | Why | Suggested |
+|---|---|---|---|
+| proposed | **The audio renderer-session cap:** Eden-NX2 caps `MaxRendererSessions` per manager, PR #4588 per server. #526 waits for this | #526 | services |
+| proposed | **The semaphore waiter key:** starquake keys a parked GPU acquire by (address space, GPU address); Eden-NX2 keys it by CPU device address. A release (or its mirror copy, #500) in one address space does not latch an acquire parked in another on the same registration. Change the key, or accept and list the divergence | #500, PR #507 | gpu-protocol |
+| proposed | **Guarded R2UR:** option 1 or 2 from PR #523's body, including what the destination holds when no lane's guard holds | #367, PR #523 | shader-pipeline |
+| proposed | **Native f64:** lower f64 natively where the host has it, or always run slice 18's f64 pass | #377, PR #524 | shader-pipeline |
+| proposed | **`TRANSLATOR_VERSION`:** a policy for when it is bumped, or a gate check that a translator change bumps it | #377, #489 | shader-pipeline |
+| proposed | **Which stage takes the pixel interpolation modes** when a geometry or tessellation stage is present. #529 refuses the case until ruled | #476, #529 | shader-pipeline |
+| proposed | **IR verifier step 5:** should it require a phi pair from every block that can run last, not only from the structured predecessors? | #488, PR #525 | shader-pipeline |
+| proposed | **A record for a partly applied constant-buffer load** (a load past the bank's size, refused after its first words were written, #456) | #456, PR #508 | observability |
+| proposed | **A `HostCaps` field for wgpu's `SHADER_F16_IN_F32`,** so f16 lowering can use it where the device has it | #377 | render-backend |
+| proposed | **Spec text:** the pass order in shader-pipeline's "Passes needed for correctness"; the compute key naming the local-memory size (touches decision 16); "Where the references disagree" against the "lowering wins" ruling; the gpu-protocol G25 row and "the rest" after a refused word; the report-semaphore wording naming operation 2; the stale "LDCG has no owning slice" sentence | waves 48 and 49 | shader-pipeline, gpu-protocol |
+| proposed | **Wave 48's shader questions:** compute reduction semaphores; vertex-stage warp operations; a shader pool for recording-choice runs; the pixel-header fallback against a `DrawError`; guarded instructions that write no IR; exact tracing against Eden's breadth-first search; PR #4588's `IsCbufStorageBufferPointer` search variant; UP2UR, the uniform twins and UF2FP; the nvdisasm checks (0xabb, RZ pairs); the NaN-payload policy. Details in the PRs of #372, #373, #366 and #354 | wave 48 | shader-pipeline |
+| proposed | **Verification that needs a console:** a GetWorkBufferSize trace of the revision words titles send; gpu-protocol verification item 8 (which releases are copied); when the 102 unlist takes effect relative to queued releases | waves 48b and 49 | owner |
+| proposed | **A stale row:** the "Environment members slice 9 does not cover" row in this file still lists the compute `LocalMemorySize` from the QMD, which #489 (PR #521) added; the texture type is now #531 | #489 | docs |
+
 ## House-rule candidates
 
 Rules distilled from review findings. A vetted rule moves into `CLAUDE.md`; until then it is
@@ -1072,3 +1096,21 @@ passed to build agents as a provisional rule for the next wave.
 - "Every variant" claims are backed by a deterministic enumeration of the full set, never a random sample.
 - A path that does not read a field refuses it with a named variant; error types use unit variants with exact Display text.
 - PR bodies and docs are re-checked after the last merge of main.
+
+### From waves 48, 48b and 49 (ledger: #22)
+
+- Each look-through, fallback or arm of a helper gets its own test per site and per listed opcode.
+- A stage that cannot complete a reference's behaviour refuses by name with an exact error, never silently producing wrong output.
+- Claims such as "unchanged on refusal" or "bounded by N steps" are checked against every error path, then narrowed or pinned.
+- Comparison, NaN and operand-order logic is tested with inputs that differ per operand.
+- Every wrap-prone product and running sum gets its own overflow test.
+- Multi-word effects are tested at the last word and the far end, not only the first.
+- A sentinel value the reference uses (0 as empty) is refused or listed as a divergence with an edge test.
+- An idempotence guard gets a test that calls twice; error text formats its limit from the shipping constant.
+- When a producer emits new requirements, every consumer across the seam supplies them in the same PR, or the regression is stated.
+- A claim to port a reference's test cases lists every case, with omissions named.
+- Find, filter and first-match logic is tested with a decoy before the target.
+- A new cap or refusal applies only on the path that uses the capped feature.
+- Cross-lane and guarded ops are tested where no lane's guard holds.
+- Agents delete only the scratch folder they created, by exact path, never a glob or parent folder.
+- A review that cannot run is not a verdict: it returns "changes" with that one finding.
