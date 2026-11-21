@@ -604,6 +604,26 @@ fn a_constant_buffer_load_reaches_the_resource_table() {
             source: ResourceSource::ConstantBuffer { bank: TABLE_BANK },
         }]
     );
+    // A load at an immediate offset: the bank is sized by collect info to the end of the read,
+    // rounded up to 16 bytes (0x24 + 4 is 0x30), not to the whole bank.
+    let mut code = vec![ldc(0, Gpr::RZ.index(), 3, 0x24)];
+    code.extend(words(&[ast(0, GENERIC_0_X), exit()]));
+    let immediate = through_the_cache(
+        GuestStage::Vertex,
+        &bytes(Some(&header), &code),
+        &State::default(),
+        &VariantKey::default(),
+    )
+    .expect("ready");
+    assert_eq!(
+        immediate.resources,
+        [ResourceSlot {
+            group: 0,
+            binding: 4,
+            kind: ResourceKind::UniformBuffer { size: 0x30 },
+            source: ResourceSource::ConstantBuffer { bank: 3 },
+        }]
+    );
 }
 
 /// A `BRX` whose table words the engine does not have reads them as 0, which names no
