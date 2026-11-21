@@ -11,13 +11,12 @@
 //!    and no emulation flag applies to compute: [`starquake_render::emulation`] derives them from
 //!    draw state only). A `Pending` answer follows the wait-while-compiling setting as a draw's
 //!    does; `Rejected`, or a ticket still pending, skips the dispatch;
-//! 2. makes the set's one shader a compute shader ([`HostShaders::get_as`]): the shader crate's
-//!    [`starquake_shader::host::HostStage`] has no compute stage yet, and it translates vertex
-//!    and pixel programs only (`only_vertex_and_pixel_stages_translate` in `starquake_shader`),
-//!    so a ready answer for a compute request is taken as the compute shader whatever its host
-//!    stage says. **An owner question**: until the shader crate translates compute programs,
-//!    production lookups for compute are rejected and every QMD completes and releases without a
-//!    dispatch (row 61);
+//! 2. makes the set's one shader a compute shader ([`HostShaders::get_as`]): a ready answer
+//!    for a compute request is taken as the compute shader whatever its host stage says. The
+//!    shader crate's production translator now translates compute programs (its driver takes
+//!    vertex, pixel and compute, `only_the_stages_the_lowering_takes_translate` in
+//!    `starquake_shader`, and the lowering makes a [`starquake_shader::host::HostStage`] of
+//!    `Compute`), so a production lookup for compute is ready when the program lowers;
 //! 3. binds each resource the shader uses: a constant buffer bank below
 //!    [`crate::back::qmd::CONSTANT_BUFFERS`] from the QMD's binding of it, through the buffer
 //!    cache (`DispatchNativeCompute` binds the QMD's eight constant buffers,
