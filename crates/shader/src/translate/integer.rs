@@ -27,7 +27,9 @@
 //!
 //! # Guards
 //!
-//! An instruction under a guard predicate other than `PT` becomes a conditional block (spec,
+//! The guard follows the translation driver's rule, the one function the driver and every
+//! group's own entry point use (`super::guard_step`; `super`'s module docs, "Guards"). An
+//! instruction under a guard predicate other than `PT` becomes a conditional block (spec,
 //! "Instruction translation"): the block the builder is in reads the guard and branches to a
 //! new block holding the instruction's IR, which jumps to a second new block that takes over
 //! the first block's terminator; the builder is left in that second block. The split is made
@@ -39,8 +41,10 @@
 //! appended ([`IntegerError::SuccessorPhi`];
 //! `tests::guards::a_phi_on_a_successor_refuses_the_split`). An instruction under `!PT` never
 //! runs and appends nothing, without its checks, as PR #4588's `Visitor::Run` returns at once
-//! when `guard.Never()`; with [`GuardMode::Tested`] the guard is ignored (flow analysis has
-//! tested it, [`crate::flow::FlowBlock::guard_tested`]).
+//! when `guard.Never()`, in either [`GuardMode`]
+//! (`tests::guards::never_guarded_instructions_append_nothing`); with [`GuardMode::Tested`] any
+//! other guard is ignored (flow analysis has tested it,
+//! [`crate::flow::FlowBlock::guard_tested`]).
 //!
 //! # Checks
 //!
@@ -122,7 +126,7 @@ mod tests;
 
 use thiserror::Error;
 
-use super::source;
+use super::{GuardStep, guard_step, source};
 use crate::decode::{
     AluSrc, CBuf, CBufRef, DecodeError, Gpr, IMadMode, Instr, Instruction, IntCmpOp, Op, OpBRev,
     OpFlo, OpIAbs, OpIAdd3, OpIAdd3X, OpIDp4, OpIMad, OpIMad64, OpIMnMx, OpISetP, OpLea, OpLeaX,
@@ -131,13 +135,15 @@ use crate::decode::{
 };
 use crate::ir::{BlockId, BuildError, Builder, Function, Imm, Inst, Opcode, Operand};
 
-/// How [`translate_integer`] treats an instruction's guard.
+/// How [`translate_integer`] (and the memory group's `translate_memory`) treats an
+/// instruction's guard, by the translation driver's rule (`super::guard_step`): `!PT` appends
+/// nothing in either mode (see the module docs, "Guards").
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GuardMode {
-    /// Honour it: a guard other than `PT` makes the instruction a conditional block, and `!PT`
-    /// appends nothing (see the module docs, "Guards").
+    /// Honour it: any other guard but `PT` makes the instruction a conditional block.
     Honour,
-    /// Ignore it: flow analysis has tested it already ([`crate::flow::FlowBlock::guard_tested`]).
+    /// Flow analysis has tested it already ([`crate::flow::FlowBlock::guard_tested`]): any
+    /// other guard but `!PT` is ignored.
     Tested,
 }
 
@@ -342,11 +348,10 @@ pub fn translate_integer(
     if !is_integer(&instr.op) {
         return Err(IntegerError::OtherGroup(instr.op.mnemonic()));
     }
-    let pending = match guard {
-        GuardMode::Tested => None,
-        GuardMode::Honour if instr.guard.is_true() => None,
-        GuardMode::Honour if instr.guard.reg.is_true() => return Ok(()),
-        GuardMode::Honour => Some(instr.guard),
+    let pending = match guard_step(instr.guard, guard == GuardMode::Tested) {
+        GuardStep::Skip => return Ok(()),
+        GuardStep::Unguarded => None,
+        GuardStep::Conditional => Some(instr.guard),
     };
     if sources(&instr.op).iter().flatten().any(|src| {
         matches!(

@@ -89,10 +89,15 @@
 //!
 //! # Guards
 //!
-//! An instruction under a guard predicate becomes a conditional block (spec, "Instruction
-//! translation"): the guard is read, the block branches to a block holding the instruction or
-//! past it, and translation continues in the block after. [`translate_instr`] skips this when
-//! its block already tests the guard (flow analysis's `guard_tested`), and for `PT`.
+//! The guard follows the translation driver's rule, the one function the driver and every
+//! group's own entry point use (`super`'s `guard_step`, through its `conditional_block`; its
+//! module docs, "Guards"). After the group check, an instruction under `!PT` never runs and
+//! appends nothing, unchecked, as PR #4588's `Visitor::Run` returns at `guard.Never()`
+//! (`tests::never_guarded_instructions_append_nothing`). An instruction under any other guard
+//! predicate but `PT` becomes a conditional block (spec, "Instruction translation"): once it
+//! is checked, the guard is read, the block branches to a block holding the instruction or
+//! past it, and translation continues in the block after. [`translate_instr`] skips the block
+//! when its block already tests the guard (flow analysis's `guard_tested`), and for `PT`.
 //!
 //! # Refusals
 //!
@@ -132,7 +137,6 @@
 //! | What | PR #4588 | Here | Pinned by |
 //! |---|---|---|---|
 //! | A guard on these instructions | a select of the result (`Visitor::Run`: `guard_select` for the pure ops `classify.h` lists) | a conditional block (spec, "Instruction translation") | `tests::guarded_instructions_become_conditional_blocks` |
-//! | `@!PT` | the instruction is skipped unchecked (`guard.Never()`) | checked, and put in a block that never runs | `tests::never_guarded_instructions_are_checked` |
 //! | `MUFU.SIN`, `MUFU.COS` | `FPSin`, `FPCos` of the argument as it is | of the argument times `2 pi` (row 95) | `tests::arith::mufu_sine_and_cosine_take_turns` |
 //! | `F2I.FTZ` with a 32-bit operand, `F2F` rounding and `.FTZ` | carried as flags only | emulated as well (decision 10) | `tests::convert::f2i_flushes_denormals_before_rounding`, `tests::convert::f2f_emulation_matches_the_modelled_conversion` |
 //! | `FSETP` with a `PT` destination | computes the combination, then `SetPred` discards it | computes nothing for it | `tests::arith::fsetp_writes_both_predicates` |
@@ -421,18 +425,25 @@ pub const fn in_group(op: &Op) -> bool {
 
 /// Translates `instr`, one of this group's instructions, at the end of `builder`'s block, and
 /// leaves `builder` in the block where translation continues: the same block, or for a guarded
-/// instruction the block after its conditional block (module docs). `guard_tested` says the
-/// block already runs only where the guard holds (flow analysis's `guard_tested`), so the guard
-/// is ignored. A refusal appends nothing.
+/// instruction the block after its conditional block (module docs, "Guards"). `guard_tested`
+/// says the block already runs only where the guard holds (flow analysis's `guard_tested`), so
+/// a guard other than `!PT` is ignored. The checks run in this order: the group, then the
+/// guard (`!PT` appends nothing), then the PR's checks. A refusal appends nothing.
 pub fn translate_instr(
     builder: &mut Builder<'_>,
     instr: Instr,
     guard_tested: bool,
 ) -> Result<(), FloatError> {
-    check(&instr.op)?;
-    super::conditional_block(builder, instr.guard, guard_tested, |b| {
-        Emit { b }.op(&instr.op)
-    })
+    if !in_group(&instr.op) {
+        return Err(FloatUnsupported::OtherGroup(instr.op.mnemonic()).into());
+    }
+    super::conditional_block(
+        builder,
+        instr.guard,
+        guard_tested,
+        || Ok::<_, FloatError>(check(&instr.op)?),
+        |b, ()| Emit { b }.op(&instr.op),
+    )
 }
 
 /// Whether `function` uses a quad operation of this group (`FSwizzleAdd`, from `FSWZADD`), so

@@ -46,7 +46,9 @@
 //!
 //! As `Visitor::Run` reads them (`visitor.cpp`: it reads a guard only when `info.pure &&
 //! !guard.Always()`, after the `guard.Never()` return), with a conditional block where the PR
-//! keeps a select:
+//! keeps a select. The rule is [`super::guard_step`]'s, with the guard settled when its block's
+//! `guard_tested` is set or the instruction is not pure; the group translators' own entry
+//! points that take a guard follow the same function (`super`'s module docs, "Guards"):
 //!
 //! - An instruction under `!PT` never runs and becomes nothing, as `Visitor::Run` returns when
 //!   `guard.Never()` (flow analysis leaves such an instruction in its block's range and skips it
@@ -117,13 +119,14 @@ use super::float::{self, FloatError};
 use super::integer::{self, GuardMode, IntegerError};
 use super::texture::{self, DescriptorBuffer, TextureError};
 use super::{
-    Failure, GuestStage, Stage, TranslateError, Translator, Unsupported, source, split_for_guard,
+    Failure, GuardStep, GuestStage, Stage, TranslateError, Translator, Unsupported, guard_step,
+    source, split_for_guard,
 };
 use crate::capture::MAX_INSTRUCTIONS;
 use crate::decode::{Instr, Instruction, Op, decode};
 use crate::flow::{
     BranchTables, FlowError, FlowGraph, Invariant, IrBlocks, OpInfo, classify, flow_graph,
-    is_never, opcode_of,
+    opcode_of,
 };
 use crate::ir::{BlockId, Builder, Function};
 use crate::sph::PixelIo;
@@ -262,14 +265,14 @@ impl Driver {
         info: OpInfo,
         guard_tested: bool,
     ) -> Result<BlockId, TranslateError> {
-        if is_never(instr.guard) {
-            return Ok(at);
+        match guard_step(instr.guard, guard_tested || !info.pure) {
+            GuardStep::Skip => Ok(at),
+            GuardStep::Unguarded => {
+                self.dispatch(function, at, index, instr)?;
+                Ok(at)
+            }
+            GuardStep::Conditional => self.conditional(function, at, index, instr, info.uniform),
         }
-        if guard_tested || instr.guard.is_true() || !info.pure {
-            self.dispatch(function, at, index, instr)?;
-            return Ok(at);
-        }
-        self.conditional(function, at, index, instr, info.uniform)
     }
 
     /// Makes `instr`, instruction `index`, a conditional block at the end of block `at`: reads
@@ -421,7 +424,7 @@ pub(crate) fn translate_decoded(
     header: Option<&PixelIo>,
     program: &[Instr],
 ) -> Result<Function, TranslateError> {
-    use crate::flow::OpKind;
+    use crate::flow::{OpKind, is_never};
     use crate::ir::Terminator;
     if !matches!(stage.stage, GuestStage::Vertex | GuestStage::Pixel) {
         return Err(TranslateError::Stage(Unsupported::Stage(stage.stage)));
