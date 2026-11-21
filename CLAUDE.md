@@ -26,7 +26,16 @@ Run `cargo xtask ci` (or `just ci`) from the repository root: fmt check, an unus
 check (the root `[workspace.dependencies]`, the dev, build and target tables, then `cargo machete`
 per crate), the host-access check (below), `cargo deny check`
 (licences, sources, advisories; `deny.toml`), clippy with `-D warnings` and the workspace lint
-set, nextest, doctests. CI runs exactly this.
+set, the same clippy on each package on its own (below), nextest, doctests. CI runs exactly this.
+
+- The `packages` step runs `cargo clippy -p <package> --locked -- -D warnings` once for each
+  workspace member (the app, every crate, `tools/hvprobe` and `xtask`), each in its own cargo
+  invocation: default features, library and binary targets. The workspace-wide clippy and
+  nextest unify features across members (a dev-dependency's `test-support` reaches every
+  member's build), which once hid a package that did not build on its own (PR #446). Clippy
+  includes `cargo check`, so the step builds each package once. The members are read from the
+  root manifest's `members` and `exclude`, so a new crate is picked up with no change to the
+  gate (`xtask/src/packages.rs`).
 
 - The unused-dependency check covers every dependency table. `cargo machete` reads only each
   crate's top-level `[dependencies]` (0.9.2 does not look at `[dev-dependencies]`,
