@@ -508,7 +508,8 @@ fn nth_listed(function: &Function, opcode: Opcode, n: usize) -> crate::ir::Value
 /// both: at the last word (byte 8) the GPU gives what the interpreter gives; one word past it
 /// (byte 12, the size the lowering was given) the interpreter refuses the access with its exact
 /// error, at the access itself, and the GPU reads 0 for the load and drops the store, leaving
-/// the last word's value (the divergence `lower::memory` lists), for a store at an immediate
+/// the last word's value and nothing to read back past the end (the divergence
+/// `lower::memory` lists), for a store at an immediate
 /// offset and at a register offset. Eden's translator selects 0 for an `LDL` whose byte offset
 /// is not below `LocalMemorySize()`, and drops an `STL` at an immediate offset not below it
 /// (`load_store_local_shared.cpp`), so for those accesses the GPU's results are also Eden's;
@@ -574,6 +575,7 @@ fn translated_local_accesses_match_the_interpreter_at_the_edge() {
             local_access(false, 0, last),
             local_access(false, 2, end),
             local_access(true, 3, last),
+            local_access(true, 5, end),
         ],
     );
     assert_eq!(
@@ -584,8 +586,9 @@ fn translated_local_accesses_match_the_interpreter_at_the_edge() {
             1
         )))
     );
-    if let Some(found) = gpu("translated_local_store_past", &store_past, &[3]) {
-        assert_eq!(found, [0x11], "the GPU");
+    // The dropped store leaves no word to read back: the word past the end still reads 0.
+    if let Some(found) = gpu("translated_local_store_past", &store_past, &[3, 5]) {
+        assert_eq!(found, [0x11, 0], "the GPU");
     }
 
     // A store one word past the end at a register offset (`STL [R4]`, R4 = 12).
@@ -601,6 +604,7 @@ fn translated_local_accesses_match_the_interpreter_at_the_edge() {
                 crate::decode::MemType::B32,
             ),
             local_access(true, 3, last),
+            local_access(true, 5, end),
         ],
     );
     assert_eq!(
@@ -611,8 +615,8 @@ fn translated_local_accesses_match_the_interpreter_at_the_edge() {
             1
         )))
     );
-    if let Some(found) = gpu("translated_local_register_past", &register_past, &[3]) {
-        assert_eq!(found, [0x11], "the GPU");
+    if let Some(found) = gpu("translated_local_register_past", &register_past, &[3, 5]) {
+        assert_eq!(found, [0x11, 0], "the GPU");
     }
 }
 
