@@ -167,8 +167,13 @@
 //! - **A refused capture outlives a map of the bytes it could not read**: an owner question
 //!   (above, "A refusal kept after a map").
 //! - **Jump tables do not extend the capture yet** (row 92): [`Translator::program`] gets the
-//!   capture as slice 3 makes it. Driving [`crate::capture::Capture::resolve_jump_tables`] with
-//!   the answers needs slice 10's table finding through the seam.
+//!   capture as slice 3 makes it. The production translator finds the tables and resolves
+//!   them from the answers ([`crate::pipeline`]), but [`Translator::shader`] has no
+//!   guest-memory reader, so it resolves them against the capture's own bytes and refuses a
+//!   table naming an instruction past the capture
+//!   ([`crate::pipeline::PipelineRefusal::JumpTargetPastCapture`]) rather than extending the
+//!   capture as the reference does. The missing piece is a guest-memory reader at
+//!   [`Translator::shader`].
 
 mod address;
 mod jobs;

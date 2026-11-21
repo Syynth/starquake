@@ -14,10 +14,11 @@ use crate::cache::{CacheLookup, CodeForm, Executor, HostTarget, ShaderCache, Tra
 use crate::capture::capture;
 use crate::decode::{
     AluSrc, BraCond, BranchOffset, BrxSrc, Gpr, Instr, IntCmpOp, MemAddr, MemEvictionPriority,
-    MemSpace, MemType, MovSrc, Op, OpASt, OpBra, OpBrx, OpExit, OpIAdd3, OpISetP, OpMov, OpSt,
-    Pred, PredSetOp, PredSrc,
+    MemSpace, MemType, MovSrc, OffsetStride, Op, OpASt, OpBra, OpBrx, OpExit, OpIAdd3, OpISetP,
+    OpLd, OpMov, OpSt, Pred, PredSetOp, PredSrc, UniformAddr, UniformReg,
 };
 use crate::exchange::{EngineState, TextureKind, exchange};
+use crate::flow::FlowError;
 use crate::host::HostStage;
 use crate::info::InfoError;
 use crate::interp::Machine;
@@ -98,14 +99,52 @@ fn ast(data: u8, addr: u16) -> Instr {
 fn stl(data: u8, offset: i32) -> Instr {
     Instr::new(Op::St(OpSt {
         data: r(data),
+        addr: rz_plus(offset),
+        mem_type: MemType::B32,
+        space: MemSpace::Local(MemEvictionPriority::Normal),
+        bit76: false,
+    }))
+}
+
+/// `[RZ + offset]`, the address the local and shared accesses below use.
+const fn rz_plus(offset: i32) -> MemAddr {
+    MemAddr {
+        reg: Gpr::RZ,
+        reg_64: false,
+        uniform: None,
+        offset,
+    }
+}
+
+/// `LDL dst, [RZ + offset]`, one word.
+fn ldl(dst: u8, offset: i32) -> Instr {
+    Instr::new(Op::Ld(OpLd {
+        dst: r(dst),
+        // `LDL` encodes the uniform register field: register 0, off, as PR #4588 takes it.
         addr: MemAddr {
-            reg: Gpr::RZ,
-            reg_64: false,
-            uniform: None,
-            offset,
+            uniform: Some(UniformAddr {
+                reg: UniformReg::new(0).expect("a uniform register"),
+                wide: false,
+                enabled: false,
+            }),
+            ..rz_plus(offset)
         },
         mem_type: MemType::B32,
         space: MemSpace::Local(MemEvictionPriority::Normal),
+        pred: PredSrc::TRUE,
+        pred_dst: Pred::PT,
+        zd: false,
+        bit76: false,
+    }))
+}
+
+/// `STS [RZ + offset], data`, one word.
+fn sts(data: u8, offset: i32) -> Instr {
+    Instr::new(Op::St(OpSt {
+        data: r(data),
+        addr: rz_plus(offset),
+        mem_type: MemType::B32,
+        space: MemSpace::Shared(OffsetStride::X1),
         bit76: false,
     }))
 }
@@ -504,6 +543,16 @@ fn a_brx_the_answers_resolve_translates() {
     }
     let refused = through_the_cache(GuestStage::Vertex, &program, &state, &VariantKey::default())
         .expect_err("the constant-buffer load is not lowered yet");
+    assert!(
+        matches!(
+            &*refused,
+            Rejection::Lower(LowerError::Operation {
+                at,
+                opcode: Opcode::GetCbufU32,
+            }) if at.index() == 22
+        ),
+        "{refused:?}"
+    );
     assert_eq!(refused.to_string(), "%22: GetCbufU32 is not lowered yet");
 }
 
@@ -530,23 +579,44 @@ fn a_brx_the_answers_do_not_resolve_is_refused() {
     );
 }
 
-/// A table value naming an instruction past the capture is dropped: the capture is not
-/// extended (module docs), so only the target inside it is kept.
+/// A table value naming an instruction past the capture is refused by name, since the capture
+/// is not extended (module docs, "Divergences from the reference"): the first instruction past
+/// the capture's end is refused, both from the program entry and through the cache, and the
+/// last captured instruction is the accepted edge, kept as a target.
 #[test]
-fn a_target_past_the_capture_is_dropped() {
+fn a_target_past_the_capture_is_refused() {
     let header = vertex_header(0);
     let program = bytes(Some(&header), &selector_program(0));
     let captured = capture(program.as_slice(), GuestStage::Vertex).expect("captures");
-    let past = captured.instruction_count() + 2;
-    let state = State {
-        table: vec![table_value(FIRST), table_value(past)],
-    };
+    let count = captured.instruction_count();
     let entry = PipelineProgram::new(&captured).expect("an entry");
-    let answers = exchange(GuestStage::Vertex, &entry, &state)
-        .expect("answered")
-        .answers;
-    let tables = entry.branch_tables(&answers).expect("resolved");
-    assert_eq!(tables.targets(BRX_AT), [FIRST]);
+    let answers = |second: u32| {
+        let state = State {
+            table: vec![table_value(FIRST), table_value(second)],
+        };
+        let answers = exchange(GuestStage::Vertex, &entry, &state)
+            .expect("answered")
+            .answers;
+        (state, answers)
+    };
+    let (_, last) = answers(count - 1);
+    let tables = entry.branch_tables(&last).expect("resolved");
+    assert_eq!(tables.targets(BRX_AT), [FIRST, count - 1]);
+    let (state, past) = answers(count);
+    assert_eq!(
+        entry.branch_tables(&past).map(|_| ()),
+        Err(Rejection::Pipeline(PipelineRefusal::JumpTargetPastCapture))
+    );
+    let refused = through_the_cache(GuestStage::Vertex, &program, &state, &VariantKey::default())
+        .expect_err("refused");
+    assert_eq!(
+        *refused,
+        Rejection::Pipeline(PipelineRefusal::JumpTargetPastCapture)
+    );
+    assert_eq!(
+        refused.to_string(),
+        "a jump table names an instruction past the captured program, which is not extended yet"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -625,6 +695,79 @@ fn a_compute_program_with_local_memory_is_refused() {
             &bytes(Some(&vertex_header(0x10)), &store),
             &State::default(),
             &variant
+        )
+        .is_ok()
+    );
+}
+
+/// A compute program that only reads local memory (`LDL R0, [RZ]; STS [RZ], R0; EXIT`) is
+/// refused by name too: the load alone, kept alive by the shared store, is a use of local
+/// memory, whose reads would otherwise give 0. Without the load the same program lowers, so
+/// the load is the only thing that varies.
+#[test]
+fn a_compute_program_that_only_reads_local_memory_is_refused() {
+    let variant = VariantKey {
+        shared_memory_size: 16,
+        ..compute_variant()
+    };
+    let load = words(&[ldl(0, 0), sts(0, 0), exit()]);
+    assert_eq!(
+        through_the_cache(
+            GuestStage::Compute,
+            &bytes(None, &load),
+            &State::default(),
+            &variant
+        )
+        .map(|_| ()),
+        Err(Arc::new(Rejection::Pipeline(
+            PipelineRefusal::ComputeLocalMemory
+        )))
+    );
+    let no_load = words(&[mov(0, 7), sts(0, 0), exit()]);
+    assert!(
+        through_the_cache(
+            GuestStage::Compute,
+            &bytes(None, &no_load),
+            &State::default(),
+            &variant
+        )
+        .is_ok()
+    );
+}
+
+/// Collect info runs between the passes and the lowering (module docs, step 4): a vertex
+/// program that stores to attribute word 0, which no slot names, is refused with collect
+/// info's exact error; the same store to generic 0's X lowers, so the attribute is the only
+/// thing that varies.
+#[test]
+fn collect_info_refuses_before_the_lowering() {
+    let unknown = through_the_cache(
+        GuestStage::Vertex,
+        &bytes(
+            Some(&vertex_header(0)),
+            &words(&[mov(0, 7), ast(0, 0), exit()]),
+        ),
+        &State::default(),
+        &VariantKey::default(),
+    )
+    .expect_err("refused");
+    assert!(
+        matches!(
+            &*unknown,
+            Rejection::Info(InfoError::UnknownAttribute { attribute, .. })
+                if *attribute == Attribute(0)
+        ),
+        "{unknown:?}"
+    );
+    assert!(
+        through_the_cache(
+            GuestStage::Vertex,
+            &bytes(
+                Some(&vertex_header(0)),
+                &words(&[mov(0, 7), ast(0, GENERIC_0_X), exit()])
+            ),
+            &State::default(),
+            &VariantKey::default(),
         )
         .is_ok()
     );

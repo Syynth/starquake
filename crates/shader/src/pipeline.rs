@@ -19,14 +19,20 @@
 //!   this order, stopping at the first failure:
 //!   1. the header against the stage ([`check_header`], [`Rejection::Info`]);
 //!   2. the jump tables, resolved from the answers ([`resolve_jump_tables`]), so a `BRX` whose
-//!      table the answers give is translated with its targets; a `BRX` the selector pattern
-//!      does not track has no target and is refused by flow analysis
-//!      ([`crate::flow::FlowError::NoTarget`], as [`Rejection::Translate`]);
+//!      table the answers give is translated with its targets; a table naming an instruction
+//!      past the capture is refused ([`PipelineRefusal::JumpTargetPastCapture`], "What it does
+//!      not do yet"); a `BRX` the selector pattern does not track has no target and is refused
+//!      by flow analysis ([`crate::flow::FlowError::NoTarget`], as [`Rejection::Translate`]);
 //!   3. the IR half of the pipeline ([`pipeline_ir`]: the translation driver, the structurizer,
 //!      the SSA rewrite and the passes), given the header's colour outputs and, for a pixel
 //!      program, its input map;
-//!   4. for a compute program, its local memory ([`PipelineRefusal::ComputeLocalMemory`]);
-//!   5. the lowering ([`lower_with`], [`Rejection::Lower`]), with the variant key's workgroup
+//!   4. collect info ([`collect`], slice 15, [`Rejection::Info`]): the spec's pass 7 ("Dead
+//!      code elimination, then collect info"), run for its refusals ([`crate::info::InfoError`],
+//!      among them an unknown attribute, a colour output that does not exist and a
+//!      constant-buffer bank or offset out of range); its tables are not passed on yet, since
+//!      nothing the lowering takes reads them until slice 17;
+//!   5. for a compute program, its local memory ([`PipelineRefusal::ComputeLocalMemory`]);
+//!   6. the lowering ([`lower_with`], [`Rejection::Lower`]), with the variant key's workgroup
 //!      and shared-memory sizes, the header's local-memory size and the host target's
 //!      features.
 //!
@@ -36,21 +42,35 @@
 //!   adds by name, so a program that needs it is rejected, not drawn wrongly: a pixel
 //!   program's generic inputs ([`crate::lower::LowerError::Input`]), and every constant-buffer,
 //!   texture, image and global-memory operation ([`crate::lower::LowerError::Operation`]).
-//!   Collect info (slice 15) is not run here: nothing the lowering takes reads it until 17.
+//!   Collect info (slice 15) runs (step 4), but the resource table and interface it builds are
+//!   dropped until 17 lowers them.
 //! - **A compute program's local memory** has no size: Eden takes it from the QMD
 //!   (`local_pos_alloc + local_crs_alloc`), which no question, key field or driver constant
 //!   carries yet (the exchange's module docs, "For the owner: what the questions do not
 //!   cover"). A compute program that still reads or writes local memory after the passes is
 //!   refused ([`PipelineRefusal::ComputeLocalMemory`]) rather than lowered over an array of no
-//!   words, whose reads would give 0. Pinned by
-//!   `tests::a_compute_program_with_local_memory_is_refused`.
+//!   words, whose reads would give 0. Pinned for a store by
+//!   `tests::a_compute_program_with_local_memory_is_refused` and for a load alone by
+//!   `tests::a_compute_program_that_only_reads_local_memory_is_refused`.
 //! - **Jump tables do not extend the capture** (the cache's module docs, "Where this differs
-//!   from the spec"): the tables are resolved against the capture's own bytes, so a target past
-//!   the capture's end cannot be read, the extension is abandoned and that target is dropped,
-//!   as the reference drops targets outside a capture it could not extend
+//!   from the spec"): the tables are resolved against the capture's own bytes, since
+//!   [`Translator::shader`] has no guest-memory reader, so a target at or past the capture's
+//!   end cannot be read and the extension is abandoned ([`crate::capture::Extension::Abandoned`]).
+//!   The program is then refused ([`PipelineRefusal::JumpTargetPastCapture`]).
+//!
+//! # Divergences from the reference
+//!
+//! - **A jump target past the capture is a refusal, not a dropped target.** The reference
 //!   (`eden-pr4588/src/shader_recompiler/frontend/ampere/program_capture.h` @ e5fb3b97,
-//!   `ResolveCaptureIndirectBranches`). Pinned by
-//!   `tests::a_target_past_the_capture_is_dropped`.
+//!   `ResolveCaptureIndirectBranches`) first extends the capture through guest memory to the
+//!   furthest target, and drops a target only when that extension fails. Here no extension is
+//!   tried, so dropping the target would end the `BRX`'s comparison chain in an unreachable
+//!   terminator, and a case past the first `EXIT` (scoping-doc row 92's situation) would lower
+//!   to a shader that does undefined things when that case is selected. Refusing is stricter
+//!   than the reference: a program the reference translates by extending its capture is
+//!   refused here until the translator gets a guest-memory reader. Pinned by
+//!   `tests::a_target_past_the_capture_is_refused`, with the last captured instruction as the
+//!   accepted edge.
 
 #[cfg(test)]
 mod tests;
@@ -58,12 +78,12 @@ mod tests;
 use thiserror::Error;
 
 use crate::cache::{ShaderInput, Translator};
-use crate::capture::Capture;
+use crate::capture::{Capture, Extension};
 use crate::decode::Instruction;
 use crate::exchange::{Answers, Question, Questioner};
-use crate::flow::{BranchTables, FlowError, JumpTableQuestions, resolve_jump_tables};
+use crate::flow::{BranchTables, JumpTableQuestions, resolve_jump_tables};
 use crate::host::{HostCaps, HostShader, Requirements};
-use crate::info::{check_header, translation_stage};
+use crate::info::{check_header, collect, translation_stage};
 use crate::ir::{Function, Inst, Opcode};
 use crate::lower::{LowerInputs, lower_with};
 use crate::program::{Rejection, pipeline_ir};
@@ -80,6 +100,12 @@ pub enum PipelineRefusal {
         "a compute program that uses local memory, whose size no translation input carries yet"
     )]
     ComputeLocalMemory,
+    /// A jump table names an instruction at or past the capture's end, which the translator
+    /// cannot extend the capture to (module docs, "Divergences from the reference").
+    #[error(
+        "a jump table names an instruction past the captured program, which is not extended yet"
+    )]
+    JumpTargetPastCapture,
 }
 
 /// The shader cache's production translator (module docs).
@@ -125,9 +151,17 @@ impl PipelineProgram {
     }
 
     /// Each `BRX`'s targets, from the words `answers` gives its table (module docs, step 2).
-    pub fn branch_tables(&self, answers: &Answers) -> Result<BranchTables, FlowError> {
+    ///
+    /// A missing answer is [`Rejection::Translate`]; a table naming an instruction at or past
+    /// the capture's end is [`PipelineRefusal::JumpTargetPastCapture`].
+    pub fn branch_tables(&self, answers: &Answers) -> Result<BranchTables, Rejection> {
         let mut copy = self.capture.clone();
-        Ok(resolve_jump_tables(&mut copy, self.reader(), answers)?.branch_tables())
+        let resolved =
+            resolve_jump_tables(&mut copy, self.reader(), answers).map_err(TranslateError::from)?;
+        if matches!(resolved.extension, Extension::Abandoned(_)) {
+            return Err(PipelineRefusal::JumpTargetPastCapture.into());
+        }
+        Ok(resolved.branch_tables())
     }
 }
 
@@ -169,9 +203,7 @@ pub fn translate_shader(input: &ShaderInput<'_, PipelineProgram>) -> Result<Host
     let program = input.program;
     let header = program.header();
     check_header(input.stage, header)?;
-    let tables = program
-        .branch_tables(input.answers)
-        .map_err(TranslateError::from)?;
+    let tables = program.branch_tables(input.answers)?;
     let stage = header.map_or(
         Stage {
             stage: input.stage,
@@ -185,6 +217,7 @@ pub fn translate_shader(input: &ShaderInput<'_, PipelineProgram>) -> Result<Host
     });
     let code: Vec<Instruction> = program.capture.instructions().collect();
     let function = pipeline_ir(stage, pixel, &code, &tables)?;
+    collect(input.stage, header, &function)?;
     if input.stage == GuestStage::Compute && uses_local_memory(&function) {
         return Err(PipelineRefusal::ComputeLocalMemory.into());
     }

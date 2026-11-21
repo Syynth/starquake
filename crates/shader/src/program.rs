@@ -6,11 +6,11 @@
 //! the jump tables it is given, decodes the instructions its blocks hold and translates them to
 //! IR; the structurizer ([`IrBlocks::structure`], slice 11) structures the IR; and the SSA
 //! rewrite and the passes after it ([`optimize`], slices 8 and 8b) run on the structured
-//! function. Every production path runs it: [`translate_program`] lowers its result,
-//! [`graphics_program_ir`] collects its info, and the shader cache's production translator
-//! ([`crate::pipeline`]) lowers it with the program's jump tables from slice 9's answers. The
-//! first failure is the rejection; there is no partial translation (spec, "Instruction
-//! translation").
+//! function. The one production path is the shader cache's production translator
+//! ([`crate::pipeline`]), which lowers it with the program's jump tables from slice 9's answers.
+//! [`translate_program`] (used by the GPU crate's draw tests) and [`graphics_program_ir`] (used
+//! by the shader crate's tests) run it too. The first failure is the rejection; there is no
+//! partial translation (spec, "Instruction translation").
 //!
 //! [`translate_program`] and [`graphics_program_ir`] take bytes only, which carry no jump
 //! tables, so a `BRX` there has no target and is refused ([`crate::flow::FlowError::NoTarget`]);

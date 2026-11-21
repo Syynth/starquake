@@ -17,7 +17,7 @@ use crate::decode::{
     SpecialReg, UniformAddr, UniformPred, UniformReg, VoteDst, VoteOp,
 };
 use crate::interp::Machine;
-use crate::ir::{Attribute, Inst, Node, Opcode};
+use crate::ir::{Attribute, BuildError, Inst, Node, Opcode};
 use crate::structure::MAX_STRUCTURE_WORK;
 use crate::testing::{canonical_word, forms};
 use crate::translate::control::{DEPBAR_REQUIRED_SCOREBOARD, FULL_WARP_MASK};
@@ -913,6 +913,42 @@ fn a_refused_memory_instruction_names_the_memory_translator_s_reason() {
     assert_eq!(
         error.to_string(),
         "instruction 0 (ldl r0, [rz];): a uniform register in a local address is not supported"
+    );
+}
+
+/// A memory instruction dispatched into a block that does not exist is the builder's error,
+/// reported as [`TranslateError::Build`] as every group's is, not as
+/// [`TranslateError::Memory`] (the dispatch's `MemoryError::Build` arm).
+#[test]
+fn a_memory_instruction_into_a_missing_block_is_the_builder_s_error() {
+    let mut function = Function::new();
+    let missing = {
+        let mut other = Function::new();
+        other.add_block().expect("a block")
+    };
+    let lds = Instr::new(Op::Ld(OpLd {
+        dst: r(2),
+        addr: MemAddr {
+            reg: r(1),
+            reg_64: false,
+            uniform: Some(UniformAddr {
+                reg: UniformReg::new(0).expect("a uniform register"),
+                wide: false,
+                enabled: false,
+            }),
+            offset: 0x10,
+        },
+        mem_type: MemType::B32,
+        space: MemSpace::Shared(OffsetStride::X1),
+        pred: PredSrc::TRUE,
+        pred_dst: Pred::PT,
+        zd: false,
+        bit76: false,
+    }));
+    let mut driver = Driver::new(VERTEX, None);
+    assert_eq!(
+        driver.dispatch(&mut function, missing, 2, lds),
+        Err(TranslateError::Build(BuildError::NoBlock(missing)))
     );
 }
 
