@@ -1620,6 +1620,7 @@ fn requirements_for_f16_f64_and_subgroup_operations() {
         info.requirements(),
         Requirements {
             subgroup: true,
+            subgroup_size_32: true,
             f16: true,
             f64: true,
             i64: false,
@@ -1715,6 +1716,15 @@ fn exactly_edens_subgroup_and_i64_atomic_opcodes_set_their_flags() {
     let mut expected = subgroup.to_vec();
     expected.sort_by_key(|opcode| Opcode::ALL.iter().position(|o| o == opcode));
     assert_eq!(set(|r| r.subgroup), expected);
+    // The narrower size flag (slice 16b's rule): Eden's subgroup list but the quad operations
+    // and `FSwizzleAdd`, whose results read only the lane's place in its quad.
+    let mut expected: Vec<Opcode> = subgroup
+        .iter()
+        .copied()
+        .filter(|&o| !matches!(o, O::QuadBroadcast | O::QuadSwap | O::FSwizzleAdd))
+        .collect();
+    expected.sort_by_key(|opcode| Opcode::ALL.iter().position(|o| o == opcode));
+    assert_eq!(set(|r| r.subgroup_size_32), expected);
     let mut expected = i64_atomics.to_vec();
     expected.sort_by_key(|opcode| Opcode::ALL.iter().position(|o| o == opcode));
     assert_eq!(set(|r| r.i64_atomics), expected);

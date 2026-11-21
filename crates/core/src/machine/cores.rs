@@ -271,17 +271,17 @@ impl<I: Interrupter> Cores<I> {
         self.parks.busy_turns.load(Ordering::SeqCst)
     }
 
-    /// How many cores are parked, read under the idle count's lock: once it is every core, the
-    /// last one's question has been asked, since a park asks with that lock held.
+    /// How many cores are parked, and the core armed for the GPU's next quiet signal, by index,
+    /// if one is, read together under the idle count's lock (count, then arming, the order every
+    /// park takes them in). Once the count is every core, the last one's question has been
+    /// asked, since a park asks with that lock held. A park arms and disarms its core only with
+    /// that lock held, so the pair is one moment: two separate reads could straddle a waking
+    /// core's disarm and decrement, and see every core parked with none armed.
     #[cfg(test)]
-    pub(super) fn parked(&self) -> usize {
-        *lock(&self.idle)
-    }
-
-    /// The core armed for the GPU's next quiet signal, by index, if one is.
-    #[cfg(test)]
-    pub(super) fn armed(&self) -> Option<usize> {
-        *lock(&self.parks.armed)
+    pub(super) fn parked_and_armed(&self) -> (usize, Option<usize>) {
+        let idle = lock(&self.idle);
+        let armed = *lock(&self.parks.armed);
+        (*idle, armed)
     }
 
     /// Stops every core: each is interrupted and woken, and parks no more.
@@ -376,10 +376,14 @@ impl<I: Interrupter> Cores<I> {
         }
         state.woken = false;
         drop(state);
+        // The disarm and the count's decrement happen under the count's lock, as the question
+        // that armed the core did: a reader that holds the count's lock while it reads the
+        // arming never sees every core parked with the arming cleared by a disarm (a quiet
+        // signal still takes the arming without this lock).
+        let mut idle = lock(&self.idle);
         // A signal told after this is told to no one; one told before it is forgotten here.
         self.parks.disarm(index);
         lock(&slot.state).quiet = false;
-        let mut idle = lock(&self.idle);
         *idle = idle.saturating_sub(1);
         if self.is_stopped() {
             Parked::Stopped

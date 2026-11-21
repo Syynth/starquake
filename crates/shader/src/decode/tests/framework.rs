@@ -752,8 +752,12 @@ fn modifiers_without_bits_are_refused() {
 
 #[test]
 fn every_operation_has_a_distinct_lower_case_mnemonic() {
-    // The 106 instructions of slices 6a to 6i (`op`'s module docs).
-    assert_eq!(MNEMONICS.len(), 23 + 15 + 10 + 2 + 10 + 9 + 12 + 21 + 4);
+    // The 125 instructions of slices 6a to 6i (`op`'s module docs): slice 6d's are `R2UR`,
+    // `UP2UR`, `UMOV`, `ULDC`, `UPLOP3` and sixteen twins (`op::uniform`).
+    assert_eq!(
+        MNEMONICS.len(),
+        23 + 15 + 10 + (5 + 16) + 10 + 9 + 12 + 21 + 4
+    );
     let mut sorted = MNEMONICS.to_vec();
     sorted.sort_unstable();
     sorted.dedup();

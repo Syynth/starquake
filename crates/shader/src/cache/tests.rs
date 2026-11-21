@@ -342,11 +342,12 @@ impl Executor for Threads {
 // ---------------------------------------------------------------------------------------------
 // The rig.
 
-/// A host target with subgroup operations.
+/// A host target with subgroup operations, 32 lanes wide.
 const TARGET: HostTarget = HostTarget {
     form: CodeForm::NagaModule,
     caps: Requirements {
         subgroup: true,
+        subgroup_size_32: true,
         f16: false,
         f64: false,
         i64: false,

@@ -6,6 +6,7 @@
 
 mod drive;
 mod golden;
+mod mirror;
 mod parse;
 mod replay;
 mod seams;

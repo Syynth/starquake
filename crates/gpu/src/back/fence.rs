@@ -53,7 +53,10 @@
 //!   release's address space ([`CloseReason::Waiter`]): [`Fences::attach`] closes after
 //!   attaching it, so the parked channel is not left waiting on recording. An 8-byte release
 //!   covers two words and a 16-byte one four, and each is looked at
-//!   (`a_waiter_on_a_wide_releases_high_word_closes_the_open_list`);
+//!   (`a_waiter_on_a_wide_releases_high_word_closes_the_open_list`), and so is each word of its
+//!   copy into a semaphore mirror page ("The semaphore mirror page" below;
+//!   `mirror::a_waiter_on_the_copy_closes_the_open_list`,
+//!   `mirror::a_waiter_on_a_wide_copys_last_word_closes_the_open_list`);
 //! - [`CLOSE_AFTER`] (1 ms, a **guess**, so that a CPU spinning on a semaphore is not starved)
 //!   of recording ([`CloseReason::Elapsed`]): [`Fences::record`] measures from the open list's
 //!   first command, on [`FenceClock::elapsed`], and closes once a command is recorded at or past
@@ -127,10 +130,66 @@
 //!   drops the range from that space's buffer and texture caches and calls the shader cache's
 //!   `invalidate` (`seams::applied_updates_are_handed_over_in_order_with_their_space`).
 //!
+//! # The semaphore mirror page
+//!
+//! **Tentative**, by the owner's ruling of 2026-11-20 (decision log, "The semaphore mirror page:
+//! copy releases, as Eden-NX2 does"; gpu-protocol, "What this spec assumes of gsv";
+//! graphics-server verification item 8; scoping row 35). Once a release is written, read back
+//! and latched, the fence path asks the release's memory where it is copied
+//! ([`GpuMemory::semaphore_mirror`]: the address one page down when the release's address lies
+//! in the second page of a two-page registration gsv listed; the rule, its Eden-NX2 sources and
+//! its own divergences are in the docs of `crate::vm`'s `mirror` submodule). If anywhere, it
+//! writes the same bytes there, the release's form long: the payload at its width, the 16-byte
+//! structure with the same timestamp, or a reduction's result. Then it reads them back and
+//! latches the waiters of the release's address space on each word, as for the release's own
+//! address. So the order is the release, its read-back and latch, then the copy, its read-back
+//! and latch, as Eden-NX2's puller queries the release, then the mirror
+//! (`eden-nx2/src/video_core/engines/puller.cpp` @ 50fa86bb, `ProcessSemaphoreTriggerMethod`;
+//! `mirror::the_copy_follows_the_releases_read_back`).
+//!
+//! Only the release's address decides, as in `Nx2SemaphoreMirror`: a release that starts in the
+//! first page and runs into the second is not copied, and one that starts near the end of the
+//! second page is copied whole, the copy running into the second page
+//! (`mirror::a_release_across_a_page_edge_is_decided_by_its_first_byte`).
+//!
+//! A copy the memory refuses is a failed release at the copy's address: logged at the action's
+//! [`FailureLog`] level, counted in [`FenceCounters::failed_releases`] and listed in
+//! [`Report::failed`]; the release itself still counts in [`Report::released`], and the copy is
+//! not counted there (`mirror::a_copy_that_faults_is_reported_at_the_copys_address`).
+//!
+//! Divergences from Eden-NX2, each pinned by the test named (of `fence/tests/mirror.rs` unless a
+//! path says otherwise):
+//!
+//! - **Every fenced release is copied.** NX2 copies only the host class's `SEMAPHORED` release
+//!   (`ProcessSemaphoreTriggerMethod`, `WriteLong`), not a `SEM_EXECUTE` release
+//!   (`ProcessSemaphoreExecute`), a 3D report semaphore or a QMD release. The ruling says "a
+//!   fenced release", and the copy is made here, where every kind is performed: the three
+//!   attach sites of `back::exec` (the ring's host semaphore releases, 3D reports, and the
+//!   releases an engine's work hands its sink, QMD releases among them) each build the same
+//!   [`FencedAction::Release`]. `every_release_form_is_copied` pins the forms (4 and 8
+//!   bytes, 4 with a timestamp, 16), built at this layer; through the threads,
+//!   `wiring::tests::mirror` copies a `SEMAPHORED` release
+//!   (`a_release_into_the_second_page_reaches_the_first_through_the_threads`) and a 3D report
+//!   semaphore release (`a_3d_report_release_into_the_second_page_reaches_the_first`). No test
+//!   copies a `SEM_EXECUTE` or QMD release.
+//! - **A reduction's result is copied**, not reduced again at the copy; NX2's copied path has
+//!   no reduction (`a_reductions_result_is_copied`).
+//! - **The copy has the release's timestamp.** NX2 queries the mirror on its own, which reads
+//!   the clock again; here the clock is read once (`a_wide_copy_has_the_releases_timestamp`).
+//! - **A release that faults is not copied.** NX2 queues the mirror's query whether or not the
+//!   release's own write lands; here only bytes that were written are copied
+//!   (`a_release_that_faults_is_not_copied`).
+//! - **The list is read when the release is performed** (and, for the waiter close trigger, when
+//!   it is attached), not when its method is processed: NX2 asks `Nx2SemaphoreMirror` in the
+//!   puller, before `OnBack`. A 101 or 102 between the two changes the answer here
+//!   (`the_list_is_read_when_the_release_is_performed`).
+//!
 //! # The catch-up
 //!
 //! [`Fences::settle`] makes every fenced release of one address space that writes a byte of a
-//! range, and is not yet performed, visible: it closes the open list if that list holds one
+//! range, itself or through its copy into a semaphore mirror page
+//! (`mirror::settle_waits_for_a_release_whose_copy_writes_the_range`), and is not yet performed,
+//! visible: it closes the open list if that list holds one
 //! ([`CloseReason::CatchUp`]), waits for the newest list in flight that holds one
 //! ([`starquake_render::Backend::wait`], bounded by its caller's timeout), and runs completion.
 //! A wait that times out is [`FenceError::CatchUpTimedOut`], after completion has performed what
@@ -592,10 +651,11 @@ pub struct Fences {
     applied: Vec<(AsId, VmUpdate)>,
 }
 
-/// Whether `release` writes a byte of `range`.
-fn overlaps(release: &Release, range: &Range<u64>) -> bool {
-    let end = release.address.saturating_add(release.form.bytes());
-    release.address < range.end && range.start < end
+/// Whether `release`, written at `address` (its own, or its semaphore mirror's), writes a byte of
+/// `range`.
+fn overlaps(address: u64, release: &Release, range: &Range<u64>) -> bool {
+    let end = address.saturating_add(release.form.bytes());
+    address < range.end && range.start < end
 }
 
 /// The low 32 bits of `value`: what a 32-bit acquire reads from a release of it.
@@ -605,12 +665,18 @@ fn low_word(value: u64) -> u32 {
 }
 
 /// The bytes a performed release wrote, from its address.
+#[derive(Clone, Copy)]
 struct Written {
     bytes: [u8; LARGEST_RELEASE_BYTES],
     len: usize,
 }
 
 impl Written {
+    /// The bytes, as long as the release's form.
+    fn bytes(&self) -> &[u8] {
+        self.bytes.get(..self.len).unwrap_or(&self.bytes)
+    }
+
     /// Each 32-bit word written, with its GPU address, in address order (a word whose address
     /// would pass `u64::MAX` is left out; the write itself would have failed).
     fn words(&self, address: u64) -> impl Iterator<Item = (u64, u32)> + '_ {
@@ -630,11 +696,15 @@ const SEMAPHORE_WORD_BYTES: u64 = 4;
 /// the open list"): one for a 4-byte release, two for an 8-byte one, four for the 16-byte
 /// structure.
 fn release_words(release: &Release) -> impl Iterator<Item = (u64, u64)> + '_ {
+    words_at(release.address, release)
+}
+
+/// The GPU address of each 32-bit word `release` writes when written at `address` (its own, or
+/// its semaphore mirror's), with its index.
+fn words_at(address: u64, release: &Release) -> impl Iterator<Item = (u64, u64)> + '_ {
     let words = release.form.bytes() / SEMAPHORE_WORD_BYTES;
     (0..words).filter_map(move |index| {
-        let at = release
-            .address
-            .checked_add(index.checked_mul(SEMAPHORE_WORD_BYTES)?)?;
+        let at = address.checked_add(index.checked_mul(SEMAPHORE_WORD_BYTES)?)?;
         Some((at, index))
     })
 }
@@ -818,8 +888,17 @@ impl Fences {
     ) -> Result<Settled, FenceError> {
         let writes = |action: &FencedAction| match action {
             FencedAction::Release {
-                space: s, release, ..
-            } => *s == space && overlaps(release, &range),
+                memory,
+                space: s,
+                release,
+                ..
+            } => {
+                *s == space
+                    && (overlaps(release.address, release, &range)
+                        || memory
+                            .semaphore_mirror(release.address)
+                            .is_some_and(|mirror| overlaps(mirror, release, &range)))
+            }
             FencedAction::Increment { .. } | FencedAction::Marker { .. } => false,
         };
         if self.open_actions.iter().any(writes) {
@@ -906,8 +985,17 @@ impl Fences {
         }
         if !self.open.commands.is_empty() {
             let waited_on = match &action {
-                FencedAction::Release { space, release, .. } => release_words(release)
-                    .any(|(address, _)| self.env.waiters.has_waiter(*space, address)),
+                FencedAction::Release {
+                    memory,
+                    space,
+                    release,
+                    ..
+                } => {
+                    let mirror = memory.semaphore_mirror(release.address);
+                    release_words(release)
+                        .chain(mirror.into_iter().flat_map(|at| words_at(at, release)))
+                        .any(|(address, _)| self.env.waiters.has_waiter(*space, address))
+                }
                 FencedAction::Increment { .. } | FencedAction::Marker { .. } => false,
             };
             self.open_actions.push(action);
@@ -1051,25 +1139,17 @@ impl Fences {
             } => match write_release(&*memory, &release, &*self.env.clock) {
                 Ok(written) => {
                     report.released = report.released.saturating_add(1);
-                    let written = read_back(&*memory, release.address, written);
-                    for (address, word) in written.words(release.address) {
-                        if self.env.waiters.on_write(space, address, word) {
-                            report.latched = true;
+                    self.latch(&*memory, space, release.address, written, report);
+                    // The semaphore mirror page (module docs): the same bytes, after the
+                    // release's own read-back and latch.
+                    if let Some(mirror) = memory.semaphore_mirror(release.address) {
+                        match memory.write(mirror, written.bytes()) {
+                            Ok(()) => self.latch(&*memory, space, mirror, written, report),
+                            Err(fault) => self.failed(mirror, fault, level, report),
                         }
                     }
                 }
-                Err(fault) => {
-                    let failure = ReleaseFailure {
-                        address: release.address,
-                        fault,
-                    };
-                    match level {
-                        FailureLog::Warn => tracing::warn!(%failure, "fenced release failed"),
-                        FailureLog::Debug => tracing::debug!(%failure, "fenced release failed"),
-                    }
-                    self.counters.failed_releases = self.counters.failed_releases.saturating_add(1);
-                    report.failed.push(failure);
-                }
+                Err(fault) => self.failed(release.address, fault, level, report),
             },
             FencedAction::Increment { id, count } => {
                 self.env.syncpoints.increment_by(id, count);
@@ -1090,6 +1170,36 @@ impl Fences {
                 report.markers.push(token);
             }
         }
+    }
+
+    /// Reads back the bytes `written` at `address` through `memory` and latches every waiter of
+    /// `space` each 32-bit word meets (module docs, "Completion").
+    fn latch(
+        &self,
+        memory: &dyn GpuMemory,
+        space: AsId,
+        address: u64,
+        written: Written,
+        report: &mut Report,
+    ) {
+        let written = read_back(memory, address, written);
+        for (at, word) in written.words(address) {
+            if self.env.waiters.on_write(space, at, word) {
+                report.latched = true;
+            }
+        }
+    }
+
+    /// Logs a write at `address` that `memory` refused at `level`, counts it and lists it in
+    /// `report` (module docs, "Completion").
+    fn failed(&mut self, address: u64, fault: GpuFault, level: FailureLog, report: &mut Report) {
+        let failure = ReleaseFailure { address, fault };
+        match level {
+            FailureLog::Warn => tracing::warn!(%failure, "fenced release failed"),
+            FailureLog::Debug => tracing::debug!(%failure, "fenced release failed"),
+        }
+        self.counters.failed_releases = self.counters.failed_releases.saturating_add(1);
+        report.failed.push(failure);
     }
 
     /// Wakes the front once for a batch that did anything.

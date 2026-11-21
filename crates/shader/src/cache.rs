@@ -4,10 +4,10 @@
 //! engine state (#12) gets"; port slice 19; Eden-NX2 rows 90 and 112).
 //!
 //! [`ShaderCache`] is what the GPU crate's back thread asks for shaders on every draw that
-//! changes a program. Translation itself (decoding, flow, structuring, lowering) is not all built
-//! yet, so the cache drives it through the [`Translator`] seam; slice 17's translator implements
-//! it, and until then a fake does in the tests (the slice table allows it: "a fake translator
-//! before 17").
+//! changes a program. The cache drives translation through the [`Translator`] seam: the
+//! production translator is [`crate::pipeline::PipelineTranslator`] (the whole pipeline, with
+//! the graphics interfaces slice 17 adds still refused by name), and a fake does in this
+//! module's tests.
 //!
 //! # The three layers
 //!
@@ -16,7 +16,8 @@
 //!    and captures it ([`crate::capture`], slice 3). Each entry remembers every guest byte the
 //!    capture read, which [`ShaderCache::invalidate`] and [`ShaderCache::tracked_ranges`] use.
 //! 2. **Program entries**: content hash to what [`Translator::program`] made of the captured
-//!    bytes (the decoded, structured IR and the questions it asks), or to its rejection.
+//!    bytes (for the production translator, the capture and its parsed header) and the questions
+//!    it asks, or to its rejection.
 //! 3. **Shader entries**: keyed by a [`ShaderStamp`], the digest of the translator version
 //!    ([`TRANSLATOR_VERSION`]), the [`HostTarget`], the stage, the content hash, the answers and
 //!    the variant key; each is pending, ready or rejected.
@@ -161,13 +162,18 @@
 //!   same bytes share a hash; their shaders differ.
 //! - **Program entries are made on the back thread**, at a program-entry miss, because the
 //!   question loop needs the program's questions there and `wait` has no engine state to answer
-//!   them with. [`Translator::program`] does the stage-independent part only (decoding and
-//!   structuring); the rest runs on the executor.
+//!   them with. [`Translator::program`] does the stage-independent part only (the production
+//!   translator keeps the capture and parses its header); the rest runs on the executor.
 //! - **A refused capture outlives a map of the bytes it could not read**: an owner question
 //!   (above, "A refusal kept after a map").
 //! - **Jump tables do not extend the capture yet** (row 92): [`Translator::program`] gets the
-//!   capture as slice 3 makes it. Driving [`crate::capture::Capture::resolve_jump_tables`] with
-//!   the answers needs slice 10's table finding through the seam.
+//!   capture as slice 3 makes it. The production translator finds the tables and resolves
+//!   them from the answers ([`crate::pipeline`]), but [`Translator::shader`] has no
+//!   guest-memory reader, so it resolves them against the capture's own bytes and refuses a
+//!   table naming an instruction past the capture
+//!   ([`crate::pipeline::PipelineRefusal::JumpTargetPastCapture`]) rather than extending the
+//!   capture as the reference does. The missing piece is a guest-memory reader at
+//!   [`Translator::shader`].
 
 mod address;
 mod jobs;
@@ -269,10 +275,11 @@ pub struct ShaderInput<'a, P> {
     pub target: &'a HostTarget,
 }
 
-/// The translation the cache drives (module docs): slice 17's translator, or a fake before it.
+/// The translation the cache drives (module docs): the production translator
+/// ([`crate::pipeline::PipelineTranslator`]), or a fake in the tests.
 pub trait Translator: Send + Sync + 'static {
-    /// A program entry (layer 2): the decoded, structured, stage-independent IR, which says
-    /// which questions it asks.
+    /// A program entry (layer 2): what the translator keeps of a capture, independent of the
+    /// stage, which says which questions it asks.
     type Program: Questioner + Send + Sync + 'static;
     /// A translated shader, with whatever the GPU crate takes beside it.
     type Shader: Translated;
@@ -328,6 +335,7 @@ pub enum CacheRefusal {
 fn missing_features(needs: Requirements, caps: Requirements) -> Option<Requirements> {
     let Requirements {
         subgroup,
+        subgroup_size_32,
         f16,
         f64,
         i64,
@@ -335,6 +343,7 @@ fn missing_features(needs: Requirements, caps: Requirements) -> Option<Requireme
     } = needs;
     let missing = Requirements {
         subgroup: subgroup && !caps.subgroup,
+        subgroup_size_32: subgroup_size_32 && !caps.subgroup_size_32,
         f16: f16 && !caps.f16,
         f64: f64 && !caps.f64,
         i64: i64 && !caps.i64,
@@ -347,6 +356,7 @@ fn missing_features(needs: Requirements, caps: Requirements) -> Option<Requireme
 fn feature_names(features: Requirements) -> String {
     let Requirements {
         subgroup,
+        subgroup_size_32,
         f16,
         f64,
         i64,
@@ -354,6 +364,7 @@ fn feature_names(features: Requirements) -> String {
     } = features;
     let names: Vec<&str> = [
         (subgroup, "subgroup operations"),
+        (subgroup_size_32, "a subgroup size of 32"),
         (f16, "16-bit floats"),
         (f64, "64-bit floats"),
         (i64, "64-bit integers"),

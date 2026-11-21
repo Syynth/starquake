@@ -32,8 +32,9 @@ use crate::ir::{Opcode, Operand, Operation, Value, WARP_SIZE};
 
 /// `GuestLane`'s mask: a lane index modulo the warp size.
 const LANE_MASK: u32 = WARP_SIZE - 1;
-/// The lanes of a quad, less one: `EmitQuadBroadcast`'s `~3u` and `3u`.
-const QUAD_LANE_MASK: u32 = 3;
+/// The lanes of a quad, less one: `EmitQuadBroadcast`'s `~3u` and `3u` (the lowering's quad
+/// operations use it too, `crate::lower`'s `warp` module).
+pub(crate) const QUAD_LANE_MASK: u32 = 3;
 
 /// Which shuffle.
 #[derive(Clone, Copy)]
