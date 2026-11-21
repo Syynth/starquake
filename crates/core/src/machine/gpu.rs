@@ -35,9 +35,13 @@
 //!   dumps), and the backend hands them to the run's [`RunFrames`]: its frame keeper
 //!   ([`FrameKeeper`], `crate::frames`) and a count of the frames handed over, which [`finish`]
 //!   compares with the GPU's presents ("At the end").
-//! - **The shader cache** behind G18's seam is [`NoShaders`] until shader-pipeline slice 19
-//!   builds the real one: every lookup is pending and never finishes, so every draw and
-//!   dispatch is skipped and counted (the draw path's `ShaderPending` skip).
+//! - **The shader cache** behind G18's seam is chosen by [`run_shaders`]: in a run that made
+//!   the compile pool (one that chose the wgpu backend, "The wgpu backend" below), the shader
+//!   crate's `ShaderCache` with its production translator (`PipelineTranslator`, issue #484)
+//!   on that pool, behind the GPU crate's seam (`CachedShaders`), for the host target
+//!   [`SHADER_TARGET`]; in a run with no pool (the recording choice), [`NoShaders`]: every
+//!   lookup is pending and never finishes, so every draw and dispatch is skipped and counted
+//!   (the draw path's `ShaderPending` skip).
 //! - **The guest memory** is the run's ([`super::Session::gpu_memory`]).
 //! - **The write watch** is one the run makes for the GPU. The kernel half of `WriteWatch`
 //!   (taking and arming requests, recording faults) is a kernel slice not yet built, so no
@@ -85,12 +89,27 @@
 //! `hle/tests/graphics/present.rs`). The local GPU test of the whole path is
 //! `the_wgpu_backend_dumps_the_same_frame_as_the_recording_backend`, there too.
 //!
-//! **The shader cache shares no pool yet.** The compile pool a wgpu run makes implements the
-//! shader crate's executor trait as well as the render crate's (`crate::compile_pool`), so the
-//! shader cache can take the same pool; but the run's shader cache is still [`NoShaders`], since
-//! no translator exists to build the real one with (shader-pipeline slice 19's `ShaderCache`
-//! takes a `Translator`, which slice 17 builds). A run with the recording backend makes no pool:
-//! the recording backend builds no pipelines, and nothing else would use it.
+//! **The shader cache shares the pool.** A run that chose the wgpu backend makes the run's one
+//! compile pool ([`graphics_opening`]) before opening the backend, and hands the same pool to
+//! the backend (`WgpuOpener::open`) and to the shader cache ([`run_shaders`]), which takes it
+//! through the shader crate's executor trait (`crate::compile_pool`; shader-pipeline,
+//! "Compilation, threads and stutter": "`core` creates one compile pool and hands it to both").
+//! The cache keeps the pool when the backend falls back to the recording backend, so such a run
+//! still translates its shaders; a pool that cannot be started is the backend's failure
+//! ("the compile pool could not be started", then why), and the run then has no shader cache
+//! ([`NoShaders`]). Pinned by `the_shader_cache_holds_the_pool_the_backend_was_given`, and the
+//! pool that cannot be started, for both choices, by
+//! `a_compile_pool_that_cannot_start_is_the_backend_s_failure` (over [`wgpu_opening`]), both in
+//! `gpu/tests.rs`. A run with the recording choice makes no pool and keeps [`NoShaders`]: its
+//! draws are skipped as before. **Owner question**: whether a recording run should start a pool
+//! of its own for its shaders, which costs every such run (every test run among them) the
+//! pool's threads.
+//!
+//! **The host target is a guess.** The render backend's caps carry no shader features yet
+//! (subgroups, 16-bit floats, 64-bit integers), so [`SHADER_TARGET`] claims none: the cache
+//! hands out no module that needs one, and refuses such a shader by name
+//! (`CacheRefusal::Unsupported`). **Owner question**: whether the render crate's `Caps` should
+//! report them, so the target is the backend's.
 //!
 //! **Departure: the clock is not in `GpuConfig`.** gpu-protocol says the timestamp is guest time
 //! "which `core` passes through the `Gpu`'s config". `GpuConfig` is a plain settings value
@@ -156,8 +175,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use starquake_gpu::back::buffer::InvalidationSink;
+use starquake_gpu::back::draw::cached::CachedShaders;
 use starquake_gpu::back::draw::shaders::{SetLookup, ShaderLookup};
-use starquake_gpu::back::exec::{ExecConfig, FrameDumps};
+use starquake_gpu::back::exec::{ExecConfig, FrameDumps, ShaderCache};
 use starquake_gpu::back::fence::FenceClock;
 use starquake_gpu::wiring::{Gpu, GpuConfig, GpuRing, IDLE_POLL_WAIT, WiringError};
 use starquake_gsv::completion::Wake;
@@ -168,10 +188,14 @@ use starquake_render::{
     Backend, Caps, Features, FormatFeatures, FormatTable, Frame, FrameSink, Limits,
     RecordingBackend, SampleCounts,
 };
+use starquake_shader::cache::{CodeForm, HostTarget};
+use starquake_shader::host::Requirements;
 use starquake_shader::lookup::{EngineState, ProgramMemory, ProgramRequest, Ticket, VariantKey};
+use starquake_shader::pipeline::PipelineTranslator;
 use starquake_trace::HostClock;
 
 use super::Ending;
+use crate::compile_pool::CompileWorkers;
 use crate::frames::{DumpedFrames, FrameKeeper};
 use crate::hle::Graphics;
 use crate::hle::graphics::{FrontMode, GpuParts};
@@ -307,6 +331,36 @@ impl FrameSink for RunFrames {
 #[derive(Debug, Default)]
 pub(crate) struct NoShaders;
 
+/// The host target the run's shader cache translates for (module docs, "The host target is a
+/// guess"): a naga module, needing no optional device feature.
+pub(crate) const SHADER_TARGET: HostTarget = HostTarget {
+    form: CodeForm::NagaModule,
+    caps: Requirements {
+        subgroup: false,
+        f16: false,
+        f64: false,
+        i64: false,
+        i64_atomics: false,
+    },
+};
+
+/// The run's shader cache (module docs, "The GPU's parts"): the shader crate's cache with its
+/// production translator on `pool`, the run's one compile pool, for [`SHADER_TARGET`]; or
+/// [`NoShaders`] when the run has no pool.
+#[must_use]
+pub(crate) fn run_shaders(pool: Option<Arc<CompileWorkers>>) -> Box<dyn ShaderCache + Send> {
+    match pool {
+        Some(pool) => Box::new(CachedShaders::new(
+            starquake_shader::cache::ShaderCache::new(
+                Arc::new(PipelineTranslator),
+                pool,
+                SHADER_TARGET,
+            ),
+        )),
+        None => Box::new(NoShaders),
+    }
+}
+
 /// The ticket every lookup of [`NoShaders`] answers with.
 const NO_TICKET: Ticket = Ticket::new(0);
 
@@ -425,7 +479,11 @@ pub(crate) fn graphics_and_backend<C: HostClock + 'static>(
     let keeper = Arc::new(RunFrames::default());
     let backend = recording_backend(&ring, &keeper);
     let dyn_backend: Arc<dyn Backend> = Arc::<RecordingBackend>::clone(&backend);
-    let graphics = start_gpu(ring, dyn_backend, memory, (wake, frame_limit, clock))?;
+    let graphics = start_gpu(
+        (ring, dyn_backend, run_shaders(None)),
+        memory,
+        (wake, frame_limit, clock),
+    )?;
     Ok((graphics, Some((keeper, backend))))
 }
 
@@ -446,19 +504,18 @@ fn recording_backend(ring: &GpuRing, keeper: &Arc<RunFrames>) -> Arc<RecordingBa
     backend
 }
 
-/// Starts the run's GPU over `ring` and `backend` (module docs, "The GPU's parts"), rung
+/// Starts the run's GPU over `ring`, `backend` and `shaders` (module docs, "The GPU's parts"), rung
 /// through `wake`, handing its front no more than `frame_limit` frames, its release timestamps
 /// read from `clock`.
 fn start_gpu<C: HostClock + 'static>(
-    ring: GpuRing,
-    backend: Arc<dyn Backend>,
+    (ring, backend, shaders): (GpuRing, Arc<dyn Backend>, Box<dyn ShaderCache + Send>),
     memory: &Arc<dyn GuestMemory>,
     (wake, frame_limit, clock): (Arc<dyn Wake>, Option<NonZeroU64>, C),
 ) -> Result<Graphics, String> {
     let parts = GpuParts {
         ring,
         backend,
-        shaders: Box::new(NoShaders),
+        shaders,
         guest: Arc::clone(memory),
         watch: Arc::new(WriteWatch::new()),
         config: gpu_config(),
@@ -483,7 +540,11 @@ pub(crate) fn graphics_with_sink<C: HostClock + 'static>(
     let frames = Arc::new(RunFrames::default());
     let backend = recording_backend(&ring, &frames);
     backend.set_frame_sink(Some(sink(Arc::clone(&frames))));
-    let graphics = start_gpu(ring, backend, memory, (wake, None, clock))?;
+    let graphics = start_gpu(
+        (ring, backend, run_shaders(None)),
+        memory,
+        (wake, None, clock),
+    )?;
     Ok((graphics, frames))
 }
 
@@ -541,31 +602,79 @@ pub(crate) fn graphics_opening<C: HostClock + 'static>(
     };
     let ring = standard_ring()?;
     let keeper = Arc::new(RunFrames::default());
-    let attempt = opener.open(
-        ring.completion_wake(),
-        gpu_config().exec.setting,
-        &keeper,
-        render.window(),
-        PRESENT_TARGET_WAIT,
-    );
-    let backend = match (attempt, if_unavailable) {
-        (Ok(backend), _) => backend,
-        (Err(Unopened::Backend(reason)), IfUnavailable::UseRecording) => {
+    let pool = started_pool(CompileWorkers::for_host());
+    let outcome = wgpu_opening(
+        &pool,
+        |pool| {
+            opener.open(
+                pool,
+                ring.completion_wake(),
+                gpu_config().exec.setting,
+                &keeper,
+                render.window(),
+                PRESENT_TARGET_WAIT,
+            )
+        },
+        if_unavailable,
+    )?;
+    let backend = match outcome {
+        Opening::Opened(backend) => backend,
+        Opening::FallBack(reason) => {
             tracing::warn!(%reason, "{FELL_BACK}");
             recording_backend(&ring, &keeper)
         }
-        (Err(Unopened::Backend(reason)), IfUnavailable::EndRun) => {
-            return Err(format!("{WGPU_UNAVAILABLE}: {reason}"));
-        }
-        (Err(Unopened::Window(message)), _) => return Err(message),
     };
     let graphics = start_gpu(
-        ring,
-        Arc::clone(&backend),
+        (ring, Arc::clone(&backend), run_shaders(pool.ok())),
         memory,
         (wake, frame_limit, clock),
     )?;
     Ok((graphics, Some((keeper, backend))))
+}
+
+/// The run's compile pool as [`graphics_opening`] hands it on, from what starting it gave: the
+/// pool, or why it could not be started, in words (module docs, "The shader cache shares the
+/// pool").
+fn started_pool(started: std::io::Result<CompileWorkers>) -> Result<Arc<CompileWorkers>, String> {
+    started
+        .map(Arc::new)
+        .map_err(|error| format!("the compile pool could not be started: {error}"))
+}
+
+/// What opening the wgpu backend came to, when the run goes on.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Opening<B> {
+    /// The backend opened.
+    Opened(B),
+    /// It did not, and the run renders with the recording backend instead: why, in words.
+    FallBack(String),
+}
+
+/// What a run that chose the wgpu backend does (module docs, "The wgpu backend" and "The
+/// shader cache shares the pool"), given its compile pool, `open`, which opens the backend on
+/// the pool, and its choice for an unavailable backend. A pool that could not be started is
+/// the backend's failure: `open` is not called, and the choice says whether the run falls back
+/// or ends ([`WGPU_UNAVAILABLE`] and the pool's reason). A window that cannot be presented into
+/// ends the run whatever the choice, with the window's own words.
+pub(crate) fn wgpu_opening<B>(
+    pool: &Result<Arc<CompileWorkers>, String>,
+    open: impl FnOnce(Arc<CompileWorkers>) -> Result<B, Unopened>,
+    if_unavailable: IfUnavailable,
+) -> Result<Opening<B>, String> {
+    let attempt = match pool {
+        Ok(pool) => open(Arc::clone(pool)),
+        Err(reason) => Err(Unopened::Backend(reason.clone())),
+    };
+    match (attempt, if_unavailable) {
+        (Ok(backend), _) => Ok(Opening::Opened(backend)),
+        (Err(Unopened::Backend(reason)), IfUnavailable::UseRecording) => {
+            Ok(Opening::FallBack(reason))
+        }
+        (Err(Unopened::Backend(reason)), IfUnavailable::EndRun) => {
+            Err(format!("{WGPU_UNAVAILABLE}: {reason}"))
+        }
+        (Err(Unopened::Window(message)), _) => Err(message),
+    }
 }
 
 /// The words a run ends with when a GPU thread ended during it, given what stopping the GPU
