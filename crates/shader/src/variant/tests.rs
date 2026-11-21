@@ -330,7 +330,7 @@ fn the_version_is_checked_first() {
     );
     assert_eq!(
         KeyError::Version { found: 1 }.to_string(),
-        "variant key version 1 is not supported; this build reads version 4"
+        "variant key version 1 is not supported; this build reads version 5"
     );
     // The right version with nothing after it.
     assert_eq!(
