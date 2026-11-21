@@ -16,6 +16,9 @@
 //!   `S2R`, `CS2R`, `PIXLD`, and the deferred `OUT`, `ISBERD` and `ISBEWR`), joined through
 //!   `GROUPS`;
 //! - [`control`]: the control and warp group (slice 12h);
+//! - [`uniform`]: the uniform datapath (slice 12d: `R2UR`, `UMOV`, `ULDC` with `LDCG`,
+//!   `UPLOP3` and the twins of the integer instructions, which it translates with the
+//!   integer group's code over the uniform register file);
 //! - `EXIT`, here: for a pixel program, the colour outputs, the sample mask and the depth
 //!   (`Translator::exit`).
 //!
@@ -72,6 +75,7 @@ pub(crate) mod source;
 #[cfg(test)]
 mod tests;
 pub mod texture;
+pub mod uniform;
 
 use std::fmt::{self, Display, Formatter};
 
@@ -254,6 +258,20 @@ pub enum TranslateError {
         instr: Instr,
         /// Why.
         error: memory::MemoryError,
+    },
+    /// An instruction of the uniform datapath is not translated ([`uniform::UniformError`]: a
+    /// form or field value slice 12d's translator does not handle, or one of the integer
+    /// group's checks on a twin; its decode and other-group refusals cannot be reached from the
+    /// driver, which hands it a decoded instruction of the group with its guard already
+    /// handled, and its build failures are [`TranslateError::Build`]).
+    #[error("instruction {index} ({instr}): {error}")]
+    Uniform {
+        /// The instruction's index in the program.
+        index: usize,
+        /// The instruction.
+        instr: Instr,
+        /// Why.
+        error: uniform::UniformError,
     },
     /// An instruction a flow block holds does not decode (flow analysis decodes only control
     /// instructions; the driver decodes the rest).

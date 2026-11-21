@@ -124,6 +124,7 @@ use super::half_double::{self, HalfDoubleError};
 use super::integer::{self, GuardMode, IntegerError};
 use super::memory::{self, MemoryError};
 use super::texture::{self, DescriptorBuffer, TextureError};
+use super::uniform::{self, UniformError};
 use super::{
     Failure, GuardStep, GuestStage, Stage, TranslateError, Translator, Unsupported, guard_step,
     source, split_for_guard,
@@ -283,6 +284,12 @@ impl Driver {
         info: OpInfo,
         guard_tested: bool,
     ) -> Result<BlockId, TranslateError> {
+        if matches!(instr.op, Op::R2UR(_)) && !guard_tested {
+            // `R2UR` reads its guard as data and makes no block (`classify.h`; the uniform
+            // group's module docs, "Divergences"): its translator honours the guard itself.
+            self.uniform(function, at, index, instr, GuardMode::Honour)?;
+            return Ok(at);
+        }
         match guard_step(instr.guard, guard_tested || !info.pure) {
             GuardStep::Skip => Ok(at),
             GuardStep::Unguarded => {
@@ -315,6 +322,28 @@ impl Driver {
         let then = b.block();
         self.dispatch(function, then, index, instr)?;
         Ok(join)
+    }
+
+    /// Translates `instr`, instruction `index`, a uniform datapath instruction, at the end of
+    /// `block` with slice 12d's translator ([`uniform::translate_uniform`]) in `mode`.
+    fn uniform(
+        &mut self,
+        function: &mut Function,
+        block: BlockId,
+        index: usize,
+        instr: Instr,
+        mode: GuardMode,
+    ) -> Result<(), TranslateError> {
+        uniform::translate_uniform(&mut Builder::new(function, block), &instr, mode).map_err(
+            |error| match error {
+                UniformError::Build(error) => TranslateError::Build(error),
+                error => TranslateError::Uniform {
+                    index,
+                    instr,
+                    error,
+                },
+            },
+        )
     }
 
     /// Translates `instr`, instruction `index`, at the end of `block` as if unguarded, with the
@@ -377,6 +406,9 @@ impl Driver {
             let _subgroup: Emitted =
                 control::translate_control(function, block, self.stage.stage, index, instr, true)?;
             return Ok(());
+        }
+        if uniform::in_group(&op) {
+            return self.uniform(function, block, index, instr, GuardMode::Tested);
         }
         if memory::is_memory(&op) {
             return memory::translate_memory(

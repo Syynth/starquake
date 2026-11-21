@@ -706,8 +706,9 @@ const fn require(ok: bool, what: MemoryUnsupported) -> Result<(), MemoryUnsuppor
     if ok { Ok(()) } else { Err(what) }
 }
 
-/// The registers a type moves: 1, or 2 and 4 for the 64- and 128-bit types.
-const fn words_of(mem_type: MemType) -> u8 {
+/// The registers a type moves: 1, or 2 and 4 for the 64- and 128-bit types. Shared with the
+/// uniform datapath's `ULDC` (slice 12d).
+pub(super) const fn words_of(mem_type: MemType) -> u8 {
     match mem_type {
         MemType::B64 => 2,
         MemType::B128 => 4,
@@ -1120,6 +1121,26 @@ const fn global_access(mem_type: MemType) -> Access {
     Access { load, store }
 }
 
+/// The global load of one type, shared with the uniform datapath's `LDCG` (slice 12d).
+pub(super) const fn global_load(mem_type: MemType) -> Opcode {
+    global_access(mem_type).load
+}
+
+/// The constant-buffer read of one type (`Visitor::LDC`'s and `Visitor::ULDC`'s `GetCbuf`
+/// widths), shared with the uniform datapath's `ULDC` (slice 12d): `None` for `.128`, which
+/// both read as four `GetCbufU32` four bytes apart.
+pub(super) const fn cbuf_load(mem_type: MemType) -> Option<Opcode> {
+    match mem_type {
+        MemType::U8 => Some(Opcode::GetCbufU8),
+        MemType::I8 => Some(Opcode::GetCbufS8),
+        MemType::U16 => Some(Opcode::GetCbufU16),
+        MemType::I16 => Some(Opcode::GetCbufS16),
+        MemType::B32 => Some(Opcode::GetCbufU32),
+        MemType::B64 => Some(Opcode::GetCbufU32x2),
+        MemType::B128 => None,
+    }
+}
+
 /// Shared memory: the 8- and 16-bit stores take the unsigned opcode for either signedness
 /// (Eden's `WriteShared(8, ..)` has no signed form).
 const fn shared_access(mem_type: MemType) -> Access {
@@ -1478,21 +1499,13 @@ impl Emit<'_, '_> {
             let reg = self.get(ldc.offset)?;
             self.op(Opcode::IAdd32, &[reg, imm32(displacement)])?
         };
-        let read = match ldc.mem_type {
-            MemType::U8 => Opcode::GetCbufU8,
-            MemType::I8 => Opcode::GetCbufS8,
-            MemType::U16 => Opcode::GetCbufU16,
-            MemType::I16 => Opcode::GetCbufS16,
-            MemType::B32 => Opcode::GetCbufU32,
-            MemType::B64 => Opcode::GetCbufU32x2,
-            MemType::B128 => {
-                for k in 0..4_u8 {
-                    let at = self.add(offset, u32::from(k) * WORD_BYTES)?;
-                    let word = self.op(Opcode::GetCbufU32, &[bank, at])?;
-                    self.set(next(ldc.dst, k), word)?;
-                }
-                return Ok(());
+        let Some(read) = cbuf_load(ldc.mem_type) else {
+            for k in 0..words_of(ldc.mem_type) {
+                let at = self.add(offset, u32::from(k) * WORD_BYTES)?;
+                let word = self.op(Opcode::GetCbufU32, &[bank, at])?;
+                self.set(next(ldc.dst, k), word)?;
             }
+            return Ok(());
         };
         let value = self.op(read, &[bank, offset])?;
         self.set_words(ldc.dst, value, words_of(ldc.mem_type))
